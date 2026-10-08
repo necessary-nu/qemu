@@ -83,8 +83,7 @@ static void test_memory_map(void)
         { "rp2350.dma",        0x50000000, 0x100000 },
         { "rp2350.usbctrl",    0x50100000, 0x100000 },
         { "rp2350.pio0",       0x50200000, 0x100000 },
-        { "rp2350.sio",        0xd0000000, 0x20000 },
-        { "rp2350.sio_nonsec", 0xd0020000, 0x20000 },
+        { "rp2350.xosc",       0x40048000, 0x8000 },
     };
     g_autofree char *path = NULL;
     QTestState *qts = boot_direct(&path);
@@ -100,6 +99,12 @@ static void test_memory_map(void)
                           "(prio 0, i/o): rp2350-resets");
     assert_mtree_has(qts, "0000000040024000-0000000040027fff "
                           "(prio -1000, i/o): rp2350.resets @0000000000004000");
+    assert_mtree_has(qts, "00000000d0000000-00000000d0000fff "
+                          "(prio 0, i/o): rp2350-sio");
+    assert_mtree_has(qts, "00000000d0001000-00000000d001ffff "
+                          "(prio -1000, i/o): rp2350.sio @0000000000001000");
+    assert_mtree_has(qts, "00000000d0020000-00000000d0020fff "
+                          "(prio 0, i/o): rp2350-sio-nonsec");
     assert_mtree_has(qts, "00000000e0080000-00000000e0080fff "
                           "(prio 0, i/o): rp2350.eppb");
     for (i = 0; i < ARRAY_SIZE(unimplemented); i++) {
@@ -224,10 +229,11 @@ static void test_flash_size(void)
     unlink(path);
 }
 
-/* [spec:nuos:req:emu.irq-routing/test] */
+/* [spec:nuos:req:emu.irq-routing+1/test] */
 static void test_irq_routing(void)
 {
-    static const int lines[] = { 1, 21, 33, 51 };
+    /* System-level lines only; core-local lines are tested per model. */
+    static const int lines[] = { 1, 14, 33, 51 };
     g_autofree char *path = write_image(XIP_BASE);
     int core, i;
 

@@ -119,6 +119,9 @@ config STM32L4X5_EXTI
 config RP2350_RESETS
     bool
 
+config RP2350_SIO
+    bool
+
 config STM32L4X5_SYSCFG
     bool
 

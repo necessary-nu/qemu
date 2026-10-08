@@ -95,10 +95,13 @@ static const RP2350Peripheral rp2350_peripherals[] = {
 };
 
 /*
- * Every peripheral interrupt is wired to the same IRQ number on both
- * cores' NVICs; each core masks the lines it does not service.
+ * System-level interrupts are wired to the same IRQ number on both cores'
+ * NVICs; each core masks the lines it does not service. Core-local
+ * sources (SIO FIFOs, doorbells and MTIMECMP, and the GPIO interrupts) do
+ * not use these inputs: their models connect each core's source straight
+ * to that core's NVIC.
  */
-/* [spec:nuos:req:emu.irq-routing] */
+/* [spec:nuos:req:emu.irq-routing+1] */
 static void rp2350_soc_set_irq(void *opaque, int n, int level)
 {
     RP2350State *s = opaque;
@@ -215,6 +218,44 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->eppb[i]), 0), 0);
     }
 
+    /* [spec:nuos:req:emu.sio] */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->sio), errp)) {
+        return;
+    }
+    for (i = 0; i < RP2350_NUM_CORES; i++) {
+        int bank;
+
+        memory_region_add_subregion_overlap(&s->armv7m[i].container,
+                                            RP2350_SIO_BASE,
+                                            rp2350_sio_view(&s->sio, i, false),
+                                            0);
+        memory_region_add_subregion_overlap(&s->armv7m[i].container,
+                                            RP2350_SIO_NONSEC_BASE,
+                                            rp2350_sio_view(&s->sio, i, true),
+                                            0);
+        for (bank = 0; bank < RP2350_SIO_BANKS; bank++) {
+            int irq = (bank * RP2350_SIO_CORES + i) * 2;
+
+            sysbus_connect_irq(SYS_BUS_DEVICE(&s->sio), irq,
+                qdev_get_gpio_in(DEVICE(&s->armv7m[i]),
+                                 RP2350_SIO_IRQ_FIFO + 2 * bank));
+            sysbus_connect_irq(SYS_BUS_DEVICE(&s->sio), irq + 1,
+                qdev_get_gpio_in(DEVICE(&s->armv7m[i]),
+                                 RP2350_SIO_IRQ_BELL + 2 * bank));
+        }
+    }
+    memory_region_init_alias(&s->sio_sysmem[0], obj, "rp2350-sio.sysmem",
+                             rp2350_sio_view(&s->sio, 0, false), 0,
+                             RP2350_SIO_VIEW_SIZE);
+    memory_region_add_subregion(s->board_memory, RP2350_SIO_BASE,
+                                &s->sio_sysmem[0]);
+    memory_region_init_alias(&s->sio_sysmem[1], obj,
+                             "rp2350-sio-nonsec.sysmem",
+                             rp2350_sio_view(&s->sio, 0, true), 0,
+                             RP2350_SIO_VIEW_SIZE);
+    memory_region_add_subregion(s->board_memory, RP2350_SIO_NONSEC_BASE,
+                                &s->sio_sysmem[1]);
+
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->resets), errp)) {
         return;
     }
@@ -239,6 +280,7 @@ static void rp2350_soc_init(Object *obj)
     }
 
     object_initialize_child(obj, "resets", &s->resets, TYPE_RP2350_RESETS);
+    object_initialize_child(obj, "sio", &s->sio, TYPE_RP2350_SIO);
 
     qdev_init_gpio_in(DEVICE(s), rp2350_soc_set_irq, RP2350_NUM_IRQS);
 

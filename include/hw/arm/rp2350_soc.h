@@ -13,6 +13,7 @@
 #include "hw/arm/armv7m.h"
 #include "hw/core/clock.h"
 #include "hw/misc/rp2350_resets.h"
+#include "hw/misc/rp2350_sio.h"
 #include "hw/misc/unimp.h"
 #include "qom/object.h"
 
@@ -66,6 +67,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_EPPB_SIZE 0x1000
 
 #define RP2350_RESETS_BASE 0x40020000
+#define RP2350_SIO_BASE 0xd0000000
+#define RP2350_SIO_NONSEC_BASE 0xd0020000
 
 #define RP2350_SYSCLK_HZ 150000000
 #define RP2350_REFCLK_HZ 1000000
@@ -76,6 +79,9 @@ struct RP2350State {
     ARMv7MState armv7m[RP2350_NUM_CORES];
     UnimplementedDeviceState eppb[RP2350_NUM_CORES];
     RP2350ResetsState resets;
+    RP2350SIOState sio;
+    /* Core 0's SIO views as seen from system memory (debug, qtest). */
+    MemoryRegion sio_sysmem[2];
 
     MemoryRegion rom;
     MemoryRegion flash;

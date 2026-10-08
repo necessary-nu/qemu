@@ -1,0 +1,402 @@
+/*
+ * RP2350 single-cycle IO block (SIO)
+ *
+ * Copyright (c) 2026 Necessary Innovations AB
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * Reference: RP2350 Datasheet, "SIO". Modelled: CPUID, the inter-core
+ * FIFOs, the hardware spinlocks, the doorbells, and GPIO output/enable
+ * storage. Secure and Non-secure banks are separate, as on hardware.
+ * Interpolators, TMDS encoders and the RISC-V platform timer are not
+ * modelled.
+ */
+
+#include "qemu/osdep.h"
+#include "qemu/log.h"
+#include "hw/core/irq.h"
+#include "hw/misc/rp2350_sio.h"
+#include "migration/vmstate.h"
+
+#define A_CPUID            0x000
+#define A_GPIO_IN          0x004
+#define A_GPIO_HI_IN       0x008
+#define A_GPIO_OUT         0x010
+#define A_GPIO_OE          0x030
+#define A_GPIO_OE_XOR_HI   0x04c
+#define A_FIFO_ST          0x050
+#define A_FIFO_WR          0x054
+#define A_FIFO_RD          0x058
+#define A_SPINLOCK_ST      0x05c
+#define A_SPINLOCK0        0x100
+#define A_SPINLOCK31       0x17c
+#define A_DOORBELL_OUT_SET 0x180
+#define A_DOORBELL_OUT_CLR 0x184
+#define A_DOORBELL_IN_SET  0x188
+#define A_DOORBELL_IN_CLR  0x18c
+
+#define FIFO_ST_VLD (1u << 0)
+#define FIFO_ST_RDY (1u << 1)
+#define FIFO_ST_WOF (1u << 2)
+#define FIFO_ST_ROE (1u << 3)
+
+#define DOORBELL_MASK 0xff
+
+static uint32_t fifo_status(RP2350SIOBank *b, int core)
+{
+    int other = !core;
+    uint32_t st = 0;
+
+    if (b->fifo_count[other]) {
+        st |= FIFO_ST_VLD;
+    }
+    if (b->fifo_count[core] < RP2350_SIO_FIFO_DEPTH) {
+        st |= FIFO_ST_RDY;
+    }
+    if (b->wof[core]) {
+        st |= FIFO_ST_WOF;
+    }
+    if (b->roe[core]) {
+        st |= FIFO_ST_ROE;
+    }
+    return st;
+}
+
+/* [spec:nuos:req:emu.irq-routing+1] */
+static void rp2350_sio_update_irqs(RP2350SIOState *s)
+{
+    int bank, core;
+
+    for (bank = 0; bank < RP2350_SIO_BANKS; bank++) {
+        RP2350SIOBank *b = &s->bank[bank];
+
+        for (core = 0; core < RP2350_SIO_CORES; core++) {
+            uint32_t st = fifo_status(b, core);
+
+            qemu_set_irq(s->irq_fifo[bank][core],
+                         !!(st & (FIFO_ST_VLD | FIFO_ST_WOF | FIFO_ST_ROE)));
+            qemu_set_irq(s->irq_bell[bank][core], b->doorbell[core] != 0);
+        }
+    }
+}
+
+static void fifo_write(RP2350SIOBank *b, int core, uint32_t value)
+{
+    if (b->fifo_count[core] == RP2350_SIO_FIFO_DEPTH) {
+        b->wof[core] = true;
+        return;
+    }
+    b->fifo[core][(b->fifo_head[core] + b->fifo_count[core]) %
+                  RP2350_SIO_FIFO_DEPTH] = value;
+    b->fifo_count[core]++;
+}
+
+static uint32_t fifo_read(RP2350SIOBank *b, int core)
+{
+    int other = !core;
+    uint32_t value;
+
+    if (b->fifo_count[other] == 0) {
+        b->roe[core] = true;
+        return 0;
+    }
+    value = b->fifo[other][b->fifo_head[other]];
+    b->fifo_head[other] = (b->fifo_head[other] + 1) % RP2350_SIO_FIFO_DEPTH;
+    b->fifo_count[other]--;
+    return value;
+}
+
+/*
+ * GPIO registers are shared between banks. Non-secure access is filtered
+ * per pin by ACCESSCTRL GPIO_NSMASK, which is not modelled and resets to
+ * all pins Secure-only, so Non-secure GPIO accesses read zero and are
+ * ignored.
+ */
+static uint32_t gpio_read(RP2350SIOState *s, hwaddr reg)
+{
+    int hi;
+
+    switch (reg) {
+    case A_GPIO_IN:
+    case A_GPIO_HI_IN:
+        hi = reg == A_GPIO_HI_IN;
+        return s->gpio_out[hi] & s->gpio_oe[hi];
+    }
+    hi = (reg / 4) & 1;
+    if (reg < A_GPIO_OE) {
+        return s->gpio_out[hi];
+    }
+    return s->gpio_oe[hi];
+}
+
+static void gpio_write(RP2350SIOState *s, hwaddr reg, uint32_t value)
+{
+    uint32_t *r;
+    int hi = (reg / 4) & 1;
+
+    if (reg < A_GPIO_OUT) {
+        return;
+    }
+    r = reg < A_GPIO_OE ? &s->gpio_out[hi] : &s->gpio_oe[hi];
+    /* Each group is the register then its SET, CLR and XOR aliases. */
+    switch (((reg - A_GPIO_OUT) / 8) % 4) {
+    case 0:
+        *r = value;
+        break;
+    case 1:
+        *r |= value;
+        break;
+    case 2:
+        *r &= ~value;
+        break;
+    case 3:
+        *r ^= value;
+        break;
+    }
+}
+
+static RP2350SIOBank *view_bank(RP2350SIOView *v, MemTxAttrs attrs)
+{
+    int bank = v->bank;
+
+    if (bank < 0) {
+        /* Unspecified attributes (qtest, debug) see the Secure bank. */
+        bank = (attrs.secure || attrs.unspecified) ? RP2350_SIO_SECURE
+                                                   : RP2350_SIO_NONSECURE;
+    }
+    return &v->sio->bank[bank];
+}
+
+static bool view_is_secure(RP2350SIOView *v, MemTxAttrs attrs)
+{
+    return view_bank(v, attrs) == &v->sio->bank[RP2350_SIO_SECURE];
+}
+
+/* Only Secure code may use the Non-secure mirror. */
+static bool view_accessible(RP2350SIOView *v, MemTxAttrs attrs)
+{
+    return v->bank != RP2350_SIO_NONSECURE || attrs.secure ||
+           attrs.unspecified;
+}
+
+/* [spec:nuos:req:emu.sio] */
+static MemTxResult rp2350_sio_read(void *opaque, hwaddr addr, uint64_t *data,
+                                   unsigned size, MemTxAttrs attrs)
+{
+    RP2350SIOView *v = opaque;
+    RP2350SIOState *s = v->sio;
+    RP2350SIOBank *b;
+    uint32_t bit;
+
+    if (!view_accessible(v, attrs)) {
+        return MEMTX_ERROR;
+    }
+    b = view_bank(v, attrs);
+
+    switch (addr) {
+    case A_CPUID:
+        *data = v->core;
+        break;
+    case A_GPIO_IN ... A_GPIO_OE_XOR_HI:
+        *data = view_is_secure(v, attrs) ? gpio_read(s, addr) : 0;
+        break;
+    case A_FIFO_ST:
+        *data = fifo_status(b, v->core);
+        break;
+    case A_FIFO_RD:
+        *data = fifo_read(b, v->core);
+        rp2350_sio_update_irqs(s);
+        break;
+    case A_FIFO_WR:
+        *data = 0;
+        break;
+    case A_SPINLOCK_ST:
+        *data = b->spinlocks;
+        break;
+    case A_SPINLOCK0 ... A_SPINLOCK31:
+        bit = 1u << ((addr - A_SPINLOCK0) / 4);
+        if (b->spinlocks & bit) {
+            *data = 0;
+        } else {
+            b->spinlocks |= bit;
+            *data = bit;
+        }
+        break;
+    case A_DOORBELL_OUT_SET:
+    case A_DOORBELL_OUT_CLR:
+        *data = b->doorbell[!v->core];
+        break;
+    case A_DOORBELL_IN_SET:
+    case A_DOORBELL_IN_CLR:
+        *data = b->doorbell[v->core];
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "rp2350-sio: unimplemented read at 0x%"
+                      HWADDR_PRIx "\n", addr);
+        *data = 0;
+        break;
+    }
+    return MEMTX_OK;
+}
+
+static MemTxResult rp2350_sio_write(void *opaque, hwaddr addr, uint64_t value,
+                                    unsigned size, MemTxAttrs attrs)
+{
+    RP2350SIOView *v = opaque;
+    RP2350SIOState *s = v->sio;
+    RP2350SIOBank *b;
+
+    if (!view_accessible(v, attrs)) {
+        return MEMTX_ERROR;
+    }
+    b = view_bank(v, attrs);
+
+    switch (addr) {
+    case A_CPUID:
+    case A_FIFO_RD:
+    case A_SPINLOCK_ST:
+        break;
+    case A_GPIO_IN ... A_GPIO_OE_XOR_HI:
+        if (view_is_secure(v, attrs)) {
+            gpio_write(s, addr, value);
+        }
+        break;
+    case A_FIFO_ST:
+        b->roe[v->core] = false;
+        b->wof[v->core] = false;
+        break;
+    case A_FIFO_WR:
+        fifo_write(b, v->core, value);
+        break;
+    case A_SPINLOCK0 ... A_SPINLOCK31:
+        b->spinlocks &= ~(1u << ((addr - A_SPINLOCK0) / 4));
+        break;
+    case A_DOORBELL_OUT_SET:
+        b->doorbell[!v->core] |= value & DOORBELL_MASK;
+        break;
+    case A_DOORBELL_OUT_CLR:
+        b->doorbell[!v->core] &= ~value;
+        break;
+    case A_DOORBELL_IN_SET:
+        b->doorbell[v->core] |= value & DOORBELL_MASK;
+        break;
+    case A_DOORBELL_IN_CLR:
+        b->doorbell[v->core] &= ~value;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "rp2350-sio: unimplemented write at 0x%"
+                      HWADDR_PRIx "\n", addr);
+        break;
+    }
+    rp2350_sio_update_irqs(s);
+    return MEMTX_OK;
+}
+
+static const MemoryRegionOps rp2350_sio_ops = {
+    .read_with_attrs = rp2350_sio_read,
+    .write_with_attrs = rp2350_sio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
+MemoryRegion *rp2350_sio_view(RP2350SIOState *s, int core, bool mirror)
+{
+    return &s->view[core][mirror];
+}
+
+static void rp2350_sio_hold_reset(Object *obj, ResetType type)
+{
+    RP2350SIOState *s = RP2350_SIO(obj);
+
+    memset(s->bank, 0, sizeof(s->bank));
+    memset(s->gpio_out, 0, sizeof(s->gpio_out));
+    memset(s->gpio_oe, 0, sizeof(s->gpio_oe));
+}
+
+static void rp2350_sio_exit_reset(Object *obj, ResetType type)
+{
+    rp2350_sio_update_irqs(RP2350_SIO(obj));
+}
+
+static void rp2350_sio_init(Object *obj)
+{
+    RP2350SIOState *s = RP2350_SIO(obj);
+    int core, mirror, bank;
+
+    for (core = 0; core < RP2350_SIO_CORES; core++) {
+        for (mirror = 0; mirror < 2; mirror++) {
+            RP2350SIOView *v = &s->view_opaque[core][mirror];
+
+            v->sio = s;
+            v->core = core;
+            v->bank = mirror ? RP2350_SIO_NONSECURE : -1;
+            memory_region_init_io(&s->view[core][mirror], obj,
+                                  &rp2350_sio_ops, v,
+                                  mirror ? "rp2350-sio-nonsec" : "rp2350-sio",
+                                  RP2350_SIO_VIEW_SIZE);
+        }
+    }
+
+    /* GPIO outputs: FIFO then doorbell, per bank, per core. */
+    for (bank = 0; bank < RP2350_SIO_BANKS; bank++) {
+        for (core = 0; core < RP2350_SIO_CORES; core++) {
+            sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq_fifo[bank][core]);
+            sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq_bell[bank][core]);
+        }
+    }
+}
+
+static const VMStateDescription vmstate_rp2350_sio_bank = {
+    .name = "rp2350-sio-bank",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_2DARRAY(fifo, RP2350SIOBank, RP2350_SIO_CORES,
+                               RP2350_SIO_FIFO_DEPTH),
+        VMSTATE_UINT8_ARRAY(fifo_head, RP2350SIOBank, RP2350_SIO_CORES),
+        VMSTATE_UINT8_ARRAY(fifo_count, RP2350SIOBank, RP2350_SIO_CORES),
+        VMSTATE_BOOL_ARRAY(roe, RP2350SIOBank, RP2350_SIO_CORES),
+        VMSTATE_BOOL_ARRAY(wof, RP2350SIOBank, RP2350_SIO_CORES),
+        VMSTATE_UINT8_ARRAY(doorbell, RP2350SIOBank, RP2350_SIO_CORES),
+        VMSTATE_UINT32(spinlocks, RP2350SIOBank),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_rp2350_sio = {
+    .name = TYPE_RP2350_SIO,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT_ARRAY(bank, RP2350SIOState, RP2350_SIO_BANKS, 1,
+                             vmstate_rp2350_sio_bank, RP2350SIOBank),
+        VMSTATE_UINT32_ARRAY(gpio_out, RP2350SIOState, 2),
+        VMSTATE_UINT32_ARRAY(gpio_oe, RP2350SIOState, 2),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static void rp2350_sio_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+
+    rc->phases.hold = rp2350_sio_hold_reset;
+    rc->phases.exit = rp2350_sio_exit_reset;
+    dc->vmsd = &vmstate_rp2350_sio;
+}
+
+static const TypeInfo rp2350_sio_info = {
+    .name          = TYPE_RP2350_SIO,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(RP2350SIOState),
+    .instance_init = rp2350_sio_init,
+    .class_init    = rp2350_sio_class_init,
+};
+
+static void rp2350_sio_register_types(void)
+{
+    type_register_static(&rp2350_sio_info);
+}
+type_init(rp2350_sio_register_types)

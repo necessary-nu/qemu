@@ -244,7 +244,8 @@ qtests_aspeed64 = \
 
 qtests_rp2350 = \
   ['rp2350-test',
-   'rp2350-resets-test']
+   'rp2350-resets-test',
+   'rp2350-sio-test']
 
 qtests_stm32l4x5 = \
   ['stm32l4x5_exti-test',
