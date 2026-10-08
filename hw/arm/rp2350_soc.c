@@ -26,9 +26,10 @@ typedef struct RP2350Peripheral {
 } RP2350Peripheral;
 
 /*
- * Peripheral blocks without a device model. Mapping them as unimplemented
- * devices makes guest accesses log the block's name rather than raise a
- * bus fault on unassigned memory.
+ * The whole peripheral address map. Each block is mapped as a low-priority
+ * unimplemented device, so guest accesses outside a modelled block log the
+ * block's name rather than raise a bus fault on unassigned memory. Device
+ * models are mapped over their block at normal priority.
  */
 static const RP2350Peripheral rp2350_peripherals[] = {
     { "rp2350.sysinfo",         0x40000000, 0x8000 },
@@ -210,6 +211,11 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->eppb[i]), 0), 0);
     }
 
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->resets), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->resets), 0, RP2350_RESETS_BASE);
+
     for (i = 0; i < ARRAY_SIZE(rp2350_peripherals); i++) {
         create_unimplemented_device(rp2350_peripherals[i].name,
                                     rp2350_peripherals[i].base,
@@ -227,6 +233,8 @@ static void rp2350_soc_init(Object *obj)
         object_initialize_child(obj, "eppb[*]", &s->eppb[i],
                                 TYPE_UNIMPLEMENTED_DEVICE);
     }
+
+    object_initialize_child(obj, "resets", &s->resets, TYPE_RP2350_RESETS);
 
     qdev_init_gpio_in(DEVICE(s), rp2350_soc_set_irq, RP2350_NUM_IRQS);
 

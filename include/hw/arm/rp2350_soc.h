@@ -12,6 +12,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/arm/armv7m.h"
 #include "hw/core/clock.h"
+#include "hw/misc/rp2350_resets.h"
 #include "hw/misc/unimp.h"
 #include "qom/object.h"
 
@@ -63,6 +64,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_EPPB_BASE 0xe0080000
 #define RP2350_EPPB_SIZE 0x1000
 
+#define RP2350_RESETS_BASE 0x40020000
+
 #define RP2350_SYSCLK_HZ 150000000
 #define RP2350_REFCLK_HZ 1000000
 
@@ -71,6 +74,7 @@ struct RP2350State {
 
     ARMv7MState armv7m[RP2350_NUM_CORES];
     UnimplementedDeviceState eppb[RP2350_NUM_CORES];
+    RP2350ResetsState resets;
 
     MemoryRegion rom;
     MemoryRegion flash;
