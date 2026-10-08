@@ -268,7 +268,7 @@ static void test_irq_routing(void)
     unlink(path);
 }
 
-/* [spec:nuos:req:emu.bootrom+1/test] */
+/* [spec:nuos:req:emu.bootrom+2/test] */
 static void test_rom_with_direct_load(void)
 {
     g_autofree char *kernel = write_image(XIP_BASE);
