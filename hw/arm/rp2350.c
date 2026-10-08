@@ -89,7 +89,7 @@ static void rp2350_init(MachineState *machine)
                          direct ? RP2350_XIP_BASE : RP2350_ROM_BASE);
     sysbus_realize(SYS_BUS_DEVICE(soc), &error_fatal);
 
-    /* [spec:nuos:req:emu.bootrom] */
+    /* [spec:nuos:req:emu.bootrom+1] */
     if (machine->firmware) {
         if (load_image_targphys(machine->firmware, RP2350_ROM_BASE,
                                 RP2350_ROM_SIZE, NULL) < 0) {
