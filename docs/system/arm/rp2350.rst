@@ -1,0 +1,35 @@
+Raspberry Pi RP2350 (``rp2350``)
+================================
+
+The RP2350 is a dual-core microcontroller from Raspberry Pi Ltd. This
+machine models its Arm configuration: two Cortex-M33 cores with the
+Security Extension, FPU, DSP extension, and 52 external interrupts, plus
+520 KiB of SRAM. The cores' MPU region counts are QEMU's defaults.
+
+Supported devices
+-----------------
+
+* Boot ROM (32 KiB at ``0x00000000``)
+* XIP flash (4 MiB at ``0x10000000``, with its non-caching aliases)
+* SRAM (520 KiB at ``0x20000000``; ``-m`` cannot change it)
+
+Every other peripheral block in the address map is an unimplemented
+device. Core 1 starts powered off.
+
+Boot options
+------------
+
+Exactly one of these must be given:
+
+``-bios FILE``
+  Loads a raw boot ROM image at ``0x00000000``. Core 0 resets through the
+  ROM's vector table, as on hardware.
+
+``-kernel FILE``
+  Loads an ELF image, or a raw image into flash. Core 0 resets through
+  the vector table at ``0x10000000``, skipping the boot ROM. Images loaded
+  this way must place their vector table at the start of flash.
+
+.. code-block:: bash
+
+  $ qemu-system-arm -M rp2350 -kernel kernel.elf -nographic

@@ -389,6 +389,17 @@ config B_L475E_IOT01A
     select STM32L4X5_SOC
     imply DM163
 
+config RP2350
+    bool
+    default y
+    depends on TCG && ARM
+    select RP2350_SOC
+
+config RP2350_SOC
+    bool
+    select ARM_V7M
+    select UNIMP
+
 config STM32L4X5_SOC
     bool
     select ARM_V7M

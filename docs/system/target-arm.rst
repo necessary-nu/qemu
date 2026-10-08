@@ -99,6 +99,7 @@ Board-specific documentation
    arm/collie
    arm/sx1
    arm/stellaris
+   arm/rp2350
    arm/stm32
    arm/virt
    arm/vmapple
