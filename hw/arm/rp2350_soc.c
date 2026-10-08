@@ -78,7 +78,16 @@ static const RP2350Peripheral rp2350_peripherals[] = {
     { "rp2350.xip_aux",         0x50500000, 0x100000 },
     { "rp2350.hstx_fifo",       0x50600000, 0x100000 },
     { "rp2350.coresight_trace", 0x50700000, 0x100000 },
-    { "rp2350.xip_sram",        0x13ffc000, 0x4000 },
+    { "rp2350.xip",             RP2350_XIP_BASE,
+                                RP2350_XIP_SRAM_BASE - RP2350_XIP_BASE },
+    { "rp2350.xip_sram",        RP2350_XIP_SRAM_BASE, 0x4000 },
+    { "rp2350.xip_nocache_noalloc", RP2350_XIP_NOCACHE_NOALLOC_BASE,
+                                RP2350_XIP_WINDOW_SIZE },
+    { "rp2350.xip_maintenance", RP2350_XIP_MAINTENANCE_BASE,
+                                RP2350_XIP_WINDOW_SIZE },
+    { "rp2350.xip_nocache_noalloc_notranslate",
+                                RP2350_XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE,
+                                RP2350_XIP_WINDOW_SIZE },
     { "rp2350.sio",             0xd0000000, 0x20000 },
     { "rp2350.sio_nonsec",      0xd0020000, 0x20000 },
 };
@@ -94,9 +103,9 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         error_setg(errp, "memory property was not set");
         return;
     }
-    if (s->flash_size == 0 || s->flash_size > RP2350_XIP_WINDOW_SIZE) {
-        error_setg(errp, "flash-size must be between 1 byte and %u MiB",
-                   (unsigned)(RP2350_XIP_WINDOW_SIZE / MiB));
+    if (s->flash_size > RP2350_FLASH_MAX_SIZE) {
+        error_setg(errp, "flash-size must be at most %u MiB",
+                   (unsigned)(RP2350_FLASH_MAX_SIZE / MiB));
         return;
     }
 
@@ -106,23 +115,31 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     memory_region_add_subregion(s->board_memory, RP2350_ROM_BASE, &s->rom);
 
-    if (!memory_region_init_rom(&s->flash, obj, "rp2350.flash", s->flash_size,
-                                errp)) {
-        return;
+    /*
+     * The chip has no flash of its own; the board supplies it. Without
+     * any, the XIP windows hold only their unimplemented-device stubs.
+     */
+    /* [spec:nuos:req:emu.flash] */
+    if (s->flash_size) {
+        if (!memory_region_init_rom(&s->flash, obj, "rp2350.flash",
+                                    s->flash_size, errp)) {
+            return;
+        }
+        memory_region_add_subregion(s->board_memory, RP2350_XIP_BASE,
+                                    &s->flash);
+        memory_region_init_alias(&s->flash_nocache_alias, obj,
+                                 "rp2350.flash.nocache-noalloc", &s->flash, 0,
+                                 s->flash_size);
+        memory_region_add_subregion(s->board_memory,
+                                    RP2350_XIP_NOCACHE_NOALLOC_BASE,
+                                    &s->flash_nocache_alias);
+        memory_region_init_alias(&s->flash_notranslate_alias, obj,
+                                 "rp2350.flash.nocache-noalloc-notranslate",
+                                 &s->flash, 0, s->flash_size);
+        memory_region_add_subregion(
+            s->board_memory, RP2350_XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE,
+            &s->flash_notranslate_alias);
     }
-    memory_region_add_subregion(s->board_memory, RP2350_XIP_BASE, &s->flash);
-    memory_region_init_alias(&s->flash_nocache_alias, obj,
-                             "rp2350.flash.nocache-noalloc", &s->flash, 0,
-                             s->flash_size);
-    memory_region_add_subregion(s->board_memory,
-                                RP2350_XIP_NOCACHE_NOALLOC_BASE,
-                                &s->flash_nocache_alias);
-    memory_region_init_alias(&s->flash_notranslate_alias, obj,
-                             "rp2350.flash.nocache-noalloc-notranslate",
-                             &s->flash, 0, s->flash_size);
-    memory_region_add_subregion(s->board_memory,
-                                RP2350_XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE,
-                                &s->flash_notranslate_alias);
 
     /*
      * SRAM0-9 as one contiguous region: the striped SRAM0-7 window
@@ -202,8 +219,7 @@ static void rp2350_soc_init(Object *obj)
 static const Property rp2350_soc_properties[] = {
     DEFINE_PROP_LINK("memory", RP2350State, board_memory, TYPE_MEMORY_REGION,
                      MemoryRegion *),
-    DEFINE_PROP_UINT32("flash-size", RP2350State, flash_size,
-                       RP2350_FLASH_DEFAULT_SIZE),
+    DEFINE_PROP_UINT32("flash-size", RP2350State, flash_size, 0),
     DEFINE_PROP_UINT32("init-svtor", RP2350State, init_svtor, RP2350_ROM_BASE),
 };
 

@@ -24,11 +24,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_ROM_BASE 0x00000000
 #define RP2350_ROM_SIZE (32 * KiB)
 
+/*
+ * The XIP address space is four 64 MiB windows onto the same QSPI devices.
+ * The cached window ends where the 16 KiB XIP cache-as-SRAM begins.
+ */
 #define RP2350_XIP_BASE 0x10000000
-#define RP2350_XIP_WINDOW_SIZE (32 * MiB)
 #define RP2350_XIP_NOCACHE_NOALLOC_BASE 0x14000000
+#define RP2350_XIP_MAINTENANCE_BASE 0x18000000
 #define RP2350_XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE 0x1c000000
-#define RP2350_FLASH_DEFAULT_SIZE (4 * MiB)
+#define RP2350_XIP_WINDOW_SIZE (64 * MiB)
+#define RP2350_XIP_SRAM_BASE 0x13ffc000
+
+/* Flash sits on QSPI chip select 0, which decodes 16 MiB. */
+#define RP2350_FLASH_MAX_SIZE (16 * MiB)
 
 #define RP2350_SRAM_BASE 0x20000000
 #define RP2350_SRAM_SIZE (520 * KiB)

@@ -10,7 +10,10 @@ Supported devices
 -----------------
 
 * Boot ROM (32 KiB at ``0x00000000``)
-* XIP flash (4 MiB at ``0x10000000``, with its non-caching aliases)
+* XIP flash at ``0x10000000``, with its non-caching aliases. The chip has
+  no flash of its own, so the board sets its size with
+  ``-M rp2350,flash-size=SIZE`` (up to 16 MiB; a Pico 2 has 4 MiB). There
+  is no default.
 * SRAM (520 KiB at ``0x20000000``; ``-m`` cannot change it)
 
 Every other peripheral block in the address map is an unimplemented
@@ -26,10 +29,11 @@ Exactly one of these must be given:
   ROM's vector table, as on hardware.
 
 ``-kernel FILE``
-  Loads an ELF image, or a raw image into flash. Core 0 resets through
-  the vector table at ``0x10000000``, skipping the boot ROM. Images loaded
-  this way must place their vector table at the start of flash.
+  Loads an ELF image, or a raw image into flash, so ``flash-size`` must be
+  set. Core 0 resets through the vector table at ``0x10000000``, skipping
+  the boot ROM. Images loaded this way must place their vector table at
+  the start of flash.
 
 .. code-block:: bash
 
-  $ qemu-system-arm -M rp2350 -kernel kernel.elf -nographic
+  $ qemu-system-arm -M rp2350,flash-size=4M -kernel kernel.elf -nographic

@@ -41,7 +41,7 @@ static char *write_image(uint32_t base)
 static QTestState *boot_direct(char **path)
 {
     *path = write_image(XIP_BASE);
-    return qtest_initf("-M rp2350 -kernel %s", *path);
+    return qtest_initf("-M rp2350,flash-size=4M -kernel %s", *path);
 }
 
 static void assert_mtree_has(QTestState *qts, const char *needle)
@@ -162,6 +162,64 @@ static void test_boot_rom(void)
     unlink(path);
 }
 
+/*
+ * Run QEMU outside qtest and return its exit status, for configurations
+ * the machine must refuse before it starts.
+ */
+static int run_qemu(const char *args, char **err)
+{
+    g_autofree char *cmd = g_strdup_printf("%s -display none -serial none "
+                                           "-monitor none %s",
+                                           qtest_qemu_binary(NULL), args);
+    g_auto(GStrv) argv = NULL;
+    GError *gerr = NULL;
+    int status;
+
+    g_assert(g_shell_parse_argv(cmd, NULL, &argv, &gerr));
+    g_assert(g_spawn_sync(NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL,
+                          NULL, NULL, err, &status, &gerr));
+    g_assert_no_error(gerr);
+    return status;
+}
+
+/* [spec:nuos:req:emu.flash/test] */
+static void test_flash_size(void)
+{
+    g_autofree char *path = write_image(XIP_BASE);
+    g_autofree char *args = NULL;
+    g_autofree char *err = NULL;
+    QTestState *qts;
+
+    args = g_strdup_printf("-M rp2350 -kernel %s", path);
+    g_assert_cmpint(run_qemu(args, &err), !=, 0);
+    g_assert(strstr(err, "flash-size"));
+    g_clear_pointer(&err, g_free);
+    g_clear_pointer(&args, g_free);
+
+    args = g_strdup_printf("-M rp2350,flash-size=32M -kernel %s", path);
+    g_assert_cmpint(run_qemu(args, &err), !=, 0);
+    g_assert(strstr(err, "at most 16 MiB"));
+
+    /* No flash: the XIP windows hold only unimplemented-device stubs. */
+    qts = qtest_initf("-M rp2350 -bios %s", path);
+    {
+        g_autofree char *mtree = qtest_hmp(qts, "info mtree -f");
+
+        g_assert(!strstr(mtree, "rp2350.flash"));
+        g_assert(strstr(mtree, "0000000010000000-0000000013ffbfff "
+                               "(prio -1000, i/o): rp2350.xip"));
+    }
+    qtest_quit(qts);
+
+    qts = qtest_initf("-M rp2350,flash-size=2M -kernel %s", path);
+    assert_mtree_has(qts, "0000000010000000-00000000101fffff "
+                          "(prio 0, rom): rp2350.flash");
+    assert_mtree_has(qts, "0000000010200000-0000000013ffbfff "
+                          "(prio -1000, i/o): rp2350.xip");
+    qtest_quit(qts);
+    unlink(path);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -170,6 +228,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/sram-size", test_sram_size);
     qtest_add_func("/rp2350/direct-load", test_direct_load);
     qtest_add_func("/rp2350/boot-rom", test_boot_rom);
+    qtest_add_func("/rp2350/flash-size", test_flash_size);
 
     return g_test_run();
 }
