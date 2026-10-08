@@ -66,7 +66,7 @@ static void assert_pc(QTestState *qts, uint32_t pc)
     }
 }
 
-/* [spec:nuos:req:emu.machine/test] */
+/* [spec:nuos:req:emu.machine+1/test] */
 static void test_memory_map(void)
 {
     static const struct {
@@ -96,6 +96,8 @@ static void test_memory_map(void)
                           "(prio 0, rom): rp2350.flash");
     assert_mtree_has(qts, "0000000020000000-0000000020081fff "
                           "(prio 0, ram): rp2350.sram");
+    assert_mtree_has(qts, "00000000e0080000-00000000e0080fff "
+                          "(prio 0, i/o): rp2350.eppb");
     for (i = 0; i < ARRAY_SIZE(unimplemented); i++) {
         g_autofree char *entry = g_strdup_printf(
             "%016" PRIx64 "-%016" PRIx64 " (prio -1000, i/o): %s",

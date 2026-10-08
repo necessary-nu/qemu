@@ -83,7 +83,7 @@ static const RP2350Peripheral rp2350_peripherals[] = {
     { "rp2350.sio_nonsec",      0xd0020000, 0x20000 },
 };
 
-/* [spec:nuos:req:emu.machine] */
+/* [spec:nuos:req:emu.machine+1] */
 static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 {
     RP2350State *s = RP2350_SOC(dev_soc);
@@ -161,6 +161,20 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         if (!sysbus_realize(SYS_BUS_DEVICE(armv7m), errp)) {
             return;
         }
+
+        /*
+         * The extended PPB is core-local and sits inside the PPB range
+         * that each armv7m container claims, so it is mapped per core
+         * rather than in board memory.
+         */
+        qdev_prop_set_string(DEVICE(&s->eppb[i]), "name", "rp2350.eppb");
+        qdev_prop_set_uint64(DEVICE(&s->eppb[i]), "size", RP2350_EPPB_SIZE);
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->eppb[i]), errp)) {
+            return;
+        }
+        memory_region_add_subregion_overlap(
+            &s->armv7m[i].container, RP2350_EPPB_BASE,
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->eppb[i]), 0), 0);
     }
 
     for (i = 0; i < ARRAY_SIZE(rp2350_peripherals); i++) {
@@ -177,6 +191,8 @@ static void rp2350_soc_init(Object *obj)
 
     for (i = 0; i < RP2350_NUM_CORES; i++) {
         object_initialize_child(obj, "armv7m[*]", &s->armv7m[i], TYPE_ARMV7M);
+        object_initialize_child(obj, "eppb[*]", &s->eppb[i],
+                                TYPE_UNIMPLEMENTED_DEVICE);
     }
 
     s->sysclk = qdev_init_clock_out(DEVICE(s), "sysclk");

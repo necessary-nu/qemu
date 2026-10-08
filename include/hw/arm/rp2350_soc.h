@@ -12,6 +12,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/arm/armv7m.h"
 #include "hw/core/clock.h"
+#include "hw/misc/unimp.h"
 #include "qom/object.h"
 
 #define TYPE_RP2350_SOC "rp2350-soc"
@@ -32,6 +33,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_SRAM_BASE 0x20000000
 #define RP2350_SRAM_SIZE (520 * KiB)
 
+#define RP2350_EPPB_BASE 0xe0080000
+#define RP2350_EPPB_SIZE 0x1000
+
 #define RP2350_SYSCLK_HZ 150000000
 #define RP2350_REFCLK_HZ 1000000
 
@@ -39,6 +43,7 @@ struct RP2350State {
     SysBusDevice parent_obj;
 
     ARMv7MState armv7m[RP2350_NUM_CORES];
+    UnimplementedDeviceState eppb[RP2350_NUM_CORES];
 
     MemoryRegion rom;
     MemoryRegion flash;
