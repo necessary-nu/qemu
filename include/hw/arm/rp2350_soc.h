@@ -21,6 +21,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_NUM_CORES 2
 #define RP2350_NUM_IRQS 52
 
+/*
+ * IRQ numbers, from the pico-sdk intctrl.h. Peripheral models connect to
+ * the SoC's unnamed GPIO input of the same number.
+ */
+#define RP2350_TIMER0_IRQ_0 0
+#define RP2350_TIMER1_IRQ_0 4
+#define RP2350_DMA_IRQ_0 10
+#define RP2350_USBCTRL_IRQ 14
+#define RP2350_IO_IRQ_BANK0 21
+#define RP2350_SIO_IRQ_FIFO 25
+#define RP2350_SIO_IRQ_BELL 26
+#define RP2350_SIO_IRQ_FIFO_NS 27
+#define RP2350_SIO_IRQ_BELL_NS 28
+#define RP2350_SIO_IRQ_MTIMECMP 29
+#define RP2350_CLOCKS_IRQ 30
+#define RP2350_UART0_IRQ 33
+#define RP2350_UART1_IRQ 34
+#define RP2350_SPARE_IRQ_5 51
+
 #define RP2350_ROM_BASE 0x00000000
 #define RP2350_ROM_SIZE (32 * KiB)
 

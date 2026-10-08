@@ -220,6 +220,37 @@ static void test_flash_size(void)
     unlink(path);
 }
 
+/* [spec:nuos:req:emu.irq-routing/test] */
+static void test_irq_routing(void)
+{
+    static const int lines[] = { 1, 21, 33, 51 };
+    g_autofree char *path = write_image(XIP_BASE);
+    int core, i;
+
+    /*
+     * qtest can intercept one device's inputs per run, so one run per
+     * core. The NVIC's IRQ inputs are passed through to its armv7m
+     * container, which is where they are intercepted.
+     */
+    for (core = 0; core < 2; core++) {
+        g_autofree char *cpu = g_strdup_printf("/machine/soc/armv7m[%d]",
+                                                core);
+        QTestState *qts = qtest_initf("-M rp2350,flash-size=4M -kernel %s",
+                                      path);
+
+        qtest_irq_intercept_in(qts, cpu);
+        for (i = 0; i < ARRAY_SIZE(lines); i++) {
+            g_assert_false(qtest_get_irq(qts, lines[i]));
+            qtest_set_irq_in(qts, "/machine/soc", NULL, lines[i], 1);
+            g_assert_true(qtest_get_irq(qts, lines[i]));
+            qtest_set_irq_in(qts, "/machine/soc", NULL, lines[i], 0);
+            g_assert_false(qtest_get_irq(qts, lines[i]));
+        }
+        qtest_quit(qts);
+    }
+    unlink(path);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -229,6 +260,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/direct-load", test_direct_load);
     qtest_add_func("/rp2350/boot-rom", test_boot_rom);
     qtest_add_func("/rp2350/flash-size", test_flash_size);
+    qtest_add_func("/rp2350/irq-routing", test_irq_routing);
 
     return g_test_run();
 }

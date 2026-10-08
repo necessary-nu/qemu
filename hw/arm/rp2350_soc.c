@@ -14,6 +14,7 @@
 #include "qapi/error.h"
 #include "hw/arm/rp2350_soc.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/unimp.h"
 #include "target/arm/cpu-qom.h"
@@ -91,6 +92,21 @@ static const RP2350Peripheral rp2350_peripherals[] = {
     { "rp2350.sio",             0xd0000000, 0x20000 },
     { "rp2350.sio_nonsec",      0xd0020000, 0x20000 },
 };
+
+/*
+ * Every peripheral interrupt is wired to the same IRQ number on both
+ * cores' NVICs; each core masks the lines it does not service.
+ */
+/* [spec:nuos:req:emu.irq-routing] */
+static void rp2350_soc_set_irq(void *opaque, int n, int level)
+{
+    RP2350State *s = opaque;
+    int i;
+
+    for (i = 0; i < RP2350_NUM_CORES; i++) {
+        qemu_set_irq(qdev_get_gpio_in(DEVICE(&s->armv7m[i]), n), level);
+    }
+}
 
 /* [spec:nuos:req:emu.machine+1] */
 static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
@@ -211,6 +227,8 @@ static void rp2350_soc_init(Object *obj)
         object_initialize_child(obj, "eppb[*]", &s->eppb[i],
                                 TYPE_UNIMPLEMENTED_DEVICE);
     }
+
+    qdev_init_gpio_in(DEVICE(s), rp2350_soc_set_irq, RP2350_NUM_IRQS);
 
     s->sysclk = qdev_init_clock_out(DEVICE(s), "sysclk");
     s->refclk = qdev_init_clock_out(DEVICE(s), "refclk");
