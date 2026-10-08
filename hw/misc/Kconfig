@@ -125,6 +125,9 @@ config RP2350_SIO
 config RP2350_CLOCKS
     bool
 
+config RP2350_RCP
+    bool
+
 config STM32L4X5_SYSCFG
     bool
 

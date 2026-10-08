@@ -403,6 +403,7 @@ config RP2350_SOC
     select RP2350_SIO
     select RP2350_CLOCKS
     select RP2350_TIMER
+    select RP2350_RCP
     select PL011
 
 config STM32L4X5_SOC

@@ -5,7 +5,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Two mutually exclusive boot paths:
+ * Two boot paths:
  *
  *   -bios FILE    loads a raw boot ROM image at 0x00000000 and resets
  *                 core 0 through the ROM's vector table, as hardware does.
@@ -13,7 +13,9 @@
  *                 resets core 0 through a vector table at the start of the
  *                 XIP flash window, skipping the boot ROM. This is a
  *                 bring-up convenience; images that boot this way must be
- *                 linked with their vector table at 0x10000000.
+ *                 linked with their vector table at 0x10000000. A -bios
+ *                 image given as well is mapped, so ROM function lookups
+ *                 work, but not executed.
  *
  * The RP2350 has no internal flash. Boards set its size with
  * -M rp2350,flash-size=SIZE (a Pico 2 has 4M); there is no default.
@@ -30,6 +32,7 @@
 #include "hw/core/qdev-properties.h"
 #include "qapi/visitor.h"
 #include "system/address-spaces.h"
+#include "system/reset.h"
 
 struct RP2350MachineState {
     MachineState parent;
@@ -40,6 +43,14 @@ struct RP2350MachineState {
 
 #define TYPE_RP2350_MACHINE MACHINE_TYPE_NAME("rp2350")
 OBJECT_DECLARE_SIMPLE_TYPE(RP2350MachineState, RP2350_MACHINE)
+
+/* Core 0 starts as the boot ROM would leave it for a flash image. */
+static void rp2350_direct_reset(void *opaque)
+{
+    RP2350MachineState *s = opaque;
+
+    rp2350_soc_boot_rom_handoff(&s->soc, 0);
+}
 
 /* [spec:nuos:req:emu.direct-load] */
 static void rp2350_init(MachineState *machine)
@@ -53,10 +64,6 @@ static void rp2350_init(MachineState *machine)
     if (machine->ram_size != RP2350_SRAM_SIZE) {
         error_report("rp2350: SRAM is fixed at %u KiB; -m is not supported",
                      (unsigned)(RP2350_SRAM_SIZE / KiB));
-        exit(1);
-    }
-    if (direct && machine->firmware) {
-        error_report("rp2350: -kernel and -bios are mutually exclusive");
         exit(1);
     }
     /* [spec:nuos:req:emu.flash] */
@@ -82,7 +89,8 @@ static void rp2350_init(MachineState *machine)
                          direct ? RP2350_XIP_BASE : RP2350_ROM_BASE);
     sysbus_realize(SYS_BUS_DEVICE(soc), &error_fatal);
 
-    if (!direct) {
+    /* [spec:nuos:req:emu.bootrom] */
+    if (machine->firmware) {
         if (load_image_targphys(machine->firmware, RP2350_ROM_BASE,
                                 RP2350_ROM_SIZE, NULL) < 0) {
             error_report("rp2350: could not load boot ROM image '%s'",
@@ -99,6 +107,10 @@ static void rp2350_init(MachineState *machine)
                        RP2350_XIP_BASE, s->soc.flash_size);
     for (i = 1; i < RP2350_NUM_CORES; i++) {
         armv7m_load_kernel(s->soc.armv7m[i].cpu, NULL, 0, 0);
+    }
+    /* Registered after the CPU resets, so it runs after them. */
+    if (direct) {
+        qemu_register_reset(rp2350_direct_reset, s);
     }
 }
 

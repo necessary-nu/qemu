@@ -98,7 +98,22 @@ static const RP2350Peripheral rp2350_peripherals[] = {
     { "rp2350.sio_nonsec",      0xd0020000, 0x20000 },
 };
 
+/* The boot ROM enables the RCP (coprocessor 7) for Secure and Non-secure. */
+#define CPACR_CP7 (3u << 14)
+#define NSACR_CP7 (1u << 7)
+
+/* [spec:nuos:req:emu.rcp-handoff] */
+void rp2350_soc_boot_rom_handoff(RP2350State *s, int core)
+{
+    CPUARMState *env = &s->armv7m[core].cpu->env;
+
+    env->v7m.cpacr[M_REG_S] |= CPACR_CP7;
+    env->v7m.cpacr[M_REG_NS] |= CPACR_CP7;
+    env->v7m.nsacr |= NSACR_CP7;
+}
+
 typedef struct RP2350Core1Start {
+    RP2350State *soc;
     uint32_t sp;
     uint32_t entry;
 } RP2350Core1Start;
@@ -110,6 +125,7 @@ static void rp2350_core1_start(CPUState *cs, run_on_cpu_data data)
 
     ARM_CPU(cs)->env.regs[13] = start->sp & ~3u;
     cpu_set_pc(cs, start->entry);
+    rp2350_soc_boot_rom_handoff(start->soc, 1);
     g_free(start);
 }
 
@@ -131,6 +147,7 @@ static void rp2350_core1_launch(void *opaque, uint32_t vtor, uint32_t sp,
         g_free(start);
         return;
     }
+    start->soc = s;
     start->sp = sp;
     start->entry = entry;
     async_run_on_cpu(CPU(cpu), rp2350_core1_start, RUN_ON_CPU_HOST_PTR(start));
@@ -301,6 +318,18 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->eppb[i]), 0), 0);
     }
 
+    /* [spec:nuos:req:emu.rcp] */
+    qdev_prop_set_bit(DEVICE(&s->rcp), "boot-rom-handoff", s->core1_launch);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->rcp), errp)) {
+        return;
+    }
+    for (i = 0; i < RP2350_NUM_CORES; i++) {
+        rp2350_rcp_attach(&s->rcp, i, s->armv7m[i].cpu);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->rcp), i,
+                           qdev_get_gpio_in_named(DEVICE(&s->armv7m[i]),
+                                                  "NMI", 0));
+    }
+
     /* [spec:nuos:req:emu.sio] */
     qdev_prop_set_bit(DEVICE(&s->sio), "core1-launch", s->core1_launch);
     rp2350_sio_set_core1_launch(&s->sio, rp2350_core1_launch, s);
@@ -426,6 +455,7 @@ static void rp2350_soc_init(Object *obj)
 
     object_initialize_child(obj, "resets", &s->resets, TYPE_RP2350_RESETS);
     object_initialize_child(obj, "sio", &s->sio, TYPE_RP2350_SIO);
+    object_initialize_child(obj, "rcp", &s->rcp, TYPE_RP2350_RCP);
     object_initialize_child(obj, "clocks", &s->clocks, TYPE_RP2350_CLOCKS);
     object_initialize_child(obj, "xosc", &s->xosc, TYPE_RP2350_XOSC);
     object_initialize_child(obj, "pll_sys", &s->pll_sys, TYPE_RP2350_PLL);

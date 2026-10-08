@@ -268,6 +268,25 @@ static void test_irq_routing(void)
     unlink(path);
 }
 
+/* [spec:nuos:req:emu.bootrom/test] */
+static void test_rom_with_direct_load(void)
+{
+    g_autofree char *kernel = write_image(XIP_BASE);
+    g_autofree char *rom = write_image(ROM_BASE);
+    QTestState *qts = qtest_initf("-M rp2350,flash-size=4M -kernel %s "
+                                  "-bios %s", kernel, rom);
+
+    /* Both images are in place, and core 0 boots from flash. */
+    g_assert_cmphex(qtest_readl(qts, ROM_BASE + 4), ==,
+                    ROM_BASE + TEST_RESET_OFFSET + 1);
+    g_assert_cmphex(qtest_readl(qts, XIP_BASE + 4), ==,
+                    XIP_BASE + TEST_RESET_OFFSET + 1);
+    assert_pc(qts, XIP_BASE + TEST_RESET_OFFSET);
+    qtest_quit(qts);
+    unlink(kernel);
+    unlink(rom);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -278,6 +297,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/boot-rom", test_boot_rom);
     qtest_add_func("/rp2350/flash-size", test_flash_size);
     qtest_add_func("/rp2350/irq-routing", test_irq_routing);
+    qtest_add_func("/rp2350/rom-with-direct-load", test_rom_with_direct_load);
 
     return g_test_run();
 }

@@ -14,6 +14,7 @@
 #include "hw/char/pl011.h"
 #include "hw/core/clock.h"
 #include "hw/misc/rp2350_clocks.h"
+#include "hw/misc/rp2350_rcp.h"
 #include "hw/misc/rp2350_resets.h"
 #include "hw/misc/rp2350_sio.h"
 #include "hw/misc/unimp.h"
@@ -94,6 +95,7 @@ struct RP2350State {
     UnimplementedDeviceState eppb[RP2350_NUM_CORES];
     RP2350ResetsState resets;
     RP2350SIOState sio;
+    RP2350RCPState rcp;
     RP2350ClkRegsState clocks;
     RP2350ClkRegsState xosc;
     RP2350ClkRegsState pll_sys;
@@ -127,5 +129,11 @@ struct RP2350State {
     Clock *sysclk;
     Clock *refclk;
 };
+
+/*
+ * Leave `core` with coprocessor access as the boot ROM hands it to user
+ * code. Called after the core is reset when no boot ROM runs.
+ */
+void rp2350_soc_boot_rom_handoff(RP2350State *s, int core);
 
 #endif

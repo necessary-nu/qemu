@@ -35,7 +35,7 @@ starts core 1 as it would on hardware (for example with pico-sdk's
 Boot options
 ------------
 
-Exactly one of these must be given:
+At least one of these must be given:
 
 ``-bios FILE``
   Loads a raw boot ROM image at ``0x00000000``. Core 0 resets through the
@@ -45,7 +45,11 @@ Exactly one of these must be given:
   Loads an ELF image, or a raw image into flash, so ``flash-size`` must be
   set. Core 0 resets through the vector table at ``0x10000000``, skipping
   the boot ROM. Images loaded this way must place their vector table at
-  the start of flash.
+  the start of flash. If ``-bios`` is given as well, the ROM is mapped, so
+  ROM function-table lookups work, but it is not executed.
+
+The boot ROM is not distributed with QEMU. It can be built from Raspberry
+Pi's published source, https://github.com/raspberrypi/pico-bootrom-rp2350.
 
 .. code-block:: bash
 
