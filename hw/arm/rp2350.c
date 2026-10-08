@@ -76,6 +76,8 @@ static void rp2350_init(MachineState *machine)
     object_property_set_link(OBJECT(soc), "memory",
                              OBJECT(get_system_memory()), &error_abort);
     qdev_prop_set_uint32(soc, "flash-size", s->flash_size);
+    /* With no ROM executing, the machine launches core 1 itself. */
+    qdev_prop_set_bit(soc, "core1-launch", direct);
     qdev_prop_set_uint32(soc, "init-svtor",
                          direct ? RP2350_XIP_BASE : RP2350_ROM_BASE);
     sysbus_realize(SYS_BUS_DEVICE(soc), &error_fatal);

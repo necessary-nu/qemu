@@ -122,6 +122,7 @@ struct RP2350State {
 
     uint32_t flash_size;
     uint32_t init_svtor;
+    bool core1_launch;
 
     Clock *sysclk;
     Clock *refclk;

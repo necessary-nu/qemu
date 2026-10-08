@@ -197,6 +197,47 @@ static void test_gpio(void)
     qtest_quit(qts);
 }
 
+static uint32_t pop(QTestState *qts)
+{
+    g_assert_cmphex(qtest_readl(qts, SIO + FIFO_ST) & VLD, ==, VLD);
+    return qtest_readl(qts, SIO + FIFO_RD);
+}
+
+/* [spec:nuos:req:emu.core1-launch/test] */
+static void test_core1_handshake(void)
+{
+    QTestState *qts = qtest_initf("-M rp2350,flash-size=4M -kernel %s",
+                                  rom_path);
+    static const uint32_t seq[] = {
+        0, 0, 1, 0x20001000, 0x20002000, 0x10000101,
+    };
+    int i;
+
+    /* Core 1 announces itself with a 0 as soon as it is waiting. */
+    g_assert_cmphex(pop(qts), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, SIO + FIFO_ST) & VLD, ==, 0);
+
+    /* Anything other than 1 after the zeros restarts the handshake. */
+    qtest_writel(qts, SIO + FIFO_WR, 0);
+    g_assert_cmphex(pop(qts), ==, 0);
+    qtest_writel(qts, SIO + FIFO_WR, 7);
+    g_assert_cmphex(pop(qts), ==, 0);
+
+    for (i = 0; i < ARRAY_SIZE(seq); i++) {
+        qtest_writel(qts, SIO + FIFO_WR, seq[i]);
+        g_assert_cmphex(pop(qts), ==, seq[i]);
+    }
+    g_assert_cmphex(qtest_readl(qts, SIO + FIFO_ST) & VLD, ==, 0);
+    qtest_quit(qts);
+
+    /* When a boot ROM runs, the machine leaves the handshake to it. */
+    qts = start(-1);
+    g_assert_cmphex(qtest_readl(qts, SIO + FIFO_ST) & VLD, ==, 0);
+    qtest_writel(qts, SIO + FIFO_WR, 0);
+    g_assert_cmphex(qtest_readl(qts, SIO + FIFO_ST) & VLD, ==, 0);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     static const uint32_t blank[2];
@@ -217,6 +258,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/sio/doorbells", test_doorbells);
     qtest_add_func("/rp2350/sio/nonsecure-bank", test_nonsecure_bank);
     qtest_add_func("/rp2350/sio/gpio", test_gpio);
+    qtest_add_func("/rp2350/sio/core1-handshake", test_core1_handshake);
 
     ret = g_test_run();
     unlink(rom_path);

@@ -19,7 +19,9 @@
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/unimp.h"
 #include "system/system.h"
-#include "target/arm/cpu-qom.h"
+#include "target/arm/arm-powerctl.h"
+#include "target/arm/cpu.h"
+#include "target/arm/multiprocessing.h"
 
 typedef struct RP2350Peripheral {
     const char *name;
@@ -95,6 +97,44 @@ static const RP2350Peripheral rp2350_peripherals[] = {
     { "rp2350.sio",             0xd0000000, 0x20000 },
     { "rp2350.sio_nonsec",      0xd0020000, 0x20000 },
 };
+
+typedef struct RP2350Core1Start {
+    uint32_t sp;
+    uint32_t entry;
+} RP2350Core1Start;
+
+/* Runs on core 1 after its reset, which loaded VTOR from init-svtor. */
+static void rp2350_core1_start(CPUState *cs, run_on_cpu_data data)
+{
+    RP2350Core1Start *start = data.host_ptr;
+
+    ARM_CPU(cs)->env.regs[13] = start->sp & ~3u;
+    cpu_set_pc(cs, start->entry);
+    g_free(start);
+}
+
+/*
+ * Core 1 is launched the way the boot ROM does it: reset onto the given
+ * vector table, then jump to the entry point on the given stack.
+ */
+/* [spec:nuos:req:emu.core1-launch] */
+static void rp2350_core1_launch(void *opaque, uint32_t vtor, uint32_t sp,
+                                uint32_t entry)
+{
+    RP2350State *s = opaque;
+    ARMCPU *cpu = s->armv7m[1].cpu;
+    RP2350Core1Start *start = g_new(RP2350Core1Start, 1);
+
+    object_property_set_uint(OBJECT(cpu), "init-svtor", vtor, &error_abort);
+    if (arm_set_cpu_on_and_reset(arm_cpu_mp_affinity(cpu)) !=
+        QEMU_ARM_POWERCTL_RET_SUCCESS) {
+        g_free(start);
+        return;
+    }
+    start->sp = sp;
+    start->entry = entry;
+    async_run_on_cpu(CPU(cpu), rp2350_core1_start, RUN_ON_CPU_HOST_PTR(start));
+}
 
 /*
  * Atomic XOR/SET/CLR aliases in front of a device model that only has the
@@ -262,6 +302,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
 
     /* [spec:nuos:req:emu.sio] */
+    qdev_prop_set_bit(DEVICE(&s->sio), "core1-launch", s->core1_launch);
+    rp2350_sio_set_core1_launch(&s->sio, rp2350_core1_launch, s);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->sio), errp)) {
         return;
     }
@@ -408,6 +450,8 @@ static const Property rp2350_soc_properties[] = {
                      MemoryRegion *),
     DEFINE_PROP_UINT32("flash-size", RP2350State, flash_size, 0),
     DEFINE_PROP_UINT32("init-svtor", RP2350State, init_svtor, RP2350_ROM_BASE),
+    /* Emulate the boot ROM's core 1 launch handshake (no ROM executing). */
+    DEFINE_PROP_BOOL("core1-launch", RP2350State, core1_launch, false),
 };
 
 static void rp2350_soc_class_init(ObjectClass *klass, const void *data)

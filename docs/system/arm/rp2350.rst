@@ -16,8 +16,21 @@ Supported devices
   is no default.
 * SRAM (520 KiB at ``0x20000000``; ``-m`` cannot change it)
 
+Modelled peripherals:
+
+* RESETS, CLOCKS, XOSC, PLL_SYS, PLL_USB and TICKS, enough for the status
+  bits software waits on (clock frequencies are not modelled)
+* SIO: CPUID, inter-core FIFOs, spinlocks, doorbells and GPIO registers,
+  in separate Secure and Non-secure banks
+* TIMER0 and TIMER1
+* UART0 and UART1 (PL011) on the first two serial ports
+* The MPU, with eight Secure and eight Non-secure regions per core
+
 Every other peripheral block in the address map is an unimplemented
-device. Core 1 starts powered off.
+device. Core 1 starts powered off. With ``-kernel``, the machine plays core
+1's side of the boot ROM launch handshake over the SIO FIFO, so software
+starts core 1 as it would on hardware (for example with pico-sdk's
+``multicore_launch_core1()``).
 
 Boot options
 ------------

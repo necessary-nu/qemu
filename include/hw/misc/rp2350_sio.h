@@ -33,6 +33,13 @@ typedef struct RP2350SIOView {
     int bank;
 } RP2350SIOView;
 
+/*
+ * Called when the emulated core 1 launch handshake completes, with the
+ * vector table, stack pointer and entry point core 0 supplied.
+ */
+typedef void RP2350SIOCore1Launch(void *opaque, uint32_t vtor, uint32_t sp,
+                                  uint32_t entry);
+
 typedef struct RP2350SIOBank {
     /* fifo[c] is written by core c and read by the other core. */
     uint32_t fifo[RP2350_SIO_CORES][RP2350_SIO_FIFO_DEPTH];
@@ -61,6 +68,19 @@ struct RP2350SIOState {
     uint32_t gpio_out[2];
     uint32_t gpio_oe[2];
 
+    /*
+     * With core1-launch set, SIO plays core 1's side of the boot ROM
+     * launch handshake on the Secure FIFOs until core 1 is launched.
+     */
+    bool core1_launch;
+    uint32_t c1_state;
+    uint32_t c1_send;
+    uint32_t c1_next;
+    uint32_t c1_vtor;
+    uint32_t c1_sp;
+    RP2350SIOCore1Launch *c1_launch_fn;
+    void *c1_launch_opaque;
+
     /* Core-local interrupts, per bank and core. */
     qemu_irq irq_fifo[RP2350_SIO_BANKS][RP2350_SIO_CORES];
     qemu_irq irq_bell[RP2350_SIO_BANKS][RP2350_SIO_CORES];
@@ -71,5 +91,8 @@ struct RP2350SIOState {
  * (mirror true).
  */
 MemoryRegion *rp2350_sio_view(RP2350SIOState *s, int core, bool mirror);
+
+void rp2350_sio_set_core1_launch(RP2350SIOState *s, RP2350SIOCore1Launch *fn,
+                                 void *opaque);
 
 #endif

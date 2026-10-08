@@ -15,6 +15,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_sio.h"
 #include "migration/vmstate.h"
 
@@ -155,6 +156,92 @@ static void gpio_write(RP2350SIOState *s, hwaddr reg, uint32_t value)
     }
 }
 
+/*
+ * Core 1's side of the boot ROM launch handshake (the wait_for_vector loop
+ * in the boot ROM's Arm startup code). Core 1 drains its FIFO and sends 0,
+ * then expects 1, the vector table, the stack pointer and the entry point
+ * in turn, echoing each. Receiving 0 at any step, or anything but 1 first,
+ * restarts the handshake.
+ */
+enum {
+    C1_DRAIN,       /* drain incoming, then send 0 */
+    C1_SEND,        /* send c1_send, then go to c1_next */
+    C1_RECV_CMD,
+    C1_RECV_VTOR,
+    C1_RECV_SP,
+    C1_RECV_ENTRY,
+    C1_LAUNCH,
+    C1_LAUNCHED,
+};
+
+/* [spec:nuos:req:emu.core1-launch] */
+static void core1_handshake(RP2350SIOState *s)
+{
+    RP2350SIOBank *b = &s->bank[RP2350_SIO_SECURE];
+    uint32_t v;
+
+    if (!s->core1_launch) {
+        return;
+    }
+    for (;;) {
+        switch (s->c1_state) {
+        case C1_DRAIN:
+            while (b->fifo_count[0]) {
+                fifo_read(b, 1);
+            }
+            s->c1_send = 0;
+            s->c1_next = C1_RECV_CMD;
+            s->c1_state = C1_SEND;
+            break;
+        case C1_SEND:
+            if (b->fifo_count[1] == RP2350_SIO_FIFO_DEPTH) {
+                return;
+            }
+            fifo_write(b, 1, s->c1_send);
+            s->c1_state = s->c1_next;
+            break;
+        case C1_RECV_CMD:
+        case C1_RECV_VTOR:
+        case C1_RECV_SP:
+        case C1_RECV_ENTRY:
+            if (!b->fifo_count[0]) {
+                return;
+            }
+            v = fifo_read(b, 1);
+            if (v == 0 || (s->c1_state == C1_RECV_CMD && v != 1)) {
+                s->c1_state = C1_DRAIN;
+                break;
+            }
+            if (s->c1_state == C1_RECV_VTOR) {
+                s->c1_vtor = v;
+            } else if (s->c1_state == C1_RECV_SP) {
+                s->c1_sp = v;
+            }
+            s->c1_send = v;
+            s->c1_next = s->c1_state == C1_RECV_ENTRY ? C1_LAUNCH
+                                                      : s->c1_state + 1;
+            s->c1_state = C1_SEND;
+            break;
+        case C1_LAUNCH:
+            s->c1_state = C1_LAUNCHED;
+            if (s->c1_launch_fn) {
+                s->c1_launch_fn(s->c1_launch_opaque, s->c1_vtor, s->c1_sp,
+                                s->c1_send);
+            }
+            return;
+        default:
+            return;
+        }
+    }
+}
+
+void rp2350_sio_set_core1_launch(RP2350SIOState *s, RP2350SIOCore1Launch *fn,
+                                 void *opaque)
+{
+    s->c1_launch_fn = fn;
+    s->c1_launch_opaque = opaque;
+}
+
 static RP2350SIOBank *view_bank(RP2350SIOView *v, MemTxAttrs attrs)
 {
     int bank = v->bank;
@@ -205,6 +292,7 @@ static MemTxResult rp2350_sio_read(void *opaque, hwaddr addr, uint64_t *data,
         break;
     case A_FIFO_RD:
         *data = fifo_read(b, v->core);
+        core1_handshake(s);
         rp2350_sio_update_irqs(s);
         break;
     case A_FIFO_WR:
@@ -267,6 +355,7 @@ static MemTxResult rp2350_sio_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     case A_FIFO_WR:
         fifo_write(b, v->core, value);
+        core1_handshake(s);
         break;
     case A_SPINLOCK0 ... A_SPINLOCK31:
         b->spinlocks &= ~(1u << ((addr - A_SPINLOCK0) / 4));
@@ -316,7 +405,11 @@ static void rp2350_sio_hold_reset(Object *obj, ResetType type)
 
 static void rp2350_sio_exit_reset(Object *obj, ResetType type)
 {
-    rp2350_sio_update_irqs(RP2350_SIO(obj));
+    RP2350SIOState *s = RP2350_SIO(obj);
+
+    s->c1_state = C1_DRAIN;
+    core1_handshake(s);
+    rp2350_sio_update_irqs(s);
 }
 
 static void rp2350_sio_init(Object *obj)
@@ -373,8 +466,17 @@ static const VMStateDescription vmstate_rp2350_sio = {
                              vmstate_rp2350_sio_bank, RP2350SIOBank),
         VMSTATE_UINT32_ARRAY(gpio_out, RP2350SIOState, 2),
         VMSTATE_UINT32_ARRAY(gpio_oe, RP2350SIOState, 2),
+        VMSTATE_UINT32(c1_state, RP2350SIOState),
+        VMSTATE_UINT32(c1_send, RP2350SIOState),
+        VMSTATE_UINT32(c1_next, RP2350SIOState),
+        VMSTATE_UINT32(c1_vtor, RP2350SIOState),
+        VMSTATE_UINT32(c1_sp, RP2350SIOState),
         VMSTATE_END_OF_LIST()
     },
+};
+
+static const Property rp2350_sio_properties[] = {
+    DEFINE_PROP_BOOL("core1-launch", RP2350SIOState, core1_launch, false),
 };
 
 static void rp2350_sio_class_init(ObjectClass *klass, const void *data)
@@ -382,6 +484,7 @@ static void rp2350_sio_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
+    device_class_set_props(dc, rp2350_sio_properties);
     rc->phases.hold = rp2350_sio_hold_reset;
     rc->phases.exit = rp2350_sio_exit_reset;
     dc->vmsd = &vmstate_rp2350_sio;
