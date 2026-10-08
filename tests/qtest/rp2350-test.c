@@ -75,7 +75,7 @@ static void test_memory_map(void)
         uint64_t size;
     } unimplemented[] = {
         { "rp2350.sysinfo",    0x40000000, 0x8000 },
-        { "rp2350.clocks",     0x40010000, 0x8000 },
+        { "rp2350.psm",        0x40018000, 0x8000 },
         { "rp2350.io_bank0",   0x40028000, 0x8000 },
         { "rp2350.uart0",      0x40070000, 0x8000 },
         { "rp2350.uart1",      0x40078000, 0x8000 },
@@ -83,7 +83,7 @@ static void test_memory_map(void)
         { "rp2350.dma",        0x50000000, 0x100000 },
         { "rp2350.usbctrl",    0x50100000, 0x100000 },
         { "rp2350.pio0",       0x50200000, 0x100000 },
-        { "rp2350.xosc",       0x40048000, 0x8000 },
+        { "rp2350.watchdog",   0x400d8000, 0x8000 },
     };
     g_autofree char *path = NULL;
     QTestState *qts = boot_direct(&path);

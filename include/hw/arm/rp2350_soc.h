@@ -12,6 +12,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/arm/armv7m.h"
 #include "hw/core/clock.h"
+#include "hw/misc/rp2350_clocks.h"
 #include "hw/misc/rp2350_resets.h"
 #include "hw/misc/rp2350_sio.h"
 #include "hw/misc/unimp.h"
@@ -66,7 +67,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_EPPB_BASE 0xe0080000
 #define RP2350_EPPB_SIZE 0x1000
 
+#define RP2350_CLOCKS_BASE 0x40010000
 #define RP2350_RESETS_BASE 0x40020000
+#define RP2350_XOSC_BASE 0x40048000
+#define RP2350_PLL_SYS_BASE 0x40050000
+#define RP2350_PLL_USB_BASE 0x40058000
+#define RP2350_TICKS_BASE 0x40108000
 #define RP2350_SIO_BASE 0xd0000000
 #define RP2350_SIO_NONSEC_BASE 0xd0020000
 
@@ -80,6 +86,11 @@ struct RP2350State {
     UnimplementedDeviceState eppb[RP2350_NUM_CORES];
     RP2350ResetsState resets;
     RP2350SIOState sio;
+    RP2350ClkRegsState clocks;
+    RP2350ClkRegsState xosc;
+    RP2350ClkRegsState pll_sys;
+    RP2350ClkRegsState pll_usb;
+    RP2350ClkRegsState ticks;
     /* Core 0's SIO views as seen from system memory (debug, qtest). */
     MemoryRegion sio_sysmem[2];
 

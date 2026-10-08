@@ -401,6 +401,7 @@ config RP2350_SOC
     select UNIMP
     select RP2350_RESETS
     select RP2350_SIO
+    select RP2350_CLOCKS
 
 config STM32L4X5_SOC
     bool

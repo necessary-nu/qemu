@@ -256,10 +256,26 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     memory_region_add_subregion(s->board_memory, RP2350_SIO_NONSEC_BASE,
                                 &s->sio_sysmem[1]);
 
-    if (!sysbus_realize(SYS_BUS_DEVICE(&s->resets), errp)) {
-        return;
+    {
+        const struct {
+            SysBusDevice *dev;
+            hwaddr base;
+        } blocks[] = {
+            { SYS_BUS_DEVICE(&s->resets), RP2350_RESETS_BASE },
+            { SYS_BUS_DEVICE(&s->clocks), RP2350_CLOCKS_BASE },
+            { SYS_BUS_DEVICE(&s->xosc), RP2350_XOSC_BASE },
+            { SYS_BUS_DEVICE(&s->pll_sys), RP2350_PLL_SYS_BASE },
+            { SYS_BUS_DEVICE(&s->pll_usb), RP2350_PLL_USB_BASE },
+            { SYS_BUS_DEVICE(&s->ticks), RP2350_TICKS_BASE },
+        };
+
+        for (i = 0; i < ARRAY_SIZE(blocks); i++) {
+            if (!sysbus_realize(blocks[i].dev, errp)) {
+                return;
+            }
+            sysbus_mmio_map(blocks[i].dev, 0, blocks[i].base);
+        }
     }
-    sysbus_mmio_map(SYS_BUS_DEVICE(&s->resets), 0, RP2350_RESETS_BASE);
 
     for (i = 0; i < ARRAY_SIZE(rp2350_peripherals); i++) {
         create_unimplemented_device(rp2350_peripherals[i].name,
@@ -281,6 +297,11 @@ static void rp2350_soc_init(Object *obj)
 
     object_initialize_child(obj, "resets", &s->resets, TYPE_RP2350_RESETS);
     object_initialize_child(obj, "sio", &s->sio, TYPE_RP2350_SIO);
+    object_initialize_child(obj, "clocks", &s->clocks, TYPE_RP2350_CLOCKS);
+    object_initialize_child(obj, "xosc", &s->xosc, TYPE_RP2350_XOSC);
+    object_initialize_child(obj, "pll_sys", &s->pll_sys, TYPE_RP2350_PLL);
+    object_initialize_child(obj, "pll_usb", &s->pll_usb, TYPE_RP2350_PLL);
+    object_initialize_child(obj, "ticks", &s->ticks, TYPE_RP2350_TICKS);
 
     qdev_init_gpio_in(DEVICE(s), rp2350_soc_set_irq, RP2350_NUM_IRQS);
 
