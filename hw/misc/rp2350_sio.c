@@ -18,6 +18,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_sio.h"
 #include "migration/vmstate.h"
+#include "target/arm/cpu.h"
 
 #define A_CPUID            0x000
 #define A_GPIO_IN          0x004
@@ -240,6 +241,146 @@ void rp2350_sio_set_core1_launch(RP2350SIOState *s, RP2350SIOCore1Launch *fn,
 {
     s->c1_launch_fn = fn;
     s->c1_launch_opaque = opaque;
+}
+
+/* Apply a GPIOC write operation: 0 write, 1 XOR, 2 set, 3 clear. */
+static void gpio_op(uint32_t *r, int op, uint32_t v)
+{
+    switch (op & 3) {
+    case 0:
+        *r = v;
+        break;
+    case 1:
+        *r ^= v;
+        break;
+    case 2:
+        *r |= v;
+        break;
+    default:
+        *r &= ~v;
+        break;
+    }
+}
+
+/* GPIO output (group 0) or output-enable (group 1) registers. */
+static uint32_t *gpio_group(RP2350SIOState *s, int group)
+{
+    return group ? s->gpio_oe : s->gpio_out;
+}
+
+/*
+ * The GPIO coprocessor: single instructions for the SIO GPIO registers
+ * (datasheet "GPIO coprocessor (GPIOC)"). CRm bits 3:2 select outputs,
+ * output enables or inputs, and bit 0 the low or high register; opc1 bits
+ * 1:0 the write operation and bits 3:2 the addressing mode. Like SIO
+ * itself, Non-secure accesses see no GPIOs, since ACCESSCTRL GPIO_NSMASK
+ * is not modelled and resets to none.
+ */
+/* [spec:nuos:req:emu.gpioc] */
+static ARMMCoprocResult rp2350_gpioc_op(void *opaque, ARMCPU *cpu,
+                                        uint32_t insn, uint32_t rt,
+                                        uint32_t rt2, bool secure,
+                                        uint64_t *result)
+{
+    RP2350SIOState *s = ((RP2350SIOView *)opaque)->sio;
+    uint32_t crm = extract32(insn, 0, 4);
+    int group = crm >> 2, hi = crm & 1;
+    uint32_t opc1, *r;
+    uint64_t bit;
+
+    /* CRm bit 1 is reserved; in mcr and mrc, CRn must be zero. */
+    if (extract32(crm, 1, 1) ||
+        ((insn & 0x0f000010) == 0x0e000010 && extract32(insn, 16, 4))) {
+        return ARM_M_COPROC_UNDEF;
+    }
+
+    if ((insn & 0x0f100010) == 0x0e000010) {
+        /* mcr: whole-register writes, and single-bit writes by index */
+        opc1 = extract32(insn, 21, 3);
+        if (group > 1 || (opc1 >= 4 && (hi || opc1 == 4))) {
+            return ARM_M_COPROC_UNDEF;
+        }
+        if (secure) {
+            r = gpio_group(s, group);
+            if (opc1 < 4) {
+                gpio_op(&r[hi], opc1, rt);
+            } else {
+                bit = 1ull << (rt & 63);
+                gpio_op(&r[bit >> 32 ? 1 : 0], opc1 - 4, bit | bit >> 32);
+            }
+        }
+        return ARM_M_COPROC_OK;
+    }
+
+    if ((insn & 0x0ff00000) == 0x0c400000) {
+        /* mcrr */
+        opc1 = extract32(insn, 4, 4);
+        if (group > 1 || hi || opc1 > 11) {
+            return ARM_M_COPROC_UNDEF;
+        }
+        if (!secure) {
+            return ARM_M_COPROC_OK;
+        }
+        r = gpio_group(s, group);
+        if (opc1 < 4) {
+            /* Both registers at once: Rt low, Rt2 high. */
+            gpio_op(&r[0], opc1, rt);
+            gpio_op(&r[1], opc1, rt2);
+        } else if (opc1 < 8) {
+            /* One bit, numbered by Rt; 4 writes Rt2 & 1, 5-7 are gated. */
+            bit = 1ull << (rt & 63);
+            int word = bit >> 32 ? 1 : 0;
+            uint32_t mask = word ? bit >> 32 : bit;
+
+            if (opc1 == 4) {
+                gpio_op(&r[word], rt2 & 1 ? 2 : 3, mask);
+            } else if (rt2 & 1) {
+                gpio_op(&r[word], opc1 - 4, mask);
+            }
+        } else if (rt2 < 2) {
+            /* Indexed: Rt2 selects the register. */
+            gpio_op(&r[rt2], opc1 - 8, rt);
+        }
+        return ARM_M_COPROC_OK;
+    }
+
+    if ((insn & 0x0f100010) == 0x0e100010) {
+        /* mrc */
+        if (extract32(insn, 21, 3) || group > 2) {
+            return ARM_M_COPROC_UNDEF;
+        }
+        *result = secure ? (group == 2 ? s->gpio_out[hi] & s->gpio_oe[hi]
+                                       : gpio_group(s, group)[hi]) : 0;
+        return ARM_M_COPROC_OK;
+    }
+
+    if ((insn & 0x0ff00000) == 0x0c500000) {
+        /* mrrc: both registers of a group */
+        if (extract32(insn, 4, 4) || group > 2 || hi) {
+            return ARM_M_COPROC_UNDEF;
+        }
+        if (secure) {
+            uint32_t lo_v, hi_v;
+
+            if (group == 2) {
+                lo_v = s->gpio_out[0] & s->gpio_oe[0];
+                hi_v = s->gpio_out[1] & s->gpio_oe[1];
+            } else {
+                lo_v = gpio_group(s, group)[0];
+                hi_v = gpio_group(s, group)[1];
+            }
+            *result = ((uint64_t)hi_v << 32) | lo_v;
+        }
+        return ARM_M_COPROC_OK;
+    }
+    return ARM_M_COPROC_UNDEF;
+}
+
+void rp2350_sio_attach_gpioc(RP2350SIOState *s, int core, ARMCPU *cpu)
+{
+    s->gpioc_opaque[core].sio = s;
+    s->gpioc_opaque[core].core = core;
+    arm_m_set_coprocessor(cpu, 0, rp2350_gpioc_op, &s->gpioc_opaque[core]);
 }
 
 static RP2350SIOBank *view_bank(RP2350SIOView *v, MemTxAttrs attrs)

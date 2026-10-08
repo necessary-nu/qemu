@@ -11,6 +11,7 @@
 
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
+#include "target/arm/cpu-qom.h"
 
 #define TYPE_RP2350_SIO "rp2350-sio"
 OBJECT_DECLARE_SIMPLE_TYPE(RP2350SIOState, RP2350_SIO)
@@ -65,6 +66,7 @@ struct RP2350SIOState {
     RP2350SIOView view_opaque[RP2350_SIO_CORES][2];
 
     RP2350SIOBank bank[RP2350_SIO_BANKS];
+    RP2350SIOView gpioc_opaque[RP2350_SIO_CORES];
     uint32_t gpio_out[2];
     uint32_t gpio_oe[2];
 
@@ -94,5 +96,8 @@ MemoryRegion *rp2350_sio_view(RP2350SIOState *s, int core, bool mirror);
 
 void rp2350_sio_set_core1_launch(RP2350SIOState *s, RP2350SIOCore1Launch *fn,
                                  void *opaque);
+
+/* Make the GPIO coprocessor (GPIOC) coprocessor 0 of `cpu`, core `core`. */
+void rp2350_sio_attach_gpioc(RP2350SIOState *s, int core, ARMCPU *cpu);
 
 #endif

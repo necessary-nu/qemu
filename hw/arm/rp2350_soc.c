@@ -350,6 +350,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     for (i = 0; i < RP2350_NUM_CORES; i++) {
         int bank;
 
+        rp2350_sio_attach_gpioc(&s->sio, i, s->armv7m[i].cpu);
         memory_region_add_subregion_overlap(&s->armv7m[i].container,
                                             RP2350_SIO_BASE,
                                             rp2350_sio_view(&s->sio, i, false),
