@@ -146,6 +146,11 @@ static bool arm_cpu_has_work(CPUState *cs)
     ARMCPU *cpu = ARM_CPU(cs);
     ARMHaltReason halt_reason = qatomic_read(&cpu->env.halt_reason);
 
+    /* Nothing but a reset brings a core out of M-profile Lockup. */
+    if (cpu->m_locked_up) {
+        return false;
+    }
+
     /*
      * Only another PSCI call can wake the CPU up in which case the
      * power_state would be set by arm_set_cpu_on_and_reset_async_work()
@@ -337,6 +342,8 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
     CPUARMState *env = &cpu->env;
 
     trace_arm_cpu_reset(arm_cpu_mp_affinity(cpu));
+
+    cpu->m_locked_up = false;
 
     if (acc->parent_phases.hold) {
         acc->parent_phases.hold(obj, type);

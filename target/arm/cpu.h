@@ -949,8 +949,9 @@ typedef struct {
  * CPACR/NSACR access checks pass, instead of taking a NOCP fault.
  *
  * The handler gets the instruction, the values of Rt and Rt2 (bits 15:12
- * and 19:16), and whether the core is in Secure state. For MRC it sets
- * *result, which goes to Rt or, for Rt == 15, to APSR.NZCV. It is called
+ * and 19:16), and whether the core is in Secure state. For MRC it sets the
+ * low word of *result, which goes to Rt or, for Rt == 15, to APSR.NZCV;
+ * for MRRC the low word goes to Rt and the high word to Rt2. It is called
  * with the BQL held.
  */
 typedef enum ARMMCoprocResult {
@@ -964,7 +965,7 @@ typedef enum ARMMCoprocResult {
 typedef ARMMCoprocResult ARMMCoprocFn(void *opaque, ARMCPU *cpu,
                                       uint32_t insn, uint32_t rt,
                                       uint32_t rt2, bool secure,
-                                      uint32_t *result);
+                                      uint64_t *result);
 
 #define ARM_M_NUM_COPROC 8
 
@@ -976,6 +977,14 @@ struct ArchCPU {
     /* M-profile implementation-defined coprocessors; see ARMMCoprocFn. */
     ARMMCoprocFn *m_coproc_fn[ARM_M_NUM_COPROC];
     void *m_coproc_opaque[ARM_M_NUM_COPROC];
+
+    /*
+     * M-profile Lockup. QEMU normally aborts on Lockup; a board that sets
+     * m_lockup_halts gets the architected behaviour instead: the locked-up
+     * core stops executing until reset, and the rest of the machine runs.
+     */
+    bool m_lockup_halts;
+    bool m_locked_up;
 
     /* Coprocessor information */
     GHashTable *cp_regs;

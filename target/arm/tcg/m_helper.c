@@ -78,7 +78,7 @@ uint32_t arm_v7m_mrs_control(CPUARMState *env, uint32_t secure)
  * goes to Secure state), and the CPACR of the current security state
  * gates privileged and unprivileged access.
  */
-uint32_t HELPER(m_coproc)(CPUARMState *env, uint32_t insn, uint32_t rt,
+uint64_t HELPER(m_coproc)(CPUARMState *env, uint32_t insn, uint32_t rt,
                           uint32_t rt2)
 {
     ARMCPU *cpu = env_archcpu(env);
@@ -87,7 +87,7 @@ uint32_t HELPER(m_coproc)(CPUARMState *env, uint32_t insn, uint32_t rt,
     bool secure = env->v7m.secure;
     bool priv = arm_current_el(env) != 0;
     bool locked = bql_locked();
-    uint32_t result = 0;
+    uint64_t result = 0;
     ARMMCoprocResult r;
 
     if (!secure && !extract32(env->v7m.nsacr, cp, 1)) {

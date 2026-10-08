@@ -23,6 +23,7 @@
 #include "target/arm/cpu.h"
 #include "target/arm/cpu-features.h"
 #include "exec/cputlb.h"
+#include "accel/tcg/cpu-loop.h"
 #include "exec/memop.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -544,6 +545,32 @@ static void armv7m_nvic_clear_pending(NVICState *s, int irq, bool secure)
     }
 }
 
+/*
+ * The core cannot take the exception it must: Lockup. Without
+ * m_lockup_halts QEMU aborts, as it always has; with it the core stops
+ * executing until reset and the rest of the machine carries on.
+ */
+static G_NORETURN G_GNUC_PRINTF(2, 3)
+void nvic_lockup(NVICState *s, const char *fmt, ...)
+{
+    CPUState *cs = CPU(s->cpu);
+    g_autofree char *msg = NULL;
+    va_list ap;
+
+    va_start(ap, fmt);
+    msg = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+
+    if (!s->cpu->m_lockup_halts) {
+        cpu_abort(cs, "%s", msg);
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "CPU %d: %s", cs->cpu_index, msg);
+    s->cpu->m_locked_up = true;
+    cs->halted = 1;
+    cs->exception_index = EXCP_HLT;
+    cpu_loop_exit(cs);
+}
+
 static void do_armv7m_nvic_set_pending(void *opaque, int irq, bool secure,
                                        bool derived)
 {
@@ -602,10 +629,9 @@ static void do_armv7m_nvic_set_pending(void *opaque, int irq, bool secure,
              * which saves having to have an extra argument is_terminal
              * that we'd only use in one place.
              */
-            cpu_abort(CPU(s->cpu),
-                      "Lockup: can't take terminal derived exception "
-                      "(original exception priority %d)\n",
-                      s->vectpending_prio);
+            nvic_lockup(s, "Lockup: can't take terminal derived exception "
+                        "(original exception priority %d)\n",
+                        s->vectpending_prio);
         }
         /* We now continue with the same code as for a normal pending
          * exception, which will cause us to pend the derived exception.
@@ -665,12 +691,10 @@ static void do_armv7m_nvic_set_pending(void *opaque, int irq, bool secure,
             if (running <= vec->prio) {
                 /* We want to escalate to HardFault but we can't take the
                  * synchronous HardFault at this point either. This is a
-                 * Lockup condition due to a guest bug. We don't model
-                 * Lockup, so report via cpu_abort() instead.
+                 * Lockup condition due to a guest bug.
                  */
-                cpu_abort(CPU(s->cpu),
-                          "Lockup: can't escalate %d to HardFault "
-                          "(current priority %d)\n", irq, running);
+                nvic_lockup(s, "Lockup: can't escalate %d to HardFault "
+                            "(current priority %d)\n", irq, running);
             }
 
             /* HF may be banked but there is only one shared HFSR */
@@ -766,9 +790,8 @@ void armv7m_nvic_set_pending_lazyfp(NVICState *s, int irq, bool secure)
              * We want to escalate to HardFault but the context the
              * FP state belongs to prevents the exception pre-empting.
              */
-            cpu_abort(CPU(s->cpu),
-                      "Lockup: can't escalate to HardFault during "
-                      "lazy FP register stacking\n");
+            nvic_lockup(s, "Lockup: can't escalate to HardFault during "
+                        "lazy FP register stacking\n");
         }
     }
 
@@ -1585,6 +1608,33 @@ static uint32_t nvic_readl(NVICState *s, uint32_t offset, MemTxAttrs attrs)
     }
 }
 
+/* CPACR and NSACR bits for the coprocessors this core implements. */
+static uint32_t m_coproc_cpacr_mask(ARMCPU *cpu)
+{
+    uint32_t mask = cpu_isar_feature(aa32_vfp_simd, cpu) ? 0xf << 20 : 0;
+    int cp;
+
+    for (cp = 0; cp < ARM_M_NUM_COPROC; cp++) {
+        if (cpu->m_coproc_fn[cp]) {
+            mask |= 3 << (cp * 2);
+        }
+    }
+    return mask;
+}
+
+static uint32_t m_coproc_nsacr_mask(ARMCPU *cpu)
+{
+    uint32_t mask = cpu_isar_feature(aa32_vfp_simd, cpu) ? 3 << 10 : 0;
+    int cp;
+
+    for (cp = 0; cp < ARM_M_NUM_COPROC; cp++) {
+        if (cpu->m_coproc_fn[cp]) {
+            mask |= 1 << cp;
+        }
+    }
+    return mask;
+}
+
 static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
                         MemTxAttrs attrs)
 {
@@ -1868,15 +1918,15 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
         }
         break;
     case 0xd88: /* CPACR */
-        if (cpu_isar_feature(aa32_vfp_simd, cpu)) {
-            /* We implement only the Floating Point extension's CP10/CP11 */
-            cpu->env.v7m.cpacr[attrs.secure] = value & (0xf << 20);
-        }
+        /*
+         * Fields exist for the Floating Point extension's CP10/CP11 and
+         * for any implementation-defined coprocessor a board attached.
+         */
+        cpu->env.v7m.cpacr[attrs.secure] = value & m_coproc_cpacr_mask(cpu);
         break;
     case 0xd8c: /* NSACR */
-        if (attrs.secure && cpu_isar_feature(aa32_vfp_simd, cpu)) {
-            /* We implement only the Floating Point extension's CP10/CP11 */
-            cpu->env.v7m.nsacr = value & (3 << 10);
+        if (attrs.secure) {
+            cpu->env.v7m.nsacr = value & m_coproc_nsacr_mask(cpu);
         }
         break;
     case 0xd90: /* MPU_TYPE */

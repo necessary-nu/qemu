@@ -734,17 +734,26 @@ static bool gen_m_coproc(DisasContext *s)
     int rt2 = extract32(insn, 16, 4);
     /* MRC/MRC2: 111x 1110 xxx1 xxxx xxxx xxxx xxx1 xxxx */
     bool is_mrc = (insn & 0x0f100010) == 0x0e100010;
+    /* MRRC/MRRC2: 111x 1100 0101 xxxx xxxx xxxx xxxx xxxx */
+    bool is_mrrc = (insn & 0x0ff00000) == 0x0c500000;
     TCGv_i32 a = rt == 15 ? tcg_constant_i32(0) : load_reg(s, rt);
     TCGv_i32 b = rt2 == 15 ? tcg_constant_i32(0) : load_reg(s, rt2);
-    TCGv_i32 result = tcg_temp_new_i32();
+    TCGv_i64 result = tcg_temp_new_i64();
+    TCGv_i32 lo, hi;
 
     gen_update_pc(s, 0);
     gen_helper_m_coproc(result, tcg_env, tcg_constant_i32(insn), a, b);
-    if (is_mrc) {
-        if (rt == 15) {
-            gen_set_nzcv(result);
+    if (is_mrc || is_mrrc) {
+        lo = tcg_temp_new_i32();
+        hi = tcg_temp_new_i32();
+        tcg_gen_extr_i64_i32(lo, hi, result);
+        if (is_mrrc) {
+            store_reg(s, rt, lo);
+            store_reg(s, rt2, hi);
+        } else if (rt == 15) {
+            gen_set_nzcv(lo);
         } else {
-            store_reg(s, rt, result);
+            store_reg(s, rt, lo);
         }
     }
     /* The coprocessor may have raised an interrupt (e.g. NMI). */
