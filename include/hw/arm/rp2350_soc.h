@@ -17,6 +17,7 @@
 #include "hw/misc/rp2350_resets.h"
 #include "hw/misc/rp2350_sio.h"
 #include "hw/misc/unimp.h"
+#include "hw/timer/rp2350_timer.h"
 #include "qom/object.h"
 
 #define TYPE_RP2350_SOC "rp2350-soc"
@@ -25,6 +26,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_NUM_CORES 2
 #define RP2350_NUM_IRQS 52
 #define RP2350_NUM_UARTS 2
+#define RP2350_NUM_TIMERS 2
 #define RP2350_MPU_REGIONS 8
 
 /*
@@ -73,6 +75,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_RESETS_BASE 0x40020000
 #define RP2350_XOSC_BASE 0x40048000
 #define RP2350_UART0_BASE 0x40070000
+#define RP2350_TIMER0_BASE 0x400b0000
+#define RP2350_TIMER1_BASE 0x400b8000
 #define RP2350_UART1_BASE 0x40078000
 #define RP2350_PLL_SYS_BASE 0x40050000
 #define RP2350_PLL_USB_BASE 0x40058000
@@ -95,6 +99,7 @@ struct RP2350State {
     RP2350ClkRegsState pll_sys;
     RP2350ClkRegsState pll_usb;
     RP2350ClkRegsState ticks;
+    RP2350TimerState timer[RP2350_NUM_TIMERS];
     PL011State uart[RP2350_NUM_UARTS];
     /* The UARTs' register windows plus their atomic aliases. */
     MemoryRegion uart_alias[RP2350_NUM_UARTS];

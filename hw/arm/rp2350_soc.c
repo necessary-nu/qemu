@@ -320,6 +320,29 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         }
     }
 
+    /* [spec:nuos:req:emu.timer] */
+    for (i = 0; i < RP2350_NUM_TIMERS; i++) {
+        static const hwaddr base[] = {
+            RP2350_TIMER0_BASE, RP2350_TIMER1_BASE,
+        };
+        static const int irq[] = { RP2350_TIMER0_IRQ_0, RP2350_TIMER1_IRQ_0 };
+        static const int tick[] = { RP2350_TICK_TIMER0, RP2350_TICK_TIMER1 };
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->timer[i]);
+        int n;
+
+        object_property_set_link(OBJECT(sbd), "ticks", OBJECT(&s->ticks),
+                                 &error_abort);
+        qdev_prop_set_uint32(DEVICE(sbd), "tick", tick[i]);
+        qdev_prop_set_uint32(DEVICE(sbd), "sysclk-hz", RP2350_SYSCLK_HZ);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, base[i]);
+        for (n = 0; n < RP2350_TIMER_ALARMS; n++) {
+            sysbus_connect_irq(sbd, n, qdev_get_gpio_in(dev_soc, irq[i] + n));
+        }
+    }
+
     /* [spec:nuos:req:emu.uart] */
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         static const hwaddr base[] = { RP2350_UART0_BASE, RP2350_UART1_BASE };
@@ -366,6 +389,10 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "pll_sys", &s->pll_sys, TYPE_RP2350_PLL);
     object_initialize_child(obj, "pll_usb", &s->pll_usb, TYPE_RP2350_PLL);
     object_initialize_child(obj, "ticks", &s->ticks, TYPE_RP2350_TICKS);
+    for (i = 0; i < RP2350_NUM_TIMERS; i++) {
+        object_initialize_child(obj, "timer[*]", &s->timer[i],
+                                TYPE_RP2350_TIMER);
+    }
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         object_initialize_child(obj, "uart[*]", &s->uart[i], TYPE_PL011);
     }

@@ -28,11 +28,28 @@ OBJECT_DECLARE_TYPE(RP2350ClkRegsState, RP2350ClkRegsClass, RP2350_CLKREGS)
 
 #define RP2350_CLKREGS_MAX 64
 
+/* The TICKS generators, in register order. */
+enum {
+    RP2350_TICK_PROC0,
+    RP2350_TICK_PROC1,
+    RP2350_TICK_TIMER0,
+    RP2350_TICK_TIMER1,
+    RP2350_TICK_WATCHDOG,
+    RP2350_TICK_RISCV,
+    RP2350_NUM_TICKS,
+};
+
+typedef void RP2350TickNotify(void *opaque);
+
 struct RP2350ClkRegsState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     uint32_t regs[RP2350_CLKREGS_MAX];
+
+    /* TICKS only: called after a generator's CTRL is written. */
+    RP2350TickNotify *tick_notify[RP2350_NUM_TICKS];
+    void *tick_opaque[RP2350_NUM_TICKS];
 };
 
 struct RP2350ClkRegsClass {
@@ -45,20 +62,15 @@ struct RP2350ClkRegsClass {
     const uint32_t *wmask;
     /* The value a read returns, given the stored register. */
     uint32_t (*read)(RP2350ClkRegsState *s, unsigned reg);
-};
-
-/* The TICKS generators, in register order. */
-enum {
-    RP2350_TICK_PROC0,
-    RP2350_TICK_PROC1,
-    RP2350_TICK_TIMER0,
-    RP2350_TICK_TIMER1,
-    RP2350_TICK_WATCHDOG,
-    RP2350_TICK_RISCV,
-    RP2350_NUM_TICKS,
+    /* Called after a register is written. */
+    void (*written)(RP2350ClkRegsState *s, unsigned reg);
 };
 
 /* Whether TICKS generator `tick` is enabled, and so producing ticks. */
 bool rp2350_ticks_running(RP2350ClkRegsState *ticks, int tick);
+
+/* Have `fn` called whenever TICKS generator `tick` is enabled or disabled. */
+void rp2350_ticks_set_notify(RP2350ClkRegsState *ticks, int tick,
+                             RP2350TickNotify *fn, void *opaque);
 
 #endif

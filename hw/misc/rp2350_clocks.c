@@ -46,6 +46,9 @@ static void rp2350_clkregs_write(void *opaque, hwaddr addr, uint64_t value,
     mask = c->wmask ? c->wmask[reg] : UINT32_MAX;
     v = rp2350_atomic_apply(addr, s->regs[reg], value);
     s->regs[reg] = (s->regs[reg] & ~mask) | (v & mask);
+    if (c->written) {
+        c->written(s, reg);
+    }
 }
 
 static const MemoryRegionOps rp2350_clkregs_ops = {
@@ -318,6 +321,22 @@ bool rp2350_ticks_running(RP2350ClkRegsState *ticks, int tick)
     return ticks->regs[tick * TICK_STRIDE] & TICK_CTRL_ENABLE;
 }
 
+void rp2350_ticks_set_notify(RP2350ClkRegsState *ticks, int tick,
+                             RP2350TickNotify *fn, void *opaque)
+{
+    ticks->tick_notify[tick] = fn;
+    ticks->tick_opaque[tick] = opaque;
+}
+
+static void ticks_written(RP2350ClkRegsState *s, unsigned reg)
+{
+    unsigned tick = reg / TICK_STRIDE;
+
+    if (reg % TICK_STRIDE == 0 && s->tick_notify[tick]) {
+        s->tick_notify[tick](s->tick_opaque[tick]);
+    }
+}
+
 static void rp2350_ticks_class_init(ObjectClass *klass, const void *data)
 {
     RP2350ClkRegsClass *c = RP2350_CLKREGS_CLASS(klass);
@@ -330,6 +349,7 @@ static void rp2350_ticks_class_init(ObjectClass *klass, const void *data)
     c->nregs = TICKS_NREGS;
     c->wmask = ticks_wmask;
     c->read = ticks_read;
+    c->written = ticks_written;
 }
 
 static const TypeInfo rp2350_clocks_types[] = {
