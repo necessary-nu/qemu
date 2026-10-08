@@ -24,6 +24,8 @@ struct RP2350TimerState {
 
     MemoryRegion iomem;
     QEMUTimer *alarm_timer[RP2350_TIMER_ALARMS];
+    /* Virtual time at which each armed alarm's target is reached, or -1. */
+    int64_t alarm_due_ns[RP2350_TIMER_ALARMS];
     qemu_irq irq[RP2350_TIMER_ALARMS];
 
     /* The TICKS block and the generator that clocks this timer. */

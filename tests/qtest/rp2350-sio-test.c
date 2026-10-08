@@ -64,6 +64,8 @@ static void test_cpuid(void)
     QTestState *qts = start(-1);
 
     g_assert_cmphex(qtest_readl(qts, SIO + CPUID), ==, 0);
+    /* pico-sdk's mutexes read CPUID with a byte load. */
+    g_assert_cmphex(qtest_readb(qts, SIO + CPUID), ==, 0);
     qtest_quit(qts);
 }
 

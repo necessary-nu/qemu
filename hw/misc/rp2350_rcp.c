@@ -277,7 +277,7 @@ static RCPOutcome rcp_exec(RP2350RCPCore *c, uint32_t insn, RCPInsn *d,
 static ARMMCoprocResult rp2350_rcp_op(void *opaque, ARMCPU *cpu,
                                       uint32_t insn, uint32_t rt,
                                       uint32_t rt2, bool secure,
-                                      uint32_t *result)
+                                      uint64_t *result)
 {
     RP2350RCPCore *c = opaque;
     uint32_t value = 0;

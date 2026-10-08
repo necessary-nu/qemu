@@ -302,6 +302,9 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         if (!sysbus_realize(SYS_BUS_DEVICE(armv7m), errp)) {
             return;
         }
+        /* A core that locks up stops; the other core carries on. */
+        /* [spec:nuos:req:emu.lockup] */
+        s->armv7m[i].cpu->m_lockup_halts = true;
 
         /*
          * The extended PPB is core-local and sits inside the PPB range
@@ -328,6 +331,14 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->rcp), i,
                            qdev_get_gpio_in_named(DEVICE(&s->armv7m[i]),
                                                   "NMI", 0));
+    }
+
+    /* [spec:nuos:req:emu.dcp-state] */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->dcp), errp)) {
+        return;
+    }
+    for (i = 0; i < RP2350_NUM_CORES; i++) {
+        rp2350_dcp_attach(&s->dcp, i, s->armv7m[i].cpu);
     }
 
     /* [spec:nuos:req:emu.sio] */
@@ -381,6 +392,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             { SYS_BUS_DEVICE(&s->pll_sys), RP2350_PLL_SYS_BASE },
             { SYS_BUS_DEVICE(&s->pll_usb), RP2350_PLL_USB_BASE },
             { SYS_BUS_DEVICE(&s->ticks), RP2350_TICKS_BASE },
+            { SYS_BUS_DEVICE(&s->bootram), RP2350_BOOTRAM_BASE },
         };
 
         for (i = 0; i < ARRAY_SIZE(blocks); i++) {
@@ -456,6 +468,8 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "resets", &s->resets, TYPE_RP2350_RESETS);
     object_initialize_child(obj, "sio", &s->sio, TYPE_RP2350_SIO);
     object_initialize_child(obj, "rcp", &s->rcp, TYPE_RP2350_RCP);
+    object_initialize_child(obj, "bootram", &s->bootram, TYPE_RP2350_BOOTRAM);
+    object_initialize_child(obj, "dcp", &s->dcp, TYPE_RP2350_DCP);
     object_initialize_child(obj, "clocks", &s->clocks, TYPE_RP2350_CLOCKS);
     object_initialize_child(obj, "xosc", &s->xosc, TYPE_RP2350_XOSC);
     object_initialize_child(obj, "pll_sys", &s->pll_sys, TYPE_RP2350_PLL);

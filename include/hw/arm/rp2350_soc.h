@@ -13,7 +13,9 @@
 #include "hw/arm/armv7m.h"
 #include "hw/char/pl011.h"
 #include "hw/core/clock.h"
+#include "hw/misc/rp2350_bootram.h"
 #include "hw/misc/rp2350_clocks.h"
+#include "hw/misc/rp2350_dcp.h"
 #include "hw/misc/rp2350_rcp.h"
 #include "hw/misc/rp2350_resets.h"
 #include "hw/misc/rp2350_sio.h"
@@ -82,6 +84,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_PLL_SYS_BASE 0x40050000
 #define RP2350_PLL_USB_BASE 0x40058000
 #define RP2350_TICKS_BASE 0x40108000
+#define RP2350_BOOTRAM_BASE 0x400e0000
 #define RP2350_SIO_BASE 0xd0000000
 #define RP2350_SIO_NONSEC_BASE 0xd0020000
 
@@ -96,6 +99,8 @@ struct RP2350State {
     RP2350ResetsState resets;
     RP2350SIOState sio;
     RP2350RCPState rcp;
+    RP2350BootRAMState bootram;
+    RP2350DCPState dcp;
     RP2350ClkRegsState clocks;
     RP2350ClkRegsState xosc;
     RP2350ClkRegsState pll_sys;

@@ -151,6 +151,25 @@ static void test_alarm(void)
 }
 
 /* [spec:nuos:req:emu.timer/test] */
+static void test_alarm_overshoot(void)
+{
+    QTestState *qts = start(true);
+
+    /*
+     * Stepping well past the target in one go, as a busy host may run the
+     * alarm callback late, still fires the alarm.
+     */
+    qtest_writel(qts, TICK_CTRL(TICK_TIMER0), 1);
+    qtest_writel(qts, TIMER0 + INTE, 1u << 3);
+    qtest_writel(qts, TIMER0 + ALARM(3), 2000);
+    qtest_clock_step(qts, 5000 * US);
+    g_assert_cmphex(qtest_readl(qts, TIMER0 + INTR), ==, 1u << 3);
+    g_assert_cmphex(qtest_readl(qts, TIMER0 + ARMED), ==, 0);
+    g_assert_true(qtest_get_irq(qts, 3));
+    qtest_quit(qts);
+}
+
+/* [spec:nuos:req:emu.timer/test] */
 static void test_timer1_alarm(void)
 {
     QTestState *qts = start(true);
@@ -191,6 +210,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/timer/counter", test_counter);
     qtest_add_func("/rp2350/timer/latching", test_latching_and_writes);
     qtest_add_func("/rp2350/timer/alarm", test_alarm);
+    qtest_add_func("/rp2350/timer/alarm-overshoot", test_alarm_overshoot);
     qtest_add_func("/rp2350/timer/timer1-alarm", test_timer1_alarm);
     qtest_add_func("/rp2350/timer/sysclk-source", test_sysclk_source);
 

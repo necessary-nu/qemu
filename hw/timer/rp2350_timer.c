@@ -81,11 +81,16 @@ static void timer_fire(RP2350TimerState *s, int n)
     timer_update_irqs(s);
 }
 
-/* Schedule each armed alarm for when the counter's low word matches it. */
+/*
+ * Schedule each armed alarm for when the counter's low word next matches
+ * it. The deadline is rounded up, so the counter has reached the target
+ * by the time the callback runs, however late that is.
+ */
 static void timer_schedule(RP2350TimerState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t lo = timer_count(s, now);
+    uint64_t hz = timer_hz(s);
     int i;
 
     for (i = 0; i < RP2350_TIMER_ALARMS; i++) {
@@ -93,16 +98,19 @@ static void timer_schedule(RP2350TimerState *s)
 
         if (!(s->armed & (1u << i)) || !s->running) {
             timer_del(s->alarm_timer[i]);
+            s->alarm_due_ns[i] = -1;
             continue;
         }
         delta = s->alarm[i] - lo;
         if (delta == 0) {
             timer_del(s->alarm_timer[i]);
+            s->alarm_due_ns[i] = -1;
             timer_fire(s, i);
             continue;
         }
-        timer_mod(s->alarm_timer[i],
-                  now + muldiv64(delta, NANOSECONDS_PER_SECOND, timer_hz(s)));
+        s->alarm_due_ns[i] = now + (delta * NANOSECONDS_PER_SECOND + hz - 1) /
+                                   hz;
+        timer_mod(s->alarm_timer[i], s->alarm_due_ns[i]);
     }
 }
 
@@ -132,12 +140,20 @@ static void timer_tick_changed(void *opaque)
     timer_restart(s);
 }
 
+/* Fire every armed alarm whose target the counter has reached. */
 static void timer_alarm_cb(void *opaque)
 {
     RP2350TimerState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int i;
 
-    /* Re-check every alarm: rounding may land a callback a tick early. */
-    timer_schedule(s);
+    for (i = 0; i < RP2350_TIMER_ALARMS; i++) {
+        if ((s->armed & (1u << i)) && s->alarm_due_ns[i] >= 0 &&
+            s->alarm_due_ns[i] <= now) {
+            s->alarm_due_ns[i] = -1;
+            timer_fire(s, i);
+        }
+    }
 }
 
 /* [spec:nuos:req:emu.timer] */
@@ -279,6 +295,7 @@ static void rp2350_timer_hold_reset(Object *obj, ResetType type)
     for (i = 0; i < RP2350_TIMER_ALARMS; i++) {
         timer_del(s->alarm_timer[i]);
         s->alarm[i] = 0;
+        s->alarm_due_ns[i] = -1;
     }
     s->count = 0;
     s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -343,6 +360,8 @@ static const VMStateDescription vmstate_rp2350_timer = {
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR_ARRAY(alarm_timer, RP2350TimerState,
                                 RP2350_TIMER_ALARMS),
+        VMSTATE_INT64_ARRAY(alarm_due_ns, RP2350TimerState,
+                            RP2350_TIMER_ALARMS),
         VMSTATE_UINT64(count, RP2350TimerState),
         VMSTATE_INT64(sync_ns, RP2350TimerState),
         VMSTATE_BOOL(running, RP2350TimerState),

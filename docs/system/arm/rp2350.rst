@@ -25,6 +25,13 @@ Modelled peripherals:
 * TIMER0 and TIMER1
 * UART0 and UART1 (PL011) on the first two serial ports
 * The MPU, with eight Secure and eight Non-secure regions per core
+* Boot RAM, with its write-once registers and boot locks
+* The redundancy coprocessor (RCP) on coprocessor 7
+* The double-precision coprocessor (DCP) state on coprocessors 4 and 5;
+  its arithmetic instructions are not modelled and raise UsageFaults
+
+A core that locks up stops until reset, as on hardware; the other core and
+the rest of the machine keep running.
 
 Every other peripheral block in the address map is an unimplemented
 device. Core 1 starts powered off. With ``-kernel``, the machine plays core
@@ -48,8 +55,10 @@ At least one of these must be given:
   the start of flash. If ``-bios`` is given as well, the ROM is mapped, so
   ROM function-table lookups work, but it is not executed.
 
-The boot ROM is not distributed with QEMU. It can be built from Raspberry
-Pi's published source, https://github.com/raspberrypi/pico-bootrom-rp2350.
+The boot ROM is not distributed with QEMU. Raspberry Pi publishes it, with
+its source, at https://github.com/raspberrypi/pico-bootrom-rp2350.
+pico-sdk programs need it given with ``-bios`` alongside ``-kernel``,
+because their startup code calls ROM functions.
 
 .. code-block:: bash
 

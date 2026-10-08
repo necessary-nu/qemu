@@ -381,12 +381,18 @@ static MemTxResult rp2350_sio_write(void *opaque, hwaddr addr, uint64_t value,
     return MEMTX_OK;
 }
 
+/*
+ * Narrower accesses act on the containing word; pico-sdk reads CPUID with
+ * a byte load.
+ */
 static const MemoryRegionOps rp2350_sio_ops = {
     .read_with_attrs = rp2350_sio_read,
     .write_with_attrs = rp2350_sio_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 4,
+    .valid.min_access_size = 1,
     .valid.max_access_size = 4,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
 };
 
 MemoryRegion *rp2350_sio_view(RP2350SIOState *s, int core, bool mirror)
