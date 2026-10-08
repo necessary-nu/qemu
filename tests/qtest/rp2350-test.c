@@ -77,8 +77,7 @@ static void test_memory_map(void)
         { "rp2350.sysinfo",    0x40000000, 0x8000 },
         { "rp2350.psm",        0x40018000, 0x8000 },
         { "rp2350.io_bank0",   0x40028000, 0x8000 },
-        { "rp2350.uart0",      0x40070000, 0x8000 },
-        { "rp2350.uart1",      0x40078000, 0x8000 },
+        { "rp2350.spi0",       0x40080000, 0x8000 },
         { "rp2350.timer0",     0x400b0000, 0x8000 },
         { "rp2350.dma",        0x50000000, 0x100000 },
         { "rp2350.usbctrl",    0x50100000, 0x100000 },
@@ -99,6 +98,10 @@ static void test_memory_map(void)
                           "(prio 0, i/o): rp2350-resets");
     assert_mtree_has(qts, "0000000040024000-0000000040027fff "
                           "(prio -1000, i/o): rp2350.resets @0000000000004000");
+    assert_mtree_has(qts, "0000000040070000-0000000040073fff "
+                          "(prio 0, i/o): rp2350-uart0");
+    assert_mtree_has(qts, "0000000040078000-000000004007bfff "
+                          "(prio 0, i/o): rp2350-uart1");
     assert_mtree_has(qts, "00000000d0000000-00000000d0000fff "
                           "(prio 0, i/o): rp2350-sio");
     assert_mtree_has(qts, "00000000d0001000-00000000d001ffff "

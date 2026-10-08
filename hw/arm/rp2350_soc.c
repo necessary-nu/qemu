@@ -16,7 +16,9 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/unimp.h"
+#include "system/system.h"
 #include "target/arm/cpu-qom.h"
 
 typedef struct RP2350Peripheral {
@@ -92,6 +94,47 @@ static const RP2350Peripheral rp2350_peripherals[] = {
                                 RP2350_XIP_WINDOW_SIZE },
     { "rp2350.sio",             0xd0000000, 0x20000 },
     { "rp2350.sio_nonsec",      0xd0020000, 0x20000 },
+};
+
+/*
+ * Atomic XOR/SET/CLR aliases in front of a device model that only has the
+ * plain register window: alias writes become read-modify-write on the
+ * target register.
+ */
+static MemTxResult rp2350_alias_read(void *opaque, hwaddr addr,
+                                     uint64_t *data, unsigned size,
+                                     MemTxAttrs attrs)
+{
+    return memory_region_dispatch_read(opaque, rp2350_atomic_reg(addr), data,
+                                       size_memop(size), attrs);
+}
+
+static MemTxResult rp2350_alias_write(void *opaque, hwaddr addr,
+                                      uint64_t value, unsigned size,
+                                      MemTxAttrs attrs)
+{
+    hwaddr reg = rp2350_atomic_reg(addr);
+    uint64_t old = 0;
+    MemTxResult r;
+
+    if (reg != addr) {
+        r = memory_region_dispatch_read(opaque, reg, &old, size_memop(size),
+                                        attrs);
+        if (r != MEMTX_OK) {
+            return r;
+        }
+        value = rp2350_atomic_apply(addr, old, value);
+    }
+    return memory_region_dispatch_write(opaque, reg, value, size_memop(size),
+                                        attrs);
+}
+
+static const MemoryRegionOps rp2350_alias_ops = {
+    .read_with_attrs = rp2350_alias_read,
+    .write_with_attrs = rp2350_alias_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
 };
 
 /*
@@ -277,6 +320,27 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         }
     }
 
+    /* [spec:nuos:req:emu.uart] */
+    for (i = 0; i < RP2350_NUM_UARTS; i++) {
+        static const hwaddr base[] = { RP2350_UART0_BASE, RP2350_UART1_BASE };
+        static const int irq[] = { RP2350_UART0_IRQ, RP2350_UART1_IRQ };
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->uart[i]);
+
+        qdev_prop_set_chr(DEVICE(sbd), "chardev", serial_hd(i));
+        qdev_connect_clock_in(DEVICE(sbd), "clk", s->sysclk);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        memory_region_init_io(&s->uart_alias[i], obj, &rp2350_alias_ops,
+                              sysbus_mmio_get_region(sbd, 0),
+                              i ? "rp2350-uart1" : "rp2350-uart0",
+                              RP2350_ATOMIC_REGION_SIZE);
+        memory_region_add_subregion(s->board_memory, base[i],
+                                    &s->uart_alias[i]);
+        /* Output 0 is the PL011's combined UARTINTR. */
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(dev_soc, irq[i]));
+    }
+
     for (i = 0; i < ARRAY_SIZE(rp2350_peripherals); i++) {
         create_unimplemented_device(rp2350_peripherals[i].name,
                                     rp2350_peripherals[i].base,
@@ -302,6 +366,9 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "pll_sys", &s->pll_sys, TYPE_RP2350_PLL);
     object_initialize_child(obj, "pll_usb", &s->pll_usb, TYPE_RP2350_PLL);
     object_initialize_child(obj, "ticks", &s->ticks, TYPE_RP2350_TICKS);
+    for (i = 0; i < RP2350_NUM_UARTS; i++) {
+        object_initialize_child(obj, "uart[*]", &s->uart[i], TYPE_PL011);
+    }
 
     qdev_init_gpio_in(DEVICE(s), rp2350_soc_set_irq, RP2350_NUM_IRQS);
 

@@ -11,6 +11,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/arm/armv7m.h"
+#include "hw/char/pl011.h"
 #include "hw/core/clock.h"
 #include "hw/misc/rp2350_clocks.h"
 #include "hw/misc/rp2350_resets.h"
@@ -23,6 +24,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 
 #define RP2350_NUM_CORES 2
 #define RP2350_NUM_IRQS 52
+#define RP2350_NUM_UARTS 2
 #define RP2350_MPU_REGIONS 8
 
 /*
@@ -70,6 +72,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_CLOCKS_BASE 0x40010000
 #define RP2350_RESETS_BASE 0x40020000
 #define RP2350_XOSC_BASE 0x40048000
+#define RP2350_UART0_BASE 0x40070000
+#define RP2350_UART1_BASE 0x40078000
 #define RP2350_PLL_SYS_BASE 0x40050000
 #define RP2350_PLL_USB_BASE 0x40058000
 #define RP2350_TICKS_BASE 0x40108000
@@ -91,6 +95,9 @@ struct RP2350State {
     RP2350ClkRegsState pll_sys;
     RP2350ClkRegsState pll_usb;
     RP2350ClkRegsState ticks;
+    PL011State uart[RP2350_NUM_UARTS];
+    /* The UARTs' register windows plus their atomic aliases. */
+    MemoryRegion uart_alias[RP2350_NUM_UARTS];
     /* Core 0's SIO views as seen from system memory (debug, qtest). */
     MemoryRegion sio_sysmem[2];
 
