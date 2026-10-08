@@ -941,10 +941,41 @@ typedef struct {
  *
  * An ARM CPU core.
  */
+/*
+ * M-profile implementation-defined coprocessors 0..7 (for example the
+ * RP2350 redundancy coprocessor on cp7). A board attaches a handler to a
+ * core with arm_m_set_coprocessor(); MCR, MRC, MCRR, MRRC, CDP, LDC and
+ * STC to that coprocessor (and their "2" forms) then call it once the
+ * CPACR/NSACR access checks pass, instead of taking a NOCP fault.
+ *
+ * The handler gets the instruction, the values of Rt and Rt2 (bits 15:12
+ * and 19:16), and whether the core is in Secure state. For MRC it sets
+ * *result, which goes to Rt or, for Rt == 15, to APSR.NZCV. It is called
+ * with the BQL held.
+ */
+typedef enum ARMMCoprocResult {
+    ARM_M_COPROC_OK,
+    /* UNDEFINSTR UsageFault */
+    ARM_M_COPROC_UNDEF,
+    /* Stall: the core halts and retries the instruction when woken. */
+    ARM_M_COPROC_STALL,
+} ARMMCoprocResult;
+
+typedef ARMMCoprocResult ARMMCoprocFn(void *opaque, ARMCPU *cpu,
+                                      uint32_t insn, uint32_t rt,
+                                      uint32_t rt2, bool secure,
+                                      uint32_t *result);
+
+#define ARM_M_NUM_COPROC 8
+
 struct ArchCPU {
     CPUState parent_obj;
 
     CPUARMState env;
+
+    /* M-profile implementation-defined coprocessors; see ARMMCoprocFn. */
+    ARMMCoprocFn *m_coproc_fn[ARM_M_NUM_COPROC];
+    void *m_coproc_opaque[ARM_M_NUM_COPROC];
 
     /* Coprocessor information */
     GHashTable *cp_regs;
@@ -1258,6 +1289,15 @@ void gt_rme_post_el_change(ARMCPU *cpu, void *opaque);
 #define ARM64_AFFINITY_INVALID (~ARM64_AFFINITY_MASK)
 
 uint64_t arm_build_mp_affinity(int idx, uint8_t clustersz);
+
+/* Attach an implementation-defined coprocessor to an M-profile core. */
+static inline void arm_m_set_coprocessor(ARMCPU *cpu, int cp,
+                                         ARMMCoprocFn *fn, void *opaque)
+{
+    assert(cp >= 0 && cp < ARM_M_NUM_COPROC);
+    cpu->m_coproc_fn[cp] = fn;
+    cpu->m_coproc_opaque[cp] = opaque;
+}
 
 #ifndef CONFIG_USER_ONLY
 extern const VMStateDescription vmstate_arm_cpu;

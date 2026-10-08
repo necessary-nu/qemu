@@ -723,6 +723,35 @@ static bool trans_VSTR_sysreg(DisasContext *s, arg_vldr_sysreg *a)
     return gen_M_fp_sysreg_read(s, a->reg, fp_sysreg_to_memory, a);
 }
 
+/*
+ * An instruction for an implementation-defined coprocessor with an
+ * ARMMCoprocFn attached: the helper does the access checks and calls it.
+ */
+static bool gen_m_coproc(DisasContext *s)
+{
+    uint32_t insn = s->insn;
+    int rt = extract32(insn, 12, 4);
+    int rt2 = extract32(insn, 16, 4);
+    /* MRC/MRC2: 111x 1110 xxx1 xxxx xxxx xxxx xxx1 xxxx */
+    bool is_mrc = (insn & 0x0f100010) == 0x0e100010;
+    TCGv_i32 a = rt == 15 ? tcg_constant_i32(0) : load_reg(s, rt);
+    TCGv_i32 b = rt2 == 15 ? tcg_constant_i32(0) : load_reg(s, rt2);
+    TCGv_i32 result = tcg_temp_new_i32();
+
+    gen_update_pc(s, 0);
+    gen_helper_m_coproc(result, tcg_env, tcg_constant_i32(insn), a, b);
+    if (is_mrc) {
+        if (rt == 15) {
+            gen_set_nzcv(result);
+        } else {
+            store_reg(s, rt, result);
+        }
+    }
+    /* The coprocessor may have raised an interrupt (e.g. NMI). */
+    s->base.is_jmp = DISAS_UPDATE_EXIT;
+    return true;
+}
+
 static bool trans_NOCP(DisasContext *s, arg_nocp *a)
 {
     /*
@@ -732,6 +761,10 @@ static bool trans_NOCP(DisasContext *s, arg_nocp *a)
      * and the real VFP/etc decode will handle the insn.
      */
     assert(arm_dc_feature(s, ARM_FEATURE_M));
+
+    if (a->cp < ARM_M_NUM_COPROC && (s->m_coproc & (1 << a->cp))) {
+        return gen_m_coproc(s);
+    }
 
     if (a->cp == 11) {
         a->cp = 10;

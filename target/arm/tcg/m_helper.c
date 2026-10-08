@@ -13,6 +13,7 @@
 #include "cpu-features.h"
 #include "gdbstub/helpers.h"
 #include "qemu/main-loop.h"
+#include "accel/tcg/cpu-loop.h"
 #include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "exec/page-protection.h"
@@ -68,6 +69,64 @@ uint32_t arm_v7m_mrs_control(CPUARMState *env, uint32_t secure)
         value |= env->v7m.control[M_REG_S] & R_V7M_CONTROL_FPCA_MASK;
     }
     return value;
+}
+
+/*
+ * An instruction for an implementation-defined coprocessor with an
+ * ARMMCoprocFn attached. Access checks follow the Armv8-M rules for
+ * coprocessors 0..7: NSACR gates Non-secure access (the NOCP fault then
+ * goes to Secure state), and the CPACR of the current security state
+ * gates privileged and unprivileged access.
+ */
+uint32_t HELPER(m_coproc)(CPUARMState *env, uint32_t insn, uint32_t rt,
+                          uint32_t rt2)
+{
+    ARMCPU *cpu = env_archcpu(env);
+    CPUState *cs = CPU(cpu);
+    int cp = extract32(insn, 8, 4);
+    bool secure = env->v7m.secure;
+    bool priv = arm_current_el(env) != 0;
+    bool locked = bql_locked();
+    uint32_t result = 0;
+    ARMMCoprocResult r;
+
+    if (!secure && !extract32(env->v7m.nsacr, cp, 1)) {
+        raise_exception_ra(env, EXCP_NOCP, 0, 3, GETPC());
+    }
+    switch (extract32(env->v7m.cpacr[secure], cp * 2, 2)) {
+    case 1:
+        if (priv) {
+            break;
+        }
+        /* fall through */
+    case 0:
+    case 2:
+        raise_exception_ra(env, EXCP_NOCP, 0, 1, GETPC());
+    default:
+        break;
+    }
+
+    if (!locked) {
+        bql_lock();
+    }
+    r = cpu->m_coproc_fn[cp](cpu->m_coproc_opaque[cp], cpu, insn, rt, rt2,
+                             secure, &result);
+    if (!locked) {
+        bql_unlock();
+    }
+
+    switch (r) {
+    case ARM_M_COPROC_UNDEF:
+        raise_exception_ra(env, EXCP_UDEF, syn_uncategorized(),
+                           exception_target_el(env), GETPC());
+    case ARM_M_COPROC_STALL:
+        cs->exception_index = EXCP_HLT;
+        cs->halted = 1;
+        cpu_loop_exit_restore(cs, GETPC());
+    default:
+        break;
+    }
+    return result;
 }
 
 #ifdef CONFIG_USER_ONLY

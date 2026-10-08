@@ -6395,6 +6395,12 @@ static void arm_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
 
     dc->isar = &cpu->isar;
     dc->condjmp = 0;
+    dc->m_coproc = 0;
+    for (int i = 0; i < ARM_M_NUM_COPROC; i++) {
+        if (cpu->m_coproc_fn[i]) {
+            dc->m_coproc |= 1 << i;
+        }
+    }
     dc->pc_save = dc->base.pc_first;
     dc->aarch64 = false;
     dc->thumb = EX_TBFLAG_AM32(tb_flags, THUMB);
