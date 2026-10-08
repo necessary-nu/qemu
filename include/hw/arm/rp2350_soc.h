@@ -21,6 +21,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 
 #define RP2350_NUM_CORES 2
 #define RP2350_NUM_IRQS 52
+#define RP2350_MPU_REGIONS 8
 
 /*
  * IRQ numbers, from the pico-sdk intctrl.h. Peripheral models connect to

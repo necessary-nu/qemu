@@ -180,6 +180,10 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         qdev_prop_set_string(armv7m, "cpu-type",
                              ARM_CPU_TYPE_NAME("cortex-m33"));
         qdev_prop_set_uint32(armv7m, "init-svtor", s->init_svtor);
+        /* QEMU's Cortex-M33 defaults to 16 regions; the RP2350 has 8 each. */
+        /* [spec:nuos:req:emu.mpu] */
+        qdev_prop_set_uint32(armv7m, "mpu-s-regions", RP2350_MPU_REGIONS);
+        qdev_prop_set_uint32(armv7m, "mpu-ns-regions", RP2350_MPU_REGIONS);
         /*
          * On hardware the boot ROM holds core 1 until core 0 launches it
          * through the SIO FIFO. Without that path modelled, core 1 stays
