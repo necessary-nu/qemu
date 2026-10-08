@@ -141,7 +141,7 @@ static void rp2350_set_flash_size(Object *obj, Visitor *v, const char *name,
 
 /*
  * The machine as a whole is what runs unmodified pico-sdk programs; see
- * emu/tests/run-pico-conformance.sh in nuos.
+ * emu/tests/run-pico-conformance.sh in NuOS.
  */
 /* [spec:nuos:req:emu.pico-sdk] */
 static void rp2350_machine_class_init(ObjectClass *oc, const void *data)
