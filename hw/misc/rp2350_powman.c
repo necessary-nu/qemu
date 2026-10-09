@@ -49,8 +49,11 @@
  * CLOCKS stage or earlier, they become RESET_PSM (the full PSM sequence),
  * RESET_SWCORE or RESET_POWMAN(_ASYNC) chip resets, each with its own
  * CHIP_RESET reason and the datasheet's set of what survives. A glitch
- * detector trigger latches HAD_GLITCH_DETECT and keeps the power manager's
- * state across the reset the detector requests.
+ * detector trigger is a chip-level reset of the PSM and the watchdog only:
+ * it latches HAD_GLITCH_DETECT and runs the full PSM sequence, leaving the
+ * power manager, the power state, the AON timer and every block outside
+ * the PSM's and RESETS' reach (SRAM contents, the detector's own
+ * registers) as they were.
  *
  * The AON timer counts ticks of its source: the LPOSC (an ideal oscillator
  * at the lposc-hz property, which matches the OTP LPOSC_CALIB row), the
@@ -309,7 +312,6 @@ typedef enum PowmanReset {
     RESET_WATCHDOG_POWMAN,
     RESET_WATCHDOG_SWCORE,
     RESET_SWCORE_PD,
-    RESET_GLITCH,
     /* Not a reset reason: the switched core lost power entering P1.x. */
     RESET_SWCORE_OFF,
 } PowmanReset;
@@ -322,7 +324,6 @@ static const uint32_t powman_reset_reason[] = {
     [RESET_WATCHDOG_POWMAN] = CHIP_RESET_HAD_WATCHDOG_RESET_POWMAN,
     [RESET_WATCHDOG_SWCORE] = CHIP_RESET_HAD_WATCHDOG_RESET_SWCORE,
     [RESET_SWCORE_PD] = CHIP_RESET_HAD_SWCORE_PD,
-    [RESET_GLITCH] = CHIP_RESET_HAD_GLITCH_DETECT,
     [RESET_SWCORE_OFF] = 0,
 };
 
@@ -1531,6 +1532,21 @@ static void powman_gpio_in(void *opaque, int n, int level)
 }
 
 /*
+ * A chip-level reset that resets the PSM and leaves the power manager and
+ * the switched core's power alone: it records `reason` and moves
+ * BOOTDIS.NEXT to NOW, as every reset of the PSM through the power
+ * manager does, then runs the PSM's full sequence.
+ */
+static void powman_psm_reset(RP2350PowmanState *s, uint32_t reason)
+{
+    s->chip_reset = (s->chip_reset & ~CHIP_RESET_HAD_MASK) | reason;
+    if (s->bootdis & BOOTDIS_NEXT) {
+        s->bootdis = BOOTDIS_NOW;
+    }
+    qemu_irq_pulse(s->psm_reset);
+}
+
+/*
  * The watchdog's reset request. POWMAN acts on it only when WDSEL selects
  * a chip-level reset and the PSM's WDSEL reaches at least the CLOCKS
  * stage; otherwise it is the PSM's to carry out.
@@ -1557,23 +1573,25 @@ static void powman_watchdog(void *opaque, int n, int level)
         powman_chip_reset(s, RESET_WATCHDOG_SWCORE,
                           SHUTDOWN_CAUSE_GUEST_RESET);
     } else {
-        /* The full PSM sequence; everything else carries on. */
-        s->chip_reset = (s->chip_reset & ~CHIP_RESET_HAD_MASK) |
-                        CHIP_RESET_HAD_WATCHDOG_RESET_PSM;
-        if (s->bootdis & BOOTDIS_NEXT) {
-            s->bootdis = BOOTDIS_NOW;
-        }
-        qemu_irq_pulse(s->psm_reset);
+        powman_psm_reset(s, CHIP_RESET_HAD_WATCHDOG_RESET_PSM);
     }
 }
 
+/*
+ * An armed glitch detector trigger. Like the watchdog's RESET_PSM it runs
+ * the full PSM sequence, which resets the processors and, through the
+ * RESETS block, every subsystem; it also resets the watchdog, scratch
+ * registers included. The switched core stays powered and the power
+ * manager, the AON timer and the power state are untouched.
+ */
 /* [spec:nuos:req:emu.powman] */
 static void powman_glitch_reset(void *opaque, int n, int level)
 {
     RP2350PowmanState *s = opaque;
 
     if (level) {
-        s->next_reset = RESET_GLITCH;
+        qemu_irq_pulse(s->watchdog_reset);
+        powman_psm_reset(s, CHIP_RESET_HAD_GLITCH_DETECT);
     }
 }
 
@@ -1733,6 +1751,8 @@ static void rp2350_powman_init(Object *obj)
     qdev_init_gpio_out_named(dev, &s->psm_watchdog,
                              RP2350_POWMAN_PSM_WATCHDOG, 1);
     qdev_init_gpio_out_named(dev, &s->psm_reset, RP2350_POWMAN_PSM_RESET, 1);
+    qdev_init_gpio_out_named(dev, &s->watchdog_reset,
+                             RP2350_POWMAN_WATCHDOG_RESET, 1);
     /* The first reset is the power-on reset. */
     s->next_reset = RESET_POR;
 }

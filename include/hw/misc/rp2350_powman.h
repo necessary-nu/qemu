@@ -53,12 +53,16 @@ enum {
  *   "psm-reset"     pulsed to run the PSM's full sequence (a chip-level
  *                   reset that leaves the power manager and switched core
  *                   alone)
+ *   "watchdog-reset" pulsed to reset the watchdog, scratch registers
+ *                   included, in a chip-level reset carried out without a
+ *                   system reset (a glitch detector trigger)
  */
 #define RP2350_POWMAN_WATCHDOG "watchdog"
 #define RP2350_POWMAN_GLITCH_RESET "glitch-reset"
 #define RP2350_POWMAN_GPIO "gpio"
 #define RP2350_POWMAN_PSM_WATCHDOG "psm-watchdog"
 #define RP2350_POWMAN_PSM_RESET "psm-reset"
+#define RP2350_POWMAN_WATCHDOG_RESET "watchdog-reset"
 
 /*
  * What the power manager asks of the rest of the chip. The switched core
@@ -84,6 +88,7 @@ struct RP2350PowmanState {
     qemu_irq irq[2];
     qemu_irq psm_watchdog;
     qemu_irq psm_reset;
+    qemu_irq watchdog_reset;
     /* Sequencer steps, and polling the processors while WAITING. */
     QEMUTimer *seq_timer;
     QEMUTimer *alarm_timer;
@@ -180,11 +185,13 @@ bool rp2350_powman_domain_on(RP2350PowmanState *s, int domain);
 
 /*
  * The QEMU reset type of the next system reset. The power manager's own
- * chip-level resets (the switched core's, a watchdog's through WDSEL, a
- * glitch detector's) leave the always-on domain, such as the pad
- * isolation latches, and the memory power domains, such as Boot RAM,
- * powered: they are RESET_TYPE_WAKEUP, which devices holding such state
- * survive. Power-on, brownout and RUN pin resets are RESET_TYPE_COLD.
+ * chip-level resets (the switched core's, a watchdog's through WDSEL)
+ * leave the always-on domain, such as the pad isolation latches, and the
+ * memory power domains, such as Boot RAM, powered: they are
+ * RESET_TYPE_WAKEUP, which devices holding such state survive. Power-on,
+ * brownout and RUN pin resets are RESET_TYPE_COLD. A glitch detector
+ * trigger is no system reset at all: the power manager resets the PSM and
+ * the watchdog.
  */
 ResetType rp2350_powman_next_reset_type(RP2350PowmanState *s);
 

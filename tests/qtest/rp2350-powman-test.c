@@ -691,11 +691,34 @@ static void test_glitch_reset(void)
     wr(qts, BOOTDIS, 0);
     g_assert_cmphex(rd(qts, BOOTDIS), ==, BOOTDIS_NEXT);
 
+    qtest_writel(qts, POWMAN + BOOT(2), 0xb007c0d3);
+    wr(qts, TIMER, TIMER_RUN);
+    wr(qts, WDSEL, WDSEL_RESET_SWCORE);
+    wr(qts, CHIP_RESET, DOUBLE_TAP);
+    qtest_writel(qts, WD_SCRATCH(3), 0x12345678);
+    qtest_writel(qts, PSM_WDSEL, PSM_ALL);
+    qtest_writel(qts, SRAM0_WORD, 0x5a5aa5a5);
+
+    /*
+     * The trigger resets the PSM and the watchdog, through the power
+     * manager; it is not a system reset of the whole switched core.
+     */
     qtest_writel(qts, GD_ARM, 0x1234);
     qtest_writel(qts, GD_TRIG_FORCE, 0x1);
-    qtest_qmp_eventwait(qts, "RESET");
-    g_assert_cmphex(rd(qts, CHIP_RESET), ==, HAD_GLITCH_DETECT);
+    g_assert_cmphex(rd(qts, CHIP_RESET), ==, HAD_GLITCH_DETECT | DOUBLE_TAP);
+    g_assert_cmphex(qtest_readl(qts, PSM_WDSEL), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, RP2350_RESETS_RESET_DONE), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, WD_SCRATCH(3)), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, WD_REASON), ==, 0);
+
+    /* The power manager, its timer and the power state carry on. */
     g_assert_cmphex(rd(qts, SCRATCH(7)), ==, 0x0badcafe);
+    g_assert_cmphex(rd(qts, BOOT(2)), ==, 0xb007c0d3);
+    g_assert_cmphex(rd(qts, WDSEL), ==, WDSEL_RESET_SWCORE);
+    g_assert_cmphex(rd(qts, TIMER) & TIMER_RUN, ==, TIMER_RUN);
+    g_assert_cmphex(rd(qts, STATE), ==, 0);
+    /* SRAM is not reset by the PSM. */
+    g_assert_cmphex(qtest_readl(qts, SRAM0_WORD), ==, 0x5a5aa5a5);
     /* Powman reset the PSM, moving BOOTDIS.NEXT to NOW. */
     g_assert_cmphex(rd(qts, BOOTDIS), ==, BOOTDIS_NOW);
     wr(qts, BOOTDIS, BOOTDIS_NOW);

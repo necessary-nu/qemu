@@ -61,8 +61,8 @@ struct RP2350GlitchDetectorState {
 
     MemoryRegion iomem;
     /*
-     * Pulsed when an armed detector trigger resets the chip, for the
-     * power manager's CHIP_RESET.HAD_GLITCH_DETECT latch.
+     * Pulsed when an armed detector trigger resets the chip: the power
+     * manager carries out the reset and latches CHIP_RESET.HAD_GLITCH_DETECT.
      */
     qemu_irq chip_reset;
 
@@ -74,8 +74,6 @@ struct RP2350GlitchDetectorState {
     uint32_t sensitivity;
     uint32_t lock;
     uint32_t trig_status;
-    /* The pending system reset was requested by a detector trigger. */
-    bool reset_pending;
 };
 
 struct RP2350DFTState {
