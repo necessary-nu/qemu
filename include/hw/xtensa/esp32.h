@@ -14,6 +14,7 @@
 #include "hw/misc/esp32_sha.h"
 #include "hw/misc/esp32_aes.h"
 #include "hw/misc/esp32_ledc.h"
+#include "hw/misc/esp32_rmt.h"
 #include "hw/misc/esp32_rsa.h"
 #include "hw/timer/esp32_frc_timer.h"
 #include "hw/timer/esp32_timg.h"
@@ -102,6 +103,7 @@ struct Esp32SocState {
     Esp32AesState aes;
     Esp32RsaState rsa;
     Esp32LEDCState ledc;
+    Esp32RmtState rmt;
     Esp32EfuseState efuse;
     Esp32FlashEncryptionState flash_enc;
     ESPRgbState rgb;
@@ -126,6 +128,8 @@ struct Esp32SocState {
     Clock *frc_apb_clk[ESP32_FRC_COUNT];
     Clock *timg_apb_clk[ESP32_TIMG_COUNT];
     Clock *spi_dma_clk[ESP32_SPI_DMA_COUNT];
+    Clock *rmt_apb_clk;
+    Clock *rmt_ref_tick_clk;
     /* APB_CLK to the GPIO block's sigma-delta modulators, never gated */
     Clock *gpio_apb_clk;
 

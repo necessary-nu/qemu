@@ -200,6 +200,7 @@ static void esp32_soc_reset(DeviceState *dev)
         device_cold_reset(DEVICE(&s->twai));
         device_cold_reset(DEVICE(&s->efuse));
         device_cold_reset(DEVICE(&s->ledc));
+        device_cold_reset(DEVICE(&s->rmt));
         device_cold_reset(DEVICE(&s->sha));
         device_cold_reset(DEVICE(&s->rng));
         device_cold_reset(DEVICE(&s->sdmmc));
@@ -802,6 +803,37 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                ESP32_GATE_PERIP, R_DPORT_PERIP_LEDC_MASK,
                                R_DPORT_PERIP_LEDC_MASK);
 
+    /*
+     * [spec:nuos:req:emu.esp32.rmt]
+     * The RMT, behind its DPORT bit, on APB_CLK and REF_TICK. Its channels
+     * reach the pads through the GPIO matrix as RMT_SIG_OUTn and
+     * RMT_SIG_INn.
+     */
+    qdev_realize(DEVICE(&s->rmt), &s->periph_bus, &error_fatal);
+    {
+        Esp32PeriphGate *g = esp32_soc_add_gated_device(
+            s, &s->rmt, DR_REG_RMT_BASE, ESP32_GATE_PERIP,
+            R_DPORT_PERIP_RMT_MASK, R_DPORT_PERIP_RMT_MASK);
+
+        g->apb_clk = s->rmt_apb_clk;
+        g->ref_tick_clk = s->rmt_ref_tick_clk;
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->rmt), 0,
+                           qdev_get_gpio_in(intmatrix_dev,
+                                            ETS_RMT_INTR_SOURCE));
+        for (int i = 0; i < ESP32_RMT_CHANNELS; i++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->rmt), ESP32_RMT_SIG_OUT, i,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->gpio),
+                                            ESP32_GPIO_SIG_OUT,
+                                            ESP32_SIG_RMT_OUT0 + i));
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_IN,
+                                        ESP32_SIG_RMT_IN0 + i,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->rmt),
+                                            ESP32_RMT_SIG_IN, i));
+        }
+    }
+
     qdev_realize(DEVICE(&s->apb_ctrl), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->apb_ctrl, DR_REG_APB_CTRL_BASE);
     qdev_connect_gpio_out_named(DEVICE(&s->apb_ctrl),
@@ -1114,7 +1146,6 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.slchost", DR_REG_SLCHOST_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s0", DR_REG_I2S_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.rmt", DR_REG_RMT_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.pcnt", DR_REG_PCNT_BASE, 0x1000);
 
     qemu_register_reset((QEMUResetHandler*) esp32_soc_reset, dev);
@@ -1246,6 +1277,11 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "aes", &s->aes, TYPE_ESP32_AES);
 
     object_initialize_child(obj, "ledc", &s->ledc, TYPE_ESP32_LEDC);
+    object_initialize_child(obj, "rmt", &s->rmt, TYPE_ESP32_RMT);
+    s->rmt_apb_clk = clock_new(obj, "rmt-apb");
+    qdev_connect_clock_in(DEVICE(&s->rmt), "apb", s->rmt_apb_clk);
+    s->rmt_ref_tick_clk = clock_new(obj, "rmt-ref");
+    qdev_connect_clock_in(DEVICE(&s->rmt), "ref_tick", s->rmt_ref_tick_clk);
 
     object_initialize_child(obj, "rsa", &s->rsa, TYPE_ESP32_RSA);
 
