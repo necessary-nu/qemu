@@ -14,6 +14,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/registerfields.h"
 #include "hw/core/clock.h"
+#include "qemu/notify.h"
 
 #define TYPE_ESP32_GPIO "esp32.gpio"
 #define ESP32_GPIO(obj)             OBJECT_CHECK(Esp32GpioState, (obj), TYPE_ESP32_GPIO)
@@ -86,19 +87,71 @@ REG32(GPIO_STRAP, 0x0038)
 #define ESP32_GPIO_PAD_RELEASE  "esp32-gpio-pad-release"
 #define ESP32_GPIO_PAD_OUT      "esp32-gpio-pad"
 
-/* GPIO matrix signal indices used by the SoC's connections */
+/*
+ * GPIO matrix signal indices used by the SoC's connections. A peripheral
+ * line with the same number in and out (U0RXD_in and U0TXD_out, ...) shares
+ * one constant.
+ */
 #define ESP32_SIG_SPICS0        5
 #define ESP32_SIG_HSPICS0       11
 #define ESP32_SIG_U0RXD_IN      14
 #define ESP32_SIG_U0TXD_OUT     14
+#define ESP32_SIG_U0CTS_IN      15
+#define ESP32_SIG_U0RTS_OUT     15
+#define ESP32_SIG_U0DSR_IN      16
+#define ESP32_SIG_U0DTR_OUT     16
+#define ESP32_SIG_U1RXD_IN      17
+#define ESP32_SIG_U1TXD_OUT     17
+#define ESP32_SIG_U1CTS_IN      18
+#define ESP32_SIG_U1RTS_OUT     18
+#define ESP32_SIG_I2CEXT0_SCL   29
+#define ESP32_SIG_I2CEXT0_SDA   30
 #define ESP32_SIG_HSPICS1       61
 #define ESP32_SIG_HSPICS2       62
 #define ESP32_SIG_VSPICS0       68
 #define ESP32_SIG_VSPICS1       69
 #define ESP32_SIG_VSPICS2       70
+/* LEDC_HS_SIG_OUT0-7, then LEDC_LS_SIG_OUT0-7 */
+#define ESP32_SIG_LEDC_HS0      71
+#define ESP32_SIG_TWAI_RX       94
+#define ESP32_SIG_I2CEXT1_SCL   95
+#define ESP32_SIG_I2CEXT1_SDA   96
 #define ESP32_SIG_GPIO_SD0_OUT  100
+#define ESP32_SIG_TWAI_TX       123
+#define ESP32_SIG_TWAI_BUS_OFF  124
+#define ESP32_SIG_TWAI_CLKOUT   125
+#define ESP32_SIG_U2RXD_IN      198
+#define ESP32_SIG_U2TXD_OUT     198
+#define ESP32_SIG_U2CTS_IN      199
+#define ESP32_SIG_U2RTS_OUT     199
 /* GPIO_FUNCn_OUT_SEL: GPIO_OUT and GPIO_ENABLE drive the pad */
 #define ESP32_SIG_GPIO_OUT      256
+
+/*
+ * Line timing.
+ *
+ * Levels move between peripherals, the matrix, the pads and the board as
+ * qemu_irq level changes, which carry no time. A source whose change
+ * belongs to a virtual time other than the present, such as a transmitter
+ * catching up on bits whose time has passed, or a timer callback that runs
+ * late, sets the line with esp32_line_set_at(). Everything that change
+ * reaches synchronously sees its time through esp32_line_time(), which is
+ * the present when no stamped change is being propagated. The matrix is
+ * combinational, so a change keeps its time from source to receiver: a
+ * UART receiver times its bits by these stamps, not by when its handlers
+ * happen to run.
+ *
+ * A source whose output follows a function of time faster than it is
+ * worth timing edge by edge (a PWM output, a clock) registers with
+ * esp32_line_add_source(); esp32_line_sync() asks every such source to
+ * bring its outputs up to the present, and the matrix calls it whenever
+ * software samples the pads, so a sampled pad reads its level at the
+ * virtual time of the sample.
+ */
+int64_t esp32_line_time(void);
+void esp32_line_set_at(qemu_irq line, int level, int64_t when_ns);
+void esp32_line_add_source(Notifier *n);
+void esp32_line_sync(void);
 
 /*
  * The GPIO interrupt's four sources in the interrupt matrix. Each can only
@@ -179,8 +232,21 @@ typedef struct Esp32GpioState {
     bool resync;
     bool updating;
     bool update_pending;
+
+    /* Told after software changes how signals are routed to pads */
+    NotifierList route_notifiers;
 } Esp32GpioState;
 
 typedef struct Esp32GpioClass {
     SysBusDeviceClass parent_class;
 } Esp32GpioClass;
+
+/*
+ * Routing queries, for peripherals whose model has a side that is not a
+ * line (a QEMU bus): the pads output signal sig drives with their output
+ * enabled, and the pad input signal sig takes its level from (-1 when it
+ * takes a constant or its default, or the pad's input is disabled).
+ */
+uint64_t esp32_gpio_sig_out_pads(Esp32GpioState *s, unsigned sig);
+int esp32_gpio_sig_in_pad(Esp32GpioState *s, unsigned sig);
+void esp32_gpio_add_route_notifier(Esp32GpioState *s, Notifier *n);

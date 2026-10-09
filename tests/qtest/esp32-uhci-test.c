@@ -449,11 +449,16 @@ static void test_in_empty(void)
     g_assert_cmphex(rd(qts, DMA_IN_STATUS), ==, 0);
     qtest_memread(qts, RAM + 0x100, buf, 4);
     g_assert_cmpmem(buf, 4, "abcd", 4);
-    /* The stall began at most 100 us before wait_int saw it. */
+    /*
+     * The stall began at most 100 us before wait_int saw it. The terminal
+     * sends at UART0's reset baud rate, 57600 with APB_CLK at 40 MHz, so
+     * "efg" follow within 530 us, each byte into the DMA FIFO restarting
+     * the timeout.
+     */
     g_assert_false(rd(qts, INT_RAW) & INT_TX_HUNG);
     qtest_clock_step(qts, 3000 * US);
     g_assert_false(rd(qts, INT_RAW) & INT_TX_HUNG);
-    qtest_clock_step(qts, 300 * US);
+    qtest_clock_step(qts, 800 * US);
     g_assert_true(rd(qts, INT_RAW) & INT_TX_HUNG);
 
     wr(qts, DMA_IN_POP, 1u << 16);

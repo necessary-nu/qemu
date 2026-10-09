@@ -4,6 +4,7 @@
 #include "target/xtensa/cpu.h"
 #include "hw/misc/esp32_reg.h"
 #include "hw/char/esp32_uart.h"
+#include "hw/char/esp32_uart_terminal.h"
 #include "hw/dma/esp32_uhci.h"
 #include "hw/gpio/esp32_gpio.h"
 #include "hw/misc/esp32_dport.h"
@@ -68,6 +69,7 @@ struct Esp32PeriphGate {
     /* The peripheral's own clocks, driven by the SoC; NULL if it has none */
     Clock *apb_clk;
     Clock *ref_tick_clk;
+    Clock *rc_fast_clk;
 
     unsigned n_windows;
     Esp32GateWindow window[ESP32_GATE_MAX_MR];
@@ -89,6 +91,8 @@ struct Esp32SocState {
     Esp32CrosscoreInt crosscore_int;
     Esp32TWAIState twai;
     ESP32UARTState uart[ESP32_UART_COUNT];
+    /* The board's terminals on the UARTs' default pads, behind -serial */
+    Esp32UartTerminalState terminal[ESP32_UART_COUNT];
     Esp32UhciState uhci[ESP32_UHCI_COUNT];
     Esp32GpioState gpio;
     Esp32RngState rng;
@@ -128,6 +132,10 @@ struct Esp32SocState {
     Clock *spi_dma_clk[ESP32_SPI_DMA_COUNT];
     /* APB_CLK to the GPIO block's sigma-delta modulators, never gated */
     Clock *gpio_apb_clk;
+    Clock *ledc_apb_clk;
+    Clock *ledc_ref_tick_clk;
+    Clock *ledc_rc_fast_clk;
+    Clock *twai_apb_clk;
 
     Esp32PeriphGate gate[ESP32_GATE_MAX];
     unsigned n_gates;
