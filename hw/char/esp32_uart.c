@@ -22,12 +22,133 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/char/esp32_uart.h"
 #include "trace.h"
 
 
-static gboolean uart_transmit(void *do_not_use, GIOCondition cond, void *opaque);
+static gboolean uart_tx_chr_ready(void *do_not_use, GIOCondition cond,
+                                  void *opaque);
 static void uart_receive(void *opaque, const uint8_t *buf, int size);
+static void uart_tx_start(ESP32UARTState *s);
+static void uart_tx_advance(ESP32UARTState *s);
+
+
+/* The UART only operates while the SoC lets its clocks run. */
+static bool uart_running(ESP32UARTState *s)
+{
+    return clock_is_enabled(s->apb_clk);
+}
+
+static bool uart_uses_ref_tick(ESP32UARTState *s)
+{
+    return !FIELD_EX32(s->reg[R_UART_CONF0], UART_CONF0, TICK_REF_ALWAYS_ON);
+}
+
+static Clock *uart_baud_clk(ESP32UARTState *s)
+{
+    return uart_uses_ref_tick(s) ? s->ref_tick_clk : s->apb_clk;
+}
+
+/* The baud divider in 1/16ths: CLKDIV + CLKDIV_FRAG / 16. */
+static uint64_t uart_div16(ESP32UARTState *s)
+{
+    return ((uint64_t)FIELD_EX32(s->reg[R_UART_CLKDIV], UART_CLKDIV, CLKDIV)
+            << 4) + FIELD_EX32(s->reg[R_UART_CLKDIV], UART_CLKDIV, CLKDIV_FRAG);
+}
+
+/* Bits per frame, in half bits: start, data, parity and stop bits. */
+static unsigned uart_frame_half_bits(ESP32UARTState *s)
+{
+    uint32_t conf0 = s->reg[R_UART_CONF0];
+    static const unsigned stop_half_bits[] = { 2, 2, 3, 4 };
+    unsigned bits = 1 + 5 + FIELD_EX32(conf0, UART_CONF0, BIT_NUM) +
+                    FIELD_EX32(conf0, UART_CONF0, PARITY_EN);
+
+    return bits * 2 + stop_half_bits[FIELD_EX32(conf0, UART_CONF0,
+                                                STOP_BIT_NUM)];
+}
+
+/* Frame time at the current baud clock and divider; 0 if it can't run. */
+static uint64_t uart_frame_ns(ESP32UARTState *s)
+{
+    Clock *clk = uart_baud_clk(s);
+    uint64_t div16 = uart_div16(s);
+
+    if (!uart_running(s) || !clock_is_enabled(clk) || div16 == 0) {
+        return 0;
+    }
+    return clock_ticks_to_ns(clk, div16 * uart_frame_half_bits(s)) / 32;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * Baud rate = baud clock * 16 / (CLKDIV * 16 + CLKDIV_FRAG), with the baud
+ * clock at its current frequency. 0 when the UART is stopped or the
+ * divider is 0.
+ */
+static void uart_update_baud(ESP32UARTState *s)
+{
+    Clock *clk = uart_baud_clk(s);
+    uint64_t div16 = uart_div16(s);
+
+    if (!uart_running(s) || !clock_is_enabled(clk) || div16 == 0) {
+        s->baud_rate = 0;
+    } else {
+        s->baud_rate = muldiv64(clock_get_hz(clk), 16, div16);
+    }
+}
+
+/* Stop the frame in flight, keeping how much of it is left to send. */
+static void uart_tx_suspend(ESP32UARTState *s)
+{
+    uint64_t frame_ns = uart_frame_ns(s);
+
+    if (!s->tx_timed) {
+        return;
+    }
+    if (frame_ns) {
+        int64_t left = MAX(s->tx_end_ns -
+                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), 0);
+        s->tx_frame_left = MIN(muldiv64(left, 65536, frame_ns), 65536);
+    }
+    timer_del(&s->tx_timer);
+    s->tx_timed = false;
+}
+
+/* Continue the frame in flight at the current frame time. */
+static void uart_tx_resume(ESP32UARTState *s)
+{
+    uint64_t frame_ns = uart_frame_ns(s);
+
+    if (!s->tx_busy || s->tx_wait_chr || s->tx_timed || !frame_ns) {
+        return;
+    }
+    s->tx_end_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                   muldiv64(frame_ns, s->tx_frame_left, 65536);
+    timer_mod_ns(&s->tx_timer, s->tx_end_ns);
+    s->tx_timed = true;
+}
+
+/* [spec:nuos:req:emu.esp32.clock-gating] */
+static void uart_clk_update(void *opaque, ClockEvent event)
+{
+    ESP32UARTState *s = ESP32_UART(opaque);
+
+    if (event == ClockPreUpdate) {
+        uart_tx_advance(s);
+        uart_tx_suspend(s);
+        return;
+    }
+    uart_update_baud(s);
+    uart_tx_resume(s);
+    uart_tx_start(s);
+    if (uart_running(s)) {
+        qemu_chr_fe_accept_input(&s->chr);
+    } else {
+        timer_del(&s->rx_timeout_timer);
+    }
+}
 
 
 void esp32_uart_update_irq(ESP32UARTState *s)
@@ -36,7 +157,7 @@ void esp32_uart_update_irq(ESP32UARTState *s)
 
     uint32_t tx_empty_raw = (fifo8_num_used(&s->tx_fifo) <= s->tx_empty_threshold);
     uint32_t rx_full_raw = (fifo8_num_used(&s->rx_fifo) >= s->rx_full_threshold);
-    uint32_t tx_done_raw = (fifo8_num_used(&s->tx_fifo) == 0);
+    uint32_t tx_done_raw = (fifo8_num_used(&s->tx_fifo) == 0) && !s->tx_busy;
     uint32_t rxfifo_tout_raw = (s->rxfifo_tout) ? 1 : 0;
 
     uint32_t int_raw = s->reg[R_UART_INT_RAW];
@@ -56,9 +177,19 @@ void esp32_uart_update_irq(ESP32UARTState *s)
 
 void esp32_uart_set_rx_timeout(ESP32UARTState *s)
 {
-    if (s->rx_tout_ena) {
+    if (s->rx_tout_ena && s->baud_rate) {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        int64_t rx_timeout_ns = now + s->rx_tout_thres * NANOSECONDS_PER_SECOND / s->baud_rate;
+        uint64_t thres = s->rx_tout_thres;
+        /*
+         * The timeout counter runs from APB_CLK: with REF_TICK as the baud
+         * clock, the threshold counts bit times scaled by REF_TICK / APB_CLK.
+         */
+        if (uart_uses_ref_tick(s)) {
+            thres = muldiv64(thres, clock_get_hz(s->ref_tick_clk),
+                             MAX(clock_get_hz(s->apb_clk), 1));
+        }
+        int64_t rx_timeout_ns = now +
+            thres * NANOSECONDS_PER_SECOND / s->baud_rate;
         /* If throttling is done, make sure timeout doesn't happen before more data
          * is allowed to come. Offset it by 1ms.
          */
@@ -78,6 +209,7 @@ static uint64_t uart_read(void *opaque, hwaddr addr, unsigned int size)
     ESP32UARTState *s = ESP32_UART(opaque);
     uint64_t r = 0;
 
+    uart_tx_advance(s);
     switch (addr) {
     case A_UART_FIFO:
         if (fifo8_num_used(&s->rx_fifo) == 0) {
@@ -93,6 +225,8 @@ static uint64_t uart_read(void *opaque, hwaddr addr, unsigned int size)
     case A_UART_STATUS:
         r = FIELD_DP32(r, UART_STATUS, RXFIFO_CNT, fifo8_num_used(&s->rx_fifo));
         r = FIELD_DP32(r, UART_STATUS, TXFIFO_CNT, fifo8_num_used(&s->tx_fifo));
+        /* TX_STRT while a frame is on the line, TX_IDLE otherwise */
+        r = FIELD_DP32(r, UART_STATUS, ST_UTX_OUT, s->tx_busy ? 1 : 0);
         break;
 
     case A_UART_LOWPULSE:
@@ -130,13 +264,14 @@ static void uart_write(void *opaque, hwaddr addr,
 {
     ESP32UARTState *s = ESP32_UART(opaque);
 
+    uart_tx_advance(s);
     switch (addr) {
     case A_UART_FIFO:
         if (fifo8_num_free(&s->tx_fifo) == 0) {
             error_report("esp_uart: write to UART FIFO while it is full");
         } else {
             fifo8_push(&s->tx_fifo, (uint8_t) (value & 0xff));
-            uart_transmit(NULL, G_IO_OUT, s);
+            uart_tx_start(s);
         }
         break;
 
@@ -152,18 +287,14 @@ static void uart_write(void *opaque, hwaddr addr,
         s->reg[addr / 4] = value;
         break;
 
-    case A_UART_CLKDIV: {
+    case A_UART_CLKDIV:
+    case A_UART_CONF0:
+        uart_tx_suspend(s);
         s->reg[addr / 4] = value;
-        unsigned clkdiv = (FIELD_EX32(s->reg[R_UART_CLKDIV], UART_CLKDIV, CLKDIV) << 4) +
-                          FIELD_EX32(s->reg[R_UART_CLKDIV], UART_CLKDIV, CLKDIV_FRAG);
-        unsigned baud_rate = 115200;
-        if (clkdiv != 0) {
-            /* FIXME: this should depend on the APB frequency */
-            baud_rate = (unsigned) ((40000000ULL << 4) / clkdiv);
-        }
-        s->baud_rate = baud_rate;
+        uart_update_baud(s);
+        uart_tx_resume(s);
+        uart_tx_start(s);
         break;
-    }
 
     case A_UART_AUTOBAUD:
         /* If autobaud is enabled, pretend that sufficient number of edges on the RXD line
@@ -210,33 +341,101 @@ static void uart_write(void *opaque, hwaddr addr,
 }
 
 
-static gboolean uart_transmit(void *do_not_use, GIOCondition cond, void *opaque)
+/* Take the next byte from the TX FIFO into the shift register at start_ns. */
+static void uart_tx_start_at(ESP32UARTState *s, int64_t start_ns,
+                             uint64_t frame_ns)
+{
+    s->tx_shift = fifo8_pop(&s->tx_fifo);
+    s->tx_busy = true;
+    s->tx_frame_left = 65536;
+    s->tx_end_ns = start_ns + frame_ns;
+    timer_mod_ns(&s->tx_timer, s->tx_end_ns);
+    s->tx_timed = true;
+}
+
+/* Start a frame now if the line is idle, a byte waits and the UART runs. */
+static void uart_tx_start(ESP32UARTState *s)
+{
+    uint64_t frame_ns = uart_frame_ns(s);
+
+    if (s->tx_busy || fifo8_is_empty(&s->tx_fifo) || !frame_ns) {
+        return;
+    }
+    uart_tx_start_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), frame_ns);
+    esp32_uart_update_irq(s);
+}
+
+/*
+ * The frame has been sent: hand the byte to the backend. A backend that
+ * can't take it holds the line until it can, as flow control would; then
+ * this returns false.
+ */
+static bool uart_tx_emit(ESP32UARTState *s)
+{
+    if (qemu_chr_fe_backend_open(&s->chr) &&
+        qemu_chr_fe_write(&s->chr, &s->tx_shift, 1) != 1) {
+        if (!s->tx_watch_handle) {
+            s->tx_watch_handle = qemu_chr_fe_add_watch(&s->chr,
+                                                       G_IO_OUT | G_IO_HUP,
+                                                       uart_tx_chr_ready, s);
+        }
+        if (s->tx_watch_handle) {
+            s->tx_wait_chr = true;
+            return false;
+        }
+        /* A backend that can't be waited on loses the byte. */
+    }
+    return true;
+}
+
+/*
+ * Bring the transmitter up to the present: every frame whose time has
+ * passed has been sent, and the next byte followed it onto the line
+ * without a gap. Register accesses call this first, so what software sees
+ * does not depend on how promptly the timer callback runs.
+ */
+static void uart_tx_advance(ESP32UARTState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    while (s->tx_timed && now >= s->tx_end_ns) {
+        int64_t end = s->tx_end_ns;
+        uint64_t frame_ns;
+
+        timer_del(&s->tx_timer);
+        s->tx_timed = false;
+        if (!uart_tx_emit(s)) {
+            break;
+        }
+        s->tx_busy = false;
+        frame_ns = uart_frame_ns(s);
+        if (!fifo8_is_empty(&s->tx_fifo) && frame_ns) {
+            uart_tx_start_at(s, end, frame_ns);
+        }
+    }
+    esp32_uart_update_irq(s);
+}
+
+static void uart_tx_timer_cb(void *opaque)
+{
+    uart_tx_advance(ESP32_UART(opaque));
+}
+
+static gboolean uart_tx_chr_ready(void *do_not_use, GIOCondition cond,
+                                  void *opaque)
 {
     ESP32UARTState *s = ESP32_UART(opaque);
 
     s->tx_watch_handle = 0;
-
-    /* drain the fifo instantly, if the char device backend is not connected */
-    if (!qemu_chr_fe_backend_open(&s->chr)) {
-        fifo8_reset(&s->tx_fifo);
-        return FALSE;
-    }
-
-    while (fifo8_num_used(&s->tx_fifo) > 0) {
-        uint8_t b = fifo8_peek(&s->tx_fifo);
-        int r = qemu_chr_fe_write(&s->chr, &b, 1);
-        if (r == 1) {
-            fifo8_pop(&s->tx_fifo);
-        } else {
-            s->tx_watch_handle = qemu_chr_fe_add_watch(&s->chr, G_IO_OUT | G_IO_HUP,
-                                                       uart_transmit, s);
-            break;
+    if (s->tx_wait_chr) {
+        s->tx_wait_chr = false;
+        if (uart_tx_emit(s)) {
+            s->tx_busy = false;
+            uart_tx_start(s);
+            esp32_uart_update_irq(s);
         }
     }
-
-    esp32_uart_update_irq(s);
-
-    return FALSE;
+    return G_SOURCE_REMOVE;
 }
 
 static void uart_receive(void *opaque, const uint8_t *buf, int size)
@@ -283,7 +482,7 @@ static void uart_receive(void *opaque, const uint8_t *buf, int size)
 static int uart_can_receive(void *opaque)
 {
     ESP32UARTState *s = ESP32_UART(opaque);
-    if (s->throttle_rx) {
+    if (s->throttle_rx || !uart_running(s) || !s->baud_rate) {
         return 0;
     }
     return fifo8_num_free(&s->rx_fifo);
@@ -321,13 +520,21 @@ static void esp32_uart_reset_hold(Object *obj, ResetType type)
     s->reg[R_UART_AUTOBAUD] = 0;
     /* Default baud rate divider after reset */
     s->reg[R_UART_CLKDIV] = FIELD_DP32(0, UART_CLKDIV, CLKDIV, 0x2B6);
-    s->baud_rate = 115200;
+    s->reg[R_UART_CONF0] = UART_CONF0_RESET;
     fifo8_reset(&s->tx_fifo);
     fifo8_reset(&s->rx_fifo);
     if (s->tx_watch_handle) {
         g_source_remove(s->tx_watch_handle);
         s->tx_watch_handle = 0;
     }
+    timer_del(&s->tx_timer);
+    s->tx_timed = false;
+    s->tx_busy = false;
+    s->tx_wait_chr = false;
+    s->tx_frame_left = 0;
+    timer_del(&s->rx_timeout_timer);
+    s->rxfifo_tout = false;
+    uart_update_baud(s);
     timer_del(&s->throttle_timer);
     s->throttle_rx = false;
     s->rx_tout_ena = false;
@@ -367,6 +574,12 @@ static void esp32_uart_init(Object *obj)
     fifo8_create(&s->rx_fifo, UART_FIFO_LENGTH);
     timer_init_ns(&s->throttle_timer, QEMU_CLOCK_VIRTUAL, uart_throttle_timer_cb, s);
     timer_init_ns(&s->rx_timeout_timer, QEMU_CLOCK_VIRTUAL, uart_rx_timeout_timer_cb, s);
+    timer_init_ns(&s->tx_timer, QEMU_CLOCK_VIRTUAL, uart_tx_timer_cb, s);
+    s->apb_clk = qdev_init_clock_in(DEVICE(obj), "apb", uart_clk_update, s,
+                                    ClockPreUpdate | ClockUpdate);
+    s->ref_tick_clk = qdev_init_clock_in(DEVICE(obj), "ref_tick",
+                                         uart_clk_update, s,
+                                         ClockPreUpdate | ClockUpdate);
 }
 
 

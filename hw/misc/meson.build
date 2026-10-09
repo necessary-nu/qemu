@@ -192,6 +192,7 @@ system_ss.add(when: 'CONFIG_AXIADO_CLK', if_true: files('axiado_clk.c'))
 
 system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
   'esp32_aes.c',
+  'esp32_apb_ctrl.c',
   'esp32_crosscore_int.c',
   'esp32_dport.c',
   'esp32_flash_enc.c',

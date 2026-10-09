@@ -1,6 +1,8 @@
 #pragma once
 
 #include "hw/core/registerfields.h"
+#include "hw/core/clock.h"
+#include "hw/core/sysbus.h"
 
 #define TYPE_ESP32_TIMG "timer.esp32.timg"
 #define ESP32_TIMG(obj) OBJECT_CHECK(Esp32TimgState, (obj), TYPE_ESP32_TIMG)
@@ -86,7 +88,8 @@ typedef struct Esp32TimgState {
 
     uint32_t rtc_slow_freq_hz;
     uint32_t xtal_freq_hz;
-    uint32_t apb_freq_hz;
+    /* APB_CLK, stopped while DPORT gates the group or holds it in reset */
+    Clock *apb_clk;
     bool flash_boot_mode;
     bool wdt_en_at_reset;
     bool wdt_disable;

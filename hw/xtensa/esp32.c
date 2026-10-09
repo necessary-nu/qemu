@@ -22,6 +22,8 @@
 #include "hw/core/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-clock.h"
+#include "qemu/bswap.h"
 #include "hw/xtensa/esp32.h"
 #include "exec/watchpoint.h"
 #include "system/address-spaces.h"
@@ -85,6 +87,9 @@ static const struct MemmapEntry {
 
 
 
+
+static void esp32_soc_update_gates(Esp32SocState *s, bool from_reset);
+static void esp32_soc_update_clocks(Esp32SocState *s);
 
 static void remove_cpu_watchpoints(XtensaCPU* xcs)
 {
@@ -164,6 +169,7 @@ static void esp32_soc_reset(DeviceState *dev)
     }
     if (s->requested_reset & ESP32_SOC_RESET_PERIPH) {
         device_cold_reset(DEVICE(&s->dport));
+        device_cold_reset(DEVICE(&s->apb_ctrl));
         device_cold_reset(DEVICE(&s->intmatrix));
         device_cold_reset(DEVICE(&s->aes));
         device_cold_reset(DEVICE(&s->rsa));
@@ -186,6 +192,10 @@ static void esp32_soc_reset(DeviceState *dev)
         }
         device_cold_reset(DEVICE(&s->twai));
         device_cold_reset(DEVICE(&s->efuse));
+        device_cold_reset(DEVICE(&s->ledc));
+        device_cold_reset(DEVICE(&s->sha));
+        device_cold_reset(DEVICE(&s->rng));
+        device_cold_reset(DEVICE(&s->sdmmc));
         if (s->eth) {
             device_cold_reset(s->eth);
         }
@@ -203,6 +213,8 @@ static void esp32_soc_reset(DeviceState *dev)
         cpu_reset(CPU(&s->cpu[1]));
     }
     s->requested_reset = 0;
+    esp32_soc_update_gates(s, true);
+    esp32_soc_update_clocks(s);
 }
 
 static void esp32_cpu_stall(void* opaque, int n, int level)
@@ -221,28 +233,281 @@ static void esp32_cpu_stall(void* opaque, int n, int level)
     }
 }
 
-static void esp32_clk_update(void* opaque, int n, int level)
+/* TWAI's interrupt register, the SJA1000's IR (register 3): read clears it */
+#define ESP32_TWAI_INT_RAW_OFFSET 0x0c
+
+/* RC_FAST_CLK, the internal 8 MHz oscillator, at its nominal frequency */
+#define ESP32_RC_FAST_HZ 8000000
+/* PLL_CLK-derived CPU_CLK frequencies for CPUPERIOD_SEL 0, 1 and 2 */
+static const uint32_t esp32_pll_cpu_hz[] = { 80000000, 160000000, 240000000 };
+#define ESP32_PLL_APB_HZ 80000000
+/*
+ * APLL_CLK's coefficients are programmed through the analog I2C bus, which
+ * is not modelled. Until it is, the APLL is taken to run at the output of
+ * its formula with every coefficient 0: 40 MHz * 4 / (2 * 2) = 40 MHz.
+ */
+#define ESP32_APLL_UNMODELLED_HZ 40000000
+
+static bool esp32_gate_running(Esp32PeriphGate *g)
 {
-    Esp32SocState *s = ESP32_SOC(opaque);
-    if (!level) {
-        return;
+    return g->clk_on && !g->held;
+}
+
+static void esp32_gate_update_clocks(Esp32SocState *s, Esp32PeriphGate *g)
+{
+    bool running = esp32_gate_running(g);
+
+    if (g->apb_clk) {
+        clock_update_hz(g->apb_clk, running ? s->apb_hz : 0);
+    }
+    if (g->ref_tick_clk) {
+        clock_update_hz(g->ref_tick_clk, running ? s->ref_tick_hz : 0);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * Derive CPU_CLK, APB_CLK and REF_TICK from RTC_CNTL_SOC_CLK_SEL,
+ * DPORT_CPUPERIOD_SEL and the SYSCON dividers (TRM tables 7.2-2, 7.2-4 and
+ * 7.2-5), and pass them to the CPUs and the APB peripherals.
+ */
+static void esp32_soc_update_clocks(Esp32SocState *s)
+{
+    uint32_t sel = s->dport.cpuperiod_sel;
+    uint32_t xtal_hz = s->rtc_cntl.xtal_apb_freq;
+    uint32_t cpu_hz, apb_hz, apll_div;
+
+    switch (s->rtc_cntl.soc_clk) {
+    case ESP32_SOC_CLK_XTAL:
+        cpu_hz = xtal_hz / esp32_apb_ctrl_pre_div(&s->apb_ctrl);
+        apb_hz = cpu_hz;
+        break;
+    case ESP32_SOC_CLK_PLL:
+        if (sel >= ARRAY_SIZE(esp32_pll_cpu_hz)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "esp32: reserved CPUPERIOD_SEL %u with PLL_CLK\n",
+                          sel);
+            sel = 0;
+        }
+        cpu_hz = esp32_pll_cpu_hz[sel];
+        apb_hz = ESP32_PLL_APB_HZ;
+        break;
+    case ESP32_SOC_CLK_8M:
+        cpu_hz = ESP32_RC_FAST_HZ / esp32_apb_ctrl_pre_div(&s->apb_ctrl);
+        apb_hz = cpu_hz;
+        break;
+    case ESP32_SOC_CLK_APLL:
+    default:
+        qemu_log_mask(LOG_UNIMP,
+                      "esp32: APLL coefficients not modelled, APLL_CLK "
+                      "taken as %u Hz\n", ESP32_APLL_UNMODELLED_HZ);
+        if (sel > 1) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "esp32: reserved CPUPERIOD_SEL %u with APLL_CLK\n",
+                          sel);
+        }
+        apll_div = sel == 0 ? 4 : 2;
+        cpu_hz = ESP32_APLL_UNMODELLED_HZ / apll_div;
+        apb_hz = cpu_hz / 2;
+        break;
     }
 
-    /* APB clock */
-    uint32_t apb_clk_freq, cpu_clk_freq;
-    if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_PLL) {
-        const uint32_t cpu_clk_mul[] = {1, 2, 3};
-        apb_clk_freq = s->rtc_cntl.pll_apb_freq;
-        cpu_clk_freq = cpu_clk_mul[s->dport.cpuperiod_sel] * apb_clk_freq;
-    } else {
-        apb_clk_freq = s->rtc_cntl.xtal_apb_freq;
-        cpu_clk_freq = apb_clk_freq;
+    s->apb_hz = apb_hz;
+    s->ref_tick_hz = apb_hz / esp32_apb_ctrl_tick_div(&s->apb_ctrl,
+                                                      s->rtc_cntl.soc_clk);
+    clock_update_hz(s->cpu_clk, cpu_hz);
+    for (unsigned i = 0; i < s->n_gates; i++) {
+        esp32_gate_update_clocks(s, &s->gate[i]);
     }
-    qdev_prop_set_int32(DEVICE(&s->frc_timer), "apb_freq", apb_clk_freq);
-    qdev_prop_set_int32(DEVICE(&s->timg[0]), "apb_freq", apb_clk_freq);
-    qdev_prop_set_int32(DEVICE(&s->timg[1]), "apb_freq", apb_clk_freq);
-    clock_update_hz(s->cpu[0].clock, cpu_clk_freq );
-    clock_update_hz(s->cpu[1].clock, cpu_clk_freq );
+}
+
+static void esp32_clk_update(void *opaque, int n, int level)
+{
+    if (level) {
+        esp32_soc_update_clocks(ESP32_SOC(opaque));
+    }
+}
+
+static uint32_t esp32_gate_clk_reg(Esp32SocState *s, Esp32GateRegs regs)
+{
+    switch (regs) {
+    case ESP32_GATE_PERI:
+        return s->dport.peri_clk_en;
+    case ESP32_GATE_PERIP:
+        return s->dport.perip_clk_en;
+    case ESP32_GATE_WIFI:
+    default:
+        return s->dport.wifi_clk_en;
+    }
+}
+
+static uint32_t esp32_gate_rst_reg(Esp32SocState *s, Esp32GateRegs regs)
+{
+    switch (regs) {
+    case ESP32_GATE_PERI:
+        return s->dport.peri_rst_en;
+    case ESP32_GATE_PERIP:
+        return s->dport.perip_rst_en;
+    case ESP32_GATE_WIFI:
+    default:
+        return s->dport.core_rst_en;
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * Apply DPORT's clock-enable and reset bits. Asserting a peripheral's
+ * reset resets it and holds it there; releasing the reset resets it again,
+ * with its clock running, so that it starts from its reset state. After a
+ * reset of the whole SoC the peripherals have just been reset, so
+ * from_reset only adopts the new state.
+ */
+static void esp32_soc_update_gates(Esp32SocState *s, bool from_reset)
+{
+    for (unsigned i = 0; i < s->n_gates; i++) {
+        Esp32PeriphGate *g = &s->gate[i];
+        uint32_t clk = esp32_gate_clk_reg(s, g->regs);
+        bool held = (esp32_gate_rst_reg(s, g->regs) & g->rst_mask) != 0;
+        bool assert_rst = !from_reset && held && !g->held;
+        bool release_rst = !from_reset && !held && g->held;
+
+        if (assert_rst) {
+            device_cold_reset(g->dev);
+        }
+        g->clk_on = (clk & g->clk_mask) == g->clk_mask;
+        g->held = held;
+        esp32_gate_update_clocks(s, g);
+        if (release_rst) {
+            device_cold_reset(g->dev);
+        }
+    }
+}
+
+static void esp32_periph_clk_update(void *opaque, int n, int level)
+{
+    if (level) {
+        esp32_soc_update_gates(ESP32_SOC(opaque), false);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * Register access through the gate. The TRM does not say how a gated or
+ * reset-held peripheral's registers read; the model takes the hardware's
+ * register flops to keep their values with the clock stopped. Writes are
+ * dropped, as the flops cannot latch them, and reads return the values the
+ * registers hold: their last values, or their reset values while the
+ * peripheral is held in reset. A read that would have a side effect, such
+ * as popping a FIFO, returns 0 and has none.
+ */
+static MemTxResult esp32_gate_read(void *opaque, hwaddr addr, uint64_t *data,
+                                   unsigned size, MemTxAttrs attrs)
+{
+    Esp32GateWindow *w = opaque;
+    Esp32PeriphGate *g = w->gate;
+    uint8_t buf[8];
+    MemTxResult r;
+
+    if (!esp32_gate_running(g) && g->has_volatile_reg && w == &g->window[0] &&
+        addr < g->volatile_reg + 4 && addr + size > g->volatile_reg) {
+        *data = 0;
+        return MEMTX_OK;
+    }
+    r = address_space_read(&w->dev_as, addr, attrs, buf, size);
+    *data = ldn_le_p(buf, size);
+    return r;
+}
+
+static MemTxResult esp32_gate_write(void *opaque, hwaddr addr, uint64_t data,
+                                    unsigned size, MemTxAttrs attrs)
+{
+    Esp32GateWindow *w = opaque;
+    Esp32PeriphGate *g = w->gate;
+    uint8_t buf[8];
+
+    if (!esp32_gate_running(g)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "esp32: write to %s at 0x%" HWADDR_PRIx " while its "
+                      "clock is gated or it is held in reset\n",
+                      object_get_canonical_path_component(OBJECT(g->dev)),
+                      addr);
+        return MEMTX_OK;
+    }
+    stn_le_p(buf, size, data);
+    return address_space_write(&w->dev_as, addr, attrs, buf, size);
+}
+
+static const MemoryRegionOps esp32_gate_ops = {
+    .read_with_attrs = esp32_gate_read,
+    .write_with_attrs = esp32_gate_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+};
+
+/*
+ * Map a register block of a gated peripheral at addr, and, like the other
+ * APB peripherals, at its alias in the 0x60000000 window if apb_alias.
+ */
+static void esp32_gate_map(Esp32PeriphGate *g, MemoryRegion *dev_mr,
+                           hwaddr addr, bool apb_alias)
+{
+    MemoryRegion *sys_mem = get_system_memory();
+    Esp32GateWindow *w;
+    char *name;
+
+    assert(g->n_windows < ESP32_GATE_MAX_MR);
+    w = &g->window[g->n_windows++];
+    w->gate = g;
+    name = g_strdup_printf("%s-gate",
+                           object_get_canonical_path_component(OBJECT(g->dev)));
+    address_space_init(&w->dev_as, dev_mr, name);
+    /*
+     * No owner: an owner's re-entrancy guard would block the forwarded
+     * access to the peripheral's own region, and one shared by all gates
+     * would block a peripheral reaching another through its gate.
+     */
+    memory_region_init_io(&w->iomem, NULL, &esp32_gate_ops, w,
+                          name, memory_region_size(dev_mr));
+    memory_region_add_subregion_overlap(sys_mem, addr, &w->iomem, 0);
+    if (apb_alias) {
+        MemoryRegion *alias = g_new(MemoryRegion, 1);
+        char *alias_name = g_strdup_printf("mr-apb-0x%08x", (uint32_t)addr);
+
+        memory_region_init_alias(alias, NULL, alias_name,
+                                 &w->iomem, 0, memory_region_size(dev_mr));
+        memory_region_add_subregion_overlap(sys_mem,
+                                            addr - DR_REG_DPORT_APB_BASE +
+                                            APB_REG_BASE, alias, 0);
+        g_free(alias_name);
+    }
+    g_free(name);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * Put a realized peripheral's first register block behind DPORT's clock
+ * gate and reset bits.
+ */
+static Esp32PeriphGate *esp32_soc_add_gated_device(Esp32SocState *s,
+                                                   void *dev, hwaddr addr,
+                                                   Esp32GateRegs regs,
+                                                   uint32_t clk_mask,
+                                                   uint32_t rst_mask)
+{
+    Esp32PeriphGate *g;
+
+    assert(s->n_gates < ESP32_GATE_MAX);
+    g = &s->gate[s->n_gates++];
+    g->dev = DEVICE(dev);
+    g->regs = regs;
+    g->clk_mask = clk_mask;
+    g->rst_mask = rst_mask;
+    esp32_gate_map(g, sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0), addr,
+                   true);
+    return g;
 }
 
 static void esp32_soc_add_periph_device(MemoryRegion *dest, void* dev, hwaddr dport_base_addr)
@@ -338,8 +603,14 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_CPU_RESET_GPIO, 1));
     qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_APPCPU_STALL_GPIO, 0,
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_CPU_STALL_GPIO, 1));
-    qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32_DPORT_CLK_UPDATE_GPIO, 0,
-                                qdev_get_gpio_in_named(dev, ESP32_RTC_CLK_UPDATE_GPIO, 0));
+    qdev_connect_gpio_out_named(DEVICE(&s->dport),
+                                ESP32_DPORT_CLK_UPDATE_GPIO, 0,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32_RTC_CLK_UPDATE_GPIO, 0));
+    qdev_connect_gpio_out_named(DEVICE(&s->dport),
+                                ESP32_DPORT_PERIPH_CLK_UPDATE_GPIO, 0,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32_DPORT_PERIPH_CLK_UPDATE_GPIO, 0));
 
     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
         char name[16];
@@ -387,16 +658,28 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     }
 
     qdev_realize(DEVICE(&s->rsa), &s->periph_bus, &error_fatal);
-    esp32_soc_add_periph_device(sys_mem, &s->rsa, DR_REG_RSA_BASE);
+    esp32_soc_add_gated_device(s, &s->rsa, DR_REG_RSA_BASE, ESP32_GATE_PERI,
+                               R_DPORT_PERI_RSA_MASK, R_DPORT_PERI_RSA_MASK);
 
     qdev_realize(DEVICE(&s->sha), &s->periph_bus, &error_fatal);
-    esp32_soc_add_periph_device(sys_mem, &s->sha, DR_REG_SHA_BASE);
+    esp32_soc_add_gated_device(s, &s->sha, DR_REG_SHA_BASE, ESP32_GATE_PERI,
+                               R_DPORT_PERI_SHA_MASK, R_DPORT_PERI_SHA_MASK);
 
     qdev_realize(DEVICE(&s->aes), &s->periph_bus, &error_fatal);
-    esp32_soc_add_periph_device(sys_mem, &s->aes, DR_REG_AES_BASE);
+    esp32_soc_add_gated_device(s, &s->aes, DR_REG_AES_BASE, ESP32_GATE_PERI,
+                               R_DPORT_PERI_AES_MASK, R_DPORT_PERI_AES_MASK);
 
     qdev_realize(DEVICE(&s->ledc), &s->periph_bus, &error_fatal);
-    esp32_soc_add_periph_device(sys_mem, &s->ledc, DR_REG_LEDC_BASE);
+    esp32_soc_add_gated_device(s, &s->ledc, DR_REG_LEDC_BASE,
+                               ESP32_GATE_PERIP, R_DPORT_PERIP_LEDC_MASK,
+                               R_DPORT_PERIP_LEDC_MASK);
+
+    qdev_realize(DEVICE(&s->apb_ctrl), &s->periph_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->apb_ctrl, DR_REG_APB_CTRL_BASE);
+    qdev_connect_gpio_out_named(DEVICE(&s->apb_ctrl),
+                                ESP32_APB_CTRL_CLK_UPDATE_GPIO, 0,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32_RTC_CLK_UPDATE_GPIO, 0));
 
     qdev_realize(DEVICE(&s->rtc_cntl), &s->rtc_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->rtc_cntl, DR_REG_RTCCNTL_BASE);
@@ -417,16 +700,39 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     for (int i = 0; i < ESP32_UART_COUNT; ++i) {
         const hwaddr uart_base[] = {DR_REG_UART_BASE, DR_REG_UART1_BASE, DR_REG_UART2_BASE};
+        const uint32_t uart_bit[] = {
+            R_DPORT_PERIP_UART_MASK, R_DPORT_PERIP_UART1_MASK,
+            R_DPORT_PERIP_UART2_MASK
+        };
+        Esp32PeriphGate *g;
+
         qdev_realize(DEVICE(&s->uart[i]), &s->periph_bus, &error_fatal);
-        esp32_soc_add_periph_device(sys_mem, &s->uart[i], uart_base[i]);
+        /* The UART needs the clock of the FIFO RAM it shares as well. */
+        g = esp32_soc_add_gated_device(s, &s->uart[i], uart_base[i],
+                                       ESP32_GATE_PERIP,
+                                       uart_bit[i] |
+                                       R_DPORT_PERIP_UART_MEM_MASK,
+                                       uart_bit[i]);
+        g->apb_clk = s->uart_apb_clk[i];
+        g->ref_tick_clk = s->uart_ref_tick_clk[i];
+        g->volatile_reg = A_UART_FIFO;
+        g->has_volatile_reg = true;
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart[i]), 0,
                            qdev_get_gpio_in(intmatrix_dev, ETS_UART0_INTR_SOURCE + i));
     }
 
     for (int i = 0; i < ESP32_FRC_COUNT; ++i) {
+        Esp32PeriphGate *g;
+
         qdev_realize(DEVICE(&s->frc_timer[i]), &s->periph_bus, &error_fatal);
 
-        esp32_soc_add_periph_device(sys_mem, &s->frc_timer[i], DR_REG_FRC_TIMER_BASE + i * ESP32_FRC_TIMER_STRIDE);
+        g = esp32_soc_add_gated_device(s, &s->frc_timer[i],
+                                       DR_REG_FRC_TIMER_BASE +
+                                       i * ESP32_FRC_TIMER_STRIDE,
+                                       ESP32_GATE_PERIP,
+                                       R_DPORT_PERIP_TIMERS_MASK,
+                                       R_DPORT_PERIP_TIMERS_MASK);
+        g->apb_clk = s->frc_apb_clk[i];
 
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->frc_timer[i]), 0,
                            qdev_get_gpio_in(intmatrix_dev, ETS_TIMER1_INTR_SOURCE + i));
@@ -436,9 +742,17 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         s->timg[i].id = i;
 
         const hwaddr timg_base[] = {DR_REG_TIMERGROUP0_BASE, DR_REG_TIMERGROUP1_BASE};
+        const uint32_t timg_bit[] = {
+            R_DPORT_PERIP_TIMERGROUP_MASK, R_DPORT_PERIP_TIMERGROUP1_MASK
+        };
+        Esp32PeriphGate *g;
+
         qdev_realize(DEVICE(&s->timg[i]), &s->periph_bus, &error_fatal);
 
-        esp32_soc_add_periph_device(sys_mem, &s->timg[i], timg_base[i]);
+        g = esp32_soc_add_gated_device(s, &s->timg[i], timg_base[i],
+                                       ESP32_GATE_PERIP, timg_bit[i],
+                                       timg_bit[i]);
+        g->apb_clk = s->timg_apb_clk[i];
 
         int timg_level_int[] = { ETS_TG0_T0_LEVEL_INTR_SOURCE, ETS_TG1_T0_LEVEL_INTR_SOURCE };
         int timg_edge_int[] = { ETS_TG0_T0_EDGE_INTR_SOURCE, ETS_TG1_T0_EDGE_INTR_SOURCE };
@@ -458,9 +772,15 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         const hwaddr spi_base[] = {
             DR_REG_SPI0_BASE, DR_REG_SPI1_BASE, DR_REG_SPI2_BASE, DR_REG_SPI3_BASE
         };
+        /* SPI0 (the cache's) and SPI1 share a bit. */
+        const uint32_t spi_bit[] = {
+            R_DPORT_PERIP_SPI01_MASK, R_DPORT_PERIP_SPI01_MASK,
+            R_DPORT_PERIP_SPI2_MASK, R_DPORT_PERIP_SPI3_MASK
+        };
         qdev_realize(DEVICE(&s->spi[i]), &s->periph_bus, &error_fatal);
 
-        esp32_soc_add_periph_device(sys_mem, &s->spi[i], spi_base[i]);
+        esp32_soc_add_gated_device(s, &s->spi[i], spi_base[i],
+                                   ESP32_GATE_PERIP, spi_bit[i], spi_bit[i]);
 
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi[i]), 0,
                            qdev_get_gpio_in(intmatrix_dev, ETS_SPI0_INTR_SOURCE + i));
@@ -470,9 +790,18 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         const hwaddr i2c_base[] = {
             DR_REG_I2C_EXT_BASE, DR_REG_I2C1_EXT_BASE
         };
+        const uint32_t i2c_bit[] = {
+            R_DPORT_PERIP_I2C_EXT0_MASK, R_DPORT_PERIP_I2C_EXT1_MASK
+        };
+        Esp32PeriphGate *g;
+
         qdev_realize(DEVICE(&s->i2c[i]), &s->periph_bus, &error_fatal);
 
-        esp32_soc_add_periph_device(sys_mem, &s->i2c[i], i2c_base[i]);
+        g = esp32_soc_add_gated_device(s, &s->i2c[i], i2c_base[i],
+                                       ESP32_GATE_PERIP, i2c_bit[i],
+                                       i2c_bit[i]);
+        g->volatile_reg = A_I2C_FIFO_DATA;
+        g->has_volatile_reg = true;
 
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2c[i]), 0,
                            qdev_get_gpio_in(intmatrix_dev, ETS_I2C_EXT0_INTR_SOURCE + i));
@@ -483,15 +812,26 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
      * performed before realization of TWAI peripheral.
      */
     qdev_realize(DEVICE(&s->twai), &s->periph_bus, &error_fatal);
-    esp32_soc_add_periph_device(sys_mem, &s->twai, DR_REG_CAN_BASE); 
+    {
+        /* Reading the SJA1000 interrupt register clears it. */
+        Esp32PeriphGate *g = esp32_soc_add_gated_device(
+            s, &s->twai, DR_REG_CAN_BASE, ESP32_GATE_PERIP,
+            R_DPORT_PERIP_TWAI_MASK, R_DPORT_PERIP_TWAI_MASK);
+        g->volatile_reg = ESP32_TWAI_INT_RAW_OFFSET;
+        g->has_volatile_reg = true;
+    }
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->twai), 0,
                        qdev_get_gpio_in(intmatrix_dev, ETS_CAN_INTR_SOURCE));
 
     qdev_realize(DEVICE(&s->rng), &s->periph_bus, &error_fatal);
-    esp32_soc_add_periph_device(sys_mem, &s->rng, ESP32_RNG_BASE);
+    /* The RNG has a clock bit but no reset bit. */
+    esp32_soc_add_gated_device(s, &s->rng, ESP32_RNG_BASE, ESP32_GATE_WIFI,
+                               R_DPORT_WIFI_CLK_EN_RNG_MASK, 0);
 
     qdev_realize(DEVICE(&s->efuse), &s->periph_bus, &error_fatal);
-    esp32_soc_add_periph_device(sys_mem, &s->efuse, DR_REG_EFUSE_BASE);
+    esp32_soc_add_gated_device(s, &s->efuse, DR_REG_EFUSE_BASE,
+                               ESP32_GATE_PERIP, R_DPORT_PERIP_EFUSE_MASK,
+                               R_DPORT_PERIP_EFUSE_MASK);
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->efuse), 0,
                        qdev_get_gpio_in(intmatrix_dev, ETS_EFUSE_INTR_SOURCE));
 
@@ -506,7 +846,10 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                 qdev_get_gpio_in_named(DEVICE(&s->flash_enc), ESP32_FLASH_ENCRYPTION_DEC_EN_GPIO, 0));
 
     qdev_realize(DEVICE(&s->sdmmc), &s->periph_bus, &error_abort);
-    esp32_soc_add_periph_device(sys_mem, &s->sdmmc, DR_REG_SDMMC_BASE);
+    esp32_soc_add_gated_device(s, &s->sdmmc, DR_REG_SDMMC_BASE,
+                               ESP32_GATE_WIFI,
+                               R_DPORT_WIFI_CLK_EN_SDIO_HOST_MASK,
+                               R_DPORT_CORE_RST_EN_SDIO_HOST_MASK);
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdmmc), 0,
                        qdev_get_gpio_in(intmatrix_dev, ETS_SDIO_HOST_INTR_SOURCE));
 
@@ -523,34 +866,10 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.hinf", DR_REG_HINF_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slc", DR_REG_SLC_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slchost", DR_REG_SLCHOST_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.apbctrl", DR_REG_APB_CTRL_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s0", DR_REG_I2S_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rmt", DR_REG_RMT_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.pcnt", DR_REG_PCNT_BASE, 0x1000);
-
-    /* Emulation of a fake register used to mark that the chip is run via QEMU */
-    MemoryRegion *apbctrl_mem = g_new(MemoryRegion, 1);
-    memory_region_init_ram(apbctrl_mem, NULL, "esp32.apbctrl_date_reg", 8 /* bytes */, &error_fatal);
-
-    /* This register is not used in the real hardware (hardwired to 0), but is still accesible, reading
-     * it won't trigger an exception, so we can override it */
-    const hwaddr apb_ctrl_emu_reg = DR_REG_APB_CTRL_BASE + 0x78;
-    /* Store "QEMU" as a 32-bit value */
-    const uint32_t apb_ctrl_emu_val = 0x51454d55;
-    /* The memory region must be added before writing to the CPU memory */
-    memory_region_add_subregion(sys_mem, apb_ctrl_emu_reg, apbctrl_mem);
-    address_space_write(&address_space_memory, apb_ctrl_emu_reg,
-                        MEMTXATTRS_UNSPECIFIED, &apb_ctrl_emu_val, 4);
-
-    /* Emulation of APB_CTRL_DATE_REG, needed for ECO3 revision detection.
-     * This is a small hack to avoid creating a whole new device just to emulate one
-     * register.
-     */
-    const hwaddr apb_ctrl_date_reg = DR_REG_APB_CTRL_BASE + 0x7c;
-    uint32_t apb_ctrl_date_reg_val = 0x16042000 | 0x80000000;  /* MSB indicates ECO3 silicon revision */
-    address_space_write(&address_space_memory, apb_ctrl_date_reg,
-                        MEMTXATTRS_UNSPECIFIED, &apb_ctrl_date_reg_val, 4);
 
     qemu_register_reset((QEMUResetHandler*) esp32_soc_reset, dev);
 }
@@ -568,9 +887,14 @@ static void esp32_soc_init(Object *obj)
     qbus_init(&s->rtc_bus, sizeof(s->rtc_bus),
                         TYPE_SYSTEM_BUS, DEVICE(s), "esp32-rtc-bus");
 
+    /* CPU_CLK after reset: XTAL_CLK, undivided */
+    s->cpu_clk = clock_new(obj, "cpu-clk");
+    clock_set_hz(s->cpu_clk, 40000000);
+
     for (int i = 0; i < ms->smp.cpus; ++i) {
         snprintf(name, sizeof(name), "cpu%d", i);
         object_initialize_child(obj, name, &s->cpu[i], TYPE_ESP32_CPU);
+        qdev_connect_clock_in(DEVICE(&s->cpu[i]), "clk-in", s->cpu_clk);
 
         const uint32_t cpuid[ESP32_CPU_COUNT] = { 0xcdcd, 0xabab };
         s->cpu[i].env.sregs[PRID] = cpuid[i];
@@ -591,6 +915,13 @@ static void esp32_soc_init(Object *obj)
     for (int i = 0; i < ESP32_UART_COUNT; ++i) {
         snprintf(name, sizeof(name), "uart%d", i);
         object_initialize_child(obj, name, &s->uart[i], TYPE_ESP32_UART);
+        snprintf(name, sizeof(name), "uart%d-apb", i);
+        s->uart_apb_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(DEVICE(&s->uart[i]), "apb", s->uart_apb_clk[i]);
+        snprintf(name, sizeof(name), "uart%d-ref", i);
+        s->uart_ref_tick_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(DEVICE(&s->uart[i]), "ref_tick",
+                              s->uart_ref_tick_clk[i]);
     }
 
     object_property_add_alias(obj, "serial0", OBJECT(&s->uart[0]), "chardev");
@@ -601,6 +932,8 @@ static void esp32_soc_init(Object *obj)
 
     object_initialize_child(obj, "dport", &s->dport, TYPE_ESP32_DPORT);
 
+    object_initialize_child(obj, "apb_ctrl", &s->apb_ctrl, TYPE_ESP32_APB_CTRL);
+
     object_initialize_child(obj, "intmatrix", &s->intmatrix, TYPE_ESP32_INTMATRIX);
 
     object_initialize_child(obj, "crosscore_int", &s->crosscore_int, TYPE_ESP32_CROSSCORE_INT);
@@ -610,11 +943,18 @@ static void esp32_soc_init(Object *obj)
     for (int i = 0; i < ESP32_FRC_COUNT; ++i) {
         snprintf(name, sizeof(name), "frc%d", i);
         object_initialize_child(obj, name, &s->frc_timer[i], TYPE_ESP32_FRC_TIMER);
+        snprintf(name, sizeof(name), "frc%d-apb", i);
+        s->frc_apb_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(DEVICE(&s->frc_timer[i]), "apb",
+                              s->frc_apb_clk[i]);
     }
 
     for (int i = 0; i < ESP32_TIMG_COUNT; ++i) {
         snprintf(name, sizeof(name), "timg%d", i);
         object_initialize_child(obj, name, &s->timg[i], TYPE_ESP32_TIMG);
+        snprintf(name, sizeof(name), "timg%d-apb", i);
+        s->timg_apb_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(DEVICE(&s->timg[i]), "apb", s->timg_apb_clk[i]);
     }
 
     for (int i = 0; i < ESP32_SPI_COUNT; ++i) {
@@ -651,6 +991,8 @@ static void esp32_soc_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(s), esp32_cpu_reset, ESP32_RTC_CPU_RESET_GPIO, ESP32_CPU_COUNT);
     qdev_init_gpio_in_named(DEVICE(s), esp32_cpu_stall, ESP32_RTC_CPU_STALL_GPIO, ESP32_CPU_COUNT);
     qdev_init_gpio_in_named(DEVICE(s), esp32_clk_update, ESP32_RTC_CLK_UPDATE_GPIO, 1);
+    qdev_init_gpio_in_named(DEVICE(s), esp32_periph_clk_update,
+                            ESP32_DPORT_PERIPH_CLK_UPDATE_GPIO, 1);
     qdev_init_gpio_in_named(DEVICE(s), esp32_timg_cpu_reset, ESP32_TIMG_WDT_CPU_RESET_GPIO, 2);
     qdev_init_gpio_in_named(DEVICE(s), esp32_timg_sys_reset, ESP32_TIMG_WDT_SYS_RESET_GPIO, 2);
 }
@@ -758,7 +1100,7 @@ static void esp32_machine_init_i2c(Esp32SocState *s)
 static void esp32_machine_init_openeth(Esp32SocState *ss)
 {
     SysBusDevice *sbd;
-    MemoryRegion* sys_mem = get_system_memory();
+    Esp32PeriphGate *g;
     hwaddr reg_base = DR_REG_EMAC_BASE;
     hwaddr desc_base = reg_base + 0x400;
     qemu_irq irq = qdev_get_gpio_in(DEVICE(&ss->intmatrix), ETS_ETH_MAC_INTR_SOURCE);
@@ -772,8 +1114,15 @@ static void esp32_machine_init_openeth(Esp32SocState *ss)
     sbd = SYS_BUS_DEVICE(open_eth_dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_connect_irq(sbd, 0, irq);
-    memory_region_add_subregion(sys_mem, reg_base, sysbus_mmio_get_region(sbd, 0));
-    memory_region_add_subregion(sys_mem, desc_base, sysbus_mmio_get_region(sbd, 1));
+    /* The OpenCores MAC stands in for the EMAC, behind the EMAC's bits. */
+    assert(ss->n_gates < ESP32_GATE_MAX);
+    g = &ss->gate[ss->n_gates++];
+    g->dev = open_eth_dev;
+    g->regs = ESP32_GATE_WIFI;
+    g->clk_mask = R_DPORT_WIFI_CLK_EN_EMAC_MASK;
+    g->rst_mask = R_DPORT_CORE_RST_EN_EMAC_MASK;
+    esp32_gate_map(g, sysbus_mmio_get_region(sbd, 0), reg_base, false);
+    esp32_gate_map(g, sysbus_mmio_get_region(sbd, 1), desc_base, false);
 }
 
 static void esp32_machine_init_sd(Esp32SocState *ss)

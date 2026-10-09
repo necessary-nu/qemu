@@ -116,11 +116,34 @@ static void esp32_sha_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * DPORT's reset bit clears the text registers and any hash in progress.
+ */
+static void esp32_sha_reset_hold(Object *obj, ResetType type)
+{
+    Esp32ShaState *s = ESP32_SHA(obj);
+
+    memset(s->text, 0, sizeof(s->text));
+    memset(&s->sha512, 0, sizeof(s->sha512));
+    memset(&s->sha384, 0, sizeof(s->sha384));
+    memset(&s->sha256, 0, sizeof(s->sha256));
+    memset(&s->sha1, 0, sizeof(s->sha1));
+}
+
+static void esp32_sha_class_init(ObjectClass *klass, const void *data)
+{
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+
+    rc->phases.hold = esp32_sha_reset_hold;
+}
+
 static const TypeInfo esp32_sha_info = {
     .name = TYPE_ESP32_SHA,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(Esp32ShaState),
     .instance_init = esp32_sha_init,
+    .class_init = esp32_sha_class_init,
 };
 
 static void esp32_sha_register_types(void)

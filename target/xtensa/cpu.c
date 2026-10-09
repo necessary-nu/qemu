@@ -270,6 +270,19 @@ static void xtensa_cpu_realizefn(DeviceState *dev, Error **errp)
     xcc->parent_realize(dev, errp);
 }
 
+#ifndef CONFIG_USER_ONLY
+static void xtensa_cpu_clock_update(void *opaque, ClockEvent event)
+{
+    XtensaCPU *cpu = opaque;
+
+    if (event == ClockPreUpdate) {
+        xtensa_cpu_clock_rebase(&cpu->env);
+    } else {
+        xtensa_cpu_clock_rearm(&cpu->env);
+    }
+}
+#endif
+
 static void xtensa_cpu_initfn(Object *obj)
 {
     XtensaCPU *cpu = XTENSA_CPU(obj);
@@ -279,7 +292,9 @@ static void xtensa_cpu_initfn(Object *obj)
     env->config = xcc->config;
 
 #ifndef CONFIG_USER_ONLY
-    cpu->clock = qdev_init_clock_in(DEVICE(obj), "clk-in", NULL, cpu, 0);
+    cpu->clock = qdev_init_clock_in(DEVICE(obj), "clk-in",
+                                    xtensa_cpu_clock_update, cpu,
+                                    ClockPreUpdate | ClockUpdate);
     clock_set_hz(cpu->clock, env->config->clock_freq_khz * 1000);
 #endif
 }

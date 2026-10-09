@@ -258,6 +258,10 @@ qtests_rp2350 = \
    'rp2350-trng-test',
    'rp2350-coresight-test']
 
+qtests_xtensa = \
+  (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ?
+    ['esp32-clock-test'] : [])
+
 qtests_stm32l4x5 = \
   ['stm32l4x5_exti-test',
    'stm32l4x5_syscfg-test',
