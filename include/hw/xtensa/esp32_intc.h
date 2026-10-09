@@ -14,6 +14,7 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "qemu/bitmap.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -33,6 +34,7 @@ typedef struct Esp32IntMatrixState {
     MemoryRegion iomem;
     qemu_irq *outputs[ESP32_CPU_COUNT];
     uint8_t irq_map[ESP32_CPU_COUNT][ESP32_INT_MATRIX_INPUTS];
+    DECLARE_BITMAP(source_level, ESP32_INT_MATRIX_INPUTS);
 
     /* properties */
     XtensaCPU *cpu[ESP32_CPU_COUNT];
