@@ -150,3 +150,7 @@ config USB_CHIPIDEA
 config ASPEED_UDC
     bool
     select USB
+
+config RP2350_USBCTRL
+    bool
+    select USB

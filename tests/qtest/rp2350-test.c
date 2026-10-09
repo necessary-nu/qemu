@@ -129,6 +129,10 @@ static void test_memory_map(void)
                           "(prio 0, i/o): rp2350-spi1");
     assert_mtree_has(qts, "00000000400a8000-00000000400abfff "
                           "(prio 0, i/o): rp2350-pwm");
+    assert_mtree_has(qts, "0000000050100000-0000000050100fff "
+                          "(prio 0, i/o): rp2350-usbctrl-dpram");
+    assert_mtree_has(qts, "0000000050110000-0000000050113fff "
+                          "(prio 0, i/o): rp2350-usbctrl-regs");
     assert_mtree_has(qts, "00000000400b0000-00000000400b3fff "
                           "(prio 0, i/o): rp2350-timer");
     assert_mtree_has(qts, "00000000400d8000-00000000400dbfff "
@@ -146,9 +150,7 @@ static void test_memory_map(void)
                           "(prio 0, i/o): rp2350-sio-nonsec");
     assert_mtree_has(qts, "00000000e0080000-00000000e0083fff "
                           "(prio 0, i/o): rp2350-eppb");
-    assert_mtree_has(qts, "0000000050100000-0000000050100fff "
-                          "(prio 0, ram): rp2350.usb-dpram");
-    assert_mtree_has(qts, "0000000050101000-00000000501fffff "
+    assert_mtree_has(qts, "0000000050101000-000000005010ffff "
                           "(prio -1000, i/o): rp2350.usbctrl "
                           "@0000000000001000");
     assert_mtree_has(qts, "0000000050000000-0000000050003fff "
@@ -188,7 +190,10 @@ static void test_sram_size(void)
     unlink(path);
 }
 
-/* The USB DPRAM is memory to the system bus, at every access size. */
+/*
+ * The USB DPRAM is memory to the system bus, at every access size, once
+ * USBCTRL is out of reset.
+ */
 /* [spec:nuos:req:emu.machine+1/test] */
 static void test_usb_dpram(void)
 {
