@@ -14,6 +14,16 @@
 #define ESP32_I2C_FIFO_LENGTH 32
 #define ESP32_I2C_CMD_COUNT 16
 
+/*
+ * The controller's open-drain lines, by the GPIO matrix's signals
+ * (I2CEXTn_SCL/SDA, in and out): an output at 0 pulls the line low, at 1
+ * releases it. Outputs are named gpio-outs, inputs named gpio-ins.
+ */
+#define ESP32_I2C_SCL_OUT "esp32-i2c-scl-out"
+#define ESP32_I2C_SDA_OUT "esp32-i2c-sda-out"
+#define ESP32_I2C_SCL_IN  "esp32-i2c-scl-in"
+#define ESP32_I2C_SDA_IN  "esp32-i2c-sda-in"
+
 
 typedef struct Esp32I2CState {
     SysBusDevice parent_obj;
@@ -38,6 +48,18 @@ typedef struct Esp32I2CState {
     uint32_t stop_hold_reg;
     uint32_t stop_setup_reg;
     uint32_t cmd_reg[ESP32_I2C_CMD_COUNT];
+
+    qemu_irq scl_out;
+    qemu_irq sda_out;
+    /* The lines as the controller sees them, through the matrix */
+    bool scl_in;
+    bool sda_in;
+    /*
+     * The START condition found both lines following the controller's
+     * outputs through the pads, so the QEMU bus's devices, which sit on
+     * those lines, take part in the transaction.
+     */
+    bool connected;
 } Esp32I2CState;
 
 
@@ -61,6 +83,8 @@ REG32(I2C_FIFO_DATA, 0x1c);
 
 REG32(I2C_INT_RAW, 0x20);
     FIELD(I2C_INT_RAW, ACK_ERR, 10, 1);
+    FIELD(I2C_INT_RAW, TIME_OUT, 8, 1);
+    FIELD(I2C_INT_RAW, ARBITRATION_LOST, 5, 1);
     FIELD(I2C_INT_RAW, TRANS_COMPLETE, 7, 1);
     FIELD(I2C_INT_RAW, END_DETECT, 3, 1);
 

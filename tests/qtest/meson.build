@@ -261,6 +261,7 @@ qtests_rp2350 = \
    'rp2350-accessctrl-test',
    'rp2350-xip-test',
    'rp2350-watchdog-test',
+   'rp2350-powman-test',
    'rp2350-pwm-test',
    'rp2350-pio-test',
    'rp2350-otp-test',
@@ -284,7 +285,8 @@ qtests_xtensa = \
      'esp32-sdio-test',
      'esp32-mcpwm-test',
      'esp32-rtc-test',
-     'esp32-i2s-test'] : [])
+     'esp32-i2s-test',
+     'esp32-periph-lines-test'] : [])
 
 qtests_stm32l4x5 = \
   ['stm32l4x5_exti-test',

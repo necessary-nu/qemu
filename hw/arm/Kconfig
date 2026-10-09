@@ -423,6 +423,7 @@ config RP2350_SOC
     select RP2350_ACCESSCTRL
     select RP2350_XIP
     select RP2350_PSM
+    select RP2350_POWMAN
     select RP2350_WATCHDOG
     select RP2350_OTP
     select RP2350_DMA

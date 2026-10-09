@@ -1271,6 +1271,19 @@ void rp2350_xip_reset_block(RP2350XIPState *s)
     rp2350_xip_reset_exit(OBJECT(s), RESET_TYPE_COLD);
 }
 
+/*
+ * The XIP memory power domain lost power: the cache's tag and data
+ * memories lose their contents, so no line stays pinned.
+ */
+/* [spec:nuos:req:emu.powman] */
+void rp2350_xip_power_down(RP2350XIPState *s)
+{
+    memset(s->tag, 0, sizeof(s->tag));
+    address_space_set(&s->cache_as, 0, 0, RP2350_XIP_CACHE_SIZE,
+                      MEMTXATTRS_UNSPECIFIED);
+    rp2350_xip_remap(s);
+}
+
 static void rp2350_xip_init(Object *obj)
 {
     RP2350XIPState *s = RP2350_XIP(obj);
