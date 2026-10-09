@@ -29,6 +29,8 @@
 #include "hw/net/can/esp32_twai.h"
 #include "hw/sd/dwc_sdmmc.h"
 #include "hw/display/esp_rgb.h"
+#include "hw/net/esp32_emac.h"
+#include "hw/net/ip101_phy.h"
 
 /* The DPORT register pairs that gate a peripheral's clock and reset it. */
 typedef enum Esp32GateRegs {
@@ -111,7 +113,8 @@ struct Esp32SocState {
     ESPRgbState rgb;
 
     DWCSDMMCState sdmmc;
-    DeviceState *eth;
+    Esp32EmacState emac;
+    IP101PhyState phy;
 
     BusState rtc_bus;
     BusState periph_bus;
@@ -132,6 +135,7 @@ struct Esp32SocState {
     Clock *spi_dma_clk[ESP32_SPI_DMA_COUNT];
     Clock *rmt_apb_clk;
     Clock *rmt_ref_tick_clk;
+    Clock *emac_apb_clk;
     /* APB_CLK to the GPIO block's sigma-delta modulators, never gated */
     Clock *gpio_apb_clk;
     Clock *pcnt_apb_clk;

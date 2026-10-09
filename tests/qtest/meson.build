@@ -275,7 +275,8 @@ qtests_xtensa = \
      'esp32-uhci-test',
      'esp32-pid-test',
      'esp32-pcnt-test',
-     'esp32-rmt-test'] : [])
+     'esp32-rmt-test',
+     'esp32-emac-test'] : [])
 
 qtests_stm32l4x5 = \
   ['stm32l4x5_exti-test',
