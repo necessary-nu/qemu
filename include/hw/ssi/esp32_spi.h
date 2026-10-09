@@ -2,6 +2,7 @@
 
 #include "hw/core/registerfields.h"
 #include "hw/ssi/ssi.h"
+#include "hw/ssi/esp32_spi_dma.h"
 
 #define TYPE_ESP32_SPI "ssi.esp32.spi"
 #define ESP32_SPI(obj) OBJECT_CHECK(Esp32SpiState, (obj), TYPE_ESP32_SPI)
@@ -17,6 +18,8 @@ typedef struct Esp32SpiState {
     qemu_irq cs_gpio[ESP32_SPI_CS_COUNT];
     int num_cs;
     SSIBus *spi;
+    /* The DMA engine of SPI1..SPI3; NULL for SPI0 */
+    Esp32SpiDmaState *dma;
 
     uint32_t addr_reg;
     uint32_t ctrl_reg;

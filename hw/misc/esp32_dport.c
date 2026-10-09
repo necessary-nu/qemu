@@ -139,6 +139,9 @@ static uint64_t esp32_dport_read(void *opaque, hwaddr addr, unsigned int size)
     case A_DPORT_CORE_RST_EN:
         r = s->core_rst_en;
         break;
+    case A_DPORT_SPI_DMA_CHAN_SEL:
+        r = s->spi_dma_chan_sel;
+        break;
     }
 
     return r;
@@ -270,6 +273,16 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
     case A_DPORT_CORE_RST_EN:
         s->core_rst_en = value;
         qemu_irq_pulse(s->periph_clk_update_req);
+        break;
+    /*
+     * [spec:nuos:req:emu.esp32.spi-dma]
+     * Two bits per SPI controller; the SPI DMA engines read the selection
+     * whenever they act. Bits 31:6 are reserved and read as 0.
+     */
+    case A_DPORT_SPI_DMA_CHAN_SEL:
+        s->spi_dma_chan_sel = value & (R_DPORT_SPI_DMA_CHAN_SEL_SPI1_MASK |
+                                       R_DPORT_SPI_DMA_CHAN_SEL_SPI2_MASK |
+                                       R_DPORT_SPI_DMA_CHAN_SEL_SPI3_MASK);
         break;
     }
 }
@@ -425,6 +438,7 @@ static void esp32_dport_reset_hold(Object *obj, ResetType type)
     s->perip_rst_en = 0;
     s->wifi_clk_en = ESP32_DPORT_WIFI_CLK_EN_RESET;
     s->core_rst_en = 0;
+    s->spi_dma_chan_sel = 0;
     esp32_cache_reset(&s->cache_state[0]);
     esp32_cache_reset(&s->cache_state[1]);
     qemu_irq_lower(s->appcpu_stall_req);
