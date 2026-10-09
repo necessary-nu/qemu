@@ -439,8 +439,12 @@ static void br_run(void *opaque)
             return;
         }
         if (r == BR_DONE) {
+            /*
+             * The next request goes in a later frame, after the device's
+             * software has seen this transfer end.
+             */
             next = br_enum_next(s, &delay);
-            ns += delay;
+            ns += MAX(delay, BR_FRAME_NS);
             if (next == STEP_DONE) {
                 s->br_state = BRIDGE_RUNNING;
                 s->br_ctl_stage = CTL_IDLE;
@@ -466,6 +470,8 @@ static void br_run(void *opaque)
                 s->br_ctl_stage = CTL_IDLE;
                 r = BR_PROGRESS;
                 ns = br_xact_ns(0);
+            } else if (r == BR_DONE) {
+                ns += BR_FRAME_NS;
             }
         } else if (s->br_in_ep && s->br_out_ep) {
             r = br_bulk(s, &ns);
