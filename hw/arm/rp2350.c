@@ -19,6 +19,9 @@
  *                 processors restart them the same way, with the machine
  *                 honouring the boot ROM's watchdog boot vector.
  *
+ * With neither, the boot ROM region is blank and the cores lock up at
+ * reset, as on a part with an empty ROM.
+ *
  * The RP2350 has no internal flash. Boards set its size with
  * -M rp2350,flash-size=SIZE (a Pico 2 has 4M); there is no default. The
  * flash is a Winbond W25Q part of that size on QSPI chip select 0. Boards
@@ -64,6 +67,15 @@ static void rp2350_direct_reset(void *opaque)
     rp2350_soc_boot_rom_handoff(&s->soc, 0);
 }
 
+/*
+ * With neither -bios nor -kernel the machine still starts, as a chip
+ * whose mask ROM held no code would: the ROM region reads as zeros, so
+ * each core resets with SP and PC of zero. A PC without the Thumb bit
+ * raises an INVSTATE UsageFault, which escalates to HardFault, whose
+ * vector is zero as well, so the core enters Lockup (emu.lockup) and
+ * stays there until reset. Nothing is loaded into flash in this case, so
+ * a machine with no flash configured still has an empty XIP window.
+ */
 /* [spec:nuos:req:emu.direct-load] */
 static void rp2350_init(MachineState *machine)
 {
@@ -82,11 +94,6 @@ static void rp2350_init(MachineState *machine)
     if (direct && s->flash_size == 0) {
         error_report("rp2350: -kernel loads into flash, which needs "
                      "-M rp2350,flash-size=SIZE");
-        exit(1);
-    }
-    if (!direct && !machine->firmware) {
-        error_report("rp2350: a boot ROM image (-bios) or a directly loaded "
-                     "image (-kernel) is required");
         exit(1);
     }
 
