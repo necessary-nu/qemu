@@ -23,3 +23,5 @@ system_ss.add(when: 'CONFIG_ACPI', if_true: files('fw_cfg-acpi.c'))
 system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files(
   'aspeed_otp.c',
   ))
+
+system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files('esp32_efuse.c'))

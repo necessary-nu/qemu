@@ -27,3 +27,7 @@ config CADENCE_SDHCI
 config AXIADO_SDHCI
     bool
     select SDHCI
+
+config DWC_SDMMC
+    bool
+    select SD
