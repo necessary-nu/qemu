@@ -42,6 +42,23 @@ typedef struct Esp32RtcIoState Esp32RtcIoState;
 #define ESP32_RTCIO_PAD_IE  "esp32-rtcio-pad-ie"
 #define ESP32_RTCIO_PAD_IN  "esp32-rtcio-pad-in"
 
+/*
+ * The RTC I2C controller's lines, which RTC function 1 puts on the pads
+ * RTCIO_SAR_I2C_IO selects (SCL on TOUCH_PAD0 or TOUCH_PAD2, SDA on
+ * TOUCH_PAD1 or TOUCH_PAD3):
+ * - ESP32_RTCIO_I2C_SCL_OUT, ESP32_RTCIO_I2C_SCL_OE, ESP32_RTCIO_I2C_SDA_OUT,
+ *   ESP32_RTCIO_I2C_SDA_OE (gpio-in): the controller's output levels and
+ *   enables;
+ * - ESP32_RTCIO_I2C_SCL_IN, ESP32_RTCIO_I2C_SDA_IN (gpio-out): the lines as
+ *   the selected pads read them; high while no pad carries the line.
+ */
+#define ESP32_RTCIO_I2C_SCL_OUT "esp32-rtcio-i2c-scl-out"
+#define ESP32_RTCIO_I2C_SCL_OE  "esp32-rtcio-i2c-scl-oe"
+#define ESP32_RTCIO_I2C_SDA_OUT "esp32-rtcio-i2c-sda-out"
+#define ESP32_RTCIO_I2C_SDA_OE  "esp32-rtcio-i2c-sda-oe"
+#define ESP32_RTCIO_I2C_SCL_IN  "esp32-rtcio-i2c-scl-in"
+#define ESP32_RTCIO_I2C_SDA_IN  "esp32-rtcio-i2c-sda-in"
+
 /* The GPIO number of each RTC GPIO */
 extern const uint8_t esp32_rtcio_gpio[ESP32_RTCIO_PAD_COUNT];
 
@@ -78,6 +95,8 @@ REG32(RTCIO_EXT_WAKEUP0, 0xbc)
     FIELD(RTCIO_EXT_WAKEUP0, SEL, 27, 5)
 REG32(RTCIO_XTL_EXT_CTR, 0xc0)
 REG32(RTCIO_SAR_I2C_IO, 0xc4)
+    FIELD(RTCIO_SAR_I2C_IO, SCL_SEL, 28, 2)
+    FIELD(RTCIO_SAR_I2C_IO, SDA_SEL, 30, 2)
 REG32(RTCIO_DATE, 0xc8)
 
 #define ESP32_RTCIO_REG_COUNT (A_RTCIO_DATE / 4 + 1)
@@ -97,6 +116,7 @@ struct Esp32RtcIoState {
     qemu_irq pad_pu[ESP32_RTCIO_PAD_COUNT];
     qemu_irq pad_pd[ESP32_RTCIO_PAD_COUNT];
     qemu_irq pad_ie[ESP32_RTCIO_PAD_COUNT];
+    qemu_irq i2c_scl_in, i2c_sda_in;
 
     uint32_t regs[ESP32_RTCIO_REG_COUNT];
 
@@ -108,6 +128,9 @@ struct Esp32RtcIoState {
      */
     uint32_t ctl_mux, ctl_out, ctl_oe, ctl_pu, ctl_pd, ctl_ie;
     uint32_t held;
+    /* The RTC I2C controller's outputs, and the inputs last given it */
+    bool i2c_scl_out, i2c_scl_oe, i2c_sda_out, i2c_sda_oe;
+    bool i2c_scl_level, i2c_sda_level;
     /* Drive every line on the next update, not only changed ones */
     bool resync;
 };

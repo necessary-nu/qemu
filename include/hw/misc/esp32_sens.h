@@ -1,5 +1,6 @@
 /*
- * ESP32 SENS: the SAR ADCs, DACs, touch sensor and Hall sensor
+ * ESP32 SENS: the SAR ADCs, DACs, touch, Hall and temperature sensors, and
+ * the ULP coprocessor's timer settings, start and RTC I2C interface
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -26,11 +27,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(Esp32SensState, ESP32_SENS)
  *   lets the touch FSM's timer start measurements.
  * - ESP32_SENS_SARADC_CTRL_IN (gpio-in): pulsed when SYSCON's
  *   SARADC_CTRL is written, for the pattern table pointers' clear bits.
+ * - ESP32_SENS_ULP_START (gpio-out): SENS_ULP_CP_FORCE_START_TOP and
+ *   SENS_ULP_CP_START_TOP both set; its rising edge starts the ULP.
  */
 #define ESP32_SENS_TOUCH_INT        "esp32-sens-touch-int"
 #define ESP32_SENS_TOUCH_WAKEUP     "esp32-sens-touch-wakeup"
 #define ESP32_SENS_TOUCH_TIMER_IN   "esp32-sens-touch-timer"
 #define ESP32_SENS_SARADC_CTRL_IN   "esp32-sens-saradc-ctrl"
+#define ESP32_SENS_ULP_START        "esp32-sens-ulp-start"
 
 #define ESP32_SENS_SIZE 0x400
 #define ESP32_SENS_REG_COUNT 64
@@ -49,7 +53,10 @@ REG32(SENS_SAR_READ_CTRL, 0x00)
     FIELD(SENS_SAR_READ_CTRL, DATA_INV, 28, 1)
 REG32(SENS_SAR_READ_STATUS1, 0x04)
 REG32(SENS_SAR_MEAS_WAIT1, 0x08)
+    FIELD(SENS_SAR_MEAS_WAIT1, AMP_WAIT1, 0, 16)
+    FIELD(SENS_SAR_MEAS_WAIT1, AMP_WAIT2, 16, 16)
 REG32(SENS_SAR_MEAS_WAIT2, 0x0c)
+    FIELD(SENS_SAR_MEAS_WAIT2, AMP_WAIT3, 0, 16)
 REG32(SENS_SAR_MEAS_CTRL, 0x10)
 REG32(SENS_SAR_READ_STATUS2, 0x14)
 REG32(SENS_ULP_CP_SLEEP_CYC0, 0x18)
@@ -60,6 +67,7 @@ REG32(SENS_SAR_START_FORCE, 0x2c)
     FIELD(SENS_SAR_START_FORCE, SAR2_EN_TEST, 4, 1)
     FIELD(SENS_SAR_START_FORCE, ULP_CP_FORCE_START_TOP, 8, 1)
     FIELD(SENS_SAR_START_FORCE, ULP_CP_START_TOP, 9, 1)
+    FIELD(SENS_SAR_START_FORCE, PC_INIT, 11, 11)
     FIELD(SENS_SAR_START_FORCE, SAR2_STOP, 22, 1)
     FIELD(SENS_SAR_START_FORCE, SAR1_STOP, 23, 1)
 REG32(SENS_SAR_MEM_WR_CTRL, 0x30)
@@ -70,11 +78,18 @@ REG32(SENS_SAR_SLAVE_ADDR1, 0x3c)
     FIELD(SENS_SAR_SLAVE_ADDR1, MEAS_STATUS, 22, 8)
 REG32(SENS_SAR_SLAVE_ADDR2, 0x40)
 REG32(SENS_SAR_SLAVE_ADDR3, 0x44)
+    FIELD(SENS_SAR_SLAVE_ADDR3, TSENS_OUT, 22, 8)
+    FIELD(SENS_SAR_SLAVE_ADDR3, TSENS_RDY_OUT, 30, 1)
 REG32(SENS_SAR_SLAVE_ADDR4, 0x48)
+    FIELD(SENS_SAR_SLAVE_ADDR4, I2C_RDATA, 22, 8)
+    FIELD(SENS_SAR_SLAVE_ADDR4, I2C_DONE, 30, 1)
 REG32(SENS_SAR_TSENS_CTRL, 0x4c)
+    FIELD(SENS_SAR_TSENS_CTRL, XPD_WAIT, 0, 12)
     FIELD(SENS_SAR_TSENS_CTRL, POWER_UP, 24, 1)
     FIELD(SENS_SAR_TSENS_CTRL, POWER_UP_FORCE, 25, 1)
+    FIELD(SENS_SAR_TSENS_CTRL, DUMP_OUT, 26, 1)
 REG32(SENS_SAR_I2C_CTRL, 0x50)
+    FIELD(SENS_SAR_I2C_CTRL, CTRL, 0, 28)
     FIELD(SENS_SAR_I2C_CTRL, START, 28, 1)
     FIELD(SENS_SAR_I2C_CTRL, START_FORCE, 29, 1)
 REG32(SENS_SAR_MEAS_START1, 0x54)
@@ -141,6 +156,7 @@ typedef struct Esp32RtcCntlState Esp32RtcCntlState;
 typedef struct Esp32RtcIoState Esp32RtcIoState;
 typedef struct Esp32GpioState Esp32GpioState;
 typedef struct Esp32ApbCtrlState Esp32ApbCtrlState;
+typedef struct Esp32RtcI2cState Esp32RtcI2cState;
 
 struct Esp32SensState {
     SysBusDevice parent_obj;
@@ -148,11 +164,13 @@ struct Esp32SensState {
     MemoryRegion iomem;
     qemu_irq touch_int;
     qemu_irq touch_wakeup;
+    qemu_irq ulp_start;
 
     Esp32RtcCntlState *rtc_cntl;
     Esp32RtcIoState *rtcio;
     Esp32GpioState *gpio;
     Esp32ApbCtrlState *apb_ctrl;
+    Esp32RtcI2cState *rtc_i2c;
 
     uint32_t regs[ESP32_SENS_REG_COUNT];
 
@@ -160,6 +178,12 @@ struct Esp32SensState {
     QEMUTimer adc_timer[ESP32_ADC_UNITS];
     bool adc_busy[ESP32_ADC_UNITS];
     uint32_t adc_result[ESP32_ADC_UNITS];
+    /* The pad each ADC's ULP-side selection (its last ADC instruction) has */
+    uint32_t ulp_pads[ESP32_ADC_UNITS];
+
+    /* An RTC I2C transaction is in progress until i2c_timer fires */
+    QEMUTimer i2c_timer;
+    bool i2c_busy;
 
     /* The DIG controllers' pattern table pointers, and alternate mode's */
     uint8_t patt_ptr[ESP32_ADC_UNITS];
@@ -180,6 +204,8 @@ struct Esp32SensState {
     uint32_t adc_mv[ESP32_ADC_UNITS][ESP32_ADC2_CHANNELS];
     int32_t hall_ut;
     uint32_t touch_ff[ESP32_TOUCH_PADS];
+    /* The die temperature at the temperature sensor, in millidegrees C */
+    int32_t tsens_mc;
 };
 
 /*
@@ -194,5 +220,33 @@ unsigned esp32_sens_dig_sample(Esp32SensState *s, uint16_t out[2]);
 bool esp32_sens_dac_dma_enabled(Esp32SensState *s);
 /* I2S0's DAC interface: channel ch (0 for DAC1) takes code */
 void esp32_sens_dac_dma(Esp32SensState *s, unsigned ch, uint8_t code);
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp]
+ * The ULP's ADC instruction: convert channel mux - 1 of ADC unit through
+ * its RTC controller. Returns the code; *cycles gets the conversion time
+ * in RTC_FAST_CLK cycles.
+ */
+uint32_t esp32_sens_ulp_adc(Esp32SensState *s, unsigned unit, unsigned mux,
+                            uint32_t *cycles);
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp]
+ * The ULP's TSENS instruction, measuring for wait cycles. Returns the
+ * temperature sensor's code; *cycles gets the instruction's execution
+ * time in RTC_FAST_CLK cycles.
+ */
+uint32_t esp32_sens_ulp_tsens(Esp32SensState *s, uint32_t wait,
+                              uint32_t *cycles);
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp]
+ * An RTC I2C transaction described as the ULP's I2C instruction's operand
+ * bits [27:0] describe it, which SENS_SAR_I2C_CTRL also holds. Returns the
+ * byte read (0 for a write), masked to the instruction's bit range;
+ * *cycles gets the transaction's time in RTC_FAST_CLK cycles.
+ */
+uint32_t esp32_sens_rtc_i2c(Esp32SensState *s, uint32_t ctrl,
+                            uint32_t *cycles);
 
 #endif

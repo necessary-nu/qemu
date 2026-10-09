@@ -920,6 +920,9 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
         }
         qemu_set_irq(s->touch_timer_en,
                      FIELD_EX32(*r, RTC_CNTL_STATE0, TOUCH_SLP_TIMER_EN));
+        /* [spec:nuos:req:emu.esp32.ulp] */
+        qemu_set_irq(s->ulp_timer_en,
+                     FIELD_EX32(*r, RTC_CNTL_STATE0, ULP_CP_SLP_TIMER_EN));
         break;
 
     case A_RTC_CNTL_RESET_STATE:
@@ -1163,6 +1166,9 @@ static void esp32_rtc_cntl_reset_exit(Object *obj, ResetType type)
     qemu_set_irq(s->touch_timer_en,
                  FIELD_EX32(REG(s, RTC_CNTL_STATE0), RTC_CNTL_STATE0,
                             TOUCH_SLP_TIMER_EN));
+    qemu_set_irq(s->ulp_timer_en,
+                 FIELD_EX32(REG(s, RTC_CNTL_STATE0), RTC_CNTL_STATE0,
+                            ULP_CP_SLP_TIMER_EN));
 }
 
 static void esp32_rtc_cntl_realize(DeviceState *dev, Error **errp)
@@ -1211,6 +1217,8 @@ static void esp32_rtc_cntl_init(Object *obj)
                              ESP32_RTC_CLK_UPDATE_GPIO, 1);
     qdev_init_gpio_out_named(dev, &s->touch_timer_en,
                              ESP32_RTC_TOUCH_TIMER_GPIO, 1);
+    qdev_init_gpio_out_named(dev, &s->ulp_timer_en,
+                             ESP32_RTC_ULP_TIMER_GPIO, 1);
     qdev_init_gpio_in_named(dev, esp32_rtc_wakeup_line,
                             ESP32_RTC_WAKEUP_IN, ESP32_RTC_WAKEUP_COUNT);
     qdev_init_gpio_in_named(dev, esp32_rtc_gpio_wakeup_line,

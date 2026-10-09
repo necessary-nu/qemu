@@ -1,5 +1,6 @@
 /*
- * ESP32 SENS: the SAR ADCs, DACs, touch sensor and Hall sensor
+ * ESP32 SENS: the SAR ADCs, DACs, touch, Hall and temperature sensors, and
+ * the ULP coprocessor's timer settings, start and RTC I2C interface
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -46,8 +47,22 @@
  * hall-field-ut; and each touch pad's capacitance, touch<n>-ff. The DACs'
  * outputs are the read-only properties dac1-mv and dac2-mv.
  *
- * The ULP coprocessor's parts of SENS (its timer, its start, the RTC I2C
- * controller) and the temperature sensor are stored but not modelled here.
+ * - The RTC controllers' sharing with the ULP coprocessor (TRM "ULP
+ *   Coprocessor"): without MEASn_START_FORCE the ULP's ADC instruction
+ *   starts the conversion, and without SARn_EN_PAD_FORCE the pad is the one
+ *   the ULP's last ADC instruction selected.
+ * - The temperature sensor: powered by TSENS_POWER_UP with
+ *   TSENS_POWER_UP_FORCE, or by the ULP's TSENS instruction, it reports the
+ *   die temperature in degrees Fahrenheit (ESP-IDF's temperatureRead()
+ *   converts with (code - 32) / 1.8) in TSENS_OUT.
+ * - The ULP's timer periods (ULP_CP_SLEEP_CYCn), its entry point and its
+ *   software start (SENS_SAR_START_FORCE), which the ULP device reads.
+ * - The RTC I2C controller's slave addresses (SENS_I2C_SLAVE_ADDRn) and the
+ *   interface the ULP's I2C instructions drive, which SENS_SAR_I2C_CTRL
+ *   takes over with SAR_I2C_START_FORCE; the byte read and the done flag
+ *   land in SENS_SAR_SLAVE_ADDR4.
+ *
+ * The die temperature is the QOM property tsens-temp-mc, in millidegrees.
  */
 
 #include "qemu/osdep.h"
@@ -63,6 +78,7 @@
 #include "hw/misc/esp32_apb_ctrl.h"
 #include "hw/gpio/esp32_rtcio.h"
 #include "hw/gpio/esp32_gpio.h"
+#include "hw/i2c/esp32_rtc_i2c.h"
 
 /* VDD3P3_RTC, the DACs' reference and a driven pad's high level */
 #define VDD_MV                  3300
@@ -410,21 +426,13 @@ static void update_meas_status(Esp32SensState *s)
 
 /*
  * [spec:nuos:req:emu.esp32.analog]
- * Start a conversion of the RTC controller of ADC unit: sample the pad
- * now, deliver the result when the conversion time has passed.
+ * [spec:nuos:req:emu.esp32.ulp]
+ * Whether the RTC controller of ADC unit can convert: it must have the ADC
+ * and not be stopped by SARn_STOP.
  */
-static void rtc_adc_start(Esp32SensState *s, unsigned unit)
+static bool rtc_adc_usable(Esp32SensState *s, unsigned unit)
 {
-    uint32_t start = s->regs[meas_start_reg(unit) / 4];
-    uint32_t read = unit ? REG(s, SENS_SAR_READ_CTRL2) :
-                           REG(s, SENS_SAR_READ_CTRL);
     uint32_t force = REG(s, SENS_SAR_START_FORCE);
-    uint32_t atten_reg = unit ? REG(s, SENS_SAR_ATTEN2) :
-                                REG(s, SENS_SAR_ATTEN1);
-    uint32_t pads, code, mask, div, cycles;
-    unsigned bits, ch;
-    uint64_t fast_hz = s->rtc_cntl->rtc_fastclk_freq;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     AdcOwner owner = adc_owner(s, unit);
 
     if (owner != ADC_OWNER_RTC) {
@@ -433,25 +441,43 @@ static void rtc_adc_start(Esp32SensState *s, unsigned unit)
                       "controller has the ADC; nothing is converted\n",
                       unit + 1,
                       owner == ADC_OWNER_DIG ? "the DIG" : "the PWDET");
-        return;
+        return false;
     }
     if (bit32(force, unit ? R_SENS_SAR_START_FORCE_SAR2_STOP_SHIFT :
                             R_SENS_SAR_START_FORCE_SAR1_STOP_SHIFT)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "esp32_sens: ADC%u started while SAR%u_STOP is set\n",
                       unit + 1, unit + 1);
-        return;
+        return false;
     }
-    if (!FIELD_EX32(start, SENS_SAR_MEAS_START1, EN_PAD_FORCE)) {
-        qemu_log_mask(LOG_UNIMP,
-                      "esp32_sens: ADC%u's pads selected by the ULP "
-                      "coprocessor (SAR%u_EN_PAD_FORCE clear) are not "
-                      "modelled\n", unit + 1, unit + 1);
-        pads = 0;
+    return true;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.analog]
+ * [spec:nuos:req:emu.esp32.ulp]
+ * The code the RTC controller of ADC unit converts now: the pad
+ * SARn_EN_PAD selects with SARn_EN_PAD_FORCE, else the one the ULP
+ * selected, at its attenuation and the width SARn_BIT_WIDTH gives, raw
+ * (inverted) unless SARn_DATA_INV.
+ */
+static uint32_t rtc_adc_code(Esp32SensState *s, unsigned unit)
+{
+    uint32_t start = s->regs[meas_start_reg(unit) / 4];
+    uint32_t read = unit ? REG(s, SENS_SAR_READ_CTRL2) :
+                           REG(s, SENS_SAR_READ_CTRL);
+    uint32_t force = REG(s, SENS_SAR_START_FORCE);
+    uint32_t atten_reg = unit ? REG(s, SENS_SAR_ATTEN2) :
+                                REG(s, SENS_SAR_ATTEN1);
+    uint32_t pads, code, mask;
+    unsigned bits, ch;
+
+    if (FIELD_EX32(start, SENS_SAR_MEAS_START1, EN_PAD_FORCE)) {
+        pads = FIELD_EX32(start, SENS_SAR_MEAS_START1, EN_PAD);
     } else {
-        pads = FIELD_EX32(start, SENS_SAR_MEAS_START1, EN_PAD) &
-               ((1u << adc_channels[unit]) - 1);
+        pads = s->ulp_pads[unit];
     }
+    pads &= (1u << adc_channels[unit]) - 1;
 
     bits = 9 + (unit ? FIELD_EX32(force, SENS_SAR_START_FORCE,
                                   SAR2_BIT_WIDTH) :
@@ -477,7 +503,44 @@ static void rtc_adc_start(Esp32SensState *s, unsigned unit)
                  FIELD_EX32(read, SENS_SAR_READ_CTRL, DATA_INV))) {
         code = ~code & mask;
     }
+    return code;
+}
 
+/* The conversion is under way: deliver code after cycles of RTC_FAST_CLK */
+static void rtc_adc_begin(Esp32SensState *s, unsigned unit, uint32_t code,
+                          uint32_t cycles)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    s->adc_result[unit] = code;
+    s->adc_busy[unit] = true;
+    s->regs[meas_start_reg(unit) / 4] &= ~R_SENS_SAR_MEAS_START1_DONE_MASK;
+    update_meas_status(s);
+    timer_mod(&s->adc_timer[unit],
+              now + muldiv64(cycles, NANOSECONDS_PER_SECOND,
+                             s->rtc_cntl->rtc_fastclk_freq));
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.analog]
+ * Software starts a conversion of the RTC controller of ADC unit: sample
+ * the pad now, deliver the result after (SAMPLE_CYCLE + width + 1) *
+ * CLK_DIV cycles.
+ */
+static void rtc_adc_start(Esp32SensState *s, unsigned unit)
+{
+    uint32_t read = unit ? REG(s, SENS_SAR_READ_CTRL2) :
+                           REG(s, SENS_SAR_READ_CTRL);
+    uint32_t force = REG(s, SENS_SAR_START_FORCE);
+    uint32_t div, bits;
+
+    if (!rtc_adc_usable(s, unit)) {
+        return;
+    }
+    bits = 9 + (unit ? FIELD_EX32(force, SENS_SAR_START_FORCE,
+                                  SAR2_BIT_WIDTH) :
+                       FIELD_EX32(force, SENS_SAR_START_FORCE,
+                                  SAR1_BIT_WIDTH));
     div = FIELD_EX32(read, SENS_SAR_READ_CTRL, CLK_DIV);
     if (div == 0) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -485,15 +548,52 @@ static void rtc_adc_start(Esp32SensState *s, unsigned unit)
                       unit + 1);
         div = 1;
     }
-    cycles = (FIELD_EX32(read, SENS_SAR_READ_CTRL, SAMPLE_CYCLE) + bits + 1) *
-             div;
+    rtc_adc_begin(s, unit, rtc_adc_code(s, unit),
+                  (FIELD_EX32(read, SENS_SAR_READ_CTRL, SAMPLE_CYCLE) +
+                   bits + 1) * div);
+}
 
-    s->adc_result[unit] = code;
-    s->adc_busy[unit] = true;
-    s->regs[meas_start_reg(unit) / 4] &= ~R_SENS_SAR_MEAS_START1_DONE_MASK;
-    update_meas_status(s);
-    timer_mod(&s->adc_timer[unit],
-              now + muldiv64(cycles, NANOSECONDS_PER_SECOND, fast_hz));
+uint32_t esp32_sens_ulp_adc(Esp32SensState *s, unsigned unit, unsigned mux,
+                            uint32_t *cycles)
+{
+    uint32_t start = s->regs[meas_start_reg(unit) / 4];
+    uint32_t read = unit ? REG(s, SENS_SAR_READ_CTRL2) :
+                           REG(s, SENS_SAR_READ_CTRL);
+    uint32_t code;
+
+    /* 23 + the amplifier's three waits + the sampling (ESP-IDF's ADC) */
+    *cycles = 23 +
+        MAX(1, FIELD_EX32(REG(s, SENS_SAR_MEAS_WAIT1), SENS_SAR_MEAS_WAIT1,
+                          AMP_WAIT1)) +
+        MAX(1, FIELD_EX32(REG(s, SENS_SAR_MEAS_WAIT1), SENS_SAR_MEAS_WAIT1,
+                          AMP_WAIT2)) +
+        MAX(1, FIELD_EX32(REG(s, SENS_SAR_MEAS_WAIT2), SENS_SAR_MEAS_WAIT2,
+                          AMP_WAIT3)) +
+        FIELD_EX32(read, SENS_SAR_READ_CTRL, SAMPLE_CYCLE) +
+        FIELD_EX32(read, SENS_SAR_READ_CTRL, SAMPLE_BIT);
+
+    if (mux == 0 || mux > adc_channels[unit]) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "esp32_sens: ULP ADC instruction selects pad %u of "
+                      "ADC%u, which has pads 1 to %u\n", mux, unit + 1,
+                      adc_channels[unit]);
+        s->ulp_pads[unit] = 0;
+    } else {
+        s->ulp_pads[unit] = 1u << (mux - 1);
+    }
+    if (FIELD_EX32(start, SENS_SAR_MEAS_START1, START_FORCE)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "esp32_sens: ULP ADC instruction while "
+                      "MEAS%u_START_FORCE gives software the start; ADC%u "
+                      "does not convert\n", unit + 1, unit + 1);
+        return FIELD_EX32(start, SENS_SAR_MEAS_START1, DATA);
+    }
+    if (!rtc_adc_usable(s, unit)) {
+        return FIELD_EX32(start, SENS_SAR_MEAS_START1, DATA);
+    }
+    code = rtc_adc_code(s, unit);
+    rtc_adc_begin(s, unit, code, *cycles);
+    return code;
 }
 
 static void rtc_adc_done(Esp32SensState *s, unsigned unit)
@@ -803,6 +903,107 @@ static void esp32_sens_touch_timer(void *opaque, int n, int level)
     touch_update_mode(s);
 }
 
+/* ---- The temperature sensor ---- */
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp]
+ * The temperature sensor's code: the die temperature in degrees
+ * Fahrenheit, saturated to 8 bits.
+ */
+static uint32_t tsens_code(Esp32SensState *s)
+{
+    int64_t f_milli = (int64_t)s->tsens_mc * 9 / 5 + 32000;
+
+    return MAX(0, MIN(255, (f_milli + 500) / 1000));
+}
+
+static void tsens_latch(Esp32SensState *s, uint32_t code)
+{
+    uint32_t *r = &REG(s, SENS_SAR_SLAVE_ADDR3);
+
+    *r = FIELD_DP32(*r, SENS_SAR_SLAVE_ADDR3, TSENS_OUT, code);
+    *r = FIELD_DP32(*r, SENS_SAR_SLAVE_ADDR3, TSENS_RDY_OUT, 1);
+}
+
+uint32_t esp32_sens_ulp_tsens(Esp32SensState *s, uint32_t wait,
+                              uint32_t *cycles)
+{
+    uint32_t ctrl = REG(s, SENS_SAR_TSENS_CTRL);
+    uint32_t code;
+
+    /*
+     * ESP32 documents no TSENS timing: the sensor powers up for
+     * TSENS_XPD_WAIT cycles, then measures for the instruction's wait.
+     */
+    *cycles = 2 + FIELD_EX32(ctrl, SENS_SAR_TSENS_CTRL, XPD_WAIT) + wait;
+    if (FIELD_EX32(ctrl, SENS_SAR_TSENS_CTRL, POWER_UP_FORCE) &&
+        !FIELD_EX32(ctrl, SENS_SAR_TSENS_CTRL, POWER_UP)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "esp32_sens: ULP TSENS instruction with the "
+                      "temperature sensor forced off\n");
+        return FIELD_EX32(REG(s, SENS_SAR_SLAVE_ADDR3), SENS_SAR_SLAVE_ADDR3,
+                          TSENS_OUT);
+    }
+    code = tsens_code(s);
+    tsens_latch(s, code);
+    return code;
+}
+
+/* ---- The RTC I2C interface ---- */
+
+static void i2c_timer_cb(void *opaque)
+{
+    Esp32SensState *s = opaque;
+
+    s->i2c_busy = false;
+    REG(s, SENS_SAR_SLAVE_ADDR4) |= R_SENS_SAR_SLAVE_ADDR4_I2C_DONE_MASK;
+}
+
+uint32_t esp32_sens_rtc_i2c(Esp32SensState *s, uint32_t ctrl,
+                            uint32_t *cycles)
+{
+    unsigned sel = extract32(ctrl, 22, 4);
+    unsigned high = extract32(ctrl, 19, 3), low = extract32(ctrl, 16, 3);
+    bool write = extract32(ctrl, 27, 1);
+    uint32_t mask, addr, *a4 = &REG(s, SENS_SAR_SLAVE_ADDR4);
+    uint8_t rdata;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (sel > 7) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "esp32_sens: RTC I2C slave address %u of 0-7\n", sel);
+        sel &= 7;
+    }
+    /* SENS_I2C_SLAVE_ADDR(2n) in [21:11] and (2n+1) in [10:0] */
+    addr = extract32(s->regs[A_SENS_SAR_SLAVE_ADDR1 / 4 + sel / 2],
+                     (sel & 1) ? 0 : 11, 11);
+    if (addr > 0x7f) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "esp32_sens: RTC I2C slave address 0x%x is not a "
+                      "7-bit address\n", addr);
+    }
+    if (high < low) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "esp32_sens: RTC I2C bit range [%u:%u] is empty\n",
+                      high, low);
+        mask = 0;
+    } else {
+        mask = MAKE_64BIT_MASK(low, high - low + 1);
+    }
+
+    *a4 &= ~R_SENS_SAR_SLAVE_ADDR4_I2C_DONE_MASK;
+    *cycles = esp32_rtc_i2c_transfer(s->rtc_i2c, addr & 0x7f,
+                                     extract32(ctrl, 0, 8), write,
+                                     extract32(ctrl, 8, 8) & mask, &rdata);
+    rdata = write ? 0 : rdata & mask;
+    *a4 = FIELD_DP32(*a4, SENS_SAR_SLAVE_ADDR4, I2C_RDATA, rdata);
+    s->i2c_busy = true;
+    timer_mod(&s->i2c_timer,
+              now + muldiv64(*cycles, NANOSECONDS_PER_SECOND,
+                             s->rtc_cntl->rtc_fastclk_freq));
+    return rdata;
+}
+
 /* ---- Registers ---- */
 
 static uint64_t esp32_sens_read(void *opaque, hwaddr addr, unsigned size)
@@ -870,10 +1071,10 @@ static void esp32_sens_write(void *opaque, hwaddr addr, uint64_t value,
             rtc_adc_start(s, addr == A_SENS_SAR_MEAS_START2);
         } else if (!FIELD_EX32(v, SENS_SAR_MEAS_START1, START_FORCE) &&
                    FIELD_EX32(v & ~old, SENS_SAR_MEAS_START1, START_SAR)) {
-            qemu_log_mask(LOG_UNIMP,
+            qemu_log_mask(LOG_GUEST_ERROR,
                           "esp32_sens: MEAS_START_SAR without "
-                          "MEAS_START_FORCE leaves the start to the ULP "
-                          "coprocessor, which is not modelled here\n");
+                          "MEAS_START_FORCE, which leaves the start to the "
+                          "ULP coprocessor, is ignored\n");
         }
         return;
 
@@ -887,12 +1088,10 @@ static void esp32_sens_write(void *opaque, hwaddr addr, uint64_t value,
 
     case A_SENS_SAR_START_FORCE:
         s->regs[idx] = v & writable;
-        if (FIELD_EX32(v, SENS_SAR_START_FORCE, ULP_CP_FORCE_START_TOP) &&
-            FIELD_EX32(v, SENS_SAR_START_FORCE, ULP_CP_START_TOP)) {
-            qemu_log_mask(LOG_UNIMP,
-                          "esp32_sens: starting the ULP coprocessor is not "
-                          "modelled here\n");
-        }
+        qemu_set_irq(s->ulp_start,
+                     FIELD_EX32(v, SENS_SAR_START_FORCE,
+                                ULP_CP_FORCE_START_TOP) &&
+                     FIELD_EX32(v, SENS_SAR_START_FORCE, ULP_CP_START_TOP));
         if (FIELD_EX32(v, SENS_SAR_START_FORCE, SAR2_EN_TEST)) {
             qemu_log_mask(LOG_UNIMP,
                           "esp32_sens: ADC2's test input (SAR2_EN_TEST) is "
@@ -903,20 +1102,36 @@ static void esp32_sens_write(void *opaque, hwaddr addr, uint64_t value,
     case A_SENS_SAR_I2C_CTRL:
         s->regs[idx] = v & writable;
         if (FIELD_EX32(v, SENS_SAR_I2C_CTRL, START_FORCE) &&
-            FIELD_EX32(v, SENS_SAR_I2C_CTRL, START)) {
-            qemu_log_mask(LOG_UNIMP,
-                          "esp32_sens: the RTC I2C controller is not "
-                          "modelled here\n");
+            FIELD_EX32(v & ~old, SENS_SAR_I2C_CTRL, START)) {
+            uint32_t cycles;
+
+            if (s->i2c_busy) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "esp32_sens: SAR_I2C_START while an RTC I2C "
+                              "transaction is in progress is ignored\n");
+                return;
+            }
+            esp32_sens_rtc_i2c(s, FIELD_EX32(v, SENS_SAR_I2C_CTRL, CTRL),
+                               &cycles);
         }
         return;
 
     case A_SENS_SAR_TSENS_CTRL:
         s->regs[idx] = v & writable;
-        if (FIELD_EX32(v, SENS_SAR_TSENS_CTRL, POWER_UP_FORCE) &&
-            FIELD_EX32(v, SENS_SAR_TSENS_CTRL, POWER_UP)) {
-            qemu_log_mask(LOG_UNIMP,
-                          "esp32_sens: the temperature sensor is not "
-                          "modelled\n");
+        /*
+         * [spec:nuos:req:emu.esp32.ulp]
+         * Software's reading: TSENS_DUMP_OUT rising with the sensor
+         * powered by TSENS_POWER_UP_FORCE and TSENS_POWER_UP.
+         */
+        if (FIELD_EX32(v & ~old, SENS_SAR_TSENS_CTRL, DUMP_OUT)) {
+            if (FIELD_EX32(v, SENS_SAR_TSENS_CTRL, POWER_UP_FORCE) &&
+                FIELD_EX32(v, SENS_SAR_TSENS_CTRL, POWER_UP)) {
+                tsens_latch(s, tsens_code(s));
+            } else {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "esp32_sens: TSENS_DUMP_OUT with the "
+                              "temperature sensor not powered up\n");
+            }
         }
         return;
 
@@ -990,6 +1205,18 @@ static void esp32_sens_set_hall(Object *obj, Visitor *v, const char *name,
     visit_type_int32(v, name, &ESP32_SENS(obj)->hall_ut, errp);
 }
 
+static void esp32_sens_get_tsens(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    visit_type_int32(v, name, &ESP32_SENS(obj)->tsens_mc, errp);
+}
+
+static void esp32_sens_set_tsens(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    visit_type_int32(v, name, &ESP32_SENS(obj)->tsens_mc, errp);
+}
+
 static void esp32_sens_reset_hold(Object *obj, ResetType type)
 {
     Esp32SensState *s = ESP32_SENS(obj);
@@ -1004,6 +1231,9 @@ static void esp32_sens_reset_hold(Object *obj, ResetType type)
         s->patt_ptr[u] = 0;
     }
     s->alt_unit = 0;
+    memset(s->ulp_pads, 0, sizeof(s->ulp_pads));
+    timer_del(&s->i2c_timer);
+    s->i2c_busy = false;
     timer_del(&s->touch_timer);
     s->touch_phase = ESP32_TOUCH_IDLE;
     s->cw_anchor_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -1017,6 +1247,7 @@ static void esp32_sens_reset_exit(Object *obj, ResetType type)
 
     s->touch_wakeup_level = false;
     qemu_set_irq(s->touch_wakeup, 0);
+    qemu_set_irq(s->ulp_start, 0);
     touch_update_mode(s);
 }
 
@@ -1024,9 +1255,10 @@ static void esp32_sens_realize(DeviceState *dev, Error **errp)
 {
     Esp32SensState *s = ESP32_SENS(dev);
 
-    if (!s->rtc_cntl || !s->rtcio || !s->gpio || !s->apb_ctrl) {
-        error_setg(errp, "esp32_sens: rtc-cntl, rtcio, gpio and apb-ctrl "
-                   "links must be set");
+    if (!s->rtc_cntl || !s->rtcio || !s->gpio || !s->apb_ctrl ||
+        !s->rtc_i2c) {
+        error_setg(errp, "esp32_sens: rtc-cntl, rtcio, gpio, apb-ctrl and "
+                   "rtc-i2c links must be set");
     }
 }
 
@@ -1042,6 +1274,8 @@ static void esp32_sens_init(Object *obj)
     timer_init_ns(&s->adc_timer[0], QEMU_CLOCK_VIRTUAL, adc1_timer_cb, s);
     timer_init_ns(&s->adc_timer[1], QEMU_CLOCK_VIRTUAL, adc2_timer_cb, s);
     timer_init_ns(&s->touch_timer, QEMU_CLOCK_VIRTUAL, touch_timer_cb, s);
+    timer_init_ns(&s->i2c_timer, QEMU_CLOCK_VIRTUAL, i2c_timer_cb, s);
+    qdev_init_gpio_out_named(dev, &s->ulp_start, ESP32_SENS_ULP_START, 1);
     qdev_init_gpio_out_named(dev, &s->touch_int, ESP32_SENS_TOUCH_INT, 1);
     qdev_init_gpio_out_named(dev, &s->touch_wakeup, ESP32_SENS_TOUCH_WAKEUP,
                              1);
@@ -1065,6 +1299,9 @@ static void esp32_sens_init(Object *obj)
     }
     object_property_add(obj, "hall-field-ut", "int32", esp32_sens_get_hall,
                         esp32_sens_set_hall, NULL, NULL);
+    s->tsens_mc = 25000;
+    object_property_add(obj, "tsens-temp-mc", "int32", esp32_sens_get_tsens,
+                        esp32_sens_set_tsens, NULL, NULL);
     for (uintptr_t d = 0; d < ESP32_DAC_CHANNELS; d++) {
         snprintf(name, sizeof(name), "dac%u-mv", (unsigned)d + 1);
         object_property_add(obj, name, "uint32", esp32_sens_get_dac, NULL,
@@ -1081,14 +1318,19 @@ static const Property esp32_sens_properties[] = {
                      Esp32GpioState *),
     DEFINE_PROP_LINK("apb-ctrl", Esp32SensState, apb_ctrl,
                      TYPE_ESP32_APB_CTRL, Esp32ApbCtrlState *),
+    DEFINE_PROP_LINK("rtc-i2c", Esp32SensState, rtc_i2c,
+                     TYPE_ESP32_RTC_I2C, Esp32RtcI2cState *),
 };
 
 static const VMStateDescription vmstate_esp32_sens = {
     .name = TYPE_ESP32_SENS,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Esp32SensState, ESP32_SENS_REG_COUNT),
+        VMSTATE_UINT32_ARRAY(ulp_pads, Esp32SensState, ESP32_ADC_UNITS),
+        VMSTATE_TIMER(i2c_timer, Esp32SensState),
+        VMSTATE_BOOL(i2c_busy, Esp32SensState),
         VMSTATE_TIMER_ARRAY(adc_timer, Esp32SensState, ESP32_ADC_UNITS),
         VMSTATE_BOOL_ARRAY(adc_busy, Esp32SensState, ESP32_ADC_UNITS),
         VMSTATE_UINT32_ARRAY(adc_result, Esp32SensState, ESP32_ADC_UNITS),
@@ -1118,6 +1360,7 @@ static void esp32_sens_class_init(ObjectClass *klass, const void *data)
 }
 
 /* [spec:nuos:req:emu.esp32.analog] */
+/* [spec:nuos:req:emu.esp32.ulp] */
 static const TypeInfo esp32_sens_info = {
     .name = TYPE_ESP32_SENS,
     .parent = TYPE_SYS_BUS_DEVICE,

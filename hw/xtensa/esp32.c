@@ -249,6 +249,8 @@ static void esp32_soc_reset(DeviceState *dev)
         device_cold_reset(DEVICE(&s->rtcio));
         device_cold_reset(DEVICE(&s->ana));
         device_cold_reset(DEVICE(&s->sens));
+        device_cold_reset(DEVICE(&s->rtc_i2c));
+        device_cold_reset(DEVICE(&s->ulp));
     }
     if (s->requested_reset & ESP32_SOC_RESET_PERIPH) {
         device_cold_reset(DEVICE(&s->dport));
@@ -1686,6 +1688,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                              &error_abort);
     object_property_set_link(OBJECT(&s->sens), "apb-ctrl",
                              OBJECT(&s->apb_ctrl), &error_abort);
+    object_property_set_link(OBJECT(&s->sens), "rtc-i2c",
+                             OBJECT(&s->rtc_i2c), &error_abort);
     qdev_realize(DEVICE(&s->sens), &s->rtc_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->sens, DR_REG_SENS_BASE);
     qdev_connect_gpio_out_named(DEVICE(&s->sens), ESP32_SENS_TOUCH_INT, 0,
@@ -1703,6 +1707,60 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                 ESP32_APB_CTRL_SARADC_CTRL_GPIO, 0,
                                 qdev_get_gpio_in_named(DEVICE(&s->sens),
                                     ESP32_SENS_SARADC_CTRL_IN, 0));
+
+    /*
+     * [spec:nuos:req:emu.esp32.ulp]
+     * The RTC I2C controller, whose lines RTCIO puts on the touch pads, and
+     * the ULP coprocessor: its timer enable from RTC_CNTL and software
+     * start from SENS, its WAKE to RTC_CNTL's ULP wakeup and interrupt,
+     * and REG_RD and REG_WR to the RTC peripherals on the system bus.
+     */
+    qdev_realize(DEVICE(&s->rtc_i2c), &s->rtc_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->rtc_i2c, DR_REG_RTC_I2C_BASE);
+    {
+        static const char *const i2c_out[][2] = {
+            { ESP32_RTC_I2C_SCL_OUT, ESP32_RTCIO_I2C_SCL_OUT },
+            { ESP32_RTC_I2C_SCL_OE, ESP32_RTCIO_I2C_SCL_OE },
+            { ESP32_RTC_I2C_SDA_OUT, ESP32_RTCIO_I2C_SDA_OUT },
+            { ESP32_RTC_I2C_SDA_OE, ESP32_RTCIO_I2C_SDA_OE },
+        };
+
+        for (int i = 0; i < ARRAY_SIZE(i2c_out); i++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->rtc_i2c), i2c_out[i][0], 0,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->rtcio), i2c_out[i][1],
+                                            0));
+        }
+        qdev_connect_gpio_out_named(DEVICE(&s->rtcio), ESP32_RTCIO_I2C_SCL_IN,
+                                    0, qdev_get_gpio_in_named(
+                                        DEVICE(&s->rtc_i2c),
+                                        ESP32_RTC_I2C_SCL_IN, 0));
+        qdev_connect_gpio_out_named(DEVICE(&s->rtcio), ESP32_RTCIO_I2C_SDA_IN,
+                                    0, qdev_get_gpio_in_named(
+                                        DEVICE(&s->rtc_i2c),
+                                        ESP32_RTC_I2C_SDA_IN, 0));
+    }
+    object_property_set_link(OBJECT(&s->ulp), "rtc-cntl",
+                             OBJECT(&s->rtc_cntl), &error_abort);
+    object_property_set_link(OBJECT(&s->ulp), "sens", OBJECT(&s->sens),
+                             &error_abort);
+    object_property_set_link(OBJECT(&s->ulp), "memory", OBJECT(sys_mem),
+                             &error_abort);
+    qdev_realize(DEVICE(&s->ulp), &s->rtc_bus, &error_fatal);
+    qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl),
+                                ESP32_RTC_ULP_TIMER_GPIO, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->ulp),
+                                    ESP32_ULP_TIMER_EN_IN, 0));
+    qdev_connect_gpio_out_named(DEVICE(&s->sens), ESP32_SENS_ULP_START, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->ulp),
+                                    ESP32_ULP_START_IN, 0));
+    qdev_connect_gpio_out_named(DEVICE(&s->ulp), ESP32_ULP_WAKEUP, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->rtc_cntl),
+                                    ESP32_RTC_WAKEUP_IN,
+                                    ESP32_RTC_WAKEUP_ULP));
+    qdev_connect_gpio_out_named(DEVICE(&s->ulp), ESP32_ULP_INT, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->rtc_cntl),
+                                    ESP32_RTC_INT_IN, ESP32_RTC_INT_ULP_CP));
 
     esp32_soc_connect_lines(s);
 
@@ -1801,6 +1859,8 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "rtcio", &s->rtcio, TYPE_ESP32_RTCIO);
     object_initialize_child(obj, "ana", &s->ana, TYPE_ESP32_ANA);
     object_initialize_child(obj, "sens", &s->sens, TYPE_ESP32_SENS);
+    object_initialize_child(obj, "rtc_i2c", &s->rtc_i2c, TYPE_ESP32_RTC_I2C);
+    object_initialize_child(obj, "ulp", &s->ulp, TYPE_ESP32_ULP);
 
     for (int i = 0; i < ESP32_FRC_COUNT; ++i) {
         snprintf(name, sizeof(name), "frc%d", i);
@@ -2030,6 +2090,16 @@ static void esp32_machine_init_i2c(Esp32SocState *s)
     I2CBus* i2c_bus = I2C_BUS(qdev_get_child_bus(i2c_master, "i2c"));
     I2CSlave* tmp105 = i2c_slave_create_simple(i2c_bus, "tmp105", 0x48);
     object_property_set_int(OBJECT(tmp105), "temperature", 25 * 1000, &error_fatal);
+
+    /*
+     * [spec:nuos:req:emu.esp32.ulp]
+     * A second TMP105, at 0x48 on the pads the RTC I2C controller drives,
+     * for the ULP to read.
+     */
+    i2c_bus = I2C_BUS(qdev_get_child_bus(DEVICE(&s->rtc_i2c), "i2c"));
+    tmp105 = i2c_slave_create_simple(i2c_bus, "tmp105", 0x48);
+    object_property_set_int(OBJECT(tmp105), "temperature", 21 * 1000,
+                            &error_fatal);
 }
 
 static void esp32_machine_init_sd(Esp32SocState *ss)
