@@ -39,6 +39,8 @@ typedef struct Esp32RtcIoState Esp32RtcIoState;
  *   domain's clock gating (dig_clk_gated) changed.
  * - ESP32_RTC_TOUCH_TIMER_GPIO: RTC_CNTL_TOUCH_SLP_TIMER_EN, which lets the
  *   touch sensor's timer start measurements.
+ * - ESP32_RTC_ULP_TIMER_GPIO: RTC_CNTL_ULP_CP_SLP_TIMER_EN, which lets the
+ *   ULP timer start the ULP coprocessor.
  *
  * Inputs, from blocks that wake the chip or interrupt through RTC_CNTL:
  * - ESP32_RTC_WAKEUP_IN (ESP32_RTC_WAKEUP_COUNT lines, indexed by the
@@ -58,6 +60,7 @@ typedef struct Esp32RtcIoState Esp32RtcIoState;
 #define ESP32_RTC_CPU_STALL_GPIO    "cpu-stall"
 #define ESP32_RTC_CLK_UPDATE_GPIO   "clk-update"
 #define ESP32_RTC_TOUCH_TIMER_GPIO  "touch-timer-en"
+#define ESP32_RTC_ULP_TIMER_GPIO    "ulp-timer-en"
 #define ESP32_RTC_WAKEUP_IN         "esp32-rtc-wakeup"
 #define ESP32_RTC_GPIO_WAKEUP_IN    "esp32-rtc-gpio-wakeup"
 #define ESP32_RTC_INT_IN            "esp32-rtc-int"
@@ -186,10 +189,12 @@ REG32(RTC_CNTL_STATE0, 0x18)
     FIELD(RTC_CNTL_STATE0, SLP_REJECT, 30, 1)
     FIELD(RTC_CNTL_STATE0, SLP_WAKEUP, 29, 1)
     FIELD(RTC_CNTL_STATE0, SDIO_ACTIVE_IND, 28, 1)
+    FIELD(RTC_CNTL_STATE0, ULP_CP_SLP_TIMER_EN, 24, 1)
     FIELD(RTC_CNTL_STATE0, TOUCH_SLP_TIMER_EN, 23, 1)
 REG32(RTC_CNTL_TIMER1, 0x1c)
     FIELD(RTC_CNTL_TIMER1, CK8M_WAIT, 6, 8)
 REG32(RTC_CNTL_TIMER2, 0x20)
+    FIELD(RTC_CNTL_TIMER2, ULPCP_TOUCH_START_WAIT, 15, 9)
 REG32(RTC_CNTL_TIMER3, 0x24)
 REG32(RTC_CNTL_TIMER4, 0x28)
 REG32(RTC_CNTL_TIMER5, 0x2c)
@@ -337,6 +342,7 @@ typedef struct Esp32RtcCntlState {
     qemu_irq cpu_stall_req[ESP32_CPU_COUNT];
     qemu_irq clk_update;
     qemu_irq touch_timer_en;
+    qemu_irq ulp_timer_en;
 
     Clock *xtal_clk;
     Clock *slow_clk;

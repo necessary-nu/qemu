@@ -292,7 +292,8 @@ qtests_xtensa = \
      'esp32-i2s-test',
      'esp32-periph-lines-test',
      'esp32-timg-cal-test',
-     'esp32-board-reset-test'] : [])
+     'esp32-board-reset-test',
+     'esp32-ulp-test'] : [])
 
 qtests_stm32l4x5 = \
   ['stm32l4x5_exti-test',

@@ -16,6 +16,10 @@
  * PAD_DRIVER making it open drain, and RTC_GPIO_IN reads it. The pads are
  * in the RTC domain: a deep sleep, which resets the digital domain, leaves
  * them as they are.
+ *
+ * In RTC function 1 (FUN_SEL 3) the pads TOUCH_PAD0 to TOUCH_PAD3 (RTC GPIO
+ * 10 to 13) carry the RTC I2C controller's SCL and SDA, on the pads
+ * RTCIO_SAR_I2C_SCL_SEL and RTCIO_SAR_I2C_SDA_SEL choose (TRM table 6.11-1).
  */
 
 #include "qemu/osdep.h"
@@ -72,6 +76,9 @@ static const RtcPadDesc pad_desc[ESP32_RTCIO_PAD_COUNT] = {
 #define FUN_SEL_RTC_GPIO 0
 /* RTC function 1: the RTC I2C controller's SCL or SDA, on RTC GPIO 10-13 */
 #define FUN_SEL_RTC_FUNC1 3
+/* SCL on RTC GPIO 10 + 2 * SCL_SEL, SDA on RTC GPIO 11 + 2 * SDA_SEL */
+#define RTC_I2C_SCL_PAD0  10
+#define RTC_I2C_SDA_PAD0  11
 
 /* RTC_GPIO_PINn_INT_TYPE */
 enum {
@@ -146,6 +153,50 @@ static bool pad_held(Esp32RtcIoState *s, unsigned n)
            esp32_rtc_cntl_dg_pad_force_hold(s->rtc_cntl);
 }
 
+/* The RTC GPIOs carrying the RTC I2C controller's SCL and SDA, if any */
+static unsigned i2c_scl_pad(Esp32RtcIoState *s)
+{
+    return RTC_I2C_SCL_PAD0 +
+           2 * (FIELD_EX32(s->regs[A_RTCIO_SAR_I2C_IO / 4], RTCIO_SAR_I2C_IO,
+                           SCL_SEL) & 1);
+}
+
+static unsigned i2c_sda_pad(Esp32RtcIoState *s)
+{
+    return RTC_I2C_SDA_PAD0 +
+           2 * (FIELD_EX32(s->regs[A_RTCIO_SAR_I2C_IO / 4], RTCIO_SAR_I2C_IO,
+                           SDA_SEL) & 1);
+}
+
+static bool pad_in_func1(Esp32RtcIoState *s, unsigned n)
+{
+    uint32_t reg = pad_reg(s, n);
+
+    return bit32(reg, pad_desc[n].mux) &&
+           ((reg >> pad_desc[n].fun_sel) & 3) == FUN_SEL_RTC_FUNC1;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp]
+ * Give the RTC I2C controller its lines as the selected pads read them;
+ * a line no pad carries reads high.
+ */
+static void esp32_rtcio_update_i2c_in(Esp32RtcIoState *s, bool resync)
+{
+    unsigned scl = i2c_scl_pad(s), sda = i2c_sda_pad(s);
+    bool scl_level = !pad_in_func1(s, scl) || bit32(s->pad_in, scl);
+    bool sda_level = !pad_in_func1(s, sda) || bit32(s->pad_in, sda);
+
+    if (resync || scl_level != s->i2c_scl_level) {
+        s->i2c_scl_level = scl_level;
+        qemu_set_irq(s->i2c_scl_in, scl_level);
+    }
+    if (resync || sda_level != s->i2c_sda_level) {
+        s->i2c_sda_level = sda_level;
+        qemu_set_irq(s->i2c_sda_in, sda_level);
+    }
+}
+
 /*
  * [spec:nuos:req:emu.esp32.rtc]
  * Work out each pad's control from the registers. A held pad keeps the
@@ -188,6 +239,13 @@ static void esp32_rtcio_update(Esp32RtcIoState *s)
                 /* Open drain: a high output releases the pad */
                 oe = false;
             }
+        } else if (fun == FUN_SEL_RTC_FUNC1 && n == i2c_scl_pad(s)) {
+            /* [spec:nuos:req:emu.esp32.ulp] */
+            val = s->i2c_scl_out;
+            oe = s->i2c_scl_oe;
+        } else if (fun == FUN_SEL_RTC_FUNC1 && n == i2c_sda_pad(s)) {
+            val = s->i2c_sda_out;
+            oe = s->i2c_sda_oe;
         }
         s->ctl_mux = (s->ctl_mux & ~m) | (mux ? m : 0);
         s->ctl_out = (s->ctl_out & ~m) | (val ? m : 0);
@@ -223,6 +281,7 @@ static void esp32_rtcio_update(Esp32RtcIoState *s)
             qemu_set_irq(s->pad_mux[n], bit32(s->ctl_mux, n));
         }
     }
+    esp32_rtcio_update_i2c_in(s, resync);
     esp32_rtc_cntl_rtcio_changed(s->rtc_cntl);
 }
 
@@ -356,11 +415,12 @@ static void esp32_rtcio_check_fun_sel(Esp32RtcIoState *s, uint32_t old,
             !((old ^ reg) & sel_mask)) {
             continue;
         }
-        if (fun == FUN_SEL_RTC_FUNC1) {
-            qemu_log_mask(LOG_UNIMP,
-                          "esp32_rtcio: RTC GPIO %u: RTC function 1 (the RTC "
-                          "I2C controller) is not modelled\n", n);
-        } else if (fun != FUN_SEL_RTC_GPIO) {
+        if (fun == FUN_SEL_RTC_FUNC1 &&
+            (n < RTC_I2C_SCL_PAD0 || n > RTC_I2C_SDA_PAD0 + 2)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "esp32_rtcio: RTC GPIO %u has no RTC function 1\n",
+                          n);
+        } else if (fun != FUN_SEL_RTC_GPIO && fun != FUN_SEL_RTC_FUNC1) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "esp32_rtcio: RTC GPIO %u: reserved FUN_SEL %u\n",
                           n, fun);
@@ -456,8 +516,45 @@ static void esp32_rtcio_pad_in(void *opaque, int n, int level)
     s->pad_in = (s->pad_in & ~(1u << n)) | ((level ? 1u : 0) << n);
     if (s->pad_in != old) {
         esp32_rtcio_latch_status(s, old);
+        esp32_rtcio_update_i2c_in(s, false);
         esp32_rtc_cntl_rtcio_changed(s->rtc_cntl);
     }
+}
+
+static void esp32_rtcio_i2c_line(Esp32RtcIoState *s, bool *line, int level)
+{
+    if (*line != (level != 0)) {
+        *line = level != 0;
+        esp32_rtcio_update(s);
+    }
+}
+
+static void esp32_rtcio_i2c_scl_out(void *opaque, int n, int level)
+{
+    Esp32RtcIoState *s = ESP32_RTCIO(opaque);
+
+    esp32_rtcio_i2c_line(s, &s->i2c_scl_out, level);
+}
+
+static void esp32_rtcio_i2c_scl_oe(void *opaque, int n, int level)
+{
+    Esp32RtcIoState *s = ESP32_RTCIO(opaque);
+
+    esp32_rtcio_i2c_line(s, &s->i2c_scl_oe, level);
+}
+
+static void esp32_rtcio_i2c_sda_out(void *opaque, int n, int level)
+{
+    Esp32RtcIoState *s = ESP32_RTCIO(opaque);
+
+    esp32_rtcio_i2c_line(s, &s->i2c_sda_out, level);
+}
+
+static void esp32_rtcio_i2c_sda_oe(void *opaque, int n, int level)
+{
+    Esp32RtcIoState *s = ESP32_RTCIO(opaque);
+
+    esp32_rtcio_i2c_line(s, &s->i2c_sda_oe, level);
 }
 
 static void esp32_rtcio_reset_hold(Object *obj, ResetType type)
@@ -507,6 +604,16 @@ static void esp32_rtcio_init(Object *obj)
                              ESP32_RTCIO_PAD_COUNT);
     qdev_init_gpio_in_named(dev, esp32_rtcio_pad_in, ESP32_RTCIO_PAD_IN,
                             ESP32_RTCIO_PAD_COUNT);
+    qdev_init_gpio_in_named(dev, esp32_rtcio_i2c_scl_out,
+                            ESP32_RTCIO_I2C_SCL_OUT, 1);
+    qdev_init_gpio_in_named(dev, esp32_rtcio_i2c_scl_oe,
+                            ESP32_RTCIO_I2C_SCL_OE, 1);
+    qdev_init_gpio_in_named(dev, esp32_rtcio_i2c_sda_out,
+                            ESP32_RTCIO_I2C_SDA_OUT, 1);
+    qdev_init_gpio_in_named(dev, esp32_rtcio_i2c_sda_oe,
+                            ESP32_RTCIO_I2C_SDA_OE, 1);
+    qdev_init_gpio_out_named(dev, &s->i2c_scl_in, ESP32_RTCIO_I2C_SCL_IN, 1);
+    qdev_init_gpio_out_named(dev, &s->i2c_sda_in, ESP32_RTCIO_I2C_SDA_IN, 1);
 }
 
 static const Property esp32_rtcio_properties[] = {
@@ -516,10 +623,16 @@ static const Property esp32_rtcio_properties[] = {
 
 static const VMStateDescription vmstate_esp32_rtcio = {
     .name = TYPE_ESP32_RTCIO,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Esp32RtcIoState, ESP32_RTCIO_REG_COUNT),
+        VMSTATE_BOOL(i2c_scl_out, Esp32RtcIoState),
+        VMSTATE_BOOL(i2c_scl_oe, Esp32RtcIoState),
+        VMSTATE_BOOL(i2c_sda_out, Esp32RtcIoState),
+        VMSTATE_BOOL(i2c_sda_oe, Esp32RtcIoState),
+        VMSTATE_BOOL(i2c_scl_level, Esp32RtcIoState),
+        VMSTATE_BOOL(i2c_sda_level, Esp32RtcIoState),
         VMSTATE_UINT32(pad_in, Esp32RtcIoState),
         VMSTATE_UINT32(ctl_mux, Esp32RtcIoState),
         VMSTATE_UINT32(ctl_out, Esp32RtcIoState),
