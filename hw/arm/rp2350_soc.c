@@ -629,6 +629,38 @@ static const MemoryRegionOps rp2350_alias_ops = {
 };
 
 /*
+ * Drive core n's SysTick reference clock from its TICKS generator: one
+ * tick every CYCLES clk_ref cycles while the generator is enabled, and no
+ * ticks while it is stopped or CYCLES is 0, so a SysTick counting the
+ * reference holds its value.
+ */
+/* [spec:nuos:req:emu.clocks] */
+static void rp2350_soc_proc_tick_update(RP2350State *s, int n)
+{
+    static const int tick[] = { RP2350_TICK_PROC0, RP2350_TICK_PROC1 };
+    uint32_t cycles = rp2350_ticks_cycles(&s->ticks, tick[n]);
+
+    if (!rp2350_ticks_running(&s->ticks, tick[n])) {
+        cycles = 0;
+    }
+    /* The period in 2^-32 ns units, exact for 1 us ticks. */
+    clock_set(s->refclk[n],
+              muldiv64(CLOCK_PERIOD_FROM_NS(NANOSECONDS_PER_SECOND), cycles,
+                       RP2350_CLK_REF_HZ));
+    clock_propagate(s->refclk[n]);
+}
+
+static void rp2350_soc_proc0_tick(void *opaque)
+{
+    rp2350_soc_proc_tick_update(opaque, 0);
+}
+
+static void rp2350_soc_proc1_tick(void *opaque)
+{
+    rp2350_soc_proc_tick_update(opaque, 1);
+}
+
+/*
  * System-level interrupts are wired to the same IRQ number on both cores'
  * NVICs; each core masks the lines it does not service. Core-local
  * sources (SIO FIFOs, doorbells and MTIMECMP, and the GPIO interrupts) do
@@ -1030,7 +1062,6 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                                 &s->usb_dpram);
 
     clock_set_hz(s->sysclk, RP2350_SYSCLK_HZ);
-    clock_set_hz(s->refclk, RP2350_REFCLK_HZ);
     clock_set_hz(s->periclk, RP2350_CLK_PERI_HZ);
     clock_set_hz(s->adcclk, RP2350_CLK_ADC_HZ);
 
@@ -1072,7 +1103,9 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         qdev_prop_set_bit(armv7m, "start-powered-off",
                           i != 0 && s->core1_launch);
         qdev_connect_clock_in(armv7m, "cpuclk", s->sysclk);
-        qdev_connect_clock_in(armv7m, "refclk", s->refclk);
+        qdev_connect_clock_in(armv7m, "refclk", s->refclk[i]);
+        /* [spec:nuos:req:emu.clocks] */
+        qdev_prop_set_uint32(armv7m, "systick-calib", RP2350_SYST_CALIB);
         object_property_set_link(OBJECT(armv7m), "memory",
                                  OBJECT(rp2350_accessctrl_view(&s->accessctrl,
                                                                i)),
@@ -1266,6 +1299,11 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             { SYS_BUS_DEVICE(&s->dft), RP2350_DFT_BASE },
             { SYS_BUS_DEVICE(&s->rosc), RP2350_ROSC_BASE },
         };
+
+        rp2350_ticks_set_notify(&s->ticks, RP2350_TICK_PROC0,
+                                rp2350_soc_proc0_tick, s);
+        rp2350_ticks_set_notify(&s->ticks, RP2350_TICK_PROC1,
+                                rp2350_soc_proc1_tick, s);
 
         for (i = 0; i < ARRAY_SIZE(blocks); i++) {
             if (!sysbus_realize(blocks[i].dev, errp)) {
@@ -1836,7 +1874,8 @@ static void rp2350_soc_init(Object *obj)
                             RP2350_GPIO_SIO_BITS);
 
     s->sysclk = qdev_init_clock_out(DEVICE(s), "sysclk");
-    s->refclk = qdev_init_clock_out(DEVICE(s), "refclk");
+    s->refclk[0] = qdev_init_clock_out(DEVICE(s), "refclk0");
+    s->refclk[1] = qdev_init_clock_out(DEVICE(s), "refclk1");
     s->periclk = qdev_init_clock_out(DEVICE(s), "periclk");
     s->adcclk = clock_new(obj, "adcclk");
 }
