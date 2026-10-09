@@ -102,6 +102,9 @@
 #define SIG_PWM0_CAP0       109
 
 #define TIMG0_WDTCONFIG0    0x3ff5f048
+#define RTC_WDTCONFIG0      0x3ff4808c
+#define RTC_WDTWPROTECT     0x3ff480a4
+#define RTC_WDT_WKEY        0x50d83aa1
 
 #define GPIO_PATH           "/machine/soc/gpio"
 #define PAD_IN              "esp32-gpio-pad-in"
@@ -642,8 +645,11 @@ static void test_long_run(void)
     const uint64_t period[3] = { 1000, 1001, 1003 };
     uint64_t cycles;
 
-    /* The flash boot watchdog would reset the chip within the run. */
+    /* The flash boot watchdogs (TIMG0 and RTC) would reset the chip. */
     qtest_writel(qts, TIMG0_WDTCONFIG0, 0);
+    qtest_writel(qts, RTC_WDTWPROTECT, RTC_WDT_WKEY);
+    qtest_writel(qts, RTC_WDTCONFIG0, 0);
+    qtest_writel(qts, RTC_WDTWPROTECT, 0);
 
     /*
      * Three timers at 160 MHz with unrelated periods, the third synced
