@@ -11,6 +11,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/arm/armv7m.h"
+#include "hw/adc/rp2350_adc.h"
 #include "hw/char/pl011.h"
 #include "hw/core/clock.h"
 #include "hw/dma/rp2350_dma.h"
@@ -70,6 +71,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_CLOCKS_IRQ 30
 #define RP2350_UART0_IRQ 33
 #define RP2350_UART1_IRQ 34
+#define RP2350_ADC_IRQ_FIFO 35
 #define RP2350_OTP_IRQ 38
 #define RP2350_TRNG_IRQ 39
 #define RP2350_SPARE_IRQ_5 51
@@ -144,6 +146,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
  * pico-sdk switches it to.
  */
 #define RP2350_CLK_REF_HZ 12000000
+/* clk_adc, as pico-sdk sets it up from PLL_USB. */
+#define RP2350_CLK_ADC_HZ 48000000
 
 struct RP2350State {
     SysBusDevice parent_obj;
@@ -176,6 +180,7 @@ struct RP2350State {
     RP2350TRNGState trng;
     RP2350SHA256State sha256;
     RP2350PWMState pwm;
+    RP2350ADCState adc;
     RP2350TimerState timer[RP2350_NUM_TIMERS];
     PL011State uart[RP2350_NUM_UARTS];
     RP2350CoreSightState coresight;
@@ -201,6 +206,7 @@ struct RP2350State {
 
     Clock *sysclk;
     Clock *refclk;
+    Clock *adcclk;
 };
 
 /*

@@ -386,6 +386,24 @@ static int pad_level(RP2350GPIOState *s, int p, uint8_t c)
     }
 }
 
+int rp2350_gpio_pin_drive(RP2350GPIOState *s, int p)
+{
+    uint8_t c = s->latch[p];
+
+    if (c & LATCH_OE) {
+        return !!(c & LATCH_OUT);
+    }
+    if (s->ext[p] != RP2350_GPIO_EXT_NONE && pin_bonded(s, p)) {
+        return s->ext[p];
+    }
+    return -1;
+}
+
+bool rp2350_gpio_pin_input_enabled(RP2350GPIOState *s, int p)
+{
+    return s->latch[p] & LATCH_IE;
+}
+
 static bool pin_ns(RP2350GPIOState *s, int p)
 {
     return (s->nsmask >> rp2350_gpio_sio_bit(p)) & 1;

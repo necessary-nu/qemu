@@ -145,6 +145,7 @@ static void rp2350_core1_launch(void *opaque, uint32_t vtor, uint32_t sp,
 }
 
 /* RESETS bits of the subsystems that have device models. */
+#define RP2350_RESET_ADC        0
 #define RP2350_RESET_BUSCTRL    1
 #define RP2350_RESET_IO_BANK0   6
 #define RP2350_RESET_IO_QSPI    7
@@ -165,6 +166,8 @@ static void rp2350_core1_launch(void *opaque, uint32_t vtor, uint32_t sp,
 static DeviceState *rp2350_subsystem(RP2350State *s, int bit)
 {
     switch (bit) {
+    case RP2350_RESET_ADC:
+        return DEVICE(&s->adc);
     case RP2350_RESET_BUSCTRL:
         return DEVICE(&s->busctrl);
     case RP2350_RESET_PLL_SYS:
@@ -565,6 +568,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
     clock_set_hz(s->sysclk, RP2350_SYSCLK_HZ);
     clock_set_hz(s->refclk, RP2350_REFCLK_HZ);
+    clock_set_hz(s->adcclk, RP2350_CLK_ADC_HZ);
 
     /*
      * The bus filters stand between each core and board memory, so every
@@ -890,6 +894,21 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         }
     }
 
+    /*
+     * ADC. Its external inputs share GPIO 26-29's pads; the DREQ_ADC
+     * output is connected with the DMA's other sources.
+     */
+    /* [spec:nuos:req:emu.adc] */
+    object_property_set_link(OBJECT(&s->adc), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
+    qdev_connect_clock_in(DEVICE(&s->adc), "clk", s->adcclk);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->adc), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->adc), 0, RP2350_ADC_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->adc), 0,
+                       qdev_get_gpio_in(dev_soc, RP2350_ADC_IRQ_FIFO));
+
     /* [spec:nuos:req:emu.uart] */
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         static const hwaddr base[] = { RP2350_UART0_BASE, RP2350_UART1_BASE };
@@ -1018,6 +1037,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->coresight_trace), 0,
             qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
                                    RP2350_DREQ_CORESIGHT));
+        qdev_connect_gpio_out_named(DEVICE(&s->adc), RP2350_ADC_DREQ, 0,
+            qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_ADC));
         qdev_connect_gpio_out_named(DEVICE(&s->sha256), RP2350_SHA256_DREQ, 0,
             qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_SHA256));
     }
@@ -1069,6 +1090,7 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "trng", &s->trng, TYPE_RP2350_TRNG);
     object_initialize_child(obj, "sha256", &s->sha256, TYPE_RP2350_SHA256);
     object_initialize_child(obj, "pwm", &s->pwm, TYPE_RP2350_PWM);
+    object_initialize_child(obj, "adc", &s->adc, TYPE_RP2350_ADC);
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
         object_initialize_child(obj, "timer[*]", &s->timer[i],
                                 TYPE_RP2350_TIMER);
@@ -1087,6 +1109,7 @@ static void rp2350_soc_init(Object *obj)
 
     s->sysclk = qdev_init_clock_out(DEVICE(s), "sysclk");
     s->refclk = qdev_init_clock_out(DEVICE(s), "refclk");
+    s->adcclk = clock_new(obj, "adcclk");
 }
 
 static const Property rp2350_soc_properties[] = {
