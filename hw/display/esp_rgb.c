@@ -266,6 +266,29 @@ static void esp_rgb_realize(DeviceState *dev, Error **errp)
     assert(s->intram != NULL);
     /* Create an address space for internal RAM so that we can read data from it on GUI update */
     address_space_init(&s->intram_as, s->intram, "esp.rgb.intram_as");
+
+    /*
+     * The console, the framebuffer RAM and its address space are created
+     * here, not in instance_init: RAM block names are global, so an
+     * object that is only introspected must not register one.
+     */
+    if (s->con == NULL) {
+        s->con = qemu_graphic_console_create(DEVICE(s), 0, &fb_ops, s);
+        /* Resize and use corrent color bpp*/
+        update_rgb_surface(s);
+        void *data = surface_data(qemu_console_surface(s->con));
+        /* Initialize the window to black */
+        memset(data, 0, (s->width * s->height * s->bpp) / 8);
+    }
+
+    /* Create a memory region that can be used as a framebuffer by the guest */
+    if (!memory_region_init_ram(&s->vram, OBJECT(s), "esp-rgb-vram",
+                                ESP_RGB_MAX_VRAM_SIZE, errp)) {
+        return;
+    }
+
+    /* An AddressSpace over the framebuffer lets the device perform DMA */
+    address_space_init(&s->vram_as, &s->vram, "esp.rgb.vram_as");
 }
 
 
@@ -291,20 +314,6 @@ static void esp_rgb_init(Object *obj)
     s->update_area = false;
     s->bpp = DEFAULT_BPP;
 
-    if (s->con == NULL) {
-        s->con = qemu_graphic_console_create(DEVICE(s), 0, &fb_ops, s);
-        /* Resize and use corrent color bpp*/
-        update_rgb_surface(s);
-        void * data = surface_data(qemu_console_surface(s->con));
-        /* Initialize the window to black */
-        memset(data, 0, (s->width * s->height * s->bpp) / 8);
-    }
-
-    /* Create a memory region that can be used as a framebuffer by the guest */
-    memory_region_init_ram(&s->vram, OBJECT(s), "esp-rgb-vram", ESP_RGB_MAX_VRAM_SIZE, &error_abort);
-
-    /* Create an AddressSpace out of the MemoryRegion to be able to perform DMA */
-    address_space_init(&s->vram_as, &s->vram, "esp.rgb.vram_as");
 }
 
 

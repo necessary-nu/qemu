@@ -22,11 +22,14 @@
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/unimp.h"
 #include "hw/ssi/ssi.h"
+#include "system/blockdev.h"
+#include "system/block-backend.h"
 #include "system/system.h"
 #include "target/arm/arm-powerctl.h"
 #include "target/arm/cpu.h"
 #include "target/arm/internals.h"
 #include "target/arm/multiprocessing.h"
+#include "target/arm/tcg/idau.h"
 
 typedef struct RP2350Peripheral {
     const char *name;
@@ -90,6 +93,70 @@ static const RP2350Peripheral rp2350_peripherals[] = {
     { "rp2350.sio",             0xd0000000, 0x20000 },
     { "rp2350.sio_nonsec",      0xd0020000, 0x20000 },
 };
+
+/*
+ * The RP2350 IDAU (datasheet "IDAU address map"), a fixed address decode.
+ * Within the 32 KiB ROM map, mirrored every 32 KiB below the XIP window:
+ * the Arm boot code is Exempt, the USB/RISC-V boot code is Non-secure for
+ * instruction fetch but Exempt for loads and stores, and the final 512
+ * bytes hold the Secure Gateways, Secure and Non-secure-callable. The
+ * peripherals and SIO are Exempt; XIP, SRAM and everything else are
+ * Non-secure. Only the Secure Gateway region reports a region number, 2,
+ * as the boot ROM's start-up checks of its TT results expect.
+ */
+#define RP2350_IDAU_ROM_MAP      0x8000
+#define RP2350_IDAU_NSBOOT_START 0x4300
+#define RP2350_IDAU_SG_START     0x7e00
+#define RP2350_IDAU_SG_REGION    2
+
+/* [spec:nuos:req:emu.machine+1] */
+static void rp2350_idau_check(IDAUInterface *ii, uint32_t address,
+                              MMUAccessType access_type, int *iregion,
+                              bool *exempt, bool *ns, bool *nsc,
+                              uint32_t *base, uint32_t *limit)
+{
+    uint32_t block = address & ~(uint32_t)(RP2350_XIP_BASE - 1);
+
+    *iregion = IREGION_NOTVALID;
+    *exempt = false;
+    *ns = true;
+    *nsc = false;
+
+    if (address < RP2350_XIP_BASE) {
+        uint32_t map = address & ~(uint32_t)(RP2350_IDAU_ROM_MAP - 1);
+        uint32_t off = address - map;
+
+        if (off < RP2350_IDAU_NSBOOT_START) {
+            *exempt = true;
+            *base = map;
+            *limit = map + RP2350_IDAU_NSBOOT_START - 1;
+        } else if (off < RP2350_IDAU_SG_START) {
+            /* The attribute depends on the access type. */
+            *exempt = access_type != MMU_INST_FETCH;
+            *base = address;
+            *limit = address;
+        } else {
+            *ns = false;
+            *nsc = true;
+            *iregion = RP2350_IDAU_SG_REGION;
+            *base = map + RP2350_IDAU_SG_START;
+            *limit = map + RP2350_IDAU_ROM_MAP - 1;
+        }
+        return;
+    }
+
+    switch (block >> 28) {
+    case 0x4: /* APB peripherals */
+    case 0x5: /* AHB peripherals */
+    case 0xd: /* SIO */
+        *exempt = true;
+        break;
+    default:
+        break;
+    }
+    *base = block;
+    *limit = block + (RP2350_XIP_BASE - 1);
+}
 
 /* The boot ROM enables the RCP (coprocessor 7) for Secure and Non-secure. */
 #define CPACR_CP7 (3u << 14)
@@ -663,7 +730,9 @@ static const char *rp2350_flash_part(uint32_t size)
  * The XIP subsystem and the board's QSPI devices: flash on chip select 0,
  * a W25Q part of the configured size, and optionally an APS6404L PSRAM on
  * chip select 1. Without flash, chip select 0 has no device and the XIP
- * windows hold no flash.
+ * windows hold no flash. The flash is erased unless backed by the first
+ * -drive if=mtd, a raw image of exactly the flash size, which then holds
+ * its contents and takes its erases and programs.
  */
 /* [spec:nuos:req:emu.flash] */
 /* [spec:nuos:req:emu.xip+1] */
@@ -699,7 +768,15 @@ static bool rp2350_soc_realize_xip(RP2350State *s, Error **errp)
         dev = qdev_new(devices[cs].type);
         qdev_prop_set_uint8(dev, "cs", cs);
         if (cs == 0) {
+            DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
+
             qdev_prop_set_bit(dev, "write-enable-autoclear", true);
+            if (dinfo &&
+                !qdev_prop_set_drive_err(dev, "drive",
+                                         blk_by_legacy_dinfo(dinfo), errp)) {
+                object_unref(OBJECT(dev));
+                return false;
+            }
         }
         object_property_set_link(OBJECT(dev), "memory",
                                  OBJECT(rp2350_xip_array(&s->xip, cs)),
@@ -762,8 +839,24 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     memory_region_add_subregion(s->board_memory, RP2350_SRAM_BASE, &s->sram);
 
+    /*
+     * The USB controller's 4 KiB data DPRAM. It is ordinary memory to the
+     * system bus, and software that does not use USB uses it as such: the
+     * boot ROM keeps its flash boot workspace there. The controller's
+     * registers are not modelled.
+     */
+    /* [spec:nuos:req:emu.machine+1] */
+    if (!memory_region_init_ram(&s->usb_dpram, obj, "rp2350.usb-dpram",
+                                RP2350_USB_DPRAM_SIZE, errp)) {
+        return;
+    }
+    memory_region_add_subregion(s->board_memory, RP2350_USB_DPRAM_BASE,
+                                &s->usb_dpram);
+
     clock_set_hz(s->sysclk, RP2350_SYSCLK_HZ);
     clock_set_hz(s->refclk, RP2350_REFCLK_HZ);
+    clock_set_hz(s->periclk, RP2350_CLK_PERI_HZ);
+    clock_set_hz(s->adcclk, RP2350_CLK_ADC_HZ);
 
     /*
      * The bus filters stand between each core and board memory, so every
@@ -794,16 +887,21 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         qdev_prop_set_uint32(armv7m, "mpu-s-regions", RP2350_MPU_REGIONS);
         qdev_prop_set_uint32(armv7m, "mpu-ns-regions", RP2350_MPU_REGIONS);
         /*
-         * On hardware the boot ROM holds core 1 until core 0 launches it
-         * through the SIO FIFO. Without that path modelled, core 1 stays
-         * powered off.
+         * Both cores leave reset into the boot ROM, which holds core 1 in
+         * its wait-for-launch code until core 0 launches it through the
+         * SIO FIFO. With no ROM executing, core 1 stays powered off until
+         * the machine's own launch handshake starts it.
          */
-        qdev_prop_set_bit(armv7m, "start-powered-off", i != 0);
+        /* [spec:nuos:req:emu.core1-launch] */
+        qdev_prop_set_bit(armv7m, "start-powered-off",
+                          i != 0 && s->core1_launch);
         qdev_connect_clock_in(armv7m, "cpuclk", s->sysclk);
         qdev_connect_clock_in(armv7m, "refclk", s->refclk);
         object_property_set_link(OBJECT(armv7m), "memory",
                                  OBJECT(rp2350_accessctrl_view(&s->accessctrl,
                                                                i)),
+                                 &error_abort);
+        object_property_set_link(OBJECT(armv7m), "idau", OBJECT(s),
                                  &error_abort);
         if (!sysbus_realize(SYS_BUS_DEVICE(armv7m), errp)) {
             return;
@@ -971,24 +1069,6 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             rp2350_gpio_connect_in(&s->gpio, RP2350_GPIO_PORT_SIO, n,
                 qdev_get_gpio_in_named(DEVICE(&s->sio), "gpio-in", n));
         }
-        /*
-         * QEMU's PL011 sends and receives through its chardev and has no
-         * line-level TX, RX or modem signals. Their pins show the idle
-         * state: TX driven high (mark) and RTS driven high (deasserted).
-         */
-        for (n = 0; n < RP2350_NUM_UARTS; n++) {
-            RP2350GPIOPort port = n ? RP2350_GPIO_PORT_UART1
-                                    : RP2350_GPIO_PORT_UART0;
-
-            qemu_set_irq(rp2350_gpio_out_line(&s->gpio, port,
-                                              RP2350_GPIO_UART_TX), 1);
-            qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port,
-                                             RP2350_GPIO_UART_TX), 1);
-            qemu_set_irq(rp2350_gpio_out_line(&s->gpio, port,
-                                              RP2350_GPIO_UART_RTS), 1);
-            qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port,
-                                             RP2350_GPIO_UART_RTS), 1);
-        }
     }
 
     {
@@ -1154,6 +1234,21 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
 
     /*
+     * ADC. Its external inputs share GPIO 26-29's pads; the DREQ_ADC
+     * output is connected with the DMA's other sources.
+     */
+    /* [spec:nuos:req:emu.adc] */
+    object_property_set_link(OBJECT(&s->adc), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
+    qdev_connect_clock_in(DEVICE(&s->adc), "clk", s->adcclk);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->adc), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->adc), 0, RP2350_ADC_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->adc), 0,
+                       qdev_get_gpio_in(dev_soc, RP2350_ADC_IRQ_FIFO));
+
+    /*
      * HSTX, clocked by clk_hstx. Clock frequencies are not modelled: at
      * reset CLK_HSTX_CTRL selects clk_sys undivided, which pico-sdk keeps,
      * so clk_hstx is clk_sys. Its eight outputs drive the HSTX function
@@ -1186,17 +1281,40 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         }
     }
 
+    /*
+     * The UARTs are r1p5 PL011s with 32-entry FIFOs, clocked by clk_peri.
+     * They have no character device: their TX, RX, CTS and RTS signals go
+     * through the GPIO muxing like any other function's, and the board
+     * attaches the console to pins. TX and RTS are always outputs.
+     */
     /* [spec:nuos:req:emu.uart] */
+    /* [spec:nuos:req:emu.gpio] */
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         static const hwaddr base[] = { RP2350_UART0_BASE, RP2350_UART1_BASE };
         static const int irq[] = { RP2350_UART0_IRQ, RP2350_UART1_IRQ };
         SysBusDevice *sbd = SYS_BUS_DEVICE(&s->uart[i]);
+        DeviceState *uart = DEVICE(sbd);
+        RP2350GPIOPort port = i ? RP2350_GPIO_PORT_UART1
+                                : RP2350_GPIO_PORT_UART0;
 
-        qdev_prop_set_chr(DEVICE(sbd), "chardev", serial_hd(i));
-        qdev_connect_clock_in(DEVICE(sbd), "clk", s->sysclk);
+        qdev_prop_set_bit(uart, "line-level", true);
+        qdev_prop_set_uint32(uart, "fifo-depth", PL011_FIFO_MAX);
+        qdev_connect_clock_in(uart, "clk", s->periclk);
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
+        qdev_connect_gpio_out_named(uart, PL011_TXD, 0,
+            rp2350_gpio_out_line(&s->gpio, port, RP2350_GPIO_UART_TX));
+        qdev_connect_gpio_out_named(uart, PL011_NRTS, 0,
+            rp2350_gpio_out_line(&s->gpio, port, RP2350_GPIO_UART_RTS));
+        qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port, RP2350_GPIO_UART_TX),
+                     1);
+        qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port,
+                                         RP2350_GPIO_UART_RTS), 1);
+        rp2350_gpio_connect_in(&s->gpio, port, RP2350_GPIO_UART_RX,
+                               qdev_get_gpio_in_named(uart, PL011_RXD, 0));
+        rp2350_gpio_connect_in(&s->gpio, port, RP2350_GPIO_UART_CTS,
+                               qdev_get_gpio_in_named(uart, PL011_NCTS, 0));
         memory_region_init_io(&s->uart_alias[i], obj, &rp2350_alias_ops,
                               sysbus_mmio_get_region(sbd, 0),
                               i ? "rp2350-uart1" : "rp2350-uart0",
@@ -1256,6 +1374,48 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     s->spi_cs_notifier.notify = rp2350_soc_spi_wire_cs;
     qemu_add_machine_init_done_notifier(&s->spi_cs_notifier);
+
+    /*
+     * I2C0 and I2C1. A controller's QEMU I2C bus ("i2c0", "i2c1") stands
+     * for the board's wires on the pins its SDA and SCL are routed to.
+     * The controller drives the pins open-drain: output level 0, its
+     * output enable pulling SCL low. It sees the pin levels, so a bus is
+     * usable once the pins select the I2C function with their input
+     * enabled and are pulled up. Otherwise SCL and SDA read low and
+     * transfers wait for an idle bus, as on hardware.
+     */
+    /* [spec:nuos:req:emu.i2c] */
+    for (i = 0; i < RP2350_NUM_I2C; i++) {
+        static const hwaddr base[] = { RP2350_I2C0_BASE, RP2350_I2C1_BASE };
+        static const int irq[] = { RP2350_I2C0_IRQ, RP2350_I2C1_IRQ };
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->i2c[i]);
+        DeviceState *dev = DEVICE(sbd);
+        RP2350GPIOPort port = i ? RP2350_GPIO_PORT_I2C1
+                                : RP2350_GPIO_PORT_I2C0;
+        int n;
+
+        qdev_prop_set_string(dev, "bus-name", i ? "i2c1" : "i2c0");
+        qdev_connect_clock_in(dev, "clk", s->sysclk);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        memory_region_init_io(&s->i2c_alias[i], obj, &rp2350_alias_ops,
+                              sysbus_mmio_get_region(sbd, 0),
+                              i ? "rp2350-i2c1" : "rp2350-i2c0",
+                              RP2350_ATOMIC_REGION_SIZE);
+        memory_region_add_subregion(s->board_memory, base[i],
+                                    &s->i2c_alias[i]);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(dev_soc, irq[i]));
+        for (n = 0; n < RP2350_GPIO_I2C_SIGNALS; n++) {
+            qemu_set_irq(rp2350_gpio_out_line(&s->gpio, port, n), 0);
+        }
+        qdev_connect_gpio_out_named(dev, DESIGNWARE_I2C_SCL_OE, 0,
+            rp2350_gpio_oe_line(&s->gpio, port, RP2350_GPIO_I2C_SCL));
+        rp2350_gpio_connect_in(&s->gpio, port, RP2350_GPIO_I2C_SCL,
+            qdev_get_gpio_in_named(dev, DESIGNWARE_I2C_SCL_IN, 0));
+        rp2350_gpio_connect_in(&s->gpio, port, RP2350_GPIO_I2C_SDA,
+            qdev_get_gpio_in_named(dev, DESIGNWARE_I2C_SDA_IN, 0));
+    }
 
     /*
      * The self-hosted debug window. Each core sees it through its own view
@@ -1360,6 +1520,15 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             qdev_connect_gpio_out_named(spi, PL022_DMA_REQ, PL022_DMA_RX,
                 qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, tx + 1));
         }
+        for (i = 0; i < RP2350_NUM_I2C; i++) {
+            DeviceState *i2c = DEVICE(&s->i2c[i]);
+            int tx = i ? RP2350_DREQ_I2C1_TX : RP2350_DREQ_I2C0_TX;
+
+            qdev_connect_gpio_out_named(i2c, DESIGNWARE_I2C_DMA_TX_REQ, 0,
+                qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, tx));
+            qdev_connect_gpio_out_named(i2c, DESIGNWARE_I2C_DMA_RX_REQ, 0,
+                qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, tx + 1));
+        }
         for (i = 0; i < RP2350_PWM_SLICES; i++) {
             qdev_connect_gpio_out_named(DEVICE(&s->pwm), RP2350_PWM_DREQ, i,
                 qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
@@ -1378,6 +1547,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->coresight_trace), 0,
             qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
                                    RP2350_DREQ_CORESIGHT));
+        qdev_connect_gpio_out_named(DEVICE(&s->adc), RP2350_ADC_DREQ, 0,
+            qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_ADC));
         qdev_connect_gpio_out_named(DEVICE(&s->sha256), RP2350_SHA256_DREQ, 0,
             qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_SHA256));
         qdev_connect_gpio_out_named(DEVICE(&s->hstx), RP2350_HSTX_DREQ, 0,
@@ -1396,6 +1567,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             int reset;
             void *dev;
         } devices[] = {
+            { RP2350_RESET_ADC, &s->adc },
             { RP2350_RESET_BUSCTRL, &s->busctrl },
             { RP2350_RESET_DMA, &s->dma },
             { RP2350_RESET_PLL_SYS, &s->pll_sys },
@@ -1413,6 +1585,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             { RP2350_RESET_SPI0, &s->spi[0] },
             { RP2350_RESET_SPI1, &s->spi[1] },
             { RP2350_RESET_HSTX, &s->hstx },
+            { RP2350_RESET_I2C0, &s->i2c[0] },
+            { RP2350_RESET_I2C1, &s->i2c[1] },
         };
         SysBusDevice *sbd = SYS_BUS_DEVICE(&s->resets);
 
@@ -1481,6 +1655,7 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "trng", &s->trng, TYPE_RP2350_TRNG);
     object_initialize_child(obj, "sha256", &s->sha256, TYPE_RP2350_SHA256);
     object_initialize_child(obj, "pwm", &s->pwm, TYPE_RP2350_PWM);
+    object_initialize_child(obj, "adc", &s->adc, TYPE_RP2350_ADC);
     object_initialize_child(obj, "hstx", &s->hstx, TYPE_RP2350_HSTX);
     object_initialize_child(obj, "pio", &s->pio, TYPE_RP2350_PIO);
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
@@ -1493,6 +1668,9 @@ static void rp2350_soc_init(Object *obj)
     for (i = 0; i < RP2350_NUM_SPIS; i++) {
         object_initialize_child(obj, "spi[*]", &s->spi[i], TYPE_PL022);
     }
+    for (i = 0; i < RP2350_NUM_I2C; i++) {
+        object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_RP2350_I2C);
+    }
     object_initialize_child(obj, "coresight", &s->coresight,
                             TYPE_RP2350_CORESIGHT);
     object_initialize_child(obj, "coresight-trace", &s->coresight_trace,
@@ -1504,6 +1682,8 @@ static void rp2350_soc_init(Object *obj)
 
     s->sysclk = qdev_init_clock_out(DEVICE(s), "sysclk");
     s->refclk = qdev_init_clock_out(DEVICE(s), "refclk");
+    s->periclk = qdev_init_clock_out(DEVICE(s), "periclk");
+    s->adcclk = clock_new(obj, "adcclk");
 }
 
 static const Property rp2350_soc_properties[] = {
@@ -1519,9 +1699,11 @@ static const Property rp2350_soc_properties[] = {
 static void rp2350_soc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    IDAUInterfaceClass *iic = IDAU_INTERFACE_CLASS(klass);
 
     dc->realize = rp2350_soc_realize;
     device_class_set_props(dc, rp2350_soc_properties);
+    iic->check = rp2350_idau_check;
 }
 
 static const TypeInfo rp2350_soc_info = {
@@ -1530,6 +1712,10 @@ static const TypeInfo rp2350_soc_info = {
     .instance_size = sizeof(RP2350State),
     .instance_init = rp2350_soc_init,
     .class_init    = rp2350_soc_class_init,
+    .interfaces    = (const InterfaceInfo[]) {
+        { TYPE_IDAU_INTERFACE },
+        { }
+    },
 };
 
 static void rp2350_soc_types(void)

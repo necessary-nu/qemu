@@ -393,7 +393,9 @@ config RP2350
     bool
     default y
     depends on TCG && ARM
+    imply I2C_DEVICES
     select RP2350_SOC
+    select UART_LINE
 
 config RP2350_SOC
     bool
@@ -414,6 +416,7 @@ config RP2350_SOC
     select RP2350_TRNG
     select RP2350_SHA256
     select RP2350_PWM
+    select RP2350_ADC
     select RP2350_HSTX
     select RP2350_PIO
     select RP2350_CORESIGHT
@@ -424,6 +427,7 @@ config RP2350_SOC
     select RP2350_OTP
     select RP2350_DMA
     select PL022
+    select RP2350_I2C
     select PL011
 
 config STM32L4X5_SOC

@@ -950,8 +950,11 @@ static void hstx_get_capture(Object *obj, Visitor *v, const char *name,
     uint32List *list = NULL;
     uint64_t n, i;
 
-    hstx_sync(s);
-    hstx_update(s);
+    /* An unrealized device (introspection) has no output to bring up to date. */
+    if (DEVICE(s)->realized) {
+        hstx_sync(s);
+        hstx_update(s);
+    }
     n = MIN(s->rec.words, RP2350_HSTX_CAPTURE);
     for (i = 0; i < n; i++) {
         /* Prepending, newest first, leaves the list oldest first. */
@@ -970,8 +973,11 @@ static void hstx_get_history(Object *obj, Visitor *v, const char *name,
     uint64List *list = NULL;
     int n;
 
-    hstx_sync(s);
-    hstx_update(s);
+    /* An unrealized device (introspection) has no output to bring up to date. */
+    if (DEVICE(s)->realized) {
+        hstx_sync(s);
+        hstx_update(s);
+    }
     for (n = RP2350_HSTX_BITS - 1; n >= 0; n--) {
         QAPI_LIST_PREPEND(list, s->rec.history[n]);
     }
@@ -985,8 +991,11 @@ static void hstx_get_count(Object *obj, Visitor *v, const char *name,
     RP2350HSTXState *s = RP2350_HSTX(obj);
     uint64_t val;
 
-    hstx_sync(s);
-    hstx_update(s);
+    /* An unrealized device (introspection) has no output to bring up to date. */
+    if (DEVICE(s)->realized) {
+        hstx_sync(s);
+        hstx_update(s);
+    }
     val = opaque ? s->rec.half_cycles : s->rec.words;
     visit_type_uint64(v, name, &val, errp);
 }

@@ -227,6 +227,28 @@ static bool sdhci_update_irq(SDHCIState *s)
     return pending;
 }
 
+/*
+ * An SDIO card's interrupt is a level: Card Interrupt status follows it
+ * while its status enable is set, and writing 1 to it does not clear it.
+ */
+static void sdhci_update_cardint(SDHCIState *s)
+{
+    if (s->card_irq && (s->norintstsen & SDHC_NISEN_CARDINT)) {
+        s->norintsts |= SDHC_NIS_CARDINT;
+    } else {
+        s->norintsts &= ~SDHC_NIS_CARDINT;
+    }
+}
+
+static void sdhci_set_card_irq(DeviceState *dev, bool level)
+{
+    SDHCIState *s = (SDHCIState *)dev;
+
+    s->card_irq = level;
+    sdhci_update_cardint(s);
+    sdhci_update_irq(s);
+}
+
 static uint8_t sdhci_get_dma_type(SDHCIState *s)
 {
     uint8_t type = SDHC_DMA_TYPE(s->hostctl1);
@@ -1381,6 +1403,7 @@ sdhci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
         MASKED_WRITE(s->errintstsen, mask >> 16, value >> 16);
         s->norintsts &= s->norintstsen;
         s->errintsts &= s->errintstsen;
+        sdhci_update_cardint(s);
         if (s->errintsts) {
             s->norintsts |= SDHC_NIS_ERR;
         } else {
@@ -1602,6 +1625,7 @@ static int sdhci_pre_load(void *opaque)
 
     s->hostctl2 = 0;
     s->sdma_boundary_paused = false;
+    s->card_irq = false;
     return 0;
 }
 
@@ -1622,6 +1646,24 @@ static const VMStateDescription sdhci_pending_insert_vmstate = {
     .needed = sdhci_pending_insert_vmstate_needed,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(pending_insert_state, SDHCIState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool sdhci_card_irq_vmstate_needed(void *opaque)
+{
+    SDHCIState *s = opaque;
+
+    return s->card_irq;
+}
+
+static const VMStateDescription sdhci_card_irq_vmstate = {
+    .name = "sdhci/card_irq",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sdhci_card_irq_vmstate_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(card_irq, SDHCIState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1678,6 +1720,7 @@ const VMStateDescription sdhci_vmstate = {
         &sdhci_hostctl2_vmstate,
         &sdhci_pending_insert_vmstate,
         &sdhci_sdma_boundary_paused_vmstate,
+        &sdhci_card_irq_vmstate,
         NULL
     },
 };
@@ -1771,6 +1814,7 @@ static void sdhci_bus_class_init(ObjectClass *klass, const void *data)
 
     sbc->set_inserted = sdhci_set_inserted;
     sbc->set_readonly = sdhci_set_readonly;
+    sbc->set_irq = sdhci_set_card_irq;
 }
 
 /* --- qdev i.MX eSDHC --- */

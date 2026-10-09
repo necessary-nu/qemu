@@ -11,10 +11,12 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/arm/armv7m.h"
+#include "hw/adc/rp2350_adc.h"
 #include "hw/char/pl011.h"
 #include "hw/core/clock.h"
 #include "hw/dma/rp2350_dma.h"
 #include "hw/gpio/rp2350_gpio.h"
+#include "hw/i2c/rp2350_i2c.h"
 #include "hw/misc/rp2350_accessctrl.h"
 #include "hw/misc/rp2350_bootram.h"
 #include "hw/misc/rp2350_busctrl.h"
@@ -51,6 +53,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_NUM_UARTS 2
 #define RP2350_NUM_SPIS 2
 #define RP2350_NUM_TIMERS 2
+#define RP2350_NUM_I2C 2
 #define RP2350_MPU_REGIONS 8
 /* CPUID: Arm Cortex-M33 r1p0, where QEMU's cortex-m33 is r0p3. */
 #define RP2350_M33_CPUID 0x411fd210
@@ -80,6 +83,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_SPI1_IRQ 32
 #define RP2350_UART0_IRQ 33
 #define RP2350_UART1_IRQ 34
+#define RP2350_ADC_IRQ_FIFO 35
+#define RP2350_I2C0_IRQ 36
+#define RP2350_I2C1_IRQ 37
 #define RP2350_OTP_IRQ 38
 #define RP2350_TRNG_IRQ 39
 #define RP2350_SPARE_IRQ_5 51
@@ -131,6 +137,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_UART1_BASE 0x40078000
 #define RP2350_SPI0_BASE 0x40080000
 #define RP2350_SPI1_BASE 0x40088000
+#define RP2350_I2C0_BASE 0x40090000
+#define RP2350_I2C1_BASE 0x40098000
 #define RP2350_PLL_SYS_BASE 0x40050000
 #define RP2350_PLL_USB_BASE 0x40058000
 #define RP2350_TICKS_BASE 0x40108000
@@ -146,6 +154,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_SHA256_BASE 0x400f8000
 #define RP2350_HSTX_CTRL_BASE 0x400c0000
 #define RP2350_HSTX_FIFO_BASE 0x50600000
+#define RP2350_USB_DPRAM_BASE 0x50100000
+#define RP2350_USB_DPRAM_SIZE (4 * KiB)
 #define RP2350_SIO_BASE 0xd0000000
 #define RP2350_SIO_NONSEC_BASE 0xd0020000
 
@@ -158,6 +168,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
  * pico-sdk switches it to.
  */
 #define RP2350_CLK_REF_HZ 12000000
+/*
+ * clk_peri, the UARTs' UARTCLK, at the clk_sys frequency pico-sdk runs it
+ * from. Its divider and enable are not modelled.
+ */
+#define RP2350_CLK_PERI_HZ 150000000
+/* clk_adc, as pico-sdk sets it up from PLL_USB. */
+#define RP2350_CLK_ADC_HZ 48000000
 
 /* Device models and bus windows per RESETS subsystem. */
 #define RP2350_RESET_MAX_DEVICES 4
@@ -201,6 +218,7 @@ struct RP2350State {
     RP2350TRNGState trng;
     RP2350SHA256State sha256;
     RP2350PWMState pwm;
+    RP2350ADCState adc;
     RP2350HSTXState hstx;
     RP2350PIOState pio;
     RP2350TimerState timer[RP2350_NUM_TIMERS];
@@ -208,6 +226,7 @@ struct RP2350State {
     PL022State spi[RP2350_NUM_SPIS];
     /* Wires the chip selects of the SSI devices on the SPI buses. */
     Notifier spi_cs_notifier;
+    DesignWareI2CState i2c[RP2350_NUM_I2C];
     RP2350CoreSightState coresight;
     RP2350CoreSightTraceState coresight_trace;
     RP2350OTPState otp;
@@ -216,6 +235,8 @@ struct RP2350State {
     MemoryRegion uart_alias[RP2350_NUM_UARTS];
     /* The SPI controllers' register windows plus their atomic aliases. */
     MemoryRegion spi_alias[RP2350_NUM_SPIS];
+    /* The I2C controllers' register windows plus their atomic aliases. */
+    MemoryRegion i2c_alias[RP2350_NUM_I2C];
     /* Core 0's SIO views as seen from system memory (debug, qtest). */
     MemoryRegion sio_sysmem[2];
     /* Core 0's EPPB as seen from system memory (debug, qtest). */
@@ -227,6 +248,7 @@ struct RP2350State {
 
     MemoryRegion rom;
     MemoryRegion sram;
+    MemoryRegion usb_dpram;
 
     MemoryRegion *board_memory;
 
@@ -237,6 +259,8 @@ struct RP2350State {
 
     Clock *sysclk;
     Clock *refclk;
+    Clock *periclk;
+    Clock *adcclk;
 };
 
 /*

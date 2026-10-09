@@ -94,6 +94,8 @@
 
 #define UART0           0x40070000
 #define UART_DR         0x00
+#define UART_IBRD       0x24
+#define UART_FBRD       0x28
 #define UART_LCR_H      0x2c
 #define UART_CR         0x30
 #define UART_DMACR      0x48
@@ -579,7 +581,12 @@ static void test_uart_dreq(void)
     for (i = 0; i < 6; i++) {
         qtest_writeb(qts, SRC + i, "qemu!\n"[i]);
     }
-    /* UART0 in loopback, FIFOs on, 8 bits. */
+    /*
+     * UART0 in loopback, FIFOs on, 8 bits, at the fastest rate, clk_peri /
+     * 16, which UARTLCR_H latches.
+     */
+    qtest_writel(qts, UART0 + UART_IBRD, 1);
+    qtest_writel(qts, UART0 + UART_FBRD, 0);
     qtest_writel(qts, UART0 + UART_LCR_H, 0x70);
     qtest_writel(qts, UART0 + UART_CR, 0x381);
 

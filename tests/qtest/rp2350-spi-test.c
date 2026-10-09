@@ -12,6 +12,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 
 #define ALIAS_SET       0x2000
 #define ALIAS_CLR       0x3000
@@ -114,6 +115,8 @@ static QTestState *start(const char *extra)
 {
     QTestState *qts = qtest_initf("-M rp2350 -bios %s %s", rom_path,
                                   extra ? extra : "");
+
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
 
     qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");
     return qts;

@@ -73,6 +73,18 @@ REG32(GPIO_STRAP, 0x0038)
  *   from outside.
  * - ESP32_GPIO_PAD_OUT (gpio-out): the level on pad n.
  *
+ * The RTC pads, from the RTC IO MUX (RTCIO), indexed by GPIO number:
+ *
+ * - ESP32_GPIO_RTC_MUX (gpio-in): high hands the pad to the RTC IO MUX, its
+ *   MUX_SEL. The IO_MUX's input enable and pulls and the GPIO matrix's
+ *   output then no longer apply to it; instead
+ * - ESP32_GPIO_RTC_OUT, ESP32_GPIO_RTC_OE, ESP32_GPIO_RTC_PU,
+ *   ESP32_GPIO_RTC_PD, ESP32_GPIO_RTC_IE (gpio-in) drive it.
+ * - ESP32_GPIO_RTC_IN (gpio-out): the pad's input as its input buffer
+ *   delivers it, whoever controls the pad; low while the buffer is off.
+ * - ESP32_GPIO_WAKEUP (gpio-out): a pad with GPIO_PINn_WAKEUP_ENABLE is at
+ *   the level its level interrupt type names, the light-sleep GPIO wakeup.
+ *
  * The block's interrupt outputs are its sysbus IRQs, in the order of
  * Esp32GpioIrq.
  */
@@ -85,18 +97,34 @@ REG32(GPIO_STRAP, 0x0038)
 #define ESP32_GPIO_PAD_IN       "esp32-gpio-pad-in"
 #define ESP32_GPIO_PAD_RELEASE  "esp32-gpio-pad-release"
 #define ESP32_GPIO_PAD_OUT      "esp32-gpio-pad"
+#define ESP32_GPIO_RTC_MUX      "esp32-gpio-rtc-mux"
+#define ESP32_GPIO_RTC_OUT      "esp32-gpio-rtc-out"
+#define ESP32_GPIO_RTC_OE       "esp32-gpio-rtc-oe"
+#define ESP32_GPIO_RTC_PU       "esp32-gpio-rtc-pu"
+#define ESP32_GPIO_RTC_PD       "esp32-gpio-rtc-pd"
+#define ESP32_GPIO_RTC_IE       "esp32-gpio-rtc-ie"
+#define ESP32_GPIO_RTC_IN       "esp32-gpio-rtc-in"
+#define ESP32_GPIO_WAKEUP       "esp32-gpio-wakeup"
 
 /* GPIO matrix signal indices used by the SoC's connections */
 #define ESP32_SIG_SPICS0        5
 #define ESP32_SIG_HSPICS0       11
 #define ESP32_SIG_U0RXD_IN      14
 #define ESP32_SIG_U0TXD_OUT     14
+#define ESP32_SIG_PWM0_SYNC0_IN 31
+#define ESP32_SIG_PWM0_OUT0A    32
+#define ESP32_SIG_PWM0_F0_IN    34
 #define ESP32_SIG_HSPICS1       61
 #define ESP32_SIG_HSPICS2       62
 #define ESP32_SIG_VSPICS0       68
 #define ESP32_SIG_VSPICS1       69
 #define ESP32_SIG_VSPICS2       70
 #define ESP32_SIG_GPIO_SD0_OUT  100
+#define ESP32_SIG_PWM1_SYNC0_IN 103
+#define ESP32_SIG_PWM1_F0_IN    106
+#define ESP32_SIG_PWM1_OUT0A    108
+#define ESP32_SIG_PWM0_CAP0_IN  109
+#define ESP32_SIG_PWM1_CAP0_IN  112
 /* GPIO_FUNCn_OUT_SEL: GPIO_OUT and GPIO_ENABLE drive the pad */
 #define ESP32_SIG_GPIO_OUT      256
 
@@ -126,6 +154,8 @@ typedef struct Esp32GpioState {
     qemu_irq pad_out[ESP32_GPIO_PIN_COUNT];
     qemu_irq sig_in_out[ESP32_GPIO_SIG_COUNT];
     qemu_irq iomux_in_out[ESP32_GPIO_PIN_COUNT * ESP32_IOMUX_FUNC_COUNT];
+    qemu_irq rtc_in_out[ESP32_GPIO_PIN_COUNT];
+    qemu_irq wakeup_out;
 
     uint32_t strap_mode;
 
@@ -168,13 +198,22 @@ typedef struct Esp32GpioState {
     uint8_t sig_oe[ESP32_GPIO_SIG_COUNT];
     uint8_t iomux_func_out[ESP32_GPIO_PIN_COUNT * ESP32_IOMUX_FUNC_COUNT];
     uint8_t iomux_func_oe[ESP32_GPIO_PIN_COUNT * ESP32_IOMUX_FUNC_COUNT];
+    /* RTC IO MUX control of the RTC pads, bit n for GPIO n */
+    uint64_t rtc_mux;
+    uint64_t rtc_out;
+    uint64_t rtc_oe;
+    uint64_t rtc_pu;
+    uint64_t rtc_pd;
+    uint64_t rtc_ie;
 
     /* Levels the block drives, as last computed */
     uint64_t pad_level;
     uint64_t in_level;
+    uint64_t rtc_in_level;
     uint8_t sig_in[ESP32_GPIO_SIG_COUNT];
     uint8_t iomux_in[ESP32_GPIO_PIN_COUNT * ESP32_IOMUX_FUNC_COUNT];
     uint8_t irq_level[ESP32_GPIO_IRQ_COUNT];
+    bool wakeup_level;
     /* Drive every output line on the next update, not only changed ones */
     bool resync;
     bool updating;
@@ -184,3 +223,17 @@ typedef struct Esp32GpioState {
 typedef struct Esp32GpioClass {
     SysBusDeviceClass parent_class;
 } Esp32GpioClass;
+
+/*
+ * The output signal that reaches input signal sig through a pad: the pad
+ * the GPIO matrix or IO_MUX connects to sig has its input enabled, is not
+ * driven from outside and is driven, push-pull, by output signal *src
+ * through the matrix or its IO_MUX function. *inverted says whether the
+ * path inverts the level. Returns false if sig has no such source.
+ *
+ * A peripheral that models a serial link at a coarser grain than single
+ * pad transitions, such as I2S passing whole frames, uses this to find
+ * which of its own output signals another of its inputs listens to.
+ */
+bool esp32_gpio_sig_in_source(Esp32GpioState *s, unsigned sig,
+                              unsigned *src, bool *inverted);
