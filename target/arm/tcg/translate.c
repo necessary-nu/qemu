@@ -3845,11 +3845,12 @@ static void do_ldrd_load(DisasContext *s, TCGv_i32 addr, int rt, int rt2)
      * so we don't get its SCTLR_B check, and instead do a 64-bit access
      * using MO_BE if appropriate and then split the two halves.
      *
-     * For M-profile, and for A-profile before LPAE, the 64-bit
-     * atomicity is not required. We could model that using
-     * the looser MO_ATOM_IFALIGN_PAIR, but providing a higher
-     * level of atomicity than required is harmless (we would not
-     * currently generate better code for IFALIGN_PAIR here).
+     * For A-profile before LPAE the 64-bit atomicity is not
+     * required. We could model that using the looser
+     * MO_ATOM_IFALIGN_PAIR, but providing a higher level of
+     * atomicity than required is harmless (we would not currently
+     * generate better code for IFALIGN_PAIR here). M-profile does
+     * not have it either, and there the bus sees two word accesses.
      *
      * This also gives us the correct behaviour of not updating
      * rt if the load of rt2 faults; this is required for cases
@@ -3857,11 +3858,29 @@ static void do_ldrd_load(DisasContext *s, TCGv_i32 addr, int rt, int rt2)
      */
     int mem_idx = get_mem_index(s);
     MemOp opc = MO_64 | MO_ALIGN_4 | MO_ATOM_SUBALIGN | s->be_data;
-    TCGv_va taddr = gen_aa32_addr(s, addr, opc);
-    TCGv_i64 t64 = tcg_temp_new_i64();
+    TCGv_va taddr;
+    TCGv_i64 t64;
     TCGv_i32 tmp = tcg_temp_new_i32();
     TCGv_i32 tmp2 = tcg_temp_new_i32();
 
+    if (arm_dc_feature(s, ARM_FEATURE_M)) {
+        /*
+         * M-profile cores have a 32-bit bus and perform LDRD as two
+         * word accesses, lower address first, so a device that only
+         * takes word accesses sees words.
+         */
+        TCGv_i32 addr2 = tcg_temp_new_i32();
+
+        gen_aa32_ld_i32(s, tmp, addr, mem_idx, MO_UL | MO_ALIGN);
+        tcg_gen_addi_i32(addr2, addr, 4);
+        gen_aa32_ld_i32(s, tmp2, addr2, mem_idx, MO_UL | MO_ALIGN);
+        store_reg(s, rt, tmp);
+        store_reg(s, rt2, tmp2);
+        return;
+    }
+
+    taddr = gen_aa32_addr(s, addr, opc);
+    t64 = tcg_temp_new_i64();
     tcg_gen_qemu_ld_i64(t64, taddr, mem_idx, opc);
     if (s->be_data == MO_BE) {
         tcg_gen_extr_i64_i32(tmp2, tmp, t64);
@@ -3907,16 +3926,28 @@ static void do_strd_store(DisasContext *s, TCGv_i32 addr, int rt, int rt2)
      * by putting the two halves together in the right order.
      *
      * As with LDRD, the 64-bit atomicity is not required for
-     * M-profile, or for A-profile before LPAE, and we provide
-     * the higher guarantee always for simplicity.
+     * A-profile before LPAE, and we provide the higher guarantee
+     * for simplicity; M-profile makes two word accesses.
      */
     int mem_idx = get_mem_index(s);
     MemOp opc = MO_64 | MO_ALIGN_4 | MO_ATOM_SUBALIGN | s->be_data;
-    TCGv_va taddr = gen_aa32_addr(s, addr, opc);
+    TCGv_va taddr;
     TCGv_i32 t1 = load_reg(s, rt);
     TCGv_i32 t2 = load_reg(s, rt2);
-    TCGv_i64 t64 = tcg_temp_new_i64();
+    TCGv_i64 t64;
 
+    if (arm_dc_feature(s, ARM_FEATURE_M)) {
+        /* As for LDRD: two word accesses, lower address first. */
+        TCGv_i32 addr2 = tcg_temp_new_i32();
+
+        gen_aa32_st_i32(s, t1, addr, mem_idx, MO_UL | MO_ALIGN);
+        tcg_gen_addi_i32(addr2, addr, 4);
+        gen_aa32_st_i32(s, t2, addr2, mem_idx, MO_UL | MO_ALIGN);
+        return;
+    }
+
+    taddr = gen_aa32_addr(s, addr, opc);
+    t64 = tcg_temp_new_i64();
     if (s->be_data == MO_BE) {
         tcg_gen_concat_i32_i64(t64, t2, t1);
     } else {
