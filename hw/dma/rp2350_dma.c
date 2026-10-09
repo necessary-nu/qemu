@@ -1011,14 +1011,18 @@ static void engine_wake(void *opaque)
 }
 
 /*
- * A DREQ input. A rising edge is a credit for each channel that paces on
- * it and can see it, answered at once: in place, unless a vCPU is making
- * a register access or a transfer would re-enter a device in the middle
- * of one, else from the bottom half. A level held high requests further
- * transfers, which the engine's timer issues. Answering in place, the
- * engine heeds credits only: the source may yet lower this line, as a
- * pulse does, and it and other sources may be part way through updating
- * their lines, when their levels are not yet to be trusted.
+ * A DREQ input. A rising edge is a credit for each busy channel that
+ * paces on it and can see it (paused with EN clear or not), answered at
+ * once: in place, unless a vCPU is making a register access or a transfer
+ * would re-enter a device in the middle of one, else from the bottom
+ * half. A level held high requests further transfers, which the engine's
+ * timer issues. Answering in place, the engine heeds credits only: the
+ * source may yet lower this line, as a pulse does, and it and other
+ * sources may be part way through updating their lines, when their levels
+ * are not yet to be trusted. A channel that is not busy takes no credits:
+ * on hardware it starts its DREQ handshake afresh when triggered, so edges
+ * from before (from whatever its TREQ_SEL then selected, DREQ_PIO0_TX0 at
+ * reset) do not count.
  */
 /* [spec:nuos:req:emu.dma] */
 static void dreq_set(void *opaque, int dreq, int level)
@@ -1032,7 +1036,7 @@ static void dreq_set(void *opaque, int dreq, int level)
     if (rising) {
         for (n = 0; n < RP2350_DMA_CHANNELS; n++) {
             if (ctrl_treq(s->ch[n].ctrl) == dreq &&
-                dreq_visible(s, n, dreq)) {
+                (s->ch[n].ctrl & CTRL_BUSY) && dreq_visible(s, n, dreq)) {
                 add_credit(&s->ch[n], 1);
             }
         }
