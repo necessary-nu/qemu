@@ -260,7 +260,7 @@ qtests_rp2350 = \
 
 qtests_xtensa = \
   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ?
-    ['esp32-clock-test'] : [])
+    ['esp32-clock-test', 'esp32-gpio-test'] : [])
 
 qtests_stm32l4x5 = \
   ['stm32l4x5_exti-test',

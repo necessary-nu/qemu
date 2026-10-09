@@ -21,21 +21,41 @@
 
 #define IRQ_MAP(cpu, input) s->irq_map[cpu][input]
 
+static void esp32_intmatrix_route(Esp32IntMatrixState *s, int cpu, int n,
+                                  int level)
+{
+    int out_index, nextint;
+
+    if (s->outputs[cpu] == NULL) {
+        return;
+    }
+    out_index = IRQ_MAP(cpu, n);
+    nextint = s->cpu[cpu]->env.config->nextint;
+    for (int int_index = 0; int_index < nextint; ++int_index) {
+        if (s->cpu[cpu]->env.config->extint[int_index] == out_index) {
+            qemu_set_irq(s->outputs[cpu][int_index], level);
+            break;
+        }
+    }
+}
+
 static void esp32_intmatrix_irq_handler(void *opaque, int n, int level)
 {
     Esp32IntMatrixState *s = ESP32_INTMATRIX(opaque);
     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
-        if (s->outputs[i] == NULL) {
-            continue;
-        }
-        int out_index = IRQ_MAP(i, n);
-        for (int int_index = 0; int_index < s->cpu[i]->env.config->nextint; ++int_index) {
-            if (s->cpu[i]->env.config->extint[int_index] == out_index) {
-                qemu_set_irq(s->outputs[i][int_index], level);
-                break;
-            }
-        }
+        esp32_intmatrix_route(s, i, n, level);
     }
+}
+
+/*
+ * A source that only one CPU's half of the matrix sees, such as
+ * GPIO_INTERRUPT_PRO and GPIO_INTERRUPT_APP, which share source number 22.
+ */
+static void esp32_intmatrix_cpu_irq_handler(void *opaque, int n, int level)
+{
+    esp32_intmatrix_route(ESP32_INTMATRIX(opaque),
+                          n / ESP32_INT_MATRIX_INPUTS,
+                          n % ESP32_INT_MATRIX_INPUTS, level);
 }
 
 static inline uint8_t* get_map_entry(Esp32IntMatrixState* s, hwaddr addr)
@@ -109,6 +129,9 @@ static void esp32_intmatrix_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
 
     qdev_init_gpio_in(DEVICE(s), esp32_intmatrix_irq_handler, ESP32_INT_MATRIX_INPUTS);
+    qdev_init_gpio_in_named(DEVICE(s), esp32_intmatrix_cpu_irq_handler,
+                            ESP32_INTMATRIX_CPU_SOURCE,
+                            ESP32_CPU_COUNT * ESP32_INT_MATRIX_INPUTS);
 }
 
 static const Property esp32_intmatrix_properties[] = {
