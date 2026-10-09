@@ -996,10 +996,21 @@ static const MemoryRegionOps rp2350_otp_ctrl_ops = {
     .valid.max_access_size = 4,
 };
 
-static void rp2350_otp_reset_hold(Object *obj, ResetType type)
+/*
+ * A reset of the OTP block by its PSM stage, which every sequence that
+ * powers the core down and up again runs: the registers take their reset
+ * values and the power-up state machine runs again, re-latching the
+ * critical flags and keys and reopening the soft locks. BOOTDIS is the
+ * exception: NEXT is ORed into NOW and cleared, so that the boot ROM can
+ * tell the OTP was reset and ignore the boot vectors, which would
+ * otherwise let a later boot stage skip the stage that soft-locked pages.
+ */
+/* [spec:nuos:req:emu.otp] */
+void rp2350_otp_reset_stage(RP2350OTPState *s)
 {
-    RP2350OTPState *s = RP2350_OTP(obj);
-
+    if (s->bootdis & BOOTDIS_NEXT) {
+        s->bootdis = BOOTDIS_NOW;
+    }
     s->sbpi_instr = 0;
     memset(s->sbpi_wdata, 0, sizeof(s->sbpi_wdata));
     memset(s->sbpi_rdata, 0, sizeof(s->sbpi_rdata));
@@ -1009,7 +1020,6 @@ static void rp2350_otp_reset_hold(Object *obj, ResetType type)
     memset(s->crt_key, 0, sizeof(s->crt_key));
     s->debugen = 0;
     s->debugen_lock = 0;
-    s->bootdis = 0;
     s->intr = 0;
     s->inte = 0;
     s->intf = 0;
@@ -1021,6 +1031,22 @@ static void rp2350_otp_reset_hold(Object *obj, ResetType type)
              (s->rma ? DBG_CUSTOMER_RMA_FLAG : 0);
     otp_update_irq(s);
     otp_update_debug(s);
+}
+
+/*
+ * A system reset of the cold type is a power-on, brownout or RUN pin
+ * reset, which clears BOOTDIS. Every other system reset resets the
+ * switched core, and with it the OTP stage.
+ */
+/* [spec:nuos:req:emu.otp] */
+static void rp2350_otp_reset_hold(Object *obj, ResetType type)
+{
+    RP2350OTPState *s = RP2350_OTP(obj);
+
+    if (type != RESET_TYPE_WAKEUP) {
+        s->bootdis = 0;
+    }
+    rp2350_otp_reset_stage(s);
 }
 
 /*

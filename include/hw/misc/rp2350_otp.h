@@ -88,4 +88,7 @@ struct RP2350OTPState {
     uint8_t pmc[RP2350_OTP_SBPI_REGS];
 };
 
+/* Reset the OTP block as its PSM stage does. */
+void rp2350_otp_reset_stage(RP2350OTPState *s);
+
 #endif

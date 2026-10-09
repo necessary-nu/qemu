@@ -38,6 +38,14 @@
 #define SET             0x2000
 #define CLR             0x3000
 
+#define PSM_FRCE_OFF    0x40018004
+#define PSM_WDSEL       0x40018008
+#define PSM_OTP         (1u << 1)
+#define PSM_PROC0       (1u << 23)
+#define PSM_PROC1       (1u << 24)
+#define WD_CTRL         0x400d8000
+#define WD_CTRL_TRIGGER (1u << 31)
+
 #define DATA            0x40130000
 #define DATA_RAW        0x40134000
 #define DATA_GUARDED    0x40138000
@@ -645,6 +653,36 @@ static void test_bootdis(void)
     g_assert_cmphex(qtest_readl(qts, BOOTDIS), ==, 0x2);
     qtest_writel(qts, BOOTDIS + CLR, 0x2);
     g_assert_cmphex(qtest_readl(qts, BOOTDIS), ==, 0x2);
+    qtest_writel(qts, SW_LOCK(3), 0x3);
+
+    /* A reset of the processors alone leaves the OTP stage alone. */
+    qtest_writel(qts, PSM_FRCE_OFF + SET, PSM_PROC0 | PSM_PROC1);
+    qtest_writel(qts, PSM_FRCE_OFF + CLR, PSM_PROC0 | PSM_PROC1);
+    g_assert_cmphex(qtest_readl(qts, BOOTDIS), ==, 0x2);
+    g_assert_cmphex(qtest_readl(qts, SW_LOCK(3)), ==, 0x3);
+
+    /*
+     * Resetting the OTP stage reruns the power-up sequence, which reopens
+     * the soft locks, and moves NEXT to NOW.
+     */
+    qtest_writel(qts, PSM_FRCE_OFF + SET, PSM_OTP);
+    g_assert_cmphex(qtest_readl(qts, BOOTDIS), ==, 0x1);
+    g_assert_cmphex(qtest_readl(qts, SW_LOCK(3)), ==, 0);
+    qtest_writel(qts, BOOTDIS, 0x1);
+    g_assert_cmphex(qtest_readl(qts, BOOTDIS), ==, 0);
+    qtest_writel(qts, PSM_FRCE_OFF + CLR, PSM_OTP);
+    g_assert_cmphex(qtest_readl(qts, BOOTDIS), ==, 0);
+
+    /* The watchdog resets the OTP stage when WDSEL selects it. */
+    qtest_writel(qts, BOOTDIS, 0x2);
+    qtest_writel(qts, PSM_WDSEL, PSM_OTP);
+    qtest_writel(qts, WD_CTRL + SET, WD_CTRL_TRIGGER);
+    g_assert_cmphex(qtest_readl(qts, BOOTDIS), ==, 0x1);
+
+    /* A chip-level cold reset clears both. */
+    qtest_writel(qts, BOOTDIS, 0x2);
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readl(qts, BOOTDIS), ==, 0);
     qtest_quit(qts);
 }
 
