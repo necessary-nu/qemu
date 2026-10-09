@@ -143,6 +143,12 @@ config RP2350_EPPB
 config RP2350_BUSCTRL
     bool
 
+config RP2350_ROSC
+    bool
+
+config RP2350_TRNG
+    bool
+
 config STM32L4X5_SYSCFG
     bool
 
