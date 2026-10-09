@@ -21,6 +21,7 @@
 #define ULP_CP_SLP_TIMER_EN     (1u << 24)
 #define INT_ULP_CP              (1u << 5)
 #define FAST_CLK_RTC_SEL_8M     (1u << 29)
+#define CK8M_DIV_SEL_MASK       (7u << 12)
 #define START_WAIT(v)           ((v) << 15)
 #define START_WAIT_MASK         (0x1ffu << 15)
 
@@ -153,7 +154,12 @@ static QTestState *start(void)
 {
     QTestState *qts = qtest_init("-M esp32 -nic none");
 
-    qtest_writel(qts, CLK_CONF, qtest_readl(qts, CLK_CONF) |
+    /*
+     * RTC_FAST_CLK from the 8 MHz oscillator undivided, as ESP-IDF's
+     * rtc_clk_init leaves it: CK8M_DIV_SEL resets to 2 (divide by 3).
+     */
+    qtest_writel(qts, CLK_CONF,
+                 (qtest_readl(qts, CLK_CONF) & ~CK8M_DIV_SEL_MASK) |
                  FAST_CLK_RTC_SEL_8M);
     return qts;
 }
