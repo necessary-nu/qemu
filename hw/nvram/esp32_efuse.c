@@ -219,7 +219,14 @@ static void esp32_efuse_op_timer_start(Esp32EfuseState *s)
 {
     uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint64_t interval_ns = 100000000; /* 10 ms, make this depend on EFUSE_CLK register */
-    timer_mod_anticipate_ns(&s->op_timer, ns_now + interval_ns);
+    /*
+     * Each command runs for the full interval from when it is issued. A
+     * command left running by the reset that powers the digital domain
+     * down for deep sleep must not end the next command early: the ROM
+     * issues a read on wake and software-resets the chip if EFUSE_CMD
+     * already reads back as done.
+     */
+    timer_mod_ns(&s->op_timer, ns_now + interval_ns);
 }
 
 static void esp32_efuse_timer_cb(void *opaque)
