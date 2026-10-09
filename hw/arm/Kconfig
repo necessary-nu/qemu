@@ -412,6 +412,7 @@ config RP2350_SOC
     select RP2350_BUSCTRL
     select RP2350_ROSC
     select RP2350_TRNG
+    select RP2350_CORESIGHT
     select PL011
 
 config STM32L4X5_SOC

@@ -72,7 +72,6 @@ static const RP2350Peripheral rp2350_peripherals[] = {
     { "rp2350.ticks",           0x40108000, 0x8000 },
     { "rp2350.otp",             0x40120000, 0x10000 },
     { "rp2350.otp_data",        0x40130000, 0x10000 },
-    { "rp2350.coresight_periph", 0x40140000, 0x10000 },
     { "rp2350.dft",             0x40150000, 0x8000 },
     { "rp2350.glitch_detector", 0x40158000, 0x8000 },
     { "rp2350.tbman",           0x40160000, 0x8000 },
@@ -83,7 +82,6 @@ static const RP2350Peripheral rp2350_peripherals[] = {
     { "rp2350.pio2",            0x50400000, 0x100000 },
     { "rp2350.xip_aux",         0x50500000, 0x100000 },
     { "rp2350.hstx_fifo",       0x50600000, 0x100000 },
-    { "rp2350.coresight_trace", 0x50700000, 0x100000 },
     { "rp2350.xip",             RP2350_XIP_BASE,
                                 RP2350_XIP_SRAM_BASE - RP2350_XIP_BASE },
     { "rp2350.xip_sram",        RP2350_XIP_SRAM_BASE, 0x4000 },
@@ -554,6 +552,40 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(dev_soc, irq[i]));
     }
 
+    /*
+     * The self-hosted debug window. Each core sees it through its own view
+     * so that it is refused its own AHB-AP; each AHB-AP masters its core's
+     * bus.
+     */
+    /* [spec:nuos:req:emu.coresight] */
+    {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->coresight);
+
+        object_property_set_link(OBJECT(sbd), "core0-memory",
+                                 OBJECT(&s->armv7m[0].container),
+                                 &error_abort);
+        object_property_set_link(OBJECT(sbd), "core1-memory",
+                                 OBJECT(&s->armv7m[1].container),
+                                 &error_abort);
+        qdev_connect_clock_in(DEVICE(sbd), "clk", s->sysclk);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, RP2350_CORESIGHT_PERIPH_BASE);
+        for (i = 0; i < RP2350_NUM_CORES; i++) {
+            memory_region_add_subregion_overlap(
+                &s->armv7m[i].container, RP2350_CORESIGHT_PERIPH_BASE,
+                rp2350_coresight_view(&s->coresight,
+                                      RP2350_CORESIGHT_CORE0 + i), 0);
+        }
+
+        sbd = SYS_BUS_DEVICE(&s->coresight_trace);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, RP2350_CORESIGHT_TRACE_BASE);
+    }
+
     for (i = 0; i < ARRAY_SIZE(rp2350_peripherals); i++) {
         create_unimplemented_device(rp2350_peripherals[i].name,
                                     rp2350_peripherals[i].base,
@@ -600,6 +632,10 @@ static void rp2350_soc_init(Object *obj)
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         object_initialize_child(obj, "uart[*]", &s->uart[i], TYPE_PL011);
     }
+    object_initialize_child(obj, "coresight", &s->coresight,
+                            TYPE_RP2350_CORESIGHT);
+    object_initialize_child(obj, "coresight-trace", &s->coresight_trace,
+                            TYPE_RP2350_CORESIGHT_TRACE);
 
     qdev_init_gpio_in(DEVICE(s), rp2350_soc_set_irq, RP2350_NUM_IRQS);
 
