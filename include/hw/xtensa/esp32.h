@@ -14,6 +14,9 @@
 #include "hw/misc/esp32_sha.h"
 #include "hw/misc/esp32_aes.h"
 #include "hw/misc/esp32_ledc.h"
+#include "hw/misc/esp32_pcnt.h"
+#include "hw/misc/esp32_rmt.h"
+#include "hw/misc/esp32_mcpwm.h"
 #include "hw/misc/esp32_rsa.h"
 #include "hw/timer/esp32_frc_timer.h"
 #include "hw/timer/esp32_timg.h"
@@ -26,7 +29,10 @@
 #include "hw/misc/esp32_flash_enc.h"
 #include "hw/net/can/esp32_twai.h"
 #include "hw/sd/dwc_sdmmc.h"
+#include "hw/sd/esp32_sdio_slave.h"
 #include "hw/display/esp_rgb.h"
+#include "hw/net/esp32_emac.h"
+#include "hw/net/ip101_phy.h"
 
 /* The DPORT register pairs that gate a peripheral's clock and reset it. */
 typedef enum Esp32GateRegs {
@@ -35,10 +41,11 @@ typedef enum Esp32GateRegs {
     ESP32_GATE_WIFI,    /* WIFI_CLK_EN / CORE_RST_EN */
 } Esp32GateRegs;
 
-#define ESP32_GATE_MAX_MR 2
+#define ESP32_GATE_MAX_MR 3
 #define ESP32_GATE_MAX 32
 
 #define ESP32_UHCI_COUNT 2
+#define ESP32_MCPWM_COUNT 2
 
 typedef struct Esp32SocState Esp32SocState;
 typedef struct Esp32PeriphGate Esp32PeriphGate;
@@ -68,6 +75,7 @@ struct Esp32PeriphGate {
     /* The peripheral's own clocks, driven by the SoC; NULL if it has none */
     Clock *apb_clk;
     Clock *ref_tick_clk;
+    Clock *f160m_clk;
 
     unsigned n_windows;
     Esp32GateWindow window[ESP32_GATE_MAX_MR];
@@ -102,12 +110,17 @@ struct Esp32SocState {
     Esp32AesState aes;
     Esp32RsaState rsa;
     Esp32LEDCState ledc;
+    Esp32PcntState pcnt;
+    Esp32RmtState rmt;
+    Esp32McpwmState mcpwm[ESP32_MCPWM_COUNT];
     Esp32EfuseState efuse;
     Esp32FlashEncryptionState flash_enc;
     ESPRgbState rgb;
 
     DWCSDMMCState sdmmc;
-    DeviceState *eth;
+    Esp32EmacState emac;
+    IP101PhyState phy;
+    Esp32SdioSlaveState sdio;
 
     BusState rtc_bus;
     BusState periph_bus;
@@ -126,8 +139,15 @@ struct Esp32SocState {
     Clock *frc_apb_clk[ESP32_FRC_COUNT];
     Clock *timg_apb_clk[ESP32_TIMG_COUNT];
     Clock *spi_dma_clk[ESP32_SPI_DMA_COUNT];
+    Clock *rmt_apb_clk;
+    Clock *rmt_ref_tick_clk;
+    Clock *emac_apb_clk;
+    Clock *sdio_apb_clk;
+    Clock *mcpwm_apb_clk[ESP32_MCPWM_COUNT];
+    Clock *mcpwm_f160m_clk[ESP32_MCPWM_COUNT];
     /* APB_CLK to the GPIO block's sigma-delta modulators, never gated */
     Clock *gpio_apb_clk;
+    Clock *pcnt_apb_clk;
 
     Esp32PeriphGate gate[ESP32_GATE_MAX];
     unsigned n_gates;

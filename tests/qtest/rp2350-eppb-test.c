@@ -12,6 +12,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 
 #define EPPB        0xe0080000
 #define NMI_MASK0   (EPPB + 0x0)
@@ -30,6 +31,7 @@
 #define TIMER_INTF  0x44
 
 #define TIMER0_IRQ_0 0
+#define RESET_TIMER0 (1u << 23)
 #define UART0_IRQ    33
 #define SPARE_IRQ_5  51
 
@@ -207,6 +209,7 @@ static void test_nmi_is_core_local(void)
 
     /* Core 0's mask routes the timer IRQ to core 0's NMI... */
     qts = start_watching_nmi(0);
+    rp2350_unreset(qts, RESET_TIMER0);
     qtest_writel(qts, NMI_MASK0, 1u << TIMER0_IRQ_0);
     qtest_writel(qts, TIMER0 + TIMER_INTE, 1);
     qtest_writel(qts, TIMER0 + TIMER_INTF, 1);
@@ -217,6 +220,7 @@ static void test_nmi_is_core_local(void)
 
     /* ...and not to core 1's, whose own mask is clear. */
     qts = start_watching_nmi(1);
+    rp2350_unreset(qts, RESET_TIMER0);
     qtest_writel(qts, NMI_MASK0, 1u << TIMER0_IRQ_0);
     qtest_writel(qts, TIMER0 + TIMER_INTE, 1);
     qtest_writel(qts, TIMER0 + TIMER_INTF, 1);
@@ -229,6 +233,7 @@ static void test_masked_irq_still_reaches_nvic(void)
 {
     QTestState *qts = start();
 
+    rp2350_unreset(qts, RESET_TIMER0);
     qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");
     qtest_writel(qts, NMI_MASK0, 1u << TIMER0_IRQ_0);
     qtest_writel(qts, TIMER0 + TIMER_INTE, 1);
