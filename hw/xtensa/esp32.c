@@ -167,6 +167,8 @@ static void esp32_soc_reset(DeviceState *dev)
     }
     if (s->requested_reset & ESP32_SOC_RESET_RTC) {
         device_cold_reset(DEVICE(&s->rtc_cntl));
+        /* The board's PHY shares the chip's power-on and EN resets. */
+        device_cold_reset(DEVICE(&s->phy));
     }
     if (s->requested_reset & ESP32_SOC_RESET_PERIPH) {
         device_cold_reset(DEVICE(&s->dport));
@@ -203,9 +205,7 @@ static void esp32_soc_reset(DeviceState *dev)
         device_cold_reset(DEVICE(&s->sha));
         device_cold_reset(DEVICE(&s->rng));
         device_cold_reset(DEVICE(&s->sdmmc));
-        if (s->eth) {
-            device_cold_reset(s->eth);
-        }
+        device_cold_reset(DEVICE(&s->emac));
 
         device_cold_reset(DEVICE(&s->rgb));
     }
@@ -1100,6 +1100,28 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdmmc), 0,
                        qdev_get_gpio_in(intmatrix_dev, ETS_SDIO_HOST_INTR_SOURCE));
 
+    /*
+     * [spec:nuos:req:emu.esp32.emac]
+     * The EMAC, with the board's IP101 PHY on its MDIO bus at address 1
+     * and the first -nic as the PHY's medium.
+     */
+    qdev_realize(DEVICE(&s->phy), NULL, &error_fatal);
+    object_property_set_link(OBJECT(&s->emac), "dma-mr", OBJECT(sys_mem),
+                             &error_abort);
+    object_property_set_link(OBJECT(&s->emac), "phy", OBJECT(&s->phy),
+                             &error_abort);
+    qemu_configure_nic_device(DEVICE(&s->emac), true, NULL);
+    qdev_realize(DEVICE(&s->emac), &s->periph_bus, &error_fatal);
+    {
+        Esp32PeriphGate *g = esp32_soc_add_gated_device(
+            s, &s->emac, DR_REG_EMAC_BASE, ESP32_GATE_WIFI,
+            R_DPORT_WIFI_CLK_EN_EMAC_MASK, R_DPORT_CORE_RST_EN_EMAC_MASK);
+        g->apb_clk = s->emac_apb_clk;
+    }
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->emac), 0,
+                       qdev_get_gpio_in(intmatrix_dev,
+                                        ETS_ETH_MAC_INTR_SOURCE));
+
     /* Provide internal RAM MemoryRegion to the RGB display */
     s->rgb.intram = dram;
     qdev_realize(DEVICE(&s->rgb), &s->periph_bus, &error_abort);
@@ -1255,6 +1277,11 @@ static void esp32_soc_init(Object *obj)
 
     object_initialize_child(obj, "sdmmc", &s->sdmmc, TYPE_DWC_SDMMC);
 
+    object_initialize_child(obj, "emac", &s->emac, TYPE_ESP32_EMAC);
+    s->emac_apb_clk = clock_new(obj, "emac-apb");
+    qdev_connect_clock_in(DEVICE(&s->emac), "apb", s->emac_apb_clk);
+    object_initialize_child(obj, "phy", &s->phy, TYPE_IP101_PHY);
+
     object_initialize_child(obj, "rgb", &s->rgb, TYPE_ESP_RGB);
 
     qdev_init_gpio_in_named(DEVICE(s), esp32_dig_reset, ESP32_RTC_DIG_RESET_GPIO, 1);
@@ -1369,34 +1396,6 @@ static void esp32_machine_init_i2c(Esp32SocState *s)
     object_property_set_int(OBJECT(tmp105), "temperature", 25 * 1000, &error_fatal);
 }
 
-static void esp32_machine_init_openeth(Esp32SocState *ss)
-{
-    SysBusDevice *sbd;
-    Esp32PeriphGate *g;
-    hwaddr reg_base = DR_REG_EMAC_BASE;
-    hwaddr desc_base = reg_base + 0x400;
-    qemu_irq irq = qdev_get_gpio_in(DEVICE(&ss->intmatrix), ETS_ETH_MAC_INTR_SOURCE);
-
-    DeviceState* open_eth_dev = qemu_create_nic_device("open_eth", true, NULL);
-    if (!open_eth_dev) {
-        return;
-    }
-
-    ss->eth = open_eth_dev;
-    sbd = SYS_BUS_DEVICE(open_eth_dev);
-    sysbus_realize_and_unref(sbd, &error_fatal);
-    sysbus_connect_irq(sbd, 0, irq);
-    /* The OpenCores MAC stands in for the EMAC, behind the EMAC's bits. */
-    assert(ss->n_gates < ESP32_GATE_MAX);
-    g = &ss->gate[ss->n_gates++];
-    g->dev = open_eth_dev;
-    g->regs = ESP32_GATE_WIFI;
-    g->clk_mask = R_DPORT_WIFI_CLK_EN_EMAC_MASK;
-    g->rst_mask = R_DPORT_CORE_RST_EN_EMAC_MASK;
-    esp32_gate_map(g, sysbus_mmio_get_region(sbd, 0), reg_base, false, 0);
-    esp32_gate_map(g, sysbus_mmio_get_region(sbd, 1), desc_base, false, 0);
-}
-
 static void esp32_machine_init_sd(Esp32SocState *ss)
 {
     DriveInfo *dinfo = drive_get(IF_SD, 0, 0);
@@ -1453,8 +1452,6 @@ static void esp32_machine_init(MachineState *machine)
     }
 
     esp32_machine_init_i2c(ss);
-
-    esp32_machine_init_openeth(ss);
 
     esp32_machine_init_sd(ss);
 
