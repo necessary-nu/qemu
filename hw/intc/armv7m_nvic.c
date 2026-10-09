@@ -1042,7 +1042,8 @@ static uint32_t nvic_readl(NVICState *s, uint32_t offset, MemTxAttrs attrs)
         if (!arm_feature(&cpu->env, ARM_FEATURE_V7)) {
             goto bad_offset;
         }
-        return ((s->num_irq - NVIC_FIRST_IRQ) / 32) - 1;
+        /* INTLINESNUM: the number of 32-line blocks, less one. */
+        return DIV_ROUND_UP(s->num_irq - NVIC_FIRST_IRQ, 32) - 1;
     case 0xc: /* CPPWR */
         if (!arm_feature(&cpu->env, ARM_FEATURE_V8)) {
             goto bad_offset;
