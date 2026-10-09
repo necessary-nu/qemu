@@ -486,8 +486,10 @@ static void usb_update_vbus_en(RP2350USBCtrlState *s)
 }
 
 /*
- * A buffer completed. If its BUFF_STATUS bit is still set, the completion
- * waits behind it: clearing the bit sets it again for this buffer.
+ * A buffer completed. If its endpoint's BUFF_STATUS bit is still set for
+ * the other buffer, the completion waits behind it: clearing the bit sets
+ * it again for this buffer. A buffer completing again before software
+ * has cleared it is not counted twice.
  */
 /* [spec:nuos:req:emu.usb] */
 static void buff_status_raise(RP2350USBCtrlState *s, int bit, int sel)
@@ -495,6 +497,9 @@ static void buff_status_raise(RP2350USBCtrlState *s, int bit, int sel)
     uint32_t m = 1u << bit;
 
     if (s->buff_status & m) {
+        if (!!(s->buff_cpu_should_handle & m) == !!sel) {
+            return;
+        }
         s->buff_status_pending |= m;
         s->buff_pending_sel = (s->buff_pending_sel & ~m) | (sel ? m : 0);
         return;
