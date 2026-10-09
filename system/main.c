@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu-main.h"
+#include "qemu/guest-random.h"
 #include "qemu/main-loop.h"
 #include "system/replay.h"
 #include "system/system.h"
@@ -45,6 +46,13 @@ static void *qemu_default_main(void *opaque)
 {
     int status;
 
+    /*
+     * Run on its own thread, the main loop needs its own guest random
+     * state derived from -seed, as vCPU threads get theirs.
+     */
+    if (opaque) {
+        qemu_guest_random_seed_thread_part2(*(uint64_t *)opaque);
+    }
     replay_mutex_lock();
     bql_lock();
     status = qemu_main_loop();
@@ -86,8 +94,12 @@ int main(int argc, char **argv)
 
     if (qemu_main) {
         QemuThread main_loop_thread;
+        static uint64_t main_loop_seed;
+
+        main_loop_seed = qemu_guest_random_seed_thread_part1();
         qemu_thread_create(&main_loop_thread, "qemu_main",
-                           qemu_default_main, NULL, QEMU_THREAD_DETACHED);
+                           qemu_default_main, &main_loop_seed,
+                           QEMU_THREAD_DETACHED);
         return qemu_main();
     } else {
         qemu_default_main(NULL);
