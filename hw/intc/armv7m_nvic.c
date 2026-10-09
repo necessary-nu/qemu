@@ -1044,6 +1044,11 @@ static uint32_t nvic_readl(NVICState *s, uint32_t offset, MemTxAttrs attrs)
         }
         /* INTLINESNUM: the number of 32-line blocks, less one. */
         return DIV_ROUND_UP(s->num_irq - NVIC_FIRST_IRQ, 32) - 1;
+    case 0x8: /* ACTLR */
+        if (!cpu->m_actlr_mask) {
+            goto bad_offset;
+        }
+        return cpu->env.v7m.actlr[attrs.secure];
     case 0xc: /* CPPWR */
         if (!arm_feature(&cpu->env, ARM_FEATURE_V8)) {
             goto bad_offset;
@@ -1642,6 +1647,30 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
     ARMCPU *cpu = s->cpu;
 
     switch (offset) {
+    case 0x8: /* ACTLR */
+        /*
+         * ACTLR is banked by Security state. Its bits tune the pipeline,
+         * trace and FPU exception outputs, none of which have an effect
+         * in QEMU, except EXTEXCLALL. With EXTEXCLALL clear, exclusives to
+         * memory that is not Shareable (which includes all Normal memory
+         * of the default memory map) use only the core's local monitor
+         * and are not signalled to the system's global monitor; with it
+         * set, every exclusive is signalled. QEMU implements one monitor
+         * that is global for all memory, which matches EXTEXCLALL set
+         * for memory the system's global monitor covers, so the bit is
+         * stored but does not change exclusive behaviour.
+         */
+        if (!cpu->m_actlr_mask) {
+            goto bad_offset;
+        }
+        if ((value ^ cpu->env.v7m.actlr[attrs.secure]) &
+            cpu->m_actlr_mask & R_V7M_ACTLR_EXTEXCLALL_MASK) {
+            qemu_log_mask(LOG_UNIMP,
+                          "NVIC: ACTLR.EXTEXCLALL does not change exclusive "
+                          "access behaviour\n");
+        }
+        cpu->env.v7m.actlr[attrs.secure] = value & cpu->m_actlr_mask;
+        break;
     case 0xc: /* CPPWR */
         if (!arm_feature(&cpu->env, ARM_FEATURE_V8)) {
             goto bad_offset;

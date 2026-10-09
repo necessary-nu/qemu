@@ -509,6 +509,24 @@ static const VMStateDescription vmstate_m_mve = {
     },
 };
 
+static bool m_actlr_needed(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    return cpu->m_actlr_mask != 0;
+}
+
+static const VMStateDescription vmstate_m_actlr = {
+    .name = "cpu/m/actlr",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = m_actlr_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(env.v7m.actlr, ARMCPU, M_REG_NUM_BANKS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static bool event_needed(void *opaque)
 {
     ARMCPU *cpu = opaque;
@@ -554,6 +572,7 @@ static const VMStateDescription vmstate_m = {
         &vmstate_m_v8m,
         &vmstate_m_fp,
         &vmstate_m_mve,
+        &vmstate_m_actlr,
         NULL
     }
 };

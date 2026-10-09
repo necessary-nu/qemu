@@ -639,6 +639,8 @@ typedef struct CPUArchState {
         uint32_t nsacr;
         uint32_t ltpsize;
         uint32_t vpr;
+        /* Auxiliary Control Register; see ArchCPU::m_actlr_mask */
+        uint32_t actlr[M_REG_NUM_BANKS];
     } v7m;
 
     /* Information associated with an exception about to be taken:
@@ -1081,6 +1083,12 @@ struct ArchCPU {
     uint32_t pmsav8r_hdregion;
     /* v8M SAU number of supported regions */
     uint32_t sau_sregion;
+    /*
+     * M-profile ACTLR: the implementation-defined bits this core
+     * implements, which are RW and reset to 0. Zero for cores whose
+     * ACTLR is not modelled, where the register is not mapped.
+     */
+    uint32_t m_actlr_mask;
 
     /* PSCI conduit used to invoke PSCI methods
      * 0 - disabled, 1 - smc, 2 - hvc
@@ -2033,6 +2041,9 @@ enum arm_cpu_mode {
 
 /* QEMU-internal value meaning "FPSCR, but we care only about NZCV" */
 #define QEMU_VFP_FPSCR_NZCV 0xffff
+
+/* Cortex-M33 ACTLR bits */
+FIELD(V7M_ACTLR, EXTEXCLALL, 29, 1)
 
 /* V7M CCR bits */
 FIELD(V7M_CCR, NONBASETHRDENA, 0, 1)
