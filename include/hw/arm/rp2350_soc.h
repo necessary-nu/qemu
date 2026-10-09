@@ -23,6 +23,7 @@
 #include "hw/misc/rp2350_dcp.h"
 #include "hw/misc/rp2350_eppb.h"
 #include "hw/misc/rp2350_psm.h"
+#include "hw/misc/rp2350_pwm.h"
 #include "hw/misc/rp2350_rcp.h"
 #include "hw/misc/rp2350_resets.h"
 #include "hw/misc/rp2350_rosc.h"
@@ -51,6 +52,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
  */
 #define RP2350_TIMER0_IRQ_0 0
 #define RP2350_TIMER1_IRQ_0 4
+#define RP2350_PWM_IRQ_WRAP_0 8
+#define RP2350_PWM_IRQ_WRAP_1 9
 #define RP2350_DMA_IRQ_0 10
 #define RP2350_USBCTRL_IRQ 14
 #define RP2350_IO_IRQ_BANK0 21
@@ -109,6 +112,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_XOSC_BASE 0x40048000
 #define RP2350_BUSCTRL_BASE 0x40068000
 #define RP2350_UART0_BASE 0x40070000
+#define RP2350_PWM_BASE 0x400a8000
 #define RP2350_TIMER0_BASE 0x400b0000
 #define RP2350_TIMER1_BASE 0x400b8000
 #define RP2350_UART1_BASE 0x40078000
@@ -168,6 +172,7 @@ struct RP2350State {
     RP2350ROSCState rosc;
     RP2350TRNGState trng;
     RP2350SHA256State sha256;
+    RP2350PWMState pwm;
     RP2350TimerState timer[RP2350_NUM_TIMERS];
     PL011State uart[RP2350_NUM_UARTS];
     RP2350CoreSightState coresight;

@@ -260,7 +260,8 @@ qtests_rp2350 = \
    'rp2350-coresight-test',
    'rp2350-accessctrl-test',
    'rp2350-xip-test',
-   'rp2350-watchdog-test']
+   'rp2350-watchdog-test',
+   'rp2350-pwm-test']
 
 qtests_xtensa = \
   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ?

@@ -158,6 +158,9 @@ config RP2350_TRNG
 config RP2350_SHA256
     bool
 
+config RP2350_PWM
+    bool
+
 config RP2350_CORESIGHT
     bool
 
