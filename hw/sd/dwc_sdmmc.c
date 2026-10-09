@@ -546,9 +546,9 @@ static void dwc_sdmmc_init(Object *obj)
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
 }
 
-static void dwc_sdmmc_reset(DeviceState *dev)
+static void dwc_sdmmc_reset_hold(Object *obj, ResetType type)
 {
-    DWCSDMMCState *s = DWC_SDMMC(dev);
+    DWCSDMMCState *s = DWC_SDMMC(obj);
     s->cmd = 0;
     s->cmdarg = 0;
     s->intmask = 0;
@@ -564,11 +564,18 @@ static void dwc_sdmmc_reset(DeviceState *dev)
     memset(s->resp, 0, sizeof(s->resp));
 }
 
+/* With every interrupt status clear, the interrupt line falls. */
+static void dwc_sdmmc_reset_exit(Object *obj, ResetType type)
+{
+    dwc_sdmmc_update_irq(DWC_SDMMC(obj));
+}
+
 static void dwc_sdmmc_class_init(ObjectClass *klass, const void *data)
 {
-    DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
-    dc->legacy_reset = dwc_sdmmc_reset;
+    rc->phases.hold = dwc_sdmmc_reset_hold;
+    rc->phases.exit = dwc_sdmmc_reset_exit;
 }
 
 static TypeInfo dwc_sdmmc_info = {
