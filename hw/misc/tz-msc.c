@@ -82,8 +82,10 @@ static MSCAction tz_msc_check(TZMSC *s, hwaddr addr)
     IDAUInterface *ii = IDAU_INTERFACE(s->idau);
     bool idau_exempt = false, idau_ns = true, idau_nsc = true;
     int idau_region = IREGION_NOTVALID;
+    uint32_t idau_base = 0, idau_limit = UINT32_MAX;
 
-    iic->check(ii, addr, &idau_region, &idau_exempt, &idau_ns, &idau_nsc);
+    iic->check(ii, addr, MMU_DATA_LOAD, &idau_region, &idau_exempt, &idau_ns,
+               &idau_nsc, &idau_base, &idau_limit);
 
     if (idau_exempt) {
         /*

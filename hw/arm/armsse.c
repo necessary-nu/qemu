@@ -1851,7 +1851,9 @@ static void armsse_realize(DeviceState *dev, Error **errp)
 }
 
 static void armsse_idau_check(IDAUInterface *ii, uint32_t address,
-                              int *iregion, bool *exempt, bool *ns, bool *nsc)
+                              MMUAccessType access_type, int *iregion,
+                              bool *exempt, bool *ns, bool *nsc,
+                              uint32_t *base, uint32_t *limit)
 {
     /*
      * For ARMSSE systems the IDAU responses are simple logical functions

@@ -47,9 +47,11 @@ static uint64_t timer_hz(RP2350TimerState *s)
     return s->source ? s->sysclk_hz : TICK_HZ;
 }
 
+/* The counter stops while the timer is held in reset. */
+/* [spec:nuos:req:emu.resets] */
 static bool timer_should_run(RP2350TimerState *s)
 {
-    if (s->pause) {
+    if (s->pause || device_is_in_reset(DEVICE(s))) {
         return false;
     }
     return s->source || rp2350_ticks_running(s->ticks, s->tick);
@@ -312,10 +314,12 @@ static void rp2350_timer_hold_reset(Object *obj, ResetType type)
     s->intf = 0;
 }
 
+/* The counter starts from zero when the timer leaves reset. */
 static void rp2350_timer_exit_reset(Object *obj, ResetType type)
 {
     RP2350TimerState *s = RP2350_TIMER(obj);
 
+    timer_sync(s);
     timer_restart(s);
     timer_update_irqs(s);
 }

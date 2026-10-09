@@ -791,6 +791,18 @@ static void rp2350_pwm_clk_update(void *opaque, ClockEvent event)
     }
 }
 
+/*
+ * The slices' cycle count starts when the block leaves reset; while it is
+ * held in reset, nothing counts.
+ */
+static void rp2350_pwm_exit_reset(Object *obj, ResetType type)
+{
+    RP2350PWMState *s = RP2350_PWM(obj);
+
+    s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->base_cycle = 0;
+}
+
 static void rp2350_pwm_hold_reset(Object *obj, ResetType type)
 {
     RP2350PWMState *s = RP2350_PWM(obj);
@@ -926,6 +938,7 @@ static void rp2350_pwm_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = rp2350_pwm_realize;
     rc->phases.hold = rp2350_pwm_hold_reset;
+    rc->phases.exit = rp2350_pwm_exit_reset;
     dc->vmsd = &vmstate_rp2350_pwm;
     device_class_set_props(dc, rp2350_pwm_properties);
 }

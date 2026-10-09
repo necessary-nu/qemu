@@ -488,6 +488,12 @@ static int esp32_gpio_pad_drive(Esp32GpioState *s, unsigned n, bool *val_out,
         *oe_out = false;
         return -1;
     }
+    if (bit64(s->rtc_mux, n)) {
+        /* The RTC IO MUX drives the pad, carrying no matrix signal */
+        *val_out = bit64(s->rtc_out, n);
+        *oe_out = bit64(s->rtc_oe, n);
+        return -1;
+    }
     fn = pad_func(s, n, &f);
     switch (fn->kind) {
     case IOMUX_GPIO:
@@ -532,13 +538,22 @@ static void esp32_gpio_resolve(Esp32GpioState *s, uint64_t *pad_out,
 
     for (unsigned n = 0; n < ESP32_GPIO_PIN_COUNT; n++) {
         uint32_t mux = s->iomux[n];
-        bool val, oe, level;
+        bool val, oe, level, pull_up, ie;
 
         if (!bit64(PAD_VALID, n)) {
             continue;
         }
         esp32_gpio_pad_drive(s, n, &val, &oe);
-        if (FIELD_EX32(s->pin[n], GPIO_PIN0, PAD_DRIVER) && val) {
+        if (bit64(s->rtc_mux, n)) {
+            /* [spec:nuos:req:emu.esp32.rtc] The RTC IO MUX has the pad */
+            pull_up = bit64(s->rtc_pu, n);
+            ie = bit64(s->rtc_ie, n);
+        } else {
+            pull_up = FIELD_EX32(mux, IO_MUX_GPIO36, FUN_WPU);
+            ie = FIELD_EX32(mux, IO_MUX_GPIO36, FUN_IE);
+        }
+        if (!bit64(s->rtc_mux, n) &&
+            FIELD_EX32(s->pin[n], GPIO_PIN0, PAD_DRIVER) && val) {
             /* Open drain: a high output releases the pad */
             oe = false;
         }
@@ -549,10 +564,10 @@ static void esp32_gpio_resolve(Esp32GpioState *s, uint64_t *pad_out,
             level = val;
         } else {
             /* Pulled up, or pulled down, or floating, which reads low */
-            level = FIELD_EX32(mux, IO_MUX_GPIO36, FUN_WPU);
+            level = pull_up;
         }
         pad |= (uint64_t)level << n;
-        if (FIELD_EX32(mux, IO_MUX_GPIO36, FUN_IE)) {
+        if (ie) {
             in |= (uint64_t)level << n;
         }
     }
@@ -633,6 +648,103 @@ static bool esp32_gpio_sig_in(Esp32GpioState *s, unsigned sig, uint64_t in,
     return v ^ FIELD_EX32(cfg, GPIO_FUNC0_IN_SEL_CFG, IN_INV_SEL);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.rtc]
+ * The GPIO wakeup from light sleep: a pad with GPIO_PINn_WAKEUP_ENABLE
+ * whose input is at the level of its INT_TYPE, which must be a level type.
+ */
+static bool esp32_gpio_wakeup(Esp32GpioState *s, uint64_t in)
+{
+    for (unsigned n = 0; n < ESP32_GPIO_PIN_COUNT; n++) {
+        uint32_t pin = s->pin[n];
+
+        if (!bit64(PAD_VALID, n) ||
+            !FIELD_EX32(pin, GPIO_PIN0, WAKEUP_ENABLE)) {
+            continue;
+        }
+        switch (FIELD_EX32(pin, GPIO_PIN0, INT_TYPE)) {
+        case INT_TYPE_LOW:
+            if (!bit64(in, n)) {
+                return true;
+            }
+            break;
+        case INT_TYPE_HIGH:
+            if (bit64(in, n)) {
+                return true;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
+/* [spec:nuos:req:emu.esp32.i2s] */
+bool esp32_gpio_sig_in_source(Esp32GpioState *s, unsigned sig,
+                              unsigned *src, bool *inverted)
+{
+    uint32_t cfg = s->func_in_sel[sig];
+    uint32_t out_cfg;
+    bool inv = false, oe, oe_periph;
+    int pad = -1;
+    unsigned f, sel;
+    const IomuxFunc *fn;
+
+    if (FIELD_EX32(cfg, GPIO_FUNC0_IN_SEL_CFG, SIG_IN_SEL)) {
+        sel = FIELD_EX32(cfg, GPIO_FUNC0_IN_SEL_CFG, IN_SEL);
+        if (sel < ESP32_GPIO_PIN_COUNT) {
+            pad = sel;
+        }
+        inv = FIELD_EX32(cfg, GPIO_FUNC0_IN_SEL_CFG, IN_INV_SEL);
+    } else {
+        for (unsigned n = 0; n < ESP32_GPIO_PIN_COUNT; n++) {
+            fn = pad_func(s, n, &f);
+            if (bit64(PAD_VALID, n) && fn->kind == IOMUX_SIG &&
+                fn->sig_in == sig) {
+                pad = n;
+                break;
+            }
+        }
+    }
+    if (pad < 0 || !bit64(PAD_VALID, pad) || !bit64(PAD_OUTPUT, pad) ||
+        bit64(s->ext_driven, pad) ||
+        !FIELD_EX32(s->iomux[pad], IO_MUX_GPIO36, FUN_IE) ||
+        FIELD_EX32(s->pin[pad], GPIO_PIN0, PAD_DRIVER)) {
+        return false;
+    }
+
+    out_cfg = s->func_out_sel[pad];
+    fn = pad_func(s, pad, &f);
+    switch (fn->kind) {
+    case IOMUX_GPIO:
+        sel = FIELD_EX32(out_cfg, GPIO_FUNC0_OUT_SEL_CFG, OUT_SEL);
+        if (sel >= ESP32_GPIO_SIG_COUNT) {
+            return false;
+        }
+        inv ^= FIELD_EX32(out_cfg, GPIO_FUNC0_OUT_SEL_CFG, OUT_INV_SEL);
+        break;
+    case IOMUX_SIG:
+        if (fn->sig_out < 0) {
+            return false;
+        }
+        sel = fn->sig_out;
+        break;
+    default:
+        return false;
+    }
+    oe_periph = s->sig_oe[sel];
+    oe = FIELD_EX32(out_cfg, GPIO_FUNC0_OUT_SEL_CFG, OEN_SEL) ?
+         bit64(gpio_enable_all(s), pad) : oe_periph;
+    oe ^= FIELD_EX32(out_cfg, GPIO_FUNC0_OUT_SEL_CFG, OEN_INV_SEL);
+    if (!oe) {
+        return false;
+    }
+    *src = sel;
+    *inverted = inv;
+    return true;
+}
+
 static void esp32_gpio_propagate(Esp32GpioState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -640,6 +752,7 @@ static void esp32_gpio_propagate(Esp32GpioState *s)
     uint64_t pad, in, changed;
     bool resync = s->resync;
     bool irq[ESP32_GPIO_IRQ_COUNT];
+    bool wakeup;
 
     s->resync = false;
     for (unsigned ch = 0; ch < ESP32_GPIO_SDM_COUNT; ch++) {
@@ -695,6 +808,18 @@ static void esp32_gpio_propagate(Esp32GpioState *s)
                 qemu_set_irq(s->iomux_in_out[idx], v);
             }
         }
+    }
+
+    for (unsigned n = 0; n < ESP32_GPIO_PIN_COUNT; n++) {
+        if (resync || bit64(in ^ s->rtc_in_level, n)) {
+            qemu_set_irq(s->rtc_in_out[n], bit64(in, n));
+        }
+    }
+    s->rtc_in_level = in;
+    wakeup = esp32_gpio_wakeup(s, in);
+    if (resync || wakeup != s->wakeup_level) {
+        s->wakeup_level = wakeup;
+        qemu_set_irq(s->wakeup_out, wakeup);
     }
 
     irq[ESP32_GPIO_IRQ_PRO] = int_view(s, INT_ENA_PRO) != 0;
@@ -778,7 +903,8 @@ int esp32_gpio_sig_in_pad(Esp32GpioState *s, unsigned sig)
             }
         }
     }
-    if (pad >= 0 && !FIELD_EX32(s->iomux[pad], IO_MUX_GPIO36, FUN_IE)) {
+    if (pad >= 0 && !(bit64(s->rtc_mux, pad) ? bit64(s->rtc_ie, pad) :
+                      FIELD_EX32(s->iomux[pad], IO_MUX_GPIO36, FUN_IE))) {
         return -1;
     }
     return pad;
@@ -1197,6 +1323,56 @@ static void esp32_gpio_set_iomux_oe(void *opaque, int n, int level)
     esp32_gpio_update(s);
 }
 
+static void esp32_gpio_set_rtc(uint64_t *mask, Esp32GpioState *s, int n,
+                               int level)
+{
+    *mask = deposit64(*mask, n, 1, level != 0);
+    esp32_gpio_update(s);
+}
+
+static void esp32_gpio_set_rtc_mux(void *opaque, int n, int level)
+{
+    Esp32GpioState *s = ESP32_GPIO(opaque);
+
+    esp32_gpio_set_rtc(&s->rtc_mux, s, n, level);
+    notifier_list_notify(&s->route_notifiers, s);
+}
+
+static void esp32_gpio_set_rtc_out(void *opaque, int n, int level)
+{
+    Esp32GpioState *s = ESP32_GPIO(opaque);
+
+    esp32_gpio_set_rtc(&s->rtc_out, s, n, level);
+}
+
+static void esp32_gpio_set_rtc_oe(void *opaque, int n, int level)
+{
+    Esp32GpioState *s = ESP32_GPIO(opaque);
+
+    esp32_gpio_set_rtc(&s->rtc_oe, s, n, level);
+}
+
+static void esp32_gpio_set_rtc_pu(void *opaque, int n, int level)
+{
+    Esp32GpioState *s = ESP32_GPIO(opaque);
+
+    esp32_gpio_set_rtc(&s->rtc_pu, s, n, level);
+}
+
+static void esp32_gpio_set_rtc_pd(void *opaque, int n, int level)
+{
+    Esp32GpioState *s = ESP32_GPIO(opaque);
+
+    esp32_gpio_set_rtc(&s->rtc_pd, s, n, level);
+}
+
+static void esp32_gpio_set_rtc_ie(void *opaque, int n, int level)
+{
+    Esp32GpioState *s = ESP32_GPIO(opaque);
+
+    esp32_gpio_set_rtc(&s->rtc_ie, s, n, level);
+}
+
 /*
  * The TRM gives no reset value ("x") for the GPIO matrix registers; ESP-IDF
  * reads none of them before writing. They reset to 0, but GPIO_FUNCn_OUT_SEL
@@ -1310,10 +1486,27 @@ static void esp32_gpio_init(Object *obj)
                             ESP32_GPIO_PIN_COUNT * ESP32_IOMUX_FUNC_COUNT);
     qdev_init_gpio_out_named(dev, s->iomux_in_out, ESP32_GPIO_IOMUX_IN,
                              ESP32_GPIO_PIN_COUNT * ESP32_IOMUX_FUNC_COUNT);
+    qdev_init_gpio_in_named(dev, esp32_gpio_set_rtc_mux, ESP32_GPIO_RTC_MUX,
+                            ESP32_GPIO_PIN_COUNT);
+    qdev_init_gpio_in_named(dev, esp32_gpio_set_rtc_out, ESP32_GPIO_RTC_OUT,
+                            ESP32_GPIO_PIN_COUNT);
+    qdev_init_gpio_in_named(dev, esp32_gpio_set_rtc_oe, ESP32_GPIO_RTC_OE,
+                            ESP32_GPIO_PIN_COUNT);
+    qdev_init_gpio_in_named(dev, esp32_gpio_set_rtc_pu, ESP32_GPIO_RTC_PU,
+                            ESP32_GPIO_PIN_COUNT);
+    qdev_init_gpio_in_named(dev, esp32_gpio_set_rtc_pd, ESP32_GPIO_RTC_PD,
+                            ESP32_GPIO_PIN_COUNT);
+    qdev_init_gpio_in_named(dev, esp32_gpio_set_rtc_ie, ESP32_GPIO_RTC_IE,
+                            ESP32_GPIO_PIN_COUNT);
+    qdev_init_gpio_out_named(dev, s->rtc_in_out, ESP32_GPIO_RTC_IN,
+                             ESP32_GPIO_PIN_COUNT);
+    qdev_init_gpio_out_named(dev, &s->wakeup_out, ESP32_GPIO_WAKEUP, 1);
 
     /*
      * The signals peripherals drive are theirs, not reset with this block:
-     * they start at the level the peripherals hold out of reset.
+     * they start at the level the peripherals hold out of reset. The RTC
+     * pad controls are the RTC domain's, which a reset of the digital
+     * domain leaves as they are.
      */
     for (unsigned sig = 0; sig < ESP32_GPIO_SIG_COUNT; sig++) {
         s->sig_out[sig] = sig_out_idle(sig);
@@ -1329,7 +1522,7 @@ static const Property esp32_gpio_properties[] = {
 
 static const VMStateDescription vmstate_esp32_gpio = {
     .name = TYPE_ESP32_GPIO,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(apb_clk, Esp32GpioState),
@@ -1372,6 +1565,14 @@ static const VMStateDescription vmstate_esp32_gpio = {
         VMSTATE_UINT8_ARRAY(iomux_in, Esp32GpioState,
                             ESP32_GPIO_PIN_COUNT * ESP32_IOMUX_FUNC_COUNT),
         VMSTATE_UINT8_ARRAY(irq_level, Esp32GpioState, ESP32_GPIO_IRQ_COUNT),
+        VMSTATE_UINT64_V(rtc_mux, Esp32GpioState, 2),
+        VMSTATE_UINT64_V(rtc_out, Esp32GpioState, 2),
+        VMSTATE_UINT64_V(rtc_oe, Esp32GpioState, 2),
+        VMSTATE_UINT64_V(rtc_pu, Esp32GpioState, 2),
+        VMSTATE_UINT64_V(rtc_pd, Esp32GpioState, 2),
+        VMSTATE_UINT64_V(rtc_ie, Esp32GpioState, 2),
+        VMSTATE_UINT64_V(rtc_in_level, Esp32GpioState, 2),
+        VMSTATE_BOOL_V(wakeup_level, Esp32GpioState, 2),
         VMSTATE_END_OF_LIST()
     }
 };

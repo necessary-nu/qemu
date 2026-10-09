@@ -186,6 +186,22 @@ static void sha256_digest_done(void *opaque)
 }
 
 /*
+ * Finish a digest whose time has come but whose timer has not yet run.
+ * The timer callback runs from the main loop and can lag the core, but
+ * software that times its accesses by other clk_sys-based hardware (the
+ * boot ROM paces its writes by the TRNG) must see WDATA_RDY as at that
+ * virtual time.
+ */
+static void sha256_sync(RP2350SHA256State *s)
+{
+    if (s->busy && timer_expire_time_ns(s->timer) <=
+                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_del(s->timer);
+        sha256_digest_done(s);
+    }
+}
+
+/*
  * Pass an assembled word to the core. The 16th word of a block starts
  * the digest, which ends DIGEST_CYCLES of clk_sys later.
  */
@@ -272,6 +288,7 @@ static uint64_t rp2350_sha256_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr reg = rp2350_atomic_reg(addr) & ~3;
     uint32_t v;
 
+    sha256_sync(s);
     switch (reg) {
     case A_CSR:
         v = sha256_csr(s);
@@ -304,6 +321,7 @@ static void rp2350_sha256_write(void *opaque, hwaddr addr, uint64_t value64,
     unsigned lane = addr & 3;
     uint32_t value = value64;
 
+    sha256_sync(s);
     /*
      * The bus carries a narrow write replicated across all its lanes, or
      * in the address bit 14 window, in its own lanes with the rest zero.

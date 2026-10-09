@@ -1042,7 +1042,8 @@ static uint32_t nvic_readl(NVICState *s, uint32_t offset, MemTxAttrs attrs)
         if (!arm_feature(&cpu->env, ARM_FEATURE_V7)) {
             goto bad_offset;
         }
-        return ((s->num_irq - NVIC_FIRST_IRQ) / 32) - 1;
+        /* INTLINESNUM: the number of 32-line blocks, less one. */
+        return DIV_ROUND_UP(s->num_irq - NVIC_FIRST_IRQ, 32) - 1;
     case 0xc: /* CPPWR */
         if (!arm_feature(&cpu->env, ARM_FEATURE_V8)) {
             goto bad_offset;
@@ -1945,6 +1946,16 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
         tlb_flush(CPU(cpu));
         break;
     case 0xd98: /* MPU_RNR */
+        if (arm_feature(&cpu->env, ARM_FEATURE_V8) &&
+            is_power_of_2(cpu->pmsav7_dregion)) {
+            /*
+             * v8-M cores such as the Cortex-M33 implement only the REGION
+             * bits their region count needs; the bits above are RAZ/WI.
+             * The RP2350 boot ROM relies on this when it checks its MPU
+             * setup.
+             */
+            value &= cpu->pmsav7_dregion - 1;
+        }
         if (value >= cpu->pmsav7_dregion) {
             qemu_log_mask(LOG_GUEST_ERROR, "MPU region out of range %"
                           PRIu32 "/%" PRIu32 "\n",
@@ -2035,6 +2046,10 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
             }
             if (region >= cpu->pmsav7_dregion) {
                 return;
+            }
+            if (!arm_feature(&cpu->env, ARM_FEATURE_V8_1M)) {
+                /* PXN, bit 4, is v8.1-M only; v8.0-M has it RES0. */
+                value &= ~(1u << 4);
             }
             cpu->env.pmsav8.rlar[attrs.secure][region] = value;
             tlb_flush(CPU(cpu));

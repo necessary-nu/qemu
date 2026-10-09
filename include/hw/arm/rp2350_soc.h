@@ -11,10 +11,12 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/arm/armv7m.h"
+#include "hw/adc/rp2350_adc.h"
 #include "hw/char/pl011.h"
 #include "hw/core/clock.h"
 #include "hw/dma/rp2350_dma.h"
 #include "hw/gpio/rp2350_gpio.h"
+#include "hw/i2c/rp2350_i2c.h"
 #include "hw/misc/rp2350_accessctrl.h"
 #include "hw/misc/rp2350_bootram.h"
 #include "hw/misc/rp2350_busctrl.h"
@@ -23,6 +25,8 @@
 #include "hw/misc/rp2350_coresight_trace.h"
 #include "hw/misc/rp2350_dcp.h"
 #include "hw/misc/rp2350_eppb.h"
+#include "hw/misc/rp2350_m33_debug.h"
+#include "hw/misc/rp2350_hstx.h"
 #include "hw/misc/rp2350_psm.h"
 #include "hw/misc/rp2350_pwm.h"
 #include "hw/misc/rp2350_otp.h"
@@ -35,6 +39,7 @@
 #include "hw/misc/rp2350_trng.h"
 #include "hw/misc/rp2350_xip.h"
 #include "hw/misc/unimp.h"
+#include "hw/ssi/pl022.h"
 #include "hw/timer/rp2350_timer.h"
 #include "hw/watchdog/rp2350_watchdog.h"
 #include "qom/object.h"
@@ -45,8 +50,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_NUM_CORES 2
 #define RP2350_NUM_IRQS 52
 #define RP2350_NUM_UARTS 2
+#define RP2350_NUM_SPIS 2
 #define RP2350_NUM_TIMERS 2
+#define RP2350_NUM_I2C 2
 #define RP2350_MPU_REGIONS 8
+/* CPUID: Arm Cortex-M33 r1p0, where QEMU's cortex-m33 is r0p3. */
+#define RP2350_M33_CPUID 0x411fd210
 
 /*
  * IRQ numbers, from the pico-sdk intctrl.h. Peripheral models connect to
@@ -68,8 +77,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_SIO_IRQ_BELL_NS 28
 #define RP2350_SIO_IRQ_MTIMECMP 29
 #define RP2350_CLOCKS_IRQ 30
+#define RP2350_SPI0_IRQ 31
+#define RP2350_SPI1_IRQ 32
 #define RP2350_UART0_IRQ 33
 #define RP2350_UART1_IRQ 34
+#define RP2350_ADC_IRQ_FIFO 35
+#define RP2350_I2C0_IRQ 36
+#define RP2350_I2C1_IRQ 37
 #define RP2350_OTP_IRQ 38
 #define RP2350_TRNG_IRQ 39
 #define RP2350_SPARE_IRQ_5 51
@@ -119,6 +133,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_TIMER0_BASE 0x400b0000
 #define RP2350_TIMER1_BASE 0x400b8000
 #define RP2350_UART1_BASE 0x40078000
+#define RP2350_SPI0_BASE 0x40080000
+#define RP2350_SPI1_BASE 0x40088000
+#define RP2350_I2C0_BASE 0x40090000
+#define RP2350_I2C1_BASE 0x40098000
 #define RP2350_PLL_SYS_BASE 0x40050000
 #define RP2350_PLL_USB_BASE 0x40058000
 #define RP2350_TICKS_BASE 0x40108000
@@ -132,6 +150,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_ROSC_BASE 0x400e8000
 #define RP2350_TRNG_BASE 0x400f0000
 #define RP2350_SHA256_BASE 0x400f8000
+#define RP2350_HSTX_CTRL_BASE 0x400c0000
+#define RP2350_HSTX_FIFO_BASE 0x50600000
+#define RP2350_USB_DPRAM_BASE 0x50100000
+#define RP2350_USB_DPRAM_SIZE (4 * KiB)
 #define RP2350_SIO_BASE 0xd0000000
 #define RP2350_SIO_NONSEC_BASE 0xd0020000
 
@@ -144,12 +166,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
  * pico-sdk switches it to.
  */
 #define RP2350_CLK_REF_HZ 12000000
+/* clk_adc, as pico-sdk sets it up from PLL_USB. */
+#define RP2350_CLK_ADC_HZ 48000000
+
+/* Device models and bus windows per RESETS subsystem. */
+#define RP2350_RESET_MAX_DEVICES 4
+#define RP2350_RESET_MAX_WINDOWS 2
+
+/* What a subsystem's bus window answers while the subsystem is in reset. */
+typedef struct RP2350ResetGate {
+    MemoryRegion mr;
+    const char *name;
+} RP2350ResetGate;
 
 struct RP2350State {
     SysBusDevice parent_obj;
 
     ARMv7MState armv7m[RP2350_NUM_CORES];
     RP2350EPPBState eppb[RP2350_NUM_CORES];
+    RP2350M33DebugState m33_debug[RP2350_NUM_CORES];
     RP2350AccessCtrlState accessctrl;
     Notifier accessctrl_notifier;
     RP2350ResetsState resets;
@@ -176,21 +211,36 @@ struct RP2350State {
     RP2350TRNGState trng;
     RP2350SHA256State sha256;
     RP2350PWMState pwm;
+    RP2350ADCState adc;
+    RP2350HSTXState hstx;
     RP2350TimerState timer[RP2350_NUM_TIMERS];
     PL011State uart[RP2350_NUM_UARTS];
+    PL022State spi[RP2350_NUM_SPIS];
+    /* Wires the chip selects of the SSI devices on the SPI buses. */
+    Notifier spi_cs_notifier;
+    DesignWareI2CState i2c[RP2350_NUM_I2C];
     RP2350CoreSightState coresight;
     RP2350CoreSightTraceState coresight_trace;
     RP2350OTPState otp;
     RP2350DMAState dma;
     /* The UARTs' register windows plus their atomic aliases. */
     MemoryRegion uart_alias[RP2350_NUM_UARTS];
+    /* The SPI controllers' register windows plus their atomic aliases. */
+    MemoryRegion spi_alias[RP2350_NUM_SPIS];
+    /* The I2C controllers' register windows plus their atomic aliases. */
+    MemoryRegion i2c_alias[RP2350_NUM_I2C];
     /* Core 0's SIO views as seen from system memory (debug, qtest). */
     MemoryRegion sio_sysmem[2];
     /* Core 0's EPPB as seen from system memory (debug, qtest). */
     MemoryRegion eppb_sysmem;
 
+    /* The device models of each RESETS subsystem, and its bus gates. */
+    DeviceState *reset_dev[RP2350_NUM_RESETS][RP2350_RESET_MAX_DEVICES];
+    RP2350ResetGate reset_gate[RP2350_NUM_RESETS][RP2350_RESET_MAX_WINDOWS];
+
     MemoryRegion rom;
     MemoryRegion sram;
+    MemoryRegion usb_dpram;
 
     MemoryRegion *board_memory;
 
@@ -201,6 +251,7 @@ struct RP2350State {
 
     Clock *sysclk;
     Clock *refclk;
+    Clock *adcclk;
 };
 
 /*
@@ -208,6 +259,18 @@ struct RP2350State {
  * code. Called after the core is reset when no boot ROM runs.
  */
 void rp2350_soc_boot_rom_handoff(RP2350State *s, int core);
+
+/*
+ * Make `dev` part of RESETS subsystem `reset` (an RP2350_RESET_* number):
+ * while the subsystem is in reset, `dev` is held in its Resettable reset,
+ * entering it when the subsystem's reset is asserted and leaving it when
+ * RESET_DONE sets. A device model must not operate while held: it starts
+ * timers and takes external input only once out of reset. Bus accesses to
+ * the subsystem's registers are answered by the SoC while it is in reset,
+ * whether or not it has a device model. Call before the SoC is realized
+ * or from its realize.
+ */
+void rp2350_soc_attach_reset(RP2350State *s, int reset, DeviceState *dev);
 
 /*
  * The input for IRQ `n` of core `core`. Every interrupt source reaches a
