@@ -140,6 +140,9 @@ static void gpio_sync(RP2350SIOState *s, bool force)
 {
     int bit;
 
+    /* GPIO_HI_OUT and GPIO_HI_OE bits 23:16 are reserved, read-only 0. */
+    s->gpio_out[1] &= 0xff00ffff;
+    s->gpio_oe[1] &= 0xff00ffff;
     for (bit = 0; bit < RP2350_SIO_GPIO_BITS; bit++) {
         int w = bit / 32;
         uint32_t m = 1u << (bit % 32);
