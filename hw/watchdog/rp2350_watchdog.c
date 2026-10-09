@@ -9,10 +9,13 @@
  * counts down once per tick of the TICKS block's WATCHDOG generator, which
  * divides clk_ref by its CYCLES setting. When the counter reaches zero, or
  * TRIGGER is written, the watchdog records why in REASON and requests a
- * reset, which the PSM carries out (see rp2350_psm.c). The watchdog itself
+ * reset, which the PSM carries out (see rp2350_psm.c) unless POWMAN.WDSEL
+ * makes it a chip-level reset (see rp2350_powman.c). The watchdog itself
  * is reset only by a chip-level reset (a QEMU system reset, or the power
- * manager's chip-reset input for a glitch detector trigger), so its
- * scratch registers and REASON survive the resets it requests.
+ * manager's chip-reset input for a glitch detector trigger or a
+ * watchdog RESET_PSM), so its scratch registers and REASON survive the
+ * PSM and RESETS resets it requests, and are lost, as on hardware, when
+ * it requests a chip-level reset.
  *
  * Firing also clears ENABLE: the block is not reset by its own reset, so
  * an enabled, expired counter would otherwise reset the chip again at the

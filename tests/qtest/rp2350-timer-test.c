@@ -30,10 +30,21 @@
 
 #define TICKS       0x40108000
 #define TICK_CTRL(n) (TICKS + (n) * 0xc)
+#define TICK_CYCLES(n) (TICKS + (n) * 0xc + 4)
 #define TICK_TIMER0 2
 #define TICK_TIMER1 3
 
 #define US          1000
+
+/*
+ * Start TICKS generator n at one tick every `cycles` cycles of the 12 MHz
+ * clk_ref; 12 gives the 1 us tick pico-sdk configures.
+ */
+static void tick_start(QTestState *qts, int n, uint32_t cycles)
+{
+    qtest_writel(qts, TICK_CYCLES(n), cycles);
+    qtest_writel(qts, TICK_CTRL(n), 1);
+}
 
 static char *rom_path;
 
@@ -57,7 +68,7 @@ static void test_counter(void)
     qtest_clock_step(qts, 1000 * US);
     g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWL), ==, 0);
 
-    qtest_writel(qts, TICK_CTRL(TICK_TIMER0), 1);
+    tick_start(qts, TICK_TIMER0, 12);
     qtest_clock_step(qts, 5 * US);
     g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWL), ==, 5);
     g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWH), ==, 0);
@@ -86,7 +97,7 @@ static void test_latching_and_writes(void)
 {
     QTestState *qts = start(false);
 
-    qtest_writel(qts, TICK_CTRL(TICK_TIMER0), 1);
+    tick_start(qts, TICK_TIMER0, 12);
     qtest_writel(qts, TIMER0 + TIMELW, 0xfffffffe);
     qtest_writel(qts, TIMER0 + TIMEHW, 0x7);
     g_assert_cmphex(qtest_readl(qts, TIMER0 + TIMERAWH), ==, 0x7);
@@ -115,7 +126,7 @@ static void test_alarm(void)
     QTestState *qts = start(true);
     uint32_t now;
 
-    qtest_writel(qts, TICK_CTRL(TICK_TIMER0), 1);
+    tick_start(qts, TICK_TIMER0, 12);
     qtest_clock_step(qts, 50 * US);
     now = qtest_readl(qts, TIMER0 + TIMERAWL);
 
@@ -161,7 +172,7 @@ static void test_alarm_overshoot(void)
      * Stepping well past the target in one go, as a busy host may run the
      * alarm callback late, still fires the alarm.
      */
-    qtest_writel(qts, TICK_CTRL(TICK_TIMER0), 1);
+    tick_start(qts, TICK_TIMER0, 12);
     qtest_writel(qts, TIMER0 + INTE, 1u << 3);
     qtest_writel(qts, TIMER0 + ALARM(3), 2000);
     qtest_clock_step(qts, 5000 * US);
@@ -176,7 +187,7 @@ static void test_timer1_alarm(void)
 {
     QTestState *qts = start(true);
 
-    qtest_writel(qts, TICK_CTRL(TICK_TIMER1), 1);
+    tick_start(qts, TICK_TIMER1, 12);
     qtest_writel(qts, TIMER1 + INTE, 1u << 0);
     qtest_writel(qts, TIMER1 + ALARM(0), 10);
     qtest_clock_step(qts, 10 * US);
@@ -185,6 +196,7 @@ static void test_timer1_alarm(void)
     qtest_quit(qts);
 }
 
+/* [spec:nuos:req:emu.timer/test] */
 static void test_sysclk_source(void)
 {
     QTestState *qts = start(false);
@@ -193,6 +205,116 @@ static void test_sysclk_source(void)
     qtest_writel(qts, TIMER0 + SOURCE, 1);
     qtest_clock_step(qts, 2 * US);
     g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWL), ==, 300);
+
+    /* Back on a tick of CYCLES 24 it counts every 2 us, from 300. */
+    tick_start(qts, TICK_TIMER0, 24);
+    qtest_writel(qts, TIMER0 + SOURCE, 0);
+    qtest_clock_step(qts, 10 * US);
+    g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWL), ==, 305);
+
+    /* clk_sys ignores the tick's CYCLES and its enable. */
+    qtest_writel(qts, TICK_CTRL(TICK_TIMER0), 0);
+    qtest_writel(qts, TIMER0 + SOURCE, 1);
+    qtest_clock_step(qts, 1 * US);
+    g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWL), ==, 455);
+    qtest_quit(qts);
+}
+
+/* [spec:nuos:req:emu.timer/test] */
+static void test_tick_cycles(void)
+{
+    QTestState *qts = start(false);
+
+    /* CYCLES resets to 0, which never completes a tick. */
+    qtest_writel(qts, TICK_CTRL(TICK_TIMER0), 1);
+    qtest_clock_step(qts, 100 * US);
+    g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWL), ==, 0);
+
+    /* 12 MHz / 24: a tick every 2 us. */
+    qtest_writel(qts, TICK_CYCLES(TICK_TIMER0), 24);
+    qtest_clock_step(qts, 10 * US);
+    g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWL), ==, 5);
+
+    /* 12 MHz / 6: a tick every 500 ns, carrying on from 5. */
+    qtest_writel(qts, TICK_CYCLES(TICK_TIMER0), 6);
+    qtest_clock_step(qts, 10 * US);
+    g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWL), ==, 25);
+
+    /* 12 MHz / 12: the 1 us tick. */
+    qtest_writel(qts, TICK_CYCLES(TICK_TIMER0), 12);
+    qtest_clock_step(qts, 10 * US);
+    g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWL), ==, 35);
+
+    /* Back to CYCLES 0: the generator stops, and the counter with it. */
+    qtest_writel(qts, TICK_CYCLES(TICK_TIMER0), 0);
+    qtest_clock_step(qts, 10 * US);
+    g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWL), ==, 35);
+    qtest_quit(qts);
+}
+
+/* [spec:nuos:req:emu.timer/test] */
+static void test_tick_fraction(void)
+{
+    QTestState *qts = start(false);
+    int i;
+
+    /*
+     * At CYCLES 7 a tick is 583.3 ns. Rewriting CYCLES with the same value
+     * every 300 ns keeps the rate, and must not lose the time already
+     * spent towards the next tick: 30 x 300 ns is 15.4 ticks.
+     */
+    tick_start(qts, TICK_TIMER0, 7);
+    for (i = 0; i < 30; i++) {
+        qtest_clock_step(qts, 300);
+        qtest_writel(qts, TICK_CYCLES(TICK_TIMER0), 7);
+    }
+    g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWL), ==, 15);
+    qtest_quit(qts);
+}
+
+/* [spec:nuos:req:emu.timer/test] */
+static void test_alarm_cycles(void)
+{
+    QTestState *qts = start(true);
+    uint32_t now;
+
+    /* At CYCLES 24 an alarm 100 counts ahead is 200 us away. */
+    tick_start(qts, TICK_TIMER0, 24);
+    qtest_clock_step(qts, 7 * US);
+    now = qtest_readl(qts, TIMER0 + TIMERAWL);
+    g_assert_cmpuint(now, ==, 3);
+    qtest_writel(qts, TIMER0 + INTE, 1u << 1);
+    qtest_writel(qts, TIMER0 + ALARM(1), now + 100);
+    qtest_clock_step(qts, 198 * US);
+    g_assert_false(qtest_get_irq(qts, 1));
+    qtest_clock_step(qts, 1 * US);
+    g_assert_true(qtest_get_irq(qts, 1));
+    g_assert_cmpuint(qtest_readl(qts, TIMER0 + TIMERAWL), ==, now + 100);
+    qtest_writel(qts, TIMER0 + INTR, 1u << 1);
+
+    /*
+     * Changing CYCLES while an alarm is armed reschedules it: 100 counts
+     * at CYCLES 6 is 50 us.
+     */
+    now = qtest_readl(qts, TIMER0 + TIMERAWL);
+    qtest_writel(qts, TIMER0 + ALARM(1), now + 100);
+    qtest_writel(qts, TICK_CYCLES(TICK_TIMER0), 6);
+    qtest_clock_step(qts, 49 * US);
+    g_assert_false(qtest_get_irq(qts, 1));
+    qtest_clock_step(qts, 1 * US);
+    g_assert_true(qtest_get_irq(qts, 1));
+    qtest_writel(qts, TIMER0 + INTR, 1u << 1);
+
+    /* A stopped generator holds an armed alarm until it restarts. */
+    now = qtest_readl(qts, TIMER0 + TIMERAWL);
+    qtest_writel(qts, TIMER0 + ALARM(1), now + 10);
+    qtest_writel(qts, TICK_CTRL(TICK_TIMER0), 0);
+    qtest_clock_step(qts, 100 * US);
+    g_assert_false(qtest_get_irq(qts, 1));
+    g_assert_cmphex(qtest_readl(qts, TIMER0 + ARMED), ==, 1u << 1);
+    qtest_writel(qts, TICK_CTRL(TICK_TIMER0), 1);
+    qtest_clock_step(qts, 5 * US);
+    g_assert_true(qtest_get_irq(qts, 1));
     qtest_quit(qts);
 }
 
@@ -215,6 +337,9 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/timer/alarm-overshoot", test_alarm_overshoot);
     qtest_add_func("/rp2350/timer/timer1-alarm", test_timer1_alarm);
     qtest_add_func("/rp2350/timer/sysclk-source", test_sysclk_source);
+    qtest_add_func("/rp2350/timer/tick-cycles", test_tick_cycles);
+    qtest_add_func("/rp2350/timer/tick-fraction", test_tick_fraction);
+    qtest_add_func("/rp2350/timer/alarm-cycles", test_alarm_cycles);
 
     ret = g_test_run();
     unlink(rom_path);

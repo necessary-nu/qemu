@@ -44,6 +44,7 @@
 #define SPI0_BASE   0x40080000
 
 #define TICK_TIMER0_CTRL 0x40108018
+#define TICK_TIMER0_CYCLES 0x4010801c
 
 #define SRAM_BASE   0x20000000
 #define XIP_BASE    0x10000000
@@ -179,6 +180,8 @@ static void test_timer_stops_in_reset(void)
     uint32_t now;
 
     qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");
+    /* A 1 us tick: twelve cycles of the 12 MHz clk_ref. */
+    qtest_writel(qts, TICK_TIMER0_CYCLES, 12);
     qtest_writel(qts, TICK_TIMER0_CTRL, 1);
 
     /* A timer in reset does not count. */

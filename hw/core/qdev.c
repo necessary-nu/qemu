@@ -258,7 +258,9 @@ static void device_reset_child_foreach(Object *obj, ResettableChildCallback cb,
     BusState *bus;
 
     QLIST_FOREACH(bus, &dev->child_bus, sibling) {
-        cb(OBJECT(bus), opaque, type);
+        if (!bus->reset_domain) {
+            cb(OBJECT(bus), opaque, type);
+        }
     }
 }
 
