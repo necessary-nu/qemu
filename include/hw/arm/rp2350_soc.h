@@ -15,6 +15,8 @@
 #include "hw/core/clock.h"
 #include "hw/misc/rp2350_bootram.h"
 #include "hw/misc/rp2350_clocks.h"
+#include "hw/misc/rp2350_coresight.h"
+#include "hw/misc/rp2350_coresight_trace.h"
 #include "hw/misc/rp2350_dcp.h"
 #include "hw/misc/rp2350_rcp.h"
 #include "hw/misc/rp2350_resets.h"
@@ -84,6 +86,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_PLL_SYS_BASE 0x40050000
 #define RP2350_PLL_USB_BASE 0x40058000
 #define RP2350_TICKS_BASE 0x40108000
+#define RP2350_CORESIGHT_PERIPH_BASE 0x40140000
+#define RP2350_CORESIGHT_TRACE_BASE 0x50700000
 #define RP2350_BOOTRAM_BASE 0x400e0000
 #define RP2350_SIO_BASE 0xd0000000
 #define RP2350_SIO_NONSEC_BASE 0xd0020000
@@ -108,6 +112,8 @@ struct RP2350State {
     RP2350ClkRegsState ticks;
     RP2350TimerState timer[RP2350_NUM_TIMERS];
     PL011State uart[RP2350_NUM_UARTS];
+    RP2350CoreSightState coresight;
+    RP2350CoreSightTraceState coresight_trace;
     /* The UARTs' register windows plus their atomic aliases. */
     MemoryRegion uart_alias[RP2350_NUM_UARTS];
     /* Core 0's SIO views as seen from system memory (debug, qtest). */
