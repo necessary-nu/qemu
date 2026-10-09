@@ -3300,6 +3300,7 @@ void v8m_security_lookup(CPUARMState *env, uint32_t address,
     }
 }
 
+/* [spec:nuos:req:emu.mpu] */
 static bool get_phys_addr_pmsav8(CPUARMState *env,
                                  S1Translate *ptw,
                                  uint32_t address,
@@ -3308,8 +3309,10 @@ static bool get_phys_addr_pmsav8(CPUARMState *env,
                                  ARMMMUFaultInfo *fi)
 {
     V8M_SAttributes sattrs = {};
+    V8M_SAttributes fetch_sattrs = {};
     ARMMMUIdx mmu_idx = ptw->in_mmu_idx;
     bool secure = arm_space_is_secure(ptw->in_space);
+    bool fetch_denied = false;
     bool ret;
 
     if (arm_feature(env, ARM_FEATURE_M_SECURITY)) {
@@ -3371,11 +3374,35 @@ static bool get_phys_addr_pmsav8(CPUARMState *env,
                 result->f.prot = 0;
                 return false;
             }
+
+            /*
+             * The TLB entry filled here also serves later instruction
+             * fetches from the page in this security state, which would
+             * then skip the fetch attribution check above. Look up the
+             * attribution a fetch would get (it differs from the data
+             * attribution for the 0xf0000000 region, for SAU-exempt
+             * ranges and for IDAU responses that depend on the access
+             * type) and grant execute permission only if such a fetch
+             * would pass. Otherwise a fetch misses on the entry and
+             * refills, taking the SecureFault (Secure code fetching
+             * Non-secure memory, INVTRAN) or the Non-secure fetch fault
+             * from Secure or Non-secure-callable memory, the latter
+             * including Secure Gateway handling.
+             */
+            v8m_security_lookup(env, address, MMU_INST_FETCH, mmu_idx,
+                                secure, &fetch_sattrs);
+            fetch_denied = fetch_sattrs.ns != !secure;
+            if (fetch_sattrs.subpage) {
+                sattrs.subpage = true;
+            }
         }
     }
 
     ret = pmsav8_mpu_lookup(env, address, access_type, ptw->in_prot_check,
                             mmu_idx, secure, result, fi, NULL);
+    if (fetch_denied) {
+        result->f.prot &= ~PAGE_EXEC;
+    }
     /*
      * For two-stage PMSA translations, s2prot holds the stage 2
      * permissions to be combined with stage 1 in get_phys_addr_twostage().
