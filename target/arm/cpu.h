@@ -986,6 +986,14 @@ struct ArchCPU {
     bool m_lockup_halts;
     bool m_locked_up;
 
+    /*
+     * The board has stopped this core's clock (for example while its
+     * oscillator is DORMANT). A clock-stopped core has no work: nothing,
+     * not even an interrupt, wakes it until the board restarts the clock.
+     * The board halts the core and owns this flag; reset leaves it alone.
+     */
+    bool clock_stopped;
+
     /* Coprocessor information */
     GHashTable *cp_regs;
     /* For marshalling (mostly coprocessor) register state between the
