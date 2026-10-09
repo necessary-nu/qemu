@@ -640,14 +640,23 @@ static void test_watchdog_resets(void)
     g_assert_cmphex(rd(qts, CHIP_RESET), ==, HAD_POR | DOUBLE_TAP);
     g_assert_cmphex(qtest_readl(qts, WD_REASON), ==, WD_REASON_FORCE);
 
-    /* RESET_PSM: the full PSM sequence; the watchdog keeps its state. */
+    /*
+     * RESET_PSM: the full PSM sequence. Like every chip-level reset it
+     * resets the watchdog, scratch and REASON included (datasheet table
+     * 560); the power manager and its scratch registers carry on.
+     */
+    wr(qts, TIMER, TIMER_RUN);
     wr(qts, WDSEL, WDSEL_RESET_PSM);
     watchdog_trigger(qts);
     g_assert_cmphex(rd(qts, CHIP_RESET), ==, HAD_WD_PSM | DOUBLE_TAP);
     g_assert_cmphex(qtest_readl(qts, PSM_WDSEL), ==, 0);
-    g_assert_cmphex(qtest_readl(qts, WD_REASON), ==, WD_REASON_FORCE);
-    g_assert_cmphex(qtest_readl(qts, WD_SCRATCH(1)), ==, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, WD_REASON), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, WD_SCRATCH(1)), ==, 0);
     g_assert_cmphex(rd(qts, SCRATCH(1)), ==, 0x600df00d);
+    g_assert_cmphex(rd(qts, BOOT(0)), ==, 0xb007c0d3);
+    g_assert_cmphex(rd(qts, WDSEL), ==, WDSEL_RESET_PSM);
+    g_assert_cmphex(rd(qts, TIMER) & TIMER_RUN, ==, TIMER_RUN);
+    qtest_writel(qts, WD_SCRATCH(1), 0x12345678);
 
     /* RESET_SWCORE: the watchdog is reset with the switched core. */
     wr(qts, TIMER, TIMER_RUN);
