@@ -12,6 +12,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 
 #define SIO         0xd0000000
 #define SIO_NS      0xd0020000
@@ -53,6 +54,7 @@ static QTestState *start(int intercept_core)
 {
     QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
 
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
     if (intercept_core >= 0) {
         g_autofree char *cpu = g_strdup_printf("/machine/soc/armv7m[%d]",
                                                intercept_core);

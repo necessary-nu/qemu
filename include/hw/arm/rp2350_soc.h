@@ -154,6 +154,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
  */
 #define RP2350_CLK_REF_HZ 12000000
 
+/* Device models and bus windows per RESETS subsystem. */
+#define RP2350_RESET_MAX_DEVICES 4
+#define RP2350_RESET_MAX_WINDOWS 2
+
+/* What a subsystem's bus window answers while the subsystem is in reset. */
+typedef struct RP2350ResetGate {
+    MemoryRegion mr;
+    const char *name;
+} RP2350ResetGate;
+
 struct RP2350State {
     SysBusDevice parent_obj;
 
@@ -204,6 +214,10 @@ struct RP2350State {
     /* Core 0's EPPB as seen from system memory (debug, qtest). */
     MemoryRegion eppb_sysmem;
 
+    /* The device models of each RESETS subsystem, and its bus gates. */
+    DeviceState *reset_dev[RP2350_NUM_RESETS][RP2350_RESET_MAX_DEVICES];
+    RP2350ResetGate reset_gate[RP2350_NUM_RESETS][RP2350_RESET_MAX_WINDOWS];
+
     MemoryRegion rom;
     MemoryRegion sram;
 
@@ -223,6 +237,18 @@ struct RP2350State {
  * code. Called after the core is reset when no boot ROM runs.
  */
 void rp2350_soc_boot_rom_handoff(RP2350State *s, int core);
+
+/*
+ * Make `dev` part of RESETS subsystem `reset` (an RP2350_RESET_* number):
+ * while the subsystem is in reset, `dev` is held in its Resettable reset,
+ * entering it when the subsystem's reset is asserted and leaving it when
+ * RESET_DONE sets. A device model must not operate while held: it starts
+ * timers and takes external input only once out of reset. Bus accesses to
+ * the subsystem's registers are answered by the SoC while it is in reset,
+ * whether or not it has a device model. Call before the SoC is realized
+ * or from its realize.
+ */
+void rp2350_soc_attach_reset(RP2350State *s, int reset, DeviceState *dev);
 
 /*
  * The input for IRQ `n` of core `core`. Every interrupt source reaches a

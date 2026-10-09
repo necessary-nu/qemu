@@ -10,6 +10,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 
 #define SYSINFO         0x40000000
 #define CHIP_ID         (SYSINFO + 0x00)
@@ -45,7 +46,10 @@ static char *rom_path;
 
 static QTestState *start(void)
 {
-    return qtest_initf("-M rp2350 -bios %s", rom_path);
+    QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
+
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
+    return qts;
 }
 
 /* [spec:nuos:req:emu.system-regs/test] */
@@ -129,6 +133,7 @@ static void test_syscfg(void)
 
     /* A system reset restores every reset value. */
     qtest_system_reset(qts);
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
     g_assert_cmphex(qtest_readl(qts, PROC_IN_SYNC_BYPASS), ==, 0);
     g_assert_cmphex(qtest_readl(qts, PROC_IN_SYNC_BYPASS_HI), ==, 0);
     g_assert_cmphex(qtest_readl(qts, DBGFORCE), ==, 0x6);
@@ -235,6 +240,7 @@ static void test_glitch_otp_armed(void)
     qts = qtest_initf("-M rp2350 -bios %s "
                       "-drive if=none,id=otp,format=raw,file=%s "
                       "-global rp2350-otp.drive=otp", rom_path, otp_path);
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
 
     /* Armed by OTP, DISARM's pattern disarms the detectors. */
     qtest_writel(qts, GD_DISARM, 0xdcaf);

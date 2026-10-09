@@ -9,6 +9,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 
 #define ROM_BASE 0x00000000
 #define XIP_BASE 0x10000000
@@ -80,6 +81,11 @@ static void test_memory_map(void)
     g_autofree char *path = NULL;
     QTestState *qts = boot_direct(&path);
     int i;
+
+    /* A subsystem in reset has its window answered for it. */
+    assert_mtree_has(qts, "0000000040000000-0000000040007fff "
+                          "(prio 1, i/o): rp2350.sysinfo-in-reset");
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
 
     assert_mtree_has(qts, "0000000000000000-0000000000007fff "
                           "(prio 0, rom): rp2350.rom");
