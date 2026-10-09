@@ -27,6 +27,7 @@
 #include "hw/misc/rp2350_eppb.h"
 #include "hw/misc/rp2350_m33_debug.h"
 #include "hw/misc/rp2350_hstx.h"
+#include "hw/misc/rp2350_pio.h"
 #include "hw/misc/rp2350_powman.h"
 #include "hw/misc/rp2350_psm.h"
 #include "hw/misc/rp2350_pwm.h"
@@ -69,6 +70,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_PWM_IRQ_WRAP_1 9
 #define RP2350_DMA_IRQ_0 10
 #define RP2350_USBCTRL_IRQ 14
+#define RP2350_PIO0_IRQ_0 15
 #define RP2350_IO_IRQ_BANK0 21
 #define RP2350_IO_IRQ_BANK0_NS 22
 #define RP2350_IO_IRQ_QSPI 23
@@ -237,6 +239,7 @@ struct RP2350State {
     RP2350ADCState adc;
     RP2350HSTXState hstx;
     RP2350USBCtrlState usbctrl;
+    RP2350PIOState pio;
     RP2350TimerState timer[RP2350_NUM_TIMERS];
     PL011State uart[RP2350_NUM_UARTS];
     PL022State spi[RP2350_NUM_SPIS];
