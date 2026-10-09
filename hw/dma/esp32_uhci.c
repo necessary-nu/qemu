@@ -33,6 +33,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/dma/esp32_uhci.h"
+#include "hw/dma/esp32_lldesc.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 
@@ -134,7 +135,6 @@
 #define LINK_START              (1u << 29)
 #define LINK_RESTART            (1u << 30)
 #define LINK_PARK               (1u << 31)
-#define LINK_DESC_BASE          0x3ff00000u
 
 /* CONF1 */
 #define CONF1_CHECK_OWNER       (1u << 6)
@@ -166,17 +166,6 @@
 #define PKT_THRES_RESET         0x80u
 #define DATE_RESET              0x16041001u
 #define AHB_TEST_MASK           0x37u
-
-/* Descriptor DW0 */
-#define DESC_SIZE(dw0)          ((dw0) & 0xfffu)
-#define DESC_LENGTH(dw0)        (((dw0) >> 12) & 0xfffu)
-#define DESC_LENGTH_SHIFT       12
-#define DESC_EOF                (1u << 30)
-#define DESC_OWNER              (1u << 31)
-
-/* SRAM the DMA engine can reach */
-#define DMA_RAM_START           0x3ffae000u
-#define DMA_RAM_END             0x40000000u
 
 /*
  * Out FIFO entries: the byte for the UART in bits 7:0 and the 9th bit of
@@ -274,12 +263,6 @@ static uint32_t uhci_uart_mask(Esp32UhciState *s)
     return mask;
 }
 
-static bool uhci_dma_range_ok(uint32_t addr, uint32_t len)
-{
-    return addr >= DMA_RAM_START && addr < DMA_RAM_END &&
-           len <= DMA_RAM_END - addr;
-}
-
 static bool uhci_ldl(Esp32UhciState *s, uint32_t addr, uint32_t *v)
 {
     MemTxResult r;
@@ -300,7 +283,7 @@ static void uhci_stl(Esp32UhciState *s, uint32_t addr, uint32_t v)
 static bool uhci_load_desc(Esp32UhciState *s, uint32_t addr, uint32_t *dw0,
                            uint32_t *buf, uint32_t *next, const char *dir)
 {
-    if ((addr & 3) || !uhci_dma_range_ok(addr, 12)) {
+    if ((addr & 3) || !esp32_dma_ram_contains(addr, 12)) {
         qemu_log_mask(LOG_GUEST_ERROR, "esp32_uhci: %slink descriptor at "
                       "0x%08x is not word-aligned DMA RAM\n", dir, addr);
         return false;
@@ -309,7 +292,7 @@ static bool uhci_load_desc(Esp32UhciState *s, uint32_t addr, uint32_t *dw0,
         !uhci_ldl(s, addr + 8, next)) {
         return false;
     }
-    if ((s->conf1 & CONF1_CHECK_OWNER) && !(*dw0 & DESC_OWNER)) {
+    if ((s->conf1 & CONF1_CHECK_OWNER) && !(*dw0 & ESP32_LLDESC_OWNER)) {
         qemu_log_mask(LOG_GUEST_ERROR, "esp32_uhci: %slink descriptor at "
                       "0x%08x is owned by the CPU\n", dir, addr);
         return false;
@@ -490,10 +473,10 @@ static void uhci_out_finish_desc(Esp32UhciState *s)
 {
     uint32_t addr = s->out_desc_addr;
     uint32_t dw0 = s->out_desc_dw0;
-    bool eof = dw0 & DESC_EOF;
+    bool eof = dw0 & ESP32_LLDESC_EOF;
 
     if (s->conf0 & CONF0_OUT_AUTO_WRBACK) {
-        uhci_stl(s, addr, dw0 & ~DESC_OWNER);
+        uhci_stl(s, addr, dw0 & ~ESP32_LLDESC_OWNER);
     }
     uhci_raise(s, INT_OUT_DONE);
     s->out_have_desc = false;
@@ -541,9 +524,9 @@ static bool uhci_out_desc_step(Esp32UhciState *s)
         uint32_t dw0, buf, next;
 
         if (!uhci_load_desc(s, addr, &dw0, &buf, &next, "out") ||
-            (DESC_LENGTH(dw0) &&
-             !uhci_dma_range_ok(buf, DESC_LENGTH(dw0)))) {
-            if (uhci_dma_range_ok(addr, 12)) {
+            (ESP32_LLDESC_LENGTH(dw0) &&
+             !esp32_dma_ram_contains(buf, ESP32_LLDESC_LENGTH(dw0)))) {
+            if (esp32_dma_ram_contains(addr, 12)) {
                 qemu_log_mask(LOG_GUEST_ERROR, "esp32_uhci: outlink "
                               "descriptor at 0x%08x is invalid\n", addr);
             }
@@ -560,9 +543,9 @@ static bool uhci_out_desc_step(Esp32UhciState *s)
         s->out_have_desc = true;
     }
 
-    length = DESC_LENGTH(s->out_desc_dw0);
+    length = ESP32_LLDESC_LENGTH(s->out_desc_dw0);
     if (seper && !s->out_in_frame &&
-        (s->out_pos < length || (s->out_desc_dw0 & DESC_EOF))) {
+        (s->out_pos < length || (s->out_desc_dw0 & ESP32_LLDESC_EOF))) {
         if (fifo_free(&s->out_fifo) < 1) {
             return false;
         }
@@ -584,7 +567,7 @@ static bool uhci_out_desc_step(Esp32UhciState *s)
         s->out_empty_run = 0;
         return true;
     }
-    if ((s->out_desc_dw0 & DESC_EOF) && seper) {
+    if ((s->out_desc_dw0 & ESP32_LLDESC_EOF) && seper) {
         if (fifo_free(&s->out_fifo) < 1) {
             return false;
         }
@@ -831,12 +814,12 @@ static void uhci_in_shift_dscr(Esp32UhciState *s, uint32_t addr)
 /* Hand the descriptor back with in_len bytes, and go on to the next. */
 static void uhci_in_complete(Esp32UhciState *s, bool eof)
 {
-    uint32_t dw0 = s->in_desc_dw0 & ~(DESC_OWNER | DESC_EOF |
-                                      (0xfffu << DESC_LENGTH_SHIFT));
+    uint32_t dw0 = s->in_desc_dw0 & ~(ESP32_LLDESC_OWNER | ESP32_LLDESC_EOF |
+                                      (0xfffu << ESP32_LLDESC_LENGTH_SHIFT));
 
-    dw0 |= s->in_len << DESC_LENGTH_SHIFT;
+    dw0 |= s->in_len << ESP32_LLDESC_LENGTH_SHIFT;
     if (eof) {
-        dw0 |= DESC_EOF;
+        dw0 |= ESP32_LLDESC_EOF;
     }
     uhci_stl(s, s->in_desc_addr, dw0);
     uhci_raise(s, INT_IN_DONE);
@@ -864,9 +847,9 @@ static bool uhci_in_load(Esp32UhciState *s)
         return false;
     }
     if (!uhci_load_desc(s, addr, &dw0, &buf, &next, "in") ||
-        DESC_SIZE(dw0) == 0 || (buf & 3) ||
-        !uhci_dma_range_ok(buf, DESC_SIZE(dw0))) {
-        if (uhci_dma_range_ok(addr, 12)) {
+        ESP32_LLDESC_SIZE(dw0) == 0 || (buf & 3) ||
+        !esp32_dma_ram_contains(buf, ESP32_LLDESC_SIZE(dw0))) {
+        if (esp32_dma_ram_contains(addr, 12)) {
             qemu_log_mask(LOG_GUEST_ERROR, "esp32_uhci: inlink descriptor "
                           "at 0x%08x is invalid: its buffer must be a "
                           "non-empty, word-aligned block of DMA RAM\n", addr);
@@ -900,7 +883,7 @@ static bool uhci_in_store(Esp32UhciState *s, uint16_t e)
         }
         return true;
     }
-    if (s->in_have_desc && s->in_len == DESC_SIZE(s->in_desc_dw0)) {
+    if (s->in_have_desc && s->in_len == ESP32_LLDESC_SIZE(s->in_desc_dw0)) {
         uhci_in_complete(s, false);
     }
     if (!s->in_have_desc && !uhci_in_load(s)) {
@@ -1052,7 +1035,7 @@ static void uhci_link_write(Esp32UhciState *s, bool out, uint32_t value)
 {
     uint32_t *reg = out ? &s->dma_out_link : &s->dma_in_link;
     uint32_t keep = out ? LINK_ADDR_MASK : LINK_ADDR_MASK | IN_LINK_AUTO_RET;
-    uint32_t first = LINK_DESC_BASE | (value & LINK_ADDR_MASK);
+    uint32_t first = ESP32_DMA_LINK_BASE | (value & LINK_ADDR_MASK);
 
     /* STOP, START and RESTART act when written as 1 and read as 0. */
     *reg = value & keep;

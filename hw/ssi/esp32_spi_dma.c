@@ -39,17 +39,9 @@
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "hw/ssi/esp32_spi_dma.h"
+#include "hw/dma/esp32_lldesc.h"
 #include "hw/misc/esp32_reg.h"
 #include "hw/misc/esp32_dport.h"
-
-#define DMA_WINDOW_BASE     0x3ff00000u
-#define DMA_RAM_START       0x3ffae000u
-#define DMA_RAM_END         0x40000000u
-
-#define DW0_SIZE(w)         ((w) & 0xfff)
-#define DW0_LENGTH(w)       (((w) >> 12) & 0xfff)
-#define DW0_EOF             (1u << 30)
-#define DW0_OWNER           (1u << 31)
 
 /* Writable bits of SPI_DMA_CONF: 2..12 and 14..16 */
 #define DMA_CONF_MASK       0x0001dffcu
@@ -108,12 +100,6 @@ static bool esp32_spi_dma_running(Esp32SpiDmaState *s)
     return clock_is_enabled(s->clk) && esp32_spi_dma_channel(s) != 0;
 }
 
-static bool esp32_spi_dma_in_ram(uint32_t addr, uint32_t len)
-{
-    return addr >= DMA_RAM_START && addr < DMA_RAM_END &&
-           len <= DMA_RAM_END - addr;
-}
-
 static bool esp32_spi_dma_read_word(uint32_t addr, uint32_t *val)
 {
     return address_space_read(&address_space_memory, addr,
@@ -162,7 +148,7 @@ static bool esp32_spi_dma_load(Esp32SpiDmaState *s, bool out, uint32_t addr)
     l->active = false;
     l->dscr = addr;
     l->pos = 0;
-    if ((addr & 3) || !esp32_spi_dma_in_ram(addr, 12) ||
+    if ((addr & 3) || !esp32_dma_ram_contains(addr, 12) ||
         !esp32_spi_dma_read_word(addr, &w[0]) ||
         !esp32_spi_dma_read_word(addr + 4, &w[1]) ||
         !esp32_spi_dma_read_word(addr + 8, &w[2])) {
@@ -179,21 +165,21 @@ static bool esp32_spi_dma_load(Esp32SpiDmaState *s, bool out, uint32_t addr)
     l->next = le32_to_cpu(w[2]);
     esp32_spi_dma_show(s, out);
 
-    if (!(l->dw0 & DW0_OWNER)) {
+    if (!(l->dw0 & ESP32_LLDESC_OWNER)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "esp32_spi_dma: SPI%u %s descriptor at 0x%08x is "
                       "owned by the CPU\n", s->host, dir, addr);
         esp32_spi_dma_raise(s, err);
         return false;
     }
-    n = out ? DW0_LENGTH(l->dw0) : DW0_SIZE(l->dw0);
+    n = out ? ESP32_LLDESC_LENGTH(l->dw0) : ESP32_LLDESC_SIZE(l->dw0);
     if (l->buf & 3) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "esp32_spi_dma: SPI%u %s buffer 0x%08x is not "
                       "word-aligned\n", s->host, dir, l->buf);
         l->buf &= ~3u;
     }
-    if (n && !esp32_spi_dma_in_ram(l->buf, n)) {
+    if (n && !esp32_dma_ram_contains(l->buf, n)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "esp32_spi_dma: SPI%u %s buffer 0x%08x+%u is outside "
                       "DMA-capable SRAM\n", s->host, dir, l->buf, n);
@@ -218,14 +204,14 @@ static void esp32_spi_dma_out_settle(Esp32SpiDmaState *s)
     for (int i = 0; i < MAX_EMPTY_DSCRS; i++) {
         uint32_t ints = R_SPI_DMA_INT_OUT_DONE_MASK;
 
-        if (!l->active || l->pos < DW0_LENGTH(l->dw0)) {
+        if (!l->active || l->pos < ESP32_LLDESC_LENGTH(l->dw0)) {
             return;
         }
         if (s->conf & R_SPI_DMA_CONF_OUT_AUTO_WRBACK_MASK) {
-            l->dw0 &= ~DW0_OWNER;
+            l->dw0 &= ~ESP32_LLDESC_OWNER;
             esp32_spi_dma_write_word(l->dscr, l->dw0);
         }
-        if (l->dw0 & DW0_EOF) {
+        if (l->dw0 & ESP32_LLDESC_EOF) {
             s->out_eof_des_addr = l->dscr;
             s->out_eof_bfr_des_addr = l->buf;
             ints |= R_SPI_DMA_INT_OUT_EOF_MASK;
@@ -258,7 +244,8 @@ static void esp32_spi_dma_in_complete(Esp32SpiDmaState *s, bool eof)
     Esp32SpiDmaLink *l = &s->in;
     uint32_t ints = R_SPI_DMA_INT_IN_DONE_MASK;
 
-    l->dw0 = (l->dw0 & 0x3f000fffu) | (l->pos << 12) | (eof ? DW0_EOF : 0);
+    l->dw0 = (l->dw0 & 0x3f000fffu) | (l->pos << 12) |
+             (eof ? ESP32_LLDESC_EOF : 0);
     esp32_spi_dma_write_word(l->dscr, l->dw0);
     if (eof) {
         s->in_suc_eof_des_addr = l->dscr;
@@ -313,7 +300,7 @@ static void esp32_spi_dma_link_ctrl(Esp32SpiDmaState *s, bool out,
         return;
     }
     if (start) {
-        esp32_spi_dma_load(s, out, DMA_WINDOW_BASE |
+        esp32_spi_dma_load(s, out, ESP32_DMA_LINK_BASE |
                            (val & R_SPI_DMA_OUT_LINK_ADDR_MASK));
     } else if (!l->active) {
         if (l->dscr == 0 || !esp32_spi_dma_read_word(l->dscr + 8, &next)) {
@@ -388,7 +375,7 @@ void esp32_spi_dma_push(Esp32SpiDmaState *s, uint8_t byte)
                       s->host);
         return;
     }
-    while (l->pos >= DW0_SIZE(l->dw0)) {
+    while (l->pos >= ESP32_LLDESC_SIZE(l->dw0)) {
         if (++empty > MAX_EMPTY_DSCRS) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "esp32_spi_dma: SPI%u inlink loops through empty "

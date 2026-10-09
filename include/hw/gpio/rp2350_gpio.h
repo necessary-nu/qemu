@@ -318,6 +318,17 @@ void rp2350_gpio_connect_in(RP2350GPIOState *s, RP2350GPIOPort port, int n,
                             qemu_irq irq);
 
 /*
+ * The digital level pin `p` is driven to: by the chip's own output driver
+ * (with the pad's output enabled), else from outside through "pad-in";
+ * -1 when neither drives it. An analogue input (ADC) on the pin reads 0 V
+ * or IOVDD when it is driven.
+ */
+int rp2350_gpio_pin_drive(RP2350GPIOState *s, int p);
+
+/* Whether pin `p`'s digital input buffer is enabled (pad IE). */
+bool rp2350_gpio_pin_input_enabled(RP2350GPIOState *s, int p);
+
+/*
  * Set the ACCESSCTRL GPIO_NSMASK1:0 pair (SIO layout). A pin whose bit is
  * set is Non-secure accessible: its interrupts go to the _NS outputs and
  * Non-secure code may access its IO and pad registers; Non-secure accesses

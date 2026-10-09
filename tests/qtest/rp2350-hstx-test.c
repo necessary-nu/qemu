@@ -12,6 +12,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 #include "qobject/qdict.h"
 #include "qobject/qlist.h"
 #include "qobject/qnum.h"
@@ -71,8 +72,11 @@ static int64_t vnow;
 
 static QTestState *start(void)
 {
-    vnow = 0;
-    return qtest_initf("-M rp2350 -bios %s", rom_path);
+    QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
+
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
+    vnow = RP2350_RESETS_RELEASE_NS;
+    return qts;
 }
 
 static void step(QTestState *qts, int64_t ns)
@@ -513,9 +517,10 @@ static void test_tmds_repeat(void)
     int len, i;
 
     /* No periodic refresh: each step below is run in one go. */
-    vnow = 0;
     qts = qtest_initf("-M rp2350 -bios %s "
                       "-global rp2350-hstx.pin-refresh-ns=0", rom_path);
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
+    vnow = RP2350_RESETS_RELEASE_NS;
 
     /* Rotate the expansion register by 8 each output: four pixels. */
     qtest_writel(qts, EXPAND_TMDS, TMDS_RGB888);

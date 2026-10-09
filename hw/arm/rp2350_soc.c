@@ -746,6 +746,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
     clock_set_hz(s->sysclk, RP2350_SYSCLK_HZ);
     clock_set_hz(s->refclk, RP2350_REFCLK_HZ);
+    clock_set_hz(s->adcclk, RP2350_CLK_ADC_HZ);
 
     /*
      * The bus filters stand between each core and board memory, so every
@@ -1093,6 +1094,21 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
 
     /*
+     * ADC. Its external inputs share GPIO 26-29's pads; the DREQ_ADC
+     * output is connected with the DMA's other sources.
+     */
+    /* [spec:nuos:req:emu.adc] */
+    object_property_set_link(OBJECT(&s->adc), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
+    qdev_connect_clock_in(DEVICE(&s->adc), "clk", s->adcclk);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->adc), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->adc), 0, RP2350_ADC_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->adc), 0,
+                       qdev_get_gpio_in(dev_soc, RP2350_ADC_IRQ_FIFO));
+
+    /*
      * HSTX, clocked by clk_hstx. Clock frequencies are not modelled: at
      * reset CLK_HSTX_CTRL selects clk_sys undivided, which pico-sdk keeps,
      * so clk_hstx is clk_sys. Its eight outputs drive the HSTX function
@@ -1357,6 +1373,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->coresight_trace), 0,
             qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
                                    RP2350_DREQ_CORESIGHT));
+        qdev_connect_gpio_out_named(DEVICE(&s->adc), RP2350_ADC_DREQ, 0,
+            qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_ADC));
         qdev_connect_gpio_out_named(DEVICE(&s->sha256), RP2350_SHA256_DREQ, 0,
             qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_SHA256));
         qdev_connect_gpio_out_named(DEVICE(&s->hstx), RP2350_HSTX_DREQ, 0,
@@ -1375,6 +1393,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             int reset;
             void *dev;
         } devices[] = {
+            { RP2350_RESET_ADC, &s->adc },
             { RP2350_RESET_BUSCTRL, &s->busctrl },
             { RP2350_RESET_DMA, &s->dma },
             { RP2350_RESET_PLL_SYS, &s->pll_sys },
@@ -1462,6 +1481,7 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "trng", &s->trng, TYPE_RP2350_TRNG);
     object_initialize_child(obj, "sha256", &s->sha256, TYPE_RP2350_SHA256);
     object_initialize_child(obj, "pwm", &s->pwm, TYPE_RP2350_PWM);
+    object_initialize_child(obj, "adc", &s->adc, TYPE_RP2350_ADC);
     object_initialize_child(obj, "hstx", &s->hstx, TYPE_RP2350_HSTX);
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
         object_initialize_child(obj, "timer[*]", &s->timer[i],
@@ -1487,6 +1507,7 @@ static void rp2350_soc_init(Object *obj)
 
     s->sysclk = qdev_init_clock_out(DEVICE(s), "sysclk");
     s->refclk = qdev_init_clock_out(DEVICE(s), "refclk");
+    s->adcclk = clock_new(obj, "adcclk");
 }
 
 static const Property rp2350_soc_properties[] = {
