@@ -83,6 +83,8 @@ typedef struct Esp32DportState {
     uint32_t wifi_clk_en;
     uint32_t core_rst_en;
 
+    /* DPORT_SPI_DMA_CHAN_SEL_REG: the DMA channel of SPI1, SPI2 and SPI3 */
+    uint32_t spi_dma_chan_sel;
 } Esp32DportState;
 
 void esp32_dport_clear_ill_trap_state(Esp32DportState* s);
@@ -228,6 +230,10 @@ REG32(DPORT_CACHE_IA_INT_EN, 0x5A0)
     FIELD(DPORT_CACHE_IA_INT_EN, IA_INT_APP_IRAM0, 1, 1)
     FIELD(DPORT_CACHE_IA_INT_EN, IA_INT_APP_DROM0, 0, 1)
 
+REG32(DPORT_SPI_DMA_CHAN_SEL, 0x5A8)
+    FIELD(DPORT_SPI_DMA_CHAN_SEL, SPI1, 0, 2)
+    FIELD(DPORT_SPI_DMA_CHAN_SEL, SPI2, 2, 2)
+    FIELD(DPORT_SPI_DMA_CHAN_SEL, SPI3, 4, 2)
 
 #define ESP32_DPORT_PRO_INTMATRIX_BASE    A_DPORT_PRO_MAC_INTR_MAP
 #define ESP32_DPORT_APP_INTMATRIX_BASE    A_DPORT_APP_MAC_INTR_MAP

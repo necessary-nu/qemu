@@ -187,6 +187,9 @@ static void esp32_soc_reset(DeviceState *dev)
         for (int i = 0; i < ESP32_SPI_COUNT; ++i) {
             device_cold_reset(DEVICE(&s->spi[i]));
         }
+        for (int i = 0; i < ESP32_SPI_DMA_COUNT; ++i) {
+            device_cold_reset(DEVICE(&s->spi_dma[i]));
+        }
         for (int i = 0; i < ESP32_I2C_COUNT; i++) {
             device_cold_reset(DEVICE(&s->i2c[i]));
         }
@@ -450,9 +453,10 @@ static const MemoryRegionOps esp32_gate_ops = {
 /*
  * Map a register block of a gated peripheral at addr, and, like the other
  * APB peripherals, at its alias in the 0x60000000 window if apb_alias.
+ * A block with a higher priority covers part of another's.
  */
 static void esp32_gate_map(Esp32PeriphGate *g, MemoryRegion *dev_mr,
-                           hwaddr addr, bool apb_alias)
+                           hwaddr addr, bool apb_alias, int priority)
 {
     MemoryRegion *sys_mem = get_system_memory();
     Esp32GateWindow *w;
@@ -471,7 +475,7 @@ static void esp32_gate_map(Esp32PeriphGate *g, MemoryRegion *dev_mr,
      */
     memory_region_init_io(&w->iomem, NULL, &esp32_gate_ops, w,
                           name, memory_region_size(dev_mr));
-    memory_region_add_subregion_overlap(sys_mem, addr, &w->iomem, 0);
+    memory_region_add_subregion_overlap(sys_mem, addr, &w->iomem, priority);
     if (apb_alias) {
         MemoryRegion *alias = g_new(MemoryRegion, 1);
         char *alias_name = g_strdup_printf("mr-apb-0x%08x", (uint32_t)addr);
@@ -480,7 +484,7 @@ static void esp32_gate_map(Esp32PeriphGate *g, MemoryRegion *dev_mr,
                                  &w->iomem, 0, memory_region_size(dev_mr));
         memory_region_add_subregion_overlap(sys_mem,
                                             addr - DR_REG_DPORT_APB_BASE +
-                                            APB_REG_BASE, alias, 0);
+                                            APB_REG_BASE, alias, priority);
         g_free(alias_name);
     }
     g_free(name);
@@ -506,7 +510,7 @@ static Esp32PeriphGate *esp32_soc_add_gated_device(Esp32SocState *s,
     g->clk_mask = clk_mask;
     g->rst_mask = rst_mask;
     esp32_gate_map(g, sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0), addr,
-                   true);
+                   true, 0);
     return g;
 }
 
@@ -777,6 +781,11 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
             R_DPORT_PERIP_SPI01_MASK, R_DPORT_PERIP_SPI01_MASK,
             R_DPORT_PERIP_SPI2_MASK, R_DPORT_PERIP_SPI3_MASK
         };
+        if (i > 0) {
+            object_property_set_link(OBJECT(&s->spi[i]), "dma",
+                                     OBJECT(&s->spi_dma[i - 1]),
+                                     &error_abort);
+        }
         qdev_realize(DEVICE(&s->spi[i]), &s->periph_bus, &error_fatal);
 
         esp32_soc_add_gated_device(s, &s->spi[i], spi_base[i],
@@ -784,6 +793,40 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi[i]), 0,
                            qdev_get_gpio_in(intmatrix_dev, ETS_SPI0_INTR_SOURCE + i));
+    }
+
+    /*
+     * [spec:nuos:req:emu.esp32.spi-dma]
+     * The DMA registers of SPI1..SPI3 cover 0x100..0x14c of the
+     * controller's block. They belong to the SPI DMA engine, behind the
+     * SPI_DMA clock and reset bits, which gate and reset all three.
+     */
+    for (int i = 0; i < ESP32_SPI_DMA_COUNT; ++i) {
+        const hwaddr spi_base[] = {
+            DR_REG_SPI1_BASE, DR_REG_SPI2_BASE, DR_REG_SPI3_BASE
+        };
+        Esp32PeriphGate *g;
+
+        qdev_prop_set_uint8(DEVICE(&s->spi_dma[i]), "host", i + 1);
+        object_property_set_link(OBJECT(&s->spi_dma[i]), "dport",
+                                 OBJECT(&s->dport), &error_abort);
+        qdev_realize(DEVICE(&s->spi_dma[i]), &s->periph_bus, &error_fatal);
+
+        assert(s->n_gates < ESP32_GATE_MAX);
+        g = &s->gate[s->n_gates++];
+        g->dev = DEVICE(&s->spi_dma[i]);
+        g->regs = ESP32_GATE_PERIP;
+        g->clk_mask = R_DPORT_PERIP_SPI_DMA_MASK;
+        g->rst_mask = R_DPORT_PERIP_SPI_DMA_MASK;
+        g->apb_clk = s->spi_dma_clk[i];
+        esp32_gate_map(g,
+                       sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->spi_dma[i]),
+                                              0),
+                       spi_base[i] + ESP32_SPI_DMA_REG_OFFSET, true, 1);
+
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi_dma[i]), 0,
+                           qdev_get_gpio_in(intmatrix_dev,
+                                            ETS_SPI1_DMA_INTR_SOURCE + i));
     }
 
     for (int i = 0; i < ESP32_I2C_COUNT; i++) {
@@ -962,6 +1005,15 @@ static void esp32_soc_init(Object *obj)
         object_initialize_child(obj, name, &s->spi[i], TYPE_ESP32_SPI);
     }
 
+    for (int i = 0; i < ESP32_SPI_DMA_COUNT; ++i) {
+        snprintf(name, sizeof(name), "spi%d-dma", i + 1);
+        object_initialize_child(obj, name, &s->spi_dma[i], TYPE_ESP32_SPI_DMA);
+        snprintf(name, sizeof(name), "spi%d-dma-apb", i + 1);
+        s->spi_dma_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(DEVICE(&s->spi_dma[i]), "apb",
+                              s->spi_dma_clk[i]);
+    }
+
     for (int i = 0; i < ESP32_I2C_COUNT; ++i) {
         snprintf(name, sizeof(name), "i2c%d", i);
         object_initialize_child(obj, name, &s->i2c[i], TYPE_ESP32_I2C);
@@ -1121,8 +1173,8 @@ static void esp32_machine_init_openeth(Esp32SocState *ss)
     g->regs = ESP32_GATE_WIFI;
     g->clk_mask = R_DPORT_WIFI_CLK_EN_EMAC_MASK;
     g->rst_mask = R_DPORT_CORE_RST_EN_EMAC_MASK;
-    esp32_gate_map(g, sysbus_mmio_get_region(sbd, 0), reg_base, false);
-    esp32_gate_map(g, sysbus_mmio_get_region(sbd, 1), desc_base, false);
+    esp32_gate_map(g, sysbus_mmio_get_region(sbd, 0), reg_base, false, 0);
+    esp32_gate_map(g, sysbus_mmio_get_region(sbd, 1), desc_base, false, 0);
 }
 
 static void esp32_machine_init_sd(Esp32SocState *ss)

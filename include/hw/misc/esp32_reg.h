@@ -142,6 +142,8 @@
 #define ESP32_FRC_COUNT             2
 #define ESP32_TIMG_COUNT            2
 #define ESP32_SPI_COUNT             4
+/* SPI1, SPI2 and SPI3 have DMA; SPI0 does not */
+#define ESP32_SPI_DMA_COUNT         3
 #define ESP32_I2C_COUNT             2
 #define ESP32_RTC_CNTL_SCRATCH_REG_COUNT     8
 

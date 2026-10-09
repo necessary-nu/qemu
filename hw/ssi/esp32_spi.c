@@ -148,6 +148,12 @@ typedef struct Esp32SpiTransaction {
     int data_tx_bytes;
     int data_rx_bytes;
     uint32_t* data;
+    /* Size of the buffer data points to, in bytes */
+    int data_size;
+    /* MOSI and MISO shift together (SPI_DOUTDIN), not one after the other */
+    bool full_duplex;
+    /* A user-defined command, whose data phases can use the DMA engine */
+    bool usr;
 } Esp32SpiTransaction;
 
 static void esp32_spi_txrx_buffer(Esp32SpiState *s, void *buf, int tx_bytes, int rx_bytes)
@@ -156,12 +162,60 @@ static void esp32_spi_txrx_buffer(Esp32SpiState *s, void *buf, int tx_bytes, int
     uint8_t *c_buf = (uint8_t*) buf;
     for (int i = 0; i < bytes; ++i) {
         uint8_t byte = 0;
-        if (byte < tx_bytes) {
-            memcpy(&byte, c_buf + i, 1);
+        if (i < tx_bytes) {
+            byte = c_buf[i];
         }
         uint32_t res = ssi_transfer(s->spi, byte);
-        if (byte < rx_bytes) {
-            memcpy(c_buf + i, &res, 1);
+        if (i < rx_bytes) {
+            c_buf[i] = res;
+        }
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.spi-dma]
+ * The data phase of a transaction. MOSI bytes come from the outlink while
+ * the DMA engine's TX is enabled, else from the CPU buffer; MISO bytes go
+ * to the inlink while its RX is enabled, else to the CPU buffer. In full
+ * duplex both shift together; in half duplex the MOSI phase precedes the
+ * MISO phase.
+ */
+static void esp32_spi_data_phase(Esp32SpiState *s, Esp32SpiTransaction *t)
+{
+    uint8_t *buf = (uint8_t *)t->data;
+    bool tx_dma = t->usr && s->dma && t->data_tx_bytes > 0 &&
+                  esp32_spi_dma_tx_enabled(s->dma);
+    bool rx_dma = t->usr && s->dma && t->data_rx_bytes > 0 &&
+                  esp32_spi_dma_rx_enabled(s->dma);
+    int bytes = t->full_duplex ? MAX(t->data_tx_bytes, t->data_rx_bytes)
+                               : t->data_tx_bytes + t->data_rx_bytes;
+
+    if ((!tx_dma && t->data_tx_bytes > t->data_size) ||
+        (!rx_dma && t->data_rx_bytes > t->data_size)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "esp32_spi: data phase longer than the %d-byte buffer\n",
+                      t->data_size);
+    }
+    for (int i = 0; i < bytes; ++i) {
+        int tx_i = i;
+        int rx_i = t->full_duplex ? i : i - t->data_tx_bytes;
+        uint8_t out = 0;
+        uint8_t in;
+
+        if (tx_i < t->data_tx_bytes) {
+            if (tx_dma) {
+                out = esp32_spi_dma_pop(s->dma);
+            } else if (tx_i < t->data_size) {
+                out = buf[tx_i];
+            }
+        }
+        in = ssi_transfer(s->spi, out);
+        if (rx_i >= 0 && rx_i < t->data_rx_bytes) {
+            if (rx_dma) {
+                esp32_spi_dma_push(s->dma, in);
+            } else if (rx_i < t->data_size) {
+                buf[rx_i] = in;
+            }
         }
     }
 }
@@ -178,8 +232,11 @@ static void esp32_spi_transaction(Esp32SpiState *s, Esp32SpiTransaction *t)
     esp32_spi_cs_set(s, 0);
     esp32_spi_txrx_buffer(s, &t->cmd, t->cmd_bytes, 0);
     esp32_spi_txrx_buffer(s, &t->addr, t->addr_bytes, 0);
-    esp32_spi_txrx_buffer(s, t->data, t->data_tx_bytes, t->data_rx_bytes);
+    esp32_spi_data_phase(s, t);
     esp32_spi_cs_set(s, 1);
+    if (t->usr && s->dma) {
+        esp32_spi_dma_trans_done(s->dma);
+    }
 }
 
 /* Convert one of the hardware "bitlen" registers to a byte count */
@@ -199,7 +256,8 @@ static void maybe_encrypt_data(Esp32SpiState *s)
 static void esp32_spi_do_command(Esp32SpiState* s, uint32_t cmd_reg)
 {
     Esp32SpiTransaction t = {
-        .cmd_bytes = 1
+        .cmd_bytes = 1,
+        .data_size = sizeof(s->data_reg),
     };
     switch (cmd_reg) {
     case R_SPI_CMD_READ_MASK:
@@ -227,12 +285,14 @@ static void esp32_spi_do_command(Esp32SpiState* s, uint32_t cmd_reg)
     case R_SPI_CMD_RDSR_MASK:
         t.cmd = CMD_RDSR;
         t.data = &s->status_reg;
+        t.data_size = sizeof(s->status_reg);
         t.data_rx_bytes = 1;
         break;
 
     case R_SPI_CMD_WRSR_MASK:
         t.cmd = CMD_WRSR;
         t.data = &s->status_reg;
+        t.data_size = sizeof(s->status_reg);
         t.data_tx_bytes = 1;
         break;
 
@@ -274,6 +334,8 @@ static void esp32_spi_do_command(Esp32SpiState* s, uint32_t cmd_reg)
 
     case R_SPI_CMD_USR_MASK:
         maybe_encrypt_data(s);
+        t.usr = true;
+        t.full_duplex = FIELD_EX32(s->user_reg, SPI_USER, DOUTDIN);
         if (FIELD_EX32(s->user_reg, SPI_USER, COMMAND) || FIELD_EX32(s->user2_reg, SPI_USER2, COMMAND_BITLEN)) {
             t.cmd = FIELD_EX32(s->user2_reg, SPI_USER2, COMMAND_VALUE);
             t.cmd_bytes = bitlen_to_bytes(FIELD_EX32(s->user2_reg, SPI_USER2, COMMAND_BITLEN));
@@ -335,6 +397,11 @@ static void esp32_spi_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(s), &s->cs_gpio[0], SSI_GPIO_CS, ESP32_SPI_CS_COUNT);
 }
 
+static const Property esp32_spi_properties[] = {
+    DEFINE_PROP_LINK("dma", Esp32SpiState, dma, TYPE_ESP32_SPI_DMA,
+                     Esp32SpiDmaState *),
+};
+
 static void esp32_spi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -342,6 +409,7 @@ static void esp32_spi_class_init(ObjectClass *klass, const void *data)
 
     rc->phases.hold = esp32_spi_reset_hold;
     dc->realize = esp32_spi_realize;
+    device_class_set_props(dc, esp32_spi_properties);
 }
 
 static const TypeInfo esp32_spi_info = {

@@ -90,6 +90,7 @@ struct Esp32SocState {
     Esp32FrcTimerState frc_timer[ESP32_FRC_COUNT];
     Esp32TimgState timg[ESP32_TIMG_COUNT];
     Esp32SpiState spi[ESP32_SPI_COUNT];
+    Esp32SpiDmaState spi_dma[ESP32_SPI_DMA_COUNT];
     Esp32I2CState i2c[ESP32_I2C_COUNT];
     Esp32ShaState sha;
     Esp32AesState aes;
@@ -117,6 +118,7 @@ struct Esp32SocState {
     Clock *uart_ref_tick_clk[ESP32_UART_COUNT];
     Clock *frc_apb_clk[ESP32_FRC_COUNT];
     Clock *timg_apb_clk[ESP32_TIMG_COUNT];
+    Clock *spi_dma_clk[ESP32_SPI_DMA_COUNT];
 
     Esp32PeriphGate gate[ESP32_GATE_MAX];
     unsigned n_gates;
