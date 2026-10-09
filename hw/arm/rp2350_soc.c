@@ -394,6 +394,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             { SYS_BUS_DEVICE(&s->pll_usb), RP2350_PLL_USB_BASE },
             { SYS_BUS_DEVICE(&s->ticks), RP2350_TICKS_BASE },
             { SYS_BUS_DEVICE(&s->bootram), RP2350_BOOTRAM_BASE },
+            { SYS_BUS_DEVICE(&s->rosc), RP2350_ROSC_BASE },
         };
 
         for (i = 0; i < ARRAY_SIZE(blocks); i++) {
@@ -426,6 +427,15 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             sysbus_connect_irq(sbd, n, qdev_get_gpio_in(dev_soc, irq[i] + n));
         }
     }
+
+    /* [spec:nuos:req:emu.rosc-trng] */
+    qdev_prop_set_uint32(DEVICE(&s->trng), "sysclk-hz", RP2350_SYSCLK_HZ);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->trng), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->trng), 0, RP2350_TRNG_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->trng), 0,
+                       qdev_get_gpio_in(dev_soc, RP2350_TRNG_IRQ));
 
     /* [spec:nuos:req:emu.uart] */
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
@@ -476,6 +486,8 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "pll_sys", &s->pll_sys, TYPE_RP2350_PLL);
     object_initialize_child(obj, "pll_usb", &s->pll_usb, TYPE_RP2350_PLL);
     object_initialize_child(obj, "ticks", &s->ticks, TYPE_RP2350_TICKS);
+    object_initialize_child(obj, "rosc", &s->rosc, TYPE_RP2350_ROSC);
+    object_initialize_child(obj, "trng", &s->trng, TYPE_RP2350_TRNG);
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
         object_initialize_child(obj, "timer[*]", &s->timer[i],
                                 TYPE_RP2350_TIMER);

@@ -134,6 +134,12 @@ config RP2350_BOOTRAM
 config RP2350_DCP
     bool
 
+config RP2350_ROSC
+    bool
+
+config RP2350_TRNG
+    bool
+
 config STM32L4X5_SYSCFG
     bool
 

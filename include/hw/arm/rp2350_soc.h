@@ -18,7 +18,9 @@
 #include "hw/misc/rp2350_dcp.h"
 #include "hw/misc/rp2350_rcp.h"
 #include "hw/misc/rp2350_resets.h"
+#include "hw/misc/rp2350_rosc.h"
 #include "hw/misc/rp2350_sio.h"
+#include "hw/misc/rp2350_trng.h"
 #include "hw/misc/unimp.h"
 #include "hw/timer/rp2350_timer.h"
 #include "qom/object.h"
@@ -49,6 +51,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_CLOCKS_IRQ 30
 #define RP2350_UART0_IRQ 33
 #define RP2350_UART1_IRQ 34
+#define RP2350_TRNG_IRQ 39
 #define RP2350_SPARE_IRQ_5 51
 
 #define RP2350_ROM_BASE 0x00000000
@@ -85,6 +88,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_PLL_USB_BASE 0x40058000
 #define RP2350_TICKS_BASE 0x40108000
 #define RP2350_BOOTRAM_BASE 0x400e0000
+#define RP2350_ROSC_BASE 0x400e8000
+#define RP2350_TRNG_BASE 0x400f0000
 #define RP2350_SIO_BASE 0xd0000000
 #define RP2350_SIO_NONSEC_BASE 0xd0020000
 
@@ -106,6 +111,8 @@ struct RP2350State {
     RP2350ClkRegsState pll_sys;
     RP2350ClkRegsState pll_usb;
     RP2350ClkRegsState ticks;
+    RP2350ROSCState rosc;
+    RP2350TRNGState trng;
     RP2350TimerState timer[RP2350_NUM_TIMERS];
     PL011State uart[RP2350_NUM_UARTS];
     /* The UARTs' register windows plus their atomic aliases. */
