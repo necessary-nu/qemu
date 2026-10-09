@@ -76,6 +76,11 @@ DeviceState *pl011_create(hwaddr addr, qemu_irq irq, Chardev *chr)
 #define INT_E (INT_OE | INT_BE | INT_PE | INT_FE)
 #define INT_MS (INT_RI | INT_DSR | INT_DCD | INT_CTS)
 
+/* DMA Control Register, UARTDMACR */
+#define DMACR_RXDMAE    (1 << 0)
+#define DMACR_TXDMAE    (1 << 1)
+#define DMACR_DMAONERR  (1 << 2)
+
 /* Line Control Register, UARTLCR_H */
 #define LCR_FEN     (1 << 4)
 #define LCR_BRK     (1 << 0)
@@ -129,6 +134,23 @@ static const uint32_t irqmask[] = {
     INT_E,
 };
 
+/*
+ * The single-transfer DMA requests. Characters are transmitted as soon as
+ * they are written, so the transmit FIFO always has room; the receive
+ * request follows the receive FIFO. DMAONERR masks the receive request
+ * while an error interrupt is pending.
+ */
+static void pl011_update_dma(PL011State *s)
+{
+    bool en = s->cr & CR_UARTEN;
+    bool rx_err = (s->dmacr & DMACR_DMAONERR) && (s->int_level & INT_E);
+
+    qemu_set_irq(s->dma_req[PL011_DMA_TX], en && (s->dmacr & DMACR_TXDMAE));
+    qemu_set_irq(s->dma_req[PL011_DMA_RX],
+                 en && (s->dmacr & DMACR_RXDMAE) && s->read_count > 0 &&
+                 !rx_err);
+}
+
 static void pl011_update(PL011State *s)
 {
     uint32_t flags;
@@ -139,6 +161,7 @@ static void pl011_update(PL011State *s)
     for (i = 0; i < ARRAY_SIZE(s->irq); i++) {
         qemu_set_irq(s->irq[i], (flags & irqmask[i]) != 0);
     }
+    pl011_update_dma(s);
 }
 
 static bool pl011_loopback_enabled(PL011State *s)
@@ -192,8 +215,8 @@ static void pl011_fifo_rx_put(void *opaque, uint32_t value)
     }
     if (s->read_count == s->read_trigger) {
         s->int_level |= INT_RX;
-        pl011_update(s);
     }
+    pl011_update(s);
 }
 
 static void pl011_loopback_tx(PL011State *s, uint32_t value)
@@ -473,6 +496,7 @@ static void pl011_write(void *opaque, hwaddr offset,
         }
         s->lcr = value;
         pl011_set_read_trigger(s);
+        pl011_update_dma(s);
         break;
     case 12: /* UARTCR */
         /* ??? Need to implement the enable bit.  */
@@ -482,6 +506,7 @@ static void pl011_write(void *opaque, hwaddr offset,
         }
         s->cr = value;
         pl011_loopback_mdmctrl(s);
+        pl011_update_dma(s);
         break;
     case 13: /* UARTIFS */
         s->ifl = value;
@@ -497,9 +522,11 @@ static void pl011_write(void *opaque, hwaddr offset,
         break;
     case 18: /* UARTDMACR */
         s->dmacr = value;
-        if (value & 3) {
-            qemu_log_mask(LOG_UNIMP, "pl011: DMA not implemented\n");
+        if ((value & (DMACR_RXDMAE | DMACR_TXDMAE)) &&
+            !s->dma_req[PL011_DMA_TX] && !s->dma_req[PL011_DMA_RX]) {
+            qemu_log_mask(LOG_UNIMP, "pl011: DMA not connected\n");
         }
+        pl011_update_dma(s);
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -657,6 +684,8 @@ static void pl011_init(Object *obj)
     for (i = 0; i < ARRAY_SIZE(s->irq); i++) {
         sysbus_init_irq(sbd, &s->irq[i]);
     }
+    qdev_init_gpio_out_named(DEVICE(obj), s->dma_req, PL011_DMA_REQ,
+                             ARRAY_SIZE(s->dma_req));
 
     s->clk = qdev_init_clock_in(DEVICE(obj), "clk", pl011_clock_update, s,
                                 ClockUpdate);
@@ -708,6 +737,7 @@ static void pl011_reset(DeviceState *dev)
     s->logged_disabled_uart = false;
     pl011_reset_rx_fifo(s);
     pl011_reset_tx_fifo(s);
+    pl011_update_dma(s);
 }
 
 static void pl011_class_init(ObjectClass *oc, const void *data)
