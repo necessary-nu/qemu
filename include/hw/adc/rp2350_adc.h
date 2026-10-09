@@ -104,6 +104,12 @@ struct RP2350ADCState {
      */
     uint64_t pace_base;
     uint64_t idle_since;
+    /*
+     * Set while the block is run forward: register accesses the DMA makes
+     * from the DREQ change of a completing conversion see the block as of
+     * that conversion, and do not run it further.
+     */
+    bool syncing;
 
     /*
      * Channels whose misuse (digital input enabled, temperature sensor

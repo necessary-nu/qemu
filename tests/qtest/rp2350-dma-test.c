@@ -572,6 +572,39 @@ static void test_dreq_credits(void)
     qtest_quit(qts);
 }
 
+/*
+ * A rising DREQ edge is answered within the call that raises it, before
+ * virtual time moves on, so that a peripheral run forward over a span of
+ * time is serviced at each DREQ in it. A level held high asks for more
+ * transfers, made in virtual time.
+ */
+/* [spec:nuos:req:emu.dma/test] */
+static void test_dreq_in_place(void)
+{
+    QTestState *qts = start();
+    const char *dma = "/machine/soc/dma";
+    int i;
+
+    for (i = 0; i < 10; i++) {
+        qtest_writel(qts, SRC + 4 * i, 0x1000 + i);
+    }
+    setup(qts, 0, SRC, DST, 10);
+    qtest_writel(qts, CH(0) + CTRL_TRIG, EN | SIZE_WORD | INCR_READ |
+                 INCR_WRITE | CHAIN_TO(0) | TREQ(TREQ_PWM_WRAP0));
+    settle(qts);
+    qtest_set_irq_in(qts, dma, "dreq", TREQ_PWM_WRAP0, 1);
+    g_assert_cmphex(qtest_readl(qts, CH(0) + TRANS_COUNT), ==, 9);
+    g_assert_cmphex(qtest_readl(qts, DST), ==, 0x1000);
+    g_assert_cmphex(qtest_readl(qts, DBG_CTDREQ(0)), ==, 0);
+    settle(qts);
+    g_assert_cmphex(qtest_readl(qts, CH(0) + TRANS_COUNT), ==, 0);
+    for (i = 0; i < 10; i++) {
+        g_assert_cmphex(qtest_readl(qts, DST + 4 * i), ==, 0x1000 + i);
+    }
+    qtest_set_irq_in(qts, dma, "dreq", TREQ_PWM_WRAP0, 0);
+    qtest_quit(qts);
+}
+
 /* [spec:nuos:req:emu.dma/test] */
 static void test_uart_dreq(void)
 {
@@ -857,6 +890,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/dma/sniff", test_sniff);
     qtest_add_func("/rp2350/dma/pacing", test_pacing_timer);
     qtest_add_func("/rp2350/dma/dreq", test_dreq_credits);
+    qtest_add_func("/rp2350/dma/dreq-in-place", test_dreq_in_place);
     qtest_add_func("/rp2350/dma/uart-dreq", test_uart_dreq);
     qtest_add_func("/rp2350/dma/xip-stream-dreq", test_xip_stream_dreq);
     qtest_add_func("/rp2350/dma/bus-errors", test_bus_errors);

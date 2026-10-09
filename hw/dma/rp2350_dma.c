@@ -11,13 +11,23 @@
  * Timing: the DMA issues at most one transfer (a read and its paired
  * write) per clk_sys cycle, round-robin over the requesting channels with
  * high-priority channels first. The model keeps a cycle count, `cycle`,
- * up to which the engine has run, and runs the engine from a timer in
- * virtual time: each run issues the transfers of every cycle between the
- * last run and now, then arms the timer for when there will be more work.
- * Transfers therefore complete at the virtual time they would complete on
- * hardware, give or take the batching. Transfers are never issued from
- * inside a register access or a DREQ change: those only bring the idle
- * engine (and the pacing timers) up to date, and kick the timer.
+ * up to which the engine has run. Each run of the engine issues the
+ * transfers of every cycle between the last run and now; then, while a
+ * channel paced by a DREQ requests, it goes on issuing transfers in the
+ * cycles after now, one a cycle, so that a DREQ is answered when it is
+ * raised rather than when a timer next fires. The engine runs:
+ *
+ *  - from inside a DREQ change, unless the change comes from a vCPU or a
+ *    transfer would reach a device in the middle of a register access,
+ *    so that a peripheral running itself forward over a span of time sees
+ *    its FIFO serviced at each DREQ in that span, as on hardware;
+ *  - from a bottom half when a DREQ change cannot be answered in place,
+ *    and after a register write leaves a DREQ-paced channel requesting;
+ *  - from a timer in virtual time, armed for when there is more work, for
+ *    the permanent request, the pacing timers and DREQs held high.
+ *
+ * A register access never issues a transfer itself: it only brings the
+ * idle engine (and the pacing timers) up to date.
  *
  * Each transfer completes before the next is issued, so the bus pipeline
  * is never observable: FIFO_LEVELS reads zero, BUSY falls as the last
@@ -26,10 +36,13 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
+#include "qemu/main-loop.h"
+#include "qemu/rcu.h"
 #include "qemu/bswap.h"
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
+#include "hw/core/cpu.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/dma/rp2350_dma.h"
@@ -141,9 +154,22 @@ static const uint8_t alias_layout[4][4] = {
 /*
  * The most cycles the engine looks ahead when arming its timer while
  * channels are transferring: an upper bound on how stale the registers
- * can be while the engine is busy.
+ * can be while the engine is busy. It also bounds how far one run of the
+ * engine goes past now for the DREQs.
  */
 #define ENGINE_QUANTUM      1500
+
+typedef enum EngineMode {
+    /*
+     * Bring the pacing timers and an idle engine up to date, stopping at
+     * the first cycle in which a transfer or completion is due.
+     */
+    ENGINE_SYNC,
+    /* Issue transfers, from the timer or the bottom half. */
+    ENGINE_ISSUE,
+    /* Issue transfers from inside a DREQ change. */
+    ENGINE_SERVICE,
+} EngineMode;
 
 static unsigned access_level(MemTxAttrs attrs)
 {
@@ -382,8 +408,22 @@ static bool ch_requests(RP2350DMAState *s, int n)
     if (treq == TREQ_PERMANENT || c->dreq_credit) {
         return true;
     }
-    return treq < RP2350_DMA_NUM_DREQ && (s->dreq_level >> treq & 1) &&
-           dreq_visible(s, n, treq);
+    return treq < RP2350_DMA_NUM_DREQ && !s->edges_only &&
+           (s->dreq_level >> treq & 1) && dreq_visible(s, n, treq);
+}
+
+/* The channels paced by a peripheral's DREQ. */
+static uint32_t dreq_paced(RP2350DMAState *s)
+{
+    uint32_t mask = 0;
+    int n;
+
+    for (n = 0; n < RP2350_DMA_CHANNELS; n++) {
+        if (ctrl_treq(s->ch[n].ctrl) < RP2350_DMA_NUM_DREQ) {
+            mask |= 1u << n;
+        }
+    }
+    return mask;
 }
 
 static uint32_t requesting(RP2350DMAState *s)
@@ -790,28 +830,76 @@ static int arbitrate(RP2350DMAState *s, uint32_t req)
     return n;
 }
 
+/* Whether the memory core would refuse an access to `mr` as re-entrant. */
+static bool region_in_access(MemoryRegion *mr)
+{
+    return mr->dev && !mr->disable_reentrancy_guard && !mr->ram &&
+           !mr->ram_device && !mr->rom_device && !mr->readonly &&
+           mr->dev->mem_reentrancy_guard.engaged_in_io;
+}
+
 /*
- * Run the engine up to now. With `issue` clear, stop at the first cycle
- * in which a transfer or completion is due: that brings the pacing timers
- * and an idle engine up to date without touching the bus.
+ * Whether an access to `addr` would reach a device that is in the middle
+ * of a register access: one of a DREQ change's callers, which the memory
+ * core refuses to re-enter. An ACCESSCTRL gate in front of the device is
+ * looked through.
+ */
+static bool target_in_access(RP2350DMAState *s, uint32_t addr)
+{
+    MemoryRegion *mr;
+    hwaddr xlat, len = 1;
+
+    RCU_READ_LOCK_GUARD();
+    mr = address_space_translate(&s->as, addr, &xlat, &len, false,
+                                 MEMTXATTRS_UNSPECIFIED);
+    if (region_in_access(mr)) {
+        return true;
+    }
+    if (s->accessctrl && mr->owner == OBJECT(s->accessctrl)) {
+        len = 1;
+        mr = address_space_translate(&s->accessctrl->bus_as, addr, &xlat,
+                                     &len, false, MEMTXATTRS_UNSPECIFIED);
+        return region_in_access(mr);
+    }
+    return false;
+}
+
+static bool ch_targets_free(RP2350DMAState *s, int n)
+{
+    return !target_in_access(s, s->ch[n].read_addr) &&
+           !target_in_access(s, s->ch[n].write_addr);
+}
+
+/*
+ * Run the engine up to now and, outside ENGINE_SYNC, past now while a
+ * DREQ-paced channel requests, by at most ENGINE_QUANTUM cycles. Returns
+ * false if an ENGINE_SERVICE run stopped short of a transfer that would
+ * re-enter a device in the middle of a register access.
  */
 /* [spec:nuos:req:emu.dma] */
-static void engine_run(RP2350DMAState *s, bool issue)
+static bool engine_run(RP2350DMAState *s, EngineMode mode)
 {
     uint64_t target = now_cycle(s);
+    uint64_t limit = MAX(s->cycle, target) + ENGINE_QUANTUM;
+    bool done = true;
 
     if (s->running) {
-        return;
+        return true;
     }
     s->running = true;
-    while (s->cycle < target) {
-        uint32_t req;
+    for (;;) {
+        bool ahead = s->cycle >= target;
+        uint32_t req, hp_served, rr_high, rr_low;
         int n;
 
+        if (ahead && (mode == ENGINE_SYNC || s->cycle >= limit)) {
+            break;
+        }
         if (s->zero_pending) {
             uint32_t pending = s->zero_pending;
 
-            if (!issue) {
+            if (mode == ENGINE_SYNC ||
+                (ahead && !(requesting(s) & dreq_paced(s)))) {
                 break;
             }
             /*
@@ -830,6 +918,9 @@ static void engine_run(RP2350DMAState *s, bool issue)
         }
 
         req = requesting(s);
+        if (ahead && !(req & dreq_paced(s))) {
+            break;
+        }
         if (!req) {
             uint64_t step = MIN(target - s->cycle, cycles_to_pacing(s));
 
@@ -837,11 +928,22 @@ static void engine_run(RP2350DMAState *s, bool issue)
             s->cycle += step;
             continue;
         }
-        if (!issue) {
+        if (mode == ENGINE_SYNC) {
+            break;
+        }
+        hp_served = s->hp_served;
+        rr_high = s->rr_high;
+        rr_low = s->rr_low;
+        n = arbitrate(s, req);
+        if (mode == ENGINE_SERVICE && !ch_targets_free(s, n)) {
+            /* The bottom half takes over from this very arbitration. */
+            s->hp_served = hp_served;
+            s->rr_high = rr_high;
+            s->rr_low = rr_low;
+            done = false;
             break;
         }
         advance_pacing(s, 1);
-        n = arbitrate(s, req);
         if (s->ch[n].dreq_credit) {
             s->ch[n].dreq_credit--;
         }
@@ -850,6 +952,7 @@ static void engine_run(RP2350DMAState *s, bool issue)
     }
     s->running = false;
     update_irq(s);
+    return done;
 }
 
 /* Arm the engine's timer for the next cycle with work to do. */
@@ -898,34 +1001,53 @@ static void engine_kick(RP2350DMAState *s)
     timer_mod(s->timer, cycle_ns(s, s->cycle + wait));
 }
 
-static void engine_timer(void *opaque)
+/* The engine's timer and bottom half. */
+static void engine_wake(void *opaque)
 {
     RP2350DMAState *s = opaque;
 
-    engine_run(s, true);
+    engine_run(s, ENGINE_ISSUE);
     engine_kick(s);
 }
 
 /*
  * A DREQ input. A rising edge is a credit for each channel that paces on
- * it and can see it; a level held high requests further transfers.
+ * it and can see it, answered at once: in place, unless a vCPU is making
+ * a register access or a transfer would re-enter a device in the middle
+ * of one, else from the bottom half. A level held high requests further
+ * transfers, which the engine's timer issues. Answering in place, the
+ * engine heeds credits only: the source may yet lower this line, as a
+ * pulse does, and it and other sources may be part way through updating
+ * their lines, when their levels are not yet to be trusted.
  */
 /* [spec:nuos:req:emu.dma] */
 static void dreq_set(void *opaque, int dreq, int level)
 {
     RP2350DMAState *s = opaque;
-    bool old = s->dreq_level >> dreq & 1;
+    bool rising = level && !(s->dreq_level >> dreq & 1);
     int n;
 
-    engine_run(s, false);
+    engine_run(s, ENGINE_SYNC);
     s->dreq_level = deposit64(s->dreq_level, dreq, 1, level != 0);
-    if (level && !old) {
+    if (rising) {
         for (n = 0; n < RP2350_DMA_CHANNELS; n++) {
             if (ctrl_treq(s->ch[n].ctrl) == dreq &&
                 dreq_visible(s, n, dreq)) {
                 add_credit(&s->ch[n], 1);
             }
         }
+    }
+    if (s->running) {
+        /* The engine's own transfer changed a DREQ: it sees the change. */
+        return;
+    }
+    if (rising) {
+        s->edges_only = true;
+        if ((requesting(s) & dreq_paced(s)) &&
+            (current_cpu || !engine_run(s, ENGINE_SERVICE))) {
+            qemu_bh_schedule(s->bh);
+        }
+        s->edges_only = false;
     }
     engine_kick(s);
 }
@@ -1327,7 +1449,7 @@ static MemTxResult rp2350_dma_read(void *opaque, hwaddr addr, uint64_t *data,
     uint32_t v;
     MemTxResult r;
 
-    engine_run(s, false);
+    engine_run(s, ENGINE_SYNC);
     r = reg_read(s, rp2350_atomic_reg(addr & ~3), access_level(attrs), &v,
                  "read");
     *data = extract32(v, (addr & 3) * 8, size * 8);
@@ -1347,9 +1469,13 @@ static MemTxResult rp2350_dma_write(void *opaque, hwaddr addr, uint64_t value,
     } else if (size == 2) {
         v = (v & 0xffff) * 0x00010001u;
     }
-    engine_run(s, false);
+    engine_run(s, ENGINE_SYNC);
     r = reg_write(s, addr & ~3, v, access_level(attrs));
     update_irq(s);
+    /* A trigger, say, may leave a DREQ-paced channel requesting. */
+    if (requesting(s) & dreq_paced(s)) {
+        qemu_bh_schedule(s->bh);
+    }
     engine_kick(s);
     return r;
 }
@@ -1393,6 +1519,7 @@ static void rp2350_dma_reset_hold(Object *obj, ResetType type)
     int n;
 
     timer_del(s->timer);
+    qemu_bh_cancel(s->bh);
     for (n = 0; n < RP2350_DMA_CHANNELS; n++) {
         s->ch[n] = (RP2350DMAChannel) {
             .seccfg = SECCFG_S | SECCFG_P,
@@ -1470,12 +1597,19 @@ static void rp2350_dma_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion_overlap(&s->port, CORE_LOCAL_BASE,
                                         &s->port_hole, 1);
     address_space_init(&s->as, &s->port, "rp2350-dma");
-    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, engine_timer, s);
+    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, engine_wake, s);
+    s->bh = qemu_bh_new_guarded(engine_wake, s,
+                                &DEVICE(s)->mem_reentrancy_guard);
 }
 
 static int rp2350_dma_post_load(void *opaque, int version_id)
 {
-    engine_kick(opaque);
+    RP2350DMAState *s = opaque;
+
+    if (requesting(s) & dreq_paced(s)) {
+        qemu_bh_schedule(s->bh);
+    }
+    engine_kick(s);
     return 0;
 }
 

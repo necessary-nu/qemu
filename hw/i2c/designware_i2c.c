@@ -280,7 +280,7 @@ static uint32_t dw_raw_intr(DesignWareI2CState *s)
 static void dw_i2c_update(DesignWareI2CState *s)
 {
     bool ic_en = dw_ic_en(s);
-    bool hold, tx_req, rx_req;
+    bool hold;
 
     if (s->ic_en && !ic_en) {
         s->raw_intr &= ~(INTR_TX_OVER | INTR_RX_OVER | INTR_RX_UNDER |
@@ -291,11 +291,16 @@ static void dw_i2c_update(DesignWareI2CState *s)
 
     qemu_set_irq(s->irq, !!(dw_raw_intr(s) & s->intr_mask));
 
-    tx_req = (s->dma_cr & DMA_CR_TDMAE) && (s->enable & ENABLE_ENABLE) &&
-             tx_count(s) <= s->dma_tdlr;
-    rx_req = (s->dma_cr & DMA_CR_RDMAE) && rx_count(s) >= s->dma_rdlr + 1;
-    qemu_set_irq(s->dma_tx_req, tx_req);
-    qemu_set_irq(s->dma_rx_req, rx_req);
+    /*
+     * A DMA controller may answer a request from within qemu_set_irq(),
+     * moving data through the FIFOs: each request is worked out from the
+     * FIFOs as the one before it left them.
+     */
+    qemu_set_irq(s->dma_tx_req,
+                 (s->dma_cr & DMA_CR_TDMAE) && (s->enable & ENABLE_ENABLE) &&
+                 tx_count(s) <= s->dma_tdlr);
+    qemu_set_irq(s->dma_rx_req,
+                 (s->dma_cr & DMA_CR_RDMAE) && rx_count(s) >= s->dma_rdlr + 1);
 
     /*
      * The controller holds SCL low between commands and while the RX

@@ -320,29 +320,39 @@ static uint64_t adc_next_start(RP2350ADCState *s)
                                              s->pace_base)));
 }
 
-/* Run the ADC up to clk_adc cycle `now`. */
+/*
+ * Run the ADC up to clk_adc cycle `now`. The FIFO's interrupt and DREQ
+ * follow each completed conversion, so a DMA channel paced by the DREQ
+ * drains the FIFO between conversions however far the block is run.
+ */
 /* [spec:nuos:req:emu.adc] */
 static void adc_sync(RP2350ADCState *s, uint64_t now)
 {
+    if (s->syncing) {
+        return;
+    }
+    s->syncing = true;
     for (;;) {
         if (s->busy) {
             if (s->conv_end > now) {
-                return;
+                break;
             }
             adc_complete(s);
+            adc_update(s);
         } else {
             uint64_t start;
 
             if (!adc_free_running(s)) {
-                return;
+                break;
             }
             start = adc_next_start(s);
             if (start > now) {
-                return;
+                break;
             }
             adc_start(s, start);
         }
     }
+    s->syncing = false;
 }
 
 static void adc_schedule(RP2350ADCState *s)
