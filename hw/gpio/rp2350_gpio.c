@@ -438,6 +438,7 @@ static void rp2350_gpio_propagate(RP2350GPIOState *s, bool force)
 {
     uint8_t in[RP2350_GPIO_SIGNALS] = {};
     uint8_t to_peri[RP2350_GPIO_PINS];
+    bool pad_changed[RP2350_GPIO_PINS];
     int p, i, port;
 
     for (p = 0; p < RP2350_GPIO_PINS; p++) {
@@ -462,6 +463,7 @@ static void rp2350_gpio_propagate(RP2350GPIOState *s, bool force)
         }
         c = s->latch[p];
         level = pad_level(s, p, c);
+        pad_changed[p] = force || level != s->pad_level[p];
         s->pad_level[p] = level;
 
         s->in_from_pad[p] = (c & LATCH_IE) ? level : 0;
@@ -493,6 +495,11 @@ static void rp2350_gpio_propagate(RP2350GPIOState *s, bool force)
         if (force || in[i] != s->peri_in[i]) {
             s->peri_in[i] = in[i];
             qemu_set_irq(s->peri_in_irq[i], in[i]);
+        }
+    }
+    for (p = 0; p < RP2350_GPIO_PINS; p++) {
+        if (pad_changed[p]) {
+            qemu_set_irq(s->pad_out[p], s->pad_level[p]);
         }
     }
 
@@ -1056,6 +1063,8 @@ static void rp2350_gpio_init(Object *obj)
 
     qdev_init_gpio_in_named(dev, rp2350_gpio_set_pad_in, RP2350_GPIO_PAD_IN,
                             RP2350_GPIO_PINS);
+    qdev_init_gpio_out_named(dev, s->pad_out, RP2350_GPIO_PAD_OUT,
+                             RP2350_GPIO_PINS);
     memset(s->ext, RP2350_GPIO_EXT_NONE, sizeof(s->ext));
 }
 

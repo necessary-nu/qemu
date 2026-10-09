@@ -218,6 +218,13 @@ enum {
 #define RP2350_GPIO_PAD_IN "pad-in"
 #define RP2350_GPIO_EXT_NONE 0xff
 
+/*
+ * Named GPIO output array "pad-out", one line per pin: the level on the
+ * pin as a device outside the chip sees it, whoever drives it. Off-chip
+ * devices such as an SPI device's chip select connect here.
+ */
+#define RP2350_GPIO_PAD_OUT "pad-out"
+
 /* Interrupt destinations, in register order. */
 enum {
     RP2350_GPIO_DEST_PROC0,
@@ -287,6 +294,7 @@ struct RP2350GPIOState {
 
     qemu_irq irq[RP2350_GPIO_CORES][RP2350_GPIO_CORE_IRQS];
     qemu_irq dormant_wake;
+    qemu_irq pad_out[RP2350_GPIO_PINS];
 
     bool updating;
     bool update_pending;
