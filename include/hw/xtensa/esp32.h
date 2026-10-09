@@ -6,6 +6,7 @@
 #include "hw/char/esp32_uart.h"
 #include "hw/dma/esp32_uhci.h"
 #include "hw/gpio/esp32_gpio.h"
+#include "hw/gpio/esp32_rtcio.h"
 #include "hw/misc/esp32_dport.h"
 #include "hw/misc/esp32_apb_ctrl.h"
 #include "hw/core/clock.h"
@@ -93,6 +94,7 @@ struct Esp32SocState {
     Esp32GpioState gpio;
     Esp32RngState rng;
     Esp32RtcCntlState rtc_cntl;
+    Esp32RtcIoState rtcio;
     Esp32FrcTimerState frc_timer[ESP32_FRC_COUNT];
     Esp32TimgState timg[ESP32_TIMG_COUNT];
     Esp32SpiState spi[ESP32_SPI_COUNT];
@@ -113,6 +115,9 @@ struct Esp32SocState {
     BusState periph_bus;
 
     MemoryRegion cpu_specific_mem[ESP32_CPU_COUNT];
+    /* Internal SRAM, which deep sleep powers down */
+    MemoryRegion *dram;
+    MemoryRegion *iram;
 
     uint32_t requested_reset;
 
