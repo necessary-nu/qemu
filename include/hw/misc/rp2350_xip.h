@@ -143,4 +143,10 @@ MemoryRegion *rp2350_xip_array(RP2350XIPState *s, int cs);
  */
 void rp2350_xip_reset_block(RP2350XIPState *s);
 
+/*
+ * The XIP memory power domain powered down: clear the cache's tag and
+ * data memories, which, unlike a reset, loses pinned lines.
+ */
+void rp2350_xip_power_down(RP2350XIPState *s);
+
 #endif
