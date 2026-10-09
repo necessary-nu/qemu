@@ -64,7 +64,10 @@ struct RP2350CoreSightState {
     /* The timestamp generator's counter clock. */
     Clock *clk;
 
-    /* The OTP CRIT1 debug-disable flags, as hardware latches them. */
+    /*
+     * The debug disable signals from OTP (named GPIO inputs
+     * "debug-disable" and "secure-debug-disable").
+     */
     bool debug_disable;
     bool secure_debug_disable;
 

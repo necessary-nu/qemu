@@ -170,6 +170,9 @@ config RP2350_ACCESSCTRL
 config RP2350_PSM
     bool
 
+config RP2350_OTP
+    bool
+
 config STM32L4X5_SYSCFG
     bool
 

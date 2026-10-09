@@ -24,6 +24,7 @@
 #include "hw/misc/rp2350_eppb.h"
 #include "hw/misc/rp2350_psm.h"
 #include "hw/misc/rp2350_pwm.h"
+#include "hw/misc/rp2350_otp.h"
 #include "hw/misc/rp2350_rcp.h"
 #include "hw/misc/rp2350_resets.h"
 #include "hw/misc/rp2350_rosc.h"
@@ -68,6 +69,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_CLOCKS_IRQ 30
 #define RP2350_UART0_IRQ 33
 #define RP2350_UART1_IRQ 34
+#define RP2350_OTP_IRQ 38
 #define RP2350_TRNG_IRQ 39
 #define RP2350_SPARE_IRQ_5 51
 
@@ -177,6 +179,7 @@ struct RP2350State {
     PL011State uart[RP2350_NUM_UARTS];
     RP2350CoreSightState coresight;
     RP2350CoreSightTraceState coresight_trace;
+    RP2350OTPState otp;
     /* The UARTs' register windows plus their atomic aliases. */
     MemoryRegion uart_alias[RP2350_NUM_UARTS];
     /* Core 0's SIO views as seen from system memory (debug, qtest). */

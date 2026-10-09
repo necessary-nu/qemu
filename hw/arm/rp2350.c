@@ -23,6 +23,12 @@
  * -M rp2350,flash-size=SIZE (a Pico 2 has 4M); there is no default. The
  * flash is a Winbond W25Q part of that size on QSPI chip select 0. Boards
  * with PSRAM on chip select 1 add psram-size=8M for an APS6404L.
+ *
+ * OTP starts as a blank chip and lives in RAM. To keep programmed rows
+ * across runs, back it with a 16 KiB raw image:
+ *
+ *   -drive if=none,id=otp,format=raw,file=otp.img
+ *   -global rp2350-otp.drive=otp
  */
 
 #include "qemu/osdep.h"

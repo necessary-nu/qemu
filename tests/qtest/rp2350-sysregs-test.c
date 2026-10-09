@@ -8,6 +8,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "libqtest.h"
 
 #define SYSINFO         0x40000000
@@ -217,9 +218,23 @@ static void test_glitch_reset(void)
 /* [spec:nuos:req:emu.system-regs/test] */
 static void test_glitch_otp_armed(void)
 {
-    QTestState *qts = qtest_initf("-M rp2350 -bios %s -global "
-                                  "rp2350-glitch-detector.otp-enable=on",
-                                  rom_path);
+    /* 4096 OTP rows, with CRIT1.GLITCH_DETECTOR_ENABLE in all 8 copies. */
+    g_autofree uint32_t *otp = g_new0(uint32_t, 4096);
+    g_autofree char *otp_path = NULL;
+    GError *err = NULL;
+    QTestState *qts;
+    int fd, i;
+
+    for (i = 0; i < 8; i++) {
+        otp[0x40 + i] = cpu_to_le32(0x10);
+    }
+    fd = g_file_open_tmp("rp2350-sysregs-otp-XXXXXX.img", &otp_path, &err);
+    g_assert_no_error(err);
+    g_assert_cmpint(write(fd, otp, 4096 * 4), ==, 4096 * 4);
+    close(fd);
+    qts = qtest_initf("-M rp2350 -bios %s "
+                      "-drive if=none,id=otp,format=raw,file=%s "
+                      "-global rp2350-otp.drive=otp", rom_path, otp_path);
 
     /* Armed by OTP, DISARM's pattern disarms the detectors. */
     qtest_writel(qts, GD_DISARM, 0xdcaf);
@@ -232,6 +247,7 @@ static void test_glitch_otp_armed(void)
     qtest_qmp_eventwait(qts, "RESET");
     g_assert_cmphex(qtest_readl(qts, GD_TRIG_STATUS), ==, 0x5);
     qtest_quit(qts);
+    unlink(otp_path);
 }
 
 /* [spec:nuos:req:emu.system-regs/test] */
