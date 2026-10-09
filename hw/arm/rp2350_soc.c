@@ -1119,6 +1119,40 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         }
     }
 
+    /*
+     * USBCTRL: its DPRAM and registers, USBCTRL_IRQ, and the VBUS
+     * management signals of the GPIO USB function. Its host-mode port is
+     * a QEMU USB bus for -device usb-* devices.
+     */
+    /* [spec:nuos:req:emu.usb] */
+    {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->usbctrl);
+        DeviceState *dev = DEVICE(&s->usbctrl);
+
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, RP2350_USBCTRL_MMIO_DPRAM,
+                        RP2350_USBCTRL_DPRAM_BASE);
+        sysbus_mmio_map(sbd, RP2350_USBCTRL_MMIO_REGS,
+                        RP2350_USBCTRL_REGS_BASE);
+        sysbus_connect_irq(sbd, 0,
+                           qdev_get_gpio_in(dev_soc, RP2350_USBCTRL_IRQ));
+        qdev_connect_gpio_out_named(dev, RP2350_USBCTRL_VBUS_EN, 0,
+            rp2350_gpio_out_line(&s->gpio, RP2350_GPIO_PORT_USB,
+                                 RP2350_GPIO_USB_VBUS_EN));
+        qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, RP2350_GPIO_PORT_USB,
+                                         RP2350_GPIO_USB_VBUS_EN), 1);
+        rp2350_gpio_connect_in(&s->gpio, RP2350_GPIO_PORT_USB,
+                               RP2350_GPIO_USB_VBUS_DETECT,
+                               qdev_get_gpio_in_named(dev,
+                                   RP2350_USBCTRL_VBUS_DETECT, 0));
+        rp2350_gpio_connect_in(&s->gpio, RP2350_GPIO_PORT_USB,
+                               RP2350_GPIO_USB_OVERCURR_DETECT,
+                               qdev_get_gpio_in_named(dev,
+                                   RP2350_USBCTRL_OVERCURR_DETECT, 0));
+    }
+
     /* [spec:nuos:req:emu.uart] */
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         static const hwaddr base[] = { RP2350_UART0_BASE, RP2350_UART1_BASE };
@@ -1341,6 +1375,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             { RP2350_RESET_SPI0, &s->spi[0] },
             { RP2350_RESET_SPI1, &s->spi[1] },
             { RP2350_RESET_HSTX, &s->hstx },
+            { RP2350_RESET_USBCTRL, &s->usbctrl },
         };
         SysBusDevice *sbd = SYS_BUS_DEVICE(&s->resets);
 
@@ -1410,6 +1445,7 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "sha256", &s->sha256, TYPE_RP2350_SHA256);
     object_initialize_child(obj, "pwm", &s->pwm, TYPE_RP2350_PWM);
     object_initialize_child(obj, "hstx", &s->hstx, TYPE_RP2350_HSTX);
+    object_initialize_child(obj, "usbctrl", &s->usbctrl, TYPE_RP2350_USBCTRL);
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
         object_initialize_child(obj, "timer[*]", &s->timer[i],
                                 TYPE_RP2350_TIMER);

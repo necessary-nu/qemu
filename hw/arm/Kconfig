@@ -422,6 +422,7 @@ config RP2350_SOC
     select RP2350_WATCHDOG
     select RP2350_OTP
     select RP2350_DMA
+    select RP2350_USBCTRL
     select PL022
     select PL011
 
