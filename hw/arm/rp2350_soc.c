@@ -698,15 +698,18 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     memory_region_add_subregion(s->board_memory, RP2350_SIO_NONSEC_BASE,
                                 &s->sio_sysmem[1]);
 
+    /*
+     * Counted core accesses go through the core's ACCESSCTRL view, so the
+     * bus security filters refuse them as they refuse uncounted ones.
+     */
     /* [spec:nuos:req:emu.busctrl] */
-    object_property_set_link(OBJECT(&s->busctrl), "memory",
-                             OBJECT(s->board_memory), &error_abort);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->busctrl), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->busctrl), 0, RP2350_BUSCTRL_BASE);
     for (i = 0; i < RP2350_NUM_CORES; i++) {
         rp2350_busctrl_attach_core(&s->busctrl, i, &s->armv7m[i].container,
+                                   rp2350_accessctrl_view(&s->accessctrl, i),
                                    rp2350_sio_view(&s->sio, i, false),
                                    rp2350_sio_view(&s->sio, i, true));
     }

@@ -5,8 +5,9 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * qtest accesses do not pass through a core's bus port, so they never
- * count; the counting itself is exercised by the busctrl guest test.
+ * qtest accesses are the debugger's, made through core 0's address space,
+ * so they are counted like core 0's; the counting itself is exercised by
+ * the busctrl guest test.
  */
 
 #include "qemu/osdep.h"
@@ -21,6 +22,14 @@
 #define XOR              0x1000
 #define SET              0x2000
 #define CLR              0x3000
+
+#define EV_APB_ACCESS    0x0b
+
+#define AC_TICKS         0x400600d4
+#define AC_PASSWORD      0xacce0000u
+#define AC_TICKS_RESET   0xb8
+#define AC_PERM_DBG      (1u << 7)
+#define TICKS_PROC0_CYCLES 0x40108004
 
 #define PROC0            (1u << 0)
 #define PROC1            (1u << 4)
@@ -142,6 +151,38 @@ static void test_system_reset(void)
     qtest_quit(qts);
 }
 
+/*
+ * Counting the APB port does not open a way around ACCESSCTRL. qtest
+ * accesses are the debugger's, made through core 0's address space: with
+ * TICKS closed to the debugger, a read or write of it fails exactly as it
+ * does uncounted, never reaches TICKS, and is not counted.
+ */
+/* [spec:nuos:req:emu.accessctrl/test] */
+/* [spec:nuos:req:emu.busctrl/test] */
+static void test_counted_access_filtered(void)
+{
+    QTestState *qts = start();
+    uint32_t a, b;
+
+    qtest_writel(qts, TICKS_PROC0_CYCLES, 0x12);
+    qtest_writel(qts, PERFSEL(0), EV_APB_ACCESS);
+    qtest_writel(qts, PERFCTR_EN, 1);
+    qtest_writel(qts, AC_TICKS, AC_PASSWORD | (AC_TICKS_RESET & ~AC_PERM_DBG));
+
+    a = qtest_readl(qts, PERFCTR(0));
+    g_assert_cmphex(qtest_readl(qts, TICKS_PROC0_CYCLES), ==, 0);
+    qtest_writel(qts, TICKS_PROC0_CYCLES, 0x34);
+    b = qtest_readl(qts, PERFCTR(0));
+    g_assert_cmphex(b, ==, a + 1);
+
+    qtest_writel(qts, AC_TICKS, AC_PASSWORD | AC_TICKS_RESET);
+    a = qtest_readl(qts, PERFCTR(0));
+    g_assert_cmphex(qtest_readl(qts, TICKS_PROC0_CYCLES), ==, 0x12);
+    b = qtest_readl(qts, PERFCTR(0));
+    g_assert_cmphex(b, ==, a + 2);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     static const uint32_t blank[2];
@@ -160,6 +201,8 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/busctrl/perfctr-en-sel", test_perfctr_en_and_sel);
     qtest_add_func("/rp2350/busctrl/perfctr-clear", test_perfctr_write_clears);
     qtest_add_func("/rp2350/busctrl/system-reset", test_system_reset);
+    qtest_add_func("/rp2350/busctrl/counted-access-filtered",
+                   test_counted_access_filtered);
 
     ret = g_test_run();
     unlink(rom_path);
