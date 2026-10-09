@@ -351,6 +351,8 @@ static void uart_tx_start_at(ESP32UARTState *s, int64_t start_ns,
     s->tx_end_ns = start_ns + frame_ns;
     timer_mod_ns(&s->tx_timer, s->tx_end_ns);
     s->tx_timed = true;
+    /* A UHCI feeding this UART can refill the slot just freed. */
+    notifier_list_notify(&s->dma_notifiers, s);
 }
 
 /* Start a frame now if the line is idle, a byte waits and the UART runs. */
@@ -459,6 +461,11 @@ static void uart_receive(void *opaque, const uint8_t *buf, int size)
         fifo8_push(&s->rx_fifo, buf[i]);
     }
 
+    /* A UHCI attached to this UART takes the data from the RX FIFO. */
+    s->in_receive = true;
+    notifier_list_notify(&s->dma_notifiers, s);
+    s->in_receive = false;
+
     /* Receive throttling: some applications (in particular the ESP32 ROM bootloader)
      * may work incorrectly if the data comes in much faster than what UART baud rate
      * would allow. This code adds a delay every UART_FIFO_LENGTH bytes, to make the
@@ -477,6 +484,56 @@ static void uart_receive(void *opaque, const uint8_t *buf, int size)
 
     esp32_uart_set_rx_timeout(s);
     esp32_uart_update_irq(s);
+}
+
+/* [spec:nuos:req:emu.esp32.uhci] */
+void esp32_uart_add_dma_notifier(ESP32UARTState *s, Notifier *n)
+{
+    notifier_list_add(&s->dma_notifiers, n);
+}
+
+/* [spec:nuos:req:emu.esp32.uhci] */
+unsigned esp32_uart_dma_tx_free(ESP32UARTState *s)
+{
+    return fifo8_num_free(&s->tx_fifo);
+}
+
+/* [spec:nuos:req:emu.esp32.uhci] */
+void esp32_uart_dma_tx_push(ESP32UARTState *s, uint8_t byte)
+{
+    uart_tx_advance(s);
+    if (fifo8_num_free(&s->tx_fifo) == 0) {
+        return;
+    }
+    fifo8_push(&s->tx_fifo, byte);
+    uart_tx_start(s);
+    esp32_uart_update_irq(s);
+}
+
+/* [spec:nuos:req:emu.esp32.uhci] */
+unsigned esp32_uart_dma_rx_count(ESP32UARTState *s)
+{
+    return fifo8_num_used(&s->rx_fifo);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.uhci]
+ * Take a byte from the RX FIFO for the UHCI. While the backend is
+ * delivering, it asks again for room once it is done.
+ */
+uint8_t esp32_uart_dma_rx_pop(ESP32UARTState *s)
+{
+    uint8_t byte;
+
+    if (fifo8_is_empty(&s->rx_fifo)) {
+        return 0;
+    }
+    byte = fifo8_pop(&s->rx_fifo);
+    esp32_uart_update_irq(s);
+    if (!s->in_receive) {
+        qemu_chr_fe_accept_input(&s->chr);
+    }
+    return byte;
 }
 
 static int uart_can_receive(void *opaque)
@@ -572,6 +629,7 @@ static void esp32_uart_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
     fifo8_create(&s->tx_fifo, UART_FIFO_LENGTH);
     fifo8_create(&s->rx_fifo, UART_FIFO_LENGTH);
+    notifier_list_init(&s->dma_notifiers);
     timer_init_ns(&s->throttle_timer, QEMU_CLOCK_VIRTUAL, uart_throttle_timer_cb, s);
     timer_init_ns(&s->rx_timeout_timer, QEMU_CLOCK_VIRTUAL, uart_rx_timeout_timer_cb, s);
     timer_init_ns(&s->tx_timer, QEMU_CLOCK_VIRTUAL, uart_tx_timer_cb, s);

@@ -177,6 +177,9 @@ static void esp32_soc_reset(DeviceState *dev)
         for (int i = 0; i < ESP32_UART_COUNT; ++i) {
             device_cold_reset(DEVICE(&s->uart[i]));
         }
+        for (int i = 0; i < ESP32_UHCI_COUNT; ++i) {
+            device_cold_reset(DEVICE(&s->uhci[i]));
+        }
         for (int i = 0; i < ESP32_FRC_COUNT; ++i) {
             device_cold_reset(DEVICE(&s->frc_timer[i]));
         }
@@ -759,6 +762,35 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                            qdev_get_gpio_in(intmatrix_dev, ETS_UART0_INTR_SOURCE + i));
     }
 
+    for (int i = 0; i < ESP32_UHCI_COUNT; ++i) {
+        const hwaddr uhci_base[] = { DR_REG_UHCI0_BASE, DR_REG_UHCI1_BASE };
+        const uint32_t uhci_bit[] = {
+            R_DPORT_PERIP_UHCI0_MASK, R_DPORT_PERIP_UHCI1_MASK
+        };
+        const int uhci_intr[] = {
+            ETS_UHCI0_INTR_SOURCE, ETS_UHCI1_INTR_SOURCE
+        };
+        Esp32PeriphGate *g;
+
+        object_property_set_link(OBJECT(&s->uhci[i]), "dma-mr",
+                                 OBJECT(sys_mem), &error_abort);
+        for (int u = 0; u < ESP32_UART_COUNT; ++u) {
+            char name[8];
+
+            snprintf(name, sizeof(name), "uart%d", u);
+            object_property_set_link(OBJECT(&s->uhci[i]), name,
+                                     OBJECT(&s->uart[u]), &error_abort);
+        }
+        qdev_realize(DEVICE(&s->uhci[i]), &s->periph_bus, &error_fatal);
+        /* [spec:nuos:req:emu.esp32.uhci] */
+        g = esp32_soc_add_gated_device(s, &s->uhci[i], uhci_base[i],
+                                       ESP32_GATE_PERIP, uhci_bit[i],
+                                       uhci_bit[i]);
+        g->apb_clk = s->uhci_apb_clk[i];
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->uhci[i]), 0,
+                           qdev_get_gpio_in(intmatrix_dev, uhci_intr[i]));
+    }
+
     for (int i = 0; i < ESP32_FRC_COUNT; ++i) {
         Esp32PeriphGate *g;
 
@@ -1023,6 +1055,14 @@ static void esp32_soc_init(Object *obj)
         s->uart_ref_tick_clk[i] = clock_new(obj, name);
         qdev_connect_clock_in(DEVICE(&s->uart[i]), "ref_tick",
                               s->uart_ref_tick_clk[i]);
+    }
+
+    for (int i = 0; i < ESP32_UHCI_COUNT; ++i) {
+        snprintf(name, sizeof(name), "uhci%d", i);
+        object_initialize_child(obj, name, &s->uhci[i], TYPE_ESP32_UHCI);
+        snprintf(name, sizeof(name), "uhci%d-apb", i);
+        s->uhci_apb_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(DEVICE(&s->uhci[i]), "apb", s->uhci_apb_clk[i]);
     }
 
     object_property_add_alias(obj, "serial0", OBJECT(&s->uart[0]), "chardev");
