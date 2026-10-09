@@ -305,6 +305,24 @@ void rp2350_gpio_connect_in(RP2350GPIOState *s, RP2350GPIOPort port, int n,
     qdev_connect_gpio_out_named(DEVICE(s), name, n, irq);
 }
 
+uint64_t rp2350_gpio_port_selected(RP2350GPIOState *s, RP2350GPIOPort port)
+{
+    int base = rp2350_gpio_port_base[port];
+    int n = rp2350_gpio_port_signals(port);
+    uint64_t mask = 0;
+    int p;
+
+    assert(n <= 64);
+    for (p = 0; p < RP2350_GPIO_PINS; p++) {
+        int f = rp2350_gpio_fn[p][CTRL_FUNCSEL(s->ctrl[p])];
+
+        if (f >= base && f < base + n) {
+            mask |= 1ull << (f - base);
+        }
+    }
+    return mask;
+}
+
 /* CTRL override fields: 0 pass, 1 invert, 2 force low, 3 force high. */
 static int over(int mode, int v)
 {
@@ -447,6 +465,53 @@ static void rp2350_gpio_set_irqs(RP2350GPIOState *s)
 }
 
 /*
+ * Update pin p from its peripheral's output through the muxing and pad.
+ * Returns the level it delivers to peripherals; *pad_changed says whether
+ * the level on the pin changed and *irq_changed whether its interrupt
+ * signal did.
+ */
+static int rp2350_gpio_pin(RP2350GPIOState *s, int p, bool force,
+                           bool *pad_changed, bool *irq_changed)
+{
+    uint32_t ctrl = s->ctrl[p];
+    int f = rp2350_gpio_fn[p][CTRL_FUNCSEL(ctrl)];
+    int out = f >= 0 ? s->src_out[f] : 0;
+    int oe = f >= 0 ? s->src_oe[f] : 0;
+    uint8_t c;
+    int level, irq;
+
+    out = over(CTRL_OUTOVER(ctrl), out);
+    oe = over(CTRL_OEOVER(ctrl), oe);
+    s->out_to_pad[p] = out;
+    s->oe_to_pad[p] = oe;
+
+    /*
+     * While isolated, the pad keeps the controls latched when isolation
+     * began; the input path from the pad is not isolated.
+     */
+    if (!pad_isolated(s, p)) {
+        s->latch[p] = pad_controls(s, p, out, oe);
+    }
+    c = s->latch[p];
+    level = pad_level(s, p, c);
+    *pad_changed = force || level != s->pad_level[p];
+    s->pad_level[p] = level;
+
+    s->in_from_pad[p] = (c & LATCH_IE) ? level : 0;
+
+    irq = over(CTRL_IRQOVER(ctrl), s->in_from_pad[p]);
+    *irq_changed = irq != s->irq_level[p];
+    if (*irq_changed &&
+        !(s->held & (p < RP2350_GPIO_BANK0_PINS ? RP2350_GPIO_IO_BANK0
+                                                : RP2350_GPIO_IO_QSPI))) {
+        s->intr_edge[p / 8] |= (irq ? INT_EDGE_HIGH : INT_EDGE_LOW)
+                               << (4 * (p % 8));
+    }
+    s->irq_level[p] = irq;
+    return over(CTRL_INOVER(ctrl), s->in_from_pad[p]);
+}
+
+/*
  * Propagate every pin: outputs through the muxing and pads, pad levels
  * back to the peripherals, and interrupt detection. With `force`, every
  * peripheral input is delivered whether or not it changed.
@@ -460,44 +525,14 @@ static void rp2350_gpio_propagate(RP2350GPIOState *s, bool force)
     int p, i, port;
 
     for (p = 0; p < RP2350_GPIO_PINS; p++) {
-        uint32_t ctrl = s->ctrl[p];
-        int f = rp2350_gpio_fn[p][CTRL_FUNCSEL(ctrl)];
-        int out = f >= 0 ? s->src_out[f] : 0;
-        int oe = f >= 0 ? s->src_oe[f] : 0;
-        uint8_t c;
-        int level, irq;
+        int f = rp2350_gpio_fn[p][CTRL_FUNCSEL(s->ctrl[p])];
+        bool irq_changed;
 
-        out = over(CTRL_OUTOVER(ctrl), out);
-        oe = over(CTRL_OEOVER(ctrl), oe);
-        s->out_to_pad[p] = out;
-        s->oe_to_pad[p] = oe;
-
-        /*
-         * While isolated, the pad keeps the controls latched when
-         * isolation began; the input path from the pad is not isolated.
-         */
-        if (!pad_isolated(s, p)) {
-            s->latch[p] = pad_controls(s, p, out, oe);
-        }
-        c = s->latch[p];
-        level = pad_level(s, p, c);
-        pad_changed[p] = force || level != s->pad_level[p];
-        s->pad_level[p] = level;
-
-        s->in_from_pad[p] = (c & LATCH_IE) ? level : 0;
-        to_peri[p] = over(CTRL_INOVER(ctrl), s->in_from_pad[p]);
+        to_peri[p] = rp2350_gpio_pin(s, p, force, &pad_changed[p],
+                                     &irq_changed);
         if (f >= 0) {
             in[f] |= to_peri[p];
         }
-
-        irq = over(CTRL_IRQOVER(ctrl), s->in_from_pad[p]);
-        if (irq != s->irq_level[p] &&
-            !(s->held & (p < RP2350_GPIO_BANK0_PINS ? RP2350_GPIO_IO_BANK0
-                                                    : RP2350_GPIO_IO_QSPI))) {
-            s->intr_edge[p / 8] |= (irq ? INT_EDGE_HIGH : INT_EDGE_LOW)
-                                   << (4 * (p % 8));
-        }
-        s->irq_level[p] = irq;
     }
 
     /* SIO and PIO see every pin, selected or not. */
@@ -524,6 +559,66 @@ static void rp2350_gpio_propagate(RP2350GPIOState *s, bool force)
     }
 
     rp2350_gpio_set_irqs(s);
+}
+
+static void rp2350_gpio_deliver(RP2350GPIOState *s, int i, uint8_t level)
+{
+    if (level != s->peri_in[i]) {
+        s->peri_in[i] = level;
+        qemu_set_irq(s->peri_in_irq[i], level);
+    }
+}
+
+/*
+ * Propagate a change of peripheral signal f's output or output enable.
+ * Only the pins that select f can change, so this is a full pass cut down
+ * to them; fast-toggling outputs (PIO, PWM) take this path.
+ */
+static void rp2350_gpio_update_signal(RP2350GPIOState *s, int f)
+{
+    bool selected = false, irq = false;
+    uint8_t in = 0;
+    int p, port;
+
+    if (s->updating) {
+        s->update_pending = true;
+        return;
+    }
+    s->updating = true;
+    for (p = 0; p < RP2350_GPIO_PINS; p++) {
+        bool pad_changed, irq_changed;
+        uint8_t to_peri;
+
+        if (rp2350_gpio_fn[p][CTRL_FUNCSEL(s->ctrl[p])] != f) {
+            continue;
+        }
+        selected = true;
+        to_peri = rp2350_gpio_pin(s, p, false, &pad_changed, &irq_changed);
+        in |= to_peri;
+        irq |= irq_changed;
+        rp2350_gpio_deliver(s, sig(RP2350_GPIO_PORT_SIO,
+                                   rp2350_gpio_sio_bit(p)), to_peri);
+        if (p < RP2350_GPIO_BANK0_PINS) {
+            for (port = RP2350_GPIO_PORT_PIO0; port <= RP2350_GPIO_PORT_PIO2;
+                 port++) {
+                rp2350_gpio_deliver(s, sig(port, p), to_peri);
+            }
+        }
+        if (pad_changed) {
+            qemu_set_irq(s->pad_out[p], s->pad_level[p]);
+        }
+    }
+    if (selected) {
+        rp2350_gpio_deliver(s, f, in);
+    }
+    if (irq) {
+        rp2350_gpio_set_irqs(s);
+    }
+    while (s->update_pending) {
+        s->update_pending = false;
+        rp2350_gpio_propagate(s, false);
+    }
+    s->updating = false;
 }
 
 /*
@@ -560,16 +655,20 @@ static void rp2350_gpio_set_src_out(void *opaque, int n, int level)
 {
     RP2350GPIOPortRef *ref = opaque;
 
-    ref->s->src_out[ref->base + n] = level != 0;
-    rp2350_gpio_update(ref->s);
+    if (ref->s->src_out[ref->base + n] != (level != 0)) {
+        ref->s->src_out[ref->base + n] = level != 0;
+        rp2350_gpio_update_signal(ref->s, ref->base + n);
+    }
 }
 
 static void rp2350_gpio_set_src_oe(void *opaque, int n, int level)
 {
     RP2350GPIOPortRef *ref = opaque;
 
-    ref->s->src_oe[ref->base + n] = level != 0;
-    rp2350_gpio_update(ref->s);
+    if (ref->s->src_oe[ref->base + n] != (level != 0)) {
+        ref->s->src_oe[ref->base + n] = level != 0;
+        rp2350_gpio_update_signal(ref->s, ref->base + n);
+    }
 }
 
 static void rp2350_gpio_set_pad_in(void *opaque, int n, int level)
