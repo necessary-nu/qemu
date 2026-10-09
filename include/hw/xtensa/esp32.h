@@ -119,6 +119,8 @@ struct Esp32SocState {
     Clock *frc_apb_clk[ESP32_FRC_COUNT];
     Clock *timg_apb_clk[ESP32_TIMG_COUNT];
     Clock *spi_dma_clk[ESP32_SPI_DMA_COUNT];
+    /* APB_CLK to the GPIO block's sigma-delta modulators, never gated */
+    Clock *gpio_apb_clk;
 
     Esp32PeriphGate gate[ESP32_GATE_MAX];
     unsigned n_gates;

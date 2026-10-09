@@ -319,6 +319,7 @@ static void esp32_soc_update_clocks(Esp32SocState *s)
     s->ref_tick_hz = apb_hz / esp32_apb_ctrl_tick_div(&s->apb_ctrl,
                                                       s->rtc_cntl.soc_clk);
     clock_update_hz(s->cpu_clk, cpu_hz);
+    clock_update_hz(s->gpio_apb_clk, apb_hz);
     for (unsigned i = 0; i < s->n_gates; i++) {
         esp32_gate_update_clocks(s, &s->gate[i]);
     }
@@ -514,15 +515,22 @@ static Esp32PeriphGate *esp32_soc_add_gated_device(Esp32SocState *s,
     return g;
 }
 
-static void esp32_soc_add_periph_device(MemoryRegion *dest, void* dev, hwaddr dport_base_addr)
+static void esp32_soc_add_periph_region(MemoryRegion *dest, void *dev, int n,
+                                        hwaddr dport_base_addr)
 {
-    MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
+    MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), n);
     memory_region_add_subregion_overlap(dest, dport_base_addr, mr, 0);
     MemoryRegion *mr_apb = g_new(MemoryRegion, 1);
     char *name = g_strdup_printf("mr-apb-0x%08x", (uint32_t) dport_base_addr);
     memory_region_init_alias(mr_apb, OBJECT(dev), name, mr, 0, memory_region_size(mr));
     memory_region_add_subregion_overlap(dest, dport_base_addr - DR_REG_DPORT_APB_BASE + APB_REG_BASE, mr_apb, 0);
     g_free(name);
+}
+
+static void esp32_soc_add_periph_device(MemoryRegion *dest, void *dev,
+                                        hwaddr dport_base_addr)
+{
+    esp32_soc_add_periph_region(dest, dev, 0, dport_base_addr);
 }
 
 static void esp32_soc_add_unimp_device(MemoryRegion *dest, const char* name, hwaddr dport_base_addr, size_t size)
@@ -699,8 +707,34 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                     qdev_get_gpio_in_named(dev, ESP32_RTC_CPU_STALL_GPIO, i));
     }
 
+    /*
+     * [spec:nuos:req:emu.esp32.gpio]
+     * The GPIO matrix and IO_MUX have no DPORT clock gate or reset. The GPIO
+     * interrupt's sources are per CPU: each goes to its own CPU's half of
+     * the interrupt matrix.
+     */
     qdev_realize(DEVICE(&s->gpio), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->gpio, DR_REG_GPIO_BASE);
+    esp32_soc_add_periph_region(sys_mem, &s->gpio, 1, DR_REG_IO_MUX_BASE);
+    {
+        static const struct {
+            int cpu;
+            int source;
+        } gpio_irq[ESP32_GPIO_IRQ_COUNT] = {
+            [ESP32_GPIO_IRQ_PRO] = { 0, ETS_GPIO_INTR_SOURCE },
+            [ESP32_GPIO_IRQ_PRO_NMI] = { 0, ETS_GPIO_NMI_SOURCE },
+            [ESP32_GPIO_IRQ_APP] = { 1, ETS_GPIO_INTR_SOURCE },
+            [ESP32_GPIO_IRQ_APP_NMI] = { 1, ETS_GPIO_NMI_SOURCE },
+        };
+
+        for (int i = 0; i < ESP32_GPIO_IRQ_COUNT; i++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), i,
+                               qdev_get_gpio_in_named(intmatrix_dev,
+                                   ESP32_INTMATRIX_CPU_SOURCE,
+                                   gpio_irq[i].cpu * ESP32_INT_MATRIX_INPUTS +
+                                   gpio_irq[i].source));
+        }
+    }
 
     for (int i = 0; i < ESP32_UART_COUNT; ++i) {
         const hwaddr uart_base[] = {DR_REG_UART_BASE, DR_REG_UART1_BASE, DR_REG_UART2_BASE};
@@ -829,6 +863,31 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                             ETS_SPI1_DMA_INTR_SOURCE + i));
     }
 
+    /*
+     * [spec:nuos:req:emu.esp32.gpio]
+     * The chip selects of SPI2 (HSPI) and SPI3 (VSPI) reach their pads
+     * through the GPIO matrix or IO_MUX. SPI0 and SPI1's chip selects drive
+     * the flash and PSRAM models directly instead, as the chips sit on
+     * dedicated pads.
+     */
+    {
+        static const int spi_cs_sig[][ESP32_SPI_CS_COUNT] = {
+            { ESP32_SIG_HSPICS0, ESP32_SIG_HSPICS1, ESP32_SIG_HSPICS2 },
+            { ESP32_SIG_VSPICS0, ESP32_SIG_VSPICS1, ESP32_SIG_VSPICS2 },
+        };
+
+        for (int i = 0; i < ARRAY_SIZE(spi_cs_sig); i++) {
+            for (int cs = 0; cs < ESP32_SPI_CS_COUNT; cs++) {
+                qdev_connect_gpio_out_named(DEVICE(&s->spi[2 + i]),
+                                            SSI_GPIO_CS, cs,
+                                            qdev_get_gpio_in_named(
+                                                DEVICE(&s->gpio),
+                                                ESP32_GPIO_SIG_OUT,
+                                                spi_cs_sig[i][cs]));
+            }
+        }
+    }
+
     for (int i = 0; i < ESP32_I2C_COUNT; i++) {
         const hwaddr i2c_base[] = {
             DR_REG_I2C_EXT_BASE, DR_REG_I2C1_EXT_BASE
@@ -905,7 +964,6 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.analog", DR_REG_ANA_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_RTCIO_BASE, 0x400);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_SENS_BASE, 0x400);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.iomux", DR_REG_IO_MUX_BASE, 0x2000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.hinf", DR_REG_HINF_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slc", DR_REG_SLC_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slchost", DR_REG_SLCHOST_BASE, 0x1000);
@@ -972,6 +1030,8 @@ static void esp32_soc_init(Object *obj)
     object_property_add_alias(obj, "serial2", OBJECT(&s->uart[2]), "chardev");
 
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_ESP32_GPIO);
+    s->gpio_apb_clk = clock_new(obj, "gpio-apb");
+    qdev_connect_clock_in(DEVICE(&s->gpio), "apb", s->gpio_apb_clk);
 
     object_initialize_child(obj, "dport", &s->dport, TYPE_ESP32_DPORT);
 

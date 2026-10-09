@@ -23,6 +23,12 @@
 #define ESP32_CPU_COUNT 2
 #define ESP32_INT_MATRIX_INPUTS 69
 
+/*
+ * Named inputs for the sources that each CPU sees separately: input
+ * cpu * ESP32_INT_MATRIX_INPUTS + source reaches only that CPU's map.
+ */
+#define ESP32_INTMATRIX_CPU_SOURCE "esp32-intmatrix-cpu-source"
+
 #define TYPE_ESP32_INTMATRIX "misc.esp32.intmatrix"
 #define ESP32_INTMATRIX(obj) OBJECT_CHECK(Esp32IntMatrixState, (obj), TYPE_ESP32_INTMATRIX)
 
