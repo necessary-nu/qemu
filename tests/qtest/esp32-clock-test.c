@@ -25,6 +25,11 @@
 #define SOC_CLK_PLL         1
 #define SOC_CLK_8M          2
 #define SOC_CLK_APLL        3
+#define CK8M_DFREQ_SHIFT    17
+#define ENB_CK8M            (1u << 6)
+#define RTC_CNTL_TIMER1     0x3ff4801c
+#define CK8M_WAIT_SHIFT     6
+#define CK8M_WAIT_MASK      (0xffu << CK8M_WAIT_SHIFT)
 
 #define SYSCON              0x3ff66000
 #define SYSCON_SYSCLK_CONF  (SYSCON + 0x00)
@@ -155,6 +160,44 @@ static void test_rate_change_keeps_count(void)
     qtest_quit(qts);
 }
 
+/*
+ * RC_FAST_CLK as the SoC clock: none while ENB_CK8M powers it down; once
+ * powered up, none for CK8M_WAIT cycles of the 150 kHz RC_SLOW_CLK; then
+ * 8 MHz at CK8M_DFREQ 0 and 8.5 MHz at ESP-IDF's trim, CK8M_DFREQ 172.
+ */
+/* [spec:nuos:req:emu.esp32.clock-gating/test] */
+static void test_rc_fast(void)
+{
+    QTestState *qts = start();
+    uint32_t conf;
+
+    qtest_writel(qts, TIMG0 + T0CONFIG, T0CONFIG_RUN);
+    select_soc_clk(qts, SOC_CLK_8M);
+    g_assert_cmpuint(apb_per_100us(qts), ==, 800);
+
+    conf = qtest_readl(qts, RTC_CNTL_CLK_CONF);
+    qtest_writel(qts, RTC_CNTL_CLK_CONF, conf | ENB_CK8M);
+    g_assert_cmpuint(apb_per_100us(qts), ==, 0);
+
+    /* 15 cycles of RC_SLOW_CLK: 100 us */
+    qtest_writel(qts, RTC_CNTL_TIMER1,
+                 (qtest_readl(qts, RTC_CNTL_TIMER1) & ~CK8M_WAIT_MASK) |
+                 (15u << CK8M_WAIT_SHIFT));
+    conf |= 172u << CK8M_DFREQ_SHIFT;
+    qtest_writel(qts, RTC_CNTL_CLK_CONF, conf);
+    g_assert_cmpuint(apb_per_100us(qts), ==, 0);
+    g_assert_cmpuint(apb_per_100us(qts), ==, 850);
+
+    qtest_writel(qts, RTC_CNTL_CLK_CONF, conf & ~(0xffu << CK8M_DFREQ_SHIFT));
+    g_assert_cmpuint(apb_per_100us(qts), ==, 800);
+
+    /* XTAL_CLK does not depend on RC_FAST_CLK */
+    qtest_writel(qts, RTC_CNTL_CLK_CONF, conf | ENB_CK8M);
+    select_soc_clk(qts, SOC_CLK_XTAL);
+    g_assert_cmpuint(apb_per_100us(qts), ==, 4000);
+    qtest_quit(qts);
+}
+
 /* [spec:nuos:req:emu.esp32.clock-gating/test] */
 static void test_gate_and_reset(void)
 {
@@ -245,6 +288,7 @@ int main(int argc, char **argv)
                    test_apb_follows_soc_clk);
     qtest_add_func("esp32/clock/rate-change-keeps-count",
                    test_rate_change_keeps_count);
+    qtest_add_func("esp32/clock/rc-fast", test_rc_fast);
     qtest_add_func("esp32/clock/gate-and-reset", test_gate_and_reset);
     qtest_add_func("esp32/clock/uart-baud", test_uart_baud);
     return g_test_run();
