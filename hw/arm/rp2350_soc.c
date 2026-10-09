@@ -518,7 +518,7 @@ static void rp2350_soc_reset_core(RP2350State *s, int n, bool hold,
 /*
  * Carry out a PSM sequence: reset the device models in each stage being
  * reset, and the subsystems the watchdog resets. Stages without device
- * models (OTP, PSM_READY, BUSFABRIC, ROM, SRAM0-9) have no state here to
+ * models (PSM_READY, BUSFABRIC, ROM, SRAM0-9) have no state here to
  * reset; SRAM keeps its contents, as on hardware. The watchdog and PSM
  * are reset only by chip-level resets, so the watchdog's scratch
  * registers and REASON survive.
@@ -532,6 +532,9 @@ static void rp2350_soc_psm_reset(void *opaque, uint32_t reset, uint32_t held,
     bool sio_reset = reset & BIT(RP2350_PSM_SIO);
     int i;
 
+    if (reset & BIT(RP2350_PSM_OTP)) {
+        rp2350_otp_reset_stage(&s->otp);
+    }
     if (reset & BIT(RP2350_PSM_ROSC)) {
         device_cold_reset(DEVICE(&s->rosc));
     }
