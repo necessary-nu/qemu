@@ -27,6 +27,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(PL011State, PL011)
 
 /* Depth of UART FIFO in bytes, when FIFO mode is enabled (else depth == 1) */
 #define PL011_FIFO_DEPTH 16
+/* The deeper FIFOs of revision r1p5, selected by property "fifo-depth" */
+#define PL011_FIFO_MAX 32
 
 /*
  * Named GPIO output array: the single-transfer DMA requests, TX
@@ -36,6 +38,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(PL011State, PL011)
 #define PL011_DMA_REQ "dma-req"
 #define PL011_DMA_TX 0
 #define PL011_DMA_RX 1
+
+/*
+ * Line-level mode (property "line-level"), for boards that route the
+ * UART's pins. The UART has no character device; instead it shifts each
+ * character out on UARTTXD at the baud rate its divisors set from the
+ * "clk" input, and samples UARTRXD in the middle of each bit, with
+ * hardware flow control on nUARTRTS and nUARTCTS:
+ *
+ *   named GPIO output "txd":  UARTTXD, high while idle
+ *   named GPIO output "nrts": nUARTRTS, low while asserted
+ *   named GPIO input "rxd":   UARTRXD
+ *   named GPIO input "ncts":  nUARTCTS, low while asserted
+ *
+ * The other modem signals, nUARTDTR, nUARTDSR, nUARTDCD, nUARTRI and the
+ * OUT1/OUT2 outputs, are not connected: their status flags read 0.
+ */
+#define PL011_TXD "txd"
+#define PL011_NRTS "nrts"
+#define PL011_RXD "rxd"
+#define PL011_NCTS "ncts"
 
 struct PL011State {
     SysBusDevice parent_obj;
@@ -48,7 +70,7 @@ struct PL011State {
     uint32_t dmacr;
     uint32_t int_enabled;
     uint32_t int_level;
-    uint32_t read_fifo[PL011_FIFO_DEPTH];
+    uint32_t read_fifo[PL011_FIFO_MAX];
     uint32_t ilpr;
     uint32_t ibrd;
     uint32_t fbrd;
@@ -62,6 +84,45 @@ struct PL011State {
     Clock *clk;
     bool migrate_clk;
     bool logged_disabled_uart;
+    uint32_t fifo_depth;
+
+    /* Line-level mode */
+    bool line_level;
+    qemu_irq txd_out;
+    qemu_irq nrts_out;
+    QEMUTimer *tx_timer;
+    QEMUTimer *rx_timer;
+    QEMUTimer *rt_timer;
+    /* IBRD:FBRD as UARTLCR_H writes latch them, 16.6 fixed point */
+    uint32_t brd;
+    uint8_t tx_fifo[PL011_FIFO_MAX];
+    int32_t tx_pos;
+    int32_t tx_count;
+    /* The frame in the shift register, LSB first, and its timing */
+    bool tx_busy;
+    uint32_t tx_frame;
+    int32_t tx_len;
+    int32_t tx_bit;
+    uint32_t tx_brd;
+    int64_t tx_start;
+    int64_t tx_next;
+    /* The receiver: bit being sampled (-1 idle) and the frame so far */
+    int32_t rx_bit;
+    uint32_t rx_data;
+    uint32_t rx_brd;
+    uint32_t rx_lcr;
+    int64_t rx_start;
+    int64_t rx_next;
+    bool rx_zero;
+    bool rx_wait_mark;
+    bool rx_overrun;
+    /* Line levels: pins in, the receiver's inputs after loopback, outputs */
+    uint8_t rxd_pin;
+    uint8_t ncts_pin;
+    uint8_t rx_level;
+    uint8_t ncts_level;
+    uint8_t txd;
+    uint8_t nrts;
     const unsigned char *id;
     /*
      * Since some users embed this struct directly, we must

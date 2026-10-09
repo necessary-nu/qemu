@@ -16,6 +16,7 @@
 #include "hw/core/clock.h"
 #include "hw/dma/rp2350_dma.h"
 #include "hw/gpio/rp2350_gpio.h"
+#include "hw/i2c/rp2350_i2c.h"
 #include "hw/misc/rp2350_accessctrl.h"
 #include "hw/misc/rp2350_bootram.h"
 #include "hw/misc/rp2350_busctrl.h"
@@ -26,6 +27,7 @@
 #include "hw/misc/rp2350_eppb.h"
 #include "hw/misc/rp2350_m33_debug.h"
 #include "hw/misc/rp2350_hstx.h"
+#include "hw/misc/rp2350_powman.h"
 #include "hw/misc/rp2350_psm.h"
 #include "hw/misc/rp2350_pwm.h"
 #include "hw/misc/rp2350_otp.h"
@@ -52,6 +54,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_NUM_UARTS 2
 #define RP2350_NUM_SPIS 2
 #define RP2350_NUM_TIMERS 2
+#define RP2350_NUM_I2C 2
 #define RP2350_MPU_REGIONS 8
 /* CPUID: Arm Cortex-M33 r1p0, where QEMU's cortex-m33 is r0p3. */
 #define RP2350_M33_CPUID 0x411fd210
@@ -81,8 +84,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_UART0_IRQ 33
 #define RP2350_UART1_IRQ 34
 #define RP2350_ADC_IRQ_FIFO 35
+#define RP2350_I2C0_IRQ 36
+#define RP2350_I2C1_IRQ 37
 #define RP2350_OTP_IRQ 38
 #define RP2350_TRNG_IRQ 39
+#define RP2350_POWMAN_POW_IRQ 44
+#define RP2350_POWMAN_TIMER_IRQ 45
 #define RP2350_SPARE_IRQ_5 51
 
 #define RP2350_ROM_BASE 0x00000000
@@ -111,6 +118,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 
 #define RP2350_SRAM_BASE 0x20000000
 #define RP2350_SRAM_SIZE (520 * KiB)
+/*
+ * The SRAM power domains: SRAM0 is banks 0-3, the lower half of the
+ * striped window; SRAM1 is banks 4-7 and the SRAM8/9 scratch banks.
+ */
+#define RP2350_SRAM0_DOMAIN_SIZE (256 * KiB)
+#define RP2350_SRAM1_DOMAIN_SIZE (RP2350_SRAM_SIZE - RP2350_SRAM0_DOMAIN_SIZE)
 
 #define RP2350_EPPB_BASE 0xe0080000
 
@@ -132,6 +145,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_UART1_BASE 0x40078000
 #define RP2350_SPI0_BASE 0x40080000
 #define RP2350_SPI1_BASE 0x40088000
+#define RP2350_I2C0_BASE 0x40090000
+#define RP2350_I2C1_BASE 0x40098000
 #define RP2350_PLL_SYS_BASE 0x40050000
 #define RP2350_PLL_USB_BASE 0x40058000
 #define RP2350_TICKS_BASE 0x40108000
@@ -147,6 +162,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_SHA256_BASE 0x400f8000
 #define RP2350_HSTX_CTRL_BASE 0x400c0000
 #define RP2350_HSTX_FIFO_BASE 0x50600000
+#define RP2350_POWMAN_BASE 0x40100000
 #define RP2350_USBCTRL_DPRAM_BASE 0x50100000
 #define RP2350_USBCTRL_REGS_BASE 0x50110000
 #define RP2350_SIO_BASE 0xd0000000
@@ -161,6 +177,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
  * pico-sdk switches it to.
  */
 #define RP2350_CLK_REF_HZ 12000000
+/*
+ * clk_peri, the UARTs' UARTCLK, at the clk_sys frequency pico-sdk runs it
+ * from. Its divider and enable are not modelled.
+ */
+#define RP2350_CLK_PERI_HZ 150000000
 /* clk_adc, as pico-sdk sets it up from PLL_USB. */
 #define RP2350_CLK_ADC_HZ 48000000
 
@@ -185,6 +206,7 @@ struct RP2350State {
     RP2350ResetsState resets;
     RP2350PSMState psm;
     RP2350WatchdogState watchdog;
+    RP2350PowmanState powman;
     RP2350SIOState sio;
     RP2350GPIOState gpio;
     RP2350RCPState rcp;
@@ -214,6 +236,7 @@ struct RP2350State {
     PL022State spi[RP2350_NUM_SPIS];
     /* Wires the chip selects of the SSI devices on the SPI buses. */
     Notifier spi_cs_notifier;
+    DesignWareI2CState i2c[RP2350_NUM_I2C];
     RP2350CoreSightState coresight;
     RP2350CoreSightTraceState coresight_trace;
     RP2350OTPState otp;
@@ -222,6 +245,8 @@ struct RP2350State {
     MemoryRegion uart_alias[RP2350_NUM_UARTS];
     /* The SPI controllers' register windows plus their atomic aliases. */
     MemoryRegion spi_alias[RP2350_NUM_SPIS];
+    /* The I2C controllers' register windows plus their atomic aliases. */
+    MemoryRegion i2c_alias[RP2350_NUM_I2C];
     /* Core 0's SIO views as seen from system memory (debug, qtest). */
     MemoryRegion sio_sysmem[2];
     /* Core 0's EPPB as seen from system memory (debug, qtest). */
@@ -233,6 +258,10 @@ struct RP2350State {
 
     MemoryRegion rom;
     MemoryRegion sram;
+    /* Over SRAM0 and SRAM1 while their power domain is down. */
+    MemoryRegion sram_off[2];
+    /* SRAM, for clearing a domain that powers down. */
+    AddressSpace sram_as;
 
     MemoryRegion *board_memory;
 
@@ -243,6 +272,7 @@ struct RP2350State {
 
     Clock *sysclk;
     Clock *refclk;
+    Clock *periclk;
     Clock *adcclk;
 };
 
@@ -270,5 +300,14 @@ void rp2350_soc_attach_reset(RP2350State *s, int reset, DeviceState *dev);
  * mask sees it.
  */
 qemu_irq rp2350_soc_core_irq(RP2350State *s, int core, int n);
+
+/*
+ * Reset the machine as the chip-level reset the power manager has
+ * pending: a cold reset of `type` becomes that reset's type (see
+ * rp2350_powman_next_reset_type()). Processors stay off while the
+ * switched core is unpowered; otherwise, with no ROM executing, core 0
+ * starts as the boot ROM would hand it over.
+ */
+void rp2350_soc_system_reset(RP2350State *s, ResetType type);
 
 #endif

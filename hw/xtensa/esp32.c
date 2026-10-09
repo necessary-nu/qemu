@@ -2,6 +2,7 @@
  * ESP32 SoC and machine
  *
  * Copyright (c) 2019 Espressif Systems (Shanghai) Co. Ltd.
+ * Copyright (c) 2026 Necessary Innovations AB
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 or
@@ -442,6 +443,9 @@ static void esp32_gate_update_clocks(Esp32SocState *s, Esp32PeriphGate *g)
     if (g->ref_tick_clk) {
         clock_update_hz(g->ref_tick_clk, running ? s->ref_tick_hz : 0);
     }
+    if (g->rc_fast_clk) {
+        clock_update_hz(g->rc_fast_clk, running ? ESP32_RC_FAST_HZ : 0);
+    }
     if (g->f160m_clk) {
         clock_update_hz(g->f160m_clk, running ? ESP32_PLL_F160M_HZ : 0);
     }
@@ -720,6 +724,112 @@ static void esp32_soc_add_unimp_device(MemoryRegion *dest, const char* name, hwa
     g_free(name_apb);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * The peripherals' line-level signals go through the GPIO matrix, by their
+ * signal numbers, in and out: the UARTs' TXD, RTS and DTR and RXD, CTS and
+ * DSR, the I2C controllers' SCL and SDA, the LEDC channels' outputs and the
+ * TWAI's TX, RX, BUS_OFF and CLKOUT.
+ *
+ * The board's serial terminals sit on the pads of the UARTs' IO_MUX
+ * functions: UART0 on U0TXD (GPIO1) and U0RXD (GPIO3), UART1 on GPIO10 and
+ * GPIO9, UART2 on GPIO17 and GPIO16.
+ */
+static void esp32_soc_connect_lines(Esp32SocState *s)
+{
+    static const struct {
+        int txd, rts, dtr, rxd, cts, dsr;
+        int tx_pad, rx_pad;
+    } uart_lines[ESP32_UART_COUNT] = {
+        { ESP32_SIG_U0TXD_OUT, ESP32_SIG_U0RTS_OUT, ESP32_SIG_U0DTR_OUT,
+          ESP32_SIG_U0RXD_IN, ESP32_SIG_U0CTS_IN, ESP32_SIG_U0DSR_IN, 1, 3 },
+        { ESP32_SIG_U1TXD_OUT, ESP32_SIG_U1RTS_OUT, -1,
+          ESP32_SIG_U1RXD_IN, ESP32_SIG_U1CTS_IN, -1, 10, 9 },
+        { ESP32_SIG_U2TXD_OUT, ESP32_SIG_U2RTS_OUT, -1,
+          ESP32_SIG_U2RXD_IN, ESP32_SIG_U2CTS_IN, -1, 17, 16 },
+    };
+    static const struct {
+        int scl, sda;
+    } i2c_lines[ESP32_I2C_COUNT] = {
+        { ESP32_SIG_I2CEXT0_SCL, ESP32_SIG_I2CEXT0_SDA },
+        { ESP32_SIG_I2CEXT1_SCL, ESP32_SIG_I2CEXT1_SDA },
+    };
+    DeviceState *gpio = DEVICE(&s->gpio);
+
+#define SIG_OUT(n) qdev_get_gpio_in_named(gpio, ESP32_GPIO_SIG_OUT, (n))
+
+    for (int i = 0; i < ESP32_UART_COUNT; i++) {
+        DeviceState *uart = DEVICE(&s->uart[i]);
+        DeviceState *term = DEVICE(&s->terminal[i]);
+
+        qdev_connect_gpio_out_named(uart, ESP32_UART_TXD, 0,
+                                    SIG_OUT(uart_lines[i].txd));
+        qdev_connect_gpio_out_named(uart, ESP32_UART_RTS, 0,
+                                    SIG_OUT(uart_lines[i].rts));
+        qdev_connect_gpio_out_named(gpio, ESP32_GPIO_SIG_IN,
+                                    uart_lines[i].rxd,
+                                    qdev_get_gpio_in_named(uart,
+                                        ESP32_UART_RXD, 0));
+        qdev_connect_gpio_out_named(gpio, ESP32_GPIO_SIG_IN,
+                                    uart_lines[i].cts,
+                                    qdev_get_gpio_in_named(uart,
+                                        ESP32_UART_CTS, 0));
+        if (uart_lines[i].dtr >= 0) {
+            qdev_connect_gpio_out_named(uart, ESP32_UART_DTR, 0,
+                                        SIG_OUT(uart_lines[i].dtr));
+            qdev_connect_gpio_out_named(gpio, ESP32_GPIO_SIG_IN,
+                                        uart_lines[i].dsr,
+                                        qdev_get_gpio_in_named(uart,
+                                            ESP32_UART_DSR, 0));
+        }
+        qdev_connect_gpio_out_named(gpio, ESP32_GPIO_PAD_OUT,
+                                    uart_lines[i].tx_pad,
+                                    qdev_get_gpio_in_named(term,
+                                        ESP32_UART_TERMINAL_RX, 0));
+        qdev_connect_gpio_out_named(term, ESP32_UART_TERMINAL_TX, 0,
+                                    qdev_get_gpio_in_named(gpio,
+                                        ESP32_GPIO_PAD_IN,
+                                        uart_lines[i].rx_pad));
+    }
+
+    for (int i = 0; i < ESP32_I2C_COUNT; i++) {
+        DeviceState *i2c = DEVICE(&s->i2c[i]);
+
+        qdev_connect_gpio_out_named(i2c, ESP32_I2C_SCL_OUT, 0,
+                                    SIG_OUT(i2c_lines[i].scl));
+        qdev_connect_gpio_out_named(i2c, ESP32_I2C_SDA_OUT, 0,
+                                    SIG_OUT(i2c_lines[i].sda));
+        qdev_connect_gpio_out_named(gpio, ESP32_GPIO_SIG_IN, i2c_lines[i].scl,
+                                    qdev_get_gpio_in_named(i2c,
+                                        ESP32_I2C_SCL_IN, 0));
+        qdev_connect_gpio_out_named(gpio, ESP32_GPIO_SIG_IN, i2c_lines[i].sda,
+                                    qdev_get_gpio_in_named(i2c,
+                                        ESP32_I2C_SDA_IN, 0));
+    }
+
+    for (int n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->ledc), ESP32_LEDC_OUT, n,
+                                    SIG_OUT(ESP32_SIG_LEDC_HS0 + n));
+    }
+
+    qdev_connect_gpio_out_named(DEVICE(&s->twai), ESP32_TWAI_TX, 0,
+                                SIG_OUT(ESP32_SIG_TWAI_TX));
+    qdev_connect_gpio_out_named(DEVICE(&s->twai), ESP32_TWAI_BUS_OFF, 0,
+                                SIG_OUT(ESP32_SIG_TWAI_BUS_OFF));
+    qdev_connect_gpio_out_named(DEVICE(&s->twai), ESP32_TWAI_CLKOUT, 0,
+                                SIG_OUT(ESP32_SIG_TWAI_CLKOUT));
+    qdev_connect_gpio_out_named(gpio, ESP32_GPIO_SIG_IN, ESP32_SIG_TWAI_RX,
+                                qdev_get_gpio_in_named(DEVICE(&s->twai),
+                                    ESP32_TWAI_RX, 0));
+#undef SIG_OUT
+
+    for (int i = 0; i < ESP32_UART_COUNT; i++) {
+        object_property_set_link(OBJECT(&s->terminal[i]), "uart",
+                                 OBJECT(&s->uart[i]), &error_abort);
+        qdev_realize(DEVICE(&s->terminal[i]), NULL, &error_fatal);
+    }
+}
+
 static void esp32_soc_realize(DeviceState *dev, Error **errp)
 {
     Esp32SocState *s = ESP32_SOC(dev);
@@ -944,9 +1054,17 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                R_DPORT_PERI_AES_MASK, R_DPORT_PERI_AES_MASK);
 
     qdev_realize(DEVICE(&s->ledc), &s->periph_bus, &error_fatal);
-    esp32_soc_add_gated_device(s, &s->ledc, DR_REG_LEDC_BASE,
-                               ESP32_GATE_PERIP, R_DPORT_PERIP_LEDC_MASK,
-                               R_DPORT_PERIP_LEDC_MASK);
+    {
+        Esp32PeriphGate *g = esp32_soc_add_gated_device(
+            s, &s->ledc, DR_REG_LEDC_BASE, ESP32_GATE_PERIP,
+            R_DPORT_PERIP_LEDC_MASK, R_DPORT_PERIP_LEDC_MASK);
+
+        g->apb_clk = s->ledc_apb_clk;
+        g->ref_tick_clk = s->ledc_ref_tick_clk;
+        g->rc_fast_clk = s->ledc_rc_fast_clk;
+    }
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->ledc), 0,
+                       qdev_get_gpio_in(intmatrix_dev, ETS_LEDC_INTR_SOURCE));
 
     /*
      * [spec:nuos:req:emu.esp32.rmt]
@@ -1368,6 +1486,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
      * in realize function. That means that irq linking MUST be
      * performed before realization of TWAI peripheral.
      */
+    object_property_set_link(OBJECT(&s->twai), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
     qdev_realize(DEVICE(&s->twai), &s->periph_bus, &error_fatal);
     {
         /* Reading the SJA1000 interrupt register clears it. */
@@ -1376,6 +1496,7 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
             R_DPORT_PERIP_TWAI_MASK, R_DPORT_PERIP_TWAI_MASK);
         g->volatile_reg = ESP32_TWAI_INT_RAW_OFFSET;
         g->has_volatile_reg = true;
+        g->apb_clk = s->twai_apb_clk;
     }
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->twai), 0,
                        qdev_get_gpio_in(intmatrix_dev, ETS_CAN_INTR_SOURCE));
@@ -1517,6 +1638,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.analog", DR_REG_ANA_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.sens", DR_REG_SENS_BASE, 0x400);
 
+    esp32_soc_connect_lines(s);
+
     qemu_register_reset((QEMUResetHandler*) esp32_soc_reset, dev);
 }
 
@@ -1581,9 +1704,15 @@ static void esp32_soc_init(Object *obj)
         qdev_connect_clock_in(i2s, "apll", s->apll_clk);
     }
 
-    object_property_add_alias(obj, "serial0", OBJECT(&s->uart[0]), "chardev");
-    object_property_add_alias(obj, "serial1", OBJECT(&s->uart[1]), "chardev");
-    object_property_add_alias(obj, "serial2", OBJECT(&s->uart[2]), "chardev");
+
+    for (int i = 0; i < ESP32_UART_COUNT; ++i) {
+        snprintf(name, sizeof(name), "terminal%d", i);
+        object_initialize_child(obj, name, &s->terminal[i],
+                                TYPE_ESP32_UART_TERMINAL);
+        snprintf(name, sizeof(name), "serial%d", i);
+        object_property_add_alias(obj, name, OBJECT(&s->terminal[i]),
+                                  "chardev");
+    }
 
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_ESP32_GPIO);
     s->gpio_apb_clk = clock_new(obj, "gpio-apb");
@@ -1642,6 +1771,8 @@ static void esp32_soc_init(Object *obj)
     }
 
     object_initialize_child(obj, "twai", &s->twai, TYPE_ESP32_TWAI);
+    s->twai_apb_clk = clock_new(obj, "twai-apb");
+    qdev_connect_clock_in(DEVICE(&s->twai), "apb", s->twai_apb_clk);
 
     object_initialize_child(obj, "rng", &s->rng, TYPE_ESP32_RNG);
 
@@ -1650,6 +1781,12 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "aes", &s->aes, TYPE_ESP32_AES);
 
     object_initialize_child(obj, "ledc", &s->ledc, TYPE_ESP32_LEDC);
+    s->ledc_apb_clk = clock_new(obj, "ledc-apb");
+    qdev_connect_clock_in(DEVICE(&s->ledc), "apb", s->ledc_apb_clk);
+    s->ledc_ref_tick_clk = clock_new(obj, "ledc-ref");
+    qdev_connect_clock_in(DEVICE(&s->ledc), "ref_tick", s->ledc_ref_tick_clk);
+    s->ledc_rc_fast_clk = clock_new(obj, "ledc-rc-fast");
+    qdev_connect_clock_in(DEVICE(&s->ledc), "rc_fast", s->ledc_rc_fast_clk);
     object_initialize_child(obj, "rmt", &s->rmt, TYPE_ESP32_RMT);
     s->rmt_apb_clk = clock_new(obj, "rmt-apb");
     qdev_connect_clock_in(DEVICE(&s->rmt), "apb", s->rmt_apb_clk);

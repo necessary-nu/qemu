@@ -200,7 +200,8 @@ static void test_usb_dpram(void)
     g_autofree char *path = NULL;
     QTestState *qts = boot_direct(&path);
 
-    rp2350_unreset(qts, 1u << 28);
+    /* USBCTRL, DPRAM included, starts held in reset. */
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
     qtest_writel(qts, USB_DPRAM_BASE, 0x11223344);
     qtest_writeb(qts, USB_DPRAM_BASE + 1, 0xaa);
     qtest_writew(qts, USB_DPRAM_BASE + 2, 0xbbcc);

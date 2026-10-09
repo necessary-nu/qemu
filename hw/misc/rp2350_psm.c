@@ -106,6 +106,29 @@ static void psm_watchdog_reset(void *opaque, int n, int level)
     }
 }
 
+static void psm_reset_regs(RP2350PSMState *s)
+{
+    s->frce_on = 0;
+    s->frce_off = 0;
+    s->wdsel = 0;
+}
+
+/*
+ * A chip-level reset from the power manager that resets the PSM: its
+ * registers return to their reset values and it runs the full sequence,
+ * from the processor cold reset on.
+ */
+/* [spec:nuos:req:emu.powman] */
+static void psm_powman_reset(void *opaque, int n, int level)
+{
+    RP2350PSMState *s = opaque;
+
+    if (level) {
+        psm_reset_regs(s);
+        psm_request(s, RP2350_PSM_ALL, false);
+    }
+}
+
 /* [spec:nuos:req:emu.watchdog] */
 static uint64_t rp2350_psm_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -182,9 +205,7 @@ static void rp2350_psm_hold_reset(Object *obj, ResetType type)
 {
     RP2350PSMState *s = RP2350_PSM(obj);
 
-    s->frce_on = 0;
-    s->frce_off = 0;
-    s->wdsel = 0;
+    psm_reset_regs(s);
     /* A chip-level reset supersedes any partial sequence still queued. */
     s->pending = 0;
     s->pending_watchdog = false;
@@ -209,6 +230,7 @@ static void rp2350_psm_init(Object *obj)
                           TYPE_RP2350_PSM, RP2350_ATOMIC_REGION_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_in_named(DEVICE(obj), psm_watchdog_reset, "watchdog", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), psm_powman_reset, "powman-reset", 1);
     s->bh = qemu_bh_new(psm_run, s);
 }
 

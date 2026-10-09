@@ -17,6 +17,10 @@ config PL011
 
 config PL011_C
     bool
+    select UART_LINE
+
+config UART_LINE
+    bool
 
 config SERIAL
     bool

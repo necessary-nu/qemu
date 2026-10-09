@@ -292,7 +292,8 @@ static bool sig_in_default(unsigned sig)
 
 /*
  * Output signals of peripherals that hold them high out of reset: the
- * UARTs' TXD, RTS and DTR, the SPI chip selects and the I2C lines. They
+ * UARTs' TXD, RTS and DTR, the SPI chip selects, the I2C lines and the
+ * TWAI's TX. They
  * start high so that a peripheral which does not drive the line yet does
  * not pull its pad low.
  */
@@ -306,6 +307,7 @@ static bool sig_out_idle(unsigned sig)
     case 61 ... 62:     /* HSPICS1-2 */
     case 68 ... 70:     /* VSPICS0-2 */
     case 95 ... 96:     /* I2CEXT1_SCL, I2CEXT1_SDA */
+    case 123:           /* twai_tx, recessive */
     case 198 ... 199:   /* U2TXD, U2RTS */
         return true;
     default:
@@ -343,6 +345,56 @@ static const IomuxFunc *pad_func(Esp32GpioState *s, unsigned n,
         return &iomux_none;
     }
     return &iomux_funcs[n][f];
+}
+
+/*
+ * The time of the line change being propagated, while esp32_line_set_at()
+ * propagates one; INT64_MIN otherwise. Changes nest: a receiver can answer
+ * a stamped change with a change of its own.
+ */
+static int64_t line_stamp = INT64_MIN;
+static NotifierList line_sources = NOTIFIER_LIST_INITIALIZER(line_sources);
+static bool line_syncing;
+
+/* [spec:nuos:req:emu.esp32.gpio] */
+int64_t esp32_line_time(void)
+{
+    if (line_stamp != INT64_MIN) {
+        return line_stamp;
+    }
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+/* [spec:nuos:req:emu.esp32.gpio] */
+void esp32_line_set_at(qemu_irq line, int level, int64_t when_ns)
+{
+    int64_t saved = line_stamp;
+
+    line_stamp = when_ns;
+    qemu_set_irq(line, level);
+    line_stamp = saved;
+}
+
+/* [spec:nuos:req:emu.esp32.gpio] */
+void esp32_line_add_source(Notifier *n)
+{
+    notifier_list_add(&line_sources, n);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * Bring every registered source's outputs up to the present. A source
+ * syncing may change lines whose receivers sample the pads again; that
+ * inner sample sees the sources as they are.
+ */
+void esp32_line_sync(void)
+{
+    if (line_syncing) {
+        return;
+    }
+    line_syncing = true;
+    notifier_list_notify(&line_sources, NULL);
+    line_syncing = false;
 }
 
 /*
@@ -417,67 +469,88 @@ static uint64_t int_view(Esp32GpioState *s, unsigned k)
  * the output enable from GPIO_ENABLE instead of the peripheral and
  * OEN_INV_SEL inverts it, as ESP-IDF's gpio_ll_iomux_out() relies on.
  */
+/*
+ * What drives pad n's output driver: its level and enable, and the matrix
+ * signal it carries (-1 for GPIO_OUT, an IO_MUX function of its own, or
+ * nothing). An open-drain pad with a high output is not driven.
+ */
+static int esp32_gpio_pad_drive(Esp32GpioState *s, unsigned n, bool *val_out,
+                                bool *oe_out)
+{
+    uint32_t cfg = s->func_out_sel[n];
+    bool val = false, oe = false, oe_periph = false;
+    int sig = -1;
+    unsigned f, sel, idx;
+    const IomuxFunc *fn;
+
+    if (!bit64(PAD_VALID, n) || !bit64(PAD_OUTPUT, n)) {
+        *val_out = false;
+        *oe_out = false;
+        return -1;
+    }
+    if (bit64(s->rtc_mux, n)) {
+        /* The RTC IO MUX drives the pad, carrying no matrix signal */
+        *val_out = bit64(s->rtc_out, n);
+        *oe_out = bit64(s->rtc_oe, n);
+        return -1;
+    }
+    fn = pad_func(s, n, &f);
+    switch (fn->kind) {
+    case IOMUX_GPIO:
+        sel = FIELD_EX32(cfg, GPIO_FUNC0_OUT_SEL_CFG, OUT_SEL);
+        if (sel == ESP32_SIG_GPIO_OUT) {
+            val = bit64(gpio_out_all(s), n);
+            oe_periph = bit64(gpio_enable_all(s), n);
+        } else if (sel < ESP32_GPIO_SIG_COUNT) {
+            val = s->sig_out[sel];
+            oe_periph = s->sig_oe[sel];
+            sig = sel;
+        }
+        val ^= FIELD_EX32(cfg, GPIO_FUNC0_OUT_SEL_CFG, OUT_INV_SEL);
+        break;
+    case IOMUX_SIG:
+        if (fn->sig_out >= 0) {
+            val = s->sig_out[fn->sig_out];
+            oe_periph = s->sig_oe[fn->sig_out];
+            sig = fn->sig_out;
+        }
+        break;
+    case IOMUX_DIRECT:
+        idx = n * ESP32_IOMUX_FUNC_COUNT + f;
+        val = s->iomux_func_out[idx];
+        oe_periph = s->iomux_func_oe[idx];
+        break;
+    default:
+        break;
+    }
+    oe = FIELD_EX32(cfg, GPIO_FUNC0_OUT_SEL_CFG, OEN_SEL) ?
+         bit64(gpio_enable_all(s), n) : oe_periph;
+    oe ^= FIELD_EX32(cfg, GPIO_FUNC0_OUT_SEL_CFG, OEN_INV_SEL);
+    *val_out = val;
+    *oe_out = oe;
+    return sig;
+}
+
 static void esp32_gpio_resolve(Esp32GpioState *s, uint64_t *pad_out,
                                uint64_t *in_out)
 {
-    uint64_t out_all = gpio_out_all(s);
-    uint64_t enable_all = gpio_enable_all(s);
     uint64_t pad = 0, in = 0;
 
     for (unsigned n = 0; n < ESP32_GPIO_PIN_COUNT; n++) {
         uint32_t mux = s->iomux[n];
-        uint32_t cfg = s->func_out_sel[n];
-        bool val = false, oe = false, level, pull_up, ie;
-        unsigned f;
-        const IomuxFunc *fn;
+        bool val, oe, level, pull_up, ie;
 
         if (!bit64(PAD_VALID, n)) {
             continue;
         }
-        fn = pad_func(s, n, &f);
+        esp32_gpio_pad_drive(s, n, &val, &oe);
         if (bit64(s->rtc_mux, n)) {
             /* [spec:nuos:req:emu.esp32.rtc] The RTC IO MUX has the pad */
-            val = bit64(s->rtc_out, n);
-            oe = bit64(PAD_OUTPUT, n) && bit64(s->rtc_oe, n);
             pull_up = bit64(s->rtc_pu, n);
             ie = bit64(s->rtc_ie, n);
         } else {
             pull_up = FIELD_EX32(mux, IO_MUX_GPIO36, FUN_WPU);
             ie = FIELD_EX32(mux, IO_MUX_GPIO36, FUN_IE);
-        }
-        if (bit64(PAD_OUTPUT, n) && !bit64(s->rtc_mux, n)) {
-            bool oe_periph = false;
-            unsigned sel, idx;
-
-            switch (fn->kind) {
-            case IOMUX_GPIO:
-                sel = FIELD_EX32(cfg, GPIO_FUNC0_OUT_SEL_CFG, OUT_SEL);
-                if (sel == ESP32_SIG_GPIO_OUT) {
-                    val = bit64(out_all, n);
-                    oe_periph = bit64(enable_all, n);
-                } else if (sel < ESP32_GPIO_SIG_COUNT) {
-                    val = s->sig_out[sel];
-                    oe_periph = s->sig_oe[sel];
-                }
-                val ^= FIELD_EX32(cfg, GPIO_FUNC0_OUT_SEL_CFG, OUT_INV_SEL);
-                break;
-            case IOMUX_SIG:
-                if (fn->sig_out >= 0) {
-                    val = s->sig_out[fn->sig_out];
-                    oe_periph = s->sig_oe[fn->sig_out];
-                }
-                break;
-            case IOMUX_DIRECT:
-                idx = n * ESP32_IOMUX_FUNC_COUNT + f;
-                val = s->iomux_func_out[idx];
-                oe_periph = s->iomux_func_oe[idx];
-                break;
-            default:
-                break;
-            }
-            oe = FIELD_EX32(cfg, GPIO_FUNC0_OUT_SEL_CFG, OEN_SEL) ?
-                 bit64(enable_all, n) : oe_periph;
-            oe ^= FIELD_EX32(cfg, GPIO_FUNC0_OUT_SEL_CFG, OEN_INV_SEL);
         }
         if (!bit64(s->rtc_mux, n) &&
             FIELD_EX32(s->pin[n], GPIO_PIN0, PAD_DRIVER) && val) {
@@ -791,6 +864,64 @@ static void esp32_gpio_update(Esp32GpioState *s)
     s->updating = false;
 }
 
+/* [spec:nuos:req:emu.esp32.gpio] */
+uint64_t esp32_gpio_sig_out_pads(Esp32GpioState *s, unsigned sig)
+{
+    uint64_t pads = 0;
+
+    for (unsigned n = 0; n < ESP32_GPIO_PIN_COUNT; n++) {
+        bool val, oe;
+
+        if (esp32_gpio_pad_drive(s, n, &val, &oe) == (int)sig && oe) {
+            pads |= 1ULL << n;
+        }
+    }
+    return pads;
+}
+
+/* [spec:nuos:req:emu.esp32.gpio] */
+int esp32_gpio_sig_in_pad(Esp32GpioState *s, unsigned sig)
+{
+    uint32_t cfg = s->func_in_sel[sig];
+    int pad = -1;
+
+    if (FIELD_EX32(cfg, GPIO_FUNC0_IN_SEL_CFG, SIG_IN_SEL)) {
+        unsigned sel = FIELD_EX32(cfg, GPIO_FUNC0_IN_SEL_CFG, IN_SEL);
+
+        if (sel < ESP32_GPIO_PIN_COUNT && bit64(PAD_VALID, sel)) {
+            pad = sel;
+        }
+    } else {
+        for (unsigned n = 0; n < ESP32_GPIO_PIN_COUNT; n++) {
+            unsigned f;
+            const IomuxFunc *fn = pad_func(s, n, &f);
+
+            if (bit64(PAD_VALID, n) && fn->kind == IOMUX_SIG &&
+                fn->sig_in == (int)sig) {
+                pad = n;
+                break;
+            }
+        }
+    }
+    if (pad >= 0 && !(bit64(s->rtc_mux, pad) ? bit64(s->rtc_ie, pad) :
+                      FIELD_EX32(s->iomux[pad], IO_MUX_GPIO36, FUN_IE))) {
+        return -1;
+    }
+    return pad;
+}
+
+void esp32_gpio_add_route_notifier(Esp32GpioState *s, Notifier *n)
+{
+    notifier_list_add(&s->route_notifiers, n);
+}
+
+/* Bring the line sources up to now, then resolve the pads. */
+static void esp32_gpio_sample(Esp32GpioState *s)
+{
+    esp32_line_sync();
+    esp32_gpio_update(s);
+}
+
 static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
@@ -824,34 +955,34 @@ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
     case A_GPIO_STRAP:
         return s->strap_mode & 0xffff;
     case A_GPIO_IN:
-        esp32_gpio_update(s);
+        esp32_gpio_sample(s);
         return (uint32_t)s->in_level;
     case A_GPIO_IN1:
-        esp32_gpio_update(s);
+        esp32_gpio_sample(s);
         return (uint32_t)(s->in_level >> 32);
     case A_GPIO_STATUS:
-        esp32_gpio_update(s);
+        esp32_gpio_sample(s);
         return s->status;
     case A_GPIO_STATUS1:
-        esp32_gpio_update(s);
+        esp32_gpio_sample(s);
         return s->status1;
     case A_GPIO_ACPU_INT:
     case A_GPIO_ACPU_NMI_INT:
     case A_GPIO_PCPU_INT:
     case A_GPIO_PCPU_NMI_INT:
-        esp32_gpio_update(s);
+        esp32_gpio_sample(s);
         return (uint32_t)int_view(s, (addr - A_GPIO_ACPU_INT) / 4);
     case A_GPIO_CPUSDIO_INT:
-        esp32_gpio_update(s);
+        esp32_gpio_sample(s);
         return (uint32_t)int_view(s, INT_ENA_SDIO);
     case A_GPIO_ACPU_INT1:
     case A_GPIO_ACPU_NMI_INT1:
     case A_GPIO_PCPU_INT1:
     case A_GPIO_PCPU_NMI_INT1:
-        esp32_gpio_update(s);
+        esp32_gpio_sample(s);
         return (uint32_t)(int_view(s, (addr - A_GPIO_ACPU_INT1) / 4) >> 32);
     case A_GPIO_CPUSDIO_INT1:
-        esp32_gpio_update(s);
+        esp32_gpio_sample(s);
         return (uint32_t)(int_view(s, INT_ENA_SDIO) >> 32);
     case A_GPIO_PIN0 ... A_GPIO_PIN0 + 39 * GPIO_PIN_STRIDE:
         return s->pin[(addr - A_GPIO_PIN0) / GPIO_PIN_STRIDE];
@@ -907,6 +1038,7 @@ static void esp32_gpio_write(void *opaque, hwaddr addr,
     Esp32GpioState *s = ESP32_GPIO(opaque);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t v = value;
+    bool route = false;
     unsigned i;
 
     switch (addr) {
@@ -936,21 +1068,27 @@ static void esp32_gpio_write(void *opaque, hwaddr addr,
         break;
     case A_GPIO_ENABLE:
         s->enable = v;
+        route = true;
         break;
     case A_GPIO_ENABLE_W1TS:
         s->enable |= v;
+        route = true;
         break;
     case A_GPIO_ENABLE_W1TC:
         s->enable &= ~v;
+        route = true;
         break;
     case A_GPIO_ENABLE1:
         s->enable1 = v & HIGH_PADS_MASK;
+        route = true;
         break;
     case A_GPIO_ENABLE1_W1TS:
         s->enable1 |= v & HIGH_PADS_MASK;
+        route = true;
         break;
     case A_GPIO_ENABLE1_W1TC:
         s->enable1 &= ~v;
+        route = true;
         break;
     case A_GPIO_STATUS:
         s->status = v;
@@ -990,10 +1128,12 @@ static void esp32_gpio_write(void *opaque, hwaddr addr,
         i = (addr - A_GPIO_FUNC0_IN_SEL_CFG) / 4;
         s->func_in_sel[i] = v & GPIO_FUNC_IN_WRITABLE;
         esp32_gpio_check_in_sel(i, s->func_in_sel[i]);
+        route = true;
         break;
     case A_GPIO_FUNC0_OUT_SEL_CFG ... A_GPIO_FUNC0_OUT_SEL_CFG + 39 * 4:
         i = (addr - A_GPIO_FUNC0_OUT_SEL_CFG) / 4;
         s->func_out_sel[i] = v & GPIO_FUNC_OUT_WRITABLE;
+        route = true;
         if (FIELD_EX32(v, GPIO_FUNC0_OUT_SEL_CFG, OUT_SEL) >
             ESP32_SIG_GPIO_OUT) {
             qemu_log_mask(LOG_GUEST_ERROR,
@@ -1042,6 +1182,9 @@ static void esp32_gpio_write(void *opaque, hwaddr addr,
         return;
     }
     esp32_gpio_update(s);
+    if (route) {
+        notifier_list_notify(&s->route_notifiers, s);
+    }
 }
 
 static const MemoryRegionOps esp32_gpio_ops = {
@@ -1111,6 +1254,7 @@ static void esp32_iomux_write(void *opaque, hwaddr addr,
                       "sleep is not modelled\n", gpio);
     }
     esp32_gpio_update(s);
+    notifier_list_notify(&s->route_notifiers, s);
 }
 
 static const MemoryRegionOps esp32_iomux_ops = {
@@ -1148,6 +1292,9 @@ static void esp32_gpio_set_sig_out(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (s->sig_out[n] == (level != 0)) {
+        return;
+    }
     s->sig_out[n] = level != 0;
     esp32_gpio_update(s);
 }
@@ -1188,6 +1335,7 @@ static void esp32_gpio_set_rtc_mux(void *opaque, int n, int level)
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
     esp32_gpio_set_rtc(&s->rtc_mux, s, n, level);
+    notifier_list_notify(&s->route_notifiers, s);
 }
 
 static void esp32_gpio_set_rtc_out(void *opaque, int n, int level)
@@ -1292,6 +1440,7 @@ static void esp32_gpio_reset_exit(Object *obj, ResetType type)
 
     /* Interrupt types are all disabled, so this latches no interrupt. */
     esp32_gpio_update(s);
+    notifier_list_notify(&s->route_notifiers, s);
 }
 
 static void esp32_gpio_realize(DeviceState *dev, Error **errp)
@@ -1315,6 +1464,7 @@ static void esp32_gpio_init(Object *obj)
     }
     s->apb_clk = qdev_init_clock_in(dev, "apb", esp32_gpio_apb_update, s,
                                     ClockPreUpdate);
+    notifier_list_init(&s->route_notifiers);
 
     qdev_init_gpio_in_named(dev, esp32_gpio_pad_in, ESP32_GPIO_PAD_IN,
                             ESP32_GPIO_PIN_COUNT);

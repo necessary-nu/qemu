@@ -19,7 +19,9 @@
  *                 image given as well is mapped, so ROM function lookups
  *                 work, but not executed. Watchdog and PSM resets of the
  *                 processors restart them the same way, with the machine
- *                 honouring the boot ROM's watchdog boot vector.
+ *                 honouring the boot ROM's POWMAN and watchdog boot
+ *                 vectors, and so does a power-up from a low-power
+ *                 state.
  *
  * With neither, the boot ROM region is blank and the cores lock up at
  * reset, as on a part with an empty ROM.
@@ -33,6 +35,13 @@
  * erases and programs, back it with a raw image of exactly flash-size:
  *
  *   -drive if=mtd,format=raw,file=flash.img
+ *
+ * The serial ports are host serial adapters on UART pins: -serial (the
+ * first) is wired to GPIO 0 (UART0 TX) and GPIO 1 (UART0 RX), as a Pico 2's
+ * debug probe is, and a second -serial to GPIO 4 (UART1 TX) and GPIO 5
+ * (UART1 RX). They run 8N1 at 115200 baud, pico-sdk's default; to use
+ * another rate, -global uart-line.baud=RATE. Software sees the console
+ * only once it selects the UART function on those pins.
  *
  * OTP starts as a blank chip and lives in RAM. To keep programmed rows
  * across runs, back it with a 16 KiB raw image:
@@ -48,13 +57,16 @@
 #include "hw/arm/boot.h"
 #include "hw/arm/rp2350_soc.h"
 #include "hw/block/aps6404l.h"
+#include "hw/char/uart-line.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "qapi/visitor.h"
 #include "system/address-spaces.h"
 #include "system/blockdev.h"
 #include "system/reset.h"
+#include "system/system.h"
 
 struct RP2350MachineState {
     MachineState parent;
@@ -67,12 +79,15 @@ struct RP2350MachineState {
 #define TYPE_RP2350_MACHINE MACHINE_TYPE_NAME("rp2350")
 OBJECT_DECLARE_SIMPLE_TYPE(RP2350MachineState, RP2350_MACHINE)
 
-/* Core 0 starts as the boot ROM would leave it for a flash image. */
-static void rp2350_direct_reset(void *opaque)
+/*
+ * A system reset is whichever chip-level reset the power manager has
+ * pending; with no ROM executing, core 0 then starts as the boot ROM
+ * would leave it for a flash image.
+ */
+/* [spec:nuos:req:emu.powman] */
+static void rp2350_machine_reset(MachineState *machine, ResetType type)
 {
-    RP2350MachineState *s = opaque;
-
-    rp2350_soc_boot_rom_handoff(&s->soc, 0);
+    rp2350_soc_system_reset(&RP2350_MACHINE(machine)->soc, type);
 }
 
 /*
@@ -84,6 +99,41 @@ static void rp2350_direct_reset(void *opaque)
  * stays there until reset. Nothing is loaded into flash in this case, so
  * a machine with no flash configured still has an empty XIP window.
  */
+/* The board's UART wiring: each serial port's adapter and its pins. */
+static const struct {
+    int tx_pin;
+    int rx_pin;
+} rp2350_serial_pins[] = {
+    { 0, 1 },
+    { 4, 5 },
+};
+
+/*
+ * Attach serial port i's character device to its UART pins through a
+ * host serial adapter: the adapter receives what the chip drives on the
+ * TX pin and drives the RX pin.
+ */
+/* [spec:nuos:req:emu.uart] */
+static void rp2350_attach_serial(RP2350MachineState *s, int i)
+{
+    Chardev *chr = serial_hd(i);
+    DeviceState *gpio = DEVICE(&s->soc.gpio);
+    DeviceState *line;
+
+    if (!chr) {
+        return;
+    }
+    line = qdev_new(TYPE_UART_LINE);
+    qdev_prop_set_chr(line, "chardev", chr);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(line), &error_fatal);
+    qdev_connect_gpio_out_named(gpio, RP2350_GPIO_PAD_OUT,
+                                rp2350_serial_pins[i].tx_pin,
+                                qdev_get_gpio_in_named(line, UART_LINE_RX, 0));
+    qdev_connect_gpio_out_named(line, UART_LINE_TX, 0,
+                                qdev_get_gpio_in_named(gpio, RP2350_GPIO_PAD_IN,
+                                    rp2350_serial_pins[i].rx_pin));
+}
+
 /* [spec:nuos:req:emu.direct-load] */
 static void rp2350_init(MachineState *machine)
 {
@@ -121,6 +171,9 @@ static void rp2350_init(MachineState *machine)
     qdev_prop_set_uint32(soc, "init-svtor",
                          direct ? RP2350_XIP_BASE : RP2350_ROM_BASE);
     sysbus_realize(SYS_BUS_DEVICE(soc), &error_fatal);
+    for (i = 0; i < ARRAY_SIZE(rp2350_serial_pins); i++) {
+        rp2350_attach_serial(s, i);
+    }
 
     /* [spec:nuos:req:emu.bootrom+2] */
     if (machine->firmware) {
@@ -140,10 +193,6 @@ static void rp2350_init(MachineState *machine)
                        RP2350_XIP_BASE, s->soc.flash_size);
     for (i = 1; i < RP2350_NUM_CORES; i++) {
         armv7m_load_kernel(s->soc.armv7m[i].cpu, NULL, 0, 0);
-    }
-    /* Registered after the CPU resets, so it runs after them. */
-    if (direct) {
-        qemu_register_reset(rp2350_direct_reset, s);
     }
 }
 
@@ -225,6 +274,7 @@ static void rp2350_machine_class_init(ObjectClass *oc, const void *data)
 
     mc->desc = "Raspberry Pi RP2350 (2x Cortex-M33)";
     mc->init = rp2350_init;
+    mc->reset = rp2350_machine_reset;
     mc->default_ram_size = RP2350_SRAM_SIZE;
     mc->min_cpus = RP2350_NUM_CORES;
     mc->max_cpus = RP2350_NUM_CORES;

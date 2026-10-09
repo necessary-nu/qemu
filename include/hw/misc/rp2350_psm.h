@@ -53,6 +53,12 @@ enum {
 typedef void RP2350PSMResetFn(void *opaque, uint32_t reset, uint32_t held,
                               bool watchdog);
 
+/*
+ * Named GPIO inputs: "watchdog", the watchdog's reset request, which runs
+ * the sequence WDSEL selects; and "powman-reset", the power manager's
+ * chip-level reset of the PSM, which restores its registers and runs the
+ * full sequence.
+ */
 struct RP2350PSMState {
     SysBusDevice parent_obj;
 

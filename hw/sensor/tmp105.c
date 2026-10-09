@@ -379,12 +379,18 @@ static const VMStateDescription vmstate_tmp105 = {
     }
 };
 
+/*
+ * The temperature is not reset: it is the sensor's measurement of its
+ * surroundings, set from outside through the "temperature" property, and
+ * resetting the chip does not change the temperature around it. A board
+ * that sets it before the machine's first reset keeps that value across
+ * every reset. Until something sets it, it reads 0 C.
+ */
 static void tmp105_reset_hold(Object *obj, ResetType type)
 {
     TMP105State *s = TMP105(obj);
     const TMP105Class *tc = TMP105_GET_CLASS(s);
 
-    s->temperature = 0;
     s->pointer = 0;
     s->config = 0;
     s->faults = tc->faultq[FIELD_EX8(s->config, CONFIG, FAULT_QUEUE)];
@@ -395,7 +401,11 @@ static void tmp105_reset_hold(Object *obj, ResetType type)
     s->limit[0] = 0x4b00; /* T_LOW, 75 degrees C */
     s->limit[1] = 0x5000; /* T_HIGH, 80 degrees C */
 
-    tmp105_interrupt_update(s);
+    /*
+     * The device converts continuously from reset, so its first conversion
+     * already compares the kept temperature against the reset limits.
+     */
+    tmp105_alarm_update(s, false);
 }
 
 static void tmp105_realize(DeviceState *dev, Error **errp)
