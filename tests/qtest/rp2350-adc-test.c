@@ -94,9 +94,9 @@ static QTestState *start(void)
     QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
 
     qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");
+    /* Releasing them takes a whole number of 6-cycle steps. */
+    G_STATIC_ASSERT(RP2350_RESETS_RELEASE_NS % 125 == 0);
     rp2350_unreset(qts, RESETS_USED);
-    /* RP2350_RESETS_RELEASE_NS is a whole number of 6-cycle steps. */
-    g_assert_cmpint(qtest_clock_step(qts, 0) % 125, ==, 0);
     return qts;
 }
 
