@@ -45,4 +45,7 @@ struct RP2350DCPState {
 /* Make the DCP coprocessors 4 and 5 of `cpu`, which is RP2350 core `core`. */
 void rp2350_dcp_attach(RP2350DCPState *s, int core, ARMCPU *cpu);
 
+/* Reset core `core`'s DCP instances, as that core's own reset does. */
+void rp2350_dcp_reset_core(RP2350DCPState *s, int core);
+
 #endif

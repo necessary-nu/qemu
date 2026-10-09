@@ -22,6 +22,7 @@
 #include "hw/misc/rp2350_coresight_trace.h"
 #include "hw/misc/rp2350_dcp.h"
 #include "hw/misc/rp2350_eppb.h"
+#include "hw/misc/rp2350_psm.h"
 #include "hw/misc/rp2350_rcp.h"
 #include "hw/misc/rp2350_resets.h"
 #include "hw/misc/rp2350_rosc.h"
@@ -31,6 +32,7 @@
 #include "hw/misc/rp2350_xip.h"
 #include "hw/misc/unimp.h"
 #include "hw/timer/rp2350_timer.h"
+#include "hw/watchdog/rp2350_watchdog.h"
 #include "qom/object.h"
 
 #define TYPE_RP2350_SOC "rp2350-soc"
@@ -97,6 +99,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_SYSINFO_BASE 0x40000000
 #define RP2350_SYSCFG_BASE 0x40008000
 #define RP2350_CLOCKS_BASE 0x40010000
+#define RP2350_PSM_BASE 0x40018000
 #define RP2350_RESETS_BASE 0x40020000
 #define RP2350_IO_BANK0_BASE 0x40028000
 #define RP2350_IO_QSPI_BASE 0x40030000
@@ -113,6 +116,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_TICKS_BASE 0x40108000
 #define RP2350_CORESIGHT_PERIPH_BASE 0x40140000
 #define RP2350_CORESIGHT_TRACE_BASE 0x50700000
+#define RP2350_WATCHDOG_BASE 0x400d8000
 #define RP2350_BOOTRAM_BASE 0x400e0000
 #define RP2350_DFT_BASE 0x40150000
 #define RP2350_GLITCH_DETECTOR_BASE 0x40158000
@@ -124,6 +128,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 
 #define RP2350_SYSCLK_HZ 150000000
 #define RP2350_REFCLK_HZ 1000000
+/*
+ * clk_ref, which the TICKS generators divide. Clock frequencies are not
+ * otherwise modelled: this is both the ring oscillator's nominal rate,
+ * which clk_ref runs from at reset, and a Pico 2's 12 MHz crystal, which
+ * pico-sdk switches it to.
+ */
+#define RP2350_CLK_REF_HZ 12000000
 
 struct RP2350State {
     SysBusDevice parent_obj;
@@ -133,6 +144,8 @@ struct RP2350State {
     RP2350AccessCtrlState accessctrl;
     Notifier accessctrl_notifier;
     RP2350ResetsState resets;
+    RP2350PSMState psm;
+    RP2350WatchdogState watchdog;
     RP2350SIOState sio;
     RP2350GPIOState gpio;
     RP2350RCPState rcp;

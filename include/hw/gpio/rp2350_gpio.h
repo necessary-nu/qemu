@@ -315,4 +315,11 @@ void rp2350_gpio_connect_in(RP2350GPIOState *s, RP2350GPIOPort port, int n,
  */
 void rp2350_gpio_set_nsmask(RP2350GPIOState *s, uint64_t mask);
 
+/*
+ * Reset the selected register blocks, as their RESETS subsystem resets
+ * do. The pad isolation latches are always-on state and keep their values.
+ */
+void rp2350_gpio_reset_blocks(RP2350GPIOState *s, bool io_bank0, bool io_qspi,
+                              bool pads_bank0, bool pads_qspi);
+
 #endif

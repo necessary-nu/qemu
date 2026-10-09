@@ -47,7 +47,7 @@ struct RP2350ClkRegsState {
     MemoryRegion iomem;
     uint32_t regs[RP2350_CLKREGS_MAX];
 
-    /* TICKS only: called after a generator's CTRL is written. */
+    /* TICKS only: see rp2350_ticks_set_notify(). */
     RP2350TickNotify *tick_notify[RP2350_NUM_TICKS];
     void *tick_opaque[RP2350_NUM_TICKS];
 };
@@ -69,7 +69,13 @@ struct RP2350ClkRegsClass {
 /* Whether TICKS generator `tick` is enabled, and so producing ticks. */
 bool rp2350_ticks_running(RP2350ClkRegsState *ticks, int tick);
 
-/* Have `fn` called whenever TICKS generator `tick` is enabled or disabled. */
+/* TICKS generator `tick`'s CYCLES: clk_ref cycles per tick. */
+uint32_t rp2350_ticks_cycles(RP2350ClkRegsState *ticks, int tick);
+
+/*
+ * Have `fn` called whenever TICKS generator `tick` is enabled or disabled,
+ * its CYCLES is written, or the TICKS block is reset.
+ */
 void rp2350_ticks_set_notify(RP2350ClkRegsState *ticks, int tick,
                              RP2350TickNotify *fn, void *opaque);
 

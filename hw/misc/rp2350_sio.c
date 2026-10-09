@@ -294,6 +294,14 @@ void rp2350_sio_set_core1_launch(RP2350SIOState *s, RP2350SIOCore1Launch *fn,
     s->c1_launch_opaque = opaque;
 }
 
+/* [spec:nuos:req:emu.core1-launch] */
+void rp2350_sio_core1_reset(RP2350SIOState *s)
+{
+    s->c1_state = C1_DRAIN;
+    core1_handshake(s);
+    rp2350_sio_update_irqs(s);
+}
+
 /*
  * Apply a GPIOC write operation (0 write, 1 XOR, 2 set, 3 clear) to the
  * pins in `mask`.

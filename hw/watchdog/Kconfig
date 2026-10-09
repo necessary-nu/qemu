@@ -25,6 +25,9 @@ config K230_WDT
 config WDT_SBSA
     bool
 
+config RP2350_WATCHDOG
+    bool
+
 config ALLWINNER_WDT
     bool
     select PTIMER

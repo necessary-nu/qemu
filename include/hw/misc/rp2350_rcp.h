@@ -48,4 +48,10 @@ struct RP2350RCPState {
 /* Make the RCP coprocessor 7 of `cpu`, which is RP2350 core `core`. */
 void rp2350_rcp_attach(RP2350RCPState *s, int core, ARMCPU *cpu);
 
+/*
+ * Reset core `core`'s RCP, as that core's own reset does, leaving it as
+ * the boot ROM hands it over when boot-rom-handoff is set.
+ */
+void rp2350_rcp_reset_core(RP2350RCPState *s, int core);
+
 #endif

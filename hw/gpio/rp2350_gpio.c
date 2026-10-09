@@ -913,6 +913,71 @@ static const MemoryRegionOps rp2350_pads_bank0_ops =
 static const MemoryRegionOps rp2350_pads_qspi_ops =
     RP2350_GPIO_OPS(rp2350_pads_qspi_read, rp2350_pads_qspi_write);
 
+/* IO_BANK0 or IO_QSPI: the pins' CTRL and the bank's interrupt state. */
+static void rp2350_gpio_reset_io(RP2350GPIOState *s, bool qspi)
+{
+    int first = qspi ? RP2350_GPIO_BANK0_PINS : 0;
+    int last = qspi ? RP2350_GPIO_PINS : RP2350_GPIO_BANK0_PINS;
+    int p, w, d;
+
+    for (p = first; p < last; p++) {
+        s->ctrl[p] = CTRL_RESET;
+        s->irq_level[p] = 0;
+    }
+    for (w = first / 8; w < last / 8; w++) {
+        s->intr_edge[w] = 0;
+        for (d = 0; d < RP2350_GPIO_DESTS; d++) {
+            s->inte[d][w] = 0;
+            s->intf[d][w] = 0;
+        }
+    }
+}
+
+/*
+ * PADS_BANK0 or PADS_QSPI. The isolation latches are in the always-on
+ * domain and are not part of either block: with ISO set again, they hold
+ * the pins as they were.
+ */
+static void rp2350_gpio_reset_pads(RP2350GPIOState *s, bool qspi)
+{
+    int p;
+
+    if (qspi) {
+        s->pad[RP2350_GPIO_QSPI_SCLK] = PAD_QSPI_PD_RESET;
+        s->pad[RP2350_GPIO_QSPI_SD0] = PAD_QSPI_PD_RESET;
+        s->pad[RP2350_GPIO_QSPI_SD1] = PAD_QSPI_PD_RESET;
+        s->pad[RP2350_GPIO_QSPI_SD2] = PAD_QSPI_PU_RESET;
+        s->pad[RP2350_GPIO_QSPI_SD3] = PAD_QSPI_PU_RESET;
+        s->pad[RP2350_GPIO_QSPI_SS] = PAD_QSPI_PU_RESET;
+        s->voltage_select[1] = 0;
+        return;
+    }
+    for (p = 0; p < RP2350_GPIO_BANK0_PINS; p++) {
+        s->pad[p] = PAD_BANK0_RESET;
+    }
+    s->voltage_select[0] = 0;
+    s->pad_swclk = PAD_SWD_RESET;
+    s->pad_swd = PAD_SWD_RESET;
+}
+
+void rp2350_gpio_reset_blocks(RP2350GPIOState *s, bool io_bank0, bool io_qspi,
+                              bool pads_bank0, bool pads_qspi)
+{
+    if (io_bank0) {
+        rp2350_gpio_reset_io(s, false);
+    }
+    if (io_qspi) {
+        rp2350_gpio_reset_io(s, true);
+    }
+    if (pads_bank0) {
+        rp2350_gpio_reset_pads(s, false);
+    }
+    if (pads_qspi) {
+        rp2350_gpio_reset_pads(s, true);
+    }
+    rp2350_gpio_update_force(s, true);
+}
+
 /*
  * Reset is the chip-level (always-on domain) reset: registers, the pad
  * isolation latches, which take the reset values of the controls they
@@ -925,27 +990,12 @@ static void rp2350_gpio_hold_reset(Object *obj, ResetType type)
     int p;
 
     for (p = 0; p < RP2350_GPIO_PINS; p++) {
-        s->ctrl[p] = CTRL_RESET;
         s->pad[p] = 0;
     }
-    for (p = 0; p < RP2350_GPIO_BANK0_PINS; p++) {
-        s->pad[p] = PAD_BANK0_RESET;
-    }
-    s->pad[RP2350_GPIO_QSPI_SCLK] = PAD_QSPI_PD_RESET;
-    s->pad[RP2350_GPIO_QSPI_SD0] = PAD_QSPI_PD_RESET;
-    s->pad[RP2350_GPIO_QSPI_SD1] = PAD_QSPI_PD_RESET;
-    s->pad[RP2350_GPIO_QSPI_SD2] = PAD_QSPI_PU_RESET;
-    s->pad[RP2350_GPIO_QSPI_SD3] = PAD_QSPI_PU_RESET;
-    s->pad[RP2350_GPIO_QSPI_SS] = PAD_QSPI_PU_RESET;
-    s->voltage_select[0] = 0;
-    s->voltage_select[1] = 0;
-    s->pad_swclk = PAD_SWD_RESET;
-    s->pad_swd = PAD_SWD_RESET;
-
-    memset(s->intr_edge, 0, sizeof(s->intr_edge));
-    memset(s->inte, 0, sizeof(s->inte));
-    memset(s->intf, 0, sizeof(s->intf));
-    memset(s->irq_level, 0, sizeof(s->irq_level));
+    rp2350_gpio_reset_io(s, false);
+    rp2350_gpio_reset_io(s, true);
+    rp2350_gpio_reset_pads(s, false);
+    rp2350_gpio_reset_pads(s, true);
     memset(s->pad_level, 0, sizeof(s->pad_level));
 
     for (p = 0; p < RP2350_GPIO_PINS; p++) {
