@@ -19,6 +19,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350SIOState, RP2350_SIO)
 #define RP2350_SIO_CORES 2
 #define RP2350_SIO_FIFO_DEPTH 4
 #define RP2350_SIO_VIEW_SIZE 0x1000
+#define RP2350_SIO_GPIO_BITS 64
 
 /* Banks: SIO keeps separate FIFOs, doorbells and spinlocks per state. */
 enum {
@@ -69,6 +70,17 @@ struct RP2350SIOState {
     RP2350SIOView gpioc_opaque[RP2350_SIO_CORES];
     uint32_t gpio_out[2];
     uint32_t gpio_oe[2];
+    /* GPIO_IN as the IO muxing delivers it, through named input "gpio-in". */
+    uint32_t gpio_in[2];
+    /*
+     * GPIO_OUT and GPIO_OE drive the IO muxing's SIO function through
+     * named outputs "gpio-out" and "gpio-oe", one line per bit in the
+     * 64-bit SIO layout; *_sent are the levels last driven.
+     */
+    qemu_irq gpio_out_line[RP2350_SIO_GPIO_BITS];
+    qemu_irq gpio_oe_line[RP2350_SIO_GPIO_BITS];
+    uint32_t gpio_out_sent[2];
+    uint32_t gpio_oe_sent[2];
 
     /*
      * With core1-launch set, SIO plays core 1's side of the boot ROM

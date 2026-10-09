@@ -13,6 +13,7 @@
 #include "hw/arm/armv7m.h"
 #include "hw/char/pl011.h"
 #include "hw/core/clock.h"
+#include "hw/gpio/rp2350_gpio.h"
 #include "hw/misc/rp2350_bootram.h"
 #include "hw/misc/rp2350_clocks.h"
 #include "hw/misc/rp2350_dcp.h"
@@ -41,6 +42,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_DMA_IRQ_0 10
 #define RP2350_USBCTRL_IRQ 14
 #define RP2350_IO_IRQ_BANK0 21
+#define RP2350_IO_IRQ_BANK0_NS 22
+#define RP2350_IO_IRQ_QSPI 23
+#define RP2350_IO_IRQ_QSPI_NS 24
 #define RP2350_SIO_IRQ_FIFO 25
 #define RP2350_SIO_IRQ_BELL 26
 #define RP2350_SIO_IRQ_FIFO_NS 27
@@ -76,6 +80,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 
 #define RP2350_CLOCKS_BASE 0x40010000
 #define RP2350_RESETS_BASE 0x40020000
+#define RP2350_IO_BANK0_BASE 0x40028000
+#define RP2350_IO_QSPI_BASE 0x40030000
+#define RP2350_PADS_BANK0_BASE 0x40038000
+#define RP2350_PADS_QSPI_BASE 0x40040000
 #define RP2350_XOSC_BASE 0x40048000
 #define RP2350_UART0_BASE 0x40070000
 #define RP2350_TIMER0_BASE 0x400b0000
@@ -98,6 +106,7 @@ struct RP2350State {
     UnimplementedDeviceState eppb[RP2350_NUM_CORES];
     RP2350ResetsState resets;
     RP2350SIOState sio;
+    RP2350GPIOState gpio;
     RP2350RCPState rcp;
     RP2350BootRAMState bootram;
     RP2350DCPState dcp;

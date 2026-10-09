@@ -401,6 +401,7 @@ config RP2350_SOC
     select UNIMP
     select RP2350_RESETS
     select RP2350_SIO
+    select RP2350_GPIO
     select RP2350_CLOCKS
     select RP2350_TIMER
     select RP2350_RCP

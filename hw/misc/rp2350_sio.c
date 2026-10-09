@@ -6,8 +6,9 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * Reference: RP2350 Datasheet, "SIO". Modelled: CPUID, the inter-core
- * FIFOs, the hardware spinlocks, the doorbells, and GPIO output/enable
- * storage. Secure and Non-secure banks are separate, as on hardware.
+ * FIFOs, the hardware spinlocks, the doorbells, and the GPIO registers,
+ * which drive the IO muxing's SIO function and read the pin inputs it
+ * returns. Secure and Non-secure banks are separate, as on hardware.
  * Interpolators, TMDS encoders and the RISC-V platform timer are not
  * modelled.
  */
@@ -121,14 +122,44 @@ static uint32_t gpio_read(RP2350SIOState *s, hwaddr reg)
     switch (reg) {
     case A_GPIO_IN:
     case A_GPIO_HI_IN:
-        hi = reg == A_GPIO_HI_IN;
-        return s->gpio_out[hi] & s->gpio_oe[hi];
+        return s->gpio_in[reg == A_GPIO_HI_IN];
     }
     hi = (reg / 4) & 1;
     if (reg < A_GPIO_OE) {
         return s->gpio_out[hi];
     }
     return s->gpio_oe[hi];
+}
+
+/*
+ * Drive the GPIO_OUT and GPIO_OE bits that changed since last driven, or
+ * all of them with `force`.
+ */
+/* [spec:nuos:req:emu.gpio] */
+static void gpio_sync(RP2350SIOState *s, bool force)
+{
+    int bit;
+
+    for (bit = 0; bit < RP2350_SIO_GPIO_BITS; bit++) {
+        int w = bit / 32;
+        uint32_t m = 1u << (bit % 32);
+
+        if (force || ((s->gpio_out[w] ^ s->gpio_out_sent[w]) & m)) {
+            qemu_set_irq(s->gpio_out_line[bit], !!(s->gpio_out[w] & m));
+        }
+        if (force || ((s->gpio_oe[w] ^ s->gpio_oe_sent[w]) & m)) {
+            qemu_set_irq(s->gpio_oe_line[bit], !!(s->gpio_oe[w] & m));
+        }
+    }
+    memcpy(s->gpio_out_sent, s->gpio_out, sizeof(s->gpio_out));
+    memcpy(s->gpio_oe_sent, s->gpio_oe, sizeof(s->gpio_oe));
+}
+
+static void rp2350_sio_set_gpio_in(void *opaque, int n, int level)
+{
+    RP2350SIOState *s = opaque;
+
+    s->gpio_in[n / 32] = deposit32(s->gpio_in[n / 32], n % 32, 1, !!level);
 }
 
 static void gpio_write(RP2350SIOState *s, hwaddr reg, uint32_t value)
@@ -155,6 +186,7 @@ static void gpio_write(RP2350SIOState *s, hwaddr reg, uint32_t value)
         *r ^= value;
         break;
     }
+    gpio_sync(s, false);
 }
 
 /*
@@ -308,6 +340,7 @@ static ARMMCoprocResult rp2350_gpioc_op(void *opaque, ARMCPU *cpu,
                 bit = 1ull << (rt & 63);
                 gpio_op(&r[bit >> 32 ? 1 : 0], opc1 - 4, bit | bit >> 32);
             }
+            gpio_sync(s, false);
         }
         return ARM_M_COPROC_OK;
     }
@@ -341,6 +374,7 @@ static ARMMCoprocResult rp2350_gpioc_op(void *opaque, ARMCPU *cpu,
             /* Indexed: Rt2 selects the register. */
             gpio_op(&r[rt2], opc1 - 8, rt);
         }
+        gpio_sync(s, false);
         return ARM_M_COPROC_OK;
     }
 
@@ -349,7 +383,7 @@ static ARMMCoprocResult rp2350_gpioc_op(void *opaque, ARMCPU *cpu,
         if (extract32(insn, 21, 3) || group > 2) {
             return ARM_M_COPROC_UNDEF;
         }
-        *result = secure ? (group == 2 ? s->gpio_out[hi] & s->gpio_oe[hi]
+        *result = secure ? (group == 2 ? s->gpio_in[hi]
                                        : gpio_group(s, group)[hi]) : 0;
         return ARM_M_COPROC_OK;
     }
@@ -363,8 +397,8 @@ static ARMMCoprocResult rp2350_gpioc_op(void *opaque, ARMCPU *cpu,
             uint32_t lo_v, hi_v;
 
             if (group == 2) {
-                lo_v = s->gpio_out[0] & s->gpio_oe[0];
-                hi_v = s->gpio_out[1] & s->gpio_oe[1];
+                lo_v = s->gpio_in[0];
+                hi_v = s->gpio_in[1];
             } else {
                 lo_v = gpio_group(s, group)[0];
                 hi_v = gpio_group(s, group)[1];
@@ -557,6 +591,7 @@ static void rp2350_sio_exit_reset(Object *obj, ResetType type)
     s->c1_state = C1_DRAIN;
     core1_handshake(s);
     rp2350_sio_update_irqs(s);
+    gpio_sync(s, true);
 }
 
 static void rp2350_sio_init(Object *obj)
@@ -578,7 +613,14 @@ static void rp2350_sio_init(Object *obj)
         }
     }
 
-    /* GPIO outputs: FIFO then doorbell, per bank, per core. */
+    qdev_init_gpio_out_named(DEVICE(obj), s->gpio_out_line, "gpio-out",
+                             RP2350_SIO_GPIO_BITS);
+    qdev_init_gpio_out_named(DEVICE(obj), s->gpio_oe_line, "gpio-oe",
+                             RP2350_SIO_GPIO_BITS);
+    qdev_init_gpio_in_named(DEVICE(obj), rp2350_sio_set_gpio_in, "gpio-in",
+                            RP2350_SIO_GPIO_BITS);
+
+    /* Interrupt outputs: FIFO then doorbell, per bank, per core. */
     for (bank = 0; bank < RP2350_SIO_BANKS; bank++) {
         for (core = 0; core < RP2350_SIO_CORES; core++) {
             sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq_fifo[bank][core]);
@@ -606,7 +648,7 @@ static const VMStateDescription vmstate_rp2350_sio_bank = {
 
 static const VMStateDescription vmstate_rp2350_sio = {
     .name = TYPE_RP2350_SIO,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(bank, RP2350SIOState, RP2350_SIO_BANKS, 1,
@@ -618,6 +660,9 @@ static const VMStateDescription vmstate_rp2350_sio = {
         VMSTATE_UINT32(c1_next, RP2350SIOState),
         VMSTATE_UINT32(c1_vtor, RP2350SIOState),
         VMSTATE_UINT32(c1_sp, RP2350SIOState),
+        VMSTATE_UINT32_ARRAY_V(gpio_in, RP2350SIOState, 2, 2),
+        VMSTATE_UINT32_ARRAY_V(gpio_out_sent, RP2350SIOState, 2, 2),
+        VMSTATE_UINT32_ARRAY_V(gpio_oe_sent, RP2350SIOState, 2, 2),
         VMSTATE_END_OF_LIST()
     },
 };
