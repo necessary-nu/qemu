@@ -39,6 +39,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/misc/rp2350_accessctrl.h"
 #include "hw/misc/rp2350_busctrl.h"
+#include "hw/misc/rp2350_exclmon.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -106,6 +107,8 @@ struct RP2350DMAState {
     MemoryRegion *bus;
     RP2350AccessCtrlState *accessctrl;
     RP2350BusCtrlState *busctrl;
+    /* The global exclusive monitor, which watches the DMA's writes */
+    RP2350ExclMonState *exclmon;
     uint32_t sysclk_hz;
 
     QEMUTimer *timer;

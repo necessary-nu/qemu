@@ -23,6 +23,8 @@
 #endif
 #if !defined(CONFIG_USER_ONLY)
 #include "hw/intc/armv7m_nvic.h"
+#include "accel/tcg/probe.h"
+#include "target/arm/tcg/excl-monitor.h"
 #endif
 #include "qemu/plugin.h"
 
@@ -218,6 +220,18 @@ uint32_t HELPER(v7m_tt)(CPUARMState *env, uint32_t addr, uint32_t op)
 ARMMMUIdx arm_v7m_mmu_idx_for_secstate(CPUARMState *env, bool secstate)
 {
     return ARMMMUIdx_MUser;
+}
+
+uint32_t HELPER(v7m_ldrex)(CPUARMState *env, uint32_t addr, uint32_t oi)
+{
+    /* translate.c only calls this for a CPU with a global monitor */
+    g_assert_not_reached();
+}
+
+uint32_t HELPER(v7m_strex)(CPUARMState *env, uint32_t addr, uint32_t val,
+                           uint32_t oi, uint32_t parallel)
+{
+    g_assert_not_reached();
 }
 
 #else /* !CONFIG_USER_ONLY */
@@ -2960,6 +2974,211 @@ uint32_t HELPER(v7m_tt)(CPUARMState *env, uint32_t addr, uint32_t op)
         mregion;
 
     return tt_resp;
+}
+
+/*
+ * Exclusive accesses on a core connected to a global exclusive monitor.
+ *
+ * The core's local monitor is env->exclusive_addr: -1 is Open, anything
+ * else Exclusive. The Cortex-M33's local monitor holds no address and
+ * treats any store-exclusive as matching the previous load-exclusive, so
+ * its reservation granule is the whole address space; CLREX, exception
+ * entry and exception return clear it. An exclusive that the core marks
+ * as external also goes to the global monitor (see ARMExclMonitorClass),
+ * which can fail it; one that is not external appears on the bus as a
+ * normal access and only the local monitor decides it.
+ */
+
+/*
+ * Whether an exclusive access at @addr through @mmu_idx is external. The
+ * Cortex-M33 marks exclusives to Shareable memory as external, and every
+ * exclusive while ACTLR.EXTEXCLALL is set. Device memory is Shareable;
+ * Normal memory is Shareable if its MPU region's SH field says so, and
+ * the Normal regions of the default memory map are Non-shareable.
+ */
+static bool v7m_excl_is_external(CPUARMState *env, uint32_t addr,
+                                 ARMMMUIdx mmu_idx)
+{
+    ARMCPU *cpu = env_archcpu(env);
+    bool secure = env->v7m.secure;
+    GetPhysAddrResult res = {};
+    ARMMMUFaultInfo fi = {};
+    uint32_t mregion;
+    unsigned attrindx;
+    uint32_t mair;
+
+    if (env->v7m.actlr[secure] & cpu->m_actlr_mask &
+        R_V7M_ACTLR_EXTEXCLALL_MASK) {
+        return true;
+    }
+    if (!arm_feature(env, ARM_FEATURE_V8)) {
+        /* No PMSAv8 attributes to go by: treat every exclusive as global. */
+        return true;
+    }
+    /* The access has passed the MPU already, so this cannot fail. */
+    pmsav8_mpu_lookup(env, addr, MMU_DATA_LOAD, PAGE_READ, mmu_idx, secure,
+                      &res, &fi, &mregion);
+    if (mregion == -1) {
+        /* Default memory map: the Peripheral, Device and System regions */
+        return (addr >= 0x40000000 && addr < 0x60000000) ||
+               addr >= 0xa0000000;
+    }
+    attrindx = extract32(env->pmsav8.rlar[secure][mregion], 1, 3);
+    mair = attrindx < 4 ? env->pmsav8.mair0[secure]
+                        : env->pmsav8.mair1[secure];
+    if (extract32(mair, (attrindx & 3) * 8 + 4, 4) == 0) {
+        return true;
+    }
+    /* SH: 0b10 Outer Shareable, 0b11 Inner Shareable */
+    return extract32(env->pmsav8.rbar[secure][mregion], 3, 2) >= 2;
+}
+
+/*
+ * The global monitor tags a reservation with the Security and privilege
+ * state of the access; the Security state is the bus attribute, which the
+ * SAU makes Non-secure for a Secure access to Non-secure memory.
+ */
+static unsigned v7m_excl_tag(CPUARMState *env, uint32_t addr,
+                             ARMMMUIdx mmu_idx)
+{
+    V8M_SAttributes sattrs = {};
+    bool secure = false;
+
+    if (env->v7m.secure) {
+        v8m_security_lookup(env, addr, MMU_DATA_LOAD, mmu_idx, true,
+                            &sattrs);
+        secure = !sattrs.ns;
+    }
+    return (secure << 1) | (arm_current_el(env) != 0);
+}
+
+static uint32_t v7m_excl_ld(CPUARMState *env, uint32_t addr, MemOpIdx oi,
+                            uintptr_t ra)
+{
+    switch (get_memop(oi) & MO_SIZE) {
+    case MO_8:
+        return cpu_ldb_mmu(env, addr, oi, ra);
+    case MO_16:
+        return cpu_ldw_mmu(env, addr, oi, ra);
+    default:
+        return cpu_ldl_mmu(env, addr, oi, ra);
+    }
+}
+
+static void v7m_excl_st(CPUARMState *env, uint32_t addr, uint32_t val,
+                        MemOpIdx oi, uintptr_t ra)
+{
+    switch (get_memop(oi) & MO_SIZE) {
+    case MO_8:
+        cpu_stb_mmu(env, addr, val, oi, ra);
+        break;
+    case MO_16:
+        cpu_stw_mmu(env, addr, val, oi, ra);
+        break;
+    default:
+        cpu_stl_mmu(env, addr, val, oi, ra);
+        break;
+    }
+}
+
+/* LDREX, LDREXB, LDREXH and their acquire forms. */
+uint32_t HELPER(v7m_ldrex)(CPUARMState *env, uint32_t addr, uint32_t oi)
+{
+    ARMCPU *cpu = env_archcpu(env);
+    CPUState *cs = CPU(cpu);
+    ARMExclMonitor *m = ARM_EXCL_MONITOR(cpu->excl_monitor);
+    ARMExclMonitorClass *emc = ARM_EXCL_MONITOR_GET_CLASS(m);
+    unsigned size = get_memop(oi) & MO_SIZE;
+    int mmu_idx = get_mmuidx(oi);
+    ARMMMUIdx arm_mmu_idx = core_to_arm_mmu_idx(env, mmu_idx);
+    uintptr_t ra = GETPC();
+    void *host;
+    uint32_t val;
+
+    if (addr & ((1 << size) - 1)) {
+        arm_cpu_do_unaligned_access(cs, addr, MMU_DATA_LOAD, mmu_idx, ra);
+    }
+    /* Take any MPU, SAU or watchpoint exception before the monitors act. */
+    host = probe_access(env, addr, 1 << size, MMU_DATA_LOAD, mmu_idx, ra);
+
+    if (!v7m_excl_is_external(env, addr, arm_mmu_idx)) {
+        val = v7m_excl_ld(env, addr, oi, ra);
+    } else if (emc->supported(m, addr)) {
+        if (!host) {
+            val = v7m_excl_ld(env, addr, oi, ra);
+        }
+        emc->load(m, cs, addr, size, v7m_excl_tag(env, addr, arm_mmu_idx),
+                  host, &val);
+    } else {
+        /*
+         * The bus treats it as a normal read and reports exclusive
+         * failure, but the core still sets its local monitor, so the
+         * store-exclusive that follows goes out to the bus.
+         */
+        val = v7m_excl_ld(env, addr, oi, ra);
+        emc->clear(m, cs);
+    }
+    env->exclusive_addr = addr;
+    return val;
+}
+
+/*
+ * STREX, STREXB, STREXH and their release forms; returns the status the
+ * instruction writes to Rd, 0 if the store was performed and 1 if not.
+ */
+uint32_t HELPER(v7m_strex)(CPUARMState *env, uint32_t addr, uint32_t val,
+                           uint32_t oi, uint32_t parallel)
+{
+    ARMCPU *cpu = env_archcpu(env);
+    CPUState *cs = CPU(cpu);
+    ARMExclMonitor *m = ARM_EXCL_MONITOR(cpu->excl_monitor);
+    ARMExclMonitorClass *emc = ARM_EXCL_MONITOR_GET_CLASS(m);
+    unsigned size = get_memop(oi) & MO_SIZE;
+    int mmu_idx = get_mmuidx(oi);
+    ARMMMUIdx arm_mmu_idx = core_to_arm_mmu_idx(env, mmu_idx);
+    uintptr_t ra = GETPC();
+    void *host;
+
+    if (addr & ((1 << size) - 1)) {
+        arm_cpu_do_unaligned_access(cs, addr, MMU_DATA_STORE, mmu_idx, ra);
+    }
+    if (env->exclusive_addr == -1) {
+        /* The local monitor fails it before it reaches the bus. */
+        return 1;
+    }
+    host = probe_access(env, addr, 1 << size, MMU_DATA_STORE, mmu_idx, ra);
+
+    if (!v7m_excl_is_external(env, addr, arm_mmu_idx)) {
+        v7m_excl_st(env, addr, val, oi, ra);
+        arm_clear_exclusive(env);
+        if (emc->supported(m, addr)) {
+            emc->write(m, cs, addr, size);
+        }
+        return 0;
+    }
+    if (!emc->supported(m, addr)) {
+        /* Reported as failed, but the write is not suppressed. */
+        v7m_excl_st(env, addr, val, oi, ra);
+        arm_clear_exclusive(env);
+        emc->clear(m, cs);
+        return 1;
+    }
+    if (!host && parallel) {
+        /*
+         * The monitor cannot make an I/O write atomically with its
+         * decision, so make it with every other core stopped.
+         */
+        cpu_loop_exit_atomic(cs, ra);
+    }
+    arm_clear_exclusive(env);
+    if (!emc->store(m, cs, addr, size, v7m_excl_tag(env, addr, arm_mmu_idx),
+                    host, val)) {
+        return 1;
+    }
+    if (!host) {
+        v7m_excl_st(env, addr, val, oi, ra);
+    }
+    return 0;
 }
 
 #endif /* !CONFIG_USER_ONLY */

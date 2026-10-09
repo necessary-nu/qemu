@@ -140,6 +140,9 @@ config RP2350_XIP
 config RP2350_DCP
     bool
 
+config RP2350_EXCLMON
+    bool
+
 config RP2350_SYSREGS
     bool
 

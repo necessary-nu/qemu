@@ -409,6 +409,7 @@ config RP2350_SOC
     select RP2350_RCP
     select RP2350_BOOTRAM
     select RP2350_DCP
+    select RP2350_EXCLMON
     select RP2350_SYSREGS
     select RP2350_EPPB
     select RP2350_BUSCTRL

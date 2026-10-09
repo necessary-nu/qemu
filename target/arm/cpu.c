@@ -25,6 +25,7 @@
 #include "exec/page-vary.h"
 #include "system/whpx.h"
 #include "target/arm/tcg/idau.h"
+#include "target/arm/tcg/excl-monitor.h"
 #include "target/arm/tcg/fetch-port.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
@@ -1706,6 +1707,11 @@ static void arm_cpu_post_init(Object *obj)
         object_property_add_link(obj, "fetch-port",
                                  TYPE_ARM_FETCH_PORT_INTERFACE,
                                  &cpu->fetch_port,
+                                 qdev_prop_allow_set_link_before_realize,
+                                 OBJ_PROP_LINK_STRONG);
+        object_property_add_link(obj, "excl-monitor",
+                                 TYPE_ARM_EXCL_MONITOR_INTERFACE,
+                                 &cpu->excl_monitor,
                                  qdev_prop_allow_set_link_before_realize,
                                  OBJ_PROP_LINK_STRONG);
         /*

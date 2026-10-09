@@ -21,6 +21,7 @@
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "target/arm/tcg/idau.h"
+#include "target/arm/tcg/excl-monitor.h"
 #include "target/arm/tcg/fetch-port.h"
 #include "target/arm/cpu.h"
 #include "target/arm/cpu-features.h"
@@ -315,6 +316,10 @@ static void armv7m_realize(DeviceState *dev, Error **errp)
         object_property_set_link(OBJECT(s->cpu), "fetch-port", s->fetch_port,
                                  &error_abort);
     }
+    if (s->excl_monitor) {
+        object_property_set_link(OBJECT(s->cpu), "excl-monitor",
+                                 s->excl_monitor, &error_abort);
+    }
     if (object_property_find(OBJECT(s->cpu), "init-svtor")) {
         if (!object_property_set_uint(OBJECT(s->cpu), "init-svtor",
                                       s->init_svtor, errp)) {
@@ -570,6 +575,8 @@ static const Property armv7m_properties[] = {
     DEFINE_PROP_LINK("idau", ARMv7MState, idau, TYPE_IDAU_INTERFACE, Object *),
     DEFINE_PROP_LINK("fetch-port", ARMv7MState, fetch_port,
                      TYPE_ARM_FETCH_PORT_INTERFACE, Object *),
+    DEFINE_PROP_LINK("excl-monitor", ARMv7MState, excl_monitor,
+                     TYPE_ARM_EXCL_MONITOR_INTERFACE, Object *),
     DEFINE_PROP_UINT32("init-svtor", ARMv7MState, init_svtor, 0),
     DEFINE_PROP_UINT32("init-nsvtor", ARMv7MState, init_nsvtor, 0),
     DEFINE_PROP_BOOL("enable-bitband", ARMv7MState, enable_bitband, false),

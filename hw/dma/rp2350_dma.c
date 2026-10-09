@@ -614,6 +614,8 @@ static bool bus_access(RP2350DMAState *s, int n, uint32_t addr,
     }
     if (!is_write) {
         *data = ldn_le_p(buf, size);
+    } else if (s->exclmon) {
+        rp2350_exclmon_dma_write(s->exclmon, addr, size);
     }
     if (s->busctrl) {
         rp2350_busctrl_dma_access(s->busctrl, addr, size);
@@ -1673,6 +1675,8 @@ static const Property rp2350_dma_properties[] = {
                      TYPE_RP2350_ACCESSCTRL, RP2350AccessCtrlState *),
     DEFINE_PROP_LINK("busctrl", RP2350DMAState, busctrl,
                      TYPE_RP2350_BUSCTRL, RP2350BusCtrlState *),
+    DEFINE_PROP_LINK("exclmon", RP2350DMAState, exclmon,
+                     TYPE_RP2350_EXCLMON, RP2350ExclMonState *),
     DEFINE_PROP_UINT32("sysclk-hz", RP2350DMAState, sysclk_hz, 150000000),
 };
 

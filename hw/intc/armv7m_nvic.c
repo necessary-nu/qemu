@@ -1655,15 +1655,16 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
          * memory that is not Shareable (which includes all Normal memory
          * of the default memory map) use only the core's local monitor
          * and are not signalled to the system's global monitor; with it
-         * set, every exclusive is signalled. QEMU implements one monitor
-         * that is global for all memory, which matches EXTEXCLALL set
-         * for memory the system's global monitor covers, so the bit is
-         * stored but does not change exclusive behaviour.
+         * set, every exclusive is signalled. A core connected to a global
+         * monitor (ARMCPU::excl_monitor) applies this. Without one, QEMU's
+         * own monitor stands in for a global monitor covering all memory,
+         * which matches EXTEXCLALL set, so the bit is only stored.
          */
         if (!cpu->m_actlr_mask) {
             goto bad_offset;
         }
-        if ((value ^ cpu->env.v7m.actlr[attrs.secure]) &
+        if (!cpu->excl_monitor &&
+            (value ^ cpu->env.v7m.actlr[attrs.secure]) &
             cpu->m_actlr_mask & R_V7M_ACTLR_EXTEXCLALL_MASK) {
             qemu_log_mask(LOG_UNIMP,
                           "NVIC: ACTLR.EXTEXCLALL does not change exclusive "
