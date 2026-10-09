@@ -641,6 +641,8 @@ static inline void xtensa_select_static_vectors(CPUXtensaState *env,
     env->static_vectors = n;
 }
 void xtensa_runstall(CPUXtensaState *env, bool runstall);
+void xtensa_cpu_clock_rebase(CPUXtensaState *env);
+void xtensa_cpu_clock_rearm(CPUXtensaState *env);
 
 uint32_t cpu_get_fsr(CPUXtensaState *env);
 void cpu_set_fcr(CPUXtensaState *env, uint32_t v);

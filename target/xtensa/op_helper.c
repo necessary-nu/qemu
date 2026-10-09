@@ -71,6 +71,46 @@ void HELPER(update_ccompare)(CPUXtensaState *env, uint32_t i)
     env->yield_needed = 1;
 }
 
+/*
+ * CCOUNT is derived from virtual time at the current clock rate, so a
+ * change of rate must first fold the cycles counted so far into the base,
+ * or the new rate would be applied to time that passed at the old one.
+ */
+void xtensa_cpu_clock_rebase(CPUXtensaState *env)
+{
+    if (!xtensa_option_enabled(env->config, XTENSA_OPTION_TIMER_INTERRUPT)) {
+        return;
+    }
+    HELPER(update_ccount)(env);
+    env->ccount_base = env->sregs[CCOUNT];
+    env->time_base = env->ccount_time;
+}
+
+/*
+ * Re-arm the CCOMPARE timers for the clock rate now in force. Unlike a
+ * CCOMPARE write this leaves pending timer interrupts alone.
+ */
+void xtensa_cpu_clock_rearm(CPUXtensaState *env)
+{
+    XtensaCPU *cpu = env_archcpu(env);
+    uint32_t i;
+
+    if (!xtensa_option_enabled(env->config, XTENSA_OPTION_TIMER_INTERRUPT)) {
+        return;
+    }
+    HELPER(update_ccount)(env);
+    for (i = 0; i < env->config->nccompare; ++i) {
+        uint64_t dcc;
+
+        if (!env->ccompare[i].timer) {
+            continue;
+        }
+        dcc = (uint64_t)(env->sregs[CCOMPARE + i] - env->sregs[CCOUNT] - 1) + 1;
+        timer_mod(env->ccompare[i].timer,
+                  env->ccount_time + clock_ticks_to_ns(cpu->clock, dcc));
+    }
+}
+
 /*!
  * Check vaddr accessibility/cache attributes and raise an exception if
  * specified by the ATOMCTL SR.
