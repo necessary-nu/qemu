@@ -30,6 +30,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/misc/esp32_reg.h"
 #include "hw/misc/esp32_rtc_cntl.h"
 #include "hw/gpio/esp32_rtcio.h"
@@ -147,10 +148,14 @@ static uint64_t esp32_rtc_time(Esp32RtcCntlState *s, int64_t now)
                                     NANOSECONDS_PER_SECOND)) & TIME_MASK;
 }
 
-/* Virtual time at which the RTC timer reads ticks more than at base_ns */
+/*
+ * Virtual time at which the RTC timer reads ticks more than at base_ns.
+ * Only meaningful while RTC_SLOW_CLK runs.
+ */
 static int64_t esp32_rtc_ticks_to_ns(Esp32RtcCntlState *s, int64_t base_ns,
                                      uint64_t ticks)
 {
+    assert(s->rtc_slowclk_freq);
     return base_ns + muldiv64(ticks, NANOSECONDS_PER_SECOND,
                               s->rtc_slowclk_freq) + 1;
 }
@@ -189,7 +194,8 @@ static void esp32_rtc_alarm_arm(Esp32RtcCntlState *s)
 
     timer_del(&s->alarm_timer);
     if (!FIELD_EX32(REG(s, RTC_CNTL_SLP_TIMER1), RTC_CNTL_SLP_TIMER1,
-                    MAIN_TIMER_ALARM_EN) || alarm <= t) {
+                    MAIN_TIMER_ALARM_EN) || alarm <= t ||
+        !s->rtc_slowclk_freq) {
         return;
     }
     timer_mod(&s->alarm_timer, esp32_rtc_ticks_to_ns(s, now, alarm - t));
@@ -215,6 +221,7 @@ static void esp32_rtc_valid_cb(void *opaque)
 {
     Esp32RtcCntlState *s = opaque;
 
+    s->valid_pending = false;
     REG(s, RTC_CNTL_TIME_UPDATE) |= R_RTC_CNTL_TIME_UPDATE_VALID_MASK;
     esp32_rtc_raise(s, ESP32_RTC_INT_TIME_VALID);
 }
@@ -225,7 +232,11 @@ static void esp32_rtc_time_update(Esp32RtcCntlState *s)
 
     s->time_latched = esp32_rtc_time(s, now);
     REG(s, RTC_CNTL_TIME_UPDATE) &= ~R_RTC_CNTL_TIME_UPDATE_VALID_MASK;
-    timer_mod(&s->valid_timer, esp32_rtc_ticks_to_ns(s, now, 1));
+    s->valid_pending = true;
+    timer_del(&s->valid_timer);
+    if (s->rtc_slowclk_freq) {
+        timer_mod(&s->valid_timer, esp32_rtc_ticks_to_ns(s, now, 1));
+    }
 }
 
 static bool esp32_rtc_wdt_active(Esp32RtcCntlState *s)
@@ -286,7 +297,7 @@ static void esp32_rtc_wdt_update(Esp32RtcCntlState *s)
     s->wdt_base_ns = now;
     s->wdt_running = esp32_rtc_wdt_counting(s);
     timer_del(&s->wdt_timer);
-    if (!s->wdt_running) {
+    if (!s->wdt_running || !s->rtc_slowclk_freq) {
         return;
     }
     hold = s->regs[A_RTC_CNTL_WDTCONFIG1 / 4 + s->wdt_stage];
@@ -407,7 +418,7 @@ static void esp32_rtc_brownout(void *opaque, int n, int level)
         return;
     }
     esp32_rtc_raise(s, ESP32_RTC_INT_BROWN_OUT);
-    if (FIELD_EX32(bo, RTC_CNTL_BROWN_OUT, RST_ENA)) {
+    if (FIELD_EX32(bo, RTC_CNTL_BROWN_OUT, RST_ENA) && s->rtc_slowclk_freq) {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
         timer_mod(&s->brownout_timer, esp32_rtc_ticks_to_ns(s, now,
@@ -437,18 +448,104 @@ static void esp32_rtc_update_cpu_stall(Esp32RtcCntlState *s)
     }
 }
 
-/* [spec:nuos:req:emu.esp32.clock-gating] */
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * [spec:nuos:req:emu.esp32.rtc]
+ * Decode the clock selection and the slow clock sources' state.
+ *
+ * RC_FAST_CLK, the 8 MHz oscillator, runs unless ENB_CK8M; RC_FAST_DIV_CLK
+ * (8MD256) is it divided by 128 << CK8M_DIV, or undivided with
+ * ENB_CK8M_DIV. XTAL32K_CLK runs only with a crystal fitted and the
+ * oscillator powered up by RTCIO's XPD_XTAL_32K. RTC_SLOW_CLK is whichever
+ * ANA_CLK_RTC_SEL picks, RC_SLOW_CLK running always; it stops if its source
+ * does. The digital domain sees 8MD256 and XTAL32K_CLK only through
+ * DIG_CLK8M_D256_EN and DIG_XTAL32K_EN. Crystal start-up time and the
+ * oscillators' deviation from nominal are not modelled.
+ */
 static void esp32_rtc_decode_clk_conf(Esp32RtcCntlState *s)
 {
-    const uint32_t slowclk_freq[] = {150000, 32768, 8000000 / 256};
-    const uint32_t fastclk_freq[] = {s->xtal_apb_freq / 4, 8000000};
     uint32_t conf = REG(s, RTC_CNTL_CLK_CONF);
+    const uint32_t fastclk_freq[] = {s->xtal_apb_freq / 4,
+                                     ESP32_RC_FAST_CLK_HZ};
+    bool xpd_32k = s->rtcio &&
+        (s->rtcio->regs[A_RTCIO_XTAL_32K_PAD / 4] &
+         R_RTCIO_XTAL_32K_PAD_XPD_XTAL_32K_MASK);
+    uint32_t slowclk_freq[3];
 
     s->soc_clk = FIELD_EX32(conf, RTC_CNTL_CLK_CONF, SOC_CLK_SEL);
     s->rtc_fastclk = FIELD_EX32(conf, RTC_CNTL_CLK_CONF, FAST_CLK_RTC_SEL);
     s->rtc_slowclk = FIELD_EX32(conf, RTC_CNTL_CLK_CONF, ANA_CLK_RTC_SEL);
-    s->rtc_slowclk_freq = slowclk_freq[s->rtc_slowclk];
     s->rtc_fastclk_freq = fastclk_freq[s->rtc_fastclk];
+
+    if (FIELD_EX32(conf, RTC_CNTL_CLK_CONF, ENB_CK8M)) {
+        s->rc_fast_d256_freq = 0;
+    } else if (FIELD_EX32(conf, RTC_CNTL_CLK_CONF, ENB_CK8M_DIV)) {
+        s->rc_fast_d256_freq = ESP32_RC_FAST_CLK_HZ;
+    } else {
+        s->rc_fast_d256_freq = ESP32_RC_FAST_CLK_HZ /
+            (128 << FIELD_EX32(conf, RTC_CNTL_CLK_CONF, CK8M_DIV));
+    }
+    s->xtal32k_freq = s->xtal32k_fitted && xpd_32k ? ESP32_XTAL32K_CLK_HZ : 0;
+
+    slowclk_freq[ESP32_SLOW_CLK_RC] = ESP32_RC_SLOW_CLK_HZ;
+    slowclk_freq[ESP32_SLOW_CLK_32KXTAL] = s->xtal32k_freq;
+    slowclk_freq[ESP32_SLOW_CLK_8MD256] = s->rc_fast_d256_freq;
+    s->rtc_slowclk_freq = slowclk_freq[s->rtc_slowclk];
+}
+
+/* Drive the clock outputs from the decoded state */
+static void esp32_rtc_update_clock_outputs(Esp32RtcCntlState *s)
+{
+    uint32_t conf = REG(s, RTC_CNTL_CLK_CONF);
+
+    clock_update_hz(s->xtal_clk, s->xtal_apb_freq);
+    clock_update_hz(s->slow_clk, s->rtc_slowclk_freq);
+    clock_update_hz(s->d256_dig_clk,
+                    FIELD_EX32(conf, RTC_CNTL_CLK_CONF, DIG_CLK8M_D256_EN) ?
+                    s->rc_fast_d256_freq : 0);
+    clock_update_hz(s->xtal32k_dig_clk,
+                    FIELD_EX32(conf, RTC_CNTL_CLK_CONF, DIG_XTAL32K_EN) ?
+                    s->xtal32k_freq : 0);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rtc]
+ * The clock selection or a slow clock source changed. The RTC timer and
+ * watchdog count on at the old rate up to now and at the new one after; a
+ * stopped RTC_SLOW_CLK freezes them, and holds off TIME_VALID and the
+ * brownout reset's wait, which go on once it runs again.
+ */
+static void esp32_rtc_clocks_changed(Esp32RtcCntlState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t old_freq = s->rtc_slowclk_freq;
+    uint32_t bo;
+
+    s->time_base = esp32_rtc_time(s, now);
+    s->time_base_ns = now;
+    s->wdt_count_base = esp32_rtc_wdt_count(s, now);
+    s->wdt_base_ns = now;
+    esp32_rtc_decode_clk_conf(s);
+    esp32_rtc_update_clock_outputs(s);
+    if (s->rtc_slowclk_freq == old_freq) {
+        return;
+    }
+    esp32_rtc_alarm_arm(s);
+    esp32_rtc_wdt_update(s);
+
+    timer_del(&s->valid_timer);
+    if (s->valid_pending && s->rtc_slowclk_freq) {
+        timer_mod(&s->valid_timer, esp32_rtc_ticks_to_ns(s, now, 1));
+    }
+    bo = REG(s, RTC_CNTL_BROWN_OUT);
+    if (!s->rtc_slowclk_freq) {
+        timer_del(&s->brownout_timer);
+    } else if (!old_freq && s->brownout_line &&
+               FIELD_EX32(bo, RTC_CNTL_BROWN_OUT, ENA) &&
+               FIELD_EX32(bo, RTC_CNTL_BROWN_OUT, RST_ENA)) {
+        timer_mod(&s->brownout_timer, esp32_rtc_ticks_to_ns(s, now,
+                  FIELD_EX32(bo, RTC_CNTL_BROWN_OUT, RST_WAIT)));
+    }
 }
 
 /*
@@ -654,6 +751,12 @@ void esp32_rtc_cntl_sleep_reset_done(Esp32RtcCntlState *s)
 
 void esp32_rtc_cntl_rtcio_changed(Esp32RtcCntlState *s)
 {
+    bool xpd_32k = s->rtcio->regs[A_RTCIO_XTAL_32K_PAD / 4] &
+                   R_RTCIO_XTAL_32K_PAD_XPD_XTAL_32K_MASK;
+
+    if (s->xtal32k_fitted && xpd_32k != (s->xtal32k_freq != 0)) {
+        esp32_rtc_clocks_changed(s);
+    }
     esp32_rtc_check_wakeup(s);
 }
 
@@ -856,19 +959,8 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
             v = FIELD_DP32(v, RTC_CNTL_CLK_CONF, ANA_CLK_RTC_SEL,
                            s->rtc_slowclk);
         }
-        {
-            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-
-            /* Fold the timers' counts at the old slow clock rate */
-            s->time_base = esp32_rtc_time(s, now);
-            s->time_base_ns = now;
-            s->wdt_count_base = esp32_rtc_wdt_count(s, now);
-            s->wdt_base_ns = now;
-            *r = v & writable;
-            esp32_rtc_decode_clk_conf(s);
-            esp32_rtc_alarm_arm(s);
-            esp32_rtc_wdt_update(s);
-        }
+        *r = v & writable;
+        esp32_rtc_clocks_changed(s);
         qemu_irq_pulse(s->clk_update);
         break;
 
@@ -1026,6 +1118,7 @@ static void esp32_rtc_cntl_reset_hold(Object *obj, ResetType type)
     }
     s->time_base_ns = now;
     s->rtc_reset_pending = false;
+    s->valid_pending = false;
 
     for (int i = 0; i < ESP32_RTC_CNTL_REG_COUNT; i++) {
         s->regs[i] = reg_info[i].reset;
@@ -1053,6 +1146,7 @@ static void esp32_rtc_cntl_reset_exit(Object *obj, ResetType type)
 {
     Esp32RtcCntlState *s = ESP32_RTC_CNTL(obj);
 
+    esp32_rtc_update_clock_outputs(s);
     esp32_rtc_wdt_update(s);
     esp32_rtc_update_irq(s);
     esp32_rtc_update_cpu_stall(s);
@@ -1076,6 +1170,8 @@ static void esp32_rtc_cntl_realize(DeviceState *dev, Error **errp)
     }
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->fast_mem);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->slow_mem);
+    esp32_rtc_decode_clk_conf(s);
+    esp32_rtc_update_clock_outputs(s);
 }
 
 static void esp32_rtc_cntl_init(Object *obj)
@@ -1108,6 +1204,10 @@ static void esp32_rtc_cntl_init(Object *obj)
                             ESP32_RTC_INT_IN, ESP32_RTC_INT_COUNT);
     qdev_init_gpio_in_named(dev, esp32_rtc_brownout,
                             ESP32_RTC_BROWNOUT_IN, 1);
+    s->xtal_clk = qdev_init_clock_out(dev, ESP32_RTC_XTAL_CLK);
+    s->slow_clk = qdev_init_clock_out(dev, ESP32_RTC_SLOW_CLK);
+    s->d256_dig_clk = qdev_init_clock_out(dev, ESP32_RTC_D256_DIG_CLK);
+    s->xtal32k_dig_clk = qdev_init_clock_out(dev, ESP32_RTC_XTAL32K_DIG_CLK);
 
     timer_init_ns(&s->alarm_timer, QEMU_CLOCK_VIRTUAL, esp32_rtc_alarm_cb, s);
     timer_init_ns(&s->valid_timer, QEMU_CLOCK_VIRTUAL, esp32_rtc_valid_cb, s);
@@ -1129,13 +1229,14 @@ static void esp32_rtc_cntl_init(Object *obj)
 static int esp32_rtc_cntl_post_load(void *opaque, int version_id)
 {
     esp32_rtc_decode_clk_conf(opaque);
+    esp32_rtc_update_clock_outputs(opaque);
     return 0;
 }
 
 static const VMStateDescription vmstate_esp32_rtc_cntl = {
     .name = TYPE_ESP32_RTC_CNTL,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = esp32_rtc_cntl_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Esp32RtcCntlState,
@@ -1147,6 +1248,7 @@ static const VMStateDescription vmstate_esp32_rtc_cntl = {
         VMSTATE_UINT64(time_base, Esp32RtcCntlState),
         VMSTATE_INT64(time_base_ns, Esp32RtcCntlState),
         VMSTATE_UINT64(time_latched, Esp32RtcCntlState),
+        VMSTATE_BOOL(valid_pending, Esp32RtcCntlState),
         VMSTATE_UINT32(wdt_stage, Esp32RtcCntlState),
         VMSTATE_UINT64(wdt_count_base, Esp32RtcCntlState),
         VMSTATE_INT64(wdt_base_ns, Esp32RtcCntlState),
@@ -1172,6 +1274,7 @@ static const VMStateDescription vmstate_esp32_rtc_cntl = {
 static const Property esp32_rtc_cntl_properties[] = {
     DEFINE_PROP_LINK("rtcio", Esp32RtcCntlState, rtcio, TYPE_ESP32_RTCIO,
                      Esp32RtcIoState *),
+    DEFINE_PROP_BOOL("xtal32k", Esp32RtcCntlState, xtal32k_fitted, false),
 };
 
 static void esp32_rtc_cntl_class_init(ObjectClass *klass, const void *data)

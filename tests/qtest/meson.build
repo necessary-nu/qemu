@@ -285,7 +285,8 @@ qtests_xtensa = \
      'esp32-mcpwm-test',
      'esp32-rtc-test',
      'esp32-i2s-test',
-     'esp32-periph-lines-test'] : [])
+     'esp32-periph-lines-test',
+     'esp32-timg-cal-test'] : [])
 
 qtests_stm32l4x5 = \
   ['stm32l4x5_exti-test',

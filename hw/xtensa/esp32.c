@@ -1749,6 +1749,22 @@ static void esp32_soc_init(Object *obj)
         snprintf(name, sizeof(name), "timg%d-apb", i);
         s->timg_apb_clk[i] = clock_new(obj, name);
         qdev_connect_clock_in(DEVICE(&s->timg[i]), "apb", s->timg_apb_clk[i]);
+        /*
+         * The RTC calibration's clocks come from the RTC domain: XTAL_CLK,
+         * RTC_SLOW_CLK, and the digital views of 8MD256 and XTAL32K_CLK.
+         */
+        qdev_connect_clock_in(DEVICE(&s->timg[i]), ESP32_TIMG_XTAL_CLK,
+                              qdev_get_clock_out(DEVICE(&s->rtc_cntl),
+                                                 ESP32_RTC_XTAL_CLK));
+        qdev_connect_clock_in(DEVICE(&s->timg[i]), ESP32_TIMG_RTC_SLOW_CLK,
+                              qdev_get_clock_out(DEVICE(&s->rtc_cntl),
+                                                 ESP32_RTC_SLOW_CLK));
+        qdev_connect_clock_in(DEVICE(&s->timg[i]), ESP32_TIMG_8MD256_CLK,
+                              qdev_get_clock_out(DEVICE(&s->rtc_cntl),
+                                                 ESP32_RTC_D256_DIG_CLK));
+        qdev_connect_clock_in(DEVICE(&s->timg[i]), ESP32_TIMG_XTAL32K_CLK,
+                              qdev_get_clock_out(DEVICE(&s->rtc_cntl),
+                                                 ESP32_RTC_XTAL32K_DIG_CLK));
     }
 
     for (int i = 0; i < ESP32_SPI_COUNT; ++i) {

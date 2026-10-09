@@ -9,11 +9,22 @@
 
 #define ESP32_TIMG_WDT_STAGE_COUNT 4
 
+/* RTC_CALI_CLK_SEL: the clock the RTC calibration measures */
 typedef enum Esp32TimgCalClkSel {
     ESP32_TIMG_CAL_RTC_MUX = 0,
     ESP32_TIMG_CAL_8MD256 = 1,
-    ESP32_TIMG_CAL_32K_XTAL = 2
+    ESP32_TIMG_CAL_32K_XTAL = 2,
+    ESP32_TIMG_CAL_CLK_COUNT
 } Esp32TimgCalClkSel;
+
+/*
+ * Clock inputs for the RTC calibration, which counts XTAL_CLK cycles over
+ * RTC_CALI_MAX cycles of the selected clock.
+ */
+#define ESP32_TIMG_XTAL_CLK         "xtal"
+#define ESP32_TIMG_RTC_SLOW_CLK     "rtc-slow"
+#define ESP32_TIMG_8MD256_CLK       "rc-fast-d256"
+#define ESP32_TIMG_XTAL32K_CLK      "xtal32k"
 
 typedef enum Esp32TimgInterruptType {
     TIMG_T0_INT,
@@ -86,19 +97,40 @@ typedef struct Esp32TimgState {
     uint32_t int_ena;
     uint32_t int_raw;
 
-    uint32_t rtc_slow_freq_hz;
-    uint32_t xtal_freq_hz;
     /* APB_CLK, stopped while DPORT gates the group or holds it in reset */
     Clock *apb_clk;
+    Clock *xtal_clk;
+    /* Indexed by Esp32TimgCalClkSel */
+    Clock *cal_clk[ESP32_TIMG_CAL_CLK_COUNT];
     bool flash_boot_mode;
     bool wdt_en_at_reset;
     bool wdt_disable;
 
+    /* RTCCALICFG's fields and RTCCALICFG1's value */
     bool rtc_cal_start;
+    bool rtc_cal_start_cycling;
     bool rtc_cal_ready;
     Esp32TimgCalClkSel rtc_cal_clk_sel;
     uint32_t rtc_cal_max;
     uint32_t rtc_cal_value;
+    /*
+     * The measurement in progress, if active: started by RTC_CALI_START
+     * (oneshot) or by cycling mode, on the clock and for the cycle count
+     * latched when it started. It waits for the first edge of the clock
+     * (until counting), then counts cal_cycles of it and cal_xtal XTAL_CLK
+     * cycles before cal_seg_ns, the rest since.
+     */
+    bool cal_active;
+    bool cal_oneshot;
+    bool cal_counting;
+    Esp32TimgCalClkSel cal_sel;
+    uint32_t cal_target;
+    uint64_t cal_cycles;
+    uint64_t cal_xtal;
+    int64_t cal_seg_ns;
+    /* When the timer is due: the first edge, or the end */
+    int64_t cal_event_ns;
+    QEMUTimer cal_timer;
 } Esp32TimgState;
 
 #define ESP32_TIMG_WDT_CPU_RESET_GPIO   "mwdt-cpu-reset"

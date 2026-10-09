@@ -14,6 +14,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/core/registerfields.h"
+#include "hw/core/clock.h"
 #include "qemu/timer.h"
 #include "hw/misc/esp32_reg.h"
 
@@ -57,6 +58,25 @@ typedef struct Esp32RtcIoState Esp32RtcIoState;
 #define ESP32_RTC_GPIO_WAKEUP_IN    "esp32-rtc-gpio-wakeup"
 #define ESP32_RTC_INT_IN            "esp32-rtc-int"
 #define ESP32_RTC_BROWNOUT_IN       "esp32-rtc-brownout"
+
+/*
+ * Clock outputs, stopped (0 Hz) while their source does not run:
+ * - ESP32_RTC_XTAL_CLK: XTAL_CLK, the main crystal.
+ * - ESP32_RTC_SLOW_CLK: RTC_SLOW_CLK, as ANA_CLK_RTC_SEL selects it.
+ * - ESP32_RTC_D256_DIG_CLK: RC_FAST_DIV_CLK (8MD256) as the digital domain
+ *   sees it, behind DIG_CLK8M_D256_EN.
+ * - ESP32_RTC_XTAL32K_DIG_CLK: XTAL32K_CLK as the digital domain sees it,
+ *   behind DIG_XTAL32K_EN.
+ */
+#define ESP32_RTC_XTAL_CLK          "xtal-clk"
+#define ESP32_RTC_SLOW_CLK          "slow-clk"
+#define ESP32_RTC_D256_DIG_CLK      "rc-fast-d256-dig-clk"
+#define ESP32_RTC_XTAL32K_DIG_CLK   "xtal32k-dig-clk"
+
+/* RC_SLOW_CLK and RC_FAST_CLK, the internal oscillators, nominally */
+#define ESP32_RC_SLOW_CLK_HZ        150000
+#define ESP32_RC_FAST_CLK_HZ        8000000
+#define ESP32_XTAL32K_CLK_HZ        32768
 
 typedef enum Esp32ResetCause {
     ESP32_POWERON_RESET = 1,
@@ -191,6 +211,11 @@ REG32(RTC_CNTL_CLK_CONF, 0x70)
     FIELD(RTC_CNTL_CLK_CONF, ANA_CLK_RTC_SEL, 30, 2)
     FIELD(RTC_CNTL_CLK_CONF, FAST_CLK_RTC_SEL, 29, 1)
     FIELD(RTC_CNTL_CLK_CONF, SOC_CLK_SEL, 27, 2)
+    FIELD(RTC_CNTL_CLK_CONF, DIG_CLK8M_D256_EN, 9, 1)
+    FIELD(RTC_CNTL_CLK_CONF, DIG_XTAL32K_EN, 8, 1)
+    FIELD(RTC_CNTL_CLK_CONF, ENB_CK8M_DIV, 7, 1)
+    FIELD(RTC_CNTL_CLK_CONF, ENB_CK8M, 6, 1)
+    FIELD(RTC_CNTL_CLK_CONF, CK8M_DIV, 4, 2)
 REG32(RTC_CNTL_SDIO_CONF, 0x74)
 REG32(RTC_CNTL_BIAS_CONF, 0x78)
 REG32(RTC_CNTL_VREG, 0x7c)
@@ -287,6 +312,16 @@ typedef struct Esp32RtcCntlState {
     qemu_irq cpu_stall_req[ESP32_CPU_COUNT];
     qemu_irq clk_update;
 
+    Clock *xtal_clk;
+    Clock *slow_clk;
+    Clock *d256_dig_clk;
+    Clock *xtal32k_dig_clk;
+    /*
+     * A 32.768 kHz crystal is fitted across XTAL_32K_P/N. Modules such as
+     * the ESP32-WROOM-32E have none, so XTAL32K_CLK never runs.
+     */
+    bool xtal32k_fitted;
+
     /* RTCIO, whose pads are the EXT0, EXT1 and RTC GPIO wakeup sources */
     Esp32RtcIoState *rtcio;
     /* Strapped for SPI flash boot, which arms the watchdog's flash boot mode */
@@ -308,6 +343,8 @@ typedef struct Esp32RtcCntlState {
     int64_t time_base_ns;
     /* TIME0/TIME1 as last latched by TIME_UPDATE */
     uint64_t time_latched;
+    /* A TIME_UPDATE latch waits for an RTC_SLOW_CLK edge to set VALID */
+    bool valid_pending;
 
     /* RTC watchdog: its stage, and its count since wdt_base_ns */
     uint32_t wdt_stage;
@@ -338,7 +375,11 @@ typedef struct Esp32RtcCntlState {
     Esp32FastClkSel rtc_fastclk;
     uint32_t rtc_fastclk_freq;
     Esp32SlowClkSel rtc_slowclk;
+    /* RTC_SLOW_CLK's rate; 0 while its source does not run */
     uint32_t rtc_slowclk_freq;
+    /* RC_FAST_DIV_CLK and XTAL32K_CLK; 0 while not running */
+    uint32_t rc_fast_d256_freq;
+    uint32_t xtal32k_freq;
     uint32_t reset_cause[ESP32_CPU_COUNT];
     bool stat_vector_sel[ESP32_CPU_COUNT];
 } Esp32RtcCntlState;
