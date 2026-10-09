@@ -450,23 +450,62 @@ static void esp32_rtc_update_cpu_stall(Esp32RtcCntlState *s)
 
 /*
  * [spec:nuos:req:emu.esp32.clock-gating]
+ * RC_FAST_CLK's oscillator is powered while neither ENB_CK8M nor
+ * CK8M_FORCE_PD is set. CK8M_FORCE_PU and CK8M_FORCE_NOGATING only keep
+ * it up through sleep, in which the model stops the digital clocks anyway.
+ */
+static bool esp32_rtc_rc_fast_powered(uint32_t conf)
+{
+    return !FIELD_EX32(conf, RTC_CNTL_CLK_CONF, ENB_CK8M) &&
+           !FIELD_EX32(conf, RTC_CNTL_CLK_CONF, CK8M_FORCE_PD);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * RC_FAST_CLK's frequency as CK8M_DFREQ trims it. The TRM gives only its
+ * 8 MHz default (CK8M_DFREQ 0, the reset value) and ESP-IDF only the
+ * 8.5 MHz of its trim, CK8M_DFREQ 172; the model takes the frequency to be
+ * linear in CK8M_DFREQ through those two points. Software that needs the
+ * real rate calibrates against XTAL_CLK, as ESP-IDF's rtc_clk_cal does
+ * with 8MD256, and sees whatever the model gives here.
+ */
+static uint32_t esp32_rtc_rc_fast_hz(uint32_t conf)
+{
+    uint32_t dfreq = FIELD_EX32(conf, RTC_CNTL_CLK_CONF, CK8M_DFREQ);
+
+    return ESP32_RC_FAST_CLK_HZ +
+        (uint64_t)dfreq * (ESP32_RC_FAST_TRIMMED_HZ - ESP32_RC_FAST_CLK_HZ) /
+        ESP32_RC_FAST_TRIM_DFREQ;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
  * [spec:nuos:req:emu.esp32.rtc]
  * Decode the clock selection and the slow clock sources' state.
  *
- * RC_FAST_CLK, the 8 MHz oscillator, runs unless ENB_CK8M; RC_FAST_DIV_CLK
- * (8MD256) is it divided by 128 << CK8M_DIV, or undivided with
- * ENB_CK8M_DIV. XTAL32K_CLK runs only with a crystal fitted and the
- * oscillator powered up by RTCIO's XPD_XTAL_32K. RTC_SLOW_CLK is whichever
- * ANA_CLK_RTC_SEL picks, RC_SLOW_CLK running always; it stops if its source
- * does. The digital domain sees 8MD256 and XTAL32K_CLK only through
- * DIG_CLK8M_D256_EN and DIG_XTAL32K_EN. Crystal start-up time and the
- * oscillators' deviation from nominal are not modelled.
+ * RC_FAST_CLK, the internal oscillator, runs once it is powered and has
+ * started up (esp32_rtc_rc_fast_arm). It feeds the SoC clock mux directly
+ * and the digital peripherals, LEDC's RC_FAST source, behind
+ * DIG_CLK8M_EN; RTC_FAST_CLK takes it through the divider CK8M_DIV_SEL + 1
+ * (ESP-IDF's clk_ll_rc_fast_set_divider: "the output from the divider is
+ * passed into rtc_fast_clk MUX"). RC_FAST_DIV_CLK (8MD256) is it divided
+ * by 128 << CK8M_DIV, or undivided with ENB_CK8M_DIV. XTAL32K_CLK runs
+ * only with a crystal fitted and the oscillator powered up by RTCIO's
+ * XPD_XTAL_32K. RTC_SLOW_CLK is whichever ANA_CLK_RTC_SEL picks,
+ * RC_SLOW_CLK running always; it stops if its source does. The digital
+ * domain sees 8MD256 and XTAL32K_CLK only through DIG_CLK8M_D256_EN and
+ * DIG_XTAL32K_EN. Crystal start-up time and the oscillators' deviation
+ * from nominal are not modelled.
  */
 static void esp32_rtc_decode_clk_conf(Esp32RtcCntlState *s)
 {
     uint32_t conf = REG(s, RTC_CNTL_CLK_CONF);
-    const uint32_t fastclk_freq[] = {s->xtal_apb_freq / 4,
-                                     ESP32_RC_FAST_CLK_HZ};
+    uint32_t rc_fast = s->rc_fast_ready && esp32_rtc_rc_fast_powered(conf) ?
+                       esp32_rtc_rc_fast_hz(conf) : 0;
+    const uint32_t fastclk_freq[] = {
+        s->xtal_apb_freq / 4,
+        rc_fast / (FIELD_EX32(conf, RTC_CNTL_CLK_CONF, CK8M_DIV_SEL) + 1),
+    };
     bool xpd_32k = s->rtcio &&
         (s->rtcio->regs[A_RTCIO_XTAL_32K_PAD / 4] &
          R_RTCIO_XTAL_32K_PAD_XPD_XTAL_32K_MASK);
@@ -477,12 +516,13 @@ static void esp32_rtc_decode_clk_conf(Esp32RtcCntlState *s)
     s->rtc_slowclk = FIELD_EX32(conf, RTC_CNTL_CLK_CONF, ANA_CLK_RTC_SEL);
     s->rtc_fastclk_freq = fastclk_freq[s->rtc_fastclk];
 
-    if (FIELD_EX32(conf, RTC_CNTL_CLK_CONF, ENB_CK8M)) {
-        s->rc_fast_d256_freq = 0;
-    } else if (FIELD_EX32(conf, RTC_CNTL_CLK_CONF, ENB_CK8M_DIV)) {
-        s->rc_fast_d256_freq = ESP32_RC_FAST_CLK_HZ;
+    s->rc_fast_freq = rc_fast;
+    s->rc_fast_dig_freq = FIELD_EX32(conf, RTC_CNTL_CLK_CONF, DIG_CLK8M_EN) ?
+                          rc_fast : 0;
+    if (FIELD_EX32(conf, RTC_CNTL_CLK_CONF, ENB_CK8M_DIV)) {
+        s->rc_fast_d256_freq = rc_fast;
     } else {
-        s->rc_fast_d256_freq = ESP32_RC_FAST_CLK_HZ /
+        s->rc_fast_d256_freq = rc_fast /
             (128 << FIELD_EX32(conf, RTC_CNTL_CLK_CONF, CK8M_DIV));
     }
     s->xtal32k_freq = s->xtal32k_fitted && xpd_32k ? ESP32_XTAL32K_CLK_HZ : 0;
@@ -546,6 +586,36 @@ static void esp32_rtc_clocks_changed(Esp32RtcCntlState *s)
         timer_mod(&s->brownout_timer, esp32_rtc_ticks_to_ns(s, now,
                   FIELD_EX32(bo, RTC_CNTL_BROWN_OUT, RST_WAIT)));
     }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * RC_FAST_CLK's oscillator, once powered, gives no clock until CK8M_WAIT
+ * cycles of RTC_SLOW_CLK have passed; a write to CK8M_WAIT during the wait
+ * moves its end. ESP-IDF's rtc_clk_8m_enable clears ENB_CK8M, sets
+ * CK8M_WAIT to 5 and waits 50 us before using the clock, which covers the
+ * 33 us of 5 cycles of the 150 kHz RC_SLOW_CLK. While RTC_SLOW_CLK is
+ * stopped, as it is when it is 8MD256 from this very oscillator, the
+ * wait is counted at RC_SLOW_CLK's nominal rate.
+ */
+static void esp32_rtc_rc_fast_arm(Esp32RtcCntlState *s)
+{
+    uint32_t wait = FIELD_EX32(REG(s, RTC_CNTL_TIMER1), RTC_CNTL_TIMER1,
+                               CK8M_WAIT);
+    uint32_t hz = s->rtc_slowclk_freq ? s->rtc_slowclk_freq :
+                                        ESP32_RC_SLOW_CLK_HZ;
+
+    timer_mod(&s->rc_fast_timer,
+              s->rc_fast_on_ns + muldiv64(wait, NANOSECONDS_PER_SECOND, hz));
+}
+
+static void esp32_rtc_rc_fast_cb(void *opaque)
+{
+    Esp32RtcCntlState *s = opaque;
+
+    s->rc_fast_ready = true;
+    esp32_rtc_clocks_changed(s);
+    qemu_irq_pulse(s->clk_update);
 }
 
 /*
@@ -970,8 +1040,24 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
                            s->rtc_slowclk);
         }
         *r = v & writable;
+        if (esp32_rtc_rc_fast_powered(*r) && !esp32_rtc_rc_fast_powered(old)) {
+            s->rc_fast_on_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            s->rc_fast_ready = false;
+            esp32_rtc_rc_fast_arm(s);
+        } else if (!esp32_rtc_rc_fast_powered(*r)) {
+            s->rc_fast_ready = false;
+            timer_del(&s->rc_fast_timer);
+        }
         esp32_rtc_clocks_changed(s);
         qemu_irq_pulse(s->clk_update);
+        break;
+
+    case A_RTC_CNTL_TIMER1:
+        *r = v & writable;
+        if (esp32_rtc_rc_fast_powered(REG(s, RTC_CNTL_CLK_CONF)) &&
+            !s->rc_fast_ready) {
+            esp32_rtc_rc_fast_arm(s);
+        }
         break;
 
     case A_RTC_CNTL_PWC:
@@ -1054,7 +1140,7 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
                       HWADDR_PRIx "\n", addr);
         break;
 
-    case A_RTC_CNTL_TIMER1 ... A_RTC_CNTL_TIMER5:
+    case A_RTC_CNTL_TIMER2 ... A_RTC_CNTL_TIMER5:
     case A_RTC_CNTL_STORE0 ... A_RTC_CNTL_EXT_XTL_CONF:
     case A_RTC_CNTL_CPU_PERIOD_CONF ... A_RTC_CNTL_SDIO_ACT_CONF:
     case A_RTC_CNTL_SDIO_CONF ... A_RTC_CNTL_VREG:
@@ -1116,6 +1202,7 @@ static void esp32_rtc_cntl_reset_hold(Object *obj, ResetType type)
     timer_del(&s->valid_timer);
     timer_del(&s->wdt_timer);
     timer_del(&s->brownout_timer);
+    timer_del(&s->rc_fast_timer);
 
     if (power_on) {
         s->time_base = 0;
@@ -1139,6 +1226,9 @@ static void esp32_rtc_cntl_reset_hold(Object *obj, ResetType type)
     for (int i = 0; i < ESP32_CPU_COUNT; i++) {
         s->stat_vector_sel[i] = true;
     }
+    /* RC_FAST_CLK, powered at reset, has started up by its end */
+    s->rc_fast_on_ns = now;
+    s->rc_fast_ready = true;
     esp32_rtc_decode_clk_conf(s);
 
     s->sleep = ESP32_RTC_AWAKE;
@@ -1229,6 +1319,9 @@ static void esp32_rtc_cntl_init(Object *obj)
     timer_init_ns(&s->wdt_timer, QEMU_CLOCK_VIRTUAL, esp32_rtc_wdt_cb, s);
     timer_init_ns(&s->brownout_timer, QEMU_CLOCK_VIRTUAL,
                   esp32_rtc_brownout_cb, s);
+    timer_init_ns(&s->rc_fast_timer, QEMU_CLOCK_VIRTUAL,
+                  esp32_rtc_rc_fast_cb, s);
+    s->rc_fast_ready = true;
 
     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
         s->reset_cause[i] = ESP32_POWERON_RESET;
@@ -1250,8 +1343,8 @@ static int esp32_rtc_cntl_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_esp32_rtc_cntl = {
     .name = TYPE_ESP32_RTC_CNTL,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .post_load = esp32_rtc_cntl_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Esp32RtcCntlState,
@@ -1260,6 +1353,9 @@ static const VMStateDescription vmstate_esp32_rtc_cntl = {
         VMSTATE_TIMER(valid_timer, Esp32RtcCntlState),
         VMSTATE_TIMER(wdt_timer, Esp32RtcCntlState),
         VMSTATE_TIMER(brownout_timer, Esp32RtcCntlState),
+        VMSTATE_TIMER(rc_fast_timer, Esp32RtcCntlState),
+        VMSTATE_INT64(rc_fast_on_ns, Esp32RtcCntlState),
+        VMSTATE_BOOL(rc_fast_ready, Esp32RtcCntlState),
         VMSTATE_UINT64(time_base, Esp32RtcCntlState),
         VMSTATE_INT64(time_base_ns, Esp32RtcCntlState),
         VMSTATE_UINT64(time_latched, Esp32RtcCntlState),

@@ -409,8 +409,6 @@ static void esp32_cpu_stall(void* opaque, int n, int level)
 /* TWAI's interrupt register, the SJA1000's IR (register 3): read clears it */
 #define ESP32_TWAI_INT_RAW_OFFSET 0x0c
 
-/* RC_FAST_CLK, the internal 8 MHz oscillator, at its nominal frequency */
-#define ESP32_RC_FAST_HZ 8000000
 /* APB_CLK from PLL_CLK, whichever of its frequencies (TRM table 7.2-4) */
 #define ESP32_PLL_APB_HZ 80000000
 /*
@@ -442,7 +440,8 @@ static void esp32_gate_update_clocks(Esp32SocState *s, Esp32PeriphGate *g)
         clock_update_hz(g->ref_tick_clk, running ? s->ref_tick_hz : 0);
     }
     if (g->rc_fast_clk) {
-        clock_update_hz(g->rc_fast_clk, running ? ESP32_RC_FAST_HZ : 0);
+        clock_update_hz(g->rc_fast_clk,
+                        running ? s->rtc_cntl.rc_fast_dig_freq : 0);
     }
     if (g->f160m_clk) {
         clock_update_hz(g->f160m_clk, running ? s->f160m_hz : 0);
@@ -461,7 +460,9 @@ static void esp32_gate_update_clocks(Esp32SocState *s, Esp32PeriphGate *g)
  * From PLL_CLK, CPU_CLK is PLL_CLK / 4 with CPUPERIOD_SEL 0 and PLL_CLK / 2
  * otherwise; the TRM allows 80 and 160 MHz from the 320 MHz PLL_CLK and
  * 240 MHz from the 480 MHz one. A source that is off (the BBPLL powered
- * down, or the APLL not powered up) gives no CPU_CLK, and the CPUs stop.
+ * down, the APLL not powered up, or RC_FAST_CLK powered down by ENB_CK8M
+ * or still starting up) gives no CPU_CLK, and the CPUs stop until it runs.
+ * RC_FAST_CLK runs at the rate its CK8M_DFREQ trim gives it.
  */
 static void esp32_soc_update_clocks(Esp32SocState *s)
 {
@@ -500,7 +501,8 @@ static void esp32_soc_update_clocks(Esp32SocState *s)
         apb_hz = pll_hz ? ESP32_PLL_APB_HZ : 0;
         break;
     case ESP32_SOC_CLK_8M:
-        cpu_hz = ESP32_RC_FAST_HZ / esp32_apb_ctrl_pre_div(&s->apb_ctrl);
+        cpu_hz = s->rtc_cntl.rc_fast_freq /
+                 esp32_apb_ctrl_pre_div(&s->apb_ctrl);
         apb_hz = cpu_hz;
         break;
     case ESP32_SOC_CLK_APLL:

@@ -35,7 +35,8 @@ typedef struct Esp32RtcIoState Esp32RtcIoState;
  * - ESP32_RTC_CPU_STALL_GPIO (per CPU): the CPU's stall changed; the SoC
  *   reads cpu_stall_state.
  * - ESP32_RTC_CLK_UPDATE_GPIO: the clock selection, the BBPLL's or APLL's
- *   power, or the digital domain's clock gating (dig_clk_gated) changed.
+ *   power, RC_FAST_CLK (rc_fast_freq, rc_fast_dig_freq), or the digital
+ *   domain's clock gating (dig_clk_gated) changed.
  * - ESP32_RTC_TOUCH_TIMER_GPIO: RTC_CNTL_TOUCH_SLP_TIMER_EN, which lets the
  *   touch sensor's timer start measurements.
  *
@@ -76,9 +77,16 @@ typedef struct Esp32RtcIoState Esp32RtcIoState;
 #define ESP32_RTC_D256_DIG_CLK      "rc-fast-d256-dig-clk"
 #define ESP32_RTC_XTAL32K_DIG_CLK   "xtal32k-dig-clk"
 
-/* RC_SLOW_CLK and RC_FAST_CLK, the internal oscillators, nominally */
+/*
+ * RC_SLOW_CLK and RC_FAST_CLK, the internal oscillators, nominally. The
+ * TRM gives RC_FAST_CLK 8 MHz by default, that is with CK8M_DFREQ at its
+ * reset value 0; ESP-IDF's trim, CK8M_DFREQ = 172, gives it 8.5 MHz
+ * (SOC_CLK_RC_FAST_FREQ_APPROX).
+ */
 #define ESP32_RC_SLOW_CLK_HZ        150000
 #define ESP32_RC_FAST_CLK_HZ        8000000
+#define ESP32_RC_FAST_TRIMMED_HZ    8500000
+#define ESP32_RC_FAST_TRIM_DFREQ    172
 #define ESP32_XTAL32K_CLK_HZ        32768
 
 typedef enum Esp32ResetCause {
@@ -180,6 +188,7 @@ REG32(RTC_CNTL_STATE0, 0x18)
     FIELD(RTC_CNTL_STATE0, SDIO_ACTIVE_IND, 28, 1)
     FIELD(RTC_CNTL_STATE0, TOUCH_SLP_TIMER_EN, 23, 1)
 REG32(RTC_CNTL_TIMER1, 0x1c)
+    FIELD(RTC_CNTL_TIMER1, CK8M_WAIT, 6, 8)
 REG32(RTC_CNTL_TIMER2, 0x20)
 REG32(RTC_CNTL_TIMER3, 0x24)
 REG32(RTC_CNTL_TIMER4, 0x28)
@@ -220,6 +229,13 @@ REG32(RTC_CNTL_CLK_CONF, 0x70)
     FIELD(RTC_CNTL_CLK_CONF, ANA_CLK_RTC_SEL, 30, 2)
     FIELD(RTC_CNTL_CLK_CONF, FAST_CLK_RTC_SEL, 29, 1)
     FIELD(RTC_CNTL_CLK_CONF, SOC_CLK_SEL, 27, 2)
+    FIELD(RTC_CNTL_CLK_CONF, CK8M_FORCE_PU, 26, 1)
+    FIELD(RTC_CNTL_CLK_CONF, CK8M_FORCE_NOGATING, 25, 1)
+    FIELD(RTC_CNTL_CLK_CONF, CK8M_DFREQ, 17, 8)
+    FIELD(RTC_CNTL_CLK_CONF, CK8M_FORCE_PD, 16, 1)
+    FIELD(RTC_CNTL_CLK_CONF, CK8M_DIV_SEL, 12, 3)
+    FIELD(RTC_CNTL_CLK_CONF, CK8M_DFREQ_FORCE, 11, 1)
+    FIELD(RTC_CNTL_CLK_CONF, DIG_CLK8M_EN, 10, 1)
     FIELD(RTC_CNTL_CLK_CONF, DIG_CLK8M_D256_EN, 9, 1)
     FIELD(RTC_CNTL_CLK_CONF, DIG_XTAL32K_EN, 8, 1)
     FIELD(RTC_CNTL_CLK_CONF, ENB_CK8M_DIV, 7, 1)
@@ -341,6 +357,8 @@ typedef struct Esp32RtcCntlState {
     QEMUTimer valid_timer;
     QEMUTimer wdt_timer;
     QEMUTimer brownout_timer;
+    /* RC_FAST_CLK's start-up: CK8M_WAIT RTC_SLOW_CLK cycles */
+    QEMUTimer rc_fast_timer;
 
     /* Every register's stored value, indexed by offset / 4 */
     uint32_t regs[ESP32_RTC_CNTL_REG_COUNT];
@@ -355,6 +373,13 @@ typedef struct Esp32RtcCntlState {
     uint64_t time_latched;
     /* A TIME_UPDATE latch waits for an RTC_SLOW_CLK edge to set VALID */
     bool valid_pending;
+
+    /*
+     * RC_FAST_CLK's oscillator was powered up at rc_fast_on_ns and has
+     * started up (rc_fast_ready) or is still waiting out CK8M_WAIT.
+     */
+    int64_t rc_fast_on_ns;
+    bool rc_fast_ready;
 
     /* RTC watchdog: its stage, and its count since wdt_base_ns */
     uint32_t wdt_stage;
@@ -387,7 +412,13 @@ typedef struct Esp32RtcCntlState {
     Esp32SlowClkSel rtc_slowclk;
     /* RTC_SLOW_CLK's rate; 0 while its source does not run */
     uint32_t rtc_slowclk_freq;
-    /* RC_FAST_DIV_CLK and XTAL32K_CLK; 0 while not running */
+    /*
+     * RC_FAST_CLK, the SoC clock mux's 8M input; RC_FAST_CLK as the
+     * digital peripherals see it, behind DIG_CLK8M_EN; RC_FAST_DIV_CLK and
+     * XTAL32K_CLK. 0 while not running.
+     */
+    uint32_t rc_fast_freq;
+    uint32_t rc_fast_dig_freq;
     uint32_t rc_fast_d256_freq;
     uint32_t xtal32k_freq;
     uint32_t reset_cause[ESP32_CPU_COUNT];
