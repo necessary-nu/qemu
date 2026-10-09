@@ -164,6 +164,9 @@ config RP2350_PWM
 config RP2350_HSTX
     bool
 
+config RP2350_PIO
+    bool
+
 config RP2350_CORESIGHT
     bool
 

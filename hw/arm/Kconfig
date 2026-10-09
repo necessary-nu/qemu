@@ -415,6 +415,7 @@ config RP2350_SOC
     select RP2350_SHA256
     select RP2350_PWM
     select RP2350_HSTX
+    select RP2350_PIO
     select RP2350_CORESIGHT
     select RP2350_ACCESSCTRL
     select RP2350_XIP

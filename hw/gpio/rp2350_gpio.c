@@ -305,6 +305,24 @@ void rp2350_gpio_connect_in(RP2350GPIOState *s, RP2350GPIOPort port, int n,
     qdev_connect_gpio_out_named(DEVICE(s), name, n, irq);
 }
 
+uint64_t rp2350_gpio_port_selected(RP2350GPIOState *s, RP2350GPIOPort port)
+{
+    int base = rp2350_gpio_port_base[port];
+    int n = rp2350_gpio_port_signals(port);
+    uint64_t mask = 0;
+    int p;
+
+    assert(n <= 64);
+    for (p = 0; p < RP2350_GPIO_PINS; p++) {
+        int f = rp2350_gpio_fn[p][CTRL_FUNCSEL(s->ctrl[p])];
+
+        if (f >= base && f < base + n) {
+            mask |= 1ull << (f - base);
+        }
+    }
+    return mask;
+}
+
 /* CTRL override fields: 0 pass, 1 invert, 2 force low, 3 force high. */
 static int over(int mode, int v)
 {

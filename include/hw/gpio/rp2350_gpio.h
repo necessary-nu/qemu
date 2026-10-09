@@ -318,6 +318,12 @@ void rp2350_gpio_connect_in(RP2350GPIOState *s, RP2350GPIOPort port, int n,
                             qemu_irq irq);
 
 /*
+ * The signals of `port` (at most 64) that some pin's FUNCSEL selects:
+ * those whose outputs can reach a pin.
+ */
+uint64_t rp2350_gpio_port_selected(RP2350GPIOState *s, RP2350GPIOPort port);
+
+/*
  * Set the ACCESSCTRL GPIO_NSMASK1:0 pair (SIO layout). A pin whose bit is
  * set is Non-secure accessible: its interrupts go to the _NS outputs and
  * Non-secure code may access its IO and pad registers; Non-secure accesses

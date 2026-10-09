@@ -299,6 +299,12 @@ static void rp2350_soc_reset_hold(void *opaque, uint32_t blocks, bool hold)
     if (gpio) {
         rp2350_gpio_hold_blocks(&s->gpio, gpio, hold);
     }
+    /* The PIO blocks are one device model, held in reset individually. */
+    for (i = 0; i < RP2350_PIO_BLOCKS; i++) {
+        if (blocks & BIT(RP2350_RESET_PIO0 + i)) {
+            rp2350_pio_hold_block(&s->pio, i, hold);
+        }
+    }
 }
 
 static void rp2350_soc_init_reset_gates(RP2350State *s)
@@ -559,9 +565,21 @@ static void rp2350_soc_accessctrl_changed(Notifier *n, void *data)
 {
     RP2350State *s = container_of(n, RP2350State, accessctrl_notifier);
 
-    rp2350_gpio_set_nsmask(&s->gpio,
+    uint64_t nsmask =
         (uint64_t)rp2350_accessctrl_gpio_nsmask(&s->accessctrl, 1) << 32 |
-        rp2350_accessctrl_gpio_nsmask(&s->accessctrl, 0));
+        rp2350_accessctrl_gpio_nsmask(&s->accessctrl, 0);
+    uint32_t pio_ns = 0;
+    int i;
+
+    rp2350_gpio_set_nsmask(&s->gpio, nsmask);
+    for (i = 0; i < RP2350_PIO_BLOCKS; i++) {
+        if (rp2350_accessctrl_ns_accessible(&s->accessctrl,
+                                            RP2350_PIO0_BASE +
+                                            i * RP2350_PIO_STRIDE)) {
+            pio_ns |= 1u << i;
+        }
+    }
+    rp2350_pio_set_security(&s->pio, pio_ns, nsmask);
 }
 
 /*
@@ -1093,6 +1111,49 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
 
     /*
+     * PIO0-2. Each block drives its GPIO function signals and sees every
+     * pin; the IO bank delivers the same pin levels to all three PIO
+     * ports, so the blocks take them from PIO0's. The DREQ_PIOx_TXn/RXn
+     * outputs are connected with the DMA's other sources.
+     */
+    /* [spec:nuos:req:emu.pio] */
+    {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->pio);
+        DeviceState *dev = DEVICE(&s->pio);
+        int b, n;
+
+        qdev_connect_clock_in(dev, "clk", s->sysclk);
+        object_property_set_link(OBJECT(dev), "gpio", OBJECT(&s->gpio),
+                                 &error_abort);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        for (b = 0; b < RP2350_PIO_BLOCKS; b++) {
+            RP2350GPIOPort port = RP2350_GPIO_PORT_PIO0 + b;
+
+            sysbus_mmio_map(sbd, b, RP2350_PIO0_BASE + b * RP2350_PIO_STRIDE);
+            for (n = 0; n < RP2350_PIO_IRQS_PER_BLOCK; n++) {
+                sysbus_connect_irq(sbd, b * RP2350_PIO_IRQS_PER_BLOCK + n,
+                    qdev_get_gpio_in(dev_soc, RP2350_PIO0_IRQ_0 +
+                                     b * RP2350_PIO_IRQS_PER_BLOCK + n));
+            }
+            for (n = 0; n < RP2350_PIO_GPIOS; n++) {
+                qdev_connect_gpio_out_named(dev, RP2350_PIO_OUT,
+                    b * RP2350_PIO_GPIOS + n,
+                    rp2350_gpio_out_line(&s->gpio, port, n));
+                qdev_connect_gpio_out_named(dev, RP2350_PIO_OE,
+                    b * RP2350_PIO_GPIOS + n,
+                    rp2350_gpio_oe_line(&s->gpio, port, n));
+            }
+        }
+        for (n = 0; n < RP2350_PIO_GPIOS; n++) {
+            rp2350_gpio_connect_in(&s->gpio, RP2350_GPIO_PORT_PIO0, n,
+                                   qdev_get_gpio_in_named(dev, RP2350_PIO_IN,
+                                                          n));
+        }
+    }
+
+    /*
      * HSTX, clocked by clk_hstx. Clock frequencies are not modelled: at
      * reset CLK_HSTX_CTRL selects clk_sys undivided, which pico-sdk keeps,
      * so clk_hstx is clk_sys. Its eight outputs drive the HSTX function
@@ -1116,6 +1177,12 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                 rp2350_gpio_out_line(&s->gpio, RP2350_GPIO_PORT_HSTX, n));
             qdev_connect_gpio_out_named(dev, RP2350_HSTX_OE, n,
                 rp2350_gpio_oe_line(&s->gpio, RP2350_GPIO_PORT_HSTX, n));
+        }
+        /* Coupled mode takes each PIO block's outputs for GPIOs 12-19. */
+        /* [spec:nuos:req:emu.pio] */
+        for (n = 0; n < RP2350_PIO_BLOCKS * RP2350_PIO_HSTX_BITS; n++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->pio), RP2350_PIO_HSTX, n,
+                qdev_get_gpio_in_named(dev, RP2350_HSTX_PIO_OUT, n));
         }
     }
 
@@ -1303,6 +1370,11 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                 qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
                                        RP2350_DREQ_XIP_STREAM + i));
         }
+        /* DREQ_PIO0_TX0 to DREQ_PIO2_RX3 are DREQs 0-23. */
+        for (i = 0; i < RP2350_PIO_DREQS; i++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->pio), RP2350_PIO_DREQ, i,
+                qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, i));
+        }
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->coresight_trace), 0,
             qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
                                    RP2350_DREQ_CORESIGHT));
@@ -1410,6 +1482,7 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "sha256", &s->sha256, TYPE_RP2350_SHA256);
     object_initialize_child(obj, "pwm", &s->pwm, TYPE_RP2350_PWM);
     object_initialize_child(obj, "hstx", &s->hstx, TYPE_RP2350_HSTX);
+    object_initialize_child(obj, "pio", &s->pio, TYPE_RP2350_PIO);
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
         object_initialize_child(obj, "timer[*]", &s->timer[i],
                                 TYPE_RP2350_TIMER);

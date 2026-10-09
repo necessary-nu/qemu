@@ -262,6 +262,7 @@ qtests_rp2350 = \
    'rp2350-xip-test',
    'rp2350-watchdog-test',
    'rp2350-pwm-test',
+   'rp2350-pio-test',
    'rp2350-otp-test',
    'rp2350-dma-test',
    'rp2350-spi-test',
