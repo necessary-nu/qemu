@@ -117,8 +117,8 @@ static void test_memory_map(void)
                           "(prio -1000, i/o): rp2350.sio @0000000000001000");
     assert_mtree_has(qts, "00000000d0020000-00000000d0020fff "
                           "(prio 0, i/o): rp2350-sio-nonsec");
-    assert_mtree_has(qts, "00000000e0080000-00000000e0080fff "
-                          "(prio 0, i/o): rp2350.eppb");
+    assert_mtree_has(qts, "00000000e0080000-00000000e0083fff "
+                          "(prio 0, i/o): rp2350-eppb");
     for (i = 0; i < ARRAY_SIZE(unimplemented); i++) {
         g_autofree char *entry = g_strdup_printf(
             "%016" PRIx64 "-%016" PRIx64 " (prio -1000, i/o): %s",

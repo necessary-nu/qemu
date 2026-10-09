@@ -208,8 +208,18 @@ static void rp2350_soc_set_irq(void *opaque, int n, int level)
     int i;
 
     for (i = 0; i < RP2350_NUM_CORES; i++) {
-        qemu_set_irq(qdev_get_gpio_in(DEVICE(&s->armv7m[i]), n), level);
+        qemu_set_irq(rp2350_soc_core_irq(s, i, n), level);
     }
+}
+
+/*
+ * A core's IRQ lines pass through its EPPB on the way to its NVIC, as the
+ * EPPB's NMI mask taps every system IRQ the core receives.
+ */
+/* [spec:nuos:req:emu.eppb] */
+qemu_irq rp2350_soc_core_irq(RP2350State *s, int core, int n)
+{
+    return qdev_get_gpio_in(DEVICE(&s->eppb[core]), n);
 }
 
 /* [spec:nuos:req:emu.machine+1] */
@@ -277,6 +287,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
     for (i = 0; i < RP2350_NUM_CORES; i++) {
         DeviceState *armv7m = DEVICE(&s->armv7m[i]);
+        int n;
 
         qdev_prop_set_uint32(armv7m, "num-irq", RP2350_NUM_IRQS);
         qdev_prop_set_uint8(armv7m, "num-prio-bits", 4);
@@ -311,15 +322,26 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
          * that each armv7m container claims, so it is mapped per core
          * rather than in board memory.
          */
-        qdev_prop_set_string(DEVICE(&s->eppb[i]), "name", "rp2350.eppb");
-        qdev_prop_set_uint64(DEVICE(&s->eppb[i]), "size", RP2350_EPPB_SIZE);
+        /* [spec:nuos:req:emu.eppb] */
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->eppb[i]), errp)) {
             return;
         }
         memory_region_add_subregion_overlap(
             &s->armv7m[i].container, RP2350_EPPB_BASE,
             sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->eppb[i]), 0), 0);
+        for (n = 0; n < RP2350_NUM_IRQS; n++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->eppb[i]), "irq", n,
+                                        qdev_get_gpio_in(armv7m, n));
+        }
+        qdev_connect_gpio_out_named(DEVICE(&s->eppb[i]), "nmi", 0,
+                                    qdev_get_gpio_in_named(armv7m, "NMI", 0));
     }
+    memory_region_init_alias(&s->eppb_sysmem, obj, "rp2350-eppb.sysmem",
+                             sysbus_mmio_get_region(
+                                 SYS_BUS_DEVICE(&s->eppb[0]), 0),
+                             0, RP2350_ATOMIC_REGION_SIZE);
+    memory_region_add_subregion(s->board_memory, RP2350_EPPB_BASE,
+                                &s->eppb_sysmem);
 
     /* [spec:nuos:req:emu.rcp] */
     qdev_prop_set_bit(DEVICE(&s->rcp), "boot-rom-handoff", s->core1_launch);
@@ -329,8 +351,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     for (i = 0; i < RP2350_NUM_CORES; i++) {
         rp2350_rcp_attach(&s->rcp, i, s->armv7m[i].cpu);
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->rcp), i,
-                           qdev_get_gpio_in_named(DEVICE(&s->armv7m[i]),
-                                                  "NMI", 0));
+                           qdev_get_gpio_in_named(DEVICE(&s->eppb[i]),
+                                                  "rcp-nmi", 0));
     }
 
     /* [spec:nuos:req:emu.dcp-state] */
@@ -363,11 +385,9 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             int irq = (bank * RP2350_SIO_CORES + i) * 2;
 
             sysbus_connect_irq(SYS_BUS_DEVICE(&s->sio), irq,
-                qdev_get_gpio_in(DEVICE(&s->armv7m[i]),
-                                 RP2350_SIO_IRQ_FIFO + 2 * bank));
+                rp2350_soc_core_irq(s, i, RP2350_SIO_IRQ_FIFO + 2 * bank));
             sysbus_connect_irq(SYS_BUS_DEVICE(&s->sio), irq + 1,
-                qdev_get_gpio_in(DEVICE(&s->armv7m[i]),
-                                 RP2350_SIO_IRQ_BELL + 2 * bank));
+                rp2350_soc_core_irq(s, i, RP2350_SIO_IRQ_BELL + 2 * bank));
         }
     }
     memory_region_init_alias(&s->sio_sysmem[0], obj, "rp2350-sio.sysmem",
@@ -469,7 +489,7 @@ static void rp2350_soc_init(Object *obj)
     for (i = 0; i < RP2350_NUM_CORES; i++) {
         object_initialize_child(obj, "armv7m[*]", &s->armv7m[i], TYPE_ARMV7M);
         object_initialize_child(obj, "eppb[*]", &s->eppb[i],
-                                TYPE_UNIMPLEMENTED_DEVICE);
+                                TYPE_RP2350_EPPB);
     }
 
     object_initialize_child(obj, "resets", &s->resets, TYPE_RP2350_RESETS);

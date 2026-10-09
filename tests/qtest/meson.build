@@ -250,7 +250,8 @@ qtests_rp2350 = \
    'rp2350-uart-test',
    'rp2350-timer-test',
    'rp2350-bootram-test',
-   'rp2350-sysregs-test']
+   'rp2350-sysregs-test',
+   'rp2350-eppb-test']
 
 qtests_stm32l4x5 = \
   ['stm32l4x5_exti-test',

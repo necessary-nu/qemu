@@ -16,6 +16,7 @@
 #include "hw/misc/rp2350_bootram.h"
 #include "hw/misc/rp2350_clocks.h"
 #include "hw/misc/rp2350_dcp.h"
+#include "hw/misc/rp2350_eppb.h"
 #include "hw/misc/rp2350_rcp.h"
 #include "hw/misc/rp2350_resets.h"
 #include "hw/misc/rp2350_sio.h"
@@ -73,7 +74,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_SRAM_SIZE (520 * KiB)
 
 #define RP2350_EPPB_BASE 0xe0080000
-#define RP2350_EPPB_SIZE 0x1000
 
 #define RP2350_SYSINFO_BASE 0x40000000
 #define RP2350_SYSCFG_BASE 0x40008000
@@ -101,7 +101,7 @@ struct RP2350State {
     SysBusDevice parent_obj;
 
     ARMv7MState armv7m[RP2350_NUM_CORES];
-    UnimplementedDeviceState eppb[RP2350_NUM_CORES];
+    RP2350EPPBState eppb[RP2350_NUM_CORES];
     RP2350ResetsState resets;
     RP2350SIOState sio;
     RP2350RCPState rcp;
@@ -123,6 +123,8 @@ struct RP2350State {
     MemoryRegion uart_alias[RP2350_NUM_UARTS];
     /* Core 0's SIO views as seen from system memory (debug, qtest). */
     MemoryRegion sio_sysmem[2];
+    /* Core 0's EPPB as seen from system memory (debug, qtest). */
+    MemoryRegion eppb_sysmem;
 
     MemoryRegion rom;
     MemoryRegion flash;
@@ -151,5 +153,12 @@ struct RP2350State {
  * code. Called after the core is reset when no boot ROM runs.
  */
 void rp2350_soc_boot_rom_handoff(RP2350State *s, int core);
+
+/*
+ * The input for IRQ `n` of core `core`. Every interrupt source reaches a
+ * core through this, never straight to its NVIC, so that the core's NMI
+ * mask sees it.
+ */
+qemu_irq rp2350_soc_core_irq(RP2350State *s, int core, int n);
 
 #endif

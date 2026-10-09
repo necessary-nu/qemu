@@ -137,6 +137,9 @@ config RP2350_DCP
 config RP2350_SYSREGS
     bool
 
+config RP2350_EPPB
+    bool
+
 config STM32L4X5_SYSCFG
     bool
 
