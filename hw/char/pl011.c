@@ -16,11 +16,15 @@
  *  + sysbus IRQ 3: UARTRTINTR (receive timeout interrupt line)
  *  + sysbus IRQ 4: UARTMSINTR (momem status interrupt line)
  *  + sysbus IRQ 5: UARTEINTR (error interrupt line)
+ *  + named GPIO outputs "dma-req": UARTTXDMASREQ, UARTRXDMASREQ
+ *  + in line-level mode, named GPIO outputs "txd" and "nrts" and inputs
+ *    "rxd" and "ncts": the UART's pins (see pl011.h)
  */
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "hw/char/pl011.h"
+#include "hw/char/uart-line.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-clock.h"
@@ -54,12 +58,16 @@ DeviceState *pl011_create(hwaddr addr, qemu_irq irq, Chardev *chr)
 #define PL011_FLAG_RXFF 0x40
 #define PL011_FLAG_TXFF 0x20
 #define PL011_FLAG_RXFE 0x10
+#define PL011_FLAG_BUSY 0x08
 #define PL011_FLAG_DCD  0x04
 #define PL011_FLAG_DSR  0x02
 #define PL011_FLAG_CTS  0x01
 
-/* Data Register, UARTDR */
+/* Data Register, UARTDR, and the receive FIFO's error bits */
+#define DR_FE   (1 << 8)
+#define DR_PE   (1 << 9)
 #define DR_BE   (1 << 10)
+#define DR_OE   (1 << 11)
 
 /* Interrupt status bits in UARTRIS, UARTMIS, UARTIMSC */
 #define INT_OE (1 << 10)
@@ -82,10 +90,16 @@ DeviceState *pl011_create(hwaddr addr, qemu_irq irq, Chardev *chr)
 #define DMACR_DMAONERR  (1 << 2)
 
 /* Line Control Register, UARTLCR_H */
+#define LCR_SPS     (1 << 7)
 #define LCR_FEN     (1 << 4)
+#define LCR_STP2    (1 << 3)
+#define LCR_EPS     (1 << 2)
+#define LCR_PEN     (1 << 1)
 #define LCR_BRK     (1 << 0)
 
 /* Control Register, UARTCR */
+#define CR_CTSEN    (1 << 15)
+#define CR_RTSEN    (1 << 14)
 #define CR_OUT2     (1 << 13)
 #define CR_OUT1     (1 << 12)
 #define CR_RTS      (1 << 11)
@@ -134,18 +148,24 @@ static const uint32_t irqmask[] = {
     INT_E,
 };
 
+static inline unsigned pl011_get_fifo_depth(PL011State *s);
+
 /*
- * The single-transfer DMA requests. Characters are transmitted as soon as
- * they are written, so the transmit FIFO always has room; the receive
- * request follows the receive FIFO. DMAONERR masks the receive request
- * while an error interrupt is pending.
+ * The single-transfer DMA requests. The transmit request asks for a
+ * character while the transmit FIFO has room; outside line-level mode,
+ * characters are transmitted as soon as they are written, so it always
+ * has. The receive request follows the receive FIFO. DMAONERR masks the
+ * receive request while an error interrupt is pending.
  */
 static void pl011_update_dma(PL011State *s)
 {
     bool en = s->cr & CR_UARTEN;
     bool rx_err = (s->dmacr & DMACR_DMAONERR) && (s->int_level & INT_E);
+    bool tx_room = !s->line_level ||
+                   s->tx_count < pl011_get_fifo_depth(s);
 
-    qemu_set_irq(s->dma_req[PL011_DMA_TX], en && (s->dmacr & DMACR_TXDMAE));
+    qemu_set_irq(s->dma_req[PL011_DMA_TX],
+                 en && (s->dmacr & DMACR_TXDMAE) && tx_room);
     qemu_set_irq(s->dma_req[PL011_DMA_RX],
                  en && (s->dmacr & DMACR_RXDMAE) && s->read_count > 0 &&
                  !rx_err);
@@ -177,7 +197,7 @@ static bool pl011_is_fifo_enabled(PL011State *s)
 static inline unsigned pl011_get_fifo_depth(PL011State *s)
 {
     /* Note: FIFO depth is expected to be power-of-2 */
-    return pl011_is_fifo_enabled(s) ? PL011_FIFO_DEPTH : 1;
+    return pl011_is_fifo_enabled(s) ? s->fifo_depth : 1;
 }
 
 static inline void pl011_reset_rx_fifo(PL011State *s)
@@ -247,6 +267,477 @@ static void pl011_loopback_tx(PL011State *s, uint32_t value)
     pl011_fifo_rx_put(s, value);
 }
 
+/*
+ * Line-level mode.
+ *
+ * The transmitter takes characters from the transmit FIFO into its shift
+ * register and drives each frame on UARTTXD from a timer at the frame's
+ * bit boundaries, timed from the divisor latched by the last UARTLCR_H
+ * write: one bit is 16 Baud16 periods of BRD/64 UARTCLK cycles. The
+ * receiver starts a frame at a falling edge on its input, checks the
+ * start bit half a bit later and samples each following bit one bit
+ * period apart, once in the middle of the bit rather than as a majority
+ * of three. UARTEN, TXE and RXE gate the start of a frame; a frame in
+ * progress completes, as on hardware.
+ */
+
+/* Time of `ticks` Baud16 periods at divisor `brd`. */
+static int64_t pl011_baud16_ns(PL011State *s, uint32_t brd, unsigned ticks)
+{
+    return (uint64_t)ticks * brd * NANOSECONDS_PER_SECOND /
+           (64 * (uint64_t)clock_get_hz(s->clk));
+}
+
+/* A divisor below 1.0 (IBRD 0) does not run the baud rate generator. */
+static bool pl011_baud_runs(PL011State *s, uint32_t brd)
+{
+    return brd >= 64 && clock_get_hz(s->clk) != 0;
+}
+
+static unsigned pl011_word_bits(uint32_t lcr)
+{
+    return 5 + extract32(lcr, 5, 2);
+}
+
+/* The parity bit of `data`, with UARTLCR_H's EPS and SPS. */
+static unsigned pl011_parity(uint32_t lcr, uint32_t data)
+{
+    if (lcr & LCR_SPS) {
+        return !(lcr & LCR_EPS);
+    }
+    return (ctpop32(data) & 1) ^ !(lcr & LCR_EPS);
+}
+
+/*
+ * FIFO trigger levels, from UARTIFLS: 1/8, 1/4, 1/2, 3/4 or 7/8 full.
+ * In character mode the receive level is one character and the transmit
+ * level is an empty holding register.
+ */
+static unsigned pl011_ifls_level(PL011State *s, unsigned sel)
+{
+    static const uint8_t eighths[] = { 1, 2, 4, 6, 7 };
+
+    if (sel >= ARRAY_SIZE(eighths)) {
+        sel = 2;
+    }
+    return s->fifo_depth * eighths[sel] / 8;
+}
+
+static unsigned pl011_rx_level(PL011State *s)
+{
+    if (!pl011_is_fifo_enabled(s)) {
+        return 1;
+    }
+    return pl011_ifls_level(s, extract32(s->ifl, 3, 3));
+}
+
+static unsigned pl011_tx_level(PL011State *s)
+{
+    if (!pl011_is_fifo_enabled(s)) {
+        return 0;
+    }
+    return pl011_ifls_level(s, extract32(s->ifl, 0, 3));
+}
+
+static void pl011_line_rx_changed(PL011State *s, int64_t when);
+static void pl011_line_cts_changed(PL011State *s, int64_t when);
+
+static void pl011_line_set_txd(PL011State *s, int level, int64_t when)
+{
+    if (s->txd == level) {
+        return;
+    }
+    s->txd = level;
+    uart_line_set(s->txd_out, level, when);
+    if (pl011_loopback_enabled(s)) {
+        pl011_line_rx_changed(s, when);
+    }
+}
+
+/*
+ * nUARTRTS: with RTSEn, asserted until the receive FIFO fills to its
+ * trigger level; otherwise the inverse of UARTCR.RTS.
+ */
+static void pl011_line_update_rts(PL011State *s, int64_t when)
+{
+    int level;
+
+    if (s->cr & CR_RTSEN) {
+        level = s->read_count >= pl011_rx_level(s);
+    } else {
+        level = !(s->cr & CR_RTS);
+    }
+    if (s->nrts == level) {
+        return;
+    }
+    s->nrts = level;
+    uart_line_set(s->nrts_out, level, when);
+    if (pl011_loopback_enabled(s)) {
+        pl011_line_cts_changed(s, when);
+    }
+}
+
+/* Schedule the transmit timer for the next change of UARTTXD. */
+static void pl011_line_tx_schedule(PL011State *s)
+{
+    int bit = s->tx_bit + 1;
+
+    while (bit < s->tx_len &&
+           ((s->tx_frame >> bit) & 1) == ((s->tx_frame >> s->tx_bit) & 1)) {
+        bit++;
+    }
+    s->tx_bit = bit - 1;
+    s->tx_next = s->tx_start + pl011_baud16_ns(s, s->tx_brd, 16 * bit);
+    timer_mod(s->tx_timer, s->tx_next);
+}
+
+/*
+ * Move the next character into the shift register and start its frame,
+ * if the transmitter may: it is idle, enabled, not sending a break, and
+ * with CTSEn, nUARTCTS is asserted.
+ */
+/* [spec:nuos:req:emu.uart] */
+static void pl011_line_tx_start(PL011State *s, int64_t now)
+{
+    uint32_t data, frame;
+    unsigned bits, len, level;
+
+    if (s->tx_busy || s->tx_count == 0 || (s->lcr & LCR_BRK) ||
+        (s->cr & (CR_UARTEN | CR_TXE)) != (CR_UARTEN | CR_TXE) ||
+        ((s->cr & CR_CTSEN) && s->ncts_level)) {
+        return;
+    }
+    if (!pl011_baud_runs(s, s->brd)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "pl011: transmitting with a zero baud rate divisor\n");
+        return;
+    }
+
+    data = s->tx_fifo[s->tx_pos];
+    s->tx_pos = (s->tx_pos + 1) % PL011_FIFO_MAX;
+    level = pl011_tx_level(s);
+    if (s->tx_count > level && s->tx_count - 1 <= level) {
+        s->int_level |= INT_TX;
+    }
+    s->tx_count--;
+
+    bits = pl011_word_bits(s->lcr);
+    data &= MAKE_64BIT_MASK(0, bits);
+    /* Start bit 0, data LSB first, parity, then one or two stop bits. */
+    frame = data << 1;
+    len = 1 + bits;
+    if (s->lcr & LCR_PEN) {
+        frame |= pl011_parity(s->lcr, data) << len;
+        len++;
+    }
+    if (s->lcr & LCR_STP2) {
+        frame |= 3u << len;
+        len += 2;
+    } else {
+        frame |= 1u << len;
+        len++;
+    }
+
+    s->tx_busy = true;
+    s->tx_frame = frame;
+    s->tx_len = len;
+    s->tx_bit = 0;
+    s->tx_brd = s->brd;
+    s->tx_start = now;
+    pl011_line_set_txd(s, 0, now);
+    pl011_line_tx_schedule(s);
+    pl011_update(s);
+}
+
+static void pl011_line_tx_tick(void *opaque)
+{
+    PL011State *s = opaque;
+    int64_t now = s->tx_next;
+
+    s->tx_bit++;
+    if (s->tx_bit < s->tx_len) {
+        pl011_line_set_txd(s, (s->tx_frame >> s->tx_bit) & 1, now);
+        pl011_line_tx_schedule(s);
+        return;
+    }
+    s->tx_busy = false;
+    /* A break begins once the frame in progress has completed. */
+    pl011_line_set_txd(s, !(s->lcr & LCR_BRK), now);
+    pl011_line_tx_start(s, now);
+}
+
+static void pl011_line_write_txdata(PL011State *s, uint8_t data)
+{
+    if (s->tx_count >= pl011_get_fifo_depth(s)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "pl011: data written to a full transmit FIFO\n");
+        return;
+    }
+    s->tx_fifo[(s->tx_pos + s->tx_count) % PL011_FIFO_MAX] = data;
+    s->tx_count++;
+    if (s->tx_count > pl011_tx_level(s)) {
+        s->int_level &= ~INT_TX;
+    }
+    pl011_line_tx_start(s, uart_line_now());
+    pl011_update(s);
+}
+
+/* The receiver's input: UARTRXD, or UARTTXD in loopback. */
+static void pl011_line_rx_changed(PL011State *s, int64_t when)
+{
+    int level = pl011_loopback_enabled(s) ? s->txd : s->rxd_pin;
+
+    if (level == s->rx_level) {
+        return;
+    }
+    s->rx_level = level;
+    if (level) {
+        s->rx_wait_mark = false;
+        return;
+    }
+    /* A UART that its SoC holds in reset takes no input. */
+    if (s->rx_bit >= 0 || s->rx_wait_mark ||
+        (s->cr & (CR_UARTEN | CR_RXE)) != (CR_UARTEN | CR_RXE) ||
+        !pl011_baud_runs(s, s->brd) || device_is_in_reset(DEVICE(s))) {
+        return;
+    }
+    s->rx_bit = 0;
+    s->rx_data = 0;
+    s->rx_zero = true;
+    s->rx_brd = s->brd;
+    s->rx_lcr = s->lcr;
+    s->rx_start = when;
+    s->rx_next = when + pl011_baud16_ns(s, s->rx_brd, 8);
+    timer_mod(s->rx_timer, s->rx_next);
+}
+
+/*
+ * The modem status input nUARTCTS, or nUARTRTS in loopback. A change of
+ * the CTS flag raises the CTS modem status interrupt.
+ */
+static void pl011_line_cts_changed(PL011State *s, int64_t when)
+{
+    int level = pl011_loopback_enabled(s) ? s->nrts : s->ncts_pin;
+
+    if (level == s->ncts_level) {
+        return;
+    }
+    s->ncts_level = level;
+    s->int_level |= INT_CTS;
+    pl011_update(s);
+    pl011_line_tx_start(s, when);
+}
+
+/*
+ * A received character with its error bits. The overrun flag goes with
+ * the first character that fits after an overrun.
+ */
+static void pl011_line_rx_put(PL011State *s, uint32_t value, int64_t when)
+{
+    unsigned depth = pl011_get_fifo_depth(s);
+    unsigned level = pl011_rx_level(s);
+
+    if (s->read_count >= depth) {
+        s->rx_overrun = true;
+        s->rsr |= DR_OE >> 8;
+        s->int_level |= INT_OE;
+        pl011_update(s);
+        return;
+    }
+    if (s->rx_overrun) {
+        value |= DR_OE;
+        s->rx_overrun = false;
+    }
+    s->read_fifo[(s->read_pos + s->read_count) & (depth - 1)] = value;
+    s->read_count++;
+    s->flags &= ~PL011_FLAG_RXFE;
+    if (s->read_count == depth) {
+        s->flags |= PL011_FLAG_RXFF;
+    }
+    if (s->read_count == level) {
+        s->int_level |= INT_RX;
+    }
+    s->int_level |= (value & DR_FE ? INT_FE : 0) |
+                    (value & DR_PE ? INT_PE : 0) |
+                    (value & DR_BE ? INT_BE : 0);
+    /* The receive timeout: 32 bit periods without another character. */
+    timer_mod(s->rt_timer, when + pl011_baud16_ns(s, s->rx_brd, 32 * 16));
+    pl011_line_update_rts(s, when);
+    pl011_update(s);
+}
+
+/* [spec:nuos:req:emu.uart] */
+static void pl011_line_rx_sample(void *opaque)
+{
+    PL011State *s = opaque;
+    int64_t now = s->rx_next;
+    unsigned bits = pl011_word_bits(s->rx_lcr);
+    unsigned parity = (s->rx_lcr & LCR_PEN) ? 1 : 0;
+    int level = s->rx_level;
+    uint32_t value;
+
+    if (s->rx_bit == 0) {
+        if (level) {
+            /* The input went high again: not a valid start bit. */
+            s->rx_bit = -1;
+            return;
+        }
+    } else if (s->rx_bit <= bits + parity) {
+        s->rx_data |= level << (s->rx_bit - 1);
+        s->rx_zero &= !level;
+    } else {
+        /* The (first) stop bit. */
+        s->rx_bit = -1;
+        if (!level && s->rx_zero) {
+            /*
+             * A break: the input held low for a whole frame. One zero
+             * character is received, and the receiver waits for the
+             * input to return high before it detects a start bit.
+             */
+            value = DR_BE;
+            s->rx_wait_mark = true;
+        } else {
+            value = extract32(s->rx_data, 0, bits);
+            if (!level) {
+                value |= DR_FE;
+            }
+            if (parity && extract32(s->rx_data, bits, 1) !=
+                pl011_parity(s->rx_lcr, value & 0xff)) {
+                value |= DR_PE;
+            }
+        }
+        pl011_line_rx_put(s, value, now);
+        return;
+    }
+    s->rx_bit++;
+    s->rx_next = s->rx_start + pl011_baud16_ns(s, s->rx_brd,
+                                               8 + 16 * s->rx_bit);
+    timer_mod(s->rx_timer, s->rx_next);
+}
+
+static void pl011_line_rt_tick(void *opaque)
+{
+    PL011State *s = opaque;
+
+    if (s->read_count > 0) {
+        s->int_level |= INT_RT;
+        pl011_update(s);
+    }
+}
+
+static uint32_t pl011_line_read_rxdata(PL011State *s)
+{
+    unsigned depth = pl011_get_fifo_depth(s);
+    uint32_t c = s->read_fifo[s->read_pos];
+
+    if (s->read_count > 0) {
+        if (s->read_count == pl011_rx_level(s)) {
+            s->int_level &= ~INT_RX;
+        }
+        s->read_count--;
+        s->read_pos = (s->read_pos + 1) & (depth - 1);
+    }
+    s->flags &= ~PL011_FLAG_RXFF;
+    if (s->read_count == 0) {
+        s->flags |= PL011_FLAG_RXFE;
+        s->int_level &= ~INT_RT;
+        timer_del(s->rt_timer);
+    }
+    s->rsr = (c >> 8) & 0xf;
+    pl011_line_update_rts(s, uart_line_now());
+    pl011_update(s);
+    return c;
+}
+
+static uint32_t pl011_line_flags(PL011State *s)
+{
+    unsigned depth = pl011_get_fifo_depth(s);
+    uint32_t r = s->flags & (PL011_FLAG_RXFF | PL011_FLAG_RXFE);
+
+    if (s->tx_count == 0) {
+        r |= PL011_FLAG_TXFE;
+    }
+    if (s->tx_count >= depth) {
+        r |= PL011_FLAG_TXFF;
+    }
+    if (s->tx_count || s->tx_busy) {
+        r |= PL011_FLAG_BUSY;
+    }
+    if (!s->ncts_level) {
+        r |= PL011_FLAG_CTS;
+    }
+    return r;
+}
+
+static void pl011_line_write_lcr(PL011State *s, uint32_t old)
+{
+    int64_t now = uart_line_now();
+
+    /* UARTLCR_H writes load the divisors into the baud rate generator. */
+    s->brd = (s->ibrd << 6) | s->fbrd;
+    if ((old ^ s->lcr) & LCR_FEN) {
+        s->tx_count = 0;
+        s->tx_pos = 0;
+    }
+    if ((old ^ s->lcr) & LCR_BRK) {
+        if (!s->tx_busy) {
+            pl011_line_set_txd(s, !(s->lcr & LCR_BRK), now);
+        }
+    }
+    pl011_line_update_rts(s, now);
+    pl011_line_tx_start(s, now);
+}
+
+static void pl011_line_write_cr(PL011State *s, uint32_t old)
+{
+    int64_t now = uart_line_now();
+
+    if ((old ^ s->cr) & CR_LBE) {
+        pl011_line_rx_changed(s, now);
+    }
+    pl011_line_update_rts(s, now);
+    pl011_line_cts_changed(s, now);
+    pl011_line_tx_start(s, now);
+}
+
+static void pl011_line_rxd_in(void *opaque, int n, int level)
+{
+    PL011State *s = opaque;
+
+    s->rxd_pin = level != 0;
+    pl011_line_rx_changed(s, uart_line_now());
+}
+
+static void pl011_line_ncts_in(void *opaque, int n, int level)
+{
+    PL011State *s = opaque;
+
+    s->ncts_pin = level != 0;
+    pl011_line_cts_changed(s, uart_line_now());
+}
+
+static void pl011_line_reset(PL011State *s)
+{
+    timer_del(s->tx_timer);
+    timer_del(s->rx_timer);
+    timer_del(s->rt_timer);
+    s->brd = 0;
+    s->tx_pos = 0;
+    s->tx_count = 0;
+    s->tx_busy = false;
+    s->tx_len = 0;
+    s->tx_bit = 0;
+    s->rx_bit = -1;
+    s->rx_wait_mark = false;
+    s->rx_overrun = false;
+    s->rx_level = s->rxd_pin;
+    s->ncts_level = s->ncts_pin;
+    s->txd = 1;
+    s->nrts = 1;
+    qemu_set_irq(s->txd_out, 1);
+    qemu_set_irq(s->nrts_out, 1);
+}
+
 static void pl011_write_txdata(PL011State *s, uint8_t data)
 {
     if (!(s->cr & CR_UARTEN)) {
@@ -271,6 +762,10 @@ static void pl011_write_txdata(PL011State *s, uint8_t data)
          */
         qemu_log_mask(LOG_GUEST_ERROR,
                       "PL011 data written to disabled TX UART\n");
+    }
+    if (s->line_level) {
+        pl011_line_write_txdata(s, data);
+        return;
     }
 
     /*
@@ -315,13 +810,13 @@ static uint64_t pl011_read(void *opaque, hwaddr offset,
 
     switch (offset >> 2) {
     case 0: /* UARTDR */
-        r = pl011_read_rxdata(s);
+        r = s->line_level ? pl011_line_read_rxdata(s) : pl011_read_rxdata(s);
         break;
     case 1: /* UARTRSR */
         r = s->rsr;
         break;
     case 6: /* UARTFR */
-        r = s->flags;
+        r = s->line_level ? pl011_line_flags(s) : s->flags;
         break;
     case 8: /* UARTILPR */
         r = s->ilpr;
@@ -450,6 +945,9 @@ static void pl011_loopback_break(PL011State *s, int brk_enable)
 
 static inline void pl011_set_break(PL011State *s, int brk_enable)
 {
+    if (s->line_level) {
+        return;
+    }
     qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_SET_BREAK, &brk_enable);
 }
 
@@ -458,6 +956,7 @@ static void pl011_write(void *opaque, hwaddr offset,
 {
     PL011State *s = (PL011State *)opaque;
     unsigned char ch;
+    uint32_t old;
 
     trace_pl011_write(offset, value, pl011_regname(offset));
 
@@ -484,18 +983,22 @@ static void pl011_write(void *opaque, hwaddr offset,
         pl011_trace_baudrate_change(s);
         break;
     case 11: /* UARTLCR_H */
+        old = s->lcr;
         /* Reset the FIFO state on FIFO enable or disable */
         if ((s->lcr ^ value) & LCR_FEN) {
             pl011_reset_rx_fifo(s);
             pl011_reset_tx_fifo(s);
         }
-        if ((s->lcr ^ value) & LCR_BRK) {
+        if (((s->lcr ^ value) & LCR_BRK) && !s->line_level) {
             bool break_enable = value & LCR_BRK;
             pl011_set_break(s, break_enable);
             pl011_loopback_break(s, break_enable);
         }
         s->lcr = value;
         pl011_set_read_trigger(s);
+        if (s->line_level) {
+            pl011_line_write_lcr(s, old);
+        }
         pl011_update_dma(s);
         break;
     case 12: /* UARTCR */
@@ -504,13 +1007,21 @@ static void pl011_write(void *opaque, hwaddr offset,
             /* Re-arm the log warning when the guest toggles UARTEN */
             s->logged_disabled_uart = false;
         }
+        old = s->cr;
         s->cr = value;
-        pl011_loopback_mdmctrl(s);
+        if (s->line_level) {
+            pl011_line_write_cr(s, old);
+        } else {
+            pl011_loopback_mdmctrl(s);
+        }
         pl011_update_dma(s);
         break;
     case 13: /* UARTIFS */
         s->ifl = value;
         pl011_set_read_trigger(s);
+        if (s->line_level) {
+            pl011_line_update_rts(s, uart_line_now());
+        }
         break;
     case 14: /* UARTIMSC */
         s->int_enabled = value;
@@ -621,8 +1132,11 @@ static int pl011_post_load(void *opaque, int version_id)
     PL011State* s = opaque;
 
     /* Sanity-check input state */
-    if (s->read_pos >= ARRAY_SIZE(s->read_fifo) ||
-        s->read_count > ARRAY_SIZE(s->read_fifo)) {
+    if (s->read_pos >= s->fifo_depth || s->read_count > s->fifo_depth) {
+        return -1;
+    }
+    if (s->line_level &&
+        (s->tx_pos >= PL011_FIFO_MAX || s->tx_count > s->fifo_depth)) {
         return -1;
     }
 
@@ -643,6 +1157,54 @@ static int pl011_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static bool pl011_line_needed(void *opaque)
+{
+    PL011State *s = PL011(opaque);
+
+    return s->line_level || s->fifo_depth > PL011_FIFO_DEPTH;
+}
+
+static const VMStateDescription vmstate_pl011_line = {
+    .name = "pl011/line",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = pl011_line_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_SUB_ARRAY(read_fifo, PL011State, PL011_FIFO_DEPTH,
+                                 PL011_FIFO_MAX - PL011_FIFO_DEPTH),
+        VMSTATE_TIMER_PTR(tx_timer, PL011State),
+        VMSTATE_TIMER_PTR(rx_timer, PL011State),
+        VMSTATE_TIMER_PTR(rt_timer, PL011State),
+        VMSTATE_UINT32(brd, PL011State),
+        VMSTATE_UINT8_ARRAY(tx_fifo, PL011State, PL011_FIFO_MAX),
+        VMSTATE_INT32(tx_pos, PL011State),
+        VMSTATE_INT32(tx_count, PL011State),
+        VMSTATE_BOOL(tx_busy, PL011State),
+        VMSTATE_UINT32(tx_frame, PL011State),
+        VMSTATE_INT32(tx_len, PL011State),
+        VMSTATE_INT32(tx_bit, PL011State),
+        VMSTATE_UINT32(tx_brd, PL011State),
+        VMSTATE_INT64(tx_start, PL011State),
+        VMSTATE_INT64(tx_next, PL011State),
+        VMSTATE_INT32(rx_bit, PL011State),
+        VMSTATE_UINT32(rx_data, PL011State),
+        VMSTATE_UINT32(rx_brd, PL011State),
+        VMSTATE_UINT32(rx_lcr, PL011State),
+        VMSTATE_INT64(rx_start, PL011State),
+        VMSTATE_INT64(rx_next, PL011State),
+        VMSTATE_BOOL(rx_zero, PL011State),
+        VMSTATE_BOOL(rx_wait_mark, PL011State),
+        VMSTATE_BOOL(rx_overrun, PL011State),
+        VMSTATE_UINT8(rxd_pin, PL011State),
+        VMSTATE_UINT8(ncts_pin, PL011State),
+        VMSTATE_UINT8(rx_level, PL011State),
+        VMSTATE_UINT8(ncts_level, PL011State),
+        VMSTATE_UINT8(txd, PL011State),
+        VMSTATE_UINT8(nrts, PL011State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_pl011 = {
     .name = "pl011",
     .version_id = 2,
@@ -657,7 +1219,7 @@ static const VMStateDescription vmstate_pl011 = {
         VMSTATE_UINT32(dmacr, PL011State),
         VMSTATE_UINT32(int_enabled, PL011State),
         VMSTATE_UINT32(int_level, PL011State),
-        VMSTATE_UINT32_ARRAY(read_fifo, PL011State, PL011_FIFO_DEPTH),
+        VMSTATE_UINT32_SUB_ARRAY(read_fifo, PL011State, 0, PL011_FIFO_DEPTH),
         VMSTATE_UINT32(ilpr, PL011State),
         VMSTATE_UINT32(ibrd, PL011State),
         VMSTATE_UINT32(fbrd, PL011State),
@@ -669,6 +1231,7 @@ static const VMStateDescription vmstate_pl011 = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_pl011_clock,
+        &vmstate_pl011_line,
         NULL
     }
 };
@@ -676,6 +1239,10 @@ static const VMStateDescription vmstate_pl011 = {
 static const Property pl011_properties[] = {
     DEFINE_PROP_CHR("chardev", PL011State, chr),
     DEFINE_PROP_BOOL("migrate-clk", PL011State, migrate_clk, true),
+    /* 16 for r1p4 and earlier, 32 for r1p5 */
+    DEFINE_PROP_UINT32("fifo-depth", PL011State, fifo_depth,
+                       PL011_FIFO_DEPTH),
+    DEFINE_PROP_BOOL("line-level", PL011State, line_level, false),
 };
 
 static void pl011_init(Object *obj)
@@ -696,6 +1263,30 @@ static void pl011_init(Object *obj)
                                 ClockUpdate);
 
     s->id = pl011_id_arm;
+
+    qdev_init_gpio_out_named(DEVICE(obj), &s->txd_out, PL011_TXD, 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->nrts_out, PL011_NRTS, 1);
+    qdev_init_gpio_in_named(DEVICE(obj), pl011_line_rxd_in, PL011_RXD, 1);
+    qdev_init_gpio_in_named(DEVICE(obj), pl011_line_ncts_in, PL011_NCTS, 1);
+    s->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pl011_line_tx_tick, s);
+    s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pl011_line_rx_sample, s);
+    s->rt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pl011_line_rt_tick, s);
+    /* Undriven inputs idle high: marking, and CTS deasserted. */
+    s->rxd_pin = 1;
+    s->ncts_pin = 1;
+    s->rx_level = 1;
+    s->ncts_level = 1;
+    s->txd = 1;
+    s->nrts = 1;
+}
+
+static void pl011_finalize(Object *obj)
+{
+    PL011State *s = PL011(obj);
+
+    timer_free(s->tx_timer);
+    timer_free(s->rx_timer);
+    timer_free(s->rt_timer);
 }
 
 static int pl011_be_change(void *opaque);
@@ -720,6 +1311,18 @@ static void pl011_realize(DeviceState *dev, Error **errp)
 {
     PL011State *s = PL011(dev);
 
+    if (s->fifo_depth != PL011_FIFO_DEPTH && s->fifo_depth != PL011_FIFO_MAX) {
+        error_setg(errp, "fifo-depth must be %d or %d", PL011_FIFO_DEPTH,
+                   PL011_FIFO_MAX);
+        return;
+    }
+    if (s->line_level) {
+        if (qemu_chr_fe_backend_connected(&s->chr)) {
+            error_setg(errp, "a line-level PL011 has no chardev; attach "
+                       "one to its pins");
+        }
+        return;
+    }
     pl011_set_handlers(s);
 }
 
@@ -742,6 +1345,9 @@ static void pl011_reset(DeviceState *dev)
     s->logged_disabled_uart = false;
     pl011_reset_rx_fifo(s);
     pl011_reset_tx_fifo(s);
+    if (s->line_level) {
+        pl011_line_reset(s);
+    }
     pl011_update(s);
 }
 
@@ -760,6 +1366,7 @@ static const TypeInfo pl011_arm_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(PL011State),
     .instance_init = pl011_init,
+    .instance_finalize = pl011_finalize,
     .class_init    = pl011_class_init,
 };
 

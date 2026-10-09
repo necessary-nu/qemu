@@ -166,6 +166,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
  * pico-sdk switches it to.
  */
 #define RP2350_CLK_REF_HZ 12000000
+/*
+ * clk_peri, the UARTs' UARTCLK, at the clk_sys frequency pico-sdk runs it
+ * from. Its divider and enable are not modelled.
+ */
+#define RP2350_CLK_PERI_HZ 150000000
 /* clk_adc, as pico-sdk sets it up from PLL_USB. */
 #define RP2350_CLK_ADC_HZ 48000000
 
@@ -251,6 +256,7 @@ struct RP2350State {
 
     Clock *sysclk;
     Clock *refclk;
+    Clock *periclk;
     Clock *adcclk;
 };
 

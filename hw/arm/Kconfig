@@ -395,6 +395,7 @@ config RP2350
     depends on TCG && ARM
     imply I2C_DEVICES
     select RP2350_SOC
+    select UART_LINE
 
 config RP2350_SOC
     bool
