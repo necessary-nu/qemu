@@ -21,6 +21,7 @@
 #include "hw/i2c/esp32_i2c.h"
 #include "hw/nvram/esp32_efuse.h"
 #include "hw/xtensa/esp32_intc.h"
+#include "hw/xtensa/esp32_pid.h"
 #include "hw/misc/esp32_flash_enc.h"
 #include "hw/net/can/esp32_twai.h"
 #include "hw/sd/dwc_sdmmc.h"
@@ -78,6 +79,7 @@ struct Esp32SocState {
 
     /*< public >*/
     XtensaCPU cpu[ESP32_CPU_COUNT];
+    Esp32PidState pid[ESP32_CPU_COUNT];
     Esp32DportState dport;
     Esp32ApbCtrlState apb_ctrl;
     Esp32IntMatrixState intmatrix;
