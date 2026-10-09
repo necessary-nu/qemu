@@ -29,6 +29,7 @@
 #include "system/address-spaces.h"
 #include "hw/misc/ssi_psram.h"
 #include "hw/sd/dwc_sdmmc.h"
+#include "hw/sd/sdhci.h"
 #include "core-esp32/core-isa.h"
 #include "qemu/datadir.h"
 #include "system/system.h"
@@ -167,6 +168,8 @@ static void esp32_soc_reset(DeviceState *dev)
     }
     if (s->requested_reset & ESP32_SOC_RESET_RTC) {
         device_cold_reset(DEVICE(&s->rtc_cntl));
+        /* The board's PHY shares the chip's power-on and EN resets. */
+        device_cold_reset(DEVICE(&s->phy));
     }
     if (s->requested_reset & ESP32_SOC_RESET_PERIPH) {
         device_cold_reset(DEVICE(&s->dport));
@@ -200,12 +203,16 @@ static void esp32_soc_reset(DeviceState *dev)
         device_cold_reset(DEVICE(&s->twai));
         device_cold_reset(DEVICE(&s->efuse));
         device_cold_reset(DEVICE(&s->ledc));
+        device_cold_reset(DEVICE(&s->pcnt));
+        device_cold_reset(DEVICE(&s->rmt));
+        for (int i = 0; i < ESP32_MCPWM_COUNT; i++) {
+            device_cold_reset(DEVICE(&s->mcpwm[i]));
+        }
         device_cold_reset(DEVICE(&s->sha));
         device_cold_reset(DEVICE(&s->rng));
         device_cold_reset(DEVICE(&s->sdmmc));
-        if (s->eth) {
-            device_cold_reset(s->eth);
-        }
+        device_cold_reset(DEVICE(&s->emac));
+        device_cold_reset(DEVICE(&s->sdio));
 
         device_cold_reset(DEVICE(&s->rgb));
     }
@@ -317,6 +324,11 @@ static void esp32_cpu_stall(void* opaque, int n, int level)
 static const uint32_t esp32_pll_cpu_hz[] = { 80000000, 160000000, 240000000 };
 #define ESP32_PLL_APB_HZ 80000000
 /*
+ * PLL_F160M_CLK, divided from PLL_CLK (TRM 7.2.4.5). The PLL's power and
+ * lock are not modelled: the clock always runs.
+ */
+#define ESP32_PLL_F160M_HZ 160000000
+/*
  * APLL_CLK's coefficients are programmed through the analog I2C bus, which
  * is not modelled. Until it is, the APLL is taken to run at the output of
  * its formula with every coefficient 0: 40 MHz * 4 / (2 * 2) = 40 MHz.
@@ -337,6 +349,9 @@ static void esp32_gate_update_clocks(Esp32SocState *s, Esp32PeriphGate *g)
     }
     if (g->ref_tick_clk) {
         clock_update_hz(g->ref_tick_clk, running ? s->ref_tick_hz : 0);
+    }
+    if (g->f160m_clk) {
+        clock_update_hz(g->f160m_clk, running ? ESP32_PLL_F160M_HZ : 0);
     }
 }
 
@@ -802,6 +817,100 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                ESP32_GATE_PERIP, R_DPORT_PERIP_LEDC_MASK,
                                R_DPORT_PERIP_LEDC_MASK);
 
+    /*
+     * [spec:nuos:req:emu.esp32.rmt]
+     * The RMT, behind its DPORT bit, on APB_CLK and REF_TICK. Its channels
+     * reach the pads through the GPIO matrix as RMT_SIG_OUTn and
+     * RMT_SIG_INn.
+     */
+    qdev_realize(DEVICE(&s->rmt), &s->periph_bus, &error_fatal);
+    {
+        Esp32PeriphGate *g = esp32_soc_add_gated_device(
+            s, &s->rmt, DR_REG_RMT_BASE, ESP32_GATE_PERIP,
+            R_DPORT_PERIP_RMT_MASK, R_DPORT_PERIP_RMT_MASK);
+
+        g->apb_clk = s->rmt_apb_clk;
+        g->ref_tick_clk = s->rmt_ref_tick_clk;
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->rmt), 0,
+                           qdev_get_gpio_in(intmatrix_dev,
+                                            ETS_RMT_INTR_SOURCE));
+        for (int i = 0; i < ESP32_RMT_CHANNELS; i++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->rmt), ESP32_RMT_SIG_OUT, i,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->gpio),
+                                            ESP32_GPIO_SIG_OUT,
+                                            ESP32_SIG_RMT_OUT0 + i));
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_IN,
+                                        ESP32_SIG_RMT_IN0 + i,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->rmt),
+                                            ESP32_RMT_SIG_IN, i));
+        }
+    }
+
+    /*
+     * [spec:nuos:req:emu.esp32.mcpwm]
+     * MCPWM0 and MCPWM1, behind their DPORT clock and reset bits. Their
+     * PWM outputs and their sync, fault and capture inputs are GPIO
+     * matrix signals (TRM table 6.9-1).
+     */
+    for (int i = 0; i < ESP32_MCPWM_COUNT; i++) {
+        static const hwaddr base[] = { DR_REG_PWM_BASE, DR_REG_PWM1_BASE };
+        static const uint32_t bit[] = {
+            R_DPORT_PERIP_PWM0_MASK, R_DPORT_PERIP_PWM1_MASK
+        };
+        static const int intr[] = {
+            ETS_PWM0_INTR_SOURCE, ETS_PWM1_INTR_SOURCE
+        };
+        static const int out_sig[] = {
+            ESP32_SIG_PWM0_OUT0A, ESP32_SIG_PWM1_OUT0A
+        };
+        static const int sync_sig[] = {
+            ESP32_SIG_PWM0_SYNC0_IN, ESP32_SIG_PWM1_SYNC0_IN
+        };
+        static const int fault_sig[] = {
+            ESP32_SIG_PWM0_F0_IN, ESP32_SIG_PWM1_F0_IN
+        };
+        static const int cap_sig[] = {
+            ESP32_SIG_PWM0_CAP0_IN, ESP32_SIG_PWM1_CAP0_IN
+        };
+        DeviceState *pwm = DEVICE(&s->mcpwm[i]);
+        Esp32PeriphGate *g;
+
+        qdev_realize(pwm, &s->periph_bus, &error_fatal);
+        g = esp32_soc_add_gated_device(s, &s->mcpwm[i], base[i],
+                                       ESP32_GATE_PERIP, bit[i], bit[i]);
+        g->apb_clk = s->mcpwm_apb_clk[i];
+        g->f160m_clk = s->mcpwm_f160m_clk[i];
+        sysbus_connect_irq(SYS_BUS_DEVICE(pwm), 0,
+                           qdev_get_gpio_in(intmatrix_dev, intr[i]));
+        for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+            qdev_connect_gpio_out_named(pwm, ESP32_MCPWM_OUT, n,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->gpio),
+                                            ESP32_GPIO_SIG_OUT,
+                                            out_sig[i] + n));
+        }
+        for (int n = 0; n < ESP32_MCPWM_SYNCS; n++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_IN,
+                                        sync_sig[i] + n,
+                                        qdev_get_gpio_in_named(
+                                            pwm, ESP32_MCPWM_SYNC_IN, n));
+        }
+        for (int n = 0; n < ESP32_MCPWM_FAULTS; n++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_IN,
+                                        fault_sig[i] + n,
+                                        qdev_get_gpio_in_named(
+                                            pwm, ESP32_MCPWM_FAULT_IN, n));
+        }
+        for (int n = 0; n < ESP32_MCPWM_CAPS; n++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_IN,
+                                        cap_sig[i] + n,
+                                        qdev_get_gpio_in_named(
+                                            pwm, ESP32_MCPWM_CAP_IN, n));
+        }
+    }
+
     qdev_realize(DEVICE(&s->apb_ctrl), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->apb_ctrl, DR_REG_APB_CTRL_BASE);
     qdev_connect_gpio_out_named(DEVICE(&s->apb_ctrl),
@@ -849,6 +958,32 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                    ESP32_INTMATRIX_CPU_SOURCE,
                                    gpio_irq[i].cpu * ESP32_INT_MATRIX_INPUTS +
                                    gpio_irq[i].source));
+        }
+    }
+
+    /*
+     * [spec:nuos:req:emu.esp32.pcnt]
+     * The pulse counter's signal and control inputs are GPIO matrix input
+     * signals, reaching it from any pad through GPIO_FUNCn_IN_SEL.
+     */
+    qdev_realize(DEVICE(&s->pcnt), &s->periph_bus, &error_fatal);
+    {
+        Esp32PeriphGate *g = esp32_soc_add_gated_device(
+            s, &s->pcnt, DR_REG_PCNT_BASE, ESP32_GATE_PERIP,
+            R_DPORT_PERIP_PCNT_MASK, R_DPORT_PERIP_PCNT_MASK);
+
+        g->apb_clk = s->pcnt_apb_clk;
+    }
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->pcnt), 0,
+                       qdev_get_gpio_in(intmatrix_dev, ETS_PCNT_INTR_SOURCE));
+    for (int u = 0; u < ESP32_PCNT_UNIT_COUNT; u++) {
+        for (int k = 0; k < ESP32_PCNT_UNIT_INPUTS; k++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_IN,
+                                        ESP32_PCNT_SIG(u) + k,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->pcnt),
+                                            ESP32_PCNT_INPUT,
+                                            u * ESP32_PCNT_UNIT_INPUTS + k));
         }
     }
 
@@ -1100,6 +1235,56 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdmmc), 0,
                        qdev_get_gpio_in(intmatrix_dev, ETS_SDIO_HOST_INTR_SOURCE));
 
+    /*
+     * [spec:nuos:req:emu.esp32.emac]
+     * The EMAC, with the board's IP101 PHY on its MDIO bus at address 1
+     * and the first -nic as the PHY's medium.
+     */
+    qdev_realize(DEVICE(&s->phy), NULL, &error_fatal);
+    object_property_set_link(OBJECT(&s->emac), "dma-mr", OBJECT(sys_mem),
+                             &error_abort);
+    object_property_set_link(OBJECT(&s->emac), "phy", OBJECT(&s->phy),
+                             &error_abort);
+    qemu_configure_nic_device(DEVICE(&s->emac), true, NULL);
+    qdev_realize(DEVICE(&s->emac), &s->periph_bus, &error_fatal);
+    {
+        Esp32PeriphGate *g = esp32_soc_add_gated_device(
+            s, &s->emac, DR_REG_EMAC_BASE, ESP32_GATE_WIFI,
+            R_DPORT_WIFI_CLK_EN_EMAC_MASK, R_DPORT_CORE_RST_EN_EMAC_MASK);
+        g->apb_clk = s->emac_apb_clk;
+    }
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->emac), 0,
+                       qdev_get_gpio_in(intmatrix_dev,
+                                        ETS_ETH_MAC_INTR_SOURCE));
+
+    /*
+     * [spec:nuos:req:emu.esp32.sdio-slave]
+     * The SDIO slave's three register blocks, SLC, SLCHOST and HINF, are
+     * behind one clock bit, WIFI_CLK_EN.SDIOSLAVE, and one reset bit,
+     * CORE_RST_EN.SDIO. Its SLC0 and SLC1 interrupts go to the matrix.
+     */
+    object_property_set_link(OBJECT(&s->sdio), "dma-mr", OBJECT(sys_mem),
+                             &error_abort);
+    qdev_realize(DEVICE(&s->sdio), &s->periph_bus, &error_fatal);
+    {
+        Esp32PeriphGate *g = esp32_soc_add_gated_device(
+            s, &s->sdio, DR_REG_SLC_BASE, ESP32_GATE_WIFI,
+            R_DPORT_WIFI_CLK_EN_SDIO_SLAVE_MASK, R_DPORT_CORE_RST_EN_SDIO_MASK);
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->sdio);
+
+        g->apb_clk = s->sdio_apb_clk;
+        esp32_gate_map(g, sysbus_mmio_get_region(sbd, ESP32_SDIO_MMIO_SLCHOST),
+                       DR_REG_SLCHOST_BASE, true, 0);
+        esp32_gate_map(g, sysbus_mmio_get_region(sbd, ESP32_SDIO_MMIO_HINF),
+                       DR_REG_HINF_BASE, true, 0);
+        sysbus_connect_irq(sbd, ESP32_SDIO_IRQ_SLC0,
+                           qdev_get_gpio_in(intmatrix_dev,
+                                            ETS_SLC0_INTR_SOURCE));
+        sysbus_connect_irq(sbd, ESP32_SDIO_IRQ_SLC1,
+                           qdev_get_gpio_in(intmatrix_dev,
+                                            ETS_SLC1_INTR_SOURCE));
+    }
+
     /* Provide internal RAM MemoryRegion to the RGB display */
     s->rgb.intram = dram;
     qdev_realize(DEVICE(&s->rgb), &s->periph_bus, &error_abort);
@@ -1109,13 +1294,9 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.analog", DR_REG_ANA_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_RTCIO_BASE, 0x400);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_SENS_BASE, 0x400);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.hinf", DR_REG_HINF_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.slc", DR_REG_SLC_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.slchost", DR_REG_SLCHOST_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s0", DR_REG_I2S_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rmt", DR_REG_RMT_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.pcnt", DR_REG_PCNT_BASE, 0x1000);
 
     qemu_register_reset((QEMUResetHandler*) esp32_soc_reset, dev);
 }
@@ -1246,6 +1427,28 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "aes", &s->aes, TYPE_ESP32_AES);
 
     object_initialize_child(obj, "ledc", &s->ledc, TYPE_ESP32_LEDC);
+    object_initialize_child(obj, "rmt", &s->rmt, TYPE_ESP32_RMT);
+    s->rmt_apb_clk = clock_new(obj, "rmt-apb");
+    qdev_connect_clock_in(DEVICE(&s->rmt), "apb", s->rmt_apb_clk);
+    s->rmt_ref_tick_clk = clock_new(obj, "rmt-ref");
+    qdev_connect_clock_in(DEVICE(&s->rmt), "ref_tick", s->rmt_ref_tick_clk);
+
+    object_initialize_child(obj, "pcnt", &s->pcnt, TYPE_ESP32_PCNT);
+    s->pcnt_apb_clk = clock_new(obj, "pcnt-apb");
+    qdev_connect_clock_in(DEVICE(&s->pcnt), "apb", s->pcnt_apb_clk);
+
+    for (int i = 0; i < ESP32_MCPWM_COUNT; i++) {
+        snprintf(name, sizeof(name), "mcpwm%d", i);
+        object_initialize_child(obj, name, &s->mcpwm[i], TYPE_ESP32_MCPWM);
+        snprintf(name, sizeof(name), "mcpwm%d-apb", i);
+        s->mcpwm_apb_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(DEVICE(&s->mcpwm[i]), "apb",
+                              s->mcpwm_apb_clk[i]);
+        snprintf(name, sizeof(name), "mcpwm%d-f160m", i);
+        s->mcpwm_f160m_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(DEVICE(&s->mcpwm[i]), "f160m",
+                              s->mcpwm_f160m_clk[i]);
+    }
 
     object_initialize_child(obj, "rsa", &s->rsa, TYPE_ESP32_RSA);
 
@@ -1254,6 +1457,15 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "flash_enc", &s->flash_enc, TYPE_ESP32_FLASH_ENCRYPTION);
 
     object_initialize_child(obj, "sdmmc", &s->sdmmc, TYPE_DWC_SDMMC);
+
+    object_initialize_child(obj, "emac", &s->emac, TYPE_ESP32_EMAC);
+    s->emac_apb_clk = clock_new(obj, "emac-apb");
+    qdev_connect_clock_in(DEVICE(&s->emac), "apb", s->emac_apb_clk);
+    object_initialize_child(obj, "phy", &s->phy, TYPE_IP101_PHY);
+
+    object_initialize_child(obj, "sdio", &s->sdio, TYPE_ESP32_SDIO_SLAVE);
+    s->sdio_apb_clk = clock_new(obj, "sdio-apb");
+    qdev_connect_clock_in(DEVICE(&s->sdio), "apb", s->sdio_apb_clk);
 
     object_initialize_child(obj, "rgb", &s->rgb, TYPE_ESP_RGB);
 
@@ -1310,6 +1522,7 @@ struct Esp32MachineState {
 
     Esp32SocState esp32;
     DeviceState *flash_dev;
+    bool sdio_host;
 };
 #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
 
@@ -1369,34 +1582,6 @@ static void esp32_machine_init_i2c(Esp32SocState *s)
     object_property_set_int(OBJECT(tmp105), "temperature", 25 * 1000, &error_fatal);
 }
 
-static void esp32_machine_init_openeth(Esp32SocState *ss)
-{
-    SysBusDevice *sbd;
-    Esp32PeriphGate *g;
-    hwaddr reg_base = DR_REG_EMAC_BASE;
-    hwaddr desc_base = reg_base + 0x400;
-    qemu_irq irq = qdev_get_gpio_in(DEVICE(&ss->intmatrix), ETS_ETH_MAC_INTR_SOURCE);
-
-    DeviceState* open_eth_dev = qemu_create_nic_device("open_eth", true, NULL);
-    if (!open_eth_dev) {
-        return;
-    }
-
-    ss->eth = open_eth_dev;
-    sbd = SYS_BUS_DEVICE(open_eth_dev);
-    sysbus_realize_and_unref(sbd, &error_fatal);
-    sysbus_connect_irq(sbd, 0, irq);
-    /* The OpenCores MAC stands in for the EMAC, behind the EMAC's bits. */
-    assert(ss->n_gates < ESP32_GATE_MAX);
-    g = &ss->gate[ss->n_gates++];
-    g->dev = open_eth_dev;
-    g->regs = ESP32_GATE_WIFI;
-    g->clk_mask = R_DPORT_WIFI_CLK_EN_EMAC_MASK;
-    g->rst_mask = R_DPORT_CORE_RST_EN_EMAC_MASK;
-    esp32_gate_map(g, sysbus_mmio_get_region(sbd, 0), reg_base, false, 0);
-    esp32_gate_map(g, sysbus_mmio_get_region(sbd, 1), desc_base, false, 0);
-}
-
 static void esp32_machine_init_sd(Esp32SocState *ss)
 {
     DriveInfo *dinfo = drive_get(IF_SD, 0, 0);
@@ -1411,6 +1596,29 @@ static void esp32_machine_init_sd(Esp32SocState *ss)
         SDBus* sd_bus = SD_BUS(qdev_get_child_bus(sdmmc, "sd-bus"));
         qdev_realize_and_unref(card, BUS(sd_bus), &error_fatal);
     }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.sdio-slave]
+ * An SD host for the SDIO slave. Nothing in the ESP32 can be the slave's
+ * host (its SD/MMC host's second slot uses the same pads), so with
+ * sdio-host=on the machine adds a standard SD host controller (SDHCI)
+ * outside the ESP32's address map, standing for an external host wired
+ * to the slave's pins, and plugs the slave's card into it. The
+ * controller's interrupt is its sysbus IRQ 0, wired to nothing.
+ */
+#define ESP32_SDIO_TEST_HOST_BASE 0x22000000
+
+static void esp32_machine_init_sdio_host(Esp32MachineState *ms)
+{
+    Esp32SocState *ss = &ms->esp32;
+    DeviceState *host = qdev_new(TYPE_SYSBUS_SDHCI);
+
+    object_property_add_child(OBJECT(ms), "sdio-sdhci", OBJECT(host));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(host), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(host), 0, ESP32_SDIO_TEST_HOST_BASE);
+    esp32_sdio_slave_attach(&ss->sdio,
+                            SD_BUS(qdev_get_child_bus(host, "sd-bus")));
 }
 
 static void esp32_machine_init(MachineState *machine)
@@ -1454,9 +1662,11 @@ static void esp32_machine_init(MachineState *machine)
 
     esp32_machine_init_i2c(ss);
 
-    esp32_machine_init_openeth(ss);
-
     esp32_machine_init_sd(ss);
+
+    if (ms->sdio_host) {
+        esp32_machine_init_sdio_host(ms);
+    }
 
     /* Need MMU initialized prior to ELF loading,
      * so that ELF gets loaded into virtual addresses
@@ -1527,6 +1737,16 @@ static void esp32_machine_init(MachineState *machine)
     }
 }
 
+static bool esp32_machine_get_sdio_host(Object *obj, Error **errp)
+{
+    return ESP32_MACHINE(obj)->sdio_host;
+}
+
+static void esp32_machine_set_sdio_host(Object *obj, bool value, Error **errp)
+{
+    ESP32_MACHINE(obj)->sdio_host = value;
+}
+
 /* Initialize machine type */
 static void esp32_machine_class_init(ObjectClass *oc, const void *data)
 {
@@ -1536,6 +1756,12 @@ static void esp32_machine_class_init(ObjectClass *oc, const void *data)
     mc->max_cpus = 2;
     mc->default_cpus = 2;
     mc->default_ram_size = 0;
+
+    object_class_property_add_bool(oc, "sdio-host",
+                                   esp32_machine_get_sdio_host,
+                                   esp32_machine_set_sdio_host);
+    object_class_property_set_description(oc, "sdio-host",
+        "Add an SDHCI at 0x22000000 as the SDIO slave's host");
 }
 
 static const TypeInfo esp32_info = {

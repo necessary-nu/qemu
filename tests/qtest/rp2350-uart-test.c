@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 
 #define UART0       0x40070000
 #define XOR         0x1000
@@ -68,6 +69,7 @@ static void test_tx_rx(void)
     const char *msg = "nuos";
     int i;
 
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
     uart_init(qts);
     g_assert_cmphex(qtest_readl(qts, UART0 + UARTCR) &
                     (CR_UARTEN | CR_TXE | CR_RXE), ==,
@@ -93,6 +95,7 @@ static void test_atomic_aliases(void)
     g_autofree char *args = g_strdup_printf("-M rp2350 -bios %s", rom_path);
     QTestState *qts = qtest_init(args);
 
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
     qtest_writel(qts, UART0 + UARTLCR_H, LCR_H_WLEN8);
     /* hw_write_masked() goes through the XOR alias. */
     qtest_writel(qts, UART0 + UARTLCR_H + XOR, LCR_H_FEN);
@@ -117,6 +120,7 @@ static void test_rx_interrupt(void)
         int sock;
         QTestState *qts = qtest_init_with_serial(args, &sock);
 
+        rp2350_unreset(qts, RP2350_RESETS_ALL);
         qtest_irq_intercept_in(qts, cpu);
         uart_init(qts);
         qtest_writel(qts, UART0 + UARTIMSC, INT_RX);

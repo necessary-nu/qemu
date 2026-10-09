@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 
 #define WATCHDOG        0x400d8000
 #define CTRL            0x00
@@ -40,6 +41,7 @@
 #define RESETS          0x40020000
 #define RESETS_RESET    0x0
 #define RESETS_WDSEL    0x4
+#define RESETS_RESET_DONE 0x8
 #define RESET_TIMER0    (1u << 23)
 
 #define TICKS           0x40108000
@@ -296,6 +298,7 @@ static void test_domains(void)
     g_assert_cmphex(qtest_readl(qts, TICK_CTRL(TICK_TIMER0)), ==, 0);
     /* RESETS comes before CLOCKS in the sequence, so it was not reset. */
     qtest_writel(qts, RESETS + RESETS_RESET, 0);
+    qtest_clock_step(qts, RP2350_RESETS_RELEASE_NS);
     qtest_writel(qts, PSM + WDSEL, PSM_SIO);
     wd_write(qts, CTRL, CTRL_TRIGGER);
     g_assert_cmphex(qtest_readl(qts, RESETS + RESETS_RESET), ==, 0);
@@ -307,6 +310,11 @@ static void test_domains(void)
     qtest_writel(qts, PSM + WDSEL, 0);
     qtest_writel(qts, RESETS + RESETS_WDSEL, RESET_TIMER0);
     wd_write(qts, CTRL, CTRL_TRIGGER);
+    g_assert_cmphex(qtest_readl(qts, RESETS + RESETS_RESET_DONE) &
+                    RESET_TIMER0, ==, 0);
+    qtest_clock_step(qts, RP2350_RESETS_RELEASE_NS);
+    g_assert_cmphex(qtest_readl(qts, RESETS + RESETS_RESET_DONE) &
+                    RESET_TIMER0, ==, RESET_TIMER0);
     g_assert_cmpuint(qtest_readl(qts, TIMER0_TIMERAWL), ==, 0);
     g_assert_cmphex(qtest_readl(qts, RESETS + RESETS_RESET), ==, 0);
     qtest_clock_step(qts, 7 * US);
