@@ -278,7 +278,8 @@ qtests_xtensa = \
      'esp32-pcnt-test',
      'esp32-rmt-test',
      'esp32-emac-test',
-     'esp32-sdio-test'] : [])
+     'esp32-sdio-test',
+     'esp32-mcpwm-test'] : [])
 
 qtests_stm32l4x5 = \
   ['stm32l4x5_exti-test',

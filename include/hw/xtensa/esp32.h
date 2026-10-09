@@ -16,6 +16,7 @@
 #include "hw/misc/esp32_ledc.h"
 #include "hw/misc/esp32_pcnt.h"
 #include "hw/misc/esp32_rmt.h"
+#include "hw/misc/esp32_mcpwm.h"
 #include "hw/misc/esp32_rsa.h"
 #include "hw/timer/esp32_frc_timer.h"
 #include "hw/timer/esp32_timg.h"
@@ -44,6 +45,7 @@ typedef enum Esp32GateRegs {
 #define ESP32_GATE_MAX 32
 
 #define ESP32_UHCI_COUNT 2
+#define ESP32_MCPWM_COUNT 2
 
 typedef struct Esp32SocState Esp32SocState;
 typedef struct Esp32PeriphGate Esp32PeriphGate;
@@ -73,6 +75,7 @@ struct Esp32PeriphGate {
     /* The peripheral's own clocks, driven by the SoC; NULL if it has none */
     Clock *apb_clk;
     Clock *ref_tick_clk;
+    Clock *f160m_clk;
 
     unsigned n_windows;
     Esp32GateWindow window[ESP32_GATE_MAX_MR];
@@ -109,6 +112,7 @@ struct Esp32SocState {
     Esp32LEDCState ledc;
     Esp32PcntState pcnt;
     Esp32RmtState rmt;
+    Esp32McpwmState mcpwm[ESP32_MCPWM_COUNT];
     Esp32EfuseState efuse;
     Esp32FlashEncryptionState flash_enc;
     ESPRgbState rgb;
@@ -139,6 +143,8 @@ struct Esp32SocState {
     Clock *rmt_ref_tick_clk;
     Clock *emac_apb_clk;
     Clock *sdio_apb_clk;
+    Clock *mcpwm_apb_clk[ESP32_MCPWM_COUNT];
+    Clock *mcpwm_f160m_clk[ESP32_MCPWM_COUNT];
     /* APB_CLK to the GPIO block's sigma-delta modulators, never gated */
     Clock *gpio_apb_clk;
     Clock *pcnt_apb_clk;
