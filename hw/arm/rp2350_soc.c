@@ -20,11 +20,14 @@
 #include "hw/block/aps6404l.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/unimp.h"
+#include "system/blockdev.h"
+#include "system/block-backend.h"
 #include "system/system.h"
 #include "target/arm/arm-powerctl.h"
 #include "target/arm/cpu.h"
 #include "target/arm/internals.h"
 #include "target/arm/multiprocessing.h"
+#include "target/arm/tcg/idau.h"
 
 typedef struct RP2350Peripheral {
     const char *name;
@@ -88,6 +91,70 @@ static const RP2350Peripheral rp2350_peripherals[] = {
     { "rp2350.sio",             0xd0000000, 0x20000 },
     { "rp2350.sio_nonsec",      0xd0020000, 0x20000 },
 };
+
+/*
+ * The RP2350 IDAU (datasheet "IDAU address map"), a fixed address decode.
+ * Within the 32 KiB ROM map, mirrored every 32 KiB below the XIP window:
+ * the Arm boot code is Exempt, the USB/RISC-V boot code is Non-secure for
+ * instruction fetch but Exempt for loads and stores, and the final 512
+ * bytes hold the Secure Gateways, Secure and Non-secure-callable. The
+ * peripherals and SIO are Exempt; XIP, SRAM and everything else are
+ * Non-secure. Only the Secure Gateway region reports a region number, 2,
+ * as the boot ROM's start-up checks of its TT results expect.
+ */
+#define RP2350_IDAU_ROM_MAP      0x8000
+#define RP2350_IDAU_NSBOOT_START 0x4300
+#define RP2350_IDAU_SG_START     0x7e00
+#define RP2350_IDAU_SG_REGION    2
+
+/* [spec:nuos:req:emu.machine+1] */
+static void rp2350_idau_check(IDAUInterface *ii, uint32_t address,
+                              MMUAccessType access_type, int *iregion,
+                              bool *exempt, bool *ns, bool *nsc,
+                              uint32_t *base, uint32_t *limit)
+{
+    uint32_t block = address & ~(uint32_t)(RP2350_XIP_BASE - 1);
+
+    *iregion = IREGION_NOTVALID;
+    *exempt = false;
+    *ns = true;
+    *nsc = false;
+
+    if (address < RP2350_XIP_BASE) {
+        uint32_t map = address & ~(uint32_t)(RP2350_IDAU_ROM_MAP - 1);
+        uint32_t off = address - map;
+
+        if (off < RP2350_IDAU_NSBOOT_START) {
+            *exempt = true;
+            *base = map;
+            *limit = map + RP2350_IDAU_NSBOOT_START - 1;
+        } else if (off < RP2350_IDAU_SG_START) {
+            /* The attribute depends on the access type. */
+            *exempt = access_type != MMU_INST_FETCH;
+            *base = address;
+            *limit = address;
+        } else {
+            *ns = false;
+            *nsc = true;
+            *iregion = RP2350_IDAU_SG_REGION;
+            *base = map + RP2350_IDAU_SG_START;
+            *limit = map + RP2350_IDAU_ROM_MAP - 1;
+        }
+        return;
+    }
+
+    switch (block >> 28) {
+    case 0x4: /* APB peripherals */
+    case 0x5: /* AHB peripherals */
+    case 0xd: /* SIO */
+        *exempt = true;
+        break;
+    default:
+        break;
+    }
+    *base = block;
+    *limit = block + (RP2350_XIP_BASE - 1);
+}
 
 /* The boot ROM enables the RCP (coprocessor 7) for Secure and Non-secure. */
 #define CPACR_CP7 (3u << 14)
@@ -464,7 +531,9 @@ static const char *rp2350_flash_part(uint32_t size)
  * The XIP subsystem and the board's QSPI devices: flash on chip select 0,
  * a W25Q part of the configured size, and optionally an APS6404L PSRAM on
  * chip select 1. Without flash, chip select 0 has no device and the XIP
- * windows hold no flash.
+ * windows hold no flash. The flash is erased unless backed by the first
+ * -drive if=mtd, a raw image of exactly the flash size, which then holds
+ * its contents and takes its erases and programs.
  */
 /* [spec:nuos:req:emu.flash] */
 /* [spec:nuos:req:emu.xip+1] */
@@ -500,7 +569,15 @@ static bool rp2350_soc_realize_xip(RP2350State *s, Error **errp)
         dev = qdev_new(devices[cs].type);
         qdev_prop_set_uint8(dev, "cs", cs);
         if (cs == 0) {
+            DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
+
             qdev_prop_set_bit(dev, "write-enable-autoclear", true);
+            if (dinfo &&
+                !qdev_prop_set_drive_err(dev, "drive",
+                                         blk_by_legacy_dinfo(dinfo), errp)) {
+                object_unref(OBJECT(dev));
+                return false;
+            }
         }
         object_property_set_link(OBJECT(dev), "memory",
                                  OBJECT(rp2350_xip_array(&s->xip, cs)),
@@ -563,6 +640,20 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     memory_region_add_subregion(s->board_memory, RP2350_SRAM_BASE, &s->sram);
 
+    /*
+     * The USB controller's 4 KiB data DPRAM. It is ordinary memory to the
+     * system bus, and software that does not use USB uses it as such: the
+     * boot ROM keeps its flash boot workspace there. The controller's
+     * registers are not modelled.
+     */
+    /* [spec:nuos:req:emu.machine+1] */
+    if (!memory_region_init_ram(&s->usb_dpram, obj, "rp2350.usb-dpram",
+                                RP2350_USB_DPRAM_SIZE, errp)) {
+        return;
+    }
+    memory_region_add_subregion(s->board_memory, RP2350_USB_DPRAM_BASE,
+                                &s->usb_dpram);
+
     clock_set_hz(s->sysclk, RP2350_SYSCLK_HZ);
     clock_set_hz(s->refclk, RP2350_REFCLK_HZ);
 
@@ -593,16 +684,21 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         qdev_prop_set_uint32(armv7m, "mpu-s-regions", RP2350_MPU_REGIONS);
         qdev_prop_set_uint32(armv7m, "mpu-ns-regions", RP2350_MPU_REGIONS);
         /*
-         * On hardware the boot ROM holds core 1 until core 0 launches it
-         * through the SIO FIFO. Without that path modelled, core 1 stays
-         * powered off.
+         * Both cores leave reset into the boot ROM, which holds core 1 in
+         * its wait-for-launch code until core 0 launches it through the
+         * SIO FIFO. With no ROM executing, core 1 stays powered off until
+         * the machine's own launch handshake starts it.
          */
-        qdev_prop_set_bit(armv7m, "start-powered-off", i != 0);
+        /* [spec:nuos:req:emu.core1-launch] */
+        qdev_prop_set_bit(armv7m, "start-powered-off",
+                          i != 0 && s->core1_launch);
         qdev_connect_clock_in(armv7m, "cpuclk", s->sysclk);
         qdev_connect_clock_in(armv7m, "refclk", s->refclk);
         object_property_set_link(OBJECT(armv7m), "memory",
                                  OBJECT(rp2350_accessctrl_view(&s->accessctrl,
                                                                i)),
+                                 &error_abort);
+        object_property_set_link(OBJECT(armv7m), "idau", OBJECT(s),
                                  &error_abort);
         if (!sysbus_realize(SYS_BUS_DEVICE(armv7m), errp)) {
             return;
@@ -1102,9 +1198,11 @@ static const Property rp2350_soc_properties[] = {
 static void rp2350_soc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    IDAUInterfaceClass *iic = IDAU_INTERFACE_CLASS(klass);
 
     dc->realize = rp2350_soc_realize;
     device_class_set_props(dc, rp2350_soc_properties);
+    iic->check = rp2350_idau_check;
 }
 
 static const TypeInfo rp2350_soc_info = {
@@ -1113,6 +1211,10 @@ static const TypeInfo rp2350_soc_info = {
     .instance_size = sizeof(RP2350State),
     .instance_init = rp2350_soc_init,
     .class_init    = rp2350_soc_class_init,
+    .interfaces    = (const InterfaceInfo[]) {
+        { TYPE_IDAU_INTERFACE },
+        { }
+    },
 };
 
 static void rp2350_soc_types(void)
