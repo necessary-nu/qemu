@@ -848,10 +848,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->trng), 0,
                        qdev_get_gpio_in(dev_soc, RP2350_TRNG_IRQ));
 
-    /*
-     * The SHA-256 DREQ is left for the DMA controller to connect, through
-     * the block's RP2350_SHA256_DREQ output.
-     */
+    /* The SHA-256 DREQ is connected with the DMA's other sources. */
     /* [spec:nuos:req:emu.sha256] */
     qdev_connect_clock_in(DEVICE(&s->sha256), "clk", s->sysclk);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->sha256), errp)) {
@@ -862,8 +859,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     /*
      * PWM. Each slice's A and B drive their GPIO function signals, and B
      * returns the OR of the pins selecting it. The DREQ_PWM_WRAP0-11
-     * outputs ("dreq-wrap") are for the DMA and stay unconnected until
-     * it is modelled; unconnected, they cost nothing.
+     * outputs ("dreq-wrap") are connected with the DMA's other sources.
      */
     /* [spec:nuos:req:emu.pwm] */
     {
@@ -984,9 +980,21 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             qdev_connect_gpio_out_named(uart, PL011_DMA_REQ, PL011_DMA_RX,
                 qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, tx + 1));
         }
+        for (i = 0; i < RP2350_PWM_SLICES; i++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->pwm), RP2350_PWM_DREQ, i,
+                qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
+                                       RP2350_DREQ_PWM_WRAP0 + i));
+        }
+        for (i = 0; i < RP2350_XIP_NUM_DREQ; i++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->xip), "dreq", i,
+                qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
+                                       RP2350_DREQ_XIP_STREAM + i));
+        }
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->coresight_trace), 0,
             qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
                                    RP2350_DREQ_CORESIGHT));
+        qdev_connect_gpio_out_named(DEVICE(&s->sha256), RP2350_SHA256_DREQ, 0,
+            qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_SHA256));
     }
 
     for (i = 0; i < ARRAY_SIZE(rp2350_peripherals); i++) {

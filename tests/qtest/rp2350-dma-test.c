@@ -10,6 +10,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "libqtest.h"
 
 #define DMA             0x50000000
@@ -69,6 +70,7 @@
 #define TREQ_UART0_TX   28
 #define TREQ_UART0_RX   29
 #define TREQ_PWM_WRAP0  32
+#define TREQ_XIP_STREAM 49
 #define TREQ_TIMER0     0x3b
 #define TREQ_PERMANENT  0x3f
 
@@ -100,6 +102,12 @@
 #define PERFCTR(n)      (BUSCTRL + 0x0c + 8 * (n))
 #define PERFSEL(n)      (BUSCTRL + 0x10 + 8 * (n))
 
+#define XIP_BASE        0x10000000
+#define XIP_STREAM_ADDR 0x400c8014
+#define XIP_STREAM_CTR  0x400c8018
+#define XIP_AUX_STREAM  0x50500000
+#define IMAGE_WORDS     256
+
 #define TICKS           0x40108000
 #define SIO             0xd0000000
 
@@ -111,6 +119,7 @@
 #define US              1000
 
 static char *rom_path;
+static char *image_path;
 
 static QTestState *start(void)
 {
@@ -591,6 +600,29 @@ static void test_uart_dreq(void)
     qtest_quit(qts);
 }
 
+/* The XIP stream FIFO feeds a channel through DREQ_XIP_STREAM. */
+/* [spec:nuos:req:emu.dma/test] */
+static void test_xip_stream_dreq(void)
+{
+    QTestState *qts = qtest_initf("-M rp2350,flash-size=4M -kernel %s",
+                                  image_path);
+    int i;
+
+    setup(qts, 0, XIP_AUX_STREAM, DST, 32);
+    qtest_writel(qts, CH(0) + CTRL_TRIG, EN | SIZE_WORD | INCR_WRITE |
+                 CHAIN_TO(0) | TREQ(TREQ_XIP_STREAM));
+    qtest_writel(qts, XIP_STREAM_ADDR, XIP_BASE + 0x40);
+    qtest_writel(qts, XIP_STREAM_CTR, 32);
+    qtest_clock_step(qts, 10 * 1000 * US);
+    g_assert_cmphex(qtest_readl(qts, CH(0) + TRANS_COUNT), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, XIP_STREAM_CTR), ==, 0);
+    for (i = 0; i < 32; i++) {
+        g_assert_cmphex(qtest_readl(qts, DST + 4 * i), ==,
+                        0xa5000000 | (0x40 + 4 * i));
+    }
+    qtest_quit(qts);
+}
+
 /* [spec:nuos:req:emu.dma/test] */
 static void test_bus_errors(void)
 {
@@ -791,6 +823,19 @@ int main(int argc, char **argv)
     g_assert_cmpint(write(fd, blank, sizeof(blank)), ==, sizeof(blank));
     close(fd);
 
+    {
+        uint32_t words[IMAGE_WORDS];
+        int i;
+
+        for (i = 0; i < IMAGE_WORDS; i++) {
+            words[i] = cpu_to_le32(0xa5000000 | (i * 4));
+        }
+        fd = g_file_open_tmp("rp2350-dma-test-XXXXXX.img", &image_path, &err);
+        g_assert_no_error(err);
+        g_assert_cmpint(write(fd, words, sizeof(words)), ==, sizeof(words));
+        close(fd);
+    }
+
     qtest_add_func("/rp2350/dma/reset", test_reset);
     qtest_add_func("/rp2350/dma/copy-irq", test_copy_and_irq);
     qtest_add_func("/rp2350/dma/sizes-increments", test_sizes_and_increments);
@@ -801,6 +846,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/dma/pacing", test_pacing_timer);
     qtest_add_func("/rp2350/dma/dreq", test_dreq_credits);
     qtest_add_func("/rp2350/dma/uart-dreq", test_uart_dreq);
+    qtest_add_func("/rp2350/dma/xip-stream-dreq", test_xip_stream_dreq);
     qtest_add_func("/rp2350/dma/bus-errors", test_bus_errors);
     qtest_add_func("/rp2350/dma/security", test_security);
     qtest_add_func("/rp2350/dma/busctrl", test_busctrl_counts_dma);
@@ -808,5 +854,7 @@ int main(int argc, char **argv)
     ret = g_test_run();
     unlink(rom_path);
     g_free(rom_path);
+    unlink(image_path);
+    g_free(image_path);
     return ret;
 }
