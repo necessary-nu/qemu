@@ -587,6 +587,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         qdev_prop_set_uint8(armv7m, "num-prio-bits", 4);
         qdev_prop_set_string(armv7m, "cpu-type",
                              ARM_CPU_TYPE_NAME("cortex-m33"));
+        /* [spec:nuos:req:emu.machine+1] */
+        qdev_prop_set_uint64(armv7m, "midr", RP2350_M33_CPUID);
         qdev_prop_set_uint32(armv7m, "init-svtor", s->init_svtor);
         /* QEMU's Cortex-M33 defaults to 16 regions; the RP2350 has 8 each. */
         /* [spec:nuos:req:emu.mpu] */
@@ -629,6 +631,23 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         }
         qdev_connect_gpio_out_named(DEVICE(&s->eppb[i]), "nmi", 0,
                                     qdev_get_gpio_in_named(armv7m, "NMI", 0));
+
+        /*
+         * The processor's own debug components and PPB ROM table. The SCS
+         * identification block lies over the NVIC's SCS and its NS alias,
+         * so these take priority over the armv7m container's regions.
+         */
+        /* [spec:nuos:req:emu.coresight] */
+        qdev_connect_clock_in(DEVICE(&s->m33_debug[i]), "cpuclk", s->sysclk);
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->m33_debug[i]), errp)) {
+            return;
+        }
+        for (n = 0; n < RP2350_M33_DEBUG_NUM_REGIONS; n++) {
+            memory_region_add_subregion_overlap(
+                &s->armv7m[i].container, rp2350_m33_debug_base[n],
+                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->m33_debug[i]), n),
+                2);
+        }
     }
     memory_region_init_alias(&s->eppb_sysmem, obj, "rp2350-eppb.sysmem",
                              sysbus_mmio_get_region(
@@ -1038,6 +1057,8 @@ static void rp2350_soc_init(Object *obj)
         object_initialize_child(obj, "armv7m[*]", &s->armv7m[i], TYPE_ARMV7M);
         object_initialize_child(obj, "eppb[*]", &s->eppb[i],
                                 TYPE_RP2350_EPPB);
+        object_initialize_child(obj, "m33-debug[*]", &s->m33_debug[i],
+                                TYPE_RP2350_M33_DEBUG);
     }
 
     object_initialize_child(obj, "accessctrl", &s->accessctrl,

@@ -23,6 +23,7 @@
 #include "hw/misc/rp2350_coresight_trace.h"
 #include "hw/misc/rp2350_dcp.h"
 #include "hw/misc/rp2350_eppb.h"
+#include "hw/misc/rp2350_m33_debug.h"
 #include "hw/misc/rp2350_psm.h"
 #include "hw/misc/rp2350_pwm.h"
 #include "hw/misc/rp2350_otp.h"
@@ -47,6 +48,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_NUM_UARTS 2
 #define RP2350_NUM_TIMERS 2
 #define RP2350_MPU_REGIONS 8
+/* CPUID: Arm Cortex-M33 r1p0, where QEMU's cortex-m33 is r0p3. */
+#define RP2350_M33_CPUID 0x411fd210
 
 /*
  * IRQ numbers, from the pico-sdk intctrl.h. Peripheral models connect to
@@ -150,6 +153,7 @@ struct RP2350State {
 
     ARMv7MState armv7m[RP2350_NUM_CORES];
     RP2350EPPBState eppb[RP2350_NUM_CORES];
+    RP2350M33DebugState m33_debug[RP2350_NUM_CORES];
     RP2350AccessCtrlState accessctrl;
     Notifier accessctrl_notifier;
     RP2350ResetsState resets;
