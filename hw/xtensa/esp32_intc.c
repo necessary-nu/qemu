@@ -21,29 +21,52 @@
 
 #define IRQ_MAP(cpu, input) s->irq_map[cpu][input]
 
-static void esp32_intmatrix_route(Esp32IntMatrixState *s, int cpu, int n,
-                                  int level)
+/*
+ * A CPU interrupt is the OR of every source mapped to it in that CPU's
+ * half of the matrix: drive the output for out_index from all of them.
+ */
+static void esp32_intmatrix_update(Esp32IntMatrixState *s, int cpu,
+                                   int out_index)
 {
-    int out_index, nextint;
+    const XtensaConfig *config;
+    bool level = false;
 
     if (s->outputs[cpu] == NULL) {
         return;
     }
-    out_index = IRQ_MAP(cpu, n);
-    nextint = s->cpu[cpu]->env.config->nextint;
-    for (int int_index = 0; int_index < nextint; ++int_index) {
-        if (s->cpu[cpu]->env.config->extint[int_index] == out_index) {
+    for (int n = 0; n < ESP32_INT_MATRIX_INPUTS; ++n) {
+        if (IRQ_MAP(cpu, n) == out_index &&
+            test_bit(n, s->source_level[cpu])) {
+            level = true;
+            break;
+        }
+    }
+    config = s->cpu[cpu]->env.config;
+    for (int int_index = 0; int_index < config->nextint; ++int_index) {
+        if (config->extint[int_index] == out_index) {
             qemu_set_irq(s->outputs[cpu][int_index], level);
             break;
         }
     }
 }
 
+static void esp32_intmatrix_set_source(Esp32IntMatrixState *s, int cpu,
+                                       int n, int level)
+{
+    if (level) {
+        set_bit(n, s->source_level[cpu]);
+    } else {
+        clear_bit(n, s->source_level[cpu]);
+    }
+    esp32_intmatrix_update(s, cpu, IRQ_MAP(cpu, n));
+}
+
 static void esp32_intmatrix_irq_handler(void *opaque, int n, int level)
 {
     Esp32IntMatrixState *s = ESP32_INTMATRIX(opaque);
+
     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
-        esp32_intmatrix_route(s, i, n, level);
+        esp32_intmatrix_set_source(s, i, n, level);
     }
 }
 
@@ -53,9 +76,9 @@ static void esp32_intmatrix_irq_handler(void *opaque, int n, int level)
  */
 static void esp32_intmatrix_cpu_irq_handler(void *opaque, int n, int level)
 {
-    esp32_intmatrix_route(ESP32_INTMATRIX(opaque),
-                          n / ESP32_INT_MATRIX_INPUTS,
-                          n % ESP32_INT_MATRIX_INPUTS, level);
+    esp32_intmatrix_set_source(ESP32_INTMATRIX(opaque),
+                               n / ESP32_INT_MATRIX_INPUTS,
+                               n % ESP32_INT_MATRIX_INPUTS, level);
 }
 
 static inline uint8_t* get_map_entry(Esp32IntMatrixState* s, hwaddr addr)
@@ -82,7 +105,12 @@ static void esp32_intmatrix_write(void* opaque, hwaddr addr, uint64_t value, uns
     Esp32IntMatrixState *s = ESP32_INTMATRIX(opaque);
     uint8_t* map_entry = get_map_entry(s, addr);
     if (map_entry != NULL) {
+        int cpu = (addr / sizeof(uint32_t)) / ESP32_INT_MATRIX_INPUTS;
+        uint8_t old = *map_entry;
+
         *map_entry = value & 0x1f;
+        esp32_intmatrix_update(s, cpu, old);
+        esp32_intmatrix_update(s, cpu, *map_entry);
     }
 }
 

@@ -42,6 +42,8 @@
 static void esp32_cache_state_update(Esp32CacheState* cs);
 static void esp32_cache_data_sync(Esp32CacheRegionState* crs);
 static void esp32_cache_invalidate_all_entries(Esp32CacheRegionState* crs);
+static void esp32_cache_ctrl1_write(Esp32DportState *s, int cpu,
+                                    uint32_t value);
 
 static inline uint32_t get_mmu_entry(Esp32CacheRegionState* crs, hwaddr base, hwaddr addr)
 {
@@ -92,6 +94,7 @@ static uint64_t esp32_dport_read(void *opaque, hwaddr addr, unsigned int size)
     case A_DPORT_APP_DCACHE_DBUG0:
         /* in idle state */
         r = FIELD_DP32(0, DPORT_PRO_DCACHE_DBUG0, CACHE_STATE, 1);
+        r |= s->cache_state[addr == A_DPORT_APP_DCACHE_DBUG0].cache_ia;
         break;
     case A_DPORT_CACHE_IA_INT_EN:
         r = s->cache_ill_trap_en_reg;
@@ -100,11 +103,13 @@ static uint64_t esp32_dport_read(void *opaque, hwaddr addr, unsigned int size)
         r = 0;
         r = FIELD_DP32(r, DPORT_PRO_DCACHE_DBUG3, IA_INT_DROM0, s->cache_state[0].drom0.illegal_access_status);
         r = FIELD_DP32(r, DPORT_PRO_DCACHE_DBUG3, IA_INT_IRAM0, s->cache_state[0].iram0.illegal_access_status);
+        r |= s->cache_state[0].cache_dis_ia;
         break;
     case A_DPORT_APP_DCACHE_DBUG3:
         r = 0;
         r = FIELD_DP32(r, DPORT_APP_DCACHE_DBUG3, IA_INT_DROM0, s->cache_state[1].drom0.illegal_access_status);
         r = FIELD_DP32(r, DPORT_APP_DCACHE_DBUG3, IA_INT_IRAM0, s->cache_state[1].iram0.illegal_access_status);
+        r |= s->cache_state[1].cache_dis_ia;
         break;
     case PRO_DROM0_MMU_FIRST ... PRO_DROM0_MMU_LAST:
         r = get_mmu_entry(&s->cache_state[0].drom0, PRO_DROM0_MMU_FIRST, addr);
@@ -141,6 +146,9 @@ static uint64_t esp32_dport_read(void *opaque, hwaddr addr, unsigned int size)
         break;
     case A_DPORT_SPI_DMA_CHAN_SEL:
         r = s->spi_dma_chan_sel;
+        break;
+    default:
+        esp32_dport_mpu_read(s, addr, &r);
         break;
     }
 
@@ -184,6 +192,7 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
             esp32_cache_data_sync(&s->cache_state[0].drom0);
             esp32_cache_invalidate_all_entries(&s->cache_state[0].iram0);
             esp32_cache_data_sync(&s->cache_state[0].iram0);
+            esp32_dport_mpu_cache_flushed(s);
         }
         old_val = s->cache_state[0].cache_ctrl_reg;
         s->cache_state[0].cache_ctrl_reg = value;
@@ -192,11 +201,7 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
         }
         break;
     case A_DPORT_PRO_CACHE_CTRL1:
-        old_val = s->cache_state[0].cache_ctrl1_reg;
-        s->cache_state[0].cache_ctrl1_reg = value;
-        if (value != old_val) {
-            esp32_cache_state_update(&s->cache_state[0]);
-        }
+        esp32_cache_ctrl1_write(s, 0, value);
         break;
     case A_DPORT_APP_CACHE_CTRL:
         if (FIELD_EX32(value, DPORT_APP_CACHE_CTRL, CACHE_FLUSH_ENA)) {
@@ -206,6 +211,7 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
             esp32_cache_data_sync(&s->cache_state[1].drom0);
             esp32_cache_invalidate_all_entries(&s->cache_state[1].iram0);
             esp32_cache_data_sync(&s->cache_state[1].iram0);
+            esp32_dport_mpu_cache_flushed(s);
         }
         old_val = s->cache_state[1].cache_ctrl_reg;
         s->cache_state[1].cache_ctrl_reg = value;
@@ -214,11 +220,7 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
         }
         break;
     case A_DPORT_APP_CACHE_CTRL1:
-        old_val = s->cache_state[1].cache_ctrl1_reg;
-        s->cache_state[1].cache_ctrl1_reg = value;
-        if (value != old_val) {
-            esp32_cache_state_update(&s->cache_state[1]);
-        }
+        esp32_cache_ctrl1_write(s, 1, value);
         break;
     case A_DPORT_CACHE_IA_INT_EN:
         s->cache_ill_trap_en_reg = value;
@@ -228,6 +230,7 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
         s->cache_state[1].iram0.illegal_access_trap_en = (FIELD_EX32(value, DPORT_CACHE_IA_INT_EN, IA_INT_APP_IRAM0));
         s->cache_state[0].dram1.illegal_access_trap_en = (FIELD_EX32(value, DPORT_CACHE_IA_INT_EN, IA_INT_PRO_DRAM1));
         s->cache_state[1].dram1.illegal_access_trap_en = (FIELD_EX32(value, DPORT_CACHE_IA_INT_EN, IA_INT_APP_DRAM1));
+        esp32_dport_update_cache_irq(s);
         break;
     case PRO_DROM0_MMU_FIRST ... PRO_DROM0_MMU_LAST:
         set_mmu_entry(&s->cache_state[0].drom0, PRO_DROM0_MMU_FIRST, addr, value);
@@ -284,6 +287,9 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
                                        R_DPORT_SPI_DMA_CHAN_SEL_SPI2_MASK |
                                        R_DPORT_SPI_DMA_CHAN_SEL_SPI3_MASK);
         break;
+    default:
+        esp32_dport_mpu_write(s, addr, value);
+        break;
     }
 }
 
@@ -334,6 +340,27 @@ static void esp32_cache_invalidate_all_entries(Esp32CacheRegionState* crs)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.memory-protection]
+ * x_CACHE_MMU_IA_CLR clears the CPU's cache illegal-access flags while it
+ * is set.
+ */
+static void esp32_cache_ctrl1_write(Esp32DportState *s, int cpu,
+                                    uint32_t value)
+{
+    Esp32CacheState *cs = &s->cache_state[cpu];
+    uint32_t old_val = cs->cache_ctrl1_reg;
+
+    cs->cache_ctrl1_reg = value;
+    if (FIELD_EX32(value, DPORT_PRO_CACHE_CTRL1, MMU_IA_CLR)) {
+        cs->cache_ia = 0;
+        esp32_dport_update_cache_irq(s);
+    }
+    if (value != old_val) {
+        esp32_cache_state_update(cs);
+    }
+}
+
 static void esp32_cache_state_update(Esp32CacheState* cs)
 {
     bool cache_enabled = FIELD_EX32(cs->cache_ctrl_reg, DPORT_PRO_CACHE_CTRL, CACHE_ENA) != 0;
@@ -357,6 +384,8 @@ static void esp32_cache_state_update(Esp32CacheState* cs)
             FIELD_EX32(cs->cache_ctrl1_reg, DPORT_PRO_CACHE_CTRL1, MASK_DRAM1) == 0;
         memory_region_set_enabled(&cs->dram1.mem, dram1_enabled);
     }
+    /* The per-PID cache mappings depend on the enables and modes too. */
+    qemu_irq_pulse(cs->dport->mpu_update_req);
 }
 
 static void esp32_cache_region_reset(Esp32CacheRegionState *crs)
@@ -381,7 +410,7 @@ static uint64_t esp32_cache_ill_read(void *opaque, hwaddr addr, unsigned int siz
     memcpy(&result, ((uint8_t*) ill_data) + (addr % 4), size);
     if (crs->illegal_access_trap_en) {
         crs->illegal_access_status = true;
-        qemu_irq_raise(crs->cache->dport->cache_ill_irq);
+        esp32_dport_update_cache_irq(crs->cache->dport);
     }
     return result;
 }
@@ -441,6 +470,7 @@ static void esp32_dport_reset_hold(Object *obj, ResetType type)
     s->spi_dma_chan_sel = 0;
     esp32_cache_reset(&s->cache_state[0]);
     esp32_cache_reset(&s->cache_state[1]);
+    esp32_dport_mpu_reset(s);
     qemu_irq_lower(s->appcpu_stall_req);
 }
 
@@ -511,6 +541,13 @@ static void esp32_dport_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(sbd), &s->flash_dec_en_gpio, ESP32_DPORT_FLASH_DEC_EN_GPIO, 1);
     qdev_init_gpio_out_named(DEVICE(sbd), &s->periph_clk_update_req,
                              ESP32_DPORT_PERIPH_CLK_UPDATE_GPIO, 1);
+    qdev_init_gpio_out_named(DEVICE(sbd), &s->mpu_update_req,
+                             ESP32_DPORT_MPU_UPDATE_GPIO, 1);
+    qdev_init_gpio_out_named(DEVICE(sbd), &s->mmu_ia_irq,
+                             ESP32_DPORT_MMU_IA_IRQ_GPIO, 1);
+    qdev_init_gpio_out_named(DEVICE(sbd), &s->mpu_ia_irq,
+                             ESP32_DPORT_MPU_IA_IRQ_GPIO, 1);
+    esp32_dport_mpu_init(s);
 }
 
 static const Property esp32_dport_properties[] = {

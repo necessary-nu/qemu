@@ -39,6 +39,7 @@
 #include "system/block-backend.h"
 #include "net/net.h"
 #include "elf.h"
+#include "exec/cputlb.h"
 
 #define TYPE_ESP32_SOC "xtensa.esp32"
 #define ESP32_SOC(obj) OBJECT_CHECK(Esp32SocState, (obj), TYPE_ESP32_SOC)
@@ -212,15 +213,83 @@ static void esp32_soc_reset(DeviceState *dev)
         xtensa_select_static_vectors(&s->cpu[0].env, s->rtc_cntl.stat_vector_sel[0]);
         remove_cpu_watchpoints(&s->cpu[0]);
         cpu_reset(CPU(&s->cpu[0]));
+        device_cold_reset(DEVICE(&s->pid[0]));
     }
     if (s->requested_reset & ESP32_SOC_RESET_APPCPU) {
         xtensa_select_static_vectors(&s->cpu[1].env, s->rtc_cntl.stat_vector_sel[1]);
         remove_cpu_watchpoints(&s->cpu[1]);
         cpu_reset(CPU(&s->cpu[1]));
+        device_cold_reset(DEVICE(&s->pid[1]));
     }
     s->requested_reset = 0;
     esp32_soc_update_gates(s, true);
     esp32_soc_update_clocks(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.memory-protection]
+ * The core's hooks: every TLB fill goes through DPORT's per-PID MMUs and
+ * MPUs, and vectoring and instruction countdowns drive the CPU's PID
+ * controller.
+ */
+static void esp32_ext_filter(void *opaque, CPUXtensaState *env,
+                             uint32_t vaddr, MMUAccessType access_type,
+                             XtensaExtMapping *map)
+{
+    Esp32SocState *s = ESP32_SOC(opaque);
+    int cpu = env_cpu(env)->cpu_index;
+    Esp32MpuMapping m = {
+        .paddr = map->paddr,
+        .prot = map->prot,
+        .page_size = map->page_size,
+    };
+
+    esp32_dport_mpu_filter(&s->dport, cpu, esp32_pid_current(&s->pid[cpu]),
+                           vaddr, access_type, &m);
+    map->paddr = m.paddr;
+    map->prot = m.prot;
+    map->page_size = m.page_size;
+}
+
+static void esp32_ext_vector(void *opaque, CPUXtensaState *env, uint32_t pc)
+{
+    Esp32SocState *s = ESP32_SOC(opaque);
+
+    esp32_pid_vector(&s->pid[env_cpu(env)->cpu_index], pc);
+}
+
+static void esp32_ext_countdown_expired(void *opaque, CPUXtensaState *env,
+                                        unsigned n)
+{
+    Esp32SocState *s = ESP32_SOC(opaque);
+
+    esp32_pid_countdown_expired(&s->pid[env_cpu(env)->cpu_index], n);
+}
+
+static const XtensaExtHooks esp32_ext_hooks = {
+    .filter = esp32_ext_filter,
+    .vector = esp32_ext_vector,
+    .countdown_expired = esp32_ext_countdown_expired,
+};
+
+static unsigned esp32_get_pid(void *opaque, int cpu)
+{
+    Esp32SocState *s = ESP32_SOC(opaque);
+
+    return esp32_pid_current(&s->pid[cpu]);
+}
+
+/* DPORT's protection configuration changed: drop every CPU's mappings. */
+static void esp32_mpu_update(void *opaque, int n, int level)
+{
+    MachineState *ms = MACHINE(qdev_get_machine());
+    Esp32SocState *s = ESP32_SOC(opaque);
+
+    if (level) {
+        for (int i = 0; i < ms->smp.cpus; ++i) {
+            tlb_flush(CPU(&s->cpu[i]));
+        }
+    }
 }
 
 static void esp32_cpu_stall(void* opaque, int n, int level)
@@ -610,8 +679,49 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         qdev_realize(DEVICE(&s->cpu[i]), NULL, &error_fatal);
     }
 
+    s->dport.get_pid = esp32_get_pid;
+    s->dport.get_pid_opaque = s;
     qdev_realize(DEVICE(&s->dport), &s->periph_bus, &error_fatal);
     MemoryRegion* dport_mem = sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->dport), 0);
+
+    /*
+     * [spec:nuos:req:emu.esp32.memory-protection]
+     * Each CPU's PID controller, at the same address in each CPU's view,
+     * and the windows the protection model maps refused and translated
+     * accesses to.
+     */
+    for (int i = 0; i < ms->smp.cpus; ++i) {
+        const struct {
+            MemoryRegion *mr;
+            hwaddr base;
+        } hidden[] = {
+            { &s->dport.mpu_sink, ESP32_MPU_SINK_BASE },
+            { &s->dport.mpu_redirect, ESP32_MPU_REDIRECT_BASE },
+            { &s->dport.flash_pages, ESP32_FLASH_PAGES_BASE },
+        };
+
+        object_property_set_link(OBJECT(&s->pid[i]), "cpu",
+                                 OBJECT(&s->cpu[i]), &error_abort);
+        sysbus_realize(SYS_BUS_DEVICE(&s->pid[i]), &error_fatal);
+        memory_region_add_subregion_overlap(&s->cpu_specific_mem[i],
+            ESP32_PID_BASE,
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->pid[i]), 0), 1);
+        for (int j = 0; j < ARRAY_SIZE(hidden); ++j) {
+            MemoryRegion *alias = g_new(MemoryRegion, 1);
+            char *name = g_strdup_printf("cpu%d-%s", i,
+                                         memory_region_name(hidden[j].mr));
+
+            memory_region_init_alias(alias, NULL, name, hidden[j].mr, 0,
+                                     memory_region_size(hidden[j].mr));
+            memory_region_add_subregion_overlap(&s->cpu_specific_mem[i],
+                                                hidden[j].base, alias, 1);
+            g_free(name);
+        }
+        xtensa_set_ext_hooks(&s->cpu[i].env, &esp32_ext_hooks, s);
+    }
+    qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_MPU_UPDATE_GPIO,
+                                0, qdev_get_gpio_in_named(dev,
+                                    ESP32_DPORT_MPU_UPDATE_GPIO, 0));
 
     memory_region_add_subregion(sys_mem, DR_REG_DPORT_BASE, dport_mem);
     qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_APPCPU_RESET_GPIO, 0,
@@ -636,7 +746,6 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     DeviceState* intmatrix_dev = DEVICE(&s->intmatrix);
     memory_region_add_subregion_overlap(dport_mem, ESP32_DPORT_PRO_INTMATRIX_BASE, sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->intmatrix), 0), -1);
 
-    bool init_cache_err = false;
     if (s->dport.flash_blk) {
         for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
             Esp32CacheRegionState *drom0 = &s->dport.cache_state[i].drom0;
@@ -646,7 +755,6 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
             memory_region_add_subregion_overlap(&s->cpu_specific_mem[i], iram0->base, &iram0->illegal_access_trap_mem, -2);
             memory_region_add_subregion_overlap(&s->cpu_specific_mem[i], iram0->base, &iram0->mem, -1);
         }
-        init_cache_err = true;
     }
     if (s->dport.has_psram) {
         for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
@@ -654,12 +762,17 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
             memory_region_add_subregion_overlap(&s->cpu_specific_mem[i], dram1->base, &dram1->illegal_access_trap_mem, -2);
             memory_region_add_subregion_overlap(&s->cpu_specific_mem[i], dram1->base, &dram1->mem, -1);
         }
-        init_cache_err = true;
     }
-    if (init_cache_err) {
-        qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_CACHE_ILL_IRQ_GPIO, 0,
-                                    qdev_get_gpio_in(DEVICE(&s->intmatrix), ETS_CACHE_IA_INTR_SOURCE));
-    }
+    qdev_connect_gpio_out_named(DEVICE(&s->dport),
+                                ESP32_DPORT_CACHE_ILL_IRQ_GPIO, 0,
+                                qdev_get_gpio_in(DEVICE(&s->intmatrix),
+                                                 ETS_CACHE_IA_INTR_SOURCE));
+    qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_MMU_IA_IRQ_GPIO,
+                                0, qdev_get_gpio_in(DEVICE(&s->intmatrix),
+                                                    ETS_MMU_IA_INTR_SOURCE));
+    qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_MPU_IA_IRQ_GPIO,
+                                0, qdev_get_gpio_in(DEVICE(&s->intmatrix),
+                                                    ETS_MPU_IA_INTR_SOURCE));
 
     int n_crosscore_irqs = ESP32_DPORT_CROSSCORE_INT_COUNT;
     object_property_set_int(OBJECT(&s->crosscore_int), "n_irqs", n_crosscore_irqs, &error_abort);
@@ -1075,6 +1188,11 @@ static void esp32_soc_init(Object *obj)
 
     object_initialize_child(obj, "dport", &s->dport, TYPE_ESP32_DPORT);
 
+    for (int i = 0; i < ms->smp.cpus; ++i) {
+        snprintf(name, sizeof(name), "pid%d", i);
+        object_initialize_child(obj, name, &s->pid[i], TYPE_ESP32_PID);
+    }
+
     object_initialize_child(obj, "apb_ctrl", &s->apb_ctrl, TYPE_ESP32_APB_CTRL);
 
     object_initialize_child(obj, "intmatrix", &s->intmatrix, TYPE_ESP32_INTMATRIX);
@@ -1145,6 +1263,8 @@ static void esp32_soc_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(s), esp32_clk_update, ESP32_RTC_CLK_UPDATE_GPIO, 1);
     qdev_init_gpio_in_named(DEVICE(s), esp32_periph_clk_update,
                             ESP32_DPORT_PERIPH_CLK_UPDATE_GPIO, 1);
+    qdev_init_gpio_in_named(DEVICE(s), esp32_mpu_update,
+                            ESP32_DPORT_MPU_UPDATE_GPIO, 1);
     qdev_init_gpio_in_named(DEVICE(s), esp32_timg_cpu_reset, ESP32_TIMG_WDT_CPU_RESET_GPIO, 2);
     qdev_init_gpio_in_named(DEVICE(s), esp32_timg_sys_reset, ESP32_TIMG_WDT_SYS_RESET_GPIO, 2);
 }

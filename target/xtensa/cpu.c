@@ -122,6 +122,13 @@ static TCGTBCPUState xtensa_get_tb_cpu_state(CPUState *cs)
     if (env->yield_needed) {
         flags |= XTENSA_TBFLAG_YIELD;
     }
+#ifndef CONFIG_USER_ONLY
+    for (unsigned i = 0; i < XTENSA_EXT_COUNTDOWNS; ++i) {
+        if (env->ext_countdown[i] >= 0) {
+            flags |= XTENSA_TBFLAG_EXT_COUNTDOWN;
+        }
+    }
+#endif
 
     return (TCGTBCPUState){
         .pc = env->pc,
@@ -206,6 +213,10 @@ static void xtensa_cpu_reset_hold(Object *obj, ResetType type)
 #ifndef CONFIG_USER_ONLY
     reset_mmu(env);
     cs->halted = env->runstall;
+    for (unsigned i = 0; i < XTENSA_EXT_COUNTDOWNS; ++i) {
+        env->ext_countdown[i] = -1;
+    }
+    env->nmi_masked = false;
 #endif
     /* For inf * 0 + NaN, return the input NaN */
     set_float_infzeronan_rule(float_infzeronan_dnan_never, &env->fp_status);
@@ -296,6 +307,9 @@ static void xtensa_cpu_initfn(Object *obj)
                                     xtensa_cpu_clock_update, cpu,
                                     ClockPreUpdate | ClockUpdate);
     clock_set_hz(cpu->clock, env->config->clock_freq_khz * 1000);
+    for (unsigned i = 0; i < XTENSA_EXT_COUNTDOWNS; ++i) {
+        env->ext_countdown[i] = -1;
+    }
 #endif
 }
 
