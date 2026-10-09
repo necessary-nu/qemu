@@ -2131,6 +2131,11 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
             return;
         }
         cpu->env.sau.ctrl = value & 3;
+        /*
+         * ENABLE and ALLNS change the security attribution of every
+         * address, so TLB entries filled under the old setting are stale.
+         */
+        tlb_flush(CPU(cpu));
         break;
     case 0xdd4: /* SAU_TYPE */
         if (!arm_feature(&cpu->env, ARM_FEATURE_V8)) {
