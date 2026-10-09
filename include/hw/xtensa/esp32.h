@@ -113,6 +113,7 @@ struct Esp32SocState {
     BusState periph_bus;
 
     MemoryRegion cpu_specific_mem[ESP32_CPU_COUNT];
+    MemoryRegion cpu_sysmem_view[ESP32_CPU_COUNT];
 
     uint32_t requested_reset;
 
