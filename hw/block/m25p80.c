@@ -37,6 +37,7 @@
 #include "qapi/error.h"
 #include "trace.h"
 #include "qom/object.h"
+#include "system/memory.h"
 #include "m25p80_sfdp.h"
 
 /* 16 MiB max in 3 byte address mode */
@@ -353,11 +354,13 @@ static const FlashPartInfo known_devices[] = {
     { INFO("w25x80",      0xef3014,      0,  64 << 10,  16, ER_4K) },
     { INFO("w25x16",      0xef3015,      0,  64 << 10,  32, ER_4K) },
     { INFO("w25x32",      0xef3016,      0,  64 << 10,  64, ER_4K) },
+    { INFO("w25q16",      0xef4015,      0,  64 << 10,  32, ER_4K) },
     { INFO("w25q32",      0xef4016,      0,  64 << 10,  64, ER_4K) },
     { INFO("w25q32dw",    0xef6016,      0,  64 << 10,  64, ER_4K) },
     { INFO("w25x64",      0xef3017,      0,  64 << 10, 128, ER_4K) },
     { INFO("w25q64",      0xef4017,      0,  64 << 10, 128, ER_4K) },
     { INFO("w25q80",      0xef5014,      0,  64 << 10,  16, ER_4K) },
+    { INFO("w25q128",     0xef4018,      0,  64 << 10, 256, ER_4K) },
     { INFO("w25q80bl",    0xef4014,      0,  64 << 10,  16, ER_4K),
       .sfdp_read = m25p80_sfdp_w25q80bl },
     { INFO("w25q256",     0xef4019,      0,  64 << 10, 512, ER_4K),
@@ -485,6 +488,11 @@ struct Flash {
     SSIPeripheral parent_obj;
 
     BlockBackend *blk;
+    /*
+     * Optional ROM device region holding the array, so that a controller
+     * can map the flash contents directly. Its RAM is the storage.
+     */
+    MemoryRegion *mem;
 
     uint8_t *storage;
     uint32_t size;
@@ -513,6 +521,12 @@ struct Flash {
     uint8_t spansion_cr4v;
     bool wp_level;
     bool write_enable;
+    /*
+     * Clear the write enable latch when a program or erase completes, as
+     * SPI NOR parts do. Off by default: some controller models issue
+     * memory-mapped writes without the write enables real software sends.
+     */
+    bool wel_autoclear;
     bool four_bytes_address_mode;
     bool reset_enable;
     bool quad_enable;
@@ -604,6 +618,14 @@ static inline void flash_sync_area(Flash *s, int64_t off, int64_t len)
     blk_aio_pwritev(s->blk, off, iov, 0, blk_sync_complete, iov);
 }
 
+/* Keep a directly mapped array coherent with changes made through SPI. */
+static void flash_storage_changed(Flash *s, uint32_t off, uint32_t len)
+{
+    if (s->mem) {
+        memory_region_flush_rom_device(s->mem, off, len);
+    }
+}
+
 static void flash_erase(Flash *s, int offset, FlashCMD cmd)
 {
     uint32_t len;
@@ -652,7 +674,10 @@ static void flash_erase(Flash *s, int offset, FlashCMD cmd)
         qemu_log_mask(LOG_GUEST_ERROR, "M25P80: erase with write protect!\n");
         return;
     }
+    /* Erases act on the whole naturally aligned block. */
+    offset &= ~(len - 1);
     memset(s->storage + offset, 0xff, len);
+    flash_storage_changed(s, offset, len);
     flash_sync_area(s, offset, len);
 }
 
@@ -708,6 +733,7 @@ void flash_write8(Flash *s, uint32_t addr, uint8_t data)
     } else {
         s->storage[s->cur_addr] &= data;
     }
+    flash_storage_changed(s, s->cur_addr, 1);
 
     flash_sync_dirty(s, page);
     s->dirty_page = page;
@@ -795,6 +821,9 @@ static void complete_collecting_data(Flash *s)
     case ERASE4_SECTOR:
     case DIE_ERASE:
         flash_erase(s, s->cur_addr, s->cmd_in_progress);
+        if (s->wel_autoclear) {
+            s->write_enable = false;
+        }
         break;
     case WRSR:
         s->status_register_write_disabled = extract32(s->data[0], 7, 1);
@@ -1456,6 +1485,9 @@ static void decode_new_cmd(Flash *s, uint32_t value)
         if (s->write_enable) {
             trace_m25p80_chip_erase(s);
             flash_erase(s, 0, BULK_ERASE);
+            if (s->wel_autoclear) {
+                s->write_enable = false;
+            }
         } else {
             qemu_log_mask(LOG_GUEST_ERROR, "M25P80: chip erase with write "
                           "protect!\n");
@@ -1607,6 +1639,14 @@ static int m25p80_cs(SSIPeripheral *ss, bool select)
         if (s->state == STATE_COLLECTING_VAR_LEN_DATA) {
             complete_collecting_data(s);
         }
+        /*
+         * Raising CS# ends a page program. SST auto address increment
+         * mode keeps the latch until WRDI.
+         */
+        if (s->wel_autoclear && s->state == STATE_PAGE_PROGRAM &&
+            !s->aai_enable) {
+            s->write_enable = false;
+        }
         s->len = 0;
         s->pos = 0;
         s->state = STATE_IDLE;
@@ -1730,6 +1770,16 @@ static void m25p80_realize(SSIPeripheral *ss, Error **errp)
     s->size = s->pi->sector_size * s->pi->n_sectors;
     s->dirty_page = -1;
 
+    if (s->mem) {
+        if (!memory_region_is_romd(s->mem) ||
+            memory_region_size(s->mem) != s->size) {
+            error_setg(errp, "memory must be a ROM device region of %u bytes",
+                       s->size);
+            return;
+        }
+        s->storage = memory_region_get_ram_ptr(s->mem);
+    }
+
     if (s->blk) {
         uint64_t perm = BLK_PERM_CONSISTENT_READ |
                         (blk_supports_write_perm(s->blk) ? BLK_PERM_WRITE : 0);
@@ -1739,7 +1789,9 @@ static void m25p80_realize(SSIPeripheral *ss, Error **errp)
         }
 
         trace_m25p80_binding(s);
-        s->storage = blk_blockalign(s->blk, s->size);
+        if (!s->mem) {
+            s->storage = blk_blockalign(s->blk, s->size);
+        }
 
         if (!blk_check_size_and_read_all(s->blk, DEVICE(s),
                                          s->storage, s->size, errp)) {
@@ -1747,7 +1799,9 @@ static void m25p80_realize(SSIPeripheral *ss, Error **errp)
         }
     } else {
         trace_m25p80_binding_no_bdrv(s);
-        s->storage = blk_blockalign(NULL, s->size);
+        if (!s->mem) {
+            s->storage = blk_blockalign(NULL, s->size);
+        }
         memset(s->storage, 0xFF, s->size);
     }
 
@@ -1786,6 +1840,9 @@ static const Property m25p80_properties[] = {
     DEFINE_PROP_UINT8("spansion-cr3nv", Flash, spansion_cr3nv, 0x2),
     DEFINE_PROP_UINT8("spansion-cr4nv", Flash, spansion_cr4nv, 0x10),
     DEFINE_PROP_DRIVE("drive", Flash, blk),
+    DEFINE_PROP_LINK("memory", Flash, mem, TYPE_MEMORY_REGION,
+                     MemoryRegion *),
+    DEFINE_PROP_BOOL("write-enable-autoclear", Flash, wel_autoclear, false),
 };
 
 static int m25p80_pre_load(void *opaque)

@@ -89,7 +89,7 @@ static void test_memory_map(void)
     assert_mtree_has(qts, "0000000000000000-0000000000007fff "
                           "(prio 0, rom): rp2350.rom");
     assert_mtree_has(qts, "0000000010000000-00000000103fffff "
-                          "(prio 0, rom): rp2350.flash");
+                          "(prio 0, romd): rp2350.qspi-cs0");
     assert_mtree_has(qts, "0000000020000000-0000000020081fff "
                           "(prio 0, ram): rp2350.sram");
     assert_mtree_has(qts, "0000000040000000-0000000040003fff "
@@ -227,23 +227,33 @@ static void test_flash_size(void)
     args = g_strdup_printf("-M rp2350,flash-size=32M -kernel %s", path);
     g_assert_cmpint(run_qemu(args, &err), !=, 0);
     g_assert(strstr(err, "at most 16 MiB"));
+    g_clear_pointer(&err, g_free);
+    g_clear_pointer(&args, g_free);
 
-    /* No flash: the XIP windows hold only unimplemented-device stubs. */
+    /* Serial flash parts come in power-of-two sizes. */
+    args = g_strdup_printf("-M rp2350,flash-size=3M -kernel %s", path);
+    g_assert_cmpint(run_qemu(args, &err), !=, 0);
+    g_assert(strstr(err, "power of two"));
+
+    /* No flash: chip select 0 has no device; the XIP space is all I/O. */
     qts = qtest_initf("-M rp2350 -bios %s", path);
     {
         g_autofree char *mtree = qtest_hmp(qts, "info mtree -f");
 
-        g_assert(!strstr(mtree, "rp2350.flash"));
-        g_assert(strstr(mtree, "0000000010000000-0000000013ffbfff "
-                               "(prio -1000, i/o): rp2350.xip"));
+        g_assert(!strstr(mtree, "rp2350.qspi-cs0"));
+        g_assert(strstr(mtree, "0000000010000000-000000001fffffff "
+                               "(prio 0, i/o): rp2350-xip-space"));
     }
     qtest_quit(qts);
 
+    /* The device ignores address bits above its size: flash repeats. */
     qts = qtest_initf("-M rp2350,flash-size=2M -kernel %s", path);
     assert_mtree_has(qts, "0000000010000000-00000000101fffff "
-                          "(prio 0, rom): rp2350.flash");
-    assert_mtree_has(qts, "0000000010200000-0000000013ffbfff "
-                          "(prio -1000, i/o): rp2350.xip");
+                          "(prio 0, romd): rp2350.qspi-cs0");
+    assert_mtree_has(qts, "0000000010200000-00000000103fffff "
+                          "(prio 0, romd): rp2350.qspi-cs0");
+    g_assert_cmphex(qtest_readl(qts, XIP_BASE + 0x200004), ==,
+                    XIP_BASE + TEST_RESET_OFFSET + 1);
     qtest_quit(qts);
     unlink(path);
 }

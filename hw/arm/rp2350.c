@@ -18,7 +18,9 @@
  *                 work, but not executed.
  *
  * The RP2350 has no internal flash. Boards set its size with
- * -M rp2350,flash-size=SIZE (a Pico 2 has 4M); there is no default.
+ * -M rp2350,flash-size=SIZE (a Pico 2 has 4M); there is no default. The
+ * flash is a Winbond W25Q part of that size on QSPI chip select 0. Boards
+ * with PSRAM on chip select 1 add psram-size=8M for an APS6404L.
  */
 
 #include "qemu/osdep.h"
@@ -27,6 +29,7 @@
 #include "qapi/error.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/rp2350_soc.h"
+#include "hw/block/aps6404l.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
@@ -39,6 +42,7 @@ struct RP2350MachineState {
 
     RP2350State soc;
     uint64_t flash_size;
+    uint64_t psram_size;
 };
 
 #define TYPE_RP2350_MACHINE MACHINE_TYPE_NAME("rp2350")
@@ -83,6 +87,7 @@ static void rp2350_init(MachineState *machine)
     object_property_set_link(OBJECT(soc), "memory",
                              OBJECT(get_system_memory()), &error_abort);
     qdev_prop_set_uint32(soc, "flash-size", s->flash_size);
+    qdev_prop_set_uint32(soc, "psram-size", s->psram_size);
     /* With no ROM executing, the machine launches core 1 itself. */
     qdev_prop_set_bit(soc, "core1-launch", direct);
     qdev_prop_set_uint32(soc, "init-svtor",
@@ -136,7 +141,38 @@ static void rp2350_set_flash_size(Object *obj, Visitor *v, const char *name,
                    (unsigned)(RP2350_FLASH_MAX_SIZE / MiB));
         return;
     }
+    /* Serial flash parts come in power-of-two sizes. */
+    if (size && (!is_power_of_2(size) || size < RP2350_FLASH_MIN_SIZE)) {
+        error_setg(errp, "flash-size must be a power of two from 1 MiB");
+        return;
+    }
     s->flash_size = size;
+}
+
+static void rp2350_get_psram_size(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    RP2350MachineState *s = RP2350_MACHINE(obj);
+
+    visit_type_size(v, name, &s->psram_size, errp);
+}
+
+/* [spec:nuos:req:emu.xip] */
+static void rp2350_set_psram_size(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    RP2350MachineState *s = RP2350_MACHINE(obj);
+    uint64_t size;
+
+    if (!visit_type_size(v, name, &size, errp)) {
+        return;
+    }
+    if (size && size != APS6404L_SIZE) {
+        error_setg(errp, "psram-size must be 0 or %u MiB (an APS6404L)",
+                   (unsigned)(APS6404L_SIZE / MiB));
+        return;
+    }
+    s->psram_size = size;
 }
 
 /*
@@ -153,6 +189,11 @@ static void rp2350_machine_class_init(ObjectClass *oc, const void *data)
                               NULL, NULL);
     object_class_property_set_description(oc, "flash-size",
         "Size of the board's QSPI flash on chip select 0 (no default)");
+    object_class_property_add(oc, "psram-size", "size",
+                              rp2350_get_psram_size, rp2350_set_psram_size,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "psram-size",
+        "Size of the board's QSPI PSRAM on chip select 1 (default: none)");
 
     mc->desc = "Raspberry Pi RP2350 (2x Cortex-M33)";
     mc->init = rp2350_init;

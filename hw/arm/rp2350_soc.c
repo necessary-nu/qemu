@@ -16,6 +16,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/block/aps6404l.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/unimp.h"
 #include "system/system.h"
@@ -82,16 +83,6 @@ static const RP2350Peripheral rp2350_peripherals[] = {
     { "rp2350.pio2",            0x50400000, 0x100000 },
     { "rp2350.xip_aux",         0x50500000, 0x100000 },
     { "rp2350.hstx_fifo",       0x50600000, 0x100000 },
-    { "rp2350.xip",             RP2350_XIP_BASE,
-                                RP2350_XIP_SRAM_BASE - RP2350_XIP_BASE },
-    { "rp2350.xip_sram",        RP2350_XIP_SRAM_BASE, 0x4000 },
-    { "rp2350.xip_nocache_noalloc", RP2350_XIP_NOCACHE_NOALLOC_BASE,
-                                RP2350_XIP_WINDOW_SIZE },
-    { "rp2350.xip_maintenance", RP2350_XIP_MAINTENANCE_BASE,
-                                RP2350_XIP_WINDOW_SIZE },
-    { "rp2350.xip_nocache_noalloc_notranslate",
-                                RP2350_XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE,
-                                RP2350_XIP_WINDOW_SIZE },
     { "rp2350.sio",             0xd0000000, 0x20000 },
     { "rp2350.sio_nonsec",      0xd0020000, 0x20000 },
 };
@@ -231,6 +222,78 @@ static void rp2350_soc_accessctrl_changed(Notifier *n, void *data)
         rp2350_accessctrl_gpio_nsmask(&s->accessctrl, 0));
 }
 
+/* The Winbond W25Q parts that fit each supported flash size. */
+static const char *rp2350_flash_part(uint32_t size)
+{
+    switch (size) {
+    case 1 * MiB:
+        return "w25q80bl";
+    case 2 * MiB:
+        return "w25q16";
+    case 4 * MiB:
+        return "w25q32";
+    case 8 * MiB:
+        return "w25q64";
+    default:
+        return "w25q128";
+    }
+}
+
+/*
+ * The XIP subsystem and the board's QSPI devices: flash on chip select 0,
+ * a W25Q part of the configured size, and optionally an APS6404L PSRAM on
+ * chip select 1. Without flash, chip select 0 has no device and the XIP
+ * windows hold no flash.
+ */
+/* [spec:nuos:req:emu.flash] */
+/* [spec:nuos:req:emu.xip] */
+static bool rp2350_soc_realize_xip(RP2350State *s, Error **errp)
+{
+    SysBusDevice *sbd = SYS_BUS_DEVICE(&s->xip);
+    const struct {
+        uint32_t size;
+        const char *type;
+    } devices[RP2350_QMI_CS] = {
+        { s->flash_size, rp2350_flash_part(s->flash_size) },
+        { s->psram_size, TYPE_APS6404L },
+    };
+    int cs;
+
+    qdev_prop_set_uint32(DEVICE(sbd), "cs0-size", s->flash_size);
+    qdev_prop_set_uint32(DEVICE(sbd), "cs1-size", s->psram_size);
+    qdev_prop_set_uint32(DEVICE(sbd), "sysclk-hz", RP2350_SYSCLK_HZ);
+    if (!sysbus_realize(sbd, errp)) {
+        return false;
+    }
+    sysbus_mmio_map(sbd, RP2350_XIP_MMIO_CTRL, RP2350_XIP_CTRL_BASE);
+    sysbus_mmio_map(sbd, RP2350_XIP_MMIO_QMI, RP2350_XIP_QMI_BASE);
+    sysbus_mmio_map(sbd, RP2350_XIP_MMIO_AUX, RP2350_XIP_AUX_BASE);
+    sysbus_mmio_map(sbd, RP2350_XIP_MMIO_SPACE, RP2350_XIP_BASE);
+
+    for (cs = 0; cs < RP2350_QMI_CS; cs++) {
+        DeviceState *dev;
+
+        if (!devices[cs].size) {
+            continue;
+        }
+        dev = qdev_new(devices[cs].type);
+        qdev_prop_set_uint8(dev, "cs", cs);
+        if (cs == 0) {
+            qdev_prop_set_bit(dev, "write-enable-autoclear", true);
+        }
+        object_property_set_link(OBJECT(dev), "memory",
+                                 OBJECT(rp2350_xip_array(&s->xip, cs)),
+                                 &error_abort);
+        if (!ssi_realize_and_unref(dev, s->xip.qspi, errp)) {
+            return false;
+        }
+        qdev_connect_gpio_out_named(DEVICE(sbd), "cs", cs,
+                                    qdev_get_gpio_in_named(dev, SSI_GPIO_CS,
+                                                           0));
+    }
+    return true;
+}
+
 /* [spec:nuos:req:emu.machine+1] */
 static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 {
@@ -247,6 +310,16 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                    (unsigned)(RP2350_FLASH_MAX_SIZE / MiB));
         return;
     }
+    if (s->flash_size && (!is_power_of_2(s->flash_size) ||
+                          s->flash_size < RP2350_FLASH_MIN_SIZE)) {
+        error_setg(errp, "flash-size must be a power of two from 1 MiB");
+        return;
+    }
+    if (s->psram_size && s->psram_size != APS6404L_SIZE) {
+        error_setg(errp, "psram-size must be %u MiB, the APS6404L",
+                   (unsigned)(APS6404L_SIZE / MiB));
+        return;
+    }
 
     if (!memory_region_init_rom(&s->rom, obj, "rp2350.rom", RP2350_ROM_SIZE,
                                 errp)) {
@@ -254,30 +327,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     memory_region_add_subregion(s->board_memory, RP2350_ROM_BASE, &s->rom);
 
-    /*
-     * The chip has no flash of its own; the board supplies it. Without
-     * any, the XIP windows hold only their unimplemented-device stubs.
-     */
-    /* [spec:nuos:req:emu.flash] */
-    if (s->flash_size) {
-        if (!memory_region_init_rom(&s->flash, obj, "rp2350.flash",
-                                    s->flash_size, errp)) {
-            return;
-        }
-        memory_region_add_subregion(s->board_memory, RP2350_XIP_BASE,
-                                    &s->flash);
-        memory_region_init_alias(&s->flash_nocache_alias, obj,
-                                 "rp2350.flash.nocache-noalloc", &s->flash, 0,
-                                 s->flash_size);
-        memory_region_add_subregion(s->board_memory,
-                                    RP2350_XIP_NOCACHE_NOALLOC_BASE,
-                                    &s->flash_nocache_alias);
-        memory_region_init_alias(&s->flash_notranslate_alias, obj,
-                                 "rp2350.flash.nocache-noalloc-notranslate",
-                                 &s->flash, 0, s->flash_size);
-        memory_region_add_subregion(
-            s->board_memory, RP2350_XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE,
-            &s->flash_notranslate_alias);
+    if (!rp2350_soc_realize_xip(s, errp)) {
+        return;
     }
 
     /*
@@ -641,6 +692,7 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "bootram", &s->bootram, TYPE_RP2350_BOOTRAM);
     object_initialize_child(obj, "busctrl", &s->busctrl, TYPE_RP2350_BUSCTRL);
     object_initialize_child(obj, "dcp", &s->dcp, TYPE_RP2350_DCP);
+    object_initialize_child(obj, "xip", &s->xip, TYPE_RP2350_XIP);
     object_initialize_child(obj, "clocks", &s->clocks, TYPE_RP2350_CLOCKS);
     object_initialize_child(obj, "xosc", &s->xosc, TYPE_RP2350_XOSC);
     object_initialize_child(obj, "pll_sys", &s->pll_sys, TYPE_RP2350_PLL);
@@ -677,6 +729,7 @@ static const Property rp2350_soc_properties[] = {
     DEFINE_PROP_LINK("memory", RP2350State, board_memory, TYPE_MEMORY_REGION,
                      MemoryRegion *),
     DEFINE_PROP_UINT32("flash-size", RP2350State, flash_size, 0),
+    DEFINE_PROP_UINT32("psram-size", RP2350State, psram_size, 0),
     DEFINE_PROP_UINT32("init-svtor", RP2350State, init_svtor, RP2350_ROM_BASE),
     /* Emulate the boot ROM's core 1 launch handshake (no ROM executing). */
     DEFINE_PROP_BOOL("core1-launch", RP2350State, core1_launch, false),

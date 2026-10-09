@@ -28,6 +28,7 @@
 #include "hw/misc/rp2350_sio.h"
 #include "hw/misc/rp2350_sysregs.h"
 #include "hw/misc/rp2350_trng.h"
+#include "hw/misc/rp2350_xip.h"
 #include "hw/misc/unimp.h"
 #include "hw/timer/rp2350_timer.h"
 #include "qom/object.h"
@@ -68,17 +69,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_ROM_SIZE (32 * KiB)
 
 /*
- * The XIP address space is four 64 MiB windows onto the same QSPI devices.
- * The cached window ends where the 16 KiB XIP cache-as-SRAM begins.
+ * The XIP address space is four 64 MiB windows onto the same QSPI devices:
+ * cached, uncached, cache maintenance, and uncached-untranslated.
  */
 #define RP2350_XIP_BASE 0x10000000
 #define RP2350_XIP_NOCACHE_NOALLOC_BASE 0x14000000
 #define RP2350_XIP_MAINTENANCE_BASE 0x18000000
 #define RP2350_XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE 0x1c000000
 #define RP2350_XIP_WINDOW_SIZE (64 * MiB)
-#define RP2350_XIP_SRAM_BASE 0x13ffc000
 
-/* Flash sits on QSPI chip select 0, which decodes 16 MiB. */
+#define RP2350_XIP_CTRL_BASE 0x400c8000
+#define RP2350_XIP_QMI_BASE 0x400d0000
+#define RP2350_XIP_AUX_BASE 0x50500000
+
+/*
+ * Flash sits on QSPI chip select 0 and PSRAM, if fitted, on chip select 1.
+ * Each chip select decodes 16 MiB.
+ */
+#define RP2350_FLASH_MIN_SIZE (1 * MiB)
 #define RP2350_FLASH_MAX_SIZE (16 * MiB)
 
 #define RP2350_SRAM_BASE 0x20000000
@@ -131,6 +139,7 @@ struct RP2350State {
     RP2350BootRAMState bootram;
     RP2350BusCtrlState busctrl;
     RP2350DCPState dcp;
+    RP2350XIPState xip;
     RP2350ClkRegsState clocks;
     RP2350ClkRegsState xosc;
     RP2350ClkRegsState pll_sys;
@@ -155,14 +164,12 @@ struct RP2350State {
     MemoryRegion eppb_sysmem;
 
     MemoryRegion rom;
-    MemoryRegion flash;
-    MemoryRegion flash_nocache_alias;
-    MemoryRegion flash_notranslate_alias;
     MemoryRegion sram;
 
     MemoryRegion *board_memory;
 
     uint32_t flash_size;
+    uint32_t psram_size;
     uint32_t init_svtor;
     bool core1_launch;
 
