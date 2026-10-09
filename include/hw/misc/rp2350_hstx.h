@@ -151,6 +151,12 @@ struct RP2350HSTXState {
     uint8_t out_level[RP2350_HSTX_BITS];
     uint8_t oe_level[RP2350_HSTX_BITS];
     uint8_t dreq_level;
+    /*
+     * Set while the block is run forward: FIFO writes the DMA makes from
+     * the DREQ change of a pop see the block as of that pop, and do not
+     * run it further.
+     */
+    bool syncing;
 };
 
 #endif

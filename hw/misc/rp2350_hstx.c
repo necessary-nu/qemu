@@ -572,7 +572,8 @@ static bool hstx_run(RP2350HSTXState *s, RP2350HSTXCore *c, uint64_t end,
             break;
         }
         if (hstx_steady(s, c)) {
-            if (stop_on_pop) {
+            /* From here on nothing pops: a look-ahead can stop. */
+            if (stop_on_pop && !rec) {
                 c->cycle = end;
                 break;
             }
@@ -627,15 +628,43 @@ static int64_t hstx_now(void)
     return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
-/* Bring the block up to the current clk_hstx cycle. */
+static void hstx_update_dreq(RP2350HSTXState *s)
+{
+    uint8_t dreq = s->core.fifo_level < RP2350_HSTX_FIFO_DEPTH;
+
+    if (s->dreq_level != dreq) {
+        s->dreq_level = dreq;
+        qemu_set_irq(s->dreq, dreq);
+    }
+}
+
+/*
+ * Bring the block up to the current clk_hstx cycle. While the FIFO is
+ * full, DREQ_HSTX rises at the pop that makes room, in that pop's cycle,
+ * so that a DMA channel paced by it refills the FIFO between pops however
+ * far the block is run.
+ */
 /* [spec:nuos:req:emu.hstx] */
 static void hstx_sync(RP2350HSTXState *s)
 {
+    RP2350HSTXCore *c = &s->core;
     uint64_t now = hstx_cycle_at(s, hstx_now());
 
-    if (s->core.cycle < now) {
-        hstx_run(s, &s->core, now, false, &s->rec);
+    if (s->syncing) {
+        return;
     }
+    s->syncing = true;
+    while (c->cycle < now) {
+        if (c->fifo_level < RP2350_HSTX_FIFO_DEPTH) {
+            hstx_run(s, c, now, false, &s->rec);
+            break;
+        }
+        if (!hstx_run(s, c, now, true, &s->rec)) {
+            break;
+        }
+        hstx_update_dreq(s);
+    }
+    s->syncing = false;
 }
 
 /* The outputs while the shift register is not shifting. */
@@ -655,7 +684,6 @@ static uint8_t hstx_static_pins(RP2350HSTXState *s)
 static void hstx_drive(RP2350HSTXState *s)
 {
     uint8_t pins = hstx_idle(s, &s->core) ? hstx_static_pins(s) : s->rec.pins;
-    uint8_t dreq = s->core.fifo_level < RP2350_HSTX_FIFO_DEPTH;
     int n;
 
     for (n = 0; n < RP2350_HSTX_BITS; n++) {
@@ -670,10 +698,7 @@ static void hstx_drive(RP2350HSTXState *s)
             qemu_set_irq(s->out[n], level);
         }
     }
-    if (s->dreq_level != dreq) {
-        s->dreq_level = dreq;
-        qemu_set_irq(s->dreq, dreq);
-    }
+    hstx_update_dreq(s);
 }
 
 /*
