@@ -414,6 +414,7 @@ config RP2350_SOC
     select RP2350_TRNG
     select RP2350_CORESIGHT
     select RP2350_ACCESSCTRL
+    select RP2350_OTP
     select PL011
 
 config STM32L4X5_SOC

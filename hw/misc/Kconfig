@@ -155,6 +155,9 @@ config RP2350_CORESIGHT
 config RP2350_ACCESSCTRL
     bool
 
+config RP2350_OTP
+    bool
+
 config STM32L4X5_SYSCFG
     bool
 

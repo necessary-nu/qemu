@@ -505,6 +505,15 @@ static void rp2350_glitch_detector_hold_reset(Object *obj, ResetType type)
     s->trig_status = 0;
 }
 
+/* OTP CRIT1.GLITCH_DETECTOR_ENABLE. */
+static void rp2350_glitch_detector_set_otp_enable(void *opaque, int n,
+                                                  int level)
+{
+    RP2350GlitchDetectorState *s = opaque;
+
+    s->otp_enable = level;
+}
+
 static void rp2350_glitch_detector_init(Object *obj)
 {
     RP2350GlitchDetectorState *s = RP2350_GLITCH_DETECTOR(obj);
@@ -514,13 +523,16 @@ static void rp2350_glitch_detector_init(Object *obj)
                           RP2350_ATOMIC_REGION_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out_named(DEVICE(obj), &s->chip_reset, "chip-reset", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), rp2350_glitch_detector_set_otp_enable,
+                            "otp-enable", 1);
 }
 
 static const VMStateDescription vmstate_rp2350_glitch_detector = {
     .name = TYPE_RP2350_GLITCH_DETECTOR,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(otp_enable, RP2350GlitchDetectorState),
         VMSTATE_UINT32(arm, RP2350GlitchDetectorState),
         VMSTATE_UINT32(disarm, RP2350GlitchDetectorState),
         VMSTATE_UINT32(sensitivity, RP2350GlitchDetectorState),
@@ -531,11 +543,6 @@ static const VMStateDescription vmstate_rp2350_glitch_detector = {
     },
 };
 
-static const Property rp2350_glitch_detector_properties[] = {
-    DEFINE_PROP_BOOL("otp-enable", RP2350GlitchDetectorState, otp_enable,
-                     false),
-};
-
 static void rp2350_glitch_detector_class_init(ObjectClass *klass,
                                               const void *data)
 {
@@ -544,7 +551,6 @@ static void rp2350_glitch_detector_class_init(ObjectClass *klass,
 
     rc->phases.hold = rp2350_glitch_detector_hold_reset;
     dc->vmsd = &vmstate_rp2350_glitch_detector;
-    device_class_set_props(dc, rp2350_glitch_detector_properties);
 }
 
 static void rp2350_dft_init(Object *obj)

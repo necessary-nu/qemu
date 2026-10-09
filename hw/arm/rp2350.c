@@ -19,6 +19,12 @@
  *
  * The RP2350 has no internal flash. Boards set its size with
  * -M rp2350,flash-size=SIZE (a Pico 2 has 4M); there is no default.
+ *
+ * OTP starts as a blank chip and lives in RAM. To keep programmed rows
+ * across runs, back it with a 16 KiB raw image:
+ *
+ *   -drive if=none,id=otp,format=raw,file=otp.img
+ *   -global rp2350-otp.drive=otp
  */
 
 #include "qemu/osdep.h"

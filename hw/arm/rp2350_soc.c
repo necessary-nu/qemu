@@ -614,6 +614,31 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         sysbus_mmio_map(sbd, 0, RP2350_CORESIGHT_TRACE_BASE);
     }
 
+    /*
+     * OTP. Its power-up state machine drives the debug disables and the
+     * glitch detectors' arming from the critical flags at every reset.
+     */
+    /* [spec:nuos:req:emu.otp] */
+    {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->otp);
+        DeviceState *otp = DEVICE(&s->otp);
+
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, RP2350_OTP_BASE);
+        sysbus_mmio_map(sbd, 1, RP2350_OTP_DATA_BASE);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(dev_soc, RP2350_OTP_IRQ));
+        qdev_connect_gpio_out_named(otp, "debug-disable", 0,
+            qdev_get_gpio_in_named(DEVICE(&s->coresight), "debug-disable", 0));
+        qdev_connect_gpio_out_named(otp, "secure-debug-disable", 0,
+            qdev_get_gpio_in_named(DEVICE(&s->coresight),
+                                   "secure-debug-disable", 0));
+        qdev_connect_gpio_out_named(otp, "glitch-detector-enable", 0,
+            qdev_get_gpio_in_named(DEVICE(&s->glitch_detector),
+                                   "otp-enable", 0));
+    }
+
     for (i = 0; i < ARRAY_SIZE(rp2350_peripherals); i++) {
         create_unimplemented_device(rp2350_peripherals[i].name,
                                     rp2350_peripherals[i].base,
@@ -666,6 +691,7 @@ static void rp2350_soc_init(Object *obj)
                             TYPE_RP2350_CORESIGHT);
     object_initialize_child(obj, "coresight-trace", &s->coresight_trace,
                             TYPE_RP2350_CORESIGHT_TRACE);
+    object_initialize_child(obj, "otp", &s->otp, TYPE_RP2350_OTP);
 
     qdev_init_gpio_in(DEVICE(s), rp2350_soc_set_irq, RP2350_NUM_IRQS);
 

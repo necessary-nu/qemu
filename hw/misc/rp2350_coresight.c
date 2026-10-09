@@ -1318,6 +1318,22 @@ static void rp2350_coresight_reset_hold(Object *obj, ResetType type)
     s->cti_trigout = 0;
 }
 
+/* The debug disable signals from OTP. */
+static void rp2350_coresight_set_debug_disable(void *opaque, int n, int level)
+{
+    RP2350CoreSightState *s = opaque;
+
+    s->debug_disable = level;
+}
+
+static void rp2350_coresight_set_secure_debug_disable(void *opaque, int n,
+                                                      int level)
+{
+    RP2350CoreSightState *s = opaque;
+
+    s->secure_debug_disable = level;
+}
+
 static void rp2350_coresight_init(Object *obj)
 {
     RP2350CoreSightState *s = RP2350_CORESIGHT(obj);
@@ -1343,6 +1359,11 @@ static void rp2350_coresight_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->view[RP2350_CORESIGHT_SYSTEM]);
     s->clk = qdev_init_clock_in(DEVICE(obj), "clk", tsgen_clk_update, s,
                                 ClockPreUpdate);
+    qdev_init_gpio_in_named(DEVICE(obj), rp2350_coresight_set_debug_disable,
+                            "debug-disable", 1);
+    qdev_init_gpio_in_named(DEVICE(obj),
+                            rp2350_coresight_set_secure_debug_disable,
+                            "secure-debug-disable", 1);
 }
 
 static void rp2350_coresight_realize(DeviceState *dev, Error **errp)
@@ -1377,9 +1398,11 @@ static const VMStateDescription vmstate_rp2350_memap = {
 
 static const VMStateDescription vmstate_rp2350_coresight = {
     .name = TYPE_RP2350_CORESIGHT,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(debug_disable, RP2350CoreSightState),
+        VMSTATE_BOOL(secure_debug_disable, RP2350CoreSightState),
         VMSTATE_STRUCT_2DARRAY(ahbap, RP2350CoreSightState,
                                RP2350_CORESIGHT_CORES, 2, 1,
                                vmstate_rp2350_memap, RP2350MemAPRegs),
@@ -1425,10 +1448,6 @@ static const Property rp2350_coresight_properties[] = {
                      TYPE_MEMORY_REGION, MemoryRegion *),
     DEFINE_PROP_LINK("core1-memory", RP2350CoreSightState, core_memory[1],
                      TYPE_MEMORY_REGION, MemoryRegion *),
-    DEFINE_PROP_BOOL("debug-disable", RP2350CoreSightState, debug_disable,
-                     false),
-    DEFINE_PROP_BOOL("secure-debug-disable", RP2350CoreSightState,
-                     secure_debug_disable, false),
 };
 
 static void rp2350_coresight_class_init(ObjectClass *klass, const void *data)
