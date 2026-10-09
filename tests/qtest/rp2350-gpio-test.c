@@ -374,10 +374,7 @@ static void test_peripheral_routing(void)
     qtest_writel(qts, CTRL(13), FUNC_UART | INOVER(OVER_INVERT));
     g_assert_false(qtest_get_irq(qts, UART_RX));
 
-    /*
-     * UART0 TX on GPIO 0: QEMU's PL011 has no line-level TX, so the pin
-     * shows the idle line, driven high.
-     */
+    /* UART0 TX on GPIO 0: the idle line (mark) is driven high. */
     pad_open(qts, 0, PAD_PDE);
     qtest_writel(qts, CTRL(0), FUNC_UART);
     g_assert_cmphex(qtest_readl(qts, STATUS(0)) &
