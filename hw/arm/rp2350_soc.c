@@ -382,6 +382,19 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     memory_region_add_subregion(s->board_memory, RP2350_SIO_NONSEC_BASE,
                                 &s->sio_sysmem[1]);
 
+    /* [spec:nuos:req:emu.busctrl] */
+    object_property_set_link(OBJECT(&s->busctrl), "memory",
+                             OBJECT(s->board_memory), &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->busctrl), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->busctrl), 0, RP2350_BUSCTRL_BASE);
+    for (i = 0; i < RP2350_NUM_CORES; i++) {
+        rp2350_busctrl_attach_core(&s->busctrl, i, &s->armv7m[i].container,
+                                   rp2350_sio_view(&s->sio, i, false),
+                                   rp2350_sio_view(&s->sio, i, true));
+    }
+
     {
         const struct {
             SysBusDevice *dev;
@@ -470,6 +483,7 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "sio", &s->sio, TYPE_RP2350_SIO);
     object_initialize_child(obj, "rcp", &s->rcp, TYPE_RP2350_RCP);
     object_initialize_child(obj, "bootram", &s->bootram, TYPE_RP2350_BOOTRAM);
+    object_initialize_child(obj, "busctrl", &s->busctrl, TYPE_RP2350_BUSCTRL);
     object_initialize_child(obj, "dcp", &s->dcp, TYPE_RP2350_DCP);
     object_initialize_child(obj, "clocks", &s->clocks, TYPE_RP2350_CLOCKS);
     object_initialize_child(obj, "xosc", &s->xosc, TYPE_RP2350_XOSC);

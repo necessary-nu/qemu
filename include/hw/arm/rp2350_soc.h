@@ -14,6 +14,7 @@
 #include "hw/char/pl011.h"
 #include "hw/core/clock.h"
 #include "hw/misc/rp2350_bootram.h"
+#include "hw/misc/rp2350_busctrl.h"
 #include "hw/misc/rp2350_clocks.h"
 #include "hw/misc/rp2350_dcp.h"
 #include "hw/misc/rp2350_rcp.h"
@@ -77,6 +78,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_CLOCKS_BASE 0x40010000
 #define RP2350_RESETS_BASE 0x40020000
 #define RP2350_XOSC_BASE 0x40048000
+#define RP2350_BUSCTRL_BASE 0x40068000
 #define RP2350_UART0_BASE 0x40070000
 #define RP2350_TIMER0_BASE 0x400b0000
 #define RP2350_TIMER1_BASE 0x400b8000
@@ -100,6 +102,7 @@ struct RP2350State {
     RP2350SIOState sio;
     RP2350RCPState rcp;
     RP2350BootRAMState bootram;
+    RP2350BusCtrlState busctrl;
     RP2350DCPState dcp;
     RP2350ClkRegsState clocks;
     RP2350ClkRegsState xosc;
