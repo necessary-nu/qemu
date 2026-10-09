@@ -415,6 +415,63 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                                    rp2350_sio_view(&s->sio, i, true));
     }
 
+    /*
+     * IO_BANK0, IO_QSPI, PADS_BANK0 and PADS_QSPI. The machine is an
+     * RP2350A, which bonds out GPIOs 0-29. GPIO interrupts are core-local:
+     * each core's outputs reach only that core's NVIC.
+     */
+    /* [spec:nuos:req:emu.gpio] */
+    /* [spec:nuos:req:emu.irq-routing+1] */
+    qdev_prop_set_uint32(DEVICE(&s->gpio), "bonded-gpios",
+                         RP2350_GPIO_QFN60_PINS);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpio), errp)) {
+        return;
+    }
+    {
+        static const hwaddr base[] = {
+            RP2350_IO_BANK0_BASE, RP2350_IO_QSPI_BASE,
+            RP2350_PADS_BANK0_BASE, RP2350_PADS_QSPI_BASE,
+        };
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->gpio);
+        int n;
+
+        for (n = 0; n < ARRAY_SIZE(base); n++) {
+            sysbus_mmio_map(sbd, n, base[n]);
+        }
+        for (i = 0; i < RP2350_NUM_CORES; i++) {
+            for (n = 0; n < RP2350_GPIO_CORE_IRQS; n++) {
+                sysbus_connect_irq(sbd, i * RP2350_GPIO_CORE_IRQS + n,
+                    rp2350_soc_core_irq(s, i, RP2350_IO_IRQ_BANK0 + n));
+            }
+        }
+        for (n = 0; n < RP2350_SIO_GPIO_BITS; n++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->sio), "gpio-out", n,
+                rp2350_gpio_out_line(&s->gpio, RP2350_GPIO_PORT_SIO, n));
+            qdev_connect_gpio_out_named(DEVICE(&s->sio), "gpio-oe", n,
+                rp2350_gpio_oe_line(&s->gpio, RP2350_GPIO_PORT_SIO, n));
+            rp2350_gpio_connect_in(&s->gpio, RP2350_GPIO_PORT_SIO, n,
+                qdev_get_gpio_in_named(DEVICE(&s->sio), "gpio-in", n));
+        }
+        /*
+         * QEMU's PL011 sends and receives through its chardev and has no
+         * line-level TX, RX or modem signals. Their pins show the idle
+         * state: TX driven high (mark) and RTS driven high (deasserted).
+         */
+        for (n = 0; n < RP2350_NUM_UARTS; n++) {
+            RP2350GPIOPort port = n ? RP2350_GPIO_PORT_UART1
+                                    : RP2350_GPIO_PORT_UART0;
+
+            qemu_set_irq(rp2350_gpio_out_line(&s->gpio, port,
+                                              RP2350_GPIO_UART_TX), 1);
+            qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port,
+                                             RP2350_GPIO_UART_TX), 1);
+            qemu_set_irq(rp2350_gpio_out_line(&s->gpio, port,
+                                              RP2350_GPIO_UART_RTS), 1);
+            qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port,
+                                             RP2350_GPIO_UART_RTS), 1);
+        }
+    }
+
     {
         const struct {
             SysBusDevice *dev;
@@ -507,6 +564,7 @@ static void rp2350_soc_init(Object *obj)
 
     object_initialize_child(obj, "resets", &s->resets, TYPE_RP2350_RESETS);
     object_initialize_child(obj, "sio", &s->sio, TYPE_RP2350_SIO);
+    object_initialize_child(obj, "gpio", &s->gpio, TYPE_RP2350_GPIO);
     object_initialize_child(obj, "rcp", &s->rcp, TYPE_RP2350_RCP);
     object_initialize_child(obj, "bootram", &s->bootram, TYPE_RP2350_BOOTRAM);
     object_initialize_child(obj, "busctrl", &s->busctrl, TYPE_RP2350_BUSCTRL);

@@ -33,6 +33,10 @@
 #define DOORBELL_IN_SET  0x188
 #define DOORBELL_IN_CLR  0x18c
 
+#define IO_BANK0    0x40028000
+#define PADS_BANK0  0x40038000
+#define PAD_IE      0x40
+
 #define VLD 0x1
 #define RDY 0x2
 #define WOF 0x4
@@ -183,6 +187,8 @@ static void test_nonsecure_bank(void)
     qtest_quit(qts);
 }
 
+/* [spec:nuos:req:emu.sio/test] */
+/* [spec:nuos:req:emu.gpio/test] */
 static void test_gpio(void)
 {
     QTestState *qts = start(-1);
@@ -195,6 +201,16 @@ static void test_gpio(void)
 
     qtest_writel(qts, SIO + GPIO_OE_SET, 0x0c);
     g_assert_cmphex(qtest_readl(qts, SIO + GPIO_OE), ==, 0x0c);
+
+    /*
+     * SIO drives a pin only where IO_BANK0 selects it (function 5), and
+     * reads it back only through an enabled, unisolated pad.
+     */
+    g_assert_cmphex(qtest_readl(qts, SIO + GPIO_IN), ==, 0);
+    for (int pin = 2; pin <= 3; pin++) {
+        qtest_writel(qts, IO_BANK0 + 8 * pin + 4, 5);
+        qtest_writel(qts, PADS_BANK0 + 4 + 4 * pin, PAD_IE);
+    }
     g_assert_cmphex(qtest_readl(qts, SIO + GPIO_IN), ==, 0x0c);
     qtest_quit(qts);
 }

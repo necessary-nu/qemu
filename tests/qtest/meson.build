@@ -246,6 +246,7 @@ qtests_rp2350 = \
   ['rp2350-test',
    'rp2350-resets-test',
    'rp2350-sio-test',
+   'rp2350-gpio-test',
    'rp2350-clocks-test',
    'rp2350-uart-test',
    'rp2350-timer-test',
