@@ -22,6 +22,8 @@
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/unimp.h"
 #include "hw/ssi/ssi.h"
+#include "migration/vmstate.h"
+#include "system/cpus.h"
 #include "system/qtest.h"
 #include "system/reset.h"
 #include "system/blockdev.h"
@@ -576,6 +578,63 @@ static void rp2350_soc_psm_reset(void *opaque, uint32_t reset, uint32_t held,
 }
 
 /*
+ * A core's AIRCR.SYSRESETREQ is a warm reset of that core alone, "not the
+ * wider system" (datasheet, M33 AIRCR): the other core, the peripherals,
+ * SRAM, the PSM and POWMAN carry on, and no chip-level reset reason is
+ * recorded. The core restarts as after any processor reset: from the ROM,
+ * or with no ROM executing, core 0 into the loaded image (through the boot
+ * vectors) and core 1 back to waiting for its launch. As on RP2350 a warm
+ * reset of either core by SYSRESETREQ clears the watchdog's REASON, so
+ * that code started afresh does not see a stale timeout.
+ *
+ * The requesting core stops at the end of its current instruction block
+ * and the reset runs once every vCPU has paused, as the PSM's processor
+ * resets do; the other core resumes where it was.
+ */
+/* [spec:nuos:req:emu.watchdog] */
+static void rp2350_soc_sysresetreq_run(void *opaque)
+{
+    RP2350State *s = opaque;
+    uint32_t cores = s->sysresetreq_pending;
+    bool pause = !qtest_enabled();
+    int i;
+
+    if (!cores) {
+        return;
+    }
+    s->sysresetreq_pending = 0;
+    if (pause) {
+        pause_all_vcpus();
+    }
+    for (i = 0; i < RP2350_NUM_CORES; i++) {
+        if (cores & BIT(i)) {
+            rp2350_soc_reset_core(s, i, false, false);
+        }
+    }
+    s->watchdog.reason = 0;
+    if (pause) {
+        resume_all_vcpus();
+    }
+}
+
+/* [spec:nuos:req:emu.watchdog] */
+static void rp2350_soc_sysresetreq(void *opaque, int n, int level)
+{
+    RP2350State *s = opaque;
+
+    if (!level) {
+        return;
+    }
+    s->sysresetreq_pending |= BIT(n);
+    if (qtest_enabled()) {
+        rp2350_soc_sysresetreq_run(s);
+        return;
+    }
+    cpu_stop_current();
+    qemu_bh_schedule(s->sysresetreq_bh);
+}
+
+/*
  * Atomic XOR/SET/CLR aliases in front of a device model that only has the
  * plain register window: alias writes become read-modify-write on the
  * target register. The registers are 32 bits wide: a narrow write (from a
@@ -1118,6 +1177,11 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         /* A core that locks up stops; the other core carries on. */
         /* [spec:nuos:req:emu.lockup] */
         s->armv7m[i].cpu->m_lockup_halts = true;
+        /* SYSRESETREQ resets only the core that asserts it. */
+        /* [spec:nuos:req:emu.watchdog] */
+        qdev_connect_gpio_out_named(armv7m, "SYSRESETREQ", 0,
+                                    qdev_get_gpio_in_named(dev_soc,
+                                                           "sysresetreq", i));
 
         /*
          * The extended PPB is core-local and sits inside the PPB range
@@ -1876,6 +1940,9 @@ static void rp2350_soc_init(Object *obj)
     qdev_init_gpio_in(DEVICE(s), rp2350_soc_set_irq, RP2350_NUM_IRQS);
     qdev_init_gpio_in_named(DEVICE(s), rp2350_soc_sio_in, "sio-in",
                             RP2350_GPIO_SIO_BITS);
+    qdev_init_gpio_in_named(DEVICE(s), rp2350_soc_sysresetreq, "sysresetreq",
+                            RP2350_NUM_CORES);
+    s->sysresetreq_bh = qemu_bh_new(rp2350_soc_sysresetreq_run, s);
 
     s->sysclk = qdev_init_clock_out(DEVICE(s), "sysclk");
     s->refclk[0] = qdev_init_clock_out(DEVICE(s), "refclk0");
@@ -1894,12 +1961,45 @@ static const Property rp2350_soc_properties[] = {
     DEFINE_PROP_BOOL("core1-launch", RP2350State, core1_launch, false),
 };
 
+/* A chip-level reset supersedes a core reset still queued. */
+static void rp2350_soc_hold_reset(Object *obj, ResetType type)
+{
+    RP2350State *s = RP2350_SOC(obj);
+
+    s->sysresetreq_pending = 0;
+    qemu_bh_cancel(s->sysresetreq_bh);
+}
+
+static int rp2350_soc_post_load(void *opaque, int version_id)
+{
+    RP2350State *s = opaque;
+
+    if (s->sysresetreq_pending) {
+        qemu_bh_schedule(s->sysresetreq_bh);
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_rp2350_soc = {
+    .name = TYPE_RP2350_SOC,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = rp2350_soc_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(sysresetreq_pending, RP2350State),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void rp2350_soc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
     IDAUInterfaceClass *iic = IDAU_INTERFACE_CLASS(klass);
 
     dc->realize = rp2350_soc_realize;
+    dc->vmsd = &vmstate_rp2350_soc;
+    rc->phases.hold = rp2350_soc_hold_reset;
     device_class_set_props(dc, rp2350_soc_properties);
     iic->check = rp2350_idau_check;
 }
