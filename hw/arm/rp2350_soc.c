@@ -22,6 +22,8 @@
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/unimp.h"
 #include "hw/ssi/ssi.h"
+#include "system/qtest.h"
+#include "system/reset.h"
 #include "system/blockdev.h"
 #include "system/block-backend.h"
 #include "system/system.h"
@@ -423,50 +425,85 @@ static void rp2350_soc_init_reset_gates(RP2350State *s)
 }
 
 /*
- * The boot ROM's watchdog boot vector: SCRATCH4 holds this magic number,
- * SCRATCH5 the entry point XORed with its negation, SCRATCH6 the stack
- * pointer and SCRATCH7 the entry point.
+ * The boot ROM's boot vectors, POWMAN BOOT0-3 and then watchdog
+ * SCRATCH4-7: the magic number, the entry point XORed with the magic
+ * number's negation, the stack pointer and the entry point.
  */
 #define VECTORED_BOOT_MAGIC 0xb007c0d3u
 
 /*
- * With no ROM executing, core 0 coming out of reset does what the boot
- * ROM's boot path does with a watchdog boot vector: consume it (clearing
- * SCRATCH4) and call the entry point on the given stack. A vector that
+ * What the boot ROM's try_vector does with one vector, with no ROM
+ * executing: a valid vector is consumed (its magic number cleared) and,
+ * unless BOOTDIS disables vectors, called on its stack. A vector that
  * returns continues into the directly loaded image, as the ROM continues
- * into flash boot. The ROM's one-shot boot types (an entry point equal to
- * the magic number) select BOOTSEL, RAM image or flash update boots, which
- * need the ROM itself.
+ * into flash boot. The watchdog vector's one-shot boot types (an entry
+ * point equal to the magic number) select BOOTSEL, RAM image or flash
+ * update boots, which need the ROM itself; the POWMAN vector has none, so
+ * the ROM calls that entry point like any other. Returns whether core 0
+ * was sent to the vector.
  */
 /* [spec:nuos:req:emu.watchdog] */
-static void rp2350_soc_watchdog_vector(RP2350State *s)
+/* [spec:nuos:req:emu.powman] */
+static bool rp2350_soc_try_vector(RP2350State *s, uint32_t *vector,
+                                  bool bootdis, bool boot_types)
 {
-    uint32_t *scratch = s->watchdog.scratch;
-    uint32_t pc = scratch[7];
+    uint32_t pc = vector[3];
     ARMCPU *cpu = s->armv7m[0].cpu;
     CPUARMState *env = &cpu->env;
 
-    if (scratch[4] != VECTORED_BOOT_MAGIC ||
-        scratch[5] != (pc ^ -VECTORED_BOOT_MAGIC)) {
-        return;
+    if (vector[0] != VECTORED_BOOT_MAGIC ||
+        vector[1] != (pc ^ -VECTORED_BOOT_MAGIC)) {
+        return false;
     }
-    scratch[4] = 0;
-    if (pc == VECTORED_BOOT_MAGIC) {
+    vector[0] = 0;
+    if (pc == VECTORED_BOOT_MAGIC && boot_types) {
         qemu_log_mask(LOG_UNIMP, "rp2350: watchdog boot type %" PRIu32
                       " needs the boot ROM; starting the loaded image\n",
-                      scratch[6]);
-        return;
+                      vector[2]);
+        return false;
+    }
+    if (bootdis) {
+        return false;
     }
     if (!(pc & 1)) {
         /* The ROM hangs rather than enter code of the wrong architecture. */
-        qemu_log_mask(LOG_GUEST_ERROR, "rp2350: watchdog boot entry point "
+        qemu_log_mask(LOG_GUEST_ERROR, "rp2350: boot vector entry point "
                       "0x%08" PRIx32 " is not Thumb code; core 0 hangs\n", pc);
         CPU(cpu)->halted = 1;
-        return;
+        return true;
     }
     env->regs[14] = env->regs[15] | 1;
-    env->regs[13] = scratch[6] & ~3u;
+    env->regs[13] = vector[2] & ~3u;
     env->regs[15] = pc & ~1u;
+    return true;
+}
+
+/*
+ * The boot ROM's vector checks, POWMAN's first. The ROM tries the
+ * watchdog vector once a POWMAN vector returns; here a POWMAN vector
+ * returns into the loaded image instead. Either BOOTDIS.NOW flag (OTP or
+ * POWMAN) disables both, and the ROM then clears both.
+ */
+/* [spec:nuos:req:emu.powman] */
+static void rp2350_soc_boot_vectors(RP2350State *s)
+{
+    bool bootdis = (s->otp.bootdis | s->powman.bootdis) &
+                   RP2350_POWMAN_BOOTDIS_NOW;
+
+    if (!rp2350_soc_try_vector(s, s->powman.boot, bootdis, false)) {
+        rp2350_soc_try_vector(s, &s->watchdog.scratch[4], bootdis, true);
+    }
+    s->otp.bootdis &= ~RP2350_POWMAN_BOOTDIS_NOW;
+    s->powman.bootdis &= ~RP2350_POWMAN_BOOTDIS_NOW;
+}
+
+/* Power a core off: it stays halted until a reset powers it on. */
+static void rp2350_soc_core_off(RP2350State *s, int n)
+{
+    ARMCPU *cpu = s->armv7m[n].cpu;
+
+    CPU(cpu)->halted = 1;
+    arm_set_cpu_power_state(cpu, PSCI_OFF);
 }
 
 /*
@@ -492,8 +529,7 @@ static void rp2350_soc_reset_core(RP2350State *s, int n, bool hold,
     rp2350_dcp_reset_core(&s->dcp, n);
     cpu_reset(cs);
     if (hold) {
-        cs->halted = 1;
-        arm_set_cpu_power_state(m->cpu, PSCI_OFF);
+        rp2350_soc_core_off(s, n);
         return;
     }
     if (!s->core1_launch) {
@@ -502,7 +538,7 @@ static void rp2350_soc_reset_core(RP2350State *s, int n, bool hold,
     if (n == 0) {
         rp2350_resets_boot_rom_handoff(&s->resets);
         rp2350_soc_boot_rom_handoff(s, 0);
-        rp2350_soc_watchdog_vector(s);
+        rp2350_soc_boot_vectors(s);
     } else if (!sio_reset) {
         rp2350_sio_core1_reset(&s->sio);
     }
@@ -720,6 +756,153 @@ static void rp2350_soc_spi_wire_cs(Notifier *notifier, void *data)
     }
 }
 
+/*
+ * The SIO's pin inputs, which also reach the power manager for its
+ * power-up and time reference sources. The SIO numbers the QSPI bank's
+ * pins from bit 56; the power manager numbers pins as the GPIO block.
+ */
+/* [spec:nuos:req:emu.powman] */
+static void rp2350_soc_sio_in(void *opaque, int n, int level)
+{
+    RP2350State *s = opaque;
+
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->sio), "gpio-in", n),
+                 level);
+    if (n < RP2350_GPIO_BANK0_PINS) {
+        qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->powman),
+                                            RP2350_POWMAN_GPIO, n), level);
+    } else if (n >= RP2350_GPIO_BANK0_PINS + 8) {
+        qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->powman),
+                                            RP2350_POWMAN_GPIO, n - 8),
+                     level);
+    }
+}
+
+/*
+ * An SRAM power domain that is down. Its contents were lost when it
+ * powered down; reads return zero and writes are lost. The datasheet does
+ * not say whether the bus faults such accesses, so they do not fault.
+ */
+static MemTxResult rp2350_sram_off_read(void *opaque, hwaddr addr,
+                                        uint64_t *data, unsigned size,
+                                        MemTxAttrs attrs)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "rp2350: read of powered-down SRAM\n");
+    *data = 0;
+    return MEMTX_OK;
+}
+
+static MemTxResult rp2350_sram_off_write(void *opaque, hwaddr addr,
+                                         uint64_t value, unsigned size,
+                                         MemTxAttrs attrs)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "rp2350: write to powered-down SRAM\n");
+    return MEMTX_OK;
+}
+
+static const MemoryRegionOps rp2350_sram_off_ops = {
+    .read_with_attrs = rp2350_sram_off_read,
+    .write_with_attrs = rp2350_sram_off_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+/* The SRAM domain's window in sram_off order: SRAM0, then SRAM1. */
+static int rp2350_sram_domain(int domain)
+{
+    return domain == RP2350_POWMAN_SRAM0 ? 0 : 1;
+}
+
+/* [spec:nuos:req:emu.powman] */
+static bool rp2350_soc_procs_asleep(void *opaque)
+{
+    RP2350State *s = opaque;
+    int i;
+
+    /* Under qtest no processor executes. */
+    if (qtest_enabled()) {
+        return true;
+    }
+    for (i = 0; i < RP2350_NUM_CORES; i++) {
+        if (!CPU(s->armv7m[i].cpu)->halted) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* [spec:nuos:req:emu.powman] */
+static void rp2350_soc_swcore_stop(void *opaque)
+{
+    RP2350State *s = opaque;
+    int i;
+
+    for (i = 0; i < RP2350_NUM_CORES; i++) {
+        rp2350_soc_core_off(s, i);
+    }
+}
+
+/*
+ * A memory power domain went down or came up. SRAM and the XIP domain's
+ * Boot RAM and cache memories lose their contents when they power down.
+ */
+/* [spec:nuos:req:emu.powman] */
+static void rp2350_soc_domain_power(void *opaque, int domain, bool on)
+{
+    RP2350State *s = opaque;
+    int i;
+
+    if (domain == RP2350_POWMAN_XIP) {
+        if (!on) {
+            memset(s->bootram.ram, 0, sizeof(s->bootram.ram));
+            rp2350_xip_power_down(&s->xip);
+        }
+        return;
+    }
+    i = rp2350_sram_domain(domain);
+    if (!on) {
+        /* The address space's root keeps its address in board memory. */
+        address_space_set(&s->sram_as, RP2350_SRAM_BASE +
+                          (i ? RP2350_SRAM0_DOMAIN_SIZE : 0), 0,
+                          i ? RP2350_SRAM1_DOMAIN_SIZE
+                            : RP2350_SRAM0_DOMAIN_SIZE,
+                          MEMTXATTRS_UNSPECIFIED);
+    }
+    memory_region_set_enabled(&s->sram_off[i], !on);
+}
+
+static const RP2350PowmanOps rp2350_soc_powman_ops = {
+    .procs_asleep = rp2350_soc_procs_asleep,
+    .swcore_stop = rp2350_soc_swcore_stop,
+    .domain_power = rp2350_soc_domain_power,
+};
+
+/* [spec:nuos:req:emu.powman] */
+void rp2350_soc_system_reset(RP2350State *s, ResetType type)
+{
+    int i;
+
+    if (type == RESET_TYPE_COLD) {
+        type = rp2350_powman_next_reset_type(&s->powman);
+    }
+    qemu_devices_reset(type);
+    memory_region_set_enabled(&s->sram_off[0],
+        !rp2350_powman_domain_on(&s->powman, RP2350_POWMAN_SRAM0));
+    memory_region_set_enabled(&s->sram_off[1],
+        !rp2350_powman_domain_on(&s->powman, RP2350_POWMAN_SRAM1));
+    if (!rp2350_powman_domain_on(&s->powman, RP2350_POWMAN_SWCORE)) {
+        for (i = 0; i < RP2350_NUM_CORES; i++) {
+            rp2350_soc_core_off(s, i);
+        }
+        return;
+    }
+    if (s->core1_launch) {
+        rp2350_soc_boot_rom_handoff(s, 0);
+        rp2350_soc_boot_vectors(s);
+    }
+}
+
 /* The Winbond W25Q parts that fit each supported flash size. */
 static const char *rp2350_flash_part(uint32_t size)
 {
@@ -849,6 +1032,17 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     memory_region_add_subregion(s->board_memory, RP2350_SRAM_BASE, &s->sram);
+    address_space_init(&s->sram_as, &s->sram, "rp2350-sram");
+    for (i = 0; i < ARRAY_SIZE(s->sram_off); i++) {
+        memory_region_init_io(&s->sram_off[i], obj, &rp2350_sram_off_ops, s,
+                              i ? "rp2350.sram1-off" : "rp2350.sram0-off",
+                              i ? RP2350_SRAM1_DOMAIN_SIZE
+                                : RP2350_SRAM0_DOMAIN_SIZE);
+        memory_region_set_enabled(&s->sram_off[i], false);
+        memory_region_add_subregion_overlap(s->board_memory,
+            RP2350_SRAM_BASE + (i ? RP2350_SRAM0_DOMAIN_SIZE : 0),
+            &s->sram_off[i], 1);
+    }
 
     /*
      * The USB controller's 4 KiB data DPRAM. It is ordinary memory to the
@@ -1080,7 +1274,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             qdev_connect_gpio_out_named(DEVICE(&s->sio), "gpio-oe", n,
                 rp2350_gpio_oe_line(&s->gpio, RP2350_GPIO_PORT_SIO, n));
             rp2350_gpio_connect_in(&s->gpio, RP2350_GPIO_PORT_SIO, n,
-                qdev_get_gpio_in_named(DEVICE(&s->sio), "gpio-in", n));
+                qdev_get_gpio_in_named(DEVICE(s), "sio-in", n));
         }
     }
 
@@ -1125,9 +1319,40 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->watchdog), 0, RP2350_WATCHDOG_BASE);
-    qdev_connect_gpio_out(DEVICE(&s->watchdog), 0,
-                          qdev_get_gpio_in_named(DEVICE(&s->psm), "watchdog",
-                                                 0));
+
+    /*
+     * POWMAN. The watchdog's reset request passes through it on the way
+     * to the PSM, so that its WDSEL can make it a chip-level reset, and a
+     * glitch detector trigger is a chip-level reset it records.
+     */
+    /* [spec:nuos:req:emu.powman] */
+    {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->powman);
+        DeviceState *powman = DEVICE(&s->powman);
+
+        object_property_set_link(OBJECT(sbd), "psm", OBJECT(&s->psm),
+                                 &error_abort);
+        qdev_prop_set_uint32(powman, "ref-hz", RP2350_CLK_REF_HZ);
+        qdev_prop_set_uint32(powman, "bonded-gpios", RP2350_GPIO_QFN60_PINS);
+        rp2350_powman_set_ops(&s->powman, &rp2350_soc_powman_ops, s);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, RP2350_POWMAN_BASE);
+        sysbus_connect_irq(sbd, RP2350_POWMAN_IRQ_POW,
+                           qdev_get_gpio_in(dev_soc, RP2350_POWMAN_POW_IRQ));
+        sysbus_connect_irq(sbd, RP2350_POWMAN_IRQ_TIMER,
+                           qdev_get_gpio_in(dev_soc,
+                                            RP2350_POWMAN_TIMER_IRQ));
+        qdev_connect_gpio_out(DEVICE(&s->watchdog), 0,
+            qdev_get_gpio_in_named(powman, RP2350_POWMAN_WATCHDOG, 0));
+        qdev_connect_gpio_out_named(powman, RP2350_POWMAN_PSM_WATCHDOG, 0,
+            qdev_get_gpio_in_named(DEVICE(&s->psm), "watchdog", 0));
+        qdev_connect_gpio_out_named(powman, RP2350_POWMAN_PSM_RESET, 0,
+            qdev_get_gpio_in_named(DEVICE(&s->psm), "powman-reset", 0));
+        qdev_connect_gpio_out_named(DEVICE(&s->glitch_detector), "chip-reset",
+            0, qdev_get_gpio_in_named(powman, RP2350_POWMAN_GLITCH_RESET, 0));
+    }
 
     /* [spec:nuos:req:emu.timer] */
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
@@ -1591,6 +1816,7 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "psm", &s->psm, TYPE_RP2350_PSM);
     object_initialize_child(obj, "watchdog", &s->watchdog,
                             TYPE_RP2350_WATCHDOG);
+    object_initialize_child(obj, "powman", &s->powman, TYPE_RP2350_POWMAN);
     object_initialize_child(obj, "sio", &s->sio, TYPE_RP2350_SIO);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_RP2350_GPIO);
     object_initialize_child(obj, "rcp", &s->rcp, TYPE_RP2350_RCP);
@@ -1637,6 +1863,8 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "dma", &s->dma, TYPE_RP2350_DMA);
 
     qdev_init_gpio_in(DEVICE(s), rp2350_soc_set_irq, RP2350_NUM_IRQS);
+    qdev_init_gpio_in_named(DEVICE(s), rp2350_soc_sio_in, "sio-in",
+                            RP2350_GPIO_SIO_BITS);
 
     s->sysclk = qdev_init_clock_out(DEVICE(s), "sysclk");
     s->refclk = qdev_init_clock_out(DEVICE(s), "refclk");
