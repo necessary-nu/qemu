@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
+#include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "hw/arm/arm-security.h"
@@ -558,6 +559,37 @@ bool rp2350_accessctrl_ns_accessible(RP2350AccessCtrlState *s, hwaddr addr)
         }
     }
     return false;
+}
+
+/*
+ * A DREQ's security level is the lowest effective permission bit of its
+ * block's register, where SU counts only with SP and NSU only with NSP.
+ */
+/* [spec:nuos:req:emu.dma] */
+unsigned rp2350_accessctrl_dreq_level(RP2350AccessCtrlState *s, hwaddr addr)
+{
+    int i;
+
+    for (i = 0; i < NUM_RANGES; i++) {
+        const RP2350AccessCtrlRange *r = &rp2350_accessctrl_ranges[i];
+        uint32_t v;
+
+        if (addr < r->base || addr - r->base >= r->size) {
+            continue;
+        }
+        if (r->reg == NO_REG) {
+            break;
+        }
+        v = reg_get(s, r->reg) & PERM_SEC_ALL;
+        if (!(v & PERM_SP)) {
+            v &= ~PERM_SU;
+        }
+        if (!(v & PERM_NSP)) {
+            v &= ~PERM_NSU;
+        }
+        return v ? ctz32(v) : 4;
+    }
+    return RP2350_DMA_SECLEVEL_SP;
 }
 
 void rp2350_accessctrl_add_notifier(RP2350AccessCtrlState *s, Notifier *n)

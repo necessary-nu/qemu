@@ -257,6 +257,30 @@ static void rp2350_busctrl_count_access(RP2350BusCtrlOverlay *o, hwaddr addr,
  * QEMU's direct path, rather than raising the decode error a write through
  * an address space would.
  */
+/* [spec:nuos:req:emu.busctrl] */
+void rp2350_busctrl_dma_access(RP2350BusCtrlState *s, hwaddr addr,
+                               unsigned size)
+{
+    hwaddr word;
+    int group;
+
+    if (!(s->perfctr_en & PERFCTR_EN_MASK)) {
+        return;
+    }
+    for (group = 0; group < RP2350_BUSCTRL_GROUP_SIO; group++) {
+        const RP2350BusCtrlRange *r = &rp2350_busctrl_ranges[group];
+
+        if (addr >= r->base && addr - r->base < r->size) {
+            for (word = addr & ~(hwaddr)3; word <= ((addr + size - 1) & ~3);
+                 word += 4) {
+                /* The core argument only selects among the SIO ports. */
+                rp2350_busctrl_count(s, rp2350_busctrl_port(0, group, word));
+            }
+            return;
+        }
+    }
+}
+
 static MemTxResult rp2350_busctrl_overlay_read(void *opaque, hwaddr addr,
                                                uint64_t *data, unsigned size,
                                                MemTxAttrs attrs)

@@ -354,42 +354,54 @@ static void rp2350_soc_psm_reset(void *opaque, uint32_t reset, uint32_t held,
 /*
  * Atomic XOR/SET/CLR aliases in front of a device model that only has the
  * plain register window: alias writes become read-modify-write on the
- * target register.
+ * target register. The registers are 32 bits wide: a narrow write (from a
+ * core or a byte-wide DMA channel) is replicated across the bus and
+ * writes the whole register, and a narrow read returns its lanes.
  */
 static MemTxResult rp2350_alias_read(void *opaque, hwaddr addr,
                                      uint64_t *data, unsigned size,
                                      MemTxAttrs attrs)
 {
-    return memory_region_dispatch_read(opaque, rp2350_atomic_reg(addr), data,
-                                       size_memop(size), attrs);
+    uint64_t v = 0;
+    MemTxResult r;
+
+    r = memory_region_dispatch_read(opaque, rp2350_atomic_reg(addr & ~3), &v,
+                                    MO_32, attrs);
+    *data = extract64(v, (addr & 3) * 8, size * 8);
+    return r;
 }
 
 static MemTxResult rp2350_alias_write(void *opaque, hwaddr addr,
                                       uint64_t value, unsigned size,
                                       MemTxAttrs attrs)
 {
-    hwaddr reg = rp2350_atomic_reg(addr);
+    hwaddr reg = rp2350_atomic_reg(addr & ~3);
     uint64_t old = 0;
     MemTxResult r;
 
-    if (reg != addr) {
-        r = memory_region_dispatch_read(opaque, reg, &old, size_memop(size),
-                                        attrs);
+    if (size == 1) {
+        value = (value & 0xff) * 0x01010101u;
+    } else if (size == 2) {
+        value = (value & 0xffff) * 0x00010001u;
+    }
+    if (reg != (addr & ~3)) {
+        r = memory_region_dispatch_read(opaque, reg, &old, MO_32, attrs);
         if (r != MEMTX_OK) {
             return r;
         }
         value = rp2350_atomic_apply(addr, old, value);
     }
-    return memory_region_dispatch_write(opaque, reg, value, size_memop(size),
-                                        attrs);
+    return memory_region_dispatch_write(opaque, reg, value, MO_32, attrs);
 }
 
 static const MemoryRegionOps rp2350_alias_ops = {
     .read_with_attrs = rp2350_alias_read,
     .write_with_attrs = rp2350_alias_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 4,
+    .valid.min_access_size = 1,
     .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
 };
 
 /*
@@ -937,6 +949,46 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         sysbus_mmio_map(sbd, 0, RP2350_CORESIGHT_TRACE_BASE);
     }
 
+    /*
+     * The DMA masters the bus through its own ACCESSCTRL view, and raises
+     * DMA_IRQ_0-3 as system IRQs. Each DREQ source drives the DMA input of
+     * its DREQ number.
+     */
+    /* [spec:nuos:req:emu.dma] */
+    {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->dma);
+        DeviceState *dma = DEVICE(&s->dma);
+
+        object_property_set_link(OBJECT(sbd), "bus",
+            OBJECT(rp2350_accessctrl_view(&s->accessctrl, RP2350_MASTER_DMA)),
+            &error_abort);
+        object_property_set_link(OBJECT(sbd), "accessctrl",
+                                 OBJECT(&s->accessctrl), &error_abort);
+        object_property_set_link(OBJECT(sbd), "busctrl", OBJECT(&s->busctrl),
+                                 &error_abort);
+        qdev_prop_set_uint32(dma, "sysclk-hz", RP2350_SYSCLK_HZ);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, RP2350_DMA_BASE);
+        for (i = 0; i < RP2350_DMA_IRQS; i++) {
+            sysbus_connect_irq(sbd, i,
+                               qdev_get_gpio_in(dev_soc, RP2350_DMA_IRQ_0 + i));
+        }
+        for (i = 0; i < RP2350_NUM_UARTS; i++) {
+            DeviceState *uart = DEVICE(&s->uart[i]);
+            int tx = i ? RP2350_DREQ_UART1_TX : RP2350_DREQ_UART0_TX;
+
+            qdev_connect_gpio_out_named(uart, PL011_DMA_REQ, PL011_DMA_TX,
+                qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, tx));
+            qdev_connect_gpio_out_named(uart, PL011_DMA_REQ, PL011_DMA_RX,
+                qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, tx + 1));
+        }
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->coresight_trace), 0,
+            qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
+                                   RP2350_DREQ_CORESIGHT));
+    }
+
     for (i = 0; i < ARRAY_SIZE(rp2350_peripherals); i++) {
         create_unimplemented_device(rp2350_peripherals[i].name,
                                     rp2350_peripherals[i].base,
@@ -995,6 +1047,7 @@ static void rp2350_soc_init(Object *obj)
                             TYPE_RP2350_CORESIGHT);
     object_initialize_child(obj, "coresight-trace", &s->coresight_trace,
                             TYPE_RP2350_CORESIGHT_TRACE);
+    object_initialize_child(obj, "dma", &s->dma, TYPE_RP2350_DMA);
 
     qdev_init_gpio_in(DEVICE(s), rp2350_soc_set_irq, RP2350_NUM_IRQS);
 

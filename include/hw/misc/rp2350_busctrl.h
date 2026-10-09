@@ -82,4 +82,11 @@ void rp2350_busctrl_attach_core(RP2350BusCtrlState *s, int core,
                                 MemoryRegion *container, MemoryRegion *sio,
                                 MemoryRegion *sio_nonsec);
 
+/*
+ * Count an access the DMA completed: `size` bytes at `addr`, on the ports
+ * that serve them. The DMA reaches every port but the SIO ports.
+ */
+void rp2350_busctrl_dma_access(RP2350BusCtrlState *s, hwaddr addr,
+                               unsigned size);
+
 #endif
