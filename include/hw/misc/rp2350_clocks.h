@@ -10,6 +10,7 @@
 #define HW_MISC_RP2350_CLOCKS_H
 
 #include "hw/core/sysbus.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 /*
@@ -23,6 +24,7 @@ OBJECT_DECLARE_TYPE(RP2350ClkRegsState, RP2350ClkRegsClass, RP2350_CLKREGS)
 
 #define TYPE_RP2350_CLOCKS "rp2350-clocks"
 #define TYPE_RP2350_XOSC "rp2350-xosc"
+OBJECT_DECLARE_SIMPLE_TYPE(RP2350XOSCState, RP2350_XOSC)
 #define TYPE_RP2350_PLL "rp2350-pll"
 #define TYPE_RP2350_TICKS "rp2350-ticks"
 
@@ -50,6 +52,13 @@ struct RP2350ClkRegsState {
     /* TICKS only: see rp2350_ticks_set_notify(). */
     RP2350TickNotify *tick_notify[RP2350_NUM_TICKS];
     void *tick_opaque[RP2350_NUM_TICKS];
+    /* TICKS only: see rp2350_ticks_set_clocks(). */
+    bool ref_stopped;
+    bool sys_stopped;
+
+    /* CLOCKS only: see rp2350_clocks_set_notify(). */
+    RP2350TickNotify *clocks_notify;
+    void *clocks_opaque;
 };
 
 struct RP2350ClkRegsClass {
@@ -64,17 +73,100 @@ struct RP2350ClkRegsClass {
     uint32_t (*read)(RP2350ClkRegsState *s, unsigned reg);
     /* Called after a register is written. */
     void (*written)(RP2350ClkRegsState *s, unsigned reg);
+    /*
+     * Handles a write itself, given the bus address (for its atomic
+     * alias) and data, returning true; false stores it as usual.
+     */
+    bool (*write)(RP2350ClkRegsState *s, unsigned reg, hwaddr addr,
+                  uint32_t value);
+    /* Resets state beyond the register file. */
+    void (*reset_hold)(RP2350ClkRegsState *s);
 };
 
-/* Whether TICKS generator `tick` is enabled, and so producing ticks. */
+/*
+ * Named GPIO input of XOSC and ROSC: a DORMANT wake event while high (the
+ * GPIO banks' dormant_wake interrupt or the AON timer alarm).
+ */
+#define RP2350_OSC_DORMANT_WAKE "dormant-wake"
+
+/*
+ * Named GPIO output of XOSC and ROSC: high from entry to DORMANT until
+ * the woken oscillator is stable again, while its output is gated and
+ * every clock running from it is stopped.
+ */
+#define RP2350_OSC_DORMANT "dormant"
+
+struct RP2350XOSCState {
+    RP2350ClkRegsState parent_obj;
+
+    QEMUTimer *startup_timer;
+    qemu_irq dormant_irq;
+    uint32_t xtal_hz;
+
+    /* CTRL.ENABLE as last applied, to see the oscillator start. */
+    bool enabled;
+    bool badwrite;
+    /* Stopped by DORMANT, waiting for a wake event. */
+    bool dormant;
+    /* Output gated: from DORMANT entry until stable after the wake. */
+    bool gated;
+    /* The level of the dormant-wake input. */
+    bool wake;
+    /* Virtual time from which an enabled, running oscillator is STABLE. */
+    int64_t stable_ns;
+};
+
+/* Whether the XOSC's output is gated by DORMANT. */
+bool rp2350_xosc_dormant(RP2350XOSCState *s);
+
+/* The oscillators a clock can run from, for DORMANT. */
+typedef enum RP2350ClockRoot {
+    RP2350_ROOT_ROSC,
+    RP2350_ROOT_XOSC,
+    /* The LPOSC or a GPIO clock input: not stopped by DORMANT. */
+    RP2350_ROOT_OTHER,
+} RP2350ClockRoot;
+
+/*
+ * The oscillator clk_ref or clk_sys (CLOCKS' clock indices 4 and 5) runs
+ * from through the glitchless and auxiliary muxes, with the PLLs counting
+ * as their XOSC reference.
+ */
+RP2350ClockRoot rp2350_clocks_root(RP2350ClkRegsState *clocks, bool sys);
+
+/*
+ * Have `fn` called whenever the clk_ref or clk_sys source selection is
+ * written or CLOCKS is reset.
+ */
+void rp2350_clocks_set_notify(RP2350ClkRegsState *clocks,
+                              RP2350TickNotify *fn, void *opaque);
+
+/*
+ * Whether TICKS generator `tick` is producing ticks: it is enabled and
+ * clk_ref, which it divides, is running.
+ */
 bool rp2350_ticks_running(RP2350ClkRegsState *ticks, int tick);
+
+/*
+ * Whether clk_sys is running, for blocks such as TIMER that count it
+ * instead of their tick.
+ */
+bool rp2350_ticks_sys_running(RP2350ClkRegsState *ticks);
+
+/*
+ * Start or stop clk_ref and clk_sys (DORMANT), telling every generator's
+ * consumer when either changes.
+ */
+void rp2350_ticks_set_clocks(RP2350ClkRegsState *ticks, bool ref_running,
+                             bool sys_running);
 
 /* TICKS generator `tick`'s CYCLES: clk_ref cycles per tick. */
 uint32_t rp2350_ticks_cycles(RP2350ClkRegsState *ticks, int tick);
 
 /*
  * Have `fn` called whenever TICKS generator `tick` is enabled or disabled,
- * its CYCLES is written, or the TICKS block is reset.
+ * its CYCLES is written, clk_ref or clk_sys starts or stops, or the TICKS
+ * block is reset.
  */
 void rp2350_ticks_set_notify(RP2350ClkRegsState *ticks, int tick,
                              RP2350TickNotify *fn, void *opaque);

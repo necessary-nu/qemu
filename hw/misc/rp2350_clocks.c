@@ -6,12 +6,25 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * Reference: RP2350 Datasheet, "Clocks", "Crystal oscillator (XOSC)",
- * "PLL" and "Tick generators". Oscillators start, PLLs lock and clock
- * muxes switch as soon as they are configured.
+ * "PLL", "Tick generators" and "DORMANT state". PLLs lock and clock
+ * muxes switch as soon as they are configured. The crystal oscillator
+ * becomes stable STARTUP.DELAY * 256 crystal periods after it starts.
+ *
+ * DORMANT. Writing the DORMANT keyword to XOSC.DORMANT stops the crystal
+ * oscillator until a wake event: the GPIO banks' dormant_wake interrupt
+ * or the AON timer alarm, both arriving on the "dormant-wake" input. The
+ * oscillator then restarts and its output stays gated until it is stable
+ * again. From entry until then the "dormant" output is high, and the SoC
+ * stops every clock running from the oscillator: the processors, the
+ * TICKS generators and the blocks counting them. The PLLs are not halted
+ * by DORMANT, but their reference stops with the XOSC, so clocks running
+ * from a PLL stop too.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_clocks.h"
 #include "migration/vmstate.h"
@@ -43,6 +56,9 @@ static void rp2350_clkregs_write(void *opaque, hwaddr addr, uint64_t value,
                       HWADDR_PRIx "\n", object_get_typename(OBJECT(s)), addr);
         return;
     }
+    if (c->write && c->write(s, reg, addr, value)) {
+        return;
+    }
     mask = c->wmask ? c->wmask[reg] : UINT32_MAX;
     v = rp2350_atomic_apply(addr, s->regs[reg], value);
     s->regs[reg] = (s->regs[reg] & ~mask) | (v & mask);
@@ -68,6 +84,9 @@ static void rp2350_clkregs_hold_reset(Object *obj, ResetType type)
     if (c->reset) {
         memcpy(s->regs, c->reset, c->nregs * sizeof(uint32_t));
     }
+    if (c->reset_hold) {
+        c->reset_hold(s);
+    }
 }
 
 static void rp2350_clkregs_init(Object *obj)
@@ -81,10 +100,12 @@ static void rp2350_clkregs_init(Object *obj)
 
 static const VMStateDescription vmstate_rp2350_clkregs = {
     .name = TYPE_RP2350_CLKREGS,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, RP2350ClkRegsState, RP2350_CLKREGS_MAX),
+        VMSTATE_BOOL(ref_stopped, RP2350ClkRegsState),
+        VMSTATE_BOOL(sys_stopped, RP2350ClkRegsState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -115,6 +136,16 @@ static void rp2350_clkregs_class_init(ObjectClass *klass, const void *data)
 #define R_INTR             (0xc4 / 4)
 #define R_INTS             (0xd0 / 4)
 #define CLOCKS_NREGS       (R_INTS + 1)
+
+#define CLK_REF_SRC_ROSC   0
+#define CLK_REF_SRC_AUX    1
+#define CLK_REF_SRC_XOSC   2
+#define CLK_REF_AUX_GPIN0  1
+#define CLK_REF_AUX_GPIN1  2
+#define CLK_SYS_AUX_PLL_SYS 0
+#define CLK_SYS_AUX_PLL_USB 1
+#define CLK_SYS_AUX_ROSC   2
+#define CLK_SYS_AUX_XOSC   3
 
 #define FC0_STATUS_PASS    (1u << 0)
 #define FC0_STATUS_DONE    (1u << 4)
@@ -151,8 +182,74 @@ static uint32_t clocks_read(RP2350ClkRegsState *s, unsigned reg)
     return s->regs[reg];
 }
 
+/* [spec:nuos:req:emu.clocks] */
+RP2350ClockRoot rp2350_clocks_root(RP2350ClkRegsState *clocks, bool sys)
+{
+    uint32_t ref = clocks->regs[R_CLK_CTRL(CLK_REF)];
+    uint32_t sysc = clocks->regs[R_CLK_CTRL(CLK_SYS)];
+
+    if (sys && (sysc & 0x1)) {
+        switch ((sysc >> 5) & 0x7) {
+        case CLK_SYS_AUX_PLL_SYS:
+        case CLK_SYS_AUX_PLL_USB:
+            /* The PLLs' reference is the XOSC. */
+        case CLK_SYS_AUX_XOSC:
+            return RP2350_ROOT_XOSC;
+        case CLK_SYS_AUX_ROSC:
+            return RP2350_ROOT_ROSC;
+        default:
+            /* GPIN0 and GPIN1 are external clocks. */
+            return RP2350_ROOT_OTHER;
+        }
+    }
+    switch (ref & 0x3) {
+    case CLK_REF_SRC_ROSC:
+        return RP2350_ROOT_ROSC;
+    case CLK_REF_SRC_XOSC:
+        return RP2350_ROOT_XOSC;
+    case CLK_REF_SRC_AUX:
+        switch ((ref >> 5) & 0x3) {
+        case CLK_REF_AUX_GPIN0:
+        case CLK_REF_AUX_GPIN1:
+            return RP2350_ROOT_OTHER;
+        default:
+            /* PLL_USB, and its primary reference, the XOSC. */
+            return RP2350_ROOT_XOSC;
+        }
+    default:
+        /* The LPOSC runs through DORMANT, for the AON timer. */
+        return RP2350_ROOT_OTHER;
+    }
+}
+
+void rp2350_clocks_set_notify(RP2350ClkRegsState *clocks,
+                              RP2350TickNotify *fn, void *opaque)
+{
+    clocks->clocks_notify = fn;
+    clocks->clocks_opaque = opaque;
+}
+
+static void clocks_written(RP2350ClkRegsState *s, unsigned reg)
+{
+    if ((reg == R_CLK_CTRL(CLK_REF) || reg == R_CLK_CTRL(CLK_SYS)) &&
+        s->clocks_notify) {
+        s->clocks_notify(s->clocks_opaque);
+    }
+}
+
+/* A reset switches clk_ref and clk_sys back to the ROSC. */
+static void rp2350_clocks_exit_reset(Object *obj, ResetType type)
+{
+    RP2350ClkRegsState *s = RP2350_CLKREGS(obj);
+
+    if (s->clocks_notify) {
+        s->clocks_notify(s->clocks_opaque);
+    }
+}
+
 static void rp2350_clocks_class_init(ObjectClass *klass, const void *data)
 {
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
     RP2350ClkRegsClass *c = RP2350_CLKREGS_CLASS(klass);
     int i;
 
@@ -176,6 +273,8 @@ static void rp2350_clocks_class_init(ObjectClass *klass, const void *data)
     c->reset = clocks_reset;
     c->wmask = clocks_wmask;
     c->read = clocks_read;
+    c->written = clocks_written;
+    rc->phases.exit = rp2350_clocks_exit_reset;
 }
 
 /* XOSC */
@@ -191,29 +290,135 @@ static void rp2350_clocks_class_init(ObjectClass *klass, const void *data)
 #define XOSC_CTRL_ENABLE_MASK  0xfff
 #define XOSC_ENABLE            0xfab
 #define XOSC_STATUS_ENABLED    (1u << 12)
+#define XOSC_STATUS_BADWRITE   (1u << 24)
 #define XOSC_STATUS_STABLE     (1u << 31)
+#define XOSC_STARTUP_DELAY     0x3fff
+#define XOSC_STARTUP_X4        (1u << 20)
+#define XOSC_DORMANT_DORMANT   0x636f6d61u
+#define XOSC_DORMANT_WAKE      0x77616b65u
+
+static const uint32_t xosc_reset[XOSC_NREGS] = {
+    /* On power-up DORMANT is initialised to WAKE. */
+    [R_XOSC_DORMANT] = XOSC_DORMANT_WAKE,
+};
 
 static const uint32_t xosc_wmask[XOSC_NREGS] = {
     [R_XOSC_CTRL] = 0x00ffffff,
-    [R_XOSC_DORMANT] = UINT32_MAX,
     [R_XOSC_STARTUP] = 0x00103fff,
     [R_XOSC_COUNT] = 0x0000ffff,
 };
 
+static bool xosc_ctrl_enabled(RP2350ClkRegsState *s)
+{
+    return ((s->regs[R_XOSC_CTRL] >> XOSC_CTRL_ENABLE_SHIFT) &
+            XOSC_CTRL_ENABLE_MASK) == XOSC_ENABLE;
+}
+
+/* STARTUP.DELAY counts 256 crystal periods, four times over with X4. */
+static int64_t xosc_startup_ns(RP2350XOSCState *x)
+{
+    uint32_t startup = x->parent_obj.regs[R_XOSC_STARTUP];
+    uint64_t cycles = (uint64_t)(startup & XOSC_STARTUP_DELAY) * 256;
+
+    if (startup & XOSC_STARTUP_X4) {
+        cycles *= 4;
+    }
+    return muldiv64(cycles, NANOSECONDS_PER_SECOND, x->xtal_hz);
+}
+
+/* The crystal starts oscillating; it is STABLE once the delay expires. */
+static void xosc_start(RP2350XOSCState *x)
+{
+    x->stable_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + xosc_startup_ns(x);
+}
+
+static bool xosc_stable(RP2350XOSCState *x)
+{
+    return x->enabled && !x->dormant &&
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= x->stable_ns;
+}
+
+bool rp2350_xosc_dormant(RP2350XOSCState *x)
+{
+    return x->gated;
+}
+
+static void xosc_set_gated(RP2350XOSCState *x, bool gated)
+{
+    x->gated = gated;
+    qemu_set_irq(x->dormant_irq, gated);
+}
+
+/*
+ * A wake event restarts the oscillator, and its output is ungated once
+ * it is stable. A disabled oscillator has nothing to restart.
+ */
+/* [spec:nuos:req:emu.clocks] */
+static void xosc_wake(RP2350XOSCState *x)
+{
+    x->dormant = false;
+    x->parent_obj.regs[R_XOSC_DORMANT] = XOSC_DORMANT_WAKE;
+    if (!x->enabled) {
+        xosc_set_gated(x, false);
+        return;
+    }
+    xosc_start(x);
+    timer_mod(x->startup_timer, x->stable_ns);
+}
+
+static void xosc_startup_cb(void *opaque)
+{
+    RP2350XOSCState *x = opaque;
+
+    if (!x->dormant) {
+        xosc_set_gated(x, false);
+    }
+}
+
+/* [spec:nuos:req:emu.clocks] */
+static void xosc_enter_dormant(RP2350XOSCState *x)
+{
+    if (x->dormant) {
+        return;
+    }
+    timer_del(x->startup_timer);
+    x->dormant = true;
+    x->parent_obj.regs[R_XOSC_DORMANT] = XOSC_DORMANT_DORMANT;
+    xosc_set_gated(x, true);
+    /* A wake event already asserted restarts the oscillator at once. */
+    if (x->wake) {
+        xosc_wake(x);
+    }
+}
+
+static void xosc_set_wake(void *opaque, int n, int level)
+{
+    RP2350XOSCState *x = opaque;
+
+    x->wake = level;
+    if (level && x->dormant) {
+        xosc_wake(x);
+    }
+}
+
 /* [spec:nuos:req:emu.clocks] */
 static uint32_t xosc_read(RP2350ClkRegsState *s, unsigned reg)
 {
-    uint32_t ctrl = s->regs[R_XOSC_CTRL];
+    RP2350XOSCState *x = RP2350_XOSC(s);
     uint32_t st = 0;
 
     switch (reg) {
     case R_XOSC_STATUS:
-        /* The crystal is stable as soon as it is enabled. */
-        if (((ctrl >> XOSC_CTRL_ENABLE_SHIFT) & XOSC_CTRL_ENABLE_MASK) ==
-            XOSC_ENABLE) {
-            st |= XOSC_STATUS_ENABLED | XOSC_STATUS_STABLE;
+        if (x->enabled) {
+            st |= XOSC_STATUS_ENABLED;
         }
-        return st | (ctrl & 0x3);
+        if (xosc_stable(x)) {
+            st |= XOSC_STATUS_STABLE;
+        }
+        if (x->badwrite) {
+            st |= XOSC_STATUS_BADWRITE;
+        }
+        return st | (s->regs[R_XOSC_CTRL] & 0x3);
     case R_XOSC_COUNT:
         /* The count-down timer expires at once. */
         return 0;
@@ -221,13 +426,113 @@ static uint32_t xosc_read(RP2350ClkRegsState *s, unsigned reg)
     return s->regs[reg];
 }
 
+/* [spec:nuos:req:emu.clocks] */
+static bool xosc_write(RP2350ClkRegsState *s, unsigned reg, hwaddr addr,
+                       uint32_t value)
+{
+    RP2350XOSCState *x = RP2350_XOSC(s);
+
+    switch (reg) {
+    case R_XOSC_STATUS:
+        /* BADWRITE is write-1-to-clear through any alias. */
+        if (value & XOSC_STATUS_BADWRITE) {
+            x->badwrite = false;
+        }
+        return true;
+    case R_XOSC_DORMANT:
+        value = rp2350_atomic_apply(addr, s->regs[R_XOSC_DORMANT], value);
+        if (value == XOSC_DORMANT_DORMANT) {
+            xosc_enter_dormant(x);
+        } else if (value != XOSC_DORMANT_WAKE) {
+            /* An invalid write selects WAKE, which the running XOSC is. */
+            x->badwrite = true;
+        }
+        return true;
+    }
+    return false;
+}
+
+static void xosc_written(RP2350ClkRegsState *s, unsigned reg)
+{
+    RP2350XOSCState *x = RP2350_XOSC(s);
+    bool enabled = xosc_ctrl_enabled(s);
+
+    if (reg != R_XOSC_CTRL || enabled == x->enabled) {
+        return;
+    }
+    x->enabled = enabled;
+    if (enabled && !x->dormant) {
+        xosc_start(x);
+    }
+}
+
+static void xosc_reset_hold(RP2350ClkRegsState *s)
+{
+    RP2350XOSCState *x = RP2350_XOSC(s);
+
+    timer_del(x->startup_timer);
+    x->enabled = false;
+    x->badwrite = false;
+    x->dormant = false;
+    x->gated = false;
+    x->stable_ns = 0;
+}
+
+static void rp2350_xosc_exit_reset(Object *obj, ResetType type)
+{
+    RP2350XOSCState *x = RP2350_XOSC(obj);
+
+    qemu_set_irq(x->dormant_irq, x->gated);
+}
+
+static void rp2350_xosc_init(Object *obj)
+{
+    RP2350XOSCState *x = RP2350_XOSC(obj);
+    DeviceState *dev = DEVICE(obj);
+
+    x->startup_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xosc_startup_cb, x);
+    qdev_init_gpio_in_named(dev, xosc_set_wake, RP2350_OSC_DORMANT_WAKE, 1);
+    qdev_init_gpio_out_named(dev, &x->dormant_irq, RP2350_OSC_DORMANT, 1);
+}
+
+static const VMStateDescription vmstate_rp2350_xosc = {
+    .name = TYPE_RP2350_XOSC,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(parent_obj.regs, RP2350XOSCState,
+                             RP2350_CLKREGS_MAX),
+        VMSTATE_TIMER_PTR(startup_timer, RP2350XOSCState),
+        VMSTATE_BOOL(enabled, RP2350XOSCState),
+        VMSTATE_BOOL(badwrite, RP2350XOSCState),
+        VMSTATE_BOOL(dormant, RP2350XOSCState),
+        VMSTATE_BOOL(gated, RP2350XOSCState),
+        VMSTATE_BOOL(wake, RP2350XOSCState),
+        VMSTATE_INT64(stable_ns, RP2350XOSCState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const Property rp2350_xosc_properties[] = {
+    DEFINE_PROP_UINT32("xtal-hz", RP2350XOSCState, xtal_hz, 12000000),
+};
+
 static void rp2350_xosc_class_init(ObjectClass *klass, const void *data)
 {
     RP2350ClkRegsClass *c = RP2350_CLKREGS_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     c->nregs = XOSC_NREGS;
+    c->reset = xosc_reset;
     c->wmask = xosc_wmask;
     c->read = xosc_read;
+    c->write = xosc_write;
+    c->written = xosc_written;
+    c->reset_hold = xosc_reset_hold;
+    rc->phases.exit = rp2350_xosc_exit_reset;
+    dc->vmsd = &vmstate_rp2350_xosc;
+    device_class_set_props(dc, rp2350_xosc_properties);
 }
 
 /* PLL */
@@ -309,7 +614,8 @@ static uint32_t ticks_read(RP2350ClkRegsState *s, unsigned reg)
 
     switch (reg % TICK_STRIDE) {
     case 0:
-        return v & TICK_CTRL_ENABLE ? v | TICK_CTRL_RUNNING : v;
+        return rp2350_ticks_running(s, reg / TICK_STRIDE) ?
+               v | TICK_CTRL_RUNNING : v;
     case 2:
         return 0;
     }
@@ -318,7 +624,37 @@ static uint32_t ticks_read(RP2350ClkRegsState *s, unsigned reg)
 
 bool rp2350_ticks_running(RP2350ClkRegsState *ticks, int tick)
 {
-    return ticks->regs[tick * TICK_STRIDE] & TICK_CTRL_ENABLE;
+    return !ticks->ref_stopped &&
+           (ticks->regs[tick * TICK_STRIDE] & TICK_CTRL_ENABLE);
+}
+
+bool rp2350_ticks_sys_running(RP2350ClkRegsState *ticks)
+{
+    return !ticks->sys_stopped;
+}
+
+static void ticks_notify_all(RP2350ClkRegsState *s)
+{
+    int i;
+
+    for (i = 0; i < RP2350_NUM_TICKS; i++) {
+        if (s->tick_notify[i]) {
+            s->tick_notify[i](s->tick_opaque[i]);
+        }
+    }
+}
+
+/* [spec:nuos:req:emu.clocks] */
+void rp2350_ticks_set_clocks(RP2350ClkRegsState *ticks, bool ref_running,
+                             bool sys_running)
+{
+    if (ticks->ref_stopped == !ref_running &&
+        ticks->sys_stopped == !sys_running) {
+        return;
+    }
+    ticks->ref_stopped = !ref_running;
+    ticks->sys_stopped = !sys_running;
+    ticks_notify_all(ticks);
 }
 
 uint32_t rp2350_ticks_cycles(RP2350ClkRegsState *ticks, int tick)
@@ -346,14 +682,7 @@ static void ticks_written(RP2350ClkRegsState *s, unsigned reg)
 /* A reset stops every generator, which their consumers must see. */
 static void rp2350_ticks_exit_reset(Object *obj, ResetType type)
 {
-    RP2350ClkRegsState *s = RP2350_CLKREGS(obj);
-    int i;
-
-    for (i = 0; i < RP2350_NUM_TICKS; i++) {
-        if (s->tick_notify[i]) {
-            s->tick_notify[i](s->tick_opaque[i]);
-        }
-    }
+    ticks_notify_all(RP2350_CLKREGS(obj));
 }
 
 static void rp2350_ticks_class_init(ObjectClass *klass, const void *data)
@@ -391,6 +720,8 @@ static const TypeInfo rp2350_clocks_types[] = {
     {
         .name          = TYPE_RP2350_XOSC,
         .parent        = TYPE_RP2350_CLKREGS,
+        .instance_size = sizeof(RP2350XOSCState),
+        .instance_init = rp2350_xosc_init,
         .class_init    = rp2350_xosc_class_init,
     },
     {

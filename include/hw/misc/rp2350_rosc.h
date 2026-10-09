@@ -10,6 +10,7 @@
 #define HW_MISC_RP2350_ROSC_H
 
 #include "hw/core/sysbus.h"
+#include "hw/misc/rp2350_clocks.h"
 #include "qom/object.h"
 
 #define TYPE_RP2350_ROSC "rp2350-rosc"
@@ -19,6 +20,9 @@ struct RP2350ROSCState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
+    QEMUTimer *startup_timer;
+    /* RP2350_OSC_DORMANT; the input is RP2350_OSC_DORMANT_WAKE. */
+    qemu_irq dormant_irq;
 
     /* Registers as last written (raw, including invalid codes). */
     uint32_t ctrl;
@@ -41,6 +45,13 @@ struct RP2350ROSCState {
     /* Virtual time from which an enabled oscillator reads as STABLE. */
     int64_t stable_ns;
 
+    /* Stopped by DORMANT, waiting for a wake event. */
+    bool dormant_stopped;
+    /* Output gated: from DORMANT entry until stable after the wake. */
+    bool gated;
+    /* The level of the dormant-wake input. */
+    bool wake;
+
     /* COUNT as of virtual time count_ns; it counts down from there. */
     uint32_t count;
     int64_t count_ns;
@@ -50,5 +61,8 @@ struct RP2350ROSCState {
     uint32_t entropy_bits;
     uint32_t randombit;
 };
+
+/* Whether the ROSC's output is gated by DORMANT. */
+bool rp2350_rosc_dormant(RP2350ROSCState *s);
 
 #endif

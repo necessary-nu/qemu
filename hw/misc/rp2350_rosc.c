@@ -25,6 +25,13 @@
  * COUNT counts down at the divided output frequency, the frequency the
  * datasheet calls the ROSC's. RANDOMBIT samples the host's random source
  * while the oscillator runs.
+ *
+ * Writing the DORMANT keyword to DORMANT stops the oscillator until a
+ * DORMANT wake event (the GPIO banks' dormant_wake interrupt or the AON
+ * timer alarm, on the "dormant-wake" input). It then restarts in the same
+ * configuration, and its output is ungated once it is stable, about 1us
+ * later. The "dormant" output is high from entry until then, while the
+ * SoC stops every clock running from the ROSC.
  */
 
 #include "qemu/osdep.h"
@@ -32,6 +39,7 @@
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "hw/core/irq.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_rosc.h"
 #include "migration/vmstate.h"
@@ -109,7 +117,7 @@ static bool rosc_ctrl_enabled(uint32_t ctrl)
 
 static bool rosc_running(RP2350ROSCState *s)
 {
-    return rosc_ctrl_enabled(s->ctrl);
+    return rosc_ctrl_enabled(s->ctrl) && !s->dormant_stopped;
 }
 
 static unsigned rosc_stages_in_loop(uint32_t ctrl)
@@ -207,8 +215,11 @@ static uint32_t rosc_status(RP2350ROSCState *s)
 {
     uint32_t st = 0;
 
+    if (rosc_ctrl_enabled(s->ctrl)) {
+        st |= STATUS_ENABLED;
+    }
     if (rosc_running(s)) {
-        st |= STATUS_ENABLED | STATUS_DIV_RUNNING;
+        st |= STATUS_DIV_RUNNING;
         if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->stable_ns) {
             st |= STATUS_STABLE;
         }
@@ -217,6 +228,74 @@ static uint32_t rosc_status(RP2350ROSCState *s)
         st |= STATUS_BADWRITE;
     }
     return st;
+}
+
+bool rp2350_rosc_dormant(RP2350ROSCState *s)
+{
+    return s->gated;
+}
+
+static void rosc_set_gated(RP2350ROSCState *s, bool gated)
+{
+    s->gated = gated;
+    qemu_set_irq(s->dormant_irq, gated);
+}
+
+/*
+ * A wake event restarts the oscillator in the configuration it stopped
+ * in; its output is ungated once it is stable. A disabled oscillator has
+ * nothing to restart.
+ */
+/* [spec:nuos:req:emu.rosc-trng] */
+static void rosc_wake(RP2350ROSCState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    s->dormant_stopped = false;
+    s->dormant = DORMANT_WAKE;
+    s->count_ns = now;
+    if (!rosc_ctrl_enabled(s->ctrl)) {
+        rosc_set_gated(s, false);
+        return;
+    }
+    s->stable_ns = now + ROSC_STARTUP_NS;
+    timer_mod(s->startup_timer, s->stable_ns);
+}
+
+static void rosc_startup_cb(void *opaque)
+{
+    RP2350ROSCState *s = opaque;
+
+    if (!s->dormant_stopped) {
+        rosc_set_gated(s, false);
+    }
+}
+
+/* [spec:nuos:req:emu.rosc-trng] */
+static void rosc_enter_dormant(RP2350ROSCState *s)
+{
+    if (s->dormant_stopped) {
+        return;
+    }
+    rosc_count_sync(s);
+    timer_del(s->startup_timer);
+    s->dormant_stopped = true;
+    s->dormant = DORMANT_DORMANT;
+    rosc_set_gated(s, true);
+    /* A wake event already asserted restarts the oscillator at once. */
+    if (s->wake) {
+        rosc_wake(s);
+    }
+}
+
+static void rosc_set_wake(void *opaque, int n, int level)
+{
+    RP2350ROSCState *s = opaque;
+
+    s->wake = level;
+    if (level && s->dormant_stopped) {
+        rosc_wake(s);
+    }
 }
 
 /* [spec:nuos:req:emu.rosc-trng] */
@@ -313,21 +392,11 @@ static void rp2350_rosc_write(void *opaque, hwaddr addr, uint64_t value64,
     case A_DORMANT:
         value = rp2350_atomic_apply(addr, s->dormant, value);
         if (value == DORMANT_DORMANT) {
-            /*
-             * The oscillator would stop until a DORMANT wake event (a
-             * GPIO or AON timer interrupt) restarts it, about 1us later.
-             * The chip-wide DORMANT state is not modelled, so the
-             * oscillator restarts at once.
-             */
-            qemu_log_mask(LOG_UNIMP, "%s: DORMANT state not modelled, "
-                          "waking at once\n", __func__);
-            s->stable_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                           ROSC_STARTUP_NS;
+            rosc_enter_dormant(s);
         } else if (value != DORMANT_WAKE) {
-            /* An invalid write selects WAKE. */
+            /* An invalid write selects WAKE, which the running ROSC is. */
             s->badwrite = true;
         }
-        s->dormant = DORMANT_WAKE;
         break;
     case A_DIV:
         value = rp2350_atomic_apply(addr, s->div, value) & DIV_MASK;
@@ -403,6 +472,16 @@ static void rp2350_rosc_hold_reset(Object *obj, ResetType type)
     s->entropy = 0;
     s->entropy_bits = 0;
     s->randombit = 1;
+    timer_del(s->startup_timer);
+    s->dormant_stopped = false;
+    s->gated = false;
+}
+
+static void rp2350_rosc_exit_reset(Object *obj, ResetType type)
+{
+    RP2350ROSCState *s = RP2350_ROSC(obj);
+
+    qemu_set_irq(s->dormant_irq, s->gated);
 }
 
 static void rp2350_rosc_init(Object *obj)
@@ -412,12 +491,17 @@ static void rp2350_rosc_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &rp2350_rosc_ops, s,
                           TYPE_RP2350_ROSC, RP2350_ATOMIC_REGION_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    s->startup_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rosc_startup_cb, s);
+    qdev_init_gpio_in_named(DEVICE(obj), rosc_set_wake,
+                            RP2350_OSC_DORMANT_WAKE, 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->dormant_irq,
+                             RP2350_OSC_DORMANT, 1);
 }
 
 static const VMStateDescription vmstate_rp2350_rosc = {
     .name = TYPE_RP2350_ROSC,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(ctrl, RP2350ROSCState),
         VMSTATE_UINT32(freqa, RP2350ROSCState),
@@ -435,6 +519,10 @@ static const VMStateDescription vmstate_rp2350_rosc = {
         VMSTATE_UINT32(entropy, RP2350ROSCState),
         VMSTATE_UINT32(entropy_bits, RP2350ROSCState),
         VMSTATE_UINT32(randombit, RP2350ROSCState),
+        VMSTATE_TIMER_PTR(startup_timer, RP2350ROSCState),
+        VMSTATE_BOOL(dormant_stopped, RP2350ROSCState),
+        VMSTATE_BOOL(gated, RP2350ROSCState),
+        VMSTATE_BOOL(wake, RP2350ROSCState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -445,6 +533,7 @@ static void rp2350_rosc_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     rc->phases.hold = rp2350_rosc_hold_reset;
+    rc->phases.exit = rp2350_rosc_exit_reset;
     dc->vmsd = &vmstate_rp2350_rosc;
 }
 

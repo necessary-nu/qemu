@@ -269,7 +269,8 @@ qtests_rp2350 = \
    'rp2350-m33-debug-test',
    'rp2350-hstx-test',
    'rp2350-adc-test',
-   'rp2350-i2c-test']
+   'rp2350-i2c-test',
+   'rp2350-dormant-test']
 
 qtests_xtensa = \
   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ?

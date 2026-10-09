@@ -64,7 +64,8 @@
  * waits at each second boundary for the 1 Hz GPIO's falling edge, and an
  * edge before the boundary advances it to the boundary. The alarm fires
  * when the count reaches ALARM_TIME while ALARM_ENAB is set (the rising
- * edge of that comparison), setting TIMER.ALARM.
+ * edge of that comparison), setting TIMER.ALARM; that event also wakes
+ * the chip from DORMANT, which stops an AON timer running from the XOSC.
  *
  * The regulator and brown-out detector have no analogue behaviour to
  * model: VREG accepts writes once VREG_CTRL.UNLOCK is set, shows
@@ -395,6 +396,9 @@ static bool aon_clock(RP2350PowmanState *s, uint64_t *hz, uint64_t *div)
         return false;
     }
     if (s->timer & TIMER_USING_XOSC) {
+        if (s->xosc_dormant) {
+            return false;
+        }
         *hz = s->ref_hz;
         *div = aon_div(s->xosc_freq_int, s->xosc_freq_frac);
         return true;
@@ -504,6 +508,7 @@ static void aon_update(RP2350PowmanState *s)
 
     if (cmp && !s->alarm_cmp) {
         s->timer |= TIMER_ALARM;
+        qemu_irq_pulse(s->alarm_wake);
     }
     s->alarm_cmp = cmp;
 
@@ -1715,6 +1720,19 @@ static void rp2350_powman_realize(DeviceState *dev, Error **errp)
     s->vreg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vreg_cb, s);
 }
 
+/* [spec:nuos:req:emu.powman] */
+static void powman_xosc_dormant(void *opaque, int n, int level)
+{
+    RP2350PowmanState *s = opaque;
+
+    if (s->xosc_dormant == !!level) {
+        return;
+    }
+    aon_sync(s);
+    s->xosc_dormant = level;
+    aon_update(s);
+}
+
 static void rp2350_powman_init(Object *obj)
 {
     RP2350PowmanState *s = RP2350_POWMAN(obj);
@@ -1733,14 +1751,18 @@ static void rp2350_powman_init(Object *obj)
     qdev_init_gpio_out_named(dev, &s->psm_watchdog,
                              RP2350_POWMAN_PSM_WATCHDOG, 1);
     qdev_init_gpio_out_named(dev, &s->psm_reset, RP2350_POWMAN_PSM_RESET, 1);
+    qdev_init_gpio_in_named(dev, powman_xosc_dormant,
+                            RP2350_POWMAN_XOSC_DORMANT, 1);
+    qdev_init_gpio_out_named(dev, &s->alarm_wake, RP2350_POWMAN_ALARM_WAKE,
+                             1);
     /* The first reset is the power-on reset. */
     s->next_reset = RESET_POR;
 }
 
 static const VMStateDescription vmstate_rp2350_powman = {
     .name = TYPE_RP2350_POWMAN,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(seq_timer, RP2350PowmanState),
         VMSTATE_TIMER_PTR(alarm_timer, RP2350PowmanState),
@@ -1784,6 +1806,7 @@ static const VMStateDescription vmstate_rp2350_powman = {
         VMSTATE_UINT64(aon_sec_limit, RP2350PowmanState),
         VMSTATE_UINT32(aon_lpck_acc, RP2350PowmanState),
         VMSTATE_BOOL(alarm_cmp, RP2350PowmanState),
+        VMSTATE_BOOL(xosc_dormant, RP2350PowmanState),
         VMSTATE_UINT32_ARRAY(pwrup, RP2350PowmanState, RP2350_POWMAN_PWRUPS),
         VMSTATE_UINT32(pwrup_latch, RP2350PowmanState),
         VMSTATE_UINT32(last_swcore_pwrup, RP2350PowmanState),

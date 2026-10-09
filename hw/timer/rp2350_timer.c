@@ -8,8 +8,8 @@
  * Reference: RP2350 Datasheet, "System timers". The 64-bit counter
  * follows QEMU's virtual clock, counting microseconds from its TICKS
  * generator (or clk_sys cycles when SOURCE selects it), and stops while
- * paused or while that tick generator is disabled. Debug pause is not
- * modelled.
+ * paused, while that tick generator is disabled, or while the clock it
+ * counts is stopped (DORMANT). Debug pause is not modelled.
  */
 
 #include "qemu/osdep.h"
@@ -47,14 +47,21 @@ static uint64_t timer_hz(RP2350TimerState *s)
     return s->source ? s->sysclk_hz : TICK_HZ;
 }
 
-/* The counter stops while the timer is held in reset. */
+/*
+ * The counter stops while the timer is held in reset, and while the clock
+ * it counts (its tick, or clk_sys) is stopped, as by DORMANT.
+ */
 /* [spec:nuos:req:emu.resets] */
+/* [spec:nuos:req:emu.timer] */
 static bool timer_should_run(RP2350TimerState *s)
 {
     if (s->pause || device_is_in_reset(DEVICE(s))) {
         return false;
     }
-    return s->source || rp2350_ticks_running(s->ticks, s->tick);
+    if (s->source) {
+        return rp2350_ticks_sys_running(s->ticks);
+    }
+    return rp2350_ticks_running(s->ticks, s->tick);
 }
 
 static uint64_t timer_count(RP2350TimerState *s, int64_t now)

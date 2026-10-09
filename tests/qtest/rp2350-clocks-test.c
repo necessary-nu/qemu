@@ -67,10 +67,18 @@ static void test_xosc(void)
 
     g_assert_cmphex(qtest_readl(qts, XOSC_STATUS) & XOSC_STABLE, ==, 0);
 
-    /* xosc_init(): range, startup delay, enable, wait for STABLE. */
+    /*
+     * xosc_init(): range, startup delay, enable, wait for STABLE, which
+     * comes 0x2f * 256 periods of the 12 MHz crystal (1.003 ms) later.
+     */
     qtest_writel(qts, XOSC_CTRL, 0xaa0);
     qtest_writel(qts, XOSC_STARTUP, 0x2f);
     qtest_writel(qts, XOSC_CTRL + SET, 0xfab << 12);
+    g_assert_cmphex(qtest_readl(qts, XOSC_STATUS) &
+                    (XOSC_STABLE | XOSC_ENABLED), ==, XOSC_ENABLED);
+    qtest_clock_step(qts, 1002000);
+    g_assert_cmphex(qtest_readl(qts, XOSC_STATUS) & XOSC_STABLE, ==, 0);
+    qtest_clock_step(qts, 2000);
     g_assert_cmphex(qtest_readl(qts, XOSC_STATUS) &
                     (XOSC_STABLE | XOSC_ENABLED), ==,
                     XOSC_STABLE | XOSC_ENABLED);
