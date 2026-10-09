@@ -269,6 +269,13 @@ struct RP2350State {
     uint32_t init_svtor;
     bool core1_launch;
 
+    /*
+     * Cores whose AIRCR.SYSRESETREQ is waiting for its warm reset, which
+     * runs in a bottom half once every vCPU has stopped.
+     */
+    uint32_t sysresetreq_pending;
+    QEMUBH *sysresetreq_bh;
+
     Clock *sysclk;
     Clock *refclk;
     Clock *periclk;
