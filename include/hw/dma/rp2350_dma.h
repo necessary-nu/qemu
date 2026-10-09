@@ -21,6 +21,16 @@
  *    peripheral has room or data for one more transfer after every
  *    transfer. Pacing timers (TREQ 59-62) and the permanent request (63)
  *    are internal.
+ *
+ * A DREQ source must expect the DMA to access its registers from within
+ * the qemu_set_irq() that raises its DREQ: the transfer the rising edge
+ * asks for is issued there and then, unless the source is in the middle
+ * of a register access (or the change comes from a vCPU), when it is
+ * issued from a bottom half instead. A line still high when that call
+ * returns asks for more transfers, issued in virtual time. A source
+ * that runs itself forward over a span of time should change its DREQ at
+ * each event in that span, and treat register accesses made meanwhile as
+ * happening at that event.
  */
 
 #ifndef HW_DMA_RP2350_DMA_H
@@ -99,6 +109,7 @@ struct RP2350DMAState {
     uint32_t sysclk_hz;
 
     QEMUTimer *timer;
+    QEMUBH *bh;
     qemu_irq irq[RP2350_DMA_IRQS];
 
     RP2350DMAChannel ch[RP2350_DMA_CHANNELS];
@@ -118,6 +129,11 @@ struct RP2350DMAState {
 
     /* Levels of the DREQ inputs, bit n for DREQ n. */
     uint64_t dreq_level;
+    /*
+     * Set while the engine answers a rising DREQ edge in place: only
+     * credits request transfers, not DREQ levels.
+     */
+    bool edges_only;
 
     /* Channels triggered with a zero transfer count, completing next. */
     uint32_t zero_pending;
