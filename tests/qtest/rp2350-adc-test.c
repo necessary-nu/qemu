@@ -6,7 +6,8 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * clk_adc is 48 MHz: a conversion is 96 cycles, 2 us, and 6 cycles are
- * exactly 125 ns. Every test starts at virtual time 0, on a cycle edge.
+ * exactly 125 ns. Every test starts on a cycle edge, once the ADC, GPIO
+ * and DMA blocks are out of reset.
  * Input voltages are set with qom-set on the ADC's "ain<n>-uv",
  * "temperature" and "conversion-errors" properties.
  */
@@ -14,6 +15,7 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
+#include "rp2350-resets.h"
 
 #define ALIAS_XOR       0x1000
 #define ALIAS_SET       0x2000
@@ -66,6 +68,9 @@
 
 #define ADC_IRQ_FIFO    35
 
+/* RESETS bits: ADC, DMA, IO_BANK0 and PADS_BANK0. */
+#define RESETS_USED     ((1u << 0) | (1u << 2) | (1u << 6) | (1u << 9))
+
 #define DMA             0x50000000
 #define DMA_READ_ADDR   (DMA + 0x00)
 #define DMA_WRITE_ADDR  (DMA + 0x04)
@@ -89,6 +94,9 @@ static QTestState *start(void)
     QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
 
     qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");
+    rp2350_unreset(qts, RESETS_USED);
+    /* RP2350_RESETS_RELEASE_NS is a whole number of 6-cycle steps. */
+    g_assert_cmpint(qtest_clock_step(qts, 0) % 125, ==, 0);
     return qts;
 }
 

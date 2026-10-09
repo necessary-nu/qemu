@@ -10,6 +10,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
@@ -20,6 +21,7 @@
 #include "hw/block/aps6404l.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/unimp.h"
+#include "hw/ssi/ssi.h"
 #include "system/system.h"
 #include "target/arm/arm-powerctl.h"
 #include "target/arm/cpu.h"
@@ -144,54 +146,184 @@ static void rp2350_core1_launch(void *opaque, uint32_t vtor, uint32_t sp,
     async_run_on_cpu(CPU(cpu), rp2350_core1_start, RUN_ON_CPU_HOST_PTR(start));
 }
 
-/* RESETS bits of the subsystems that have device models. */
-#define RP2350_RESET_ADC        0
-#define RP2350_RESET_BUSCTRL    1
-#define RP2350_RESET_IO_BANK0   6
-#define RP2350_RESET_IO_QSPI    7
-#define RP2350_RESET_PADS_BANK0 9
-#define RP2350_RESET_PADS_QSPI  10
-#define RP2350_RESET_PLL_SYS    14
-#define RP2350_RESET_PLL_USB    15
-#define RP2350_RESET_SYSCFG     20
-#define RP2350_RESET_SYSINFO    21
-#define RP2350_RESET_TBMAN      22
-#define RP2350_RESET_TIMER0     23
-#define RP2350_RESET_TIMER1     24
-#define RP2350_RESET_TRNG       25
-#define RP2350_RESET_UART0      26
-#define RP2350_RESET_UART1      27
+typedef struct RP2350ResetWindow {
+    hwaddr base;
+    hwaddr size;
+} RP2350ResetWindow;
 
-/* The device model that is subsystem `bit` as a whole, if there is one. */
-static DeviceState *rp2350_subsystem(RP2350State *s, int bit)
+/*
+ * Each RESETS subsystem and the bus windows of its registers. JTAG has no
+ * registers on the system bus.
+ */
+static const struct {
+    const char *name;
+    RP2350ResetWindow window[RP2350_RESET_MAX_WINDOWS];
+} rp2350_reset_blocks[RP2350_NUM_RESETS] = {
+    [RP2350_RESET_ADC]        = { "adc", { { 0x400a0000, 0x8000 } } },
+    [RP2350_RESET_BUSCTRL]    = { "busctrl", { { 0x40068000, 0x8000 } } },
+    [RP2350_RESET_DMA]        = { "dma", { { 0x50000000, 0x100000 } } },
+    [RP2350_RESET_HSTX]       = { "hstx", { { 0x400c0000, 0x8000 },
+                                            { 0x50600000, 0x100000 } } },
+    [RP2350_RESET_I2C0]       = { "i2c0", { { 0x40090000, 0x8000 } } },
+    [RP2350_RESET_I2C1]       = { "i2c1", { { 0x40098000, 0x8000 } } },
+    [RP2350_RESET_IO_BANK0]   = { "io_bank0", { { 0x40028000, 0x8000 } } },
+    [RP2350_RESET_IO_QSPI]    = { "io_qspi", { { 0x40030000, 0x8000 } } },
+    [RP2350_RESET_JTAG]       = { "jtag" },
+    [RP2350_RESET_PADS_BANK0] = { "pads_bank0", { { 0x40038000, 0x8000 } } },
+    [RP2350_RESET_PADS_QSPI]  = { "pads_qspi", { { 0x40040000, 0x8000 } } },
+    [RP2350_RESET_PIO0]       = { "pio0", { { 0x50200000, 0x100000 } } },
+    [RP2350_RESET_PIO1]       = { "pio1", { { 0x50300000, 0x100000 } } },
+    [RP2350_RESET_PIO2]       = { "pio2", { { 0x50400000, 0x100000 } } },
+    [RP2350_RESET_PLL_SYS]    = { "pll_sys", { { 0x40050000, 0x8000 } } },
+    [RP2350_RESET_PLL_USB]    = { "pll_usb", { { 0x40058000, 0x8000 } } },
+    [RP2350_RESET_PWM]        = { "pwm", { { 0x400a8000, 0x8000 } } },
+    [RP2350_RESET_SHA256]     = { "sha256", { { 0x400f8000, 0x8000 } } },
+    [RP2350_RESET_SPI0]       = { "spi0", { { 0x40080000, 0x8000 } } },
+    [RP2350_RESET_SPI1]       = { "spi1", { { 0x40088000, 0x8000 } } },
+    [RP2350_RESET_SYSCFG]     = { "syscfg", { { 0x40008000, 0x8000 } } },
+    [RP2350_RESET_SYSINFO]    = { "sysinfo", { { 0x40000000, 0x8000 } } },
+    [RP2350_RESET_TBMAN]      = { "tbman", { { 0x40160000, 0x8000 } } },
+    [RP2350_RESET_TIMER0]     = { "timer0", { { 0x400b0000, 0x8000 } } },
+    [RP2350_RESET_TIMER1]     = { "timer1", { { 0x400b8000, 0x8000 } } },
+    [RP2350_RESET_TRNG]       = { "trng", { { 0x400f0000, 0x8000 } } },
+    [RP2350_RESET_UART0]      = { "uart0", { { 0x40070000, 0x8000 } } },
+    [RP2350_RESET_UART1]      = { "uart1", { { 0x40078000, 0x8000 } } },
+    [RP2350_RESET_USBCTRL]    = { "usbctrl", { { 0x50100000, 0x100000 } } },
+};
+
+/*
+ * The IO and pad banks are one device model, whose register blocks are
+ * held in reset individually.
+ */
+static const struct {
+    int reset;
+    unsigned block;
+} rp2350_gpio_resets[] = {
+    { RP2350_RESET_IO_BANK0, RP2350_GPIO_IO_BANK0 },
+    { RP2350_RESET_IO_QSPI, RP2350_GPIO_IO_QSPI },
+    { RP2350_RESET_PADS_BANK0, RP2350_GPIO_PADS_BANK0 },
+    { RP2350_RESET_PADS_QSPI, RP2350_GPIO_PADS_QSPI },
+};
+
+/*
+ * A subsystem in reset does not answer on the bus: reads of its registers
+ * return zero and writes have no effect, without a bus error. Erratum
+ * RP2350-E23 documents this: SYSINFO, left in reset, reads as zero.
+ */
+/* [spec:nuos:req:emu.resets] */
+static MemTxResult rp2350_reset_gate_read(void *opaque, hwaddr addr,
+                                          uint64_t *data, unsigned size,
+                                          MemTxAttrs attrs)
 {
-    switch (bit) {
-    case RP2350_RESET_ADC:
-        return DEVICE(&s->adc);
-    case RP2350_RESET_BUSCTRL:
-        return DEVICE(&s->busctrl);
-    case RP2350_RESET_PLL_SYS:
-        return DEVICE(&s->pll_sys);
-    case RP2350_RESET_PLL_USB:
-        return DEVICE(&s->pll_usb);
-    case RP2350_RESET_SYSCFG:
-        return DEVICE(&s->syscfg);
-    case RP2350_RESET_SYSINFO:
-        return DEVICE(&s->sysinfo);
-    case RP2350_RESET_TBMAN:
-        return DEVICE(&s->tbman);
-    case RP2350_RESET_TIMER0:
-        return DEVICE(&s->timer[0]);
-    case RP2350_RESET_TIMER1:
-        return DEVICE(&s->timer[1]);
-    case RP2350_RESET_TRNG:
-        return DEVICE(&s->trng);
-    case RP2350_RESET_UART0:
-        return DEVICE(&s->uart[0]);
-    case RP2350_RESET_UART1:
-        return DEVICE(&s->uart[1]);
+    RP2350ResetGate *gate = opaque;
+
+    qemu_log_mask(LOG_GUEST_ERROR, "rp2350: read of %s offset 0x%"
+                  HWADDR_PRIx " while it is in reset\n", gate->name, addr);
+    *data = 0;
+    return MEMTX_OK;
+}
+
+/* [spec:nuos:req:emu.resets] */
+static MemTxResult rp2350_reset_gate_write(void *opaque, hwaddr addr,
+                                           uint64_t value, unsigned size,
+                                           MemTxAttrs attrs)
+{
+    RP2350ResetGate *gate = opaque;
+
+    qemu_log_mask(LOG_GUEST_ERROR, "rp2350: write to %s offset 0x%"
+                  HWADDR_PRIx " while it is in reset\n", gate->name, addr);
+    return MEMTX_OK;
+}
+
+static const MemoryRegionOps rp2350_reset_gate_ops = {
+    .read_with_attrs = rp2350_reset_gate_read,
+    .write_with_attrs = rp2350_reset_gate_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+/* [spec:nuos:req:emu.resets] */
+void rp2350_soc_attach_reset(RP2350State *s, int reset, DeviceState *dev)
+{
+    int i;
+
+    assert(reset >= 0 && reset < RP2350_NUM_RESETS);
+    for (i = 0; i < RP2350_RESET_MAX_DEVICES; i++) {
+        if (!s->reset_dev[reset][i]) {
+            s->reset_dev[reset][i] = dev;
+            return;
+        }
     }
-    return NULL;
+    g_assert_not_reached();
+}
+
+/*
+ * RESETS puts subsystems into reset and takes them out. Each attached
+ * device model is held in reset through its Resettable reset, so it
+ * resets on entry and stays inert until released; the subsystem's bus
+ * windows are gated for as long.
+ */
+/* [spec:nuos:req:emu.resets] */
+static void rp2350_soc_reset_hold(void *opaque, uint32_t blocks, bool hold)
+{
+    RP2350State *s = opaque;
+    unsigned gpio = 0;
+    int i, n;
+
+    for (i = 0; i < RP2350_NUM_RESETS; i++) {
+        if (!(blocks & BIT(i))) {
+            continue;
+        }
+        for (n = 0; n < RP2350_RESET_MAX_DEVICES && s->reset_dev[i][n];
+             n++) {
+            Object *obj = OBJECT(s->reset_dev[i][n]);
+
+            if (hold) {
+                resettable_assert_reset(obj, RESET_TYPE_COLD);
+            } else {
+                resettable_release_reset(obj, RESET_TYPE_COLD);
+            }
+        }
+        for (n = 0; n < RP2350_RESET_MAX_WINDOWS; n++) {
+            if (rp2350_reset_blocks[i].window[n].size) {
+                memory_region_set_enabled(&s->reset_gate[i][n].mr, hold);
+            }
+        }
+    }
+    for (i = 0; i < ARRAY_SIZE(rp2350_gpio_resets); i++) {
+        if (blocks & BIT(rp2350_gpio_resets[i].reset)) {
+            gpio |= rp2350_gpio_resets[i].block;
+        }
+    }
+    if (gpio) {
+        rp2350_gpio_hold_blocks(&s->gpio, gpio, hold);
+    }
+}
+
+static void rp2350_soc_init_reset_gates(RP2350State *s)
+{
+    int i, n;
+
+    for (i = 0; i < RP2350_NUM_RESETS; i++) {
+        for (n = 0; n < RP2350_RESET_MAX_WINDOWS; n++) {
+            const RP2350ResetWindow *w = &rp2350_reset_blocks[i].window[n];
+            RP2350ResetGate *gate = &s->reset_gate[i][n];
+            g_autofree char *name = NULL;
+
+            if (!w->size) {
+                continue;
+            }
+            gate->name = rp2350_reset_blocks[i].name;
+            name = g_strdup_printf("rp2350.%s-in-reset", gate->name);
+            memory_region_init_io(&gate->mr, OBJECT(s),
+                                  &rp2350_reset_gate_ops, gate, name,
+                                  w->size);
+            memory_region_set_enabled(&gate->mr, false);
+            memory_region_add_subregion_overlap(s->board_memory, w->base,
+                                                &gate->mr, 1);
+        }
+    }
 }
 
 /*
@@ -272,6 +404,7 @@ static void rp2350_soc_reset_core(RP2350State *s, int n, bool hold,
         return;
     }
     if (n == 0) {
+        rp2350_resets_boot_rom_handoff(&s->resets);
         rp2350_soc_boot_rom_handoff(s, 0);
         rp2350_soc_watchdog_vector(s);
     } else if (!sio_reset) {
@@ -305,7 +438,7 @@ static void rp2350_soc_psm_reset(void *opaque, uint32_t reset, uint32_t held,
     if (reset & BIT(RP2350_PSM_RESETS)) {
         /* The reset controller asserts every subsystem reset. */
         device_cold_reset(DEVICE(&s->resets));
-        subsys = RP2350_RESETS_ALL;
+        subsys = 0;
     }
     if (reset & BIT(RP2350_PSM_CLOCKS)) {
         device_cold_reset(DEVICE(&s->clocks));
@@ -328,22 +461,7 @@ static void rp2350_soc_psm_reset(void *opaque, uint32_t reset, uint32_t held,
      * A watchdog reset of a subsystem pulses its reset: the block restarts
      * from its reset state, but RESETS.RESET keeps what software wrote.
      */
-    for (i = 0; i < 32; i++) {
-        DeviceState *dev = rp2350_subsystem(s, i);
-
-        if ((subsys & BIT(i)) && dev) {
-            device_cold_reset(dev);
-        }
-    }
-    if (subsys & (BIT(RP2350_RESET_IO_BANK0) | BIT(RP2350_RESET_IO_QSPI) |
-                  BIT(RP2350_RESET_PADS_BANK0) |
-                  BIT(RP2350_RESET_PADS_QSPI))) {
-        rp2350_gpio_reset_blocks(&s->gpio,
-                                 subsys & BIT(RP2350_RESET_IO_BANK0),
-                                 subsys & BIT(RP2350_RESET_IO_QSPI),
-                                 subsys & BIT(RP2350_RESET_PADS_BANK0),
-                                 subsys & BIT(RP2350_RESET_PADS_QSPI));
-    }
+    rp2350_resets_pulse(&s->resets, subsys);
 
     for (i = 0; i < RP2350_NUM_CORES; i++) {
         uint32_t stage = BIT(RP2350_PSM_PROC0 + i);
@@ -444,6 +562,66 @@ static void rp2350_soc_accessctrl_changed(Notifier *n, void *data)
     rp2350_gpio_set_nsmask(&s->gpio,
         (uint64_t)rp2350_accessctrl_gpio_nsmask(&s->accessctrl, 1) << 32 |
         rp2350_accessctrl_gpio_nsmask(&s->accessctrl, 0));
+}
+
+/*
+ * nSSPCTLOE of SPI controller n, the active-low output enable of its
+ * clock and frame select, which drive SCK and CSn: outputs in master
+ * mode, inputs in slave mode.
+ */
+/* [spec:nuos:req:emu.spi] */
+static void rp2350_soc_spi_ctloe(void *opaque, int n, int level)
+{
+    RP2350State *s = opaque;
+    RP2350GPIOPort port = n ? RP2350_GPIO_PORT_SPI1 : RP2350_GPIO_PORT_SPI0;
+
+    qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port, RP2350_GPIO_SPI_SCK),
+                 !level);
+    qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port, RP2350_GPIO_SPI_CSN),
+                 !level);
+}
+
+/*
+ * SSI devices on the SPI buses ("spi0", "spi1", e.g. -device
+ * w25q80bl,bus=spi0,cs=17) are off-chip devices: a device's chip select
+ * follows the level of the GPIO pin its "cs" property numbers, whether
+ * the SPI controller's CSn, SIO or anything else drives that pin. Devices
+ * are plugged after the SoC is realized, so they are wired once the
+ * machine is complete. Devices without an SSI chip select, such as a
+ * PL022 slave port, are left alone.
+ */
+/* [spec:nuos:req:emu.spi] */
+static void rp2350_soc_spi_wire_cs(Notifier *notifier, void *data)
+{
+    RP2350State *s = container_of(notifier, RP2350State, spi_cs_notifier);
+    DECLARE_BITMAP(used, RP2350_GPIO_PINS) = {};
+    int i;
+
+    for (i = 0; i < RP2350_NUM_SPIS; i++) {
+        BusChild *kid;
+
+        QTAILQ_FOREACH(kid, &BUS(s->spi[i].ssi)->children, sibling) {
+            DeviceState *dev = kid->child;
+            unsigned pin = SSI_PERIPHERAL(dev)->cs_index;
+
+            if (!object_property_find(OBJECT(dev), SSI_GPIO_CS "[0]")) {
+                continue;
+            }
+            if (pin >= RP2350_GPIO_PINS || test_bit(pin, used)) {
+                error_report("rp2350: %s on spi%d: cs=%u must name a GPIO "
+                             "pin (0-%d) no other SPI device uses",
+                             object_get_typename(OBJECT(dev)), i, pin,
+                             RP2350_GPIO_PINS - 1);
+                exit(1);
+            }
+            set_bit(pin, used);
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), RP2350_GPIO_PAD_OUT,
+                                        pin,
+                                        qdev_get_gpio_in_named(dev,
+                                                               SSI_GPIO_CS,
+                                                               0));
+        }
+    }
 }
 
 /* The Winbond W25Q parts that fit each supported flash size. */
@@ -591,6 +769,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         qdev_prop_set_uint8(armv7m, "num-prio-bits", 4);
         qdev_prop_set_string(armv7m, "cpu-type",
                              ARM_CPU_TYPE_NAME("cortex-m33"));
+        /* [spec:nuos:req:emu.machine+1] */
+        qdev_prop_set_uint64(armv7m, "midr", RP2350_M33_CPUID);
         qdev_prop_set_uint32(armv7m, "init-svtor", s->init_svtor);
         /* QEMU's Cortex-M33 defaults to 16 regions; the RP2350 has 8 each. */
         /* [spec:nuos:req:emu.mpu] */
@@ -633,6 +813,23 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         }
         qdev_connect_gpio_out_named(DEVICE(&s->eppb[i]), "nmi", 0,
                                     qdev_get_gpio_in_named(armv7m, "NMI", 0));
+
+        /*
+         * The processor's own debug components and PPB ROM table. The SCS
+         * identification block lies over the NVIC's SCS and its NS alias,
+         * so these take priority over the armv7m container's regions.
+         */
+        /* [spec:nuos:req:emu.coresight] */
+        qdev_connect_clock_in(DEVICE(&s->m33_debug[i]), "cpuclk", s->sysclk);
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->m33_debug[i]), errp)) {
+            return;
+        }
+        for (n = 0; n < RP2350_M33_DEBUG_NUM_REGIONS; n++) {
+            memory_region_add_subregion_overlap(
+                &s->armv7m[i].container, rp2350_m33_debug_base[n],
+                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->m33_debug[i]), n),
+                2);
+        }
     }
     memory_region_init_alias(&s->eppb_sysmem, obj, "rp2350-eppb.sysmem",
                              sysbus_mmio_get_region(
@@ -702,15 +899,18 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     memory_region_add_subregion(s->board_memory, RP2350_SIO_NONSEC_BASE,
                                 &s->sio_sysmem[1]);
 
+    /*
+     * Counted core accesses go through the core's ACCESSCTRL view, so the
+     * bus security filters refuse them as they refuse uncounted ones.
+     */
     /* [spec:nuos:req:emu.busctrl] */
-    object_property_set_link(OBJECT(&s->busctrl), "memory",
-                             OBJECT(s->board_memory), &error_abort);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->busctrl), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->busctrl), 0, RP2350_BUSCTRL_BASE);
     for (i = 0; i < RP2350_NUM_CORES; i++) {
         rp2350_busctrl_attach_core(&s->busctrl, i, &s->armv7m[i].container,
+                                   rp2350_accessctrl_view(&s->accessctrl, i),
                                    rp2350_sio_view(&s->sio, i, false),
                                    rp2350_sio_view(&s->sio, i, true));
     }
@@ -779,7 +979,6 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             SysBusDevice *dev;
             hwaddr base;
         } blocks[] = {
-            { SYS_BUS_DEVICE(&s->resets), RP2350_RESETS_BASE },
             { SYS_BUS_DEVICE(&s->clocks), RP2350_CLOCKS_BASE },
             { SYS_BUS_DEVICE(&s->xosc), RP2350_XOSC_BASE },
             { SYS_BUS_DEVICE(&s->pll_sys), RP2350_PLL_SYS_BASE },
@@ -909,6 +1108,33 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->adc), 0,
                        qdev_get_gpio_in(dev_soc, RP2350_ADC_IRQ_FIFO));
 
+    /*
+     * HSTX, clocked by clk_hstx. Clock frequencies are not modelled: at
+     * reset CLK_HSTX_CTRL selects clk_sys undivided, which pico-sdk keeps,
+     * so clk_hstx is clk_sys. Its eight outputs drive the HSTX function
+     * of GPIOs 12-19. DREQ_HSTX is connected with the DMA's other
+     * sources.
+     */
+    /* [spec:nuos:req:emu.hstx] */
+    {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->hstx);
+        DeviceState *dev = DEVICE(&s->hstx);
+        int n;
+
+        qdev_connect_clock_in(dev, "clk", s->sysclk);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, RP2350_HSTX_CTRL_BASE);
+        sysbus_mmio_map(sbd, 1, RP2350_HSTX_FIFO_BASE);
+        for (n = 0; n < RP2350_GPIO_HSTX_SIGNALS; n++) {
+            qdev_connect_gpio_out_named(dev, RP2350_HSTX_OUT, n,
+                rp2350_gpio_out_line(&s->gpio, RP2350_GPIO_PORT_HSTX, n));
+            qdev_connect_gpio_out_named(dev, RP2350_HSTX_OE, n,
+                rp2350_gpio_oe_line(&s->gpio, RP2350_GPIO_PORT_HSTX, n));
+        }
+    }
+
     /* [spec:nuos:req:emu.uart] */
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         static const hwaddr base[] = { RP2350_UART0_BASE, RP2350_UART1_BASE };
@@ -929,6 +1155,56 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         /* Output 0 is the PL011's combined UARTINTR. */
         sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(dev_soc, irq[i]));
     }
+
+    /*
+     * SPI0 and SPI1, PL022 r1p4 controllers timed by clk_peri, which is
+     * modelled at clk_sys's rate (pico-sdk runs clk_peri from clk_sys).
+     * Each has its SSI bus "spi0"/"spi1" for off-chip devices, and drives
+     * its SCK, CSn and TX function signals; CSn's pin input is SSPFSSIN,
+     * the select of the controller in slave mode. The DREQs are connected
+     * with the DMA's other sources.
+     */
+    /* [spec:nuos:req:emu.spi] */
+    qdev_init_gpio_in_named(dev_soc, rp2350_soc_spi_ctloe, "spi-nctloe",
+                            RP2350_NUM_SPIS);
+    for (i = 0; i < RP2350_NUM_SPIS; i++) {
+        static const hwaddr base[] = { RP2350_SPI0_BASE, RP2350_SPI1_BASE };
+        static const int irq[] = { RP2350_SPI0_IRQ, RP2350_SPI1_IRQ };
+        RP2350GPIOPort port = i ? RP2350_GPIO_PORT_SPI1
+                                : RP2350_GPIO_PORT_SPI0;
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->spi[i]);
+        DeviceState *dev = DEVICE(sbd);
+
+        qdev_prop_set_string(dev, "bus-name", i ? "spi1" : "spi0");
+        qdev_prop_set_uint8(dev, "revision", 3);
+        qdev_connect_clock_in(dev, "clk", s->sysclk);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        memory_region_init_io(&s->spi_alias[i], obj, &rp2350_alias_ops,
+                              sysbus_mmio_get_region(sbd, 0),
+                              i ? "rp2350-spi1" : "rp2350-spi0",
+                              RP2350_ATOMIC_REGION_SIZE);
+        memory_region_add_subregion(s->board_memory, base[i],
+                                    &s->spi_alias[i]);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(dev_soc, irq[i]));
+
+        qdev_connect_gpio_out_named(dev, PL022_SSP_OUT, PL022_SSPCLKOUT,
+            rp2350_gpio_out_line(&s->gpio, port, RP2350_GPIO_SPI_SCK));
+        qdev_connect_gpio_out_named(dev, PL022_SSP_OUT, PL022_SSPFSSOUT,
+            rp2350_gpio_out_line(&s->gpio, port, RP2350_GPIO_SPI_CSN));
+        qdev_connect_gpio_out_named(dev, PL022_SSP_OUT, PL022_SSPTXD,
+            rp2350_gpio_out_line(&s->gpio, port, RP2350_GPIO_SPI_TX));
+        qdev_connect_gpio_out_named(dev, PL022_SSP_OUT, PL022_NSSPCTLOE,
+            qdev_get_gpio_in_named(dev_soc, "spi-nctloe", i));
+        qdev_connect_gpio_out_named(dev, PL022_SSP_OUT, PL022_NSSPOE,
+            qemu_irq_invert(rp2350_gpio_oe_line(&s->gpio, port,
+                                                RP2350_GPIO_SPI_TX)));
+        rp2350_gpio_connect_in(&s->gpio, port, RP2350_GPIO_SPI_CSN,
+            qdev_get_gpio_in_named(dev, PL022_SSPFSSIN, 0));
+    }
+    s->spi_cs_notifier.notify = rp2350_soc_spi_wire_cs;
+    qemu_add_machine_init_done_notifier(&s->spi_cs_notifier);
 
     /*
      * The self-hosted debug window. Each core sees it through its own view
@@ -1024,6 +1300,15 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             qdev_connect_gpio_out_named(uart, PL011_DMA_REQ, PL011_DMA_RX,
                 qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, tx + 1));
         }
+        for (i = 0; i < RP2350_NUM_SPIS; i++) {
+            DeviceState *spi = DEVICE(&s->spi[i]);
+            int tx = i ? RP2350_DREQ_SPI1_TX : RP2350_DREQ_SPI0_TX;
+
+            qdev_connect_gpio_out_named(spi, PL022_DMA_REQ, PL022_DMA_TX,
+                qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, tx));
+            qdev_connect_gpio_out_named(spi, PL022_DMA_REQ, PL022_DMA_RX,
+                qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, tx + 1));
+        }
         for (i = 0; i < RP2350_PWM_SLICES; i++) {
             qdev_connect_gpio_out_named(DEVICE(&s->pwm), RP2350_PWM_DREQ, i,
                 qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
@@ -1041,6 +1326,57 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_ADC));
         qdev_connect_gpio_out_named(DEVICE(&s->sha256), RP2350_SHA256_DREQ, 0,
             qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_SHA256));
+        qdev_connect_gpio_out_named(DEVICE(&s->hstx), RP2350_HSTX_DREQ, 0,
+            qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_HSTX));
+    }
+
+    /*
+     * RESETS last, once every subsystem's device model is attached. With
+     * no ROM executing, the subsystems the ROM's flash boot path takes out
+     * of reset (the QSPI IO and pads, connecting the flash) start out of
+     * reset.
+     */
+    /* [spec:nuos:req:emu.resets] */
+    {
+        const struct {
+            int reset;
+            void *dev;
+        } devices[] = {
+            { RP2350_RESET_ADC, &s->adc },
+            { RP2350_RESET_BUSCTRL, &s->busctrl },
+            { RP2350_RESET_DMA, &s->dma },
+            { RP2350_RESET_PLL_SYS, &s->pll_sys },
+            { RP2350_RESET_PLL_USB, &s->pll_usb },
+            { RP2350_RESET_PWM, &s->pwm },
+            { RP2350_RESET_SHA256, &s->sha256 },
+            { RP2350_RESET_SYSCFG, &s->syscfg },
+            { RP2350_RESET_SYSINFO, &s->sysinfo },
+            { RP2350_RESET_TBMAN, &s->tbman },
+            { RP2350_RESET_TIMER0, &s->timer[0] },
+            { RP2350_RESET_TIMER1, &s->timer[1] },
+            { RP2350_RESET_TRNG, &s->trng },
+            { RP2350_RESET_UART0, &s->uart[0] },
+            { RP2350_RESET_UART1, &s->uart[1] },
+            { RP2350_RESET_SPI0, &s->spi[0] },
+            { RP2350_RESET_SPI1, &s->spi[1] },
+            { RP2350_RESET_HSTX, &s->hstx },
+        };
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->resets);
+
+        for (i = 0; i < ARRAY_SIZE(devices); i++) {
+            rp2350_soc_attach_reset(s, devices[i].reset,
+                                    DEVICE(devices[i].dev));
+        }
+        rp2350_soc_init_reset_gates(s);
+        rp2350_resets_set_hold_fn(&s->resets, rp2350_soc_reset_hold, s);
+        qdev_prop_set_uint32(DEVICE(sbd), "rom-unreset",
+                             s->core1_launch ?
+                             BIT(RP2350_RESET_IO_QSPI) |
+                             BIT(RP2350_RESET_PADS_QSPI) : 0);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, RP2350_RESETS_BASE);
     }
 
     for (i = 0; i < ARRAY_SIZE(rp2350_peripherals); i++) {
@@ -1059,6 +1395,8 @@ static void rp2350_soc_init(Object *obj)
         object_initialize_child(obj, "armv7m[*]", &s->armv7m[i], TYPE_ARMV7M);
         object_initialize_child(obj, "eppb[*]", &s->eppb[i],
                                 TYPE_RP2350_EPPB);
+        object_initialize_child(obj, "m33-debug[*]", &s->m33_debug[i],
+                                TYPE_RP2350_M33_DEBUG);
     }
 
     object_initialize_child(obj, "accessctrl", &s->accessctrl,
@@ -1091,12 +1429,16 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "sha256", &s->sha256, TYPE_RP2350_SHA256);
     object_initialize_child(obj, "pwm", &s->pwm, TYPE_RP2350_PWM);
     object_initialize_child(obj, "adc", &s->adc, TYPE_RP2350_ADC);
+    object_initialize_child(obj, "hstx", &s->hstx, TYPE_RP2350_HSTX);
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
         object_initialize_child(obj, "timer[*]", &s->timer[i],
                                 TYPE_RP2350_TIMER);
     }
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         object_initialize_child(obj, "uart[*]", &s->uart[i], TYPE_PL011);
+    }
+    for (i = 0; i < RP2350_NUM_SPIS; i++) {
+        object_initialize_child(obj, "spi[*]", &s->spi[i], TYPE_PL022);
     }
     object_initialize_child(obj, "coresight", &s->coresight,
                             TYPE_RP2350_CORESIGHT);

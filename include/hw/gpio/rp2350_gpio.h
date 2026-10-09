@@ -218,6 +218,13 @@ enum {
 #define RP2350_GPIO_PAD_IN "pad-in"
 #define RP2350_GPIO_EXT_NONE 0xff
 
+/*
+ * Named GPIO output array "pad-out", one line per pin: the level on the
+ * pin as a device outside the chip sees it, whoever drives it. Off-chip
+ * devices such as an SPI device's chip select connect here.
+ */
+#define RP2350_GPIO_PAD_OUT "pad-out"
+
 /* Interrupt destinations, in register order. */
 enum {
     RP2350_GPIO_DEST_PROC0,
@@ -277,6 +284,9 @@ struct RP2350GPIOState {
     qemu_irq peri_in_irq[RP2350_GPIO_SIGNALS];
     RP2350GPIOPortRef port_ref[RP2350_GPIO_NUM_PORTS];
 
+    /* RP2350_GPIO_* blocks in reset; set by the SoC's RESETS. */
+    uint32_t held;
+
     /* ACCESSCTRL GPIO_NSMASK1:0, in the SIO layout. */
     uint64_t nsmask;
 
@@ -287,6 +297,7 @@ struct RP2350GPIOState {
 
     qemu_irq irq[RP2350_GPIO_CORES][RP2350_GPIO_CORE_IRQS];
     qemu_irq dormant_wake;
+    qemu_irq pad_out[RP2350_GPIO_PINS];
 
     bool updating;
     bool update_pending;
@@ -326,11 +337,18 @@ bool rp2350_gpio_pin_input_enabled(RP2350GPIOState *s, int p);
  */
 void rp2350_gpio_set_nsmask(RP2350GPIOState *s, uint64_t mask);
 
+/* The register blocks, each a RESETS subsystem. */
+#define RP2350_GPIO_IO_BANK0   (1u << 0)
+#define RP2350_GPIO_IO_QSPI    (1u << 1)
+#define RP2350_GPIO_PADS_BANK0 (1u << 2)
+#define RP2350_GPIO_PADS_QSPI  (1u << 3)
+
 /*
- * Reset the selected register blocks, as their RESETS subsystem resets
- * do. The pad isolation latches are always-on state and keep their values.
+ * Put the selected register blocks into reset (`hold` true), resetting
+ * their registers, or take them out of it. While IO_BANK0 or IO_QSPI is in
+ * reset its edge detectors latch nothing. The pad isolation latches are
+ * always-on state and keep their values.
  */
-void rp2350_gpio_reset_blocks(RP2350GPIOState *s, bool io_bank0, bool io_qspi,
-                              bool pads_bank0, bool pads_qspi);
+void rp2350_gpio_hold_blocks(RP2350GPIOState *s, unsigned blocks, bool hold);
 
 #endif

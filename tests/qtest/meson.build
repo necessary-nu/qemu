@@ -264,12 +264,23 @@ qtests_rp2350 = \
    'rp2350-pwm-test',
    'rp2350-otp-test',
    'rp2350-dma-test',
+   'rp2350-spi-test',
+   'rp2350-m33-debug-test',
+   'rp2350-hstx-test',
    'rp2350-adc-test']
 
 qtests_xtensa = \
   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ?
-    ['esp32-clock-test', 'esp32-spi-dma-test', 'esp32-gpio-test',
-     'esp32-uhci-test', 'esp32-pid-test'] : [])
+    ['esp32-clock-test',
+     'esp32-spi-dma-test',
+     'esp32-gpio-test',
+     'esp32-uhci-test',
+     'esp32-pid-test',
+     'esp32-pcnt-test',
+     'esp32-rmt-test',
+     'esp32-emac-test',
+     'esp32-sdio-test',
+     'esp32-mcpwm-test'] : [])
 
 qtests_stm32l4x5 = \
   ['stm32l4x5_exti-test',

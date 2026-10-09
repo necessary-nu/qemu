@@ -456,6 +456,7 @@ static void rp2350_gpio_propagate(RP2350GPIOState *s, bool force)
 {
     uint8_t in[RP2350_GPIO_SIGNALS] = {};
     uint8_t to_peri[RP2350_GPIO_PINS];
+    bool pad_changed[RP2350_GPIO_PINS];
     int p, i, port;
 
     for (p = 0; p < RP2350_GPIO_PINS; p++) {
@@ -480,6 +481,7 @@ static void rp2350_gpio_propagate(RP2350GPIOState *s, bool force)
         }
         c = s->latch[p];
         level = pad_level(s, p, c);
+        pad_changed[p] = force || level != s->pad_level[p];
         s->pad_level[p] = level;
 
         s->in_from_pad[p] = (c & LATCH_IE) ? level : 0;
@@ -489,11 +491,13 @@ static void rp2350_gpio_propagate(RP2350GPIOState *s, bool force)
         }
 
         irq = over(CTRL_IRQOVER(ctrl), s->in_from_pad[p]);
-        if (irq != s->irq_level[p]) {
+        if (irq != s->irq_level[p] &&
+            !(s->held & (p < RP2350_GPIO_BANK0_PINS ? RP2350_GPIO_IO_BANK0
+                                                    : RP2350_GPIO_IO_QSPI))) {
             s->intr_edge[p / 8] |= (irq ? INT_EDGE_HIGH : INT_EDGE_LOW)
                                    << (4 * (p % 8));
-            s->irq_level[p] = irq;
         }
+        s->irq_level[p] = irq;
     }
 
     /* SIO and PIO see every pin, selected or not. */
@@ -511,6 +515,11 @@ static void rp2350_gpio_propagate(RP2350GPIOState *s, bool force)
         if (force || in[i] != s->peri_in[i]) {
             s->peri_in[i] = in[i];
             qemu_set_irq(s->peri_in_irq[i], in[i]);
+        }
+    }
+    for (p = 0; p < RP2350_GPIO_PINS; p++) {
+        if (pad_changed[p]) {
+            qemu_set_irq(s->pad_out[p], s->pad_level[p]);
         }
     }
 
@@ -978,19 +987,24 @@ static void rp2350_gpio_reset_pads(RP2350GPIOState *s, bool qspi)
     s->pad_swd = PAD_SWD_RESET;
 }
 
-void rp2350_gpio_reset_blocks(RP2350GPIOState *s, bool io_bank0, bool io_qspi,
-                              bool pads_bank0, bool pads_qspi)
+/* [spec:nuos:req:emu.resets] */
+void rp2350_gpio_hold_blocks(RP2350GPIOState *s, unsigned blocks, bool hold)
 {
-    if (io_bank0) {
+    if (!hold) {
+        s->held &= ~blocks;
+        return;
+    }
+    s->held |= blocks;
+    if (blocks & RP2350_GPIO_IO_BANK0) {
         rp2350_gpio_reset_io(s, false);
     }
-    if (io_qspi) {
+    if (blocks & RP2350_GPIO_IO_QSPI) {
         rp2350_gpio_reset_io(s, true);
     }
-    if (pads_bank0) {
+    if (blocks & RP2350_GPIO_PADS_BANK0) {
         rp2350_gpio_reset_pads(s, false);
     }
-    if (pads_qspi) {
+    if (blocks & RP2350_GPIO_PADS_QSPI) {
         rp2350_gpio_reset_pads(s, true);
     }
     rp2350_gpio_update_force(s, true);
@@ -1074,6 +1088,8 @@ static void rp2350_gpio_init(Object *obj)
 
     qdev_init_gpio_in_named(dev, rp2350_gpio_set_pad_in, RP2350_GPIO_PAD_IN,
                             RP2350_GPIO_PINS);
+    qdev_init_gpio_out_named(dev, s->pad_out, RP2350_GPIO_PAD_OUT,
+                             RP2350_GPIO_PINS);
     memset(s->ext, RP2350_GPIO_EXT_NONE, sizeof(s->ext));
 }
 

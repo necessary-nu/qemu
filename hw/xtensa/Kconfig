@@ -27,8 +27,8 @@ config XTENSA_ESP32
     select SSI
     select SSI_M25P80
     select UNIMP
-    select OPENCORES_ETH
     select DWC_SDMMC
+    select SDHCI
     select TMP105
     select LED
     select ESP_RGB
