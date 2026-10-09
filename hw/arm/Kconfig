@@ -406,6 +406,7 @@ config RP2350_SOC
     select RP2350_RCP
     select RP2350_BOOTRAM
     select RP2350_DCP
+    select RP2350_SYSREGS
     select PL011
 
 config STM32L4X5_SOC
