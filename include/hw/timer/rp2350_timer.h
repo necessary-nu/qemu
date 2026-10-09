@@ -31,12 +31,16 @@ struct RP2350TimerState {
     /* The TICKS block and the generator that clocks this timer. */
     RP2350ClkRegsState *ticks;
     uint32_t tick;
+    /* The frequencies of clk_ref, which the tick divides, and clk_sys. */
+    uint32_t ref_hz;
     uint32_t sysclk_hz;
 
     /* The counter as of virtual time sync_ns, and whether it was running. */
     uint64_t count;
     int64_t sync_ns;
     bool running;
+    /* The generator's CYCLES the counter is running at. */
+    uint32_t cycles;
 
     uint32_t timelw;
     uint32_t latched_hi;
