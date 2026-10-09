@@ -394,6 +394,12 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             { SYS_BUS_DEVICE(&s->pll_usb), RP2350_PLL_USB_BASE },
             { SYS_BUS_DEVICE(&s->ticks), RP2350_TICKS_BASE },
             { SYS_BUS_DEVICE(&s->bootram), RP2350_BOOTRAM_BASE },
+            { SYS_BUS_DEVICE(&s->sysinfo), RP2350_SYSINFO_BASE },
+            { SYS_BUS_DEVICE(&s->syscfg), RP2350_SYSCFG_BASE },
+            { SYS_BUS_DEVICE(&s->tbman), RP2350_TBMAN_BASE },
+            { SYS_BUS_DEVICE(&s->glitch_detector),
+              RP2350_GLITCH_DETECTOR_BASE },
+            { SYS_BUS_DEVICE(&s->dft), RP2350_DFT_BASE },
         };
 
         for (i = 0; i < ARRAY_SIZE(blocks); i++) {
@@ -476,6 +482,13 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "pll_sys", &s->pll_sys, TYPE_RP2350_PLL);
     object_initialize_child(obj, "pll_usb", &s->pll_usb, TYPE_RP2350_PLL);
     object_initialize_child(obj, "ticks", &s->ticks, TYPE_RP2350_TICKS);
+    /* [spec:nuos:req:emu.system-regs] */
+    object_initialize_child(obj, "sysinfo", &s->sysinfo, TYPE_RP2350_SYSINFO);
+    object_initialize_child(obj, "syscfg", &s->syscfg, TYPE_RP2350_SYSCFG);
+    object_initialize_child(obj, "tbman", &s->tbman, TYPE_RP2350_TBMAN);
+    object_initialize_child(obj, "glitch_detector", &s->glitch_detector,
+                            TYPE_RP2350_GLITCH_DETECTOR);
+    object_initialize_child(obj, "dft", &s->dft, TYPE_RP2350_DFT);
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
         object_initialize_child(obj, "timer[*]", &s->timer[i],
                                 TYPE_RP2350_TIMER);

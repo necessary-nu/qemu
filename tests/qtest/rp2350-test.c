@@ -74,7 +74,6 @@ static void test_memory_map(void)
         uint64_t base;
         uint64_t size;
     } unimplemented[] = {
-        { "rp2350.sysinfo",    0x40000000, 0x8000 },
         { "rp2350.psm",        0x40018000, 0x8000 },
         { "rp2350.io_bank0",   0x40028000, 0x8000 },
         { "rp2350.spi0",       0x40080000, 0x8000 },
@@ -94,6 +93,12 @@ static void test_memory_map(void)
                           "(prio 0, rom): rp2350.flash");
     assert_mtree_has(qts, "0000000020000000-0000000020081fff "
                           "(prio 0, ram): rp2350.sram");
+    assert_mtree_has(qts, "0000000040000000-0000000040003fff "
+                          "(prio 0, i/o): rp2350-sysinfo");
+    assert_mtree_has(qts, "0000000040004000-0000000040007fff "
+                          "(prio -1000, i/o): rp2350.sysinfo @0000000000004000");
+    assert_mtree_has(qts, "0000000040158000-000000004015bfff "
+                          "(prio 0, i/o): rp2350-glitch-detector");
     assert_mtree_has(qts, "0000000040020000-0000000040023fff "
                           "(prio 0, i/o): rp2350-resets");
     assert_mtree_has(qts, "0000000040024000-0000000040027fff "
