@@ -13,6 +13,10 @@ config FDC_SYSBUS
 config SSI_M25P80
     bool
 
+config APS6404L
+    bool
+    select SSI
+
 config PFLASH_CFI01
     bool
 
