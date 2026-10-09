@@ -220,7 +220,7 @@ struct RP2350State {
     RP2350DCPState dcp;
     RP2350XIPState xip;
     RP2350ClkRegsState clocks;
-    RP2350ClkRegsState xosc;
+    RP2350XOSCState xosc;
     RP2350ClkRegsState pll_sys;
     RP2350ClkRegsState pll_usb;
     RP2350ClkRegsState ticks;
@@ -269,6 +269,15 @@ struct RP2350State {
     MemoryRegion usb_dpram;
 
     MemoryRegion *board_memory;
+
+    /*
+     * DORMANT: the wake events' levels (the GPIO banks' dormant_wake
+     * interrupt and the AON alarm), whether clk_sys is stopped, and which
+     * cores were halted because it stopped.
+     */
+    bool dormant_wake[2];
+    bool clk_sys_stopped;
+    bool core_clock_halted[RP2350_NUM_CORES];
 
     uint32_t flash_size;
     uint32_t psram_size;

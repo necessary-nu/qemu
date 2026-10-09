@@ -916,11 +916,134 @@ static bool rp2350_soc_procs_asleep(void *opaque)
         return true;
     }
     for (i = 0; i < RP2350_NUM_CORES; i++) {
-        if (!CPU(s->armv7m[i].cpu)->halted) {
+        /* A core whose clock stopped is not asleep. */
+        if (!CPU(s->armv7m[i].cpu)->halted || s->core_clock_halted[i]) {
             return false;
         }
     }
     return true;
+}
+
+static int rp2350_soc_core_index(RP2350State *s, CPUState *cs)
+{
+    return ARM_CPU(cs) == s->armv7m[0].cpu ? 0 : 1;
+}
+
+/*
+ * Run on a core when clk_sys stops: halt it where it is. The flag that
+ * stops interrupts waking it is already set. A core already halted (in
+ * WFI or WFE, or powered off) stays as it is.
+ */
+static void rp2350_soc_core_clock_stop(CPUState *cs, run_on_cpu_data data)
+{
+    RP2350State *s = data.host_ptr;
+    int n = rp2350_soc_core_index(s, cs);
+
+    if (!qatomic_read(&ARM_CPU(cs)->clock_stopped) || cs->halted) {
+        return;
+    }
+    cs->halted = 1;
+    s->core_clock_halted[n] = true;
+}
+
+/*
+ * Run on a core when clk_sys restarts: a core the stop halted carries on
+ * from the instruction after the one it stopped at, unless a reset has
+ * since powered it off. A core halted in WFI or WFE goes on waiting.
+ */
+static void rp2350_soc_core_clock_start(CPUState *cs, run_on_cpu_data data)
+{
+    RP2350State *s = data.host_ptr;
+    ARMCPU *cpu = ARM_CPU(cs);
+    int n = rp2350_soc_core_index(s, cs);
+
+    if (qatomic_read(&cpu->clock_stopped) || !s->core_clock_halted[n]) {
+        return;
+    }
+    s->core_clock_halted[n] = false;
+    if (qatomic_read(&cpu->power_state) != PSCI_OFF && !cpu->m_locked_up) {
+        cs->halted = 0;
+    }
+}
+
+static bool rp2350_soc_root_running(RP2350State *s, RP2350ClockRoot root)
+{
+    switch (root) {
+    case RP2350_ROOT_XOSC:
+        return !rp2350_xosc_dormant(&s->xosc);
+    case RP2350_ROOT_ROSC:
+        return !rp2350_rosc_dormant(&s->rosc);
+    default:
+        return true;
+    }
+}
+
+/*
+ * Stop or restart the clocks that run from an oscillator in DORMANT.
+ * clk_ref drives the TICKS generators, so TIMER0/1, the watchdog and the
+ * other tick consumers stop with it. clk_sys clocks the processors: they
+ * stop executing, and nothing but the clock restarting resumes them.
+ *
+ * A core stops at the end of the code block it is executing, so on the
+ * core that entered DORMANT, the instructions after the write in the same
+ * straight-line run complete before the clock stops rather than after it
+ * restarts; a STATUS poll, as pico-sdk follows the write with, reads the
+ * oscillator stopped and so does not complete.
+ */
+/* [spec:nuos:req:emu.clocks] */
+static void rp2350_soc_clocks_update(void *opaque)
+{
+    RP2350State *s = opaque;
+    bool ref = rp2350_soc_root_running(s, rp2350_clocks_root(&s->clocks,
+                                                             false));
+    bool sys = rp2350_soc_root_running(s, rp2350_clocks_root(&s->clocks,
+                                                             true));
+    int i;
+
+    rp2350_ticks_set_clocks(&s->ticks, ref, sys);
+    if (s->clk_sys_stopped == !sys) {
+        return;
+    }
+    s->clk_sys_stopped = !sys;
+    for (i = 0; i < RP2350_NUM_CORES; i++) {
+        CPUState *cs = CPU(s->armv7m[i].cpu);
+
+        qatomic_set(&s->armv7m[i].cpu->clock_stopped, !sys);
+        async_run_on_cpu(cs, sys ? rp2350_soc_core_clock_start
+                                 : rp2350_soc_core_clock_stop,
+                         RUN_ON_CPU_HOST_PTR(s));
+    }
+}
+
+/* An oscillator entered DORMANT, or became stable after waking. */
+static void rp2350_soc_osc_dormant(void *opaque, int n, int level)
+{
+    RP2350State *s = opaque;
+
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->powman),
+                                        RP2350_POWMAN_XOSC_DORMANT, 0),
+                 rp2350_xosc_dormant(&s->xosc));
+    rp2350_soc_clocks_update(s);
+}
+
+/*
+ * The DORMANT wake events: input 0 is the GPIO banks' dormant_wake
+ * interrupt, input 1 the AON timer alarm. Either wakes whichever
+ * oscillator is DORMANT.
+ */
+/* [spec:nuos:req:emu.gpio] */
+/* [spec:nuos:req:emu.powman] */
+static void rp2350_soc_dormant_wake(void *opaque, int n, int level)
+{
+    RP2350State *s = opaque;
+    bool wake;
+
+    s->dormant_wake[n] = level;
+    wake = s->dormant_wake[0] || s->dormant_wake[1];
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->xosc),
+                                        RP2350_OSC_DORMANT_WAKE, 0), wake);
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->rosc),
+                                        RP2350_OSC_DORMANT_WAKE, 0), wake);
 }
 
 /* [spec:nuos:req:emu.powman] */
@@ -1460,6 +1583,22 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             0, qdev_get_gpio_in_named(powman, RP2350_POWMAN_GLITCH_RESET, 0));
     }
 
+    /*
+     * DORMANT. The GPIO banks' dormant_wake interrupt and the AON timer
+     * alarm wake the oscillators, and an oscillator in DORMANT stops the
+     * clocks running from it.
+     */
+    /* [spec:nuos:req:emu.clocks] */
+    qdev_connect_gpio_out_named(DEVICE(&s->gpio), RP2350_GPIO_DORMANT_WAKE, 0,
+        qdev_get_gpio_in_named(DEVICE(s), "dormant-wake", 0));
+    qdev_connect_gpio_out_named(DEVICE(&s->powman), RP2350_POWMAN_ALARM_WAKE,
+        0, qdev_get_gpio_in_named(DEVICE(s), "dormant-wake", 1));
+    qdev_connect_gpio_out_named(DEVICE(&s->xosc), RP2350_OSC_DORMANT, 0,
+        qdev_get_gpio_in_named(DEVICE(s), "osc-dormant", 0));
+    qdev_connect_gpio_out_named(DEVICE(&s->rosc), RP2350_OSC_DORMANT, 0,
+        qdev_get_gpio_in_named(DEVICE(s), "osc-dormant", 0));
+    rp2350_clocks_set_notify(&s->clocks, rp2350_soc_clocks_update, s);
+
     /* [spec:nuos:req:emu.timer] */
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
         static const hwaddr base[] = {
@@ -1974,6 +2113,10 @@ static void rp2350_soc_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(s), rp2350_soc_sysresetreq, "sysresetreq",
                             RP2350_NUM_CORES);
     s->sysresetreq_bh = qemu_bh_new(rp2350_soc_sysresetreq_run, s);
+    qdev_init_gpio_in_named(DEVICE(s), rp2350_soc_dormant_wake,
+                            "dormant-wake", 2);
+    qdev_init_gpio_in_named(DEVICE(s), rp2350_soc_osc_dormant,
+                            "osc-dormant", 1);
 
     s->sysclk = qdev_init_clock_out(DEVICE(s), "sysclk");
     s->refclk[0] = qdev_init_clock_out(DEVICE(s), "refclk0");

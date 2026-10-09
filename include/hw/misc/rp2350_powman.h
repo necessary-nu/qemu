@@ -48,6 +48,8 @@ enum {
  *   "glitch-reset"  a glitch detector trigger resetting the chip
  *   "gpio"          one line per pin (RP2350_GPIO_PINS), the pin's input
  *                   level, for the power-up and time reference sources
+ *   "xosc-dormant"  high while the XOSC is stopped by DORMANT, which stops
+ *                   an AON timer running from it
  * Named GPIO outputs:
  *   "psm-watchdog"  the watchdog reset passed on to the PSM
  *   "psm-reset"     pulsed to run the PSM's full sequence (a chip-level
@@ -56,6 +58,8 @@ enum {
  *   "watchdog-reset" pulsed to reset the watchdog, scratch registers
  *                   included, in a chip-level reset carried out without a
  *                   system reset (a glitch detector trigger)
+ *   "alarm-wake"    pulsed by each AON timer alarm event (the rising edge
+ *                   of the alarm comparison), a DORMANT wake event
  */
 #define RP2350_POWMAN_WATCHDOG "watchdog"
 #define RP2350_POWMAN_GLITCH_RESET "glitch-reset"
@@ -63,6 +67,8 @@ enum {
 #define RP2350_POWMAN_PSM_WATCHDOG "psm-watchdog"
 #define RP2350_POWMAN_PSM_RESET "psm-reset"
 #define RP2350_POWMAN_WATCHDOG_RESET "watchdog-reset"
+#define RP2350_POWMAN_XOSC_DORMANT "xosc-dormant"
+#define RP2350_POWMAN_ALARM_WAKE "alarm-wake"
 
 /*
  * What the power manager asks of the rest of the chip. The switched core
@@ -89,6 +95,7 @@ struct RP2350PowmanState {
     qemu_irq psm_watchdog;
     qemu_irq psm_reset;
     qemu_irq watchdog_reset;
+    qemu_irq alarm_wake;
     /* Sequencer steps, and polling the processors while WAITING. */
     QEMUTimer *seq_timer;
     QEMUTimer *alarm_timer;
@@ -159,6 +166,8 @@ struct RP2350PowmanState {
     uint32_t aon_lpck_acc;
     /* The alarm comparison, whose rising edge sets TIMER.ALARM. */
     bool alarm_cmp;
+    /* The XOSC is stopped by DORMANT. */
+    bool xosc_dormant;
 
     uint32_t pwrup[RP2350_POWMAN_PWRUPS];
     /* Latched edges of the edge-sensitive power-up sources. */

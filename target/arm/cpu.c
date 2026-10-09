@@ -152,6 +152,11 @@ static bool arm_cpu_has_work(CPUState *cs)
         return false;
     }
 
+    /* A core whose clock is stopped executes nothing. */
+    if (qatomic_read(&cpu->clock_stopped)) {
+        return false;
+    }
+
     /*
      * Only another PSCI call can wake the CPU up in which case the
      * power_state would be set by arm_set_cpu_on_and_reset_async_work()
