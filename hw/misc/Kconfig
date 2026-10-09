@@ -152,6 +152,9 @@ config RP2350_TRNG
 config RP2350_CORESIGHT
     bool
 
+config RP2350_ACCESSCTRL
+    bool
+
 config STM32L4X5_SYSCFG
     bool
 

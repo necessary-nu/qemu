@@ -220,6 +220,17 @@ qemu_irq rp2350_soc_core_irq(RP2350State *s, int core, int n)
     return qdev_get_gpio_in(DEVICE(&s->eppb[core]), n);
 }
 
+/* The IO and pad banks follow ACCESSCTRL's GPIO Non-secure masks. */
+/* [spec:nuos:req:emu.accessctrl] */
+static void rp2350_soc_accessctrl_changed(Notifier *n, void *data)
+{
+    RP2350State *s = container_of(n, RP2350State, accessctrl_notifier);
+
+    rp2350_gpio_set_nsmask(&s->gpio,
+        (uint64_t)rp2350_accessctrl_gpio_nsmask(&s->accessctrl, 1) << 32 |
+        rp2350_accessctrl_gpio_nsmask(&s->accessctrl, 0));
+}
+
 /* [spec:nuos:req:emu.machine+1] */
 static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 {
@@ -283,6 +294,19 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     clock_set_hz(s->sysclk, RP2350_SYSCLK_HZ);
     clock_set_hz(s->refclk, RP2350_REFCLK_HZ);
 
+    /*
+     * The bus filters stand between each core and board memory, so every
+     * core reaches the board through its ACCESSCTRL view of the bus.
+     */
+    /* [spec:nuos:req:emu.accessctrl] */
+    object_property_set_link(OBJECT(&s->accessctrl), "bus",
+                             OBJECT(s->board_memory), &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->accessctrl), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->accessctrl), 0,
+                    RP2350_ACCESSCTRL_BASE);
+
     for (i = 0; i < RP2350_NUM_CORES; i++) {
         DeviceState *armv7m = DEVICE(&s->armv7m[i]);
         int n;
@@ -304,10 +328,10 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         qdev_prop_set_bit(armv7m, "start-powered-off", i != 0);
         qdev_connect_clock_in(armv7m, "cpuclk", s->sysclk);
         qdev_connect_clock_in(armv7m, "refclk", s->refclk);
-        memory_region_init_alias(&s->core_memory[i], obj, "rp2350.core-memory",
-                                 s->board_memory, 0, UINT64_MAX);
         object_property_set_link(OBJECT(armv7m), "memory",
-                                 OBJECT(&s->core_memory[i]), &error_abort);
+                                 OBJECT(rp2350_accessctrl_view(&s->accessctrl,
+                                                               i)),
+                                 &error_abort);
         if (!sysbus_realize(SYS_BUS_DEVICE(armv7m), errp)) {
             return;
         }
@@ -363,6 +387,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
     /* [spec:nuos:req:emu.sio] */
     qdev_prop_set_bit(DEVICE(&s->sio), "core1-launch", s->core1_launch);
+    object_property_set_link(OBJECT(&s->sio), "accessctrl",
+                             OBJECT(&s->accessctrl), &error_abort);
     rp2350_sio_set_core1_launch(&s->sio, rp2350_core1_launch, s);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->sio), errp)) {
         return;
@@ -425,6 +451,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpio), errp)) {
         return;
     }
+    s->accessctrl_notifier.notify = rp2350_soc_accessctrl_changed;
+    rp2350_accessctrl_add_notifier(&s->accessctrl, &s->accessctrl_notifier);
     {
         static const hwaddr base[] = {
             RP2350_IO_BANK0_BASE, RP2350_IO_QSPI_BASE,
@@ -604,6 +632,8 @@ static void rp2350_soc_init(Object *obj)
                                 TYPE_RP2350_EPPB);
     }
 
+    object_initialize_child(obj, "accessctrl", &s->accessctrl,
+                            TYPE_RP2350_ACCESSCTRL);
     object_initialize_child(obj, "resets", &s->resets, TYPE_RP2350_RESETS);
     object_initialize_child(obj, "sio", &s->sio, TYPE_RP2350_SIO);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_RP2350_GPIO);

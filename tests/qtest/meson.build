@@ -256,7 +256,8 @@ qtests_rp2350 = \
    'rp2350-busctrl-test',
    'rp2350-rosc-test',
    'rp2350-trng-test',
-   'rp2350-coresight-test']
+   'rp2350-coresight-test',
+   'rp2350-accessctrl-test']
 
 qtests_stm32l4x5 = \
   ['stm32l4x5_exti-test',

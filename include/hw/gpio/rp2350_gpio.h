@@ -310,7 +310,8 @@ void rp2350_gpio_connect_in(RP2350GPIOState *s, RP2350GPIOPort port, int n,
  * Set the ACCESSCTRL GPIO_NSMASK1:0 pair (SIO layout). A pin whose bit is
  * set is Non-secure accessible: its interrupts go to the _NS outputs and
  * Non-secure code may access its IO and pad registers; Non-secure accesses
- * to other pins' registers read zero and are ignored. Resets to 0.
+ * to other pins' registers read zero and are ignored. The mask is
+ * ACCESSCTRL state, so resets of the GPIO banks leave it alone.
  */
 void rp2350_gpio_set_nsmask(RP2350GPIOState *s, uint64_t mask);
 
