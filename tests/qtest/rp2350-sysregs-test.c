@@ -206,12 +206,22 @@ static void test_glitch_reset(void)
     /* Any value but 0x5bad arms the detectors; DISARM is then ignored. */
     qtest_writel(qts, GD_ARM, 0x1234);
     qtest_writel(qts, GD_DISARM, 0xdcaf);
+    qtest_writel(qts, GD_SENSITIVITY, 0xde00002a);
+    qtest_writel(qts, DBGFORCE, 0xe);
     qtest_writel(qts, GD_TRIG_FORCE, 0x2);
-    qtest_qmp_eventwait(qts, "RESET");
 
-    /* The detector block keeps its state across the reset it caused. */
+    /*
+     * The trigger resets the PSM, and with it every subsystem through
+     * RESETS, SYSCFG among them. The detector block is outside the PSM's
+     * reset domain and keeps its state across the reset it caused.
+     */
+    g_assert_cmphex(qtest_readl(qts, RP2350_RESETS_RESET_DONE), ==, 0);
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
+    g_assert_cmphex(qtest_readl(qts, DBGFORCE), ==, 0x6);
     g_assert_cmphex(qtest_readl(qts, GD_TRIG_STATUS), ==, 0x2);
     g_assert_cmphex(qtest_readl(qts, GD_ARM), ==, 0x1234);
+    g_assert_cmphex(qtest_readl(qts, GD_DISARM), ==, 0xdcaf);
+    g_assert_cmphex(qtest_readl(qts, GD_SENSITIVITY), ==, 0xde00002a);
 
     /* Any other system reset clears it. */
     qtest_system_reset(qts);
@@ -250,7 +260,7 @@ static void test_glitch_otp_armed(void)
     /* Any other DISARM value leaves them armed. */
     qtest_writel(qts, GD_DISARM, 0xdcae);
     qtest_writel(qts, GD_TRIG_FORCE, 0x4);
-    qtest_qmp_eventwait(qts, "RESET");
+    g_assert_cmphex(qtest_readl(qts, RP2350_RESETS_RESET_DONE), ==, 0);
     g_assert_cmphex(qtest_readl(qts, GD_TRIG_STATUS), ==, 0x5);
     qtest_quit(qts);
     unlink(otp_path);

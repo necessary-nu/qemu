@@ -19,6 +19,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350WatchdogState, RP2350_WATCHDOG)
 
 #define RP2350_WATCHDOG_SCRATCH 8
 
+#define RP2350_WATCHDOG_CHIP_RESET "chip-reset"
+
 /* REASON bits: why the watchdog last reset the chip. */
 #define RP2350_WATCHDOG_REASON_TIMER (1u << 0)
 #define RP2350_WATCHDOG_REASON_FORCE (1u << 1)
@@ -26,6 +28,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350WatchdogState, RP2350_WATCHDOG)
 /*
  * The watchdog's reset request is its single GPIO output, pulsed when the
  * counter expires or TRIGGER is written; the PSM runs the reset sequence.
+ * Its named GPIO input "chip-reset", pulsed by the power manager, resets
+ * the watchdog, scratch registers included, for a chip-level reset that
+ * is not a system reset.
  */
 struct RP2350WatchdogState {
     SysBusDevice parent_obj;

@@ -1292,7 +1292,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     /*
      * POWMAN. The watchdog's reset request passes through it on the way
      * to the PSM, so that its WDSEL can make it a chip-level reset, and a
-     * glitch detector trigger is a chip-level reset it records.
+     * glitch detector trigger is a chip-level reset it records and
+     * carries out by resetting the PSM and the watchdog.
      */
     /* [spec:nuos:req:emu.powman] */
     {
@@ -1319,6 +1320,9 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             qdev_get_gpio_in_named(DEVICE(&s->psm), "watchdog", 0));
         qdev_connect_gpio_out_named(powman, RP2350_POWMAN_PSM_RESET, 0,
             qdev_get_gpio_in_named(DEVICE(&s->psm), "powman-reset", 0));
+        qdev_connect_gpio_out_named(powman, RP2350_POWMAN_WATCHDOG_RESET, 0,
+            qdev_get_gpio_in_named(DEVICE(&s->watchdog),
+                                   RP2350_WATCHDOG_CHIP_RESET, 0));
         qdev_connect_gpio_out_named(DEVICE(&s->glitch_detector), "chip-reset",
             0, qdev_get_gpio_in_named(powman, RP2350_POWMAN_GLITCH_RESET, 0));
     }

@@ -10,7 +10,8 @@
  * divides clk_ref by its CYCLES setting. When the counter reaches zero, or
  * TRIGGER is written, the watchdog records why in REASON and requests a
  * reset, which the PSM carries out (see rp2350_psm.c). The watchdog itself
- * is reset only by a chip-level reset (a QEMU system reset), so its
+ * is reset only by a chip-level reset (a QEMU system reset, or the power
+ * manager's chip-reset input for a glitch detector trigger), so its
  * scratch registers and REASON survive the resets it requests.
  *
  * Firing also clears ENABLE: the block is not reset by its own reset, so
@@ -223,6 +224,18 @@ static void rp2350_watchdog_exit_reset(Object *obj, ResetType type)
     wd_restart(s);
 }
 
+/*
+ * A chip-level reset that the power manager carries out without a system
+ * reset.
+ */
+/* [spec:nuos:req:emu.watchdog] */
+static void rp2350_watchdog_chip_reset(void *opaque, int n, int level)
+{
+    if (level) {
+        device_cold_reset(DEVICE(opaque));
+    }
+}
+
 static void rp2350_watchdog_realize(DeviceState *dev, Error **errp)
 {
     RP2350WatchdogState *s = RP2350_WATCHDOG(dev);
@@ -248,6 +261,8 @@ static void rp2350_watchdog_init(Object *obj)
                           TYPE_RP2350_WATCHDOG, RP2350_ATOMIC_REGION_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out(DEVICE(obj), &s->reset_req, 1);
+    qdev_init_gpio_in_named(DEVICE(obj), rp2350_watchdog_chip_reset,
+                            RP2350_WATCHDOG_CHIP_RESET, 1);
 }
 
 static const VMStateDescription vmstate_rp2350_watchdog = {

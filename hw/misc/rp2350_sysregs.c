@@ -21,7 +21,6 @@
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_sysregs.h"
 #include "migration/vmstate.h"
-#include "system/runstate.h"
 
 /* SYSINFO */
 #define A_SYSINFO_CHIP_ID       0x00
@@ -270,14 +269,14 @@ static void glitch_detector_trigger(RP2350GlitchDetectorState *s,
     s->trig_status |= dets;
     if (glitch_detector_armed(s)) {
         /*
-         * An armed trigger resets the PSM, which resets the processors and
-         * every block downstream of it; the system reset stands in for
-         * that. The detector's own registers are not in the PSM's reset
-         * domain, so TRIG_STATUS still shows which detector fired.
+         * An armed trigger is a chip-level reset through the power
+         * manager, which records it and resets the PSM and the watchdog.
+         * It is not a reset of the whole switched core: the detector's own
+         * registers are outside the PSM's reset domain, so TRIG_STATUS
+         * still shows which detector fired, and ARM, DISARM, SENSITIVITY
+         * and LOCK keep their values.
          */
-        s->reset_pending = true;
         qemu_irq_pulse(s->chip_reset);
-        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
 }
 
@@ -490,14 +489,9 @@ static void rp2350_glitch_detector_hold_reset(Object *obj, ResetType type)
     RP2350GlitchDetectorState *s = RP2350_GLITCH_DETECTOR(obj);
 
     /*
-     * A reset the detector caused leaves its registers alone, so software
-     * can read TRIG_STATUS after the reboot. Every other system reset
-     * stands for a reset of the whole switched core domain.
+     * A system reset stands for a reset of the whole switched core
+     * domain, which clears the detectors and their registers.
      */
-    if (s->reset_pending) {
-        s->reset_pending = false;
-        return;
-    }
     s->arm = GD_ARM_NO;
     s->disarm = 0;
     s->sensitivity = 0;
@@ -529,8 +523,8 @@ static void rp2350_glitch_detector_init(Object *obj)
 
 static const VMStateDescription vmstate_rp2350_glitch_detector = {
     .name = TYPE_RP2350_GLITCH_DETECTOR,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(otp_enable, RP2350GlitchDetectorState),
         VMSTATE_UINT32(arm, RP2350GlitchDetectorState),
@@ -538,7 +532,6 @@ static const VMStateDescription vmstate_rp2350_glitch_detector = {
         VMSTATE_UINT32(sensitivity, RP2350GlitchDetectorState),
         VMSTATE_UINT32(lock, RP2350GlitchDetectorState),
         VMSTATE_UINT32(trig_status, RP2350GlitchDetectorState),
-        VMSTATE_BOOL(reset_pending, RP2350GlitchDetectorState),
         VMSTATE_END_OF_LIST()
     },
 };
