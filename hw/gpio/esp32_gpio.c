@@ -910,6 +910,32 @@ int esp32_gpio_sig_in_pad(Esp32GpioState *s, unsigned sig)
     return pad;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.analog]
+ * Whether pad n is driven digitally, by a driver outside the chip or by its
+ * own output driver (an open-drain pad's high output does not drive it),
+ * and at what level.
+ */
+bool esp32_gpio_pad_driven(Esp32GpioState *s, unsigned n, bool *level)
+{
+    bool val, oe;
+
+    if (n >= ESP32_GPIO_PIN_COUNT || !bit64(PAD_VALID, n)) {
+        return false;
+    }
+    if (bit64(s->ext_driven, n)) {
+        *level = bit64(s->ext_level, n);
+        return true;
+    }
+    esp32_gpio_pad_drive(s, n, &val, &oe);
+    if (!bit64(s->rtc_mux, n) &&
+        FIELD_EX32(s->pin[n], GPIO_PIN0, PAD_DRIVER) && val) {
+        oe = false;
+    }
+    *level = val;
+    return oe;
+}
+
 void esp32_gpio_add_route_notifier(Esp32GpioState *s, Notifier *n)
 {
     notifier_list_add(&s->route_notifiers, n);

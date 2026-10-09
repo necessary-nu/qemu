@@ -17,6 +17,7 @@
 
 typedef struct Esp32GpioState Esp32GpioState;
 typedef struct Esp32ApbCtrlState Esp32ApbCtrlState;
+typedef struct Esp32SensState Esp32SensState;
 
 #define TYPE_ESP32_I2S "esp32.i2s"
 OBJECT_DECLARE_SIMPLE_TYPE(Esp32I2sState, ESP32_I2S)
@@ -134,6 +135,8 @@ struct Esp32I2sState {
     AddressSpace dma_as;
     Esp32GpioState *gpio;
     Esp32ApbCtrlState *apb_ctrl;
+    /* SENS, with the SAR ADCs and DACs of I2S0's ADC and DAC modes */
+    Esp32SensState *sens;
     /* The other controller, which shares the GPIO matrix with this one */
     Esp32I2sState *peer;
     uint8_t id;
@@ -252,7 +255,6 @@ struct Esp32I2sState {
 
     bool in_kick;
     bool kick_again;
-    bool logged_adc;
     bool logged_pdm_in;
 };
 

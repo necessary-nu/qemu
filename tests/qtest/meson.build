@@ -287,6 +287,7 @@ qtests_xtensa = \
      'esp32-sdio-test',
      'esp32-mcpwm-test',
      'esp32-rtc-test',
+     'esp32-analog-test',
      'esp32-i2s-test',
      'esp32-periph-lines-test',
      'esp32-timg-cal-test'] : [])

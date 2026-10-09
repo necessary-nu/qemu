@@ -11,6 +11,8 @@
 #include "hw/gpio/esp32_rtcio.h"
 #include "hw/misc/esp32_dport.h"
 #include "hw/misc/esp32_apb_ctrl.h"
+#include "hw/misc/esp32_ana.h"
+#include "hw/misc/esp32_sens.h"
 #include "hw/core/clock.h"
 #include "hw/misc/esp32_rtc_cntl.h"
 #include "hw/misc/esp32_rng.h"
@@ -109,6 +111,8 @@ struct Esp32SocState {
     Esp32RngState rng;
     Esp32RtcCntlState rtc_cntl;
     Esp32RtcIoState rtcio;
+    Esp32AnaState ana;
+    Esp32SensState sens;
     Esp32FrcTimerState frc_timer[ESP32_FRC_COUNT];
     Esp32TimgState timg[ESP32_TIMG_COUNT];
     Esp32SpiState spi[ESP32_SPI_COUNT];
@@ -145,6 +149,12 @@ struct Esp32SocState {
     Clock *cpu_clk;
     uint32_t apb_hz;
     uint32_t ref_tick_hz;
+    /* PLL_F160M_CLK: 160 MHz while the BBPLL runs */
+    uint32_t f160m_hz;
+    /* CPU_CLK's source is off: the CPUs do not run */
+    bool cpu_clk_stopped;
+    /* The PLL_CLK and CPUPERIOD_SEL combination last reported as invalid */
+    uint32_t logged_pll_combo;
     Clock *uart_apb_clk[ESP32_UART_COUNT];
     Clock *uart_ref_tick_clk[ESP32_UART_COUNT];
     Clock *uhci_apb_clk[ESP32_UHCI_COUNT];

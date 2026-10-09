@@ -19,7 +19,6 @@
 #include "hw/core/sysbus.h"
 #include "hw/i2c/esp32_i2c.h"
 #include "hw/xtensa/xtensa_memory.h"
-#include "hw/misc/unimp.h"
 #include "hw/core/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/core/qdev-properties.h"
@@ -248,6 +247,8 @@ static void esp32_soc_reset(DeviceState *dev)
         /* The board's PHY shares the chip's power-on and EN resets. */
         device_cold_reset(DEVICE(&s->phy));
         device_cold_reset(DEVICE(&s->rtcio));
+        device_cold_reset(DEVICE(&s->ana));
+        device_cold_reset(DEVICE(&s->sens));
     }
     if (s->requested_reset & ESP32_SOC_RESET_PERIPH) {
         device_cold_reset(DEVICE(&s->dport));
@@ -397,6 +398,8 @@ static void esp32_cpu_stall(void* opaque, int n, int level)
     } else {
         stall = s->rtc_cntl.cpu_stall_state[1] || s->dport.appcpu_stall_state || (!s->dport.appcpu_clkgate_state);
     }
+    /* [spec:nuos:req:emu.esp32.analog] No CPU_CLK, no instructions */
+    stall = stall || s->cpu_clk_stopped;
 
     if (stall != s->cpu[n].env.runstall) {
         xtensa_runstall(&s->cpu[n].env, stall);
@@ -408,20 +411,15 @@ static void esp32_cpu_stall(void* opaque, int n, int level)
 
 /* RC_FAST_CLK, the internal 8 MHz oscillator, at its nominal frequency */
 #define ESP32_RC_FAST_HZ 8000000
-/* PLL_CLK-derived CPU_CLK frequencies for CPUPERIOD_SEL 0, 1 and 2 */
-static const uint32_t esp32_pll_cpu_hz[] = { 80000000, 160000000, 240000000 };
+/* APB_CLK from PLL_CLK, whichever of its frequencies (TRM table 7.2-4) */
 #define ESP32_PLL_APB_HZ 80000000
 /*
- * PLL_F160M_CLK, divided from PLL_CLK (TRM 7.2.4.5). The PLL's power and
- * lock are not modelled: the clock always runs.
+ * PLL_F160M_CLK, divided from PLL_CLK by a division that adjusts itself to
+ * PLL_CLK's frequency (TRM 7.2.4.5)
  */
 #define ESP32_PLL_F160M_HZ 160000000
-/*
- * APLL_CLK's coefficients are programmed through the analog I2C bus, which
- * is not modelled. Until it is, the APLL is taken to run at the output of
- * its formula with every coefficient 0: 40 MHz * 4 / (2 * 2) = 40 MHz.
- */
-#define ESP32_APLL_UNMODELLED_HZ 40000000
+#define ESP32_PLL_320M_HZ 320000000
+#define ESP32_PLL_480M_HZ 480000000
 
 static bool esp32_gate_running(Esp32PeriphGate *g)
 {
@@ -447,21 +445,33 @@ static void esp32_gate_update_clocks(Esp32SocState *s, Esp32PeriphGate *g)
         clock_update_hz(g->rc_fast_clk, running ? ESP32_RC_FAST_HZ : 0);
     }
     if (g->f160m_clk) {
-        clock_update_hz(g->f160m_clk, running ? ESP32_PLL_F160M_HZ : 0);
+        clock_update_hz(g->f160m_clk, running ? s->f160m_hz : 0);
     }
 }
 
 /*
  * [spec:nuos:req:emu.esp32.clock-gating]
+ * [spec:nuos:req:emu.esp32.analog]
  * Derive CPU_CLK, APB_CLK and REF_TICK from RTC_CNTL_SOC_CLK_SEL,
  * DPORT_CPUPERIOD_SEL and the SYSCON dividers (TRM tables 7.2-2, 7.2-4 and
- * 7.2-5), and pass them to the CPUs and the APB peripherals.
+ * 7.2-5), with PLL_CLK and APLL_CLK as the analog block's BBPLL and APLL
+ * configurations give them, and pass them to the CPUs and the APB
+ * peripherals.
+ *
+ * From PLL_CLK, CPU_CLK is PLL_CLK / 4 with CPUPERIOD_SEL 0 and PLL_CLK / 2
+ * otherwise; the TRM allows 80 and 160 MHz from the 320 MHz PLL_CLK and
+ * 240 MHz from the 480 MHz one. A source that is off (the BBPLL powered
+ * down, or the APLL not powered up) gives no CPU_CLK, and the CPUs stop.
  */
 static void esp32_soc_update_clocks(Esp32SocState *s)
 {
+    MachineState *ms = MACHINE(qdev_get_machine());
     uint32_t sel = s->dport.cpuperiod_sel;
     uint32_t xtal_hz = s->rtc_cntl.xtal_apb_freq;
-    uint32_t cpu_hz, apb_hz, apll_div;
+    uint32_t pll_hz = esp32_ana_pll_hz(&s->ana);
+    uint32_t apll_hz = esp32_ana_apll_hz(&s->ana);
+    uint32_t cpu_hz, apb_hz, apll_div, combo;
+    bool stopped;
 
     switch (s->rtc_cntl.soc_clk) {
     case ESP32_SOC_CLK_XTAL:
@@ -469,14 +479,25 @@ static void esp32_soc_update_clocks(Esp32SocState *s)
         apb_hz = cpu_hz;
         break;
     case ESP32_SOC_CLK_PLL:
-        if (sel >= ARRAY_SIZE(esp32_pll_cpu_hz)) {
+        if (sel > 2) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "esp32: reserved CPUPERIOD_SEL %u with PLL_CLK\n",
                           sel);
             sel = 0;
         }
-        cpu_hz = esp32_pll_cpu_hz[sel];
-        apb_hz = ESP32_PLL_APB_HZ;
+        esp32_ana_check_pll(&s->ana);
+        combo = (pll_hz / 1000000) << 8 | sel;
+        if (pll_hz && combo != s->logged_pll_combo &&
+            !(pll_hz == ESP32_PLL_320M_HZ && sel < 2) &&
+            !(pll_hz == ESP32_PLL_480M_HZ && sel == 2)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "esp32: CPUPERIOD_SEL %u with a %u MHz PLL_CLK is "
+                          "not a CPU_CLK setting the TRM allows\n", sel,
+                          pll_hz / 1000000);
+            s->logged_pll_combo = combo;
+        }
+        cpu_hz = pll_hz / (sel == 0 ? 4 : 2);
+        apb_hz = pll_hz ? ESP32_PLL_APB_HZ : 0;
         break;
     case ESP32_SOC_CLK_8M:
         cpu_hz = ESP32_RC_FAST_HZ / esp32_apb_ctrl_pre_div(&s->apb_ctrl);
@@ -484,16 +505,13 @@ static void esp32_soc_update_clocks(Esp32SocState *s)
         break;
     case ESP32_SOC_CLK_APLL:
     default:
-        qemu_log_mask(LOG_UNIMP,
-                      "esp32: APLL coefficients not modelled, APLL_CLK "
-                      "taken as %u Hz\n", ESP32_APLL_UNMODELLED_HZ);
         if (sel > 1) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "esp32: reserved CPUPERIOD_SEL %u with APLL_CLK\n",
                           sel);
         }
         apll_div = sel == 0 ? 4 : 2;
-        cpu_hz = ESP32_APLL_UNMODELLED_HZ / apll_div;
+        cpu_hz = apll_hz / apll_div;
         apb_hz = cpu_hz / 2;
         break;
     }
@@ -501,10 +519,20 @@ static void esp32_soc_update_clocks(Esp32SocState *s)
     s->apb_hz = apb_hz;
     s->ref_tick_hz = apb_hz / esp32_apb_ctrl_tick_div(&s->apb_ctrl,
                                                       s->rtc_cntl.soc_clk);
+    s->f160m_hz = pll_hz ? ESP32_PLL_F160M_HZ : 0;
+    clock_update_hz(s->apll_clk, apll_hz);
     clock_update_hz(s->cpu_clk, cpu_hz);
     clock_update_hz(s->gpio_apb_clk, s->rtc_cntl.dig_clk_gated ? 0 : apb_hz);
     for (unsigned i = 0; i < s->n_gates; i++) {
         esp32_gate_update_clocks(s, &s->gate[i]);
+    }
+
+    stopped = cpu_hz == 0;
+    if (stopped != s->cpu_clk_stopped) {
+        s->cpu_clk_stopped = stopped;
+        for (int i = 0; i < ms->smp.cpus; i++) {
+            esp32_cpu_stall(s, i, 1);
+        }
     }
 }
 
@@ -716,14 +744,6 @@ static void esp32_soc_add_periph_device(MemoryRegion *dest, void *dev,
     esp32_soc_add_periph_region(dest, dev, 0, dport_base_addr);
 }
 
-static void esp32_soc_add_unimp_device(MemoryRegion *dest, const char* name, hwaddr dport_base_addr, size_t size)
-{
-    create_unimplemented_device(name, dport_base_addr, size);
-    char * name_apb = g_strdup_printf("%s-apb", name);
-    create_unimplemented_device(name_apb, dport_base_addr - DR_REG_DPORT_APB_BASE + APB_REG_BASE, size);
-    g_free(name_apb);
-}
-
 /*
  * [spec:nuos:req:emu.esp32.gpio]
  * The peripherals' line-level signals go through the GPIO matrix, by their
@@ -917,6 +937,19 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                              OBJECT(&s->rtc_cntl), &error_abort);
     qdev_realize(DEVICE(&s->rtc_cntl), &s->rtc_bus, &error_fatal);
     qdev_realize(DEVICE(&s->rtcio), &s->rtc_bus, &error_fatal);
+
+    /*
+     * [spec:nuos:req:emu.esp32.analog]
+     * The analog block, with the internal I2C bus to the BBPLL and the
+     * APLL, whose frequencies the clock tree takes.
+     */
+    object_property_set_link(OBJECT(&s->ana), "rtc-cntl",
+                             OBJECT(&s->rtc_cntl), &error_abort);
+    qdev_realize(DEVICE(&s->ana), &s->rtc_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->ana, DR_REG_ANA_BASE);
+    qdev_connect_gpio_out_named(DEVICE(&s->ana), ESP32_ANA_CLK_UPDATE_GPIO, 0,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32_RTC_CLK_UPDATE_GPIO, 0));
 
     memory_region_add_subregion(sys_mem, memmap[ESP32_MEMREGION_RTCSLOW].base,
                                 &s->rtc_cntl.slow_mem);
@@ -1612,6 +1645,10 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                  OBJECT(&s->apb_ctrl), &error_abort);
         object_property_set_link(OBJECT(i2s), "peer",
                                  OBJECT(&s->i2s[1 - i]), &error_abort);
+        if (i == 0) {
+            object_property_set_link(OBJECT(i2s), "sens", OBJECT(&s->sens),
+                                     &error_abort);
+        }
         qdev_realize(i2s, &s->periph_bus, &error_fatal);
         g = esp32_soc_add_gated_device(s, &s->i2s[i], i2s_base[i],
                                        ESP32_GATE_PERIP, i2s_bit[i],
@@ -1635,8 +1672,37 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         }
     }
 
-    esp32_soc_add_unimp_device(sys_mem, "esp32.analog", DR_REG_ANA_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.sens", DR_REG_SENS_BASE, 0x400);
+    /*
+     * [spec:nuos:req:emu.esp32.analog]
+     * SENS, in the RTC domain, with the SAR ADCs, the DACs, the touch
+     * sensor and the Hall sensor: the touch interrupt and wakeup go to
+     * RTC_CNTL, and I2S0's ADC and DAC modes reach the converters.
+     */
+    object_property_set_link(OBJECT(&s->sens), "rtc-cntl",
+                             OBJECT(&s->rtc_cntl), &error_abort);
+    object_property_set_link(OBJECT(&s->sens), "rtcio", OBJECT(&s->rtcio),
+                             &error_abort);
+    object_property_set_link(OBJECT(&s->sens), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
+    object_property_set_link(OBJECT(&s->sens), "apb-ctrl",
+                             OBJECT(&s->apb_ctrl), &error_abort);
+    qdev_realize(DEVICE(&s->sens), &s->rtc_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->sens, DR_REG_SENS_BASE);
+    qdev_connect_gpio_out_named(DEVICE(&s->sens), ESP32_SENS_TOUCH_INT, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->rtc_cntl),
+                                    ESP32_RTC_INT_IN, ESP32_RTC_INT_TOUCH));
+    qdev_connect_gpio_out_named(DEVICE(&s->sens), ESP32_SENS_TOUCH_WAKEUP, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->rtc_cntl),
+                                    ESP32_RTC_WAKEUP_IN,
+                                    ESP32_RTC_WAKEUP_TOUCH));
+    qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl),
+                                ESP32_RTC_TOUCH_TIMER_GPIO, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->sens),
+                                    ESP32_SENS_TOUCH_TIMER_IN, 0));
+    qdev_connect_gpio_out_named(DEVICE(&s->apb_ctrl),
+                                ESP32_APB_CTRL_SARADC_CTRL_GPIO, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->sens),
+                                    ESP32_SENS_SARADC_CTRL_IN, 0));
 
     esp32_soc_connect_lines(s);
 
@@ -1687,8 +1753,8 @@ static void esp32_soc_init(Object *obj)
         qdev_connect_clock_in(DEVICE(&s->uhci[i]), "apb", s->uhci_apb_clk[i]);
     }
 
+    /* APLL_CLK, off until software powers the APLL up */
     s->apll_clk = clock_new(obj, "apll");
-    clock_set_hz(s->apll_clk, ESP32_APLL_UNMODELLED_HZ);
     for (int i = 0; i < ESP32_I2S_COUNT; ++i) {
         DeviceState *i2s;
 
@@ -1733,6 +1799,8 @@ static void esp32_soc_init(Object *obj)
 
     object_initialize_child(obj, "rtc_cntl", &s->rtc_cntl, TYPE_ESP32_RTC_CNTL);
     object_initialize_child(obj, "rtcio", &s->rtcio, TYPE_ESP32_RTCIO);
+    object_initialize_child(obj, "ana", &s->ana, TYPE_ESP32_ANA);
+    object_initialize_child(obj, "sens", &s->sens, TYPE_ESP32_SENS);
 
     for (int i = 0; i < ESP32_FRC_COUNT; ++i) {
         snprintf(name, sizeof(name), "frc%d", i);
