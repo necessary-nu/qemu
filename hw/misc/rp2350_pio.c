@@ -34,23 +34,34 @@
  *  - Registers are accessed between cycles. An instruction written to
  *    SMx_INSTR executes in the next cycle, which the write runs at once.
  *
- * Time. The blocks hold their state as of a clk_sys cycle and are run
- * forward to the current virtual time before every register access and
- * pin input change. Cycles in which no state machine has anything to do
- * are skipped: a state machine is only run in cycles in which its divider
+ * Time. The blocks hold their state as of a clk_sys cycle, counted on
+ * the clock's own grid from when it started, and are run forward to the
+ * current virtual time before every register access and pin input
+ * change. Cycles in which no state machine has anything to do are
+ * skipped: a state machine is only run in cycles in which its divider
  * gives an enable, and one that stalled with nothing changed since that
- * could release it is not run at all. To time the outputs (DREQs,
- * interrupts and pins that a GPIO's FUNCSEL routes to PIO), the model runs
- * a copy of the blocks ahead of virtual time until one changes, and fires
- * a timer at that cycle; if nothing disturbed the blocks meanwhile, the
- * copy becomes the state, so the cycles are run once. While no output
- * changes, the run ahead is limited to a horizon that starts short after
- * every disturbance and grows while there are none. Output changes on
- * GPIOs that no pin routes to PIO are not timed: they are delivered
- * whenever the blocks next catch up.
+ * could release it is not run at all. A jump to itself that tests
+ * something without changing it is such a stall; one that counts X or Y
+ * down (the usual delay loop) runs in closed form to its last iteration.
  *
- * Not modelled: the RESETS hold of a block (it runs while held), and pad
- * input and output delays beyond the synchronisers.
+ * To time the outputs (DREQs, interrupts, pins that a GPIO's FUNCSEL
+ * routes to PIO, and HSTX's coupled inputs), the model runs a copy of the
+ * blocks ahead of virtual time until one changes, and fires a timer at
+ * that cycle; if nothing disturbed the blocks meanwhile, the copy becomes
+ * the state, so the cycles are run once. While no output changes, the run
+ * ahead is limited to a horizon that starts short after every disturbance
+ * and grows while there are none. Output changes on GPIOs that no pin
+ * routes to PIO are not timed: they are delivered whenever the blocks
+ * next catch up. Pin changes are driven to the IO bank in the cycle they
+ * happen, so PIO-to-PIO paths through the pads are exact.
+ *
+ * Without icount, virtual time follows the host clock. Blocks with more
+ * to do than they can run in real time (pins toggling every few cycles
+ * through the pads, say) stop catching up after RUN_BUDGET_NS of host
+ * time and let the cycles they could not run go: they run slow rather
+ * than fall ever further behind. Their own timing stays exact.
+ *
+ * Not modelled: pad input and output delays beyond the synchronisers.
  */
 
 #include "qemu/osdep.h"
@@ -62,6 +73,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_pio.h"
+#include "exec/icount.h"
 #include "migration/vmstate.h"
 
 #define A_CTRL                  0x000
@@ -168,6 +180,8 @@
 #define SMF_FORCED              (1u << 4)   /* an SMx_INSTR write waits */
 #define SMF_STICKY              (1u << 5)   /* a sticky pin write is held */
 #define SMF_STICKY_DIR          (1u << 6)   /* ... to the pin directions */
+#define SMF_LOOP                (1u << 7)   /* a JMP X--/Y-- loop runs */
+#define SMF_LOOP_Y              (1u << 8)   /* ... on Y */
 
 /* Instruction classes (bits 15:13) and fields. */
 enum {
@@ -198,6 +212,19 @@ enum {
 
 #define GPIO_MASK               MAKE_64BIT_MASK(0, RP2350_PIO_GPIOS)
 
+/*
+ * Host time one catch-up or run ahead may take. Without icount, virtual
+ * time follows the host clock; blocks with more to do than they can run
+ * in real time would otherwise never catch up with it.
+ */
+#define RUN_BUDGET_NS           (1 * SCALE_MS)
+
+typedef enum PIORunResult {
+    RUN_DONE,       /* reached the target */
+    RUN_EVENT,      /* a run ahead stopped at a visible change */
+    RUN_SLOW,       /* out of host time */
+} PIORunResult;
+
 /* Pin writes collected from one cycle. */
 typedef struct PIOPinWrite {
     uint32_t mask;
@@ -226,6 +253,18 @@ typedef enum PIOExecKind {
     EXEC_LATCH,     /* run by OUT/MOV EXEC */
     EXEC_FORCED,    /* written to SMx_INSTR */
 } PIOExecKind;
+
+#define SM_BIT(b, i)            (1u << ((b) * RP2350_PIO_SMS + (i)))
+
+/*
+ * Something one state machine can see of others changed (IRQ flags,
+ * pins, FIFOs or configuration from the system): every stalled state
+ * machine must look again.
+ */
+static inline void core_changed(RP2350PIOCore *core)
+{
+    core->idle = 0;
+}
 
 static inline uint32_t mask_n(unsigned n)
 {
@@ -369,6 +408,20 @@ static uint64_t div_next(RP2350PIOSM *sm, uint64_t from)
     return from + DIV_ROUND_UP(d - sm->div_acc, 256) - 1;
 }
 
+/*
+ * Take the enable the divider gives in cycle c (its next_en) and find the
+ * next, without the general division of div_next().
+ */
+static void div_step(RP2350PIOSM *sm, uint64_t c)
+{
+    uint32_t d = sm_div(sm);
+    uint64_t acc = sm->div_acc + 256 * (c - sm->div_cycle) + 256 - d;
+
+    sm->div_acc = acc;
+    sm->div_cycle = c + 1;
+    sm->next_en = c + DIV_ROUND_UP(d - acc, 256);
+}
+
 static void div_restart(RP2350PIOSM *sm, uint64_t cycle)
 {
     sm->div_cycle = cycle;
@@ -421,7 +474,7 @@ static void core_input(RP2350PIOCore *core, uint64_t vec, uint64_t t)
         core->in_n++;
     }
     core->in_settle = t + 2;
-    core->seq++;
+    core_changed(core);
 }
 
 /* A block's view of the pins at cycle c, in its 32-pin space. */
@@ -637,6 +690,7 @@ static bool sm_exec(RP2350PIOCore *core, int b, int i, uint16_t instr,
     unsigned delay = ds & mask_n(5 - ss_count);
     unsigned arg1 = INSTR_ARG1(instr), arg2 = INSTR_ARG2(instr);
     bool first = !(sm->flags & SMF_STALLED);
+    bool side_write = false;
     bool done = true, is_out = false, exec = false, progress = false;
     int new_pc = -1;
     uint32_t v = 0;
@@ -656,6 +710,7 @@ static bool sm_exec(RP2350PIOCore *core, int b, int i, uint16_t instr,
         if (go && bits) {
             pin_write(cx, b, i, CH_SIDE, ec & EXECCTRL_SIDE_PINDIR,
                       PINCTRL_SIDESET_BASE(pinctrl), bits, ss);
+            side_write = true;
         }
     }
 
@@ -693,6 +748,26 @@ static bool sm_exec(RP2350PIOCore *core, int b, int i, uint16_t instr,
         }
         if (take) {
             new_pc = arg2;
+        }
+        if (!take || kind != EXEC_MEM || arg2 != sm->pc || side_write) {
+            break;
+        }
+        /*
+         * A jump to itself. Counting down X or Y, it runs in closed form
+         * until the register reaches 0; otherwise, without a delay, it
+         * changes nothing until what it tests changes, like a stall.
+         */
+        if (arg1 == 2 || arg1 == 4) {
+            uint32_t left = arg1 == 2 ? sm->x : sm->y;
+
+            if (left) {
+                sm->flags = (sm->flags & ~SMF_LOOP_Y) | SMF_LOOP |
+                            (arg1 == 4 ? SMF_LOOP_Y : 0);
+                sm->loop_count = left;
+                sm->loop_delay = delay;
+            }
+        } else if (!delay) {
+            done = false;
         }
         break;
     }
@@ -967,39 +1042,79 @@ static bool sm_exec(RP2350PIOCore *core, int b, int i, uint16_t instr,
     return progress || first;
 }
 
-/* Note a stalled state machine that nothing has released. */
-static void sm_note_stall(RP2350PIOCore *core, RP2350PIOSM *sm, uint64_t c,
+/*
+ * Note whether a state machine that has just run stalled with nothing
+ * changed that could release it. Changes in the same cycle (committed at
+ * its end) and pin changes not yet through the synchronisers still can.
+ */
+static void sm_note_stall(RP2350PIOCore *core, int b, int i, uint64_t c,
                           bool progress)
 {
+    RP2350PIOSM *sm = &core->blk[b].sm[i];
+
     if ((sm->flags & SMF_STALLED) && !progress && c >= core->in_settle) {
-        sm->idle_seq = core->seq;
+        core->idle |= SM_BIT(b, i);
     } else {
-        sm->idle_seq = core->seq - 1;
+        core->idle &= ~SM_BIT(b, i);
     }
 }
 
-static bool sm_idle(const RP2350PIOCore *core, const RP2350PIOSM *sm)
+static void sm_note_exec(RP2350PIOCore *core, int b, int i)
 {
-    return (sm->flags & SMF_STALLED) && sm->idle_seq == core->seq;
+    if (core->blk[b].sm[i].flags & (SMF_FORCED | SMF_LATCH_FORCED)) {
+        core->xmask |= SM_BIT(b, i);
+    } else {
+        core->xmask &= ~SM_BIT(b, i);
+    }
+}
+
+/* The state machines that may have work: enabled or executing SMx_INSTR. */
+static uint32_t core_runnable(const RP2350PIOCore *core)
+{
+    uint32_t en = 0;
+    int b;
+
+    for (b = 0; b < RP2350_PIO_BLOCKS; b++) {
+        en |= core->blk[b].sm_enable << (b * RP2350_PIO_SMS);
+    }
+    return (en | core->xmask) & ~core->idle;
+}
+
+/*
+ * The JMP X--/Y-- loop's state as of cycle t (at most its end): the
+ * iterations completed so far, and the delay of the last.
+ */
+static bool pio_loop_y(const RP2350PIOSM *sm)
+{
+    return sm->flags & SMF_LOOP_Y;
+}
+
+static void sm_loop_settle(RP2350PIOSM *sm, uint64_t t)
+{
+    uint64_t d = sm_div(sm), per = sm->loop_delay + 1;
+    uint64_t enables = t > sm->loop_start
+        ? (sm->loop_acc + 256 * (t - sm->loop_start)) / d : 0;
+    uint32_t done = enables / per;
+    uint32_t left = sm->loop_count - done;
+
+    if (sm->flags & SMF_LOOP) {
+        if (pio_loop_y(sm)) {
+            sm->y = left;
+        } else {
+            sm->x = left;
+        }
+        sm->delay = sm->loop_delay - enables % per;
+        sm->flags &= ~SMF_LOOP;
+    }
 }
 
 /* The next cycle in which state machine i of block b must run. */
 static uint64_t sm_due(RP2350PIOCore *core, int b, int i)
 {
-    RP2350PIOBlock *blk = &core->blk[b];
-    RP2350PIOSM *sm = &blk->sm[i];
+    RP2350PIOSM *sm = &core->blk[b].sm[i];
 
-    if (sm->flags & SMF_FORCED) {
+    if (core->xmask & SM_BIT(b, i)) {
         return core->cycle;
-    }
-    if (sm_idle(core, sm)) {
-        return NO_CYCLE;
-    }
-    if (sm->flags & SMF_LATCH_FORCED) {
-        return core->cycle;
-    }
-    if (!(blk->sm_enable & (1u << i))) {
-        return NO_CYCLE;
     }
     if (sm->next_en < core->cycle) {
         sm->next_en = div_next(sm, core->cycle);
@@ -1010,13 +1125,18 @@ static uint64_t sm_due(RP2350PIOCore *core, int b, int i)
 static uint64_t core_next(RP2350PIOCore *core)
 {
     uint64_t next = NO_CYCLE;
-    int b, i;
+    uint32_t m = core_runnable(core);
+    int b;
 
     for (b = 0; b < RP2350_PIO_BLOCKS; b++) {
         next = MIN(next, core->blk[b].resolve_at);
-        for (i = 0; i < RP2350_PIO_SMS; i++) {
-            next = MIN(next, sm_due(core, b, i));
-        }
+    }
+    while (m) {
+        int n = ctz32(m);
+
+        m &= m - 1;
+        next = MIN(next, sm_due(core, n / RP2350_PIO_SMS,
+                                n % RP2350_PIO_SMS));
     }
     return next;
 }
@@ -1031,7 +1151,12 @@ static void sm_cycle(RP2350PIOCore *core, int b, int i, uint64_t c,
     bool progress;
 
     if (enabled) {
-        sm->next_en = div_next(sm, c + 1);
+        if (sm->flags & SMF_LOOP) {
+            /* The loop's last iteration, in which the register is 0. */
+            sm_loop_settle(sm, c);
+            div_advance(sm, c);
+        }
+        div_step(sm, c);
     }
 
     if (sm->flags & SMF_FORCED) {
@@ -1039,8 +1164,6 @@ static void sm_cycle(RP2350PIOCore *core, int b, int i, uint64_t c,
         sm->flags &= ~(SMF_FORCED | SMF_STALLED | SMF_IRQ_WAIT |
                        SMF_LATCH | SMF_LATCH_FORCED);
         progress = sm_exec(core, b, i, sm->forced, EXEC_FORCED, c, cx);
-    } else if (sm_idle(core, sm)) {
-        return;
     } else if (sm->flags & SMF_LATCH_FORCED) {
         progress = sm_exec(core, b, i, sm->latch, EXEC_FORCED, c, cx);
     } else if (!enabled) {
@@ -1054,7 +1177,35 @@ static void sm_cycle(RP2350PIOCore *core, int b, int i, uint64_t c,
     } else {
         progress = sm_exec(core, b, i, blk->imem[sm->pc], EXEC_MEM, c, cx);
     }
-    sm_note_stall(core, sm, c, progress);
+    sm_note_exec(core, b, i);
+    sm_note_stall(core, b, i, c, progress);
+    if (sm->flags & SMF_LOOP) {
+        /* Skip to the cycle of the loop's last iteration. */
+        uint64_t d = sm_div(sm);
+        uint64_t k = (uint64_t)(sm->loop_count + 1) * (sm->loop_delay + 1);
+
+        sm->loop_start = sm->div_cycle;
+        sm->loop_acc = sm->div_acc;
+        sm->next_en = sm->div_cycle + DIV_ROUND_UP(k * d - sm->loop_acc, 256) -
+                      1;
+    }
+}
+
+/* Bring every JMP X--/Y-- loop up to date, as of the next cycle to run. */
+static void core_settle_loops(RP2350PIOCore *core)
+{
+    int b, i;
+
+    for (b = 0; b < RP2350_PIO_BLOCKS; b++) {
+        for (i = 0; i < RP2350_PIO_SMS; i++) {
+            RP2350PIOSM *sm = &core->blk[b].sm[i];
+
+            if (sm->flags & SMF_LOOP) {
+                sm_loop_settle(sm, core->cycle);
+                sm->next_en = div_next(sm, core->cycle);
+            }
+        }
+    }
 }
 
 typedef struct PIOChanges {
@@ -1076,7 +1227,7 @@ static void core_commit(RP2350PIOCore *core, uint64_t c, PIOCycle *cx,
 
         if (irq != blk->irq) {
             blk->irq = irq;
-            core->seq++;
+            core_changed(core);
             ch->outputs = true;
         }
 
@@ -1115,7 +1266,7 @@ static void core_commit(RP2350PIOCore *core, uint64_t c, PIOCycle *cx,
         if (out != blk->pad_out || oe != blk->pad_oe) {
             blk->pad_out = out;
             blk->pad_oe = oe;
-            core->seq++;
+            core_changed(core);
             ch->pins[b] = true;
         }
     }
@@ -1273,13 +1424,18 @@ static uint64_t blk_routed(RP2350PIOState *s, int b)
  * pin changes as they happen, so that they come back through the pads
  * stamped with the right cycle. A run ahead (`spec`) drives nothing and
  * stops after the first cycle that changes an output visible outside the
- * blocks; it returns whether it did.
+ * blocks. Without icount, a run also stops when it has taken
+ * RUN_BUDGET_NS of host time.
  */
-static bool core_run(RP2350PIOState *s, RP2350PIOCore *core, uint64_t target,
-                     bool spec)
+static PIORunResult core_run(RP2350PIOState *s, RP2350PIOCore *core,
+                             uint64_t target, bool spec)
 {
+    int64_t deadline = icount_enabled() ? INT64_MAX :
+        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + RUN_BUDGET_NS;
+    unsigned steps = 0;
     uint64_t routed[RP2350_PIO_BLOCKS];
-    int b, i;
+    uint32_t m;
+    int b;
 
     if (spec) {
         for (b = 0; b < RP2350_PIO_BLOCKS; b++) {
@@ -1296,14 +1452,20 @@ static bool core_run(RP2350PIOState *s, RP2350PIOCore *core, uint64_t target,
             core->cycle = target;
             break;
         }
+        if (!(++steps % 256) &&
+            qemu_clock_get_ns(QEMU_CLOCK_REALTIME) > deadline) {
+            return RUN_SLOW;
+        }
         memset(cx.irq_set, 0, sizeof(cx.irq_set));
         memset(cx.irq_clr, 0, sizeof(cx.irq_clr));
         memset(cx.wvalid, 0, sizeof(cx.wvalid));
         cx.fifo = false;
-        for (b = 0; b < RP2350_PIO_BLOCKS; b++) {
-            for (i = 0; i < RP2350_PIO_SMS; i++) {
-                sm_cycle(core, b, i, c, &cx);
-            }
+        m = core_runnable(core);
+        while (m) {
+            int n = ctz32(m);
+
+            m &= m - 1;
+            sm_cycle(core, n / RP2350_PIO_SMS, n % RP2350_PIO_SMS, c, &cx);
         }
         core_commit(core, c, &cx, &ch);
         core->cycle = c + 1;
@@ -1322,7 +1484,7 @@ static bool core_run(RP2350PIOState *s, RP2350PIOCore *core, uint64_t target,
             if (ch.pins[b] &&
                 (((blk_gpio(blk, blk->pad_out) ^ s->drv_out[b]) |
                   (blk_gpio(blk, blk->pad_oe) ^ s->drv_oe[b])) & routed[b])) {
-                return true;
+                return RUN_EVENT;
             }
         }
         if (ch.outputs) {
@@ -1330,11 +1492,11 @@ static bool core_run(RP2350PIOState *s, RP2350PIOCore *core, uint64_t target,
 
             core_lines(core, &irq, &dreq);
             if (irq != s->drv_irq || dreq != s->drv_dreq) {
-                return true;
+                return RUN_EVENT;
             }
         }
     }
-    return false;
+    return RUN_DONE;
 }
 
 /* Time */
@@ -1382,7 +1544,15 @@ static void pio_sync(RP2350PIOState *s)
         drive_all(s);
     }
     s->spec_valid = false;
-    core_run(s, &s->core, now, false);
+    if (core_run(s, &s->core, now, false) == RUN_SLOW) {
+        /*
+         * The blocks cannot keep up with virtual time. Rather than fall
+         * ever further behind, they let the cycles they could not run go:
+         * their clock restarts from where they are, now.
+         */
+        s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->base_cycle = s->core.cycle;
+    }
     drive_all(s);
     s->busy = false;
 }
@@ -1398,7 +1568,8 @@ static void pio_schedule(RP2350PIOState *s)
         return;
     }
     s->spec = s->core;
-    event = core_run(s, &s->spec, s->core.cycle + s->horizon, true);
+    event = core_run(s, &s->spec, s->core.cycle + s->horizon, true) ==
+            RUN_EVENT;
     if (!event && core_next(&s->spec) == NO_CYCLE) {
         /* Nothing will happen until something disturbs the blocks. */
         s->spec_valid = false;
@@ -1423,6 +1594,7 @@ static void pio_disturb(RP2350PIOState *s)
 {
     s->horizon = HORIZON_MIN;
     pio_sync(s);
+    core_settle_loops(&s->core);
 }
 
 /* The blocks were changed from outside: drive and re-time the outputs. */
@@ -1485,6 +1657,7 @@ static void blk_ctrl(RP2350PIOCore *core, int b, uint32_t enable,
 
         if (restart & (1u << i)) {
             sm_restart(sm);
+            sm_note_exec(core, b, i);
         }
         if (clkdiv_restart & (1u << i)) {
             div_restart(sm, core->cycle);
@@ -1519,7 +1692,7 @@ static void pio_write_ctrl(RP2350PIOCore *core, int b, uint32_t v)
     }
     blk_ctrl(core, b, CTRL_SM_ENABLE(v), CTRL_SM_RESTART(v),
              CTRL_CLKDIV_RESTART(v));
-    core->seq++;
+    core_changed(core);
 }
 
 static void pio_write_shiftctrl(RP2350PIOSM *sm, uint32_t v)
@@ -1675,7 +1848,7 @@ static uint32_t pio_read_reg(RP2350PIOState *s, int b, hwaddr reg)
             blk->fdebug |= FDEBUG_RXUNDER(i);
             return rx_cap(sm) ? rx_peek(sm) : 0;
         }
-        s->core.seq++;
+        core_changed(&s->core);
         return rx_pop(sm);
     }
     if (reg >= A_RXF0_PUTGET0 && reg < A_GPIOBASE) {
@@ -1728,28 +1901,28 @@ static void pio_write_reg(RP2350PIOState *s, int b, hwaddr reg,
             blk->fdebug |= FDEBUG_TXOVER(i);
         } else {
             tx_push(sm, value);
-            core->seq++;
+            core_changed(core);
         }
         return;
     }
     case A_IRQ:
         if (w1c) {
             blk->irq &= ~raw;
-            core->seq++;
+            core_changed(core);
         }
         return;
     case A_IRQ_FORCE:
         blk->irq |= value & 0xff;
-        core->seq++;
+        core_changed(core);
         return;
     case A_INPUT_SYNC_BYPASS:
         blk->sync_bypass = value;
-        core->seq++;
+        core_changed(core);
         return;
     case A_INSTR_MEM0 ... A_SM0_CLKDIV - 4:
         blk->imem[(reg - A_INSTR_MEM0) / 4] = value;
         pio_check_instr(b, "INSTR_MEM", value);
-        core->seq++;
+        core_changed(core);
         return;
     case A_SM0_CLKDIV ... A_RXF0_PUTGET0 - 4: {
         RP2350PIOSM *sm;
@@ -1778,15 +1951,16 @@ static void pio_write_reg(RP2350PIOState *s, int b, hwaddr reg,
         case SM_INSTR:
             sm->forced = value;
             sm->flags |= SMF_FORCED;
+            sm_note_exec(core, b, i);
             pio_check_instr(b, "SM_INSTR", value);
-            core->seq++;
+            core_changed(core);
             pio_run_cycle(s);
             return;
         default:
             sm->pinctrl = value;
             break;
         }
-        core->seq++;
+        core_changed(core);
         return;
     }
     case A_RXF0_PUTGET0 ... A_GPIOBASE - 4: {
@@ -1803,12 +1977,12 @@ static void pio_write_reg(RP2350PIOState *s, int b, hwaddr reg,
         }
         sm->fifo[RP2350_PIO_FIFO_DEPTH + ((reg - A_RXF0_PUTGET0) / 4) % 4] =
             value;
-        core->seq++;
+        core_changed(core);
         return;
     }
     case A_GPIOBASE:
         blk->gpiobase = value & GPIOBASE_MASK;
-        core->seq++;
+        core_changed(core);
         return;
     case A_IRQ0_INTE:
     case A_IRQ0_INTE + 12:
@@ -1909,6 +2083,7 @@ static void blk_reset(RP2350PIOCore *core, int b)
     int i;
 
     memset(blk, 0, sizeof(*blk));
+    core->xmask &= ~MAKE_64BIT_MASK(b * RP2350_PIO_SMS, RP2350_PIO_SMS);
     blk->ns = ns;
     blk->held = held;
     blk->resolve_at = NO_CYCLE;
@@ -1922,7 +2097,7 @@ static void blk_reset(RP2350PIOCore *core, int b)
         sm->osr_count = 32;
         div_restart(sm, core->cycle);
     }
-    core->seq++;
+    core_changed(core);
 }
 
 /* [spec:nuos:req:emu.pio] */
@@ -1933,7 +2108,7 @@ void rp2350_pio_hold_block(RP2350PIOState *s, int n, bool hold)
         blk_reset(&s->core, n);
     }
     s->core.blk[n].held = hold;
-    s->core.seq++;
+    core_changed(&s->core);
     pio_settle(s);
 }
 
@@ -1948,7 +2123,7 @@ void rp2350_pio_set_security(RP2350PIOState *s, uint32_t ns_blocks,
         s->core.blk[b].ns = (ns_blocks >> b) & 1;
     }
     s->core.gpio_nsmask = gpio_nsmask;
-    s->core.seq++;
+    core_changed(&s->core);
     pio_settle(s);
 }
 
@@ -1962,15 +2137,18 @@ static void rp2350_pio_reset_hold(Object *obj, ResetType type)
     timer_del(s->timer);
     s->spec_valid = false;
     s->horizon = HORIZON_MIN;
-    s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    s->base_cycle = 0;
 
-    core->cycle = 0;
+    /*
+     * clk_sys runs on through the reset: the blocks keep counting its
+     * cycles from when it started, so that their cycles stay those of
+     * every other device timed on the same clock.
+     */
+    core->cycle = pio_now(s);
     /* The pin levels are outside the blocks; they are not reset. */
     core->in_val[0] = s->in_level;
-    core->in_cycle[0] = 0;
+    core->in_cycle[0] = core->cycle;
     core->in_n = 1;
-    core->in_settle = 0;
+    core->in_settle = core->cycle;
     for (b = 0; b < RP2350_PIO_BLOCKS; b++) {
         blk_reset(core, b);
     }
@@ -2047,7 +2225,7 @@ static const VMStateDescription vmstate_rp2350_pio_sm = {
         VMSTATE_UINT8(delay, RP2350PIOSM),
         VMSTATE_UINT16(latch, RP2350PIOSM),
         VMSTATE_UINT16(forced, RP2350PIOSM),
-        VMSTATE_UINT8(flags, RP2350PIOSM),
+        VMSTATE_UINT16(flags, RP2350PIOSM),
         VMSTATE_UINT32_ARRAY(fifo, RP2350PIOSM, 2 * RP2350_PIO_FIFO_DEPTH),
         VMSTATE_UINT8(tx_head, RP2350PIOSM),
         VMSTATE_UINT8(tx_level, RP2350PIOSM),
@@ -2058,7 +2236,10 @@ static const VMStateDescription vmstate_rp2350_pio_sm = {
         VMSTATE_UINT64(next_en, RP2350PIOSM),
         VMSTATE_UINT32(sticky_mask, RP2350PIOSM),
         VMSTATE_UINT32(sticky_data, RP2350PIOSM),
-        VMSTATE_UINT64(idle_seq, RP2350PIOSM),
+        VMSTATE_UINT64(loop_start, RP2350PIOSM),
+        VMSTATE_UINT32(loop_acc, RP2350PIOSM),
+        VMSTATE_UINT32(loop_count, RP2350PIOSM),
+        VMSTATE_UINT8(loop_delay, RP2350PIOSM),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -2095,7 +2276,8 @@ static const VMStateDescription vmstate_rp2350_pio_core = {
         VMSTATE_STRUCT_ARRAY(blk, RP2350PIOCore, RP2350_PIO_BLOCKS, 1,
                              vmstate_rp2350_pio_block, RP2350PIOBlock),
         VMSTATE_UINT64(cycle, RP2350PIOCore),
-        VMSTATE_UINT64(seq, RP2350PIOCore),
+        VMSTATE_UINT32(idle, RP2350PIOCore),
+        VMSTATE_UINT32(xmask, RP2350PIOCore),
         VMSTATE_UINT64_ARRAY(in_val, RP2350PIOCore, RP2350_PIO_IN_HIST),
         VMSTATE_UINT64_ARRAY(in_cycle, RP2350PIOCore, RP2350_PIO_IN_HIST),
         VMSTATE_UINT32(in_n, RP2350PIOCore),

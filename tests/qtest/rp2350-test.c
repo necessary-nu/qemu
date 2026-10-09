@@ -73,16 +73,8 @@ static void assert_pc(QTestState *qts, uint32_t pc)
 /* [spec:nuos:req:emu.machine+1/test] */
 static void test_memory_map(void)
 {
-    static const struct {
-        const char *name;
-        uint64_t base;
-        uint64_t size;
-    } unimplemented[] = {
-        { "rp2350.pio0",       0x50200000, 0x100000 },
-    };
     g_autofree char *path = NULL;
     QTestState *qts = boot_direct(&path);
-    int i;
 
     /* A subsystem in reset has its window answered for it. */
     assert_mtree_has(qts, "0000000040000000-0000000040007fff "
@@ -155,14 +147,12 @@ static void test_memory_map(void)
                           "(prio 0, i/o): rp2350-dma");
     assert_mtree_has(qts, "0000000050004000-00000000500fffff "
                           "(prio -1000, i/o): rp2350.dma @0000000000004000");
-    for (i = 0; i < ARRAY_SIZE(unimplemented); i++) {
-        g_autofree char *entry = g_strdup_printf(
-            "%016" PRIx64 "-%016" PRIx64 " (prio -1000, i/o): %s",
-            unimplemented[i].base,
-            unimplemented[i].base + unimplemented[i].size - 1,
-            unimplemented[i].name);
-        assert_mtree_has(qts, entry);
-    }
+    assert_mtree_has(qts, "0000000050200000-0000000050203fff "
+                          "(prio 0, i/o): rp2350-pio0");
+    assert_mtree_has(qts, "0000000050204000-00000000502fffff "
+                          "(prio -1000, i/o): rp2350.pio0 @0000000000004000");
+    assert_mtree_has(qts, "0000000050400000-0000000050403fff "
+                          "(prio 0, i/o): rp2350-pio2");
 
     qtest_quit(qts);
     unlink(path);

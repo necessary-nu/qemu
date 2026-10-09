@@ -1186,6 +1186,69 @@ static void test_hstx_coupling(void)
     qtest_quit(qts);
 }
 
+/* [spec:nuos:req:emu.pio/test] */
+static void test_delay_loops(void)
+{
+    QTestState *qts = start();
+    static const uint16_t prog[] = {
+        I_JMP(C_XDEC, 0) | DLY(2),
+        I_IRQ(0, 0, 0),
+        I_JMP(C_ALWAYS, 2),
+    };
+
+    /*
+     * A counting loop at a divisor of 2.5: iteration j runs at enable
+     * 3j + 1 (counting from 1), and enables fall at offsets 0, 3, 5, 8,
+     * 10, ... from the restart. Loop X = 9 runs ten times; IRQ 0 is set
+     * at enable 31, offset 75.
+     */
+    load(qts, 0, 0, prog, 3);
+    wr(qts, 0, CLKDIV(0), (2 << 16) | (128 << 8));
+    exec(qts, 0, 0, I_SET(D_X, 9));
+    cycles(qts, 30);
+    wr(qts, 0, CTRL, CTRL_EN(1) | CTRL_CLKDIV_RST(1));
+    cycles(qts, 75);
+    g_assert_cmphex(qtest_readl(qts, PIO_BASE(0) + 0x2000 + IRQ), ==, 0);
+    cycles(qts, 3);
+    g_assert_cmphex(rd(qts, 0, IRQ), ==, 1);
+    g_assert_cmpuint(rd(qts, 0, ADDR(0)), ==, 2);
+
+    /* Stopped part way: 12 enables in 30 cycles, so four iterations. */
+    wr(qts, 0, CTRL, 0);
+    wr(qts, 0, IRQ, 1);
+    exec(qts, 0, 0, I_SET(D_X, 9));
+    exec(qts, 0, 0, I_JMP(C_ALWAYS, 0));
+    cycles(qts, 30);
+    wr(qts, 0, CTRL, CTRL_EN(1) | CTRL_CLKDIV_RST(1));
+    cycles(qts, 30);
+    wr(qts, 0, CTRL, 0);
+    g_assert_cmpuint(read_reg(qts, 0, 0, S_X), ==, 5);
+    g_assert_cmpuint(rd(qts, 0, ADDR(0)), ==, 0);
+    /* Resumed, it finishes the remaining iterations and the delay. */
+    cycles(qts, 30);
+    wr(qts, 0, CTRL, CTRL_EN(1));
+    cycles(qts, 300);
+    g_assert_cmphex(rd(qts, 0, IRQ), ==, 1);
+
+    /* A long loop: a quarter second at full speed. */
+    wr(qts, 0, CTRL, 0);
+    wr(qts, 0, IRQ, 1);
+    wr(qts, 0, CLKDIV(0), 1 << 16);
+    wr(qts, 0, INSTR_MEM(0), I_JMP(C_XDEC, 0));
+    wr(qts, 0, TXF(0), 37500000 - 1);
+    exec(qts, 0, 0, I_PULL(0, 1));
+    exec(qts, 0, 0, I_MOV(MD_X, 0, S_OSR));
+    exec(qts, 0, 0, I_JMP(C_ALWAYS, 0));
+    cycles(qts, 30);
+    wr(qts, 0, CTRL, CTRL_EN(1));
+    /* The loop ends in cycle 37499999 and IRQ sets in 37500000. */
+    qtest_clock_step(qts, 250 * 1000 * 1000 - 20);
+    g_assert_cmphex(rd(qts, 0, IRQ), ==, 0);
+    cycles(qts, 6);
+    g_assert_cmphex(rd(qts, 0, IRQ), ==, 1);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     static const uint32_t blank[2];
@@ -1220,6 +1283,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/pio/dreq", test_dreq);
     qtest_add_func("/rp2350/pio/reset-hold", test_reset_hold);
     qtest_add_func("/rp2350/pio/hstx-coupling", test_hstx_coupling);
+    qtest_add_func("/rp2350/pio/delay-loops", test_delay_loops);
 
     ret = g_test_run();
     unlink(rom_path);

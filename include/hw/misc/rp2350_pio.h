@@ -90,7 +90,7 @@ typedef struct RP2350PIOSM {
     uint16_t latch;
     /* An SMx_INSTR write that has not yet executed. */
     uint16_t forced;
-    uint8_t flags;
+    uint16_t flags;
 
     /*
      * The FIFO storage: TX in entries 0-3 and RX in 4-7, or all eight for
@@ -115,8 +115,15 @@ typedef struct RP2350PIOSM {
     uint32_t sticky_mask;
     uint32_t sticky_data;
 
-    /* RP2350PIOCore.seq when the state machine was last seen stalled. */
-    uint64_t idle_seq;
+    /*
+     * A one-instruction JMP X--/Y-- loop run in closed form: from the
+     * divider state loop_acc at loop_start, with loop_count more taken
+     * iterations of 1 + loop_delay enabled cycles each to come.
+     */
+    uint64_t loop_start;
+    uint32_t loop_acc;
+    uint32_t loop_count;
+    uint8_t loop_delay;
 } RP2350PIOSM;
 
 typedef struct RP2350PIOBlock {
@@ -149,8 +156,14 @@ typedef struct RP2350PIOCore {
     RP2350PIOBlock blk[RP2350_PIO_BLOCKS];
     /* The next clk_sys cycle to run. */
     uint64_t cycle;
-    /* Bumped by every change one state machine can see of another's. */
-    uint64_t seq;
+    /*
+     * State machines (bit block * 4 + sm) stalled with nothing changed
+     * since that could release them; cleared by every change one state
+     * machine can see of another's.
+     */
+    uint32_t idle;
+    /* State machines with an SMx_INSTR write pending or latched. */
+    uint32_t xmask;
     /*
      * Pin levels (bank 0 GPIOs) and the cycle from which each applies,
      * oldest first; enough to look two cycles back through the input
