@@ -469,6 +469,8 @@ static void armv7m_realize(DeviceState *dev, Error **errp)
                               s->refclk);
     }
     qdev_connect_clock_in(DEVICE(&s->systick[M_REG_NS]), "cpuclk", s->cpuclk);
+    qdev_prop_set_uint32(DEVICE(&s->systick[M_REG_NS]), "calib",
+                         s->systick_calib);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->systick[M_REG_NS]), errp)) {
         return;
     }
@@ -490,6 +492,8 @@ static void armv7m_realize(DeviceState *dev, Error **errp)
         }
         qdev_connect_clock_in(DEVICE(&s->systick[M_REG_S]), "cpuclk",
                               s->cpuclk);
+        qdev_prop_set_uint32(DEVICE(&s->systick[M_REG_S]), "calib",
+                             s->systick_calib);
 
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->systick[M_REG_S]), errp)) {
             return;
@@ -569,6 +573,8 @@ static const Property armv7m_properties[] = {
     DEFINE_PROP_UINT64("midr", ARMv7MState, midr, 0),
     DEFINE_PROP_UINT32("mpu-ns-regions", ARMv7MState, mpu_ns_regions, UINT_MAX),
     DEFINE_PROP_UINT32("mpu-s-regions", ARMv7MState, mpu_s_regions, UINT_MAX),
+    DEFINE_PROP_UINT32("systick-calib", ARMv7MState, systick_calib,
+                       SYSTICK_CALIB_FROM_REFCLK),
 };
 
 static const VMStateDescription vmstate_armv7m = {
