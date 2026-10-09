@@ -4,6 +4,7 @@
 #include "target/xtensa/cpu.h"
 #include "hw/misc/esp32_reg.h"
 #include "hw/char/esp32_uart.h"
+#include "hw/dma/esp32_uhci.h"
 #include "hw/gpio/esp32_gpio.h"
 #include "hw/misc/esp32_dport.h"
 #include "hw/misc/esp32_apb_ctrl.h"
@@ -35,6 +36,8 @@ typedef enum Esp32GateRegs {
 
 #define ESP32_GATE_MAX_MR 2
 #define ESP32_GATE_MAX 32
+
+#define ESP32_UHCI_COUNT 2
 
 typedef struct Esp32SocState Esp32SocState;
 typedef struct Esp32PeriphGate Esp32PeriphGate;
@@ -84,6 +87,7 @@ struct Esp32SocState {
     Esp32CrosscoreInt crosscore_int;
     Esp32TWAIState twai;
     ESP32UARTState uart[ESP32_UART_COUNT];
+    Esp32UhciState uhci[ESP32_UHCI_COUNT];
     Esp32GpioState gpio;
     Esp32RngState rng;
     Esp32RtcCntlState rtc_cntl;
@@ -115,6 +119,7 @@ struct Esp32SocState {
     uint32_t ref_tick_hz;
     Clock *uart_apb_clk[ESP32_UART_COUNT];
     Clock *uart_ref_tick_clk[ESP32_UART_COUNT];
+    Clock *uhci_apb_clk[ESP32_UHCI_COUNT];
     Clock *frc_apb_clk[ESP32_FRC_COUNT];
     Clock *timg_apb_clk[ESP32_TIMG_COUNT];
 

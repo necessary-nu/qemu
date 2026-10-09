@@ -5,6 +5,7 @@
 #include "chardev/char-fe.h"
 #include "hw/core/registerfields.h"
 #include "hw/core/clock.h"
+#include "qemu/notify.h"
 
 #define UART_FIFO_LENGTH 128
 
@@ -132,6 +133,15 @@ typedef struct ESPUARTState {
     /* Threshold, in bytes, for a full RX FIFO and an empty TX FIFO respectively */
     uint32_t tx_empty_threshold;
     uint32_t rx_full_threshold;
+
+    /*
+     * UART DMA (UHCI) attachment: notified, with the UART as data, when a
+     * byte leaves the TX FIFO or arrives in the RX FIFO, so an attached
+     * UHCI can refill or drain the FIFOs. in_receive while the backend is
+     * delivering bytes.
+     */
+    NotifierList dma_notifiers;
+    bool in_receive;
 } ESP32UARTState;
 
 typedef struct ESPUARTClass {
@@ -155,3 +165,10 @@ void esp32_uart_set_rx_timeout(ESP32UARTState *s);
  * the configured threshold.
  */
 void esp32_uart_update_irq(ESP32UARTState *s);
+
+/* UART DMA (UHCI) access to the UART's FIFOs, as the hardware's DMA port. */
+void esp32_uart_add_dma_notifier(ESP32UARTState *s, Notifier *n);
+unsigned esp32_uart_dma_tx_free(ESP32UARTState *s);
+void esp32_uart_dma_tx_push(ESP32UARTState *s, uint8_t byte);
+unsigned esp32_uart_dma_rx_count(ESP32UARTState *s);
+uint8_t esp32_uart_dma_rx_pop(ESP32UARTState *s);
