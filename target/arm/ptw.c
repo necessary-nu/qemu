@@ -17,6 +17,7 @@
 #include "accel/tcg/probe.h"
 #include "target/arm/tcg/idau.h"
 #endif
+#include "target/arm/tcg/fetch-port.h"
 #include "cpu.h"
 #include "internals.h"
 #include "cpu-features.h"
@@ -2908,6 +2909,47 @@ static bool get_phys_addr_pmsav7(CPUARMState *env,
     return (ptw->in_prot_check & ~result->f.prot) == 0;
 }
 
+/*
+ * Apply the SoC's instruction fetch port decode to an address that has
+ * passed the MPU. An address the instruction port cannot reach loses
+ * execute permission, so that a TLB entry filled by a load or store never
+ * lets a later fetch skip this check, and a fetch from it fails on the bus
+ * as an external abort, which M profile reports as a BusFault with
+ * IBUSERR. MPU faults take priority because a fetch that faults in the
+ * MPU never reaches the bus.
+ */
+static bool m_fetch_port_check(CPUARMState *env, uint32_t address,
+                               MMUAccessType access_type,
+                               GetPhysAddrResult *result,
+                               ARMMMUFaultInfo *fi)
+{
+    ARMCPU *cpu = env_archcpu(env);
+    ARMFetchPortClass *fpc;
+    uint32_t base = 0, limit = 0xffffffff;
+    uint32_t page_base = address & TARGET_PAGE_MASK;
+    bool fetchable;
+
+    if (!cpu->fetch_port) {
+        return true;
+    }
+    fpc = ARM_FETCH_PORT_GET_CLASS(cpu->fetch_port);
+    fetchable = fpc->fetchable(ARM_FETCH_PORT(cpu->fetch_port), address,
+                               &base, &limit);
+    if (base > page_base || limit < page_base + (TARGET_PAGE_SIZE - 1)) {
+        result->f.lg_page_size = 0;
+    }
+    if (fetchable) {
+        return true;
+    }
+    result->f.prot &= ~PAGE_EXEC;
+    if (access_type != MMU_INST_FETCH) {
+        return true;
+    }
+    fi->type = ARMFault_SyncExternal;
+    fi->ea = true;
+    return false;
+}
+
 #ifdef CONFIG_TCG
 
 static uint32_t *regime_rbar(CPUARMState *env, ARMMMUIdx mmu_idx,
@@ -3925,6 +3967,9 @@ static bool get_phys_addr_nogpc(CPUARMState *env, S1Translate *ptw,
             /* Pre-v7 MPU */
             ret = get_phys_addr_pmsav5(env, ptw, address, access_type,
                                        result, fi);
+        }
+        if (ret && arm_feature(env, ARM_FEATURE_M)) {
+            ret = m_fetch_port_check(env, address, access_type, result, fi);
         }
         qemu_log_mask(CPU_LOG_MMU, "PMSA MPU lookup for %s at 0x%08" PRIx32
                       " mmu_idx %u -> %s (prot %c%c%c)\n",

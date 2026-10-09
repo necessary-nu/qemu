@@ -25,6 +25,7 @@
 #include "exec/page-vary.h"
 #include "system/whpx.h"
 #include "target/arm/tcg/idau.h"
+#include "target/arm/tcg/fetch-port.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "cpu.h"
@@ -1697,6 +1698,11 @@ static void arm_cpu_post_init(Object *obj)
                                        OBJ_PROP_FLAG_READWRITE);
     }
     if (arm_feature(&cpu->env, ARM_FEATURE_M)) {
+        object_property_add_link(obj, "fetch-port",
+                                 TYPE_ARM_FETCH_PORT_INTERFACE,
+                                 &cpu->fetch_port,
+                                 qdev_prop_allow_set_link_before_realize,
+                                 OBJ_PROP_LINK_STRONG);
         /*
          * Initial value of the NS VTOR (for cores without the Security
          * extension, this is the only VTOR)
