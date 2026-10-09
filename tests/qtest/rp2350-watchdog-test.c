@@ -304,6 +304,7 @@ static void test_domains(void)
     g_assert_cmphex(qtest_readl(qts, RESETS + RESETS_RESET), ==, 0);
 
     /* RESETS.WDSEL resets a subsystem alone; RESET keeps its value. */
+    qtest_writel(qts, TICK_CYCLES(TICK_TIMER0), 12);
     qtest_writel(qts, TICK_CTRL(TICK_TIMER0), 1);
     qtest_clock_step(qts, 100 * US);
     g_assert_cmpuint(qtest_readl(qts, TIMER0_TIMERAWL), ==, 100);

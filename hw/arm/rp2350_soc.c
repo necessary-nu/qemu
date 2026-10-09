@@ -1619,6 +1619,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         object_property_set_link(OBJECT(sbd), "ticks", OBJECT(&s->ticks),
                                  &error_abort);
         qdev_prop_set_uint32(DEVICE(sbd), "tick", tick[i]);
+        qdev_prop_set_uint32(DEVICE(sbd), "ref-hz", RP2350_CLK_REF_HZ);
         qdev_prop_set_uint32(DEVICE(sbd), "sysclk-hz", RP2350_SYSCLK_HZ);
         if (!sysbus_realize(sbd, errp)) {
             return;
