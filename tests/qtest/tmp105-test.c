@@ -59,6 +59,17 @@ static void qmp_tmp105_set_temperature(const char *id, int value)
     qobject_unref(response);
 }
 
+/*
+ * qos runs each test after a system reset of the machine the previous test
+ * used. The temperature survives reset, so every test that watches ALERT
+ * starts from 0 C; that conversion also releases any alert the previous
+ * test's temperature left asserted.
+ */
+static void start_at_zero(const char *id)
+{
+    qmp_tmp105_set_temperature(id, 0);
+}
+
 #define TMP105_PRECISION (1000/16)
 static void send_and_receive(void *obj, void *data, QGuestAllocator *alloc)
 {
@@ -131,6 +142,7 @@ static void test_alert_single_fault(void *obj, void *data,
 {
     QI2CDevice *i2cdev = (QI2CDevice *)obj;
 
+    start_at_zero(TMP105_TEST_ID);
     qtest_irq_intercept_out(global_qtest, TMP105_TEST_PATH);
 
     i2c_set8(i2cdev, TMP105_REG_CONFIG, TMP105_CONFIG_POL | TMP105_CONFIG_FQ_1);
@@ -148,6 +160,7 @@ static void test_fault_queue(void *obj, void *data, QGuestAllocator *alloc)
     QI2CDevice *i2cdev = (QI2CDevice *)obj;
     int i;
 
+    start_at_zero(TMP105_TEST_ID);
     qtest_irq_intercept_out(global_qtest, TMP105_TEST_PATH);
 
     /* Comparator mode, active-high ALERT, fault queue of four. */
@@ -188,6 +201,7 @@ static void check_fault_queue(QI2CDevice *i2cdev, const char *id,
 {
     int i;
 
+    start_at_zero(id);
     qtest_irq_intercept_out(global_qtest, path);
 
     i2c_set8(i2cdev, TMP105_REG_CONFIG,
@@ -212,6 +226,7 @@ static void test_one_shot(void *obj, void *data, QGuestAllocator *alloc)
     QI2CDevice *i2cdev = (QI2CDevice *)obj;
     int i;
 
+    start_at_zero(TMP105_TEST_ID);
     qtest_irq_intercept_out(global_qtest, TMP105_TEST_PATH);
 
     i2c_set8(i2cdev, TMP105_REG_CONFIG, TMP105_CONFIG_POL | TMP105_CONFIG_FQ_4);
@@ -246,6 +261,7 @@ static void test_fault_queue_ignores_writes(void *obj, void *data,
     QI2CDevice *i2cdev = (QI2CDevice *)obj;
     int i;
 
+    start_at_zero(TMP105_TEST_ID);
     qtest_irq_intercept_out(global_qtest, TMP105_TEST_PATH);
 
     i2c_set8(i2cdev, TMP105_REG_CONFIG, TMP105_CONFIG_POL | TMP105_CONFIG_FQ_4);
@@ -279,6 +295,7 @@ static void test_wake_from_shutdown(void *obj, void *data,
 {
     QI2CDevice *i2cdev = (QI2CDevice *)obj;
 
+    start_at_zero(TMP105_TEST_ID);
     qtest_irq_intercept_out(global_qtest, TMP105_TEST_PATH);
 
     i2c_set8(i2cdev, TMP105_REG_CONFIG, TMP105_CONFIG_POL | TMP105_CONFIG_FQ_1);
@@ -321,6 +338,7 @@ static void test_tmp75_tm_clears_alert(void *obj, void *data,
     QI2CDevice *i2cdev = (QI2CDevice *)obj;
     int i;
 
+    start_at_zero(TMP75_TEST_ID);
     qtest_irq_intercept_out(global_qtest, TMP75_TEST_PATH);
 
     i2c_set8(i2cdev, TMP105_REG_CONFIG,
@@ -345,6 +363,7 @@ static void test_tmp75_shutdown_clears_alert(void *obj, void *data,
     QI2CDevice *i2cdev = (QI2CDevice *)obj;
     int i;
 
+    start_at_zero(TMP75_TEST_ID);
     qtest_irq_intercept_out(global_qtest, TMP75_TEST_PATH);
 
     i2c_set8(i2cdev, TMP105_REG_CONFIG,
@@ -408,6 +427,7 @@ static void test_lm75b_shutdown_clears_alert(void *obj, void *data,
 {
     QI2CDevice *i2cdev = (QI2CDevice *)obj;
 
+    start_at_zero(LM75B_TEST_ID);
     qtest_irq_intercept_out(global_qtest, LM75B_TEST_PATH);
 
     i2c_set8(i2cdev, TMP105_REG_CONFIG, TMP105_CONFIG_POL | TMP105_CONFIG_TM);
@@ -416,6 +436,41 @@ static void test_lm75b_shutdown_clears_alert(void *obj, void *data,
 
     i2c_set8(i2cdev, TMP105_REG_CONFIG,
              TMP105_CONFIG_POL | TMP105_CONFIG_TM | TMP105_CONFIG_SD);
+    g_assert_false(get_irq(0));
+}
+
+/*
+ * The temperature is the sensor's surroundings, not chip state: a system
+ * reset returns the registers to their reset values but keeps it, and the
+ * first conversion after reset compares it against the reset limits.
+ */
+static void test_reset_keeps_temperature(void *obj, void *data,
+                                         QGuestAllocator *alloc)
+{
+    QI2CDevice *i2cdev = (QI2CDevice *)obj;
+
+    start_at_zero(TMP105_TEST_ID);
+    qtest_irq_intercept_out(global_qtest, TMP105_TEST_PATH);
+
+    qmp_tmp105_set_temperature(TMP105_TEST_ID, 25000);
+    i2c_set8(i2cdev, TMP105_REG_CONFIG, 0x60);
+    i2c_set16(i2cdev, TMP105_REG_T_HIGH, 0x1000);
+    qtest_system_reset(global_qtest);
+
+    g_assert_cmpint(qmp_tmp105_get_temperature(TMP105_TEST_ID), ==, 25000);
+    g_assert_cmphex(i2c_get8(i2cdev, TMP105_REG_CONFIG), ==, 0);
+    g_assert_cmphex(i2c_get16(i2cdev, TMP105_REG_T_HIGH), ==, 0x5000);
+    g_assert_cmphex(i2c_get16(i2cdev, TMP105_REG_TEMPERATURE), ==, 0x1900);
+    /* ALERT is active low after reset, and 25 C is below T_high. */
+    g_assert_true(get_irq(0));
+
+    i2c_set8(i2cdev, TMP105_REG_CONFIG, TMP105_CONFIG_POL);
+    qmp_tmp105_set_temperature(TMP105_TEST_ID, 85000);
+    g_assert_true(get_irq(0));
+    qtest_system_reset(global_qtest);
+
+    g_assert_cmpint(qmp_tmp105_get_temperature(TMP105_TEST_ID), ==, 85000);
+    /* Still over T_high, now with ALERT active low: asserted. */
     g_assert_false(get_irq(0));
 }
 
@@ -436,6 +491,8 @@ static void tmp105_register_nodes(void)
                  test_fault_queue_ignores_writes, NULL);
     qos_add_test("one-shot", "tmp105", test_one_shot, NULL);
     qos_add_test("wake-from-shutdown", "tmp105", test_wake_from_shutdown, NULL);
+    qos_add_test("reset-keeps-temperature", "tmp105",
+                 test_reset_keeps_temperature, NULL);
 
     /* TMP75: register-compatible, but with a 1/2/3/4 fault queue. */
     QOSGraphEdgeOptions tmp75_opts = {
