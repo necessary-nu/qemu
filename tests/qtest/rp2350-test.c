@@ -9,6 +9,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 
 #define ROM_BASE 0x00000000
 #define XIP_BASE 0x10000000
@@ -74,13 +75,17 @@ static void test_memory_map(void)
         uint64_t base;
         uint64_t size;
     } unimplemented[] = {
-        { "rp2350.spi0",       0x40080000, 0x8000 },
         { "rp2350.usbctrl",    0x50100000, 0x100000 },
         { "rp2350.pio0",       0x50200000, 0x100000 },
     };
     g_autofree char *path = NULL;
     QTestState *qts = boot_direct(&path);
     int i;
+
+    /* A subsystem in reset has its window answered for it. */
+    assert_mtree_has(qts, "0000000040000000-0000000040007fff "
+                          "(prio 1, i/o): rp2350.sysinfo-in-reset");
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
 
     assert_mtree_has(qts, "0000000000000000-0000000000007fff "
                           "(prio 0, rom): rp2350.rom");
@@ -114,6 +119,12 @@ static void test_memory_map(void)
                           "(prio 0, i/o): rp2350-uart0");
     assert_mtree_has(qts, "0000000040078000-000000004007bfff "
                           "(prio 0, i/o): rp2350-uart1");
+    assert_mtree_has(qts, "0000000040080000-0000000040083fff "
+                          "(prio 0, i/o): rp2350-spi0");
+    assert_mtree_has(qts, "0000000040084000-0000000040087fff "
+                          "(prio -1000, i/o): rp2350.spi0 @0000000000004000");
+    assert_mtree_has(qts, "0000000040088000-000000004008bfff "
+                          "(prio 0, i/o): rp2350-spi1");
     assert_mtree_has(qts, "00000000400a8000-00000000400abfff "
                           "(prio 0, i/o): rp2350-pwm");
     assert_mtree_has(qts, "00000000400b0000-00000000400b3fff "

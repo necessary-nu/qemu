@@ -17,6 +17,8 @@
  *
  * ACCESS events are counted by overlays in each core's address space that
  * forward every access to the fabric behind them and count it on the way.
+ * The fabric behind an overlay is the core's ACCESSCTRL view of the bus,
+ * so counted accesses meet the same bus security filters as the rest.
  * An overlay is mapped only while counting is enabled and some counter
  * selects an ACCESS event of a port behind it, so the rest of the time
  * accesses take QEMU's direct paths (TCG executes and loads from RAM
@@ -32,10 +34,8 @@
 #include "qemu/log.h"
 #include "qemu/bswap.h"
 #include "qemu/rcu.h"
-#include "qapi/error.h"
 #include "exec/tb-flush.h"
 #include "hw/core/cpu.h"
-#include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_busctrl.h"
 #include "migration/vmstate.h"
@@ -253,6 +253,9 @@ static void rp2350_busctrl_count_access(RP2350BusCtrlOverlay *o, hwaddr addr,
 /*
  * An access completes on its port when the fabric behind the overlay
  * completes it; accesses that fail decode or are refused count nothing.
+ * In particular an access the bus security filter denies is "prevented
+ * from accessing the downstream port" (datasheet, "Bus security
+ * filtering"), so it is not an access to that port.
  * A core's write to read-only memory is discarded without a fault, as on
  * QEMU's direct path, rather than raising the decode error a write through
  * an address space would.
@@ -445,22 +448,20 @@ static const MemoryRegionOps rp2350_busctrl_ops = {
 
 /* [spec:nuos:req:emu.busctrl] */
 void rp2350_busctrl_attach_core(RP2350BusCtrlState *s, int core,
-                                MemoryRegion *container, MemoryRegion *sio,
-                                MemoryRegion *sio_nonsec)
+                                MemoryRegion *container, MemoryRegion *bus,
+                                MemoryRegion *sio, MemoryRegion *sio_nonsec)
 {
     Object *obj = OBJECT(s);
     g_autofree char *name = g_strdup_printf("rp2350-busctrl.fabric%d", core);
     int group;
 
     assert(core >= 0 && core < RP2350_BUSCTRL_CORES && !s->attached[core]);
-    assert(s->board_memory);
 
     memory_region_init(&s->fabric[core], obj, name, UINT64_MAX);
-    memory_region_init_alias(&s->fabric_board[core], obj,
-                             "rp2350-busctrl.fabric-board", s->board_memory,
-                             0, UINT64_MAX);
+    memory_region_init_alias(&s->fabric_bus[core], obj,
+                             "rp2350-busctrl.fabric-bus", bus, 0, UINT64_MAX);
     memory_region_add_subregion_overlap(&s->fabric[core], 0,
-                                        &s->fabric_board[core], -1);
+                                        &s->fabric_bus[core], -1);
     memory_region_init_alias(&s->fabric_sio[core][0], obj,
                              "rp2350-busctrl.fabric-sio", sio, 0,
                              memory_region_size(sio));
@@ -523,15 +524,6 @@ static void rp2350_busctrl_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
 }
 
-static void rp2350_busctrl_realize(DeviceState *dev, Error **errp)
-{
-    RP2350BusCtrlState *s = RP2350_BUSCTRL(dev);
-
-    if (!s->board_memory) {
-        error_setg(errp, "memory property was not set");
-    }
-}
-
 static int rp2350_busctrl_post_load(void *opaque, int version_id)
 {
     rp2350_busctrl_update_overlays(opaque);
@@ -555,20 +547,13 @@ static const VMStateDescription vmstate_rp2350_busctrl = {
     },
 };
 
-static const Property rp2350_busctrl_properties[] = {
-    DEFINE_PROP_LINK("memory", RP2350BusCtrlState, board_memory,
-                     TYPE_MEMORY_REGION, MemoryRegion *),
-};
-
 static void rp2350_busctrl_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
-    dc->realize = rp2350_busctrl_realize;
     rc->phases.hold = rp2350_busctrl_hold_reset;
     dc->vmsd = &vmstate_rp2350_busctrl;
-    device_class_set_props(dc, rp2350_busctrl_properties);
 }
 
 /* [spec:nuos:req:emu.busctrl] */

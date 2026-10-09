@@ -11,6 +11,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 
 #define SET 0x2000
 #define CLR 0x3000
@@ -53,7 +54,10 @@ static char *rom_path;
 
 static QTestState *start(void)
 {
-    return qtest_initf("-M rp2350 -bios %s", rom_path);
+    QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
+
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
+    return qts;
 }
 
 /* [spec:nuos:req:emu.clocks/test] */

@@ -52,18 +52,17 @@ struct RP2350BusCtrlState {
 
     /*
      * Each core's view of the fabric without the counting overlays: the
-     * board memory plus that core's SIO port. Counted accesses are
-     * forwarded through it.
+     * core's ACCESSCTRL view of the system bus plus its SIO port. Counted
+     * accesses are forwarded through it, so the bus security filters
+     * check them exactly as they check accesses that are not counted.
      */
     MemoryRegion fabric[RP2350_BUSCTRL_CORES];
-    MemoryRegion fabric_board[RP2350_BUSCTRL_CORES];
+    MemoryRegion fabric_bus[RP2350_BUSCTRL_CORES];
     MemoryRegion fabric_sio[RP2350_BUSCTRL_CORES][2];
     AddressSpace fabric_as[RP2350_BUSCTRL_CORES];
     bool attached[RP2350_BUSCTRL_CORES];
 
     RP2350BusCtrlOverlay overlay[RP2350_BUSCTRL_CORES][RP2350_BUSCTRL_GROUPS];
-
-    MemoryRegion *board_memory;
 
     uint32_t bus_priority;
     uint32_t bus_priority_ack;
@@ -75,12 +74,15 @@ struct RP2350BusCtrlState {
 /*
  * Route `core`'s bus accesses through the performance counters: the
  * counting overlays go into `container`, the core's address space, above
- * the board memory and the SIO views. `sio` and `sio_nonsec` are the
- * core's SIO views, which the core sees at the SIO and SIO_NONSEC bases.
+ * its view of the system bus and the SIO views. `bus` is the core's
+ * ACCESSCTRL view of the system bus (rp2350_accessctrl_view()), the same
+ * view `container` holds, so that counted accesses pass the same bus
+ * security filters. `sio` and `sio_nonsec` are the core's SIO views,
+ * which the core sees at the SIO and SIO_NONSEC bases.
  */
 void rp2350_busctrl_attach_core(RP2350BusCtrlState *s, int core,
-                                MemoryRegion *container, MemoryRegion *sio,
-                                MemoryRegion *sio_nonsec);
+                                MemoryRegion *container, MemoryRegion *bus,
+                                MemoryRegion *sio, MemoryRegion *sio_nonsec);
 
 /*
  * Count an access the DMA completed: `size` bytes at `addr`, on the ports

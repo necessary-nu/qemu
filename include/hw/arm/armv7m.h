@@ -52,6 +52,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ARMv7MState, ARMV7M)
  * + Property "init-nsvtor": non-secure VTOR reset value (forwarded to CPU object)
  * + Property "vfp": enable VFP (forwarded to CPU object)
  * + Property "dsp": enable DSP (forwarded to CPU object)
+ * + Property "midr": the CPUID value the CPU reports, for an implementation
+ *   of a different revision than the CPU type models (forwarded to CPU
+ *   object; 0, the default, keeps the CPU type's own value)
  * + Property "enable-bitband": expose bitbanded IO
  * + Property "mpu-ns-regions": number of Non-Secure MPU regions (forwarded
  *   to CPU object pmsav7-dregion property; default is whatever the default
@@ -102,6 +105,7 @@ struct ARMv7MState {
     Object *idau;
     uint32_t init_svtor;
     uint32_t init_nsvtor;
+    uint64_t midr;
     uint32_t mpu_ns_regions;
     uint32_t mpu_s_regions;
     bool enable_bitband;

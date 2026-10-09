@@ -133,7 +133,8 @@ system_ss.add(when: 'CONFIG_RP2350_ROSC', if_true: files('rp2350_rosc.c'))
 system_ss.add(when: 'CONFIG_RP2350_TRNG', if_true: files('rp2350_trng.c'))
 system_ss.add(when: 'CONFIG_RP2350_SHA256', if_true: files('rp2350_sha256.c'))
 system_ss.add(when: 'CONFIG_RP2350_PWM', if_true: files('rp2350_pwm.c'))
-system_ss.add(when: 'CONFIG_RP2350_CORESIGHT', if_true: files('rp2350_coresight.c', 'rp2350_coresight_trace.c'))
+system_ss.add(when: 'CONFIG_RP2350_CORESIGHT', if_true: files('rp2350_coresight.c', 'rp2350_coresight_trace.c', 'rp2350_m33_debug.c'))
+system_ss.add(when: 'CONFIG_RP2350_HSTX', if_true: files('rp2350_hstx.c'))
 system_ss.add(when: 'CONFIG_RP2350_ACCESSCTRL', if_true: files('rp2350_accessctrl.c'))
 system_ss.add(when: 'CONFIG_RP2350_XIP', if_true: files('rp2350_xip.c'))
 system_ss.add(when: 'CONFIG_RP2350_PSM', if_true: files('rp2350_psm.c'))
@@ -204,6 +205,8 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
   'esp32_dport_mpu.c',
   'esp32_flash_enc.c',
   'esp32_ledc.c',
+  'esp32_pcnt.c',
+  'esp32_rmt.c',
   'esp32_rng.c',
   'esp32_rsa.c',
   'esp32_rtc_cntl.c',

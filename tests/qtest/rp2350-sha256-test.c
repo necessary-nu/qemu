@@ -9,6 +9,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 
 #define XOR                 0x1000
 #define SET                 0x2000
@@ -64,7 +65,10 @@ static const Vector vectors[] = {
 
 static QTestState *start(void)
 {
-    return qtest_initf("-M rp2350 -bios %s", rom_path);
+    QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
+
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
+    return qts;
 }
 
 /* Pad `msg` as FIPS 180-4 section 5.1.1 does; returns the padded length. */
