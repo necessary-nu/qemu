@@ -133,6 +133,7 @@ struct Esp32SocState {
     /* Internal SRAM, which deep sleep powers down */
     MemoryRegion *dram;
     MemoryRegion *iram;
+    MemoryRegion cpu_sysmem_view[ESP32_CPU_COUNT];
 
     uint32_t requested_reset;
 

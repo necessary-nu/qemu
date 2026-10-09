@@ -1,2 +1,5 @@
 config STM32F2XX_ADC
     bool
+
+config RP2350_ADC
+    bool
