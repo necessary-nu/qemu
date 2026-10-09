@@ -141,11 +141,19 @@ void rp2350_bootram_reset_regs(RP2350BootRAMState *s)
     s->lock_stat = LOCK_MASK;
 }
 
+/*
+ * Boot RAM is in the XIP memory power domain, which stays powered through
+ * the power manager's own resets (RESET_TYPE_WAKEUP); the power manager
+ * clears it when the domain powers down.
+ */
+/* [spec:nuos:req:emu.powman] */
 static void rp2350_bootram_hold_reset(Object *obj, ResetType type)
 {
     RP2350BootRAMState *s = RP2350_BOOTRAM(obj);
 
-    memset(s->ram, 0, sizeof(s->ram));
+    if (type != RESET_TYPE_WAKEUP) {
+        memset(s->ram, 0, sizeof(s->ram));
+    }
     rp2350_bootram_reset_regs(s);
 }
 
