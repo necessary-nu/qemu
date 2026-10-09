@@ -13,6 +13,14 @@ static void esp32_i2c_reset_hold(Object *obj, ResetType type)
 {
     Esp32I2CState * s = Esp32_I2C(obj);
 
+    /*
+     * The bus's devices are not reset with the controller. A transaction
+     * left open ends for them: the next START the controller puts on the
+     * lines makes every device listen for its address again.
+     */
+    if (s->trans_ongoing && s->connected) {
+        i2c_end_transfer(s->bus);
+    }
     fifo8_reset(&s->rx_fifo);
     fifo8_reset(&s->tx_fifo);
     s->trans_ongoing = false;

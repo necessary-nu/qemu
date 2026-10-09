@@ -75,6 +75,11 @@ void bus_cold_reset(BusState *bus)
     resettable_reset(OBJECT(bus), RESET_TYPE_COLD);
 }
 
+void qbus_set_reset_domain(BusState *bus)
+{
+    bus->reset_domain = true;
+}
+
 bool bus_is_in_reset(BusState *bus)
 {
     return resettable_is_in_reset(OBJECT(bus));

@@ -402,6 +402,11 @@ struct BusState {
      * @reset: ResettableState for the bus; handled by Resettable interface.
      */
     ResettableState reset;
+    /**
+     * @reset_domain: the bus is its own reset domain: a reset of its
+     * parent device does not reach it. See qbus_set_reset_domain().
+     */
+    bool reset_domain;
 };
 
 /*** Board API.  This should go away once we have a machine config file.  ***/
@@ -886,6 +891,20 @@ void device_cold_reset(DeviceState *dev);
  * interface. It triggers a RESET_TYPE_COLD.
  */
 void bus_cold_reset(BusState *bus);
+
+/**
+ * qbus_set_reset_domain() - make a bus its own reset domain
+ * @bus: bus to detach from its parent device's resets
+ *
+ * A reset of @bus's parent device resets the device but no longer
+ * propagates to @bus or the devices on it; they reset only when @bus
+ * itself is reset, for example with bus_cold_reset(). This models a
+ * controller whose reset line does not reach the devices it talks to,
+ * such as an SoC's I2C or SPI controller whose bus leads to chips on the
+ * board: those chips reset at power-on, not when the SoC resets the
+ * controller.
+ */
+void qbus_set_reset_domain(BusState *bus);
 
 /**
  * device_is_in_reset() - check device reset state

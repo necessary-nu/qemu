@@ -88,6 +88,8 @@ static const struct MemmapEntry {
 #define ESP32_SOC_RESET_ALL       (ESP32_SOC_RESET_RTC | ESP32_SOC_RESET_DIG)
 /* The digital domain's reset is its power-down for deep sleep */
 #define ESP32_SOC_RESET_SLEEP     0x10
+/* Power-on: the board's chips on the ESP32's buses reset too */
+#define ESP32_SOC_RESET_BOARD     0x20
 
 /* What powered-down internal SRAM holds when it comes back */
 #define ESP32_LOST_SRAM_PATTERN   0xa5
@@ -226,6 +228,29 @@ static void esp32_timg_sys_reset(void* opaque, int n, int level)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.rtc]
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * The buses from the ESP32's I2C, SPI and SD/MMC controllers to the
+ * board's chips: the TMP105, the SPI flash and PSRAM, the SD card, and
+ * whatever else is wired to those pins. The chips are powered by the
+ * board, not the ESP32, and no ESP32 reset reaches them: a software reset,
+ * a watchdog reset, a deep-sleep wake or a DPORT reset bit resets the
+ * controller alone, and the chips keep their state (a TMP105's limits, a
+ * flash's status register and write enable, an SD card's protocol state).
+ * Each bus is its own reset domain, which only a power cycle resets.
+ */
+static void esp32_soc_board_buses(Esp32SocState *s, void (*fn)(BusState *))
+{
+    for (int i = 0; i < ESP32_I2C_COUNT; i++) {
+        fn(qdev_get_child_bus(DEVICE(&s->i2c[i]), "i2c"));
+    }
+    for (int i = 0; i < ESP32_SPI_COUNT; i++) {
+        fn(qdev_get_child_bus(DEVICE(&s->spi[i]), "spi"));
+    }
+    fn(qdev_get_child_bus(DEVICE(&s->sdmmc), "sd-bus"));
+}
+
 static void esp32_soc_reset(DeviceState *dev)
 {
     Esp32SocState *s = ESP32_SOC(dev);
@@ -237,10 +262,17 @@ static void esp32_soc_reset(DeviceState *dev)
 
     qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->flash_enc), ESP32_FLASH_ENCRYPTION_DL_MODE_GPIO, 0), !flash_boot_mode);
 
+    /*
+     * No reset request from the chip: this is QEMU's system reset, the
+     * board's power cycle, which also resets the board's chips.
+     */
     if (s->requested_reset == 0) {
-        s->requested_reset = ESP32_SOC_RESET_ALL;
+        s->requested_reset = ESP32_SOC_RESET_ALL | ESP32_SOC_RESET_BOARD;
     }
     requested = s->requested_reset;
+    if (s->requested_reset & ESP32_SOC_RESET_BOARD) {
+        esp32_soc_board_buses(s, bus_cold_reset);
+    }
     if (s->requested_reset & ESP32_SOC_RESET_RTC) {
         s->rtc_cntl.flash_boot_mode = flash_boot_mode;
         device_cold_reset(DEVICE(&s->rtc_cntl));
@@ -1707,6 +1739,7 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                     ESP32_SENS_SARADC_CTRL_IN, 0));
 
     esp32_soc_connect_lines(s);
+    esp32_soc_board_buses(s, qbus_set_reset_domain);
 
     qemu_register_reset((QEMUResetHandler*) esp32_soc_reset, dev);
 }
