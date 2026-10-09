@@ -550,6 +550,10 @@ static int pl011_can_receive(void *opaque)
      * UART continuously enabled regardless of the enable bits.
      */
 
+    /* A UART that its SoC holds in reset takes no input. */
+    if (device_is_in_reset(DEVICE(s))) {
+        return 0;
+    }
     trace_pl011_can_receive(s->lcr, s->read_count, fifo_depth, fifo_available);
     return fifo_available;
 }
@@ -573,7 +577,8 @@ static void pl011_receive(void *opaque, const uint8_t *buf, int size)
 
 static void pl011_event(void *opaque, QEMUChrEvent event)
 {
-    if (event == CHR_EVENT_BREAK && !pl011_loopback_enabled(opaque)) {
+    if (event == CHR_EVENT_BREAK && !pl011_loopback_enabled(opaque) &&
+        !device_is_in_reset(DEVICE(opaque))) {
         pl011_fifo_rx_put(opaque, DR_BE);
     }
 }
@@ -737,7 +742,7 @@ static void pl011_reset(DeviceState *dev)
     s->logged_disabled_uart = false;
     pl011_reset_rx_fifo(s);
     pl011_reset_tx_fifo(s);
-    pl011_update_dma(s);
+    pl011_update(s);
 }
 
 static void pl011_class_init(ObjectClass *oc, const void *data)
