@@ -280,10 +280,20 @@ bool xtensa_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                   __func__, address, access_type, mmu_idx, paddr, ret);
 
     if (ret == 0) {
+        XtensaExtMapping map = {
+            .paddr = paddr,
+            .prot = access,
+            .page_size = page_size,
+        };
+
+        if (env->ext_hooks && env->ext_hooks->filter) {
+            env->ext_hooks->filter(env->ext_opaque, env, address,
+                                   access_type, &map);
+        }
         tlb_set_page(cs,
                      address & TARGET_PAGE_MASK,
-                     paddr & TARGET_PAGE_MASK,
-                     access, mmu_idx, page_size);
+                     map.paddr & TARGET_PAGE_MASK,
+                     map.prot, mmu_idx, map.page_size);
         return true;
     } else if (probe) {
         return false;
@@ -306,6 +316,41 @@ void xtensa_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
                                   INSTR_PIF_ADDR_ERROR_CAUSE :
                                   LOAD_STORE_PIF_ADDR_ERROR_CAUSE,
                                   addr);
+}
+
+void xtensa_set_ext_hooks(CPUXtensaState *env, const XtensaExtHooks *hooks,
+                          void *opaque)
+{
+    env->ext_hooks = hooks;
+    env->ext_opaque = opaque;
+    tlb_flush(env_cpu(env));
+}
+
+/*
+ * Run countdown n out after insns more instructions: the hook is called
+ * before the instruction after them. The core counts the instructions it
+ * executes from the next translation block on; a countdown started by an
+ * MMIO store starts after that store, as an MMIO access always ends its
+ * translation block.
+ */
+void xtensa_ext_countdown_start(CPUXtensaState *env, unsigned n,
+                                uint32_t insns)
+{
+    assert(n < XTENSA_EXT_COUNTDOWNS);
+    env->ext_countdown[n] = MIN(insns, INT32_MAX);
+}
+
+void xtensa_ext_countdown_cancel(CPUXtensaState *env, unsigned n)
+{
+    assert(n < XTENSA_EXT_COUNTDOWNS);
+    env->ext_countdown[n] = -1;
+}
+
+/* Called with the BQL held. */
+void xtensa_set_nmi_masked(CPUXtensaState *env, bool masked)
+{
+    env->nmi_masked = masked;
+    check_interrupts(env);
 }
 
 void xtensa_runstall(CPUXtensaState *env, bool runstall)

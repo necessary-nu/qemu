@@ -1173,6 +1173,18 @@ static void xtensa_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         return;
     }
 
+#ifndef CONFIG_USER_ONLY
+    /*
+     * An MMIO access that is not the last instruction of its block runs
+     * again alone (CF_MEMI_ONLY, see cpu_io_recompile); it has been
+     * counted already.
+     */
+    if ((dc->base.tb->flags & XTENSA_TBFLAG_EXT_COUNTDOWN) &&
+        !(tb_cflags(dc->base.tb) & CF_MEMI_ONLY)) {
+        gen_helper_ext_countdown(tcg_env, tcg_constant_i32(dc->pc));
+    }
+#endif
+
     if (dc->icount) {
         TCGLabel *label = gen_new_label();
 

@@ -143,6 +143,43 @@ void HELPER(intclear)(CPUXtensaState *env, uint32_t v)
                        env->config->inttype_mask[INTTYPE_EDGE]));
 }
 
+/*
+ * Count an instruction against each running countdown; one that has run
+ * out expires before this instruction, which then runs anew.
+ */
+void HELPER(ext_countdown)(CPUXtensaState *env, uint32_t pc)
+{
+    unsigned expired = 0;
+
+    for (unsigned i = 0; i < XTENSA_EXT_COUNTDOWNS; ++i) {
+        if (env->ext_countdown[i] == 0) {
+            env->ext_countdown[i] = -1;
+            expired |= 1u << i;
+        } else if (env->ext_countdown[i] > 0) {
+            env->ext_countdown[i]--;
+        }
+    }
+    if (expired) {
+        env->pc = pc;
+        bql_lock();
+        for (unsigned i = 0; i < XTENSA_EXT_COUNTDOWNS; ++i) {
+            if ((expired & (1u << i)) && env->ext_hooks &&
+                env->ext_hooks->countdown_expired) {
+                env->ext_hooks->countdown_expired(env->ext_opaque, env, i);
+            }
+        }
+        bql_unlock();
+        cpu_loop_exit(env_cpu(env));
+    }
+}
+
+static void ext_vector(CPUXtensaState *env)
+{
+    if (env->ext_hooks && env->ext_hooks->vector) {
+        env->ext_hooks->vector(env->ext_opaque, env, env->pc);
+    }
+}
+
 static uint32_t relocated_vector(CPUXtensaState *env, uint32_t vector)
 {
     if (xtensa_option_enabled(env->config,
@@ -167,7 +204,7 @@ static void handle_interrupt(CPUXtensaState *env)
          level <= env->config->nlevel &&
          (env->config->level_mask[level] &
           env->sregs[INTSET] & env->sregs[INTENABLE])) ||
-        level == env->config->nmi_level) {
+        (level == env->config->nmi_level && !env->nmi_masked)) {
         CPUState *cs = env_cpu(env);
 
         if (level > 1) {
@@ -180,6 +217,7 @@ static void handle_interrupt(CPUXtensaState *env)
                 (env->sregs[PS] & ~PS_INTLEVEL) | level | PS_EXCM;
             env->pc = relocated_vector(env,
                                        env->config->interrupt_vector[level]);
+            ext_vector(env);
             if (level == env->config->nmi_level) {
                 intclear(env, env->config->inttype_mask[INTTYPE_NMI]);
             }
@@ -247,6 +285,7 @@ void xtensa_cpu_do_interrupt(CPUState *cs)
 
             vector = env->config->exception_vector[cs->exception_index];
             env->pc = relocated_vector(env, vector);
+            ext_vector(env);
             qemu_plugin_vcpu_exception_cb(cs, last_pc);
         } else {
             qemu_log_mask(CPU_LOG_INT,

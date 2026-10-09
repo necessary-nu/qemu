@@ -309,6 +309,37 @@ typedef enum {
 
 typedef struct CPUArchState CPUXtensaState;
 
+#ifndef CONFIG_USER_ONLY
+/*
+ * Hooks for a process-ID and memory protection unit that a board puts
+ * around the core, such as the ESP32's PID controllers and the MMUs and
+ * MPUs in its DPORT block.
+ */
+#define XTENSA_EXT_COUNTDOWNS 2
+
+/*
+ * A TLB mapping the core has computed for one access: the physical
+ * address of the accessed byte, the PAGE_* rights, and the size of the
+ * page it belongs to. The filter hook may replace any of them; a page size
+ * below TARGET_PAGE_SIZE makes every access to the page refill the TLB.
+ */
+typedef struct XtensaExtMapping {
+    hwaddr paddr;
+    int prot;
+    uint64_t page_size;
+} XtensaExtMapping;
+
+typedef struct XtensaExtHooks {
+    /* Called on every TLB fill, after the core's own translation. */
+    void (*filter)(void *opaque, CPUXtensaState *env, uint32_t vaddr,
+                   MMUAccessType access_type, XtensaExtMapping *map);
+    /* Called with the vector address whenever the core vectors. */
+    void (*vector)(void *opaque, CPUXtensaState *env, uint32_t pc);
+    /* Called before the instruction at which countdown n runs out. */
+    void (*countdown_expired)(void *opaque, CPUXtensaState *env, unsigned n);
+} XtensaExtHooks;
+#endif
+
 typedef struct xtensa_tlb_entry {
     uint32_t vaddr;
     uint32_t paddr;
@@ -539,6 +570,13 @@ struct CPUArchState {
     uint64_t time_base;
     uint64_t ccount_time;
     uint32_t ccount_base;
+
+    const XtensaExtHooks *ext_hooks;
+    void *ext_opaque;
+    /* Instructions left before each countdown expires, or -1 if idle */
+    int32_t ext_countdown[XTENSA_EXT_COUNTDOWNS];
+    /* The board masks the NMI, as the ESP32's PID controller can */
+    bool nmi_masked;
 #endif
 
     int yield_needed;
@@ -641,6 +679,14 @@ static inline void xtensa_select_static_vectors(CPUXtensaState *env,
     env->static_vectors = n;
 }
 void xtensa_runstall(CPUXtensaState *env, bool runstall);
+#ifndef CONFIG_USER_ONLY
+void xtensa_set_ext_hooks(CPUXtensaState *env, const XtensaExtHooks *hooks,
+                          void *opaque);
+void xtensa_ext_countdown_start(CPUXtensaState *env, unsigned n,
+                                uint32_t insns);
+void xtensa_ext_countdown_cancel(CPUXtensaState *env, unsigned n);
+void xtensa_set_nmi_masked(CPUXtensaState *env, bool masked);
+#endif
 void xtensa_cpu_clock_rebase(CPUXtensaState *env);
 void xtensa_cpu_clock_rearm(CPUXtensaState *env);
 
@@ -732,6 +778,7 @@ static inline uint32_t xtensa_replicate_windowstart(const CPUXtensaState *env)
 #define XTENSA_TBFLAG_CWOE 0x40000
 #define XTENSA_TBFLAG_CALLINC_MASK 0x180000
 #define XTENSA_TBFLAG_CALLINC_SHIFT 19
+#define XTENSA_TBFLAG_EXT_COUNTDOWN 0x200000
 
 #define XTENSA_CSBASE_LEND_MASK 0x0000ffff
 #define XTENSA_CSBASE_LEND_SHIFT 0
