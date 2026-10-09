@@ -1042,6 +1042,12 @@ struct ArchCPU {
     /* For v8M, pointer to the IDAU interface provided by board/SoC */
     Object *idau;
 
+    /*
+     * For M profile, pointer to the instruction fetch port decode provided
+     * by the board/SoC; NULL if its instruction port reaches everything.
+     */
+    Object *fetch_port;
+
     /* 'compatible' string for this CPU for Linux device trees */
     const char *dtb_compatible;
 

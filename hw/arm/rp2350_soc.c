@@ -29,6 +29,7 @@
 #include "target/arm/cpu.h"
 #include "target/arm/internals.h"
 #include "target/arm/multiprocessing.h"
+#include "target/arm/tcg/fetch-port.h"
 #include "target/arm/tcg/idau.h"
 
 typedef struct RP2350Peripheral {
@@ -156,6 +157,34 @@ static void rp2350_idau_check(IDAUInterface *ii, uint32_t address,
     }
     *base = block;
     *limit = block + (RP2350_XIP_BASE - 1);
+}
+
+/*
+ * The bus fabric's decode for the cores' instruction fetch ports (datasheet
+ * "Bus fabric" and "Address map"). The fabric decodes bits 31:28 first,
+ * and only the ROM, XIP and SRAM segments are wired to the instruction
+ * ports. The APB and AHB peripheral segments, boot RAM and USB RAM
+ * included, and SIO are reachable by loads, stores and DMA only, which
+ * keeps the IDAU-Exempt peripheral space from ever being both Non-secure-
+ * writable and Secure-executable. A fetch the MPU passes to any other
+ * segment fails on the bus.
+ */
+/* [spec:nuos:req:emu.machine+1] */
+static bool rp2350_fetchable(ARMFetchPort *fp, uint32_t address,
+                             uint32_t *base, uint32_t *limit)
+{
+    uint32_t block = address & ~(uint32_t)(RP2350_XIP_BASE - 1);
+
+    *base = block;
+    *limit = block + (RP2350_XIP_BASE - 1);
+    switch (block) {
+    case RP2350_ROM_BASE:
+    case RP2350_XIP_BASE:
+    case RP2350_SRAM_BASE:
+        return true;
+    default:
+        return false;
+    }
 }
 
 /* The boot ROM enables the RCP (coprocessor 7) for Secure and Non-secure. */
@@ -884,6 +913,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                                                                i)),
                                  &error_abort);
         object_property_set_link(OBJECT(armv7m), "idau", OBJECT(s),
+                                 &error_abort);
+        object_property_set_link(OBJECT(armv7m), "fetch-port", OBJECT(s),
                                  &error_abort);
         if (!sysbus_realize(SYS_BUS_DEVICE(armv7m), errp)) {
             return;
@@ -1627,10 +1658,12 @@ static void rp2350_soc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     IDAUInterfaceClass *iic = IDAU_INTERFACE_CLASS(klass);
+    ARMFetchPortClass *fpc = ARM_FETCH_PORT_CLASS(klass);
 
     dc->realize = rp2350_soc_realize;
     device_class_set_props(dc, rp2350_soc_properties);
     iic->check = rp2350_idau_check;
+    fpc->fetchable = rp2350_fetchable;
 }
 
 static const TypeInfo rp2350_soc_info = {
@@ -1641,6 +1674,7 @@ static const TypeInfo rp2350_soc_info = {
     .class_init    = rp2350_soc_class_init,
     .interfaces    = (const InterfaceInfo[]) {
         { TYPE_IDAU_INTERFACE },
+        { TYPE_ARM_FETCH_PORT_INTERFACE },
         { }
     },
 };

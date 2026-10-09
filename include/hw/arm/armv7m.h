@@ -48,6 +48,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ARMv7MState, ARMV7M)
  *   that CPU accesses see. (The NVIC, bitbanding and other CPU-internal
  *   devices will be automatically layered on top of this view.)
  * + Property "idau": IDAU interface (forwarded to CPU object)
+ * + Property "fetch-port": instruction fetch port decode interface
+ *   (forwarded to CPU object; unset, the instruction port reaches every
+ *   address the data port does)
  * + Property "init-svtor": secure VTOR reset value (forwarded to CPU object)
  * + Property "init-nsvtor": non-secure VTOR reset value (forwarded to CPU object)
  * + Property "vfp": enable VFP (forwarded to CPU object)
@@ -103,6 +106,7 @@ struct ARMv7MState {
     /* MemoryRegion the board provides to us (with its devices, RAM, etc) */
     MemoryRegion *board_memory;
     Object *idau;
+    Object *fetch_port;
     uint32_t init_svtor;
     uint32_t init_nsvtor;
     uint64_t midr;

@@ -2083,6 +2083,14 @@ static bool v7m_read_half_insn(ARMCPU *cpu, ARMMMUIdx mmu_idx, bool secure,
         return false;
     }
     if (!get_phys_addr(env, addr, MMU_INST_FETCH, 0, mmu_idx, &res, &fi)) {
+        if (fi.type == ARMFault_SyncExternal) {
+            /* The bus has no instruction path to the address. */
+            env->v7m.cfsr[M_REG_NS] |= R_V7M_CFSR_IBUSERR_MASK;
+            armv7m_nvic_set_pending(env->nvic, ARMV7M_EXCP_BUS, false);
+            qemu_log_mask(CPU_LOG_INT,
+                          "...really BusFault with CFSR.IBUSERR\n");
+            return false;
+        }
         /* the MPU lookup failed */
         env->v7m.cfsr[env->v7m.secure] |= R_V7M_CFSR_IACCVIOL_MASK;
         armv7m_nvic_set_pending(env->nvic, ARMV7M_EXCP_MEM, env->v7m.secure);
