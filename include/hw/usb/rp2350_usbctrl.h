@@ -41,7 +41,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350USBCtrlState, RP2350_USBCTRL)
 /*
  * The USB port. In host mode (MAIN_CTRL.HOST_NDEVICE) it is the root port
  * of a QEMU USB bus, so QEMU USB devices (-device usb-kbd and the like)
- * plug into it. In device mode the RP2350 is the device on the port, and
+ * plug into it. Without port=1, QEMU puts a usb-hub on the single port
+ * and the device behind it. In device mode the RP2350 is the device on the port, and
  * what sits at the other end of the cable is one of:
  *
  *  - the CDC-ACM bridge ("cdc-chardev" property): a built-in host that
