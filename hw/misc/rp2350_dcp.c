@@ -166,13 +166,18 @@ void rp2350_dcp_attach(RP2350DCPState *s, int core, ARMCPU *cpu)
     arm_m_set_coprocessor(cpu, 5, rp2350_dcp_op, &s->core[core]);
 }
 
+void rp2350_dcp_reset_core(RP2350DCPState *s, int core)
+{
+    memset(s->core[core].inst, 0, sizeof(s->core[core].inst));
+}
+
 static void rp2350_dcp_hold_reset(Object *obj, ResetType type)
 {
     RP2350DCPState *s = RP2350_DCP(obj);
     int i;
 
     for (i = 0; i < RP2350_DCP_CORES; i++) {
-        memset(s->core[i].inst, 0, sizeof(s->core[i].inst));
+        rp2350_dcp_reset_core(s, i);
     }
 }
 

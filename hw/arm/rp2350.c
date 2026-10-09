@@ -15,7 +15,9 @@
  *                 bring-up convenience; images that boot this way must be
  *                 linked with their vector table at 0x10000000. A -bios
  *                 image given as well is mapped, so ROM function lookups
- *                 work, but not executed.
+ *                 work, but not executed. Watchdog and PSM resets of the
+ *                 processors restart them the same way, with the machine
+ *                 honouring the boot ROM's watchdog boot vector.
  *
  * The RP2350 has no internal flash. Boards set its size with
  * -M rp2350,flash-size=SIZE (a Pico 2 has 4M); there is no default. The

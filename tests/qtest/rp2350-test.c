@@ -74,13 +74,11 @@ static void test_memory_map(void)
         uint64_t base;
         uint64_t size;
     } unimplemented[] = {
-        { "rp2350.psm",        0x40018000, 0x8000 },
         { "rp2350.spi0",       0x40080000, 0x8000 },
         { "rp2350.pwm",        0x400a8000, 0x8000 },
         { "rp2350.dma",        0x50000000, 0x100000 },
         { "rp2350.usbctrl",    0x50100000, 0x100000 },
         { "rp2350.pio0",       0x50200000, 0x100000 },
-        { "rp2350.watchdog",   0x400d8000, 0x8000 },
     };
     g_autofree char *path = NULL;
     QTestState *qts = boot_direct(&path);
@@ -98,6 +96,10 @@ static void test_memory_map(void)
                           "(prio -1000, i/o): rp2350.sysinfo @0000000000004000");
     assert_mtree_has(qts, "0000000040158000-000000004015bfff "
                           "(prio 0, i/o): rp2350-glitch-detector");
+    assert_mtree_has(qts, "0000000040018000-000000004001bfff "
+                          "(prio 0, i/o): rp2350-psm");
+    assert_mtree_has(qts, "000000004001c000-000000004001ffff "
+                          "(prio -1000, i/o): rp2350.psm @0000000000004000");
     assert_mtree_has(qts, "0000000040020000-0000000040023fff "
                           "(prio 0, i/o): rp2350-resets");
     assert_mtree_has(qts, "0000000040024000-0000000040027fff "
@@ -116,6 +118,11 @@ static void test_memory_map(void)
                           "(prio 0, i/o): rp2350-uart1");
     assert_mtree_has(qts, "00000000400b0000-00000000400b3fff "
                           "(prio 0, i/o): rp2350-timer");
+    assert_mtree_has(qts, "00000000400d8000-00000000400dbfff "
+                          "(prio 0, i/o): rp2350-watchdog");
+    assert_mtree_has(qts, "00000000400dc000-00000000400dffff "
+                          "(prio -1000, i/o): rp2350.watchdog "
+                          "@0000000000004000");
     assert_mtree_has(qts, "00000000400b8000-00000000400bbfff "
                           "(prio 0, i/o): rp2350-timer");
     assert_mtree_has(qts, "00000000d0000000-00000000d0000fff "

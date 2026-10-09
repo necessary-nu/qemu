@@ -1265,6 +1265,12 @@ static void rp2350_xip_reset_exit(Object *obj, ResetType type)
     rp2350_xip_update_dreq(s);
 }
 
+void rp2350_xip_reset_block(RP2350XIPState *s)
+{
+    rp2350_xip_reset_enter(OBJECT(s), RESET_TYPE_COLD);
+    rp2350_xip_reset_exit(OBJECT(s), RESET_TYPE_COLD);
+}
+
 static void rp2350_xip_init(Object *obj)
 {
     RP2350XIPState *s = RP2350_XIP(obj);

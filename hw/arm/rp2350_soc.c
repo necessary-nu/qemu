@@ -10,6 +10,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "hw/arm/rp2350_soc.h"
@@ -22,6 +23,7 @@
 #include "system/system.h"
 #include "target/arm/arm-powerctl.h"
 #include "target/arm/cpu.h"
+#include "target/arm/internals.h"
 #include "target/arm/multiprocessing.h"
 
 typedef struct RP2350Peripheral {
@@ -140,6 +142,213 @@ static void rp2350_core1_launch(void *opaque, uint32_t vtor, uint32_t sp,
     start->sp = sp;
     start->entry = entry;
     async_run_on_cpu(CPU(cpu), rp2350_core1_start, RUN_ON_CPU_HOST_PTR(start));
+}
+
+/* RESETS bits of the subsystems that have device models. */
+#define RP2350_RESET_BUSCTRL    1
+#define RP2350_RESET_IO_BANK0   6
+#define RP2350_RESET_IO_QSPI    7
+#define RP2350_RESET_PADS_BANK0 9
+#define RP2350_RESET_PADS_QSPI  10
+#define RP2350_RESET_PLL_SYS    14
+#define RP2350_RESET_PLL_USB    15
+#define RP2350_RESET_SYSCFG     20
+#define RP2350_RESET_SYSINFO    21
+#define RP2350_RESET_TBMAN      22
+#define RP2350_RESET_TIMER0     23
+#define RP2350_RESET_TIMER1     24
+#define RP2350_RESET_TRNG       25
+#define RP2350_RESET_UART0      26
+#define RP2350_RESET_UART1      27
+
+/* The device model that is subsystem `bit` as a whole, if there is one. */
+static DeviceState *rp2350_subsystem(RP2350State *s, int bit)
+{
+    switch (bit) {
+    case RP2350_RESET_BUSCTRL:
+        return DEVICE(&s->busctrl);
+    case RP2350_RESET_PLL_SYS:
+        return DEVICE(&s->pll_sys);
+    case RP2350_RESET_PLL_USB:
+        return DEVICE(&s->pll_usb);
+    case RP2350_RESET_SYSCFG:
+        return DEVICE(&s->syscfg);
+    case RP2350_RESET_SYSINFO:
+        return DEVICE(&s->sysinfo);
+    case RP2350_RESET_TBMAN:
+        return DEVICE(&s->tbman);
+    case RP2350_RESET_TIMER0:
+        return DEVICE(&s->timer[0]);
+    case RP2350_RESET_TIMER1:
+        return DEVICE(&s->timer[1]);
+    case RP2350_RESET_TRNG:
+        return DEVICE(&s->trng);
+    case RP2350_RESET_UART0:
+        return DEVICE(&s->uart[0]);
+    case RP2350_RESET_UART1:
+        return DEVICE(&s->uart[1]);
+    }
+    return NULL;
+}
+
+/*
+ * The boot ROM's watchdog boot vector: SCRATCH4 holds this magic number,
+ * SCRATCH5 the entry point XORed with its negation, SCRATCH6 the stack
+ * pointer and SCRATCH7 the entry point.
+ */
+#define VECTORED_BOOT_MAGIC 0xb007c0d3u
+
+/*
+ * With no ROM executing, core 0 coming out of reset does what the boot
+ * ROM's boot path does with a watchdog boot vector: consume it (clearing
+ * SCRATCH4) and call the entry point on the given stack. A vector that
+ * returns continues into the directly loaded image, as the ROM continues
+ * into flash boot. The ROM's one-shot boot types (an entry point equal to
+ * the magic number) select BOOTSEL, RAM image or flash update boots, which
+ * need the ROM itself.
+ */
+/* [spec:nuos:req:emu.watchdog] */
+static void rp2350_soc_watchdog_vector(RP2350State *s)
+{
+    uint32_t *scratch = s->watchdog.scratch;
+    uint32_t pc = scratch[7];
+    ARMCPU *cpu = s->armv7m[0].cpu;
+    CPUARMState *env = &cpu->env;
+
+    if (scratch[4] != VECTORED_BOOT_MAGIC ||
+        scratch[5] != (pc ^ -VECTORED_BOOT_MAGIC)) {
+        return;
+    }
+    scratch[4] = 0;
+    if (pc == VECTORED_BOOT_MAGIC) {
+        qemu_log_mask(LOG_UNIMP, "rp2350: watchdog boot type %" PRIu32
+                      " needs the boot ROM; starting the loaded image\n",
+                      scratch[6]);
+        return;
+    }
+    if (!(pc & 1)) {
+        /* The ROM hangs rather than enter code of the wrong architecture. */
+        qemu_log_mask(LOG_GUEST_ERROR, "rp2350: watchdog boot entry point "
+                      "0x%08" PRIx32 " is not Thumb code; core 0 hangs\n", pc);
+        CPU(cpu)->halted = 1;
+        return;
+    }
+    env->regs[14] = env->regs[15] | 1;
+    env->regs[13] = scratch[6] & ~3u;
+    env->regs[15] = pc & ~1u;
+}
+
+/*
+ * Reset one core and what belongs to it: its NVIC, EPPB and SysTicks, and
+ * its RCP and DCP state. A core held in reset is left powered off. Otherwise
+ * it starts as at power-on: from the ROM, or, with no ROM executing,
+ * core 0 as the ROM would hand it over and core 1 waiting to be launched.
+ */
+/* [spec:nuos:req:emu.watchdog] */
+static void rp2350_soc_reset_core(RP2350State *s, int n, bool hold,
+                                  bool sio_reset)
+{
+    ARMv7MState *m = &s->armv7m[n];
+    CPUState *cs = CPU(m->cpu);
+
+    device_cold_reset(DEVICE(&m->nvic));
+    device_cold_reset(DEVICE(&s->eppb[n]));
+    device_cold_reset(DEVICE(&m->systick[M_REG_NS]));
+    if (DEVICE(&m->systick[M_REG_S])->realized) {
+        device_cold_reset(DEVICE(&m->systick[M_REG_S]));
+    }
+    rp2350_rcp_reset_core(&s->rcp, n);
+    rp2350_dcp_reset_core(&s->dcp, n);
+    cpu_reset(cs);
+    if (hold) {
+        cs->halted = 1;
+        arm_set_cpu_power_state(m->cpu, PSCI_OFF);
+        return;
+    }
+    if (!s->core1_launch) {
+        return;
+    }
+    if (n == 0) {
+        rp2350_soc_boot_rom_handoff(s, 0);
+        rp2350_soc_watchdog_vector(s);
+    } else if (!sio_reset) {
+        rp2350_sio_core1_reset(&s->sio);
+    }
+}
+
+/*
+ * Carry out a PSM sequence: reset the device models in each stage being
+ * reset, and the subsystems the watchdog resets. Stages without device
+ * models (OTP, PSM_READY, BUSFABRIC, ROM, SRAM0-9) have no state here to
+ * reset; SRAM keeps its contents, as on hardware. The watchdog and PSM
+ * are reset only by chip-level resets, so the watchdog's scratch
+ * registers and REASON survive.
+ */
+/* [spec:nuos:req:emu.watchdog] */
+static void rp2350_soc_psm_reset(void *opaque, uint32_t reset, uint32_t held,
+                                 bool watchdog)
+{
+    RP2350State *s = opaque;
+    uint32_t subsys = watchdog ? s->resets.wdsel : 0;
+    bool sio_reset = reset & BIT(RP2350_PSM_SIO);
+    int i;
+
+    if (reset & BIT(RP2350_PSM_ROSC)) {
+        device_cold_reset(DEVICE(&s->rosc));
+    }
+    if (reset & BIT(RP2350_PSM_XOSC)) {
+        device_cold_reset(DEVICE(&s->xosc));
+    }
+    if (reset & BIT(RP2350_PSM_RESETS)) {
+        /* The reset controller asserts every subsystem reset. */
+        device_cold_reset(DEVICE(&s->resets));
+        subsys = RP2350_RESETS_ALL;
+    }
+    if (reset & BIT(RP2350_PSM_CLOCKS)) {
+        device_cold_reset(DEVICE(&s->clocks));
+        device_cold_reset(DEVICE(&s->ticks));
+    }
+    if (reset & BIT(RP2350_PSM_BOOTRAM)) {
+        rp2350_bootram_reset_regs(&s->bootram);
+    }
+    if (reset & BIT(RP2350_PSM_XIP)) {
+        rp2350_xip_reset_block(&s->xip);
+    }
+    if (sio_reset) {
+        device_cold_reset(DEVICE(&s->sio));
+    }
+    if (reset & BIT(RP2350_PSM_ACCESSCTRL)) {
+        device_cold_reset(DEVICE(&s->accessctrl));
+    }
+
+    /*
+     * A watchdog reset of a subsystem pulses its reset: the block restarts
+     * from its reset state, but RESETS.RESET keeps what software wrote.
+     */
+    for (i = 0; i < 32; i++) {
+        DeviceState *dev = rp2350_subsystem(s, i);
+
+        if ((subsys & BIT(i)) && dev) {
+            device_cold_reset(dev);
+        }
+    }
+    if (subsys & (BIT(RP2350_RESET_IO_BANK0) | BIT(RP2350_RESET_IO_QSPI) |
+                  BIT(RP2350_RESET_PADS_BANK0) |
+                  BIT(RP2350_RESET_PADS_QSPI))) {
+        rp2350_gpio_reset_blocks(&s->gpio,
+                                 subsys & BIT(RP2350_RESET_IO_BANK0),
+                                 subsys & BIT(RP2350_RESET_IO_QSPI),
+                                 subsys & BIT(RP2350_RESET_PADS_BANK0),
+                                 subsys & BIT(RP2350_RESET_PADS_QSPI));
+    }
+
+    for (i = 0; i < RP2350_NUM_CORES; i++) {
+        uint32_t stage = BIT(RP2350_PSM_PROC0 + i);
+
+        if (reset & (stage | BIT(RP2350_PSM_PROC_COLD))) {
+            rp2350_soc_reset_core(s, i, held & stage, sio_reset);
+        }
+    }
 }
 
 /*
@@ -578,6 +787,23 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         }
     }
 
+    /* [spec:nuos:req:emu.watchdog] */
+    rp2350_psm_set_reset_fn(&s->psm, rp2350_soc_psm_reset, s);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->psm), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->psm), 0, RP2350_PSM_BASE);
+    object_property_set_link(OBJECT(&s->watchdog), "ticks", OBJECT(&s->ticks),
+                             &error_abort);
+    qdev_prop_set_uint32(DEVICE(&s->watchdog), "ref-hz", RP2350_CLK_REF_HZ);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->watchdog), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->watchdog), 0, RP2350_WATCHDOG_BASE);
+    qdev_connect_gpio_out(DEVICE(&s->watchdog), 0,
+                          qdev_get_gpio_in_named(DEVICE(&s->psm), "watchdog",
+                                                 0));
+
     /* [spec:nuos:req:emu.timer] */
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
         static const hwaddr base[] = {
@@ -686,6 +912,9 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "accessctrl", &s->accessctrl,
                             TYPE_RP2350_ACCESSCTRL);
     object_initialize_child(obj, "resets", &s->resets, TYPE_RP2350_RESETS);
+    object_initialize_child(obj, "psm", &s->psm, TYPE_RP2350_PSM);
+    object_initialize_child(obj, "watchdog", &s->watchdog,
+                            TYPE_RP2350_WATCHDOG);
     object_initialize_child(obj, "sio", &s->sio, TYPE_RP2350_SIO);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_RP2350_GPIO);
     object_initialize_child(obj, "rcp", &s->rcp, TYPE_RP2350_RCP);

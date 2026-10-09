@@ -321,6 +321,11 @@ bool rp2350_ticks_running(RP2350ClkRegsState *ticks, int tick)
     return ticks->regs[tick * TICK_STRIDE] & TICK_CTRL_ENABLE;
 }
 
+uint32_t rp2350_ticks_cycles(RP2350ClkRegsState *ticks, int tick)
+{
+    return ticks->regs[tick * TICK_STRIDE + 1];
+}
+
 void rp2350_ticks_set_notify(RP2350ClkRegsState *ticks, int tick,
                              RP2350TickNotify *fn, void *opaque)
 {
@@ -332,14 +337,29 @@ static void ticks_written(RP2350ClkRegsState *s, unsigned reg)
 {
     unsigned tick = reg / TICK_STRIDE;
 
-    if (reg % TICK_STRIDE == 0 && s->tick_notify[tick]) {
+    /* CTRL starts or stops the generator; CYCLES changes its rate. */
+    if (reg % TICK_STRIDE != 2 && s->tick_notify[tick]) {
         s->tick_notify[tick](s->tick_opaque[tick]);
+    }
+}
+
+/* A reset stops every generator, which their consumers must see. */
+static void rp2350_ticks_exit_reset(Object *obj, ResetType type)
+{
+    RP2350ClkRegsState *s = RP2350_CLKREGS(obj);
+    int i;
+
+    for (i = 0; i < RP2350_NUM_TICKS; i++) {
+        if (s->tick_notify[i]) {
+            s->tick_notify[i](s->tick_opaque[i]);
+        }
     }
 }
 
 static void rp2350_ticks_class_init(ObjectClass *klass, const void *data)
 {
     RP2350ClkRegsClass *c = RP2350_CLKREGS_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
     int i;
 
     for (i = 0; i < RP2350_NUM_TICKS; i++) {
@@ -350,6 +370,7 @@ static void rp2350_ticks_class_init(ObjectClass *klass, const void *data)
     c->wmask = ticks_wmask;
     c->read = ticks_read;
     c->written = ticks_written;
+    rc->phases.exit = rp2350_ticks_exit_reset;
 }
 
 static const TypeInfo rp2350_clocks_types[] = {

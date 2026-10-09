@@ -112,6 +112,12 @@ MemoryRegion *rp2350_sio_view(RP2350SIOState *s, int core, bool mirror);
 void rp2350_sio_set_core1_launch(RP2350SIOState *s, RP2350SIOCore1Launch *fn,
                                  void *opaque);
 
+/*
+ * Core 1 was reset: with the launch handshake emulated, start it again
+ * from the top, as core 1's boot ROM code does.
+ */
+void rp2350_sio_core1_reset(RP2350SIOState *s);
+
 /* Make the GPIO coprocessor (GPIOC) coprocessor 0 of `cpu`, core `core`. */
 void rp2350_sio_attach_gpioc(RP2350SIOState *s, int core, ARMCPU *cpu);
 

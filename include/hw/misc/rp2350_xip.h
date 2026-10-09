@@ -136,4 +136,11 @@ struct RP2350XIPState {
 /* The ROM device region backing the device on chip select `cs`. */
 MemoryRegion *rp2350_xip_array(RP2350XIPState *s, int cs);
 
+/*
+ * Reset XIP_CTRL, the QMI and XIP_AUX, as a PSM reset of the XIP stage
+ * does. Unlike a device reset, this leaves the QSPI devices on the bus
+ * alone: they are outside the chip.
+ */
+void rp2350_xip_reset_block(RP2350XIPState *s);
+
 #endif

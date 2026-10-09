@@ -28,4 +28,11 @@ struct RP2350BootRAMState {
     uint32_t lock_stat;
 };
 
+/*
+ * Reset the WRITE_ONCE registers and boot locks but keep the RAM, as a
+ * PSM reset of the BOOTRAM stage does: the boot ROM relies on its data in
+ * Boot RAM surviving a watchdog reboot.
+ */
+void rp2350_bootram_reset_regs(RP2350BootRAMState *s);
+
 #endif

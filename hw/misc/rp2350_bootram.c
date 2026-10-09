@@ -134,14 +134,19 @@ static const MemoryRegionOps rp2350_bootram_ops = {
     .impl.max_access_size = 4,
 };
 
+void rp2350_bootram_reset_regs(RP2350BootRAMState *s)
+{
+    s->write_once[0] = 0;
+    s->write_once[1] = 0;
+    s->lock_stat = LOCK_MASK;
+}
+
 static void rp2350_bootram_hold_reset(Object *obj, ResetType type)
 {
     RP2350BootRAMState *s = RP2350_BOOTRAM(obj);
 
     memset(s->ram, 0, sizeof(s->ram));
-    s->write_once[0] = 0;
-    s->write_once[1] = 0;
-    s->lock_stat = LOCK_MASK;
+    rp2350_bootram_reset_regs(s);
 }
 
 static void rp2350_bootram_init(Object *obj)

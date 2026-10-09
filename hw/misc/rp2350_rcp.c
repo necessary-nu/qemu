@@ -327,26 +327,37 @@ void rp2350_rcp_attach(RP2350RCPState *s, int core, ARMCPU *cpu)
     arm_m_set_coprocessor(cpu, 7, rp2350_rcp_op, &s->core[core]);
 }
 
+static void rcp_reset_core_state(RP2350RCPState *s, int core)
+{
+    RP2350RCPCore *c = &s->core[core];
+
+    c->salt = 0;
+    c->salt_valid = false;
+    c->count = 0;
+    c->faulted = false;
+    c->prng = 0;
+    /* [spec:nuos:req:emu.rcp-handoff] */
+    if (s->boot_rom_handoff) {
+        uint64_t salt;
+
+        qemu_guest_getrandom_nofail(&salt, sizeof(salt));
+        set_salt(c, salt);
+    }
+}
+
+void rp2350_rcp_reset_core(RP2350RCPState *s, int core)
+{
+    rcp_reset_core_state(s, core);
+    qemu_irq_lower(s->nmi[core]);
+}
+
 static void rp2350_rcp_hold_reset(Object *obj, ResetType type)
 {
     RP2350RCPState *s = RP2350_RCP(obj);
     int i;
 
     for (i = 0; i < RP2350_RCP_CORES; i++) {
-        RP2350RCPCore *c = &s->core[i];
-
-        c->salt = 0;
-        c->salt_valid = false;
-        c->count = 0;
-        c->faulted = false;
-        c->prng = 0;
-        /* [spec:nuos:req:emu.rcp-handoff] */
-        if (s->boot_rom_handoff) {
-            uint64_t salt;
-
-            qemu_guest_getrandom_nofail(&salt, sizeof(salt));
-            set_salt(c, salt);
-        }
+        rcp_reset_core_state(s, i);
     }
 }
 
