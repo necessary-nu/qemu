@@ -907,8 +907,12 @@ static void engine_timer(void *opaque)
 }
 
 /*
- * A DREQ input. A rising edge is a credit for each channel that paces on
- * it and can see it; a level held high requests further transfers.
+ * A DREQ input. A rising edge is a credit for each busy channel that
+ * paces on it and can see it (paused with EN clear or not); a level held
+ * high requests further transfers. A channel that is not busy takes no
+ * credits: on hardware it starts its DREQ handshake afresh when
+ * triggered, so edges from before (from whatever its TREQ_SEL then
+ * selected, DREQ_PIO0_TX0 at reset) do not count.
  */
 /* [spec:nuos:req:emu.dma] */
 static void dreq_set(void *opaque, int dreq, int level)
@@ -922,7 +926,7 @@ static void dreq_set(void *opaque, int dreq, int level)
     if (level && !old) {
         for (n = 0; n < RP2350_DMA_CHANNELS; n++) {
             if (ctrl_treq(s->ch[n].ctrl) == dreq &&
-                dreq_visible(s, n, dreq)) {
+                (s->ch[n].ctrl & CTRL_BUSY) && dreq_visible(s, n, dreq)) {
                 add_credit(&s->ch[n], 1);
             }
         }
