@@ -144,51 +144,184 @@ static void rp2350_core1_launch(void *opaque, uint32_t vtor, uint32_t sp,
     async_run_on_cpu(CPU(cpu), rp2350_core1_start, RUN_ON_CPU_HOST_PTR(start));
 }
 
-/* RESETS bits of the subsystems that have device models. */
-#define RP2350_RESET_BUSCTRL    1
-#define RP2350_RESET_IO_BANK0   6
-#define RP2350_RESET_IO_QSPI    7
-#define RP2350_RESET_PADS_BANK0 9
-#define RP2350_RESET_PADS_QSPI  10
-#define RP2350_RESET_PLL_SYS    14
-#define RP2350_RESET_PLL_USB    15
-#define RP2350_RESET_SYSCFG     20
-#define RP2350_RESET_SYSINFO    21
-#define RP2350_RESET_TBMAN      22
-#define RP2350_RESET_TIMER0     23
-#define RP2350_RESET_TIMER1     24
-#define RP2350_RESET_TRNG       25
-#define RP2350_RESET_UART0      26
-#define RP2350_RESET_UART1      27
+typedef struct RP2350ResetWindow {
+    hwaddr base;
+    hwaddr size;
+} RP2350ResetWindow;
 
-/* The device model that is subsystem `bit` as a whole, if there is one. */
-static DeviceState *rp2350_subsystem(RP2350State *s, int bit)
+/*
+ * Each RESETS subsystem and the bus windows of its registers. JTAG has no
+ * registers on the system bus.
+ */
+static const struct {
+    const char *name;
+    RP2350ResetWindow window[RP2350_RESET_MAX_WINDOWS];
+} rp2350_reset_blocks[RP2350_NUM_RESETS] = {
+    [RP2350_RESET_ADC]        = { "adc", { { 0x400a0000, 0x8000 } } },
+    [RP2350_RESET_BUSCTRL]    = { "busctrl", { { 0x40068000, 0x8000 } } },
+    [RP2350_RESET_DMA]        = { "dma", { { 0x50000000, 0x100000 } } },
+    [RP2350_RESET_HSTX]       = { "hstx", { { 0x400c0000, 0x8000 },
+                                            { 0x50600000, 0x100000 } } },
+    [RP2350_RESET_I2C0]       = { "i2c0", { { 0x40090000, 0x8000 } } },
+    [RP2350_RESET_I2C1]       = { "i2c1", { { 0x40098000, 0x8000 } } },
+    [RP2350_RESET_IO_BANK0]   = { "io_bank0", { { 0x40028000, 0x8000 } } },
+    [RP2350_RESET_IO_QSPI]    = { "io_qspi", { { 0x40030000, 0x8000 } } },
+    [RP2350_RESET_JTAG]       = { "jtag" },
+    [RP2350_RESET_PADS_BANK0] = { "pads_bank0", { { 0x40038000, 0x8000 } } },
+    [RP2350_RESET_PADS_QSPI]  = { "pads_qspi", { { 0x40040000, 0x8000 } } },
+    [RP2350_RESET_PIO0]       = { "pio0", { { 0x50200000, 0x100000 } } },
+    [RP2350_RESET_PIO1]       = { "pio1", { { 0x50300000, 0x100000 } } },
+    [RP2350_RESET_PIO2]       = { "pio2", { { 0x50400000, 0x100000 } } },
+    [RP2350_RESET_PLL_SYS]    = { "pll_sys", { { 0x40050000, 0x8000 } } },
+    [RP2350_RESET_PLL_USB]    = { "pll_usb", { { 0x40058000, 0x8000 } } },
+    [RP2350_RESET_PWM]        = { "pwm", { { 0x400a8000, 0x8000 } } },
+    [RP2350_RESET_SHA256]     = { "sha256", { { 0x400f8000, 0x8000 } } },
+    [RP2350_RESET_SPI0]       = { "spi0", { { 0x40080000, 0x8000 } } },
+    [RP2350_RESET_SPI1]       = { "spi1", { { 0x40088000, 0x8000 } } },
+    [RP2350_RESET_SYSCFG]     = { "syscfg", { { 0x40008000, 0x8000 } } },
+    [RP2350_RESET_SYSINFO]    = { "sysinfo", { { 0x40000000, 0x8000 } } },
+    [RP2350_RESET_TBMAN]      = { "tbman", { { 0x40160000, 0x8000 } } },
+    [RP2350_RESET_TIMER0]     = { "timer0", { { 0x400b0000, 0x8000 } } },
+    [RP2350_RESET_TIMER1]     = { "timer1", { { 0x400b8000, 0x8000 } } },
+    [RP2350_RESET_TRNG]       = { "trng", { { 0x400f0000, 0x8000 } } },
+    [RP2350_RESET_UART0]      = { "uart0", { { 0x40070000, 0x8000 } } },
+    [RP2350_RESET_UART1]      = { "uart1", { { 0x40078000, 0x8000 } } },
+    [RP2350_RESET_USBCTRL]    = { "usbctrl", { { 0x50100000, 0x100000 } } },
+};
+
+/*
+ * The IO and pad banks are one device model, whose register blocks are
+ * held in reset individually.
+ */
+static const struct {
+    int reset;
+    unsigned block;
+} rp2350_gpio_resets[] = {
+    { RP2350_RESET_IO_BANK0, RP2350_GPIO_IO_BANK0 },
+    { RP2350_RESET_IO_QSPI, RP2350_GPIO_IO_QSPI },
+    { RP2350_RESET_PADS_BANK0, RP2350_GPIO_PADS_BANK0 },
+    { RP2350_RESET_PADS_QSPI, RP2350_GPIO_PADS_QSPI },
+};
+
+/*
+ * A subsystem in reset does not answer on the bus: reads of its registers
+ * return zero and writes have no effect, without a bus error. Erratum
+ * RP2350-E23 documents this: SYSINFO, left in reset, reads as zero.
+ */
+/* [spec:nuos:req:emu.resets] */
+static MemTxResult rp2350_reset_gate_read(void *opaque, hwaddr addr,
+                                          uint64_t *data, unsigned size,
+                                          MemTxAttrs attrs)
 {
-    switch (bit) {
-    case RP2350_RESET_BUSCTRL:
-        return DEVICE(&s->busctrl);
-    case RP2350_RESET_PLL_SYS:
-        return DEVICE(&s->pll_sys);
-    case RP2350_RESET_PLL_USB:
-        return DEVICE(&s->pll_usb);
-    case RP2350_RESET_SYSCFG:
-        return DEVICE(&s->syscfg);
-    case RP2350_RESET_SYSINFO:
-        return DEVICE(&s->sysinfo);
-    case RP2350_RESET_TBMAN:
-        return DEVICE(&s->tbman);
-    case RP2350_RESET_TIMER0:
-        return DEVICE(&s->timer[0]);
-    case RP2350_RESET_TIMER1:
-        return DEVICE(&s->timer[1]);
-    case RP2350_RESET_TRNG:
-        return DEVICE(&s->trng);
-    case RP2350_RESET_UART0:
-        return DEVICE(&s->uart[0]);
-    case RP2350_RESET_UART1:
-        return DEVICE(&s->uart[1]);
+    RP2350ResetGate *gate = opaque;
+
+    qemu_log_mask(LOG_GUEST_ERROR, "rp2350: read of %s offset 0x%"
+                  HWADDR_PRIx " while it is in reset\n", gate->name, addr);
+    *data = 0;
+    return MEMTX_OK;
+}
+
+/* [spec:nuos:req:emu.resets] */
+static MemTxResult rp2350_reset_gate_write(void *opaque, hwaddr addr,
+                                           uint64_t value, unsigned size,
+                                           MemTxAttrs attrs)
+{
+    RP2350ResetGate *gate = opaque;
+
+    qemu_log_mask(LOG_GUEST_ERROR, "rp2350: write to %s offset 0x%"
+                  HWADDR_PRIx " while it is in reset\n", gate->name, addr);
+    return MEMTX_OK;
+}
+
+static const MemoryRegionOps rp2350_reset_gate_ops = {
+    .read_with_attrs = rp2350_reset_gate_read,
+    .write_with_attrs = rp2350_reset_gate_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+/* [spec:nuos:req:emu.resets] */
+void rp2350_soc_attach_reset(RP2350State *s, int reset, DeviceState *dev)
+{
+    int i;
+
+    assert(reset >= 0 && reset < RP2350_NUM_RESETS);
+    for (i = 0; i < RP2350_RESET_MAX_DEVICES; i++) {
+        if (!s->reset_dev[reset][i]) {
+            s->reset_dev[reset][i] = dev;
+            return;
+        }
     }
-    return NULL;
+    g_assert_not_reached();
+}
+
+/*
+ * RESETS puts subsystems into reset and takes them out. Each attached
+ * device model is held in reset through its Resettable reset, so it
+ * resets on entry and stays inert until released; the subsystem's bus
+ * windows are gated for as long.
+ */
+/* [spec:nuos:req:emu.resets] */
+static void rp2350_soc_reset_hold(void *opaque, uint32_t blocks, bool hold)
+{
+    RP2350State *s = opaque;
+    unsigned gpio = 0;
+    int i, n;
+
+    for (i = 0; i < RP2350_NUM_RESETS; i++) {
+        if (!(blocks & BIT(i))) {
+            continue;
+        }
+        for (n = 0; n < RP2350_RESET_MAX_DEVICES && s->reset_dev[i][n];
+             n++) {
+            Object *obj = OBJECT(s->reset_dev[i][n]);
+
+            if (hold) {
+                resettable_assert_reset(obj, RESET_TYPE_COLD);
+            } else {
+                resettable_release_reset(obj, RESET_TYPE_COLD);
+            }
+        }
+        for (n = 0; n < RP2350_RESET_MAX_WINDOWS; n++) {
+            if (rp2350_reset_blocks[i].window[n].size) {
+                memory_region_set_enabled(&s->reset_gate[i][n].mr, hold);
+            }
+        }
+    }
+    for (i = 0; i < ARRAY_SIZE(rp2350_gpio_resets); i++) {
+        if (blocks & BIT(rp2350_gpio_resets[i].reset)) {
+            gpio |= rp2350_gpio_resets[i].block;
+        }
+    }
+    if (gpio) {
+        rp2350_gpio_hold_blocks(&s->gpio, gpio, hold);
+    }
+}
+
+static void rp2350_soc_init_reset_gates(RP2350State *s)
+{
+    int i, n;
+
+    for (i = 0; i < RP2350_NUM_RESETS; i++) {
+        for (n = 0; n < RP2350_RESET_MAX_WINDOWS; n++) {
+            const RP2350ResetWindow *w = &rp2350_reset_blocks[i].window[n];
+            RP2350ResetGate *gate = &s->reset_gate[i][n];
+            g_autofree char *name = NULL;
+
+            if (!w->size) {
+                continue;
+            }
+            gate->name = rp2350_reset_blocks[i].name;
+            name = g_strdup_printf("rp2350.%s-in-reset", gate->name);
+            memory_region_init_io(&gate->mr, OBJECT(s),
+                                  &rp2350_reset_gate_ops, gate, name,
+                                  w->size);
+            memory_region_set_enabled(&gate->mr, false);
+            memory_region_add_subregion_overlap(s->board_memory, w->base,
+                                                &gate->mr, 1);
+        }
+    }
 }
 
 /*
@@ -269,6 +402,7 @@ static void rp2350_soc_reset_core(RP2350State *s, int n, bool hold,
         return;
     }
     if (n == 0) {
+        rp2350_resets_boot_rom_handoff(&s->resets);
         rp2350_soc_boot_rom_handoff(s, 0);
         rp2350_soc_watchdog_vector(s);
     } else if (!sio_reset) {
@@ -302,7 +436,7 @@ static void rp2350_soc_psm_reset(void *opaque, uint32_t reset, uint32_t held,
     if (reset & BIT(RP2350_PSM_RESETS)) {
         /* The reset controller asserts every subsystem reset. */
         device_cold_reset(DEVICE(&s->resets));
-        subsys = RP2350_RESETS_ALL;
+        subsys = 0;
     }
     if (reset & BIT(RP2350_PSM_CLOCKS)) {
         device_cold_reset(DEVICE(&s->clocks));
@@ -325,22 +459,7 @@ static void rp2350_soc_psm_reset(void *opaque, uint32_t reset, uint32_t held,
      * A watchdog reset of a subsystem pulses its reset: the block restarts
      * from its reset state, but RESETS.RESET keeps what software wrote.
      */
-    for (i = 0; i < 32; i++) {
-        DeviceState *dev = rp2350_subsystem(s, i);
-
-        if ((subsys & BIT(i)) && dev) {
-            device_cold_reset(dev);
-        }
-    }
-    if (subsys & (BIT(RP2350_RESET_IO_BANK0) | BIT(RP2350_RESET_IO_QSPI) |
-                  BIT(RP2350_RESET_PADS_BANK0) |
-                  BIT(RP2350_RESET_PADS_QSPI))) {
-        rp2350_gpio_reset_blocks(&s->gpio,
-                                 subsys & BIT(RP2350_RESET_IO_BANK0),
-                                 subsys & BIT(RP2350_RESET_IO_QSPI),
-                                 subsys & BIT(RP2350_RESET_PADS_BANK0),
-                                 subsys & BIT(RP2350_RESET_PADS_QSPI));
-    }
+    rp2350_resets_pulse(&s->resets, subsys);
 
     for (i = 0; i < RP2350_NUM_CORES; i++) {
         uint32_t stage = BIT(RP2350_PSM_PROC0 + i);
@@ -778,7 +897,6 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             SysBusDevice *dev;
             hwaddr base;
         } blocks[] = {
-            { SYS_BUS_DEVICE(&s->resets), RP2350_RESETS_BASE },
             { SYS_BUS_DEVICE(&s->clocks), RP2350_CLOCKS_BASE },
             { SYS_BUS_DEVICE(&s->xosc), RP2350_XOSC_BASE },
             { SYS_BUS_DEVICE(&s->pll_sys), RP2350_PLL_SYS_BASE },
@@ -1023,6 +1141,51 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                                    RP2350_DREQ_CORESIGHT));
         qdev_connect_gpio_out_named(DEVICE(&s->sha256), RP2350_SHA256_DREQ, 0,
             qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_SHA256));
+    }
+
+    /*
+     * RESETS last, once every subsystem's device model is attached. With
+     * no ROM executing, the subsystems the ROM's flash boot path takes out
+     * of reset (the QSPI IO and pads, connecting the flash) start out of
+     * reset.
+     */
+    /* [spec:nuos:req:emu.resets] */
+    {
+        const struct {
+            int reset;
+            void *dev;
+        } devices[] = {
+            { RP2350_RESET_BUSCTRL, &s->busctrl },
+            { RP2350_RESET_DMA, &s->dma },
+            { RP2350_RESET_PLL_SYS, &s->pll_sys },
+            { RP2350_RESET_PLL_USB, &s->pll_usb },
+            { RP2350_RESET_PWM, &s->pwm },
+            { RP2350_RESET_SHA256, &s->sha256 },
+            { RP2350_RESET_SYSCFG, &s->syscfg },
+            { RP2350_RESET_SYSINFO, &s->sysinfo },
+            { RP2350_RESET_TBMAN, &s->tbman },
+            { RP2350_RESET_TIMER0, &s->timer[0] },
+            { RP2350_RESET_TIMER1, &s->timer[1] },
+            { RP2350_RESET_TRNG, &s->trng },
+            { RP2350_RESET_UART0, &s->uart[0] },
+            { RP2350_RESET_UART1, &s->uart[1] },
+        };
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->resets);
+
+        for (i = 0; i < ARRAY_SIZE(devices); i++) {
+            rp2350_soc_attach_reset(s, devices[i].reset,
+                                    DEVICE(devices[i].dev));
+        }
+        rp2350_soc_init_reset_gates(s);
+        rp2350_resets_set_hold_fn(&s->resets, rp2350_soc_reset_hold, s);
+        qdev_prop_set_uint32(DEVICE(sbd), "rom-unreset",
+                             s->core1_launch ?
+                             BIT(RP2350_RESET_IO_QSPI) |
+                             BIT(RP2350_RESET_PADS_QSPI) : 0);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, RP2350_RESETS_BASE);
     }
 
     for (i = 0; i < ARRAY_SIZE(rp2350_peripherals); i++) {

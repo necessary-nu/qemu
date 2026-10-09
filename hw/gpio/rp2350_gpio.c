@@ -471,11 +471,13 @@ static void rp2350_gpio_propagate(RP2350GPIOState *s, bool force)
         }
 
         irq = over(CTRL_IRQOVER(ctrl), s->in_from_pad[p]);
-        if (irq != s->irq_level[p]) {
+        if (irq != s->irq_level[p] &&
+            !(s->held & (p < RP2350_GPIO_BANK0_PINS ? RP2350_GPIO_IO_BANK0
+                                                    : RP2350_GPIO_IO_QSPI))) {
             s->intr_edge[p / 8] |= (irq ? INT_EDGE_HIGH : INT_EDGE_LOW)
                                    << (4 * (p % 8));
-            s->irq_level[p] = irq;
         }
+        s->irq_level[p] = irq;
     }
 
     /* SIO and PIO see every pin, selected or not. */
@@ -960,19 +962,24 @@ static void rp2350_gpio_reset_pads(RP2350GPIOState *s, bool qspi)
     s->pad_swd = PAD_SWD_RESET;
 }
 
-void rp2350_gpio_reset_blocks(RP2350GPIOState *s, bool io_bank0, bool io_qspi,
-                              bool pads_bank0, bool pads_qspi)
+/* [spec:nuos:req:emu.resets] */
+void rp2350_gpio_hold_blocks(RP2350GPIOState *s, unsigned blocks, bool hold)
 {
-    if (io_bank0) {
+    if (!hold) {
+        s->held &= ~blocks;
+        return;
+    }
+    s->held |= blocks;
+    if (blocks & RP2350_GPIO_IO_BANK0) {
         rp2350_gpio_reset_io(s, false);
     }
-    if (io_qspi) {
+    if (blocks & RP2350_GPIO_IO_QSPI) {
         rp2350_gpio_reset_io(s, true);
     }
-    if (pads_bank0) {
+    if (blocks & RP2350_GPIO_PADS_BANK0) {
         rp2350_gpio_reset_pads(s, false);
     }
-    if (pads_qspi) {
+    if (blocks & RP2350_GPIO_PADS_QSPI) {
         rp2350_gpio_reset_pads(s, true);
     }
     rp2350_gpio_update_force(s, true);

@@ -12,6 +12,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 
 #define BUSCTRL_BASE     0x40068000
 #define BUS_PRIORITY     (BUSCTRL_BASE + 0x00)
@@ -41,7 +42,10 @@ static char *rom_path;
 /* A blank boot ROM is enough: qtest never runs the CPU. */
 static QTestState *start(void)
 {
-    return qtest_initf("-M rp2350 -bios %s", rom_path);
+    QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
+
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
+    return qts;
 }
 
 /* [spec:nuos:req:emu.busctrl/test] */
@@ -143,7 +147,9 @@ static void test_system_reset(void)
     qtest_writel(qts, BUS_PRIORITY, PROC0);
     qtest_writel(qts, PERFCTR_EN, 1);
     qtest_writel(qts, PERFSEL(2), 0x0b);
+    /* The system reset puts BUSCTRL back into reset too. */
     qtest_system_reset(qts);
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
     g_assert_cmphex(qtest_readl(qts, BUS_PRIORITY), ==, 0);
     g_assert_cmphex(qtest_readl(qts, BUS_PRIORITY_ACK), ==, 0);
     g_assert_cmphex(qtest_readl(qts, PERFCTR_EN), ==, 0);

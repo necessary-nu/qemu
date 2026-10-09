@@ -12,6 +12,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "libqtest.h"
+#include "rp2350-resets.h"
 
 #define DMA             0x50000000
 #define CH(n)           (DMA + 0x40 * (n))
@@ -123,7 +124,10 @@ static char *image_path;
 
 static QTestState *start(void)
 {
-    return qtest_initf("-M rp2350 -bios %s", rom_path);
+    QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
+
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
+    return qts;
 }
 
 /* Run the machine long enough for any short transfer to finish. */
@@ -608,6 +612,7 @@ static void test_xip_stream_dreq(void)
                                   image_path);
     int i;
 
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
     setup(qts, 0, XIP_AUX_STREAM, DST, 32);
     qtest_writel(qts, CH(0) + CTRL_TRIG, EN | SIZE_WORD | INCR_WRITE |
                  CHAIN_TO(0) | TREQ(TREQ_XIP_STREAM));
