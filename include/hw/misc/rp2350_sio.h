@@ -10,6 +10,7 @@
 #define HW_MISC_RP2350_SIO_H
 
 #include "hw/core/sysbus.h"
+#include "hw/misc/rp2350_accessctrl.h"
 #include "qom/object.h"
 #include "target/arm/cpu-qom.h"
 
@@ -68,6 +69,8 @@ struct RP2350SIOState {
 
     RP2350SIOBank bank[RP2350_SIO_BANKS];
     RP2350SIOView gpioc_opaque[RP2350_SIO_CORES];
+    /* Source of the GPIO_NSMASK filter on Non-secure GPIO accesses. */
+    RP2350AccessCtrlState *accessctrl;
     uint32_t gpio_out[2];
     uint32_t gpio_oe[2];
     /* GPIO_IN as the IO muxing delivers it, through named input "gpio-in". */

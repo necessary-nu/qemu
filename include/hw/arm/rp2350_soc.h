@@ -14,6 +14,7 @@
 #include "hw/char/pl011.h"
 #include "hw/core/clock.h"
 #include "hw/gpio/rp2350_gpio.h"
+#include "hw/misc/rp2350_accessctrl.h"
 #include "hw/misc/rp2350_bootram.h"
 #include "hw/misc/rp2350_busctrl.h"
 #include "hw/misc/rp2350_clocks.h"
@@ -121,6 +122,8 @@ struct RP2350State {
 
     ARMv7MState armv7m[RP2350_NUM_CORES];
     RP2350EPPBState eppb[RP2350_NUM_CORES];
+    RP2350AccessCtrlState accessctrl;
+    Notifier accessctrl_notifier;
     RP2350ResetsState resets;
     RP2350SIOState sio;
     RP2350GPIOState gpio;
@@ -158,12 +161,6 @@ struct RP2350State {
     MemoryRegion sram;
 
     MemoryRegion *board_memory;
-    /*
-     * Each armv7m container takes its memory link as a subregion, and a
-     * region can have only one container, so every core sees the board
-     * memory through its own alias.
-     */
-    MemoryRegion core_memory[RP2350_NUM_CORES];
 
     uint32_t flash_size;
     uint32_t init_svtor;

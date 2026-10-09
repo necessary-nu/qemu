@@ -947,7 +947,6 @@ static void rp2350_gpio_hold_reset(Object *obj, ResetType type)
     memset(s->intf, 0, sizeof(s->intf));
     memset(s->irq_level, 0, sizeof(s->irq_level));
     memset(s->pad_level, 0, sizeof(s->pad_level));
-    s->nsmask = 0;
 
     for (p = 0; p < RP2350_GPIO_PINS; p++) {
         /* FUNCSEL is null, so nothing drives the pad. */
