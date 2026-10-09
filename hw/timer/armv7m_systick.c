@@ -15,6 +15,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -30,6 +31,24 @@
 #define SYSCALIB_SKEW (1U << 30)
 #define SYSCALIB_TENMS ((1U << 24) - 1)
 
+/*
+ * Whether SYST_CALIB.NOREF is set: no reference clock, so SYST_CSR.CLKSOURCE
+ * is forced to the processor clock.
+ */
+static bool systick_noref(SysTickState *s)
+{
+    if (s->calib != SYSTICK_CALIB_FROM_REFCLK) {
+        return s->calib & SYSCALIB_NOREF;
+    }
+    return !clock_has_source(s->refclk);
+}
+
+/* The clock SYST_CSR.CLKSOURCE selects. */
+static Clock *systick_clock(SysTickState *s)
+{
+    return s->control & SYSTICK_CLKSOURCE ? s->cpuclk : s->refclk;
+}
+
 static void systick_set_period_from_clock(SysTickState *s)
 {
     /*
@@ -41,6 +60,41 @@ static void systick_set_period_from_clock(SysTickState *s)
     } else {
         ptimer_set_period_from_clock(s->ptimer, s->refclk, 1);
     }
+}
+
+/*
+ * Follow the selected clock starting or stopping while the counter is
+ * enabled: a counter whose clock stops holds its value until the clock
+ * runs again. A counter that ran down to zero with SYST_RVR zero stays
+ * stopped. Must be called from within a ptimer transaction block, after
+ * the ptimer period has been set from the selected clock.
+ */
+static void systick_follow_clock(SysTickState *s)
+{
+    if (!(s->control & SYSTICK_ENABLE)) {
+        return;
+    }
+    if (!clock_is_enabled(systick_clock(s))) {
+        ptimer_stop(s->ptimer);
+    } else if (ptimer_get_limit(s->ptimer) || ptimer_get_count(s->ptimer)) {
+        ptimer_run(s->ptimer, 0);
+    }
+}
+
+/*
+ * Change the ptimer period to follow the selected clock, stopping the
+ * ptimer first if that clock has stopped so it never runs with a zero
+ * period.
+ */
+static void systick_clock_changed(SysTickState *s)
+{
+    ptimer_transaction_begin(s->ptimer);
+    if (!clock_is_enabled(systick_clock(s))) {
+        ptimer_stop(s->ptimer);
+    }
+    systick_set_period_from_clock(s);
+    systick_follow_clock(s);
+    ptimer_transaction_commit(s->ptimer);
 }
 
 static void systick_timer_tick(void *opaque)
@@ -94,10 +148,13 @@ static MemTxResult systick_read(void *opaque, hwaddr addr, uint64_t *data,
          * report the theoretical correct value as described in the
          * knowledgebase article at
          * https://developer.arm.com/documentation/ka001325/latest
-         * If necessary, we could implement an extra QOM property on this
-         * device to force the STCALIB value to something different from
-         * the "correct" value.
+         * A board whose STCALIB tie-off differs sets it through the
+         * "calib" property.
          */
+        if (s->calib != SYSTICK_CALIB_FROM_REFCLK) {
+            val = s->calib;
+            break;
+        }
         if (!clock_has_source(s->refclk)) {
             val = SYSCALIB_NOREF;
             break;
@@ -139,7 +196,7 @@ static MemTxResult systick_write(void *opaque, hwaddr addr,
     {
         uint32_t oldval;
 
-        if (!clock_has_source(s->refclk)) {
+        if (systick_noref(s)) {
             /* This bit is always 1 if there is no external refclk */
             value |= SYSTICK_CLKSOURCE;
         }
@@ -150,12 +207,21 @@ static MemTxResult systick_write(void *opaque, hwaddr addr,
         s->control |= value & 7;
 
         if ((oldval ^ value) & SYSTICK_CLKSOURCE) {
+            if (!clock_is_enabled(systick_clock(s))) {
+                ptimer_stop(s->ptimer);
+            }
             systick_set_period_from_clock(s);
+            if (oldval & SYSTICK_ENABLE) {
+                systick_follow_clock(s);
+            }
         }
 
         if ((oldval ^ value) & SYSTICK_ENABLE) {
             if (value & SYSTICK_ENABLE) {
-                ptimer_run(s->ptimer, 0);
+                /* The counter does not count while its clock is stopped. */
+                if (clock_is_enabled(systick_clock(s))) {
+                    ptimer_run(s->ptimer, 0);
+                }
             } else {
                 ptimer_stop(s->ptimer);
             }
@@ -203,7 +269,7 @@ static void systick_reset(DeviceState *dev)
 
     ptimer_transaction_begin(s->ptimer);
     s->control = 0;
-    if (!clock_has_source(s->refclk)) {
+    if (systick_noref(s)) {
         /* This bit is always 1 if there is no external refclk */
         s->control |= SYSTICK_CLKSOURCE;
     }
@@ -220,11 +286,10 @@ static void systick_cpuclk_update(void *opaque, ClockEvent event)
 
     if (!(s->control & SYSTICK_CLKSOURCE)) {
         /* currently using refclk, we can ignore cpuclk changes */
+        return;
     }
 
-    ptimer_transaction_begin(s->ptimer);
-    ptimer_set_period_from_clock(s->ptimer, s->cpuclk, 1);
-    ptimer_transaction_commit(s->ptimer);
+    systick_clock_changed(s);
 }
 
 static void systick_refclk_update(void *opaque, ClockEvent event)
@@ -233,11 +298,10 @@ static void systick_refclk_update(void *opaque, ClockEvent event)
 
     if (s->control & SYSTICK_CLKSOURCE) {
         /* currently using cpuclk, we can ignore refclk changes */
+        return;
     }
 
-    ptimer_transaction_begin(s->ptimer);
-    ptimer_set_period_from_clock(s->ptimer, s->refclk, 1);
-    ptimer_transaction_commit(s->ptimer);
+    systick_clock_changed(s);
 }
 
 static void systick_instance_init(Object *obj)
@@ -285,10 +349,16 @@ static const VMStateDescription vmstate_systick = {
     }
 };
 
+static const Property systick_properties[] = {
+    DEFINE_PROP_UINT32("calib", SysTickState, calib,
+                       SYSTICK_CALIB_FROM_REFCLK),
+};
+
 static void systick_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    device_class_set_props(dc, systick_properties);
     dc->vmsd = &vmstate_systick;
     device_class_set_legacy_reset(dc, systick_reset);
     dc->realize = systick_realize;

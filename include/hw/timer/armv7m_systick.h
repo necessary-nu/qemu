@@ -30,7 +30,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(SysTickState, SYSTICK)
  *    (used when SYST_CSR.CLKSOURCE == 0)
  *  + Clock input "cpuclk" is the main CPU clock
  *    (used when SYST_CSR.CLKSOURCE == 1)
+ *  + Property "calib" is the value SYST_CALIB reads, which hardware takes
+ *    from the core's STCALIB tie-off. Its default,
+ *    SYSTICK_CALIB_FROM_REFCLK, derives SYST_CALIB from the refclk
+ *    frequency instead. A board that sets it also sets NOREF through it.
  */
+
+/* Never a valid SYST_CALIB value: bits [29:24] are reserved. */
+#define SYSTICK_CALIB_FROM_REFCLK UINT32_MAX
 
 struct SysTickState {
     /*< private >*/
@@ -45,6 +52,7 @@ struct SysTickState {
     qemu_irq irq;
     Clock *refclk;
     Clock *cpuclk;
+    uint32_t calib;
 };
 
 #endif

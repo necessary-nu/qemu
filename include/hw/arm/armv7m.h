@@ -62,6 +62,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ARMv7MState, ARMV7M)
  * + Property "mpu-s-regions": number of Secure MPU regions (default is
  *   whatever the default for the CPU is; must currently be set to the same
  *   value as mpu-ns-regions if the CPU implements the Security Extension)
+ * + Property "systick-calib": the value SYST_CALIB reads, as the core's
+ *   STCALIB tie-off sets it (forwarded to the systick devices' "calib"
+ *   property; the default derives it from the refclk frequency)
  * + Clock input "refclk" is the external reference clock for the systick timers
  * + Clock input "cpuclk" is the main CPU clock
  */
@@ -108,6 +111,7 @@ struct ARMv7MState {
     uint64_t midr;
     uint32_t mpu_ns_regions;
     uint32_t mpu_s_regions;
+    uint32_t systick_calib;
     bool enable_bitband;
     bool start_powered_off;
     bool vfp;

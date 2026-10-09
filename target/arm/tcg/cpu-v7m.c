@@ -177,6 +177,11 @@ static void cortex_m33_initfn(Object *obj)
     cpu->midr = 0x410fd213; /* r0p3 */
     cpu->pmsav7_dregion = 16;
     cpu->sau_sregion = 8;
+    /*
+     * ACTLR: EXTEXCLALL, DISITMATBFLUSH, FPEXCODIS, DISOOFP, DISFOLD and
+     * DISMCYCINT (Cortex-M33 TRM, "Auxiliary Control Register").
+     */
+    cpu->m_actlr_mask = 0x20001605;
     cpu->isar.mvfr0 = 0x10110021;
     cpu->isar.mvfr1 = 0x11000011;
     cpu->isar.mvfr2 = 0x00000040;

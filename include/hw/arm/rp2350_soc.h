@@ -168,7 +168,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_SIO_NONSEC_BASE 0xd0020000
 
 #define RP2350_SYSCLK_HZ 150000000
-#define RP2350_REFCLK_HZ 1000000
+/*
+ * SYST_CALIB as the RP2350 hardwires it on both cores: TENMS is 100,000
+ * (datasheet 8.5.1, "Tick generators"), with NOREF and SKEW clear. The
+ * SysTick reference clock is the core's TICKS generator (PROC0 or PROC1),
+ * not a fixed clock.
+ */
+#define RP2350_SYST_CALIB 100000
 /*
  * clk_ref, which the TICKS generators divide. Clock frequencies are not
  * otherwise modelled: this is both the ring oscillator's nominal rate,
@@ -270,7 +276,8 @@ struct RP2350State {
     bool core1_launch;
 
     Clock *sysclk;
-    Clock *refclk;
+    /* Each core's SysTick reference: its TICKS PROC0/PROC1 generator. */
+    Clock *refclk[RP2350_NUM_CORES];
     Clock *periclk;
     Clock *adcclk;
 };
