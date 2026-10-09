@@ -146,6 +146,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_SHA256_BASE 0x400f8000
 #define RP2350_HSTX_CTRL_BASE 0x400c0000
 #define RP2350_HSTX_FIFO_BASE 0x50600000
+#define RP2350_USB_DPRAM_BASE 0x50100000
+#define RP2350_USB_DPRAM_SIZE (4 * KiB)
 #define RP2350_SIO_BASE 0xd0000000
 #define RP2350_SIO_NONSEC_BASE 0xd0020000
 
@@ -229,6 +231,7 @@ struct RP2350State {
 
     MemoryRegion rom;
     MemoryRegion sram;
+    MemoryRegion usb_dpram;
 
     MemoryRegion *board_memory;
 

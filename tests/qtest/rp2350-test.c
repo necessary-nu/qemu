@@ -17,6 +17,9 @@
 #define XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE 0x1c000000
 #define SRAM_BASE 0x20000000
 #define SRAM_SIZE (520 * 1024)
+#define USB_DPRAM_BASE 0x50100000
+#define USB_DPRAM_SIZE 0x1000
+#define FLASH_SIZE (4 * 1024 * 1024)
 
 /* Initial SP at the top of SRAM, reset vector at image offset 8 (Thumb). */
 #define TEST_SP (SRAM_BASE + SRAM_SIZE)
@@ -75,7 +78,6 @@ static void test_memory_map(void)
         uint64_t base;
         uint64_t size;
     } unimplemented[] = {
-        { "rp2350.usbctrl",    0x50100000, 0x100000 },
         { "rp2350.pio0",       0x50200000, 0x100000 },
     };
     g_autofree char *path = NULL;
@@ -144,6 +146,11 @@ static void test_memory_map(void)
                           "(prio 0, i/o): rp2350-sio-nonsec");
     assert_mtree_has(qts, "00000000e0080000-00000000e0083fff "
                           "(prio 0, i/o): rp2350-eppb");
+    assert_mtree_has(qts, "0000000050100000-0000000050100fff "
+                          "(prio 0, ram): rp2350.usb-dpram");
+    assert_mtree_has(qts, "0000000050101000-00000000501fffff "
+                          "(prio -1000, i/o): rp2350.usbctrl "
+                          "@0000000000001000");
     assert_mtree_has(qts, "0000000050000000-0000000050003fff "
                           "(prio 0, i/o): rp2350-dma");
     assert_mtree_has(qts, "0000000050004000-00000000500fffff "
@@ -176,6 +183,27 @@ static void test_sram_size(void)
 
     qtest_writel(qts, SRAM_BASE + SRAM_SIZE, 0x12345678);
     g_assert_cmphex(qtest_readl(qts, SRAM_BASE + SRAM_SIZE), ==, 0);
+
+    qtest_quit(qts);
+    unlink(path);
+}
+
+/* The USB DPRAM is memory to the system bus, at every access size. */
+/* [spec:nuos:req:emu.machine+1/test] */
+static void test_usb_dpram(void)
+{
+    g_autofree char *path = NULL;
+    QTestState *qts = boot_direct(&path);
+
+    qtest_writel(qts, USB_DPRAM_BASE, 0x11223344);
+    qtest_writeb(qts, USB_DPRAM_BASE + 1, 0xaa);
+    qtest_writew(qts, USB_DPRAM_BASE + 2, 0xbbcc);
+    g_assert_cmphex(qtest_readl(qts, USB_DPRAM_BASE), ==, 0xbbccaa44);
+    g_assert_cmphex(qtest_readb(qts, USB_DPRAM_BASE + 3), ==, 0xbb);
+
+    qtest_writel(qts, USB_DPRAM_BASE + USB_DPRAM_SIZE - 4, 0xcafef00d);
+    g_assert_cmphex(qtest_readl(qts, USB_DPRAM_BASE + USB_DPRAM_SIZE - 4),
+                    ==, 0xcafef00d);
 
     qtest_quit(qts);
     unlink(path);
@@ -280,6 +308,70 @@ static void test_flash_size(void)
     unlink(path);
 }
 
+/* Write a flash image of `size` bytes: erased, with markers. */
+static char *write_flash_image(size_t size)
+{
+    g_autofree uint8_t *data = g_malloc(size);
+    GError *err = NULL;
+    char *path = NULL;
+    int fd = g_file_open_tmp("rp2350-flash-XXXXXX.img", &path, &err);
+
+    g_assert_no_error(err);
+    memset(data, 0xff, size);
+    stl_le_p(data, 0x464c5348);
+    stl_le_p(data + size - 4, 0x454e4421);
+    g_assert_cmpint(write(fd, data, size), ==, size);
+    close(fd);
+    return path;
+}
+
+/*
+ * The first -drive if=mtd backs the flash on chip select 0. It must be
+ * exactly the flash size, and needs a flash.
+ */
+/* [spec:nuos:req:emu.flash/test] */
+static void test_flash_drive(void)
+{
+    g_autofree char *rom = write_image(ROM_BASE);
+    g_autofree char *flash = write_flash_image(FLASH_SIZE);
+    g_autofree char *small = write_flash_image(FLASH_SIZE / 2);
+    g_autofree char *args = NULL;
+    g_autofree char *err = NULL;
+    QTestState *qts;
+
+    qts = qtest_initf("-M rp2350,flash-size=4M -bios %s "
+                      "-drive if=mtd,format=raw,file=%s", rom, flash);
+    g_assert_cmphex(qtest_readl(qts, XIP_NOCACHE_NOALLOC_BASE), ==,
+                    0x464c5348);
+    g_assert_cmphex(qtest_readl(qts, XIP_NOCACHE_NOALLOC_BASE +
+                                     FLASH_SIZE - 4), ==, 0x454e4421);
+    g_assert_cmphex(qtest_readl(qts, XIP_NOCACHE_NOALLOC_BASE + 4), ==,
+                    0xffffffff);
+    qtest_quit(qts);
+
+    /* Without an image the flash is erased. */
+    qts = qtest_initf("-M rp2350,flash-size=4M -bios %s", rom);
+    g_assert_cmphex(qtest_readl(qts, XIP_NOCACHE_NOALLOC_BASE), ==,
+                    0xffffffff);
+    qtest_quit(qts);
+
+    args = g_strdup_printf("-M rp2350 -bios %s "
+                           "-drive if=mtd,format=raw,file=%s", rom, flash);
+    g_assert_cmpint(run_qemu(args, &err), !=, 0);
+    g_assert(strstr(err, "flash-size"));
+    g_clear_pointer(&err, g_free);
+    g_clear_pointer(&args, g_free);
+
+    args = g_strdup_printf("-M rp2350,flash-size=4M -bios %s "
+                           "-drive if=mtd,format=raw,file=%s", rom, small);
+    g_assert_cmpint(run_qemu(args, &err), !=, 0);
+    g_assert(strstr(err, "requires 4194304 bytes"));
+
+    unlink(rom);
+    unlink(flash);
+    unlink(small);
+}
+
 /* [spec:nuos:req:emu.irq-routing+1/test] */
 static void test_irq_routing(void)
 {
@@ -337,9 +429,11 @@ int main(int argc, char **argv)
 
     qtest_add_func("/rp2350/memory-map", test_memory_map);
     qtest_add_func("/rp2350/sram-size", test_sram_size);
+    qtest_add_func("/rp2350/usb-dpram", test_usb_dpram);
     qtest_add_func("/rp2350/direct-load", test_direct_load);
     qtest_add_func("/rp2350/boot-rom", test_boot_rom);
     qtest_add_func("/rp2350/flash-size", test_flash_size);
+    qtest_add_func("/rp2350/flash-drive", test_flash_drive);
     qtest_add_func("/rp2350/irq-routing", test_irq_routing);
     qtest_add_func("/rp2350/rom-with-direct-load", test_rom_with_direct_load);
 

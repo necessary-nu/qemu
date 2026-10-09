@@ -8,7 +8,9 @@
  * Two boot paths:
  *
  *   -bios FILE    loads a raw boot ROM image at 0x00000000 and resets
- *                 core 0 through the ROM's vector table, as hardware does.
+ *                 both cores through the ROM's vector table, as hardware
+ *                 does: the ROM boots from flash, or with no bootable
+ *                 image enters BOOTSEL, and holds core 1 until launched.
  *   -kernel FILE  loads an ELF (or raw image into flash) directly and
  *                 resets core 0 through a vector table at the start of the
  *                 XIP flash window, skipping the boot ROM. This is a
@@ -26,6 +28,11 @@
  * -M rp2350,flash-size=SIZE (a Pico 2 has 4M); there is no default. The
  * flash is a Winbond W25Q part of that size on QSPI chip select 0. Boards
  * with PSRAM on chip select 1 add psram-size=8M for an APS6404L.
+ *
+ * The flash starts erased. To give it contents, and keep what the guest
+ * erases and programs, back it with a raw image of exactly flash-size:
+ *
+ *   -drive if=mtd,format=raw,file=flash.img
  *
  * OTP starts as a blank chip and lives in RAM. To keep programmed rows
  * across runs, back it with a 16 KiB raw image:
@@ -46,6 +53,7 @@
 #include "hw/core/qdev-properties.h"
 #include "qapi/visitor.h"
 #include "system/address-spaces.h"
+#include "system/blockdev.h"
 #include "system/reset.h"
 
 struct RP2350MachineState {
@@ -93,6 +101,11 @@ static void rp2350_init(MachineState *machine)
     /* [spec:nuos:req:emu.flash] */
     if (direct && s->flash_size == 0) {
         error_report("rp2350: -kernel loads into flash, which needs "
+                     "-M rp2350,flash-size=SIZE");
+        exit(1);
+    }
+    if (drive_get(IF_MTD, 0, 0) && s->flash_size == 0) {
+        error_report("rp2350: a flash image (-drive if=mtd) needs "
                      "-M rp2350,flash-size=SIZE");
         exit(1);
     }

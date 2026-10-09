@@ -29,6 +29,7 @@
 #define TARGET_ARM_IDAU_H
 
 #include "qom/object.h"
+#include "exec/mmu-access-type.h"
 
 #define TYPE_IDAU_INTERFACE "idau-interface"
 #define IDAU_INTERFACE(obj) \
@@ -44,15 +45,22 @@ typedef struct IDAUInterface IDAUInterface;
 struct IDAUInterfaceClass {
     InterfaceClass parent;
 
-    /* Check the specified address and return the IDAU security information
-     * for it by filling in iregion, exempt, ns and nsc:
+    /*
+     * Check the specified address for an access of the given type and
+     * return the IDAU security information for it by filling in iregion,
+     * exempt, ns and nsc:
      *  iregion: IDAU region number, or IREGION_NOTVALID if not valid
      *  exempt: true if address is exempt from security attribution
      *  ns: true if the address is NonSecure
      *  nsc: true if the address is NonSecure-callable
+     * The caller sets *base to 0 and *limit to 0xffffffff. An IDAU whose
+     * response is not the same for every address and access type in that
+     * range narrows it to the inclusive range around the address over
+     * which its response holds for every access type.
      */
-    void (*check)(IDAUInterface *ii, uint32_t address, int *iregion,
-                  bool *exempt, bool *ns, bool *nsc);
+    void (*check)(IDAUInterface *ii, uint32_t address,
+                  MMUAccessType access_type, int *iregion, bool *exempt,
+                  bool *ns, bool *nsc, uint32_t *base, uint32_t *limit);
 };
 
 #endif
