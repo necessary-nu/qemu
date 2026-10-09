@@ -2,6 +2,7 @@
 
 #include "hw/core/registerfields.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/clock.h"
 #include "hw/misc/esp32_reg.h"
 
 #define TYPE_ESP32_FRC_TIMER "timer.esp32.frc"
@@ -15,8 +16,10 @@ typedef struct Esp32FrcTimerState {
     qemu_irq irq;
     QEMUTimer alarm_timer;
 
+    /* APB_CLK, stopped while DPORT gates the timers or holds them in reset */
+    Clock *apb_clk;
+
     /* properties */
-    uint32_t apb_freq;
     bool has_alarm;
     uint32_t count_mask;
 

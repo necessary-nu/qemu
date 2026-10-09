@@ -12,33 +12,38 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
-#include "qapi/visitor.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/registerfields.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/boards.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/timer/esp32_frc_timer.h"
 #include "trace.h"
 
 static uint64_t esp32_frc_timer_get_count(Esp32FrcTimerState *s, uint64_t ns_now)
 {
-    if (!s->enable) {
+    if (!s->enable || !clock_is_enabled(s->apb_clk)) {
         return s->count_base;
     }
     uint64_t ns_from_base = ns_now - s->ns_base;
-    uint64_t ticks_from_base = muldiv64(ns_from_base, s->apb_freq, NANOSECONDS_PER_SECOND * s->prescaler);
+    uint64_t ticks_from_base =
+        clock_ns_to_ticks(s->apb_clk, ns_from_base) / s->prescaler;
     uint64_t count = (ticks_from_base + s->count_base) & s->count_mask;
     return count;
 }
 
 static uint64_t esp32_frc_timer_count_to_ns(Esp32FrcTimerState *s, uint64_t count)
 {
-    return muldiv64(count, NANOSECONDS_PER_SECOND * s->prescaler, s->apb_freq);
+    return clock_ticks_to_ns(s->apb_clk, count * s->prescaler);
 }
 
 static void esp32_frc_timer_update_alarm(Esp32FrcTimerState *s, uint64_t ticks_alarm, uint32_t ticks_now, uint64_t ns_now)
 {
+    if (!clock_is_enabled(s->apb_clk)) {
+        timer_del(&s->alarm_timer);
+        return;
+    }
     if (ticks_alarm <= ticks_now) {
         ticks_alarm += (1ULL << 32);
     }
@@ -165,13 +170,24 @@ static void esp32_frc_timer_write(void *opaque, hwaddr addr,
     }
 }
 
-static void esp32_frc_timer_set_apb_freq(Object *obj, Visitor *v,
-                                  const char *name, void *opaque,
-                                  Error **errp)
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * The counter counts APB_CLK cycles; the SoC stops the clock while DPORT
+ * gates the timers or holds them in reset, and the count freezes. A change
+ * of rate folds the count into its base at the old rate, then re-arms the
+ * alarm at the new one.
+ */
+static void esp32_frc_timer_apb_clk_update(void *opaque, ClockEvent event)
 {
     Esp32FrcTimerState *s = ESP32_FRC_TIMER(opaque);
-    visit_type_uint32(v, name, &s->apb_freq, errp);
+    uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    if (event == ClockPreUpdate) {
+        s->count_base = esp32_frc_timer_get_count(s, ns_now);
+        s->ns_base = ns_now;
+    } else if (s->enable) {
+        esp32_frc_timer_update_alarm(s, s->alarm_reg, s->count_base, ns_now);
+    }
 }
 
 static const MemoryRegionOps esp32_frc_timer_ops = {
@@ -183,7 +199,18 @@ static const MemoryRegionOps esp32_frc_timer_ops = {
 static void esp32_frc_timer_reset_hold(Object *obj, ResetType type)
 {
     Esp32FrcTimerState *s = ESP32_FRC_TIMER(obj);
+
+    timer_del(&s->alarm_timer);
+    s->load_reg = 0;
+    s->alarm_reg = 0;
+    s->count_base = 0;
+    s->ns_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->enable = false;
+    s->autoload = false;
+    s->level_int = false;
+    s->level_int_status = false;
     s->prescaler = 1;
+    qemu_irq_lower(s->irq);
 }
 
 static void esp32_frc_timer_realize(DeviceState *dev, Error **errp)
@@ -200,16 +227,12 @@ static void esp32_frc_timer_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
 
-    object_property_add(obj, "apb_freq", "uint32",
-                        NULL,
-                        esp32_frc_timer_set_apb_freq,
-                        NULL,
-                        obj);
-
+    s->apb_clk = qdev_init_clock_in(DEVICE(obj), "apb",
+                                    esp32_frc_timer_apb_clk_update, s,
+                                    ClockPreUpdate | ClockUpdate);
 
     timer_init_ns(&s->alarm_timer, QEMU_CLOCK_VIRTUAL, esp32_frc_timer_cb, s);
 
-    s->apb_freq = 80000000;
     s->count_mask = UINT32_MAX;
     s->has_alarm = true;
 }

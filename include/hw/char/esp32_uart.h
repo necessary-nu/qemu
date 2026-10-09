@@ -4,6 +4,7 @@
 #include "hw/core/sysbus.h"
 #include "chardev/char-fe.h"
 #include "hw/core/registerfields.h"
+#include "hw/core/clock.h"
 
 #define UART_FIFO_LENGTH 128
 
@@ -56,8 +57,13 @@ REG32(UART_LOWPULSE, 0x28)
 REG32(UART_HIGHPULSE, 0x2c)
 REG32(UART_RXD_CNT, 0x30)
 
-/* TODO: implement */
 REG32(UART_CONF0, 0x20)
+    FIELD(UART_CONF0, PARITY_EN, 1, 1)
+    FIELD(UART_CONF0, BIT_NUM, 2, 2)
+    FIELD(UART_CONF0, STOP_BIT_NUM, 4, 2)
+    FIELD(UART_CONF0, TICK_REF_ALWAYS_ON, 27, 1)
+/* 8 data bits, 1 stop bit, clocked from APB_CLK */
+#define UART_CONF0_RESET 0x0800001c
 REG32(UART_CONF1, 0x24)
     FIELD(UART_CONF1, TOUT_EN, 31, 1)
     FIELD(UART_CONF1, TOUT_THRD, 24, 7)
@@ -87,6 +93,30 @@ typedef struct ESPUARTState {
     bool throttle_rx;
     bool rxfifo_tout;
     unsigned baud_rate;
+
+    /*
+     * The baud clock is APB_CLK or REF_TICK, chosen by
+     * CONF0.TICK_REF_ALWAYS_ON. The SoC stops both while DPORT gates the
+     * UART or holds it in reset.
+     */
+    Clock *apb_clk;
+    Clock *ref_tick_clk;
+
+    /*
+     * Transmitter: the byte in the shift register leaves one frame time
+     * after it was taken from the TX FIFO; tx_timed while that frame's end
+     * is scheduled at tx_end_ns. tx_frame_left is the part of the frame
+     * still to send, in 1/65536ths, while a change of baud clock has
+     * stopped the frame, and tx_wait_chr while a sent byte waits for the
+     * backend.
+     */
+    QEMUTimer tx_timer;
+    bool tx_busy;
+    bool tx_timed;
+    bool tx_wait_chr;
+    uint8_t tx_shift;
+    int64_t tx_end_ns;
+    uint32_t tx_frame_left;
 
     Fifo8 rx_fifo;
     Fifo8 tx_fifo;

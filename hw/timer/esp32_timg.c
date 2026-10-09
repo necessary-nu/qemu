@@ -12,12 +12,12 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
-#include "qapi/visitor.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/registerfields.h"
 #include "hw/core/boards.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/timer/esp32_timg.h"
 
 
@@ -34,6 +34,8 @@ static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_update_config(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_feed(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now);
+static uint64_t esp32_timg_wdt_get_count(Esp32TimgWdtState *ws,
+                                         uint64_t ns_now);
 
 
 #define TIMG_DEBUG_LOG(...) // qemu_log(__VA_ARGS__)
@@ -315,13 +317,36 @@ static void esp32_timg_reset_hold(Object *obj, ResetType type)
     esp32_timg_wdt_reset(&s->wdt);
 }
 
-static void esp32_timg_set_apb_freq(Object *obj, Visitor *v,
-                                  const char *name, void *opaque,
-                                  Error **errp)
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * The counters and the watchdog count APB_CLK cycles. The SoC stops the
+ * clock (0 Hz) while DPORT gates the group's clock or holds it in reset;
+ * the counts then freeze. Before a change of rate the counts are folded
+ * into their bases at the old rate; afterwards the alarms and the watchdog
+ * stage are re-armed at the new one.
+ */
+static void esp32_timg_apb_clk_update(void *opaque, ClockEvent event)
 {
     Esp32TimgState *s = ESP32_TIMG(opaque);
-    visit_type_uint32(v, name, &s->apb_freq_hz, errp);
-    TIMG_DEBUG_LOG("%s: TG%d apb_freq_hz=%d\n", __func__, s->id, s->apb_freq_hz);
+    Esp32TimgTimerState *timers[] = { &s->t0, &s->t1, &s->lact };
+    uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (int i = 0; i < ARRAY_SIZE(timers); i++) {
+        Esp32TimgTimerState *ts = timers[i];
+
+        if (event == ClockPreUpdate) {
+            ts->count_base = esp32_timg_timer_get_count(ts, ns_now);
+            ts->ns_base = ns_now;
+        } else {
+            esp32_timg_timer_update_alarm(ts, ns_now);
+        }
+    }
+    if (event == ClockPreUpdate) {
+        s->wdt.count_base = esp32_timg_wdt_get_count(&s->wdt, ns_now);
+        s->wdt.ns_base = ns_now;
+    } else {
+        esp32_timg_wdt_arm(&s->wdt, ns_now);
+    }
 }
 
 static void esp32_timg_do_calibration(Esp32TimgState* s)
@@ -401,20 +426,37 @@ static int esp32_timg_timer_direction(Esp32TimgTimerState *s)
     }
 }
 
+/* APB_CLK cycles counted between two points of virtual time. */
+static uint64_t esp32_timg_apb_ticks(Esp32TimgState *s, uint64_t ns)
+{
+    return clock_ns_to_ticks(s->apb_clk, ns);
+}
+
+/* Virtual time taken by a number of APB_CLK cycles. */
+static uint64_t esp32_timg_apb_ns(Esp32TimgState *s, uint64_t ticks,
+                                  uint32_t prescale)
+{
+    if (ticks > UINT64_MAX / prescale) {
+        return INT64_MAX;
+    }
+    return clock_ticks_to_ns(s->apb_clk, ticks * prescale);
+}
+
 static uint64_t esp32_timg_timer_get_count(Esp32TimgTimerState *s, uint64_t ns_now)
 {
-    if (!s->en) {
+    if (!s->en || !clock_is_enabled(s->parent->apb_clk)) {
         return s->count_base;
     }
     uint64_t ns_from_base = ns_now - s->ns_base;
-    uint64_t ticks_from_base = muldiv64(ns_from_base, s->parent->apb_freq_hz / 1000000, 1000 * s->divider);
+    uint64_t ticks_from_base =
+        esp32_timg_apb_ticks(s->parent, ns_from_base) / s->divider;
     uint64_t count = esp32_timg_timer_direction(s) * ticks_from_base + s->count_base;
     return count;
 }
 
 static uint64_t esp32_timg_timer_count_to_ns(Esp32TimgTimerState *s, uint64_t count)
 {
-    return muldiv64(count, 1000 * s->divider, s->parent->apb_freq_hz / 1000000);
+    return esp32_timg_apb_ns(s->parent, count, s->divider);
 }
 
 static uint32_t esp32_timg_timer_div_from_reg(uint32_t reg_val)
@@ -464,7 +506,7 @@ static void esp32_timg_timer_reload(Esp32TimgTimerState *ts, uint64_t ns_now)
 
 static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_now)
 {
-    if (!ts->en || !ts->alarm) {
+    if (!ts->en || !ts->alarm || !clock_is_enabled(ts->parent->apb_clk)) {
         timer_del(&ts->alarm_timer);
         return;
     }
@@ -492,11 +534,12 @@ static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws)
 
 static uint64_t esp32_timg_wdt_get_count(Esp32TimgWdtState *ws, uint64_t ns_now)
 {
-    if (!ws->en) {
+    if (!ws->en || !clock_is_enabled(ws->parent->apb_clk)) {
         return ws->count_base;
     }
     uint64_t ns_from_base = ns_now - ws->ns_base;
-    uint64_t ticks_from_base = muldiv64(ns_from_base, ws->parent->apb_freq_hz / 1000000, 1000 * MAX(ws->prescale, 1));
+    uint64_t ticks_from_base =
+        esp32_timg_apb_ticks(ws->parent, ns_from_base) / MAX(ws->prescale, 1);
     uint64_t count = ticks_from_base + ws->count_base;
     return count;
 }
@@ -550,11 +593,15 @@ static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now)
     if (ws->parent->wdt_disable || !(ws->en || (ws->flashboot_en && ws->parent->flash_boot_mode))) {
         return;
     }
+    if (!clock_is_enabled(ws->parent->apb_clk)) {
+        return;
+    }
 
     uint32_t stage_timeout = ws->timeout[ws->cur_stage];
     uint32_t cur_count = esp32_timg_wdt_get_count(ws, ns_now);
     uint32_t count_to_timeout = stage_timeout - cur_count;
-    uint64_t ns_to_timeout = muldiv64(count_to_timeout, 1000 * ws->prescale, ws->parent->apb_freq_hz / 1000000);
+    uint64_t ns_to_timeout = esp32_timg_apb_ns(ws->parent, count_to_timeout,
+                                               MAX(ws->prescale, 1));
     TIMG_DEBUG_LOG("%s: TG%d ns=0x%08llx stage %d count=0x%08x count_to_timeout=0x%08x ns_to_timeout=0x%08llx\n",
                    __func__, ws->parent->id, ns_now, ws->cur_stage, cur_count, count_to_timeout, ns_to_timeout);
     timer_mod_anticipate_ns(&ws->stage_timer, ns_now + ns_to_timeout);
@@ -613,15 +660,12 @@ static void esp32_timg_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
     qdev_init_gpio_out_named(DEVICE(sbd), s->irqs, SYSBUS_DEVICE_GPIO_IRQ, 2*TIMG_INT_MAX);
 
-    object_property_add(obj, "apb_freq", "uint32",
-                        NULL,
-                        esp32_timg_set_apb_freq,
-                        NULL,
-                        obj);
+    s->apb_clk = qdev_init_clock_in(DEVICE(obj), "apb",
+                                    esp32_timg_apb_clk_update, s,
+                                    ClockPreUpdate | ClockUpdate);
 
     s->rtc_slow_freq_hz = 150000;
     s->xtal_freq_hz = 40000000;
-    s->apb_freq_hz = 40000000;
 
     esp32_timg_timer_init(s, &s->t0, TIMG_T0_INT);
     esp32_timg_timer_init(s, &s->t1, TIMG_T1_INT);

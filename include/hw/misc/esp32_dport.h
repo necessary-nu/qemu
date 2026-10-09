@@ -74,6 +74,15 @@ typedef struct Esp32DportState {
     uint32_t cache_ill_trap_en_reg;
     uint32_t slave_spi_config_reg;
 
+    /* Peripheral clock-enable and reset registers; the SoC applies them. */
+    qemu_irq periph_clk_update_req;
+    uint32_t peri_clk_en;
+    uint32_t peri_rst_en;
+    uint32_t perip_clk_en;
+    uint32_t perip_rst_en;
+    uint32_t wifi_clk_en;
+    uint32_t core_rst_en;
+
 } Esp32DportState;
 
 void esp32_dport_clear_ill_trap_state(Esp32DportState* s);
@@ -84,7 +93,14 @@ void esp32_dport_clear_ill_trap_state(Esp32DportState* s);
 #define ESP32_DPORT_CACHE_ILL_IRQ_GPIO  "cache-ill-irq"
 #define ESP32_DPORT_FLASH_ENC_EN_GPIO   "flash-enc-en"
 #define ESP32_DPORT_FLASH_DEC_EN_GPIO   "flash-dec-en"
+#define ESP32_DPORT_PERIPH_CLK_UPDATE_GPIO "periph-clk-update"
 
+
+REG32(DPORT_PERI_CLK_EN, 0x1c)
+REG32(DPORT_PERI_RST_EN, 0x20)
+    FIELD(DPORT_PERI, AES, 0, 1)
+    FIELD(DPORT_PERI, SHA, 1, 1)
+    FIELD(DPORT_PERI, RSA, 2, 1)
 
 REG32(DPORT_APPCPU_RESET, 0x2c)
 REG32(DPORT_APPCPU_CLK, 0x30)
@@ -125,6 +141,48 @@ REG32(DPORT_APP_CACHE_CTRL1, 0x5C)
 REG32(DPORT_SLAVE_SPI_CONFIG, 0xC8)
     FIELD(DPORT_SLAVE_SPI_CONFIG, SLAVE_SPI_ENCRYPT_ENABLE, 8, 1)
     FIELD(DPORT_SLAVE_SPI_CONFIG, SLAVE_SPI_DECRYPT_ENABLE, 12, 1)
+
+REG32(DPORT_PERIP_CLK_EN, 0xc0)
+REG32(DPORT_PERIP_RST_EN, 0xc4)
+    FIELD(DPORT_PERIP, TIMERS, 0, 1)
+    FIELD(DPORT_PERIP, SPI01, 1, 1)
+    FIELD(DPORT_PERIP, UART, 2, 1)
+    FIELD(DPORT_PERIP, WDG, 3, 1)
+    FIELD(DPORT_PERIP, I2S0, 4, 1)
+    FIELD(DPORT_PERIP, UART1, 5, 1)
+    FIELD(DPORT_PERIP, SPI2, 6, 1)
+    FIELD(DPORT_PERIP, I2C_EXT0, 7, 1)
+    FIELD(DPORT_PERIP, UHCI0, 8, 1)
+    FIELD(DPORT_PERIP, RMT, 9, 1)
+    FIELD(DPORT_PERIP, PCNT, 10, 1)
+    FIELD(DPORT_PERIP, LEDC, 11, 1)
+    FIELD(DPORT_PERIP, UHCI1, 12, 1)
+    FIELD(DPORT_PERIP, TIMERGROUP, 13, 1)
+    FIELD(DPORT_PERIP, EFUSE, 14, 1)
+    FIELD(DPORT_PERIP, TIMERGROUP1, 15, 1)
+    FIELD(DPORT_PERIP, SPI3, 16, 1)
+    FIELD(DPORT_PERIP, PWM0, 17, 1)
+    FIELD(DPORT_PERIP, I2C_EXT1, 18, 1)
+    FIELD(DPORT_PERIP, TWAI, 19, 1)
+    FIELD(DPORT_PERIP, PWM1, 20, 1)
+    FIELD(DPORT_PERIP, I2S1, 21, 1)
+    FIELD(DPORT_PERIP, SPI_DMA, 22, 1)
+    FIELD(DPORT_PERIP, UART2, 23, 1)
+    FIELD(DPORT_PERIP, UART_MEM, 24, 1)
+    FIELD(DPORT_PERIP, PWM2, 25, 1)
+    FIELD(DPORT_PERIP, PWM3, 26, 1)
+
+REG32(DPORT_WIFI_CLK_EN, 0xcc)
+    FIELD(DPORT_WIFI_CLK_EN, SDIO_HOST, 13, 1)
+    FIELD(DPORT_WIFI_CLK_EN, EMAC, 14, 1)
+    FIELD(DPORT_WIFI_CLK_EN, RNG, 15, 1)
+REG32(DPORT_CORE_RST_EN, 0xd0)
+    FIELD(DPORT_CORE_RST_EN, SDIO_HOST, 6, 1)
+    FIELD(DPORT_CORE_RST_EN, EMAC, 7, 1)
+
+/* Reset values, from ESP-IDF's soc/esp32/register/soc/dport_reg.h. */
+#define ESP32_DPORT_PERIP_CLK_EN_RESET  0xf9c1e06f
+#define ESP32_DPORT_WIFI_CLK_EN_RESET   0xfffce030
 
 REG32(DPORT_CPU_INTR_FROM_CPU_0, 0xdc)
 REG32(DPORT_CPU_INTR_FROM_CPU_1, 0xe0)

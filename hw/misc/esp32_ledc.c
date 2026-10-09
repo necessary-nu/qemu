@@ -132,10 +132,30 @@ static void esp32_ledc_init(Object *obj)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * DPORT's reset bit returns the timers and channels to their reset state,
+ * with every output off.
+ */
+static void esp32_ledc_reset_hold(Object *obj, ResetType type)
+{
+    Esp32LEDCState *s = ESP32_LEDC(obj);
+
+    memset(s->duty_res, 0, sizeof(s->duty_res));
+    memset(s->timer_conf_reg, 0, sizeof(s->timer_conf_reg));
+    memset(s->channel_conf0_reg, 0, sizeof(s->channel_conf0_reg));
+    for (int i = 0; i < ESP32_LEDC_CHANNEL_CNT; i++) {
+        led_set_intensity(&s->led[i], 0);
+    }
+}
+
 static void esp32_ledc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+
     dc->realize = esp32_ledc_realize;
+    rc->phases.hold = esp32_ledc_reset_hold;
 }
 
 static const TypeInfo esp32_ledc_info = {

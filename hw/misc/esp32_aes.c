@@ -93,6 +93,10 @@ static const MemoryRegionOps esp32_aes_ops = {
 static void esp32_aes_reset_hold(Object *obj, ResetType type)
 {
     Esp32AesState *s = ESP32_AES(obj);
+
+    memset(s->text, 0, sizeof(s->text));
+    memset(s->key, 0, sizeof(s->key));
+    esp32_aes_mode(s, 0);
     s->aes_idle_reg = 0;
 }
 

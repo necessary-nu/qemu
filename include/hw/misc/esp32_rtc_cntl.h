@@ -58,7 +58,7 @@ typedef struct Esp32RtcCntlState {
     bool cpu_stall_state[ESP32_CPU_COUNT];
 
     uint32_t xtal_apb_freq;
-    uint32_t pll_apb_freq;
+    uint32_t clk_conf_reg;
     Esp32SocClkSel soc_clk;
     Esp32FastClkSel rtc_fastclk;
     uint32_t rtc_fastclk_freq;
@@ -102,6 +102,9 @@ REG32(RTC_CNTL_CLK_CONF, 0x70)
     FIELD(RTC_CNTL_CLK_CONF, ANA_CLK_RTC_SEL, 30, 2)
     FIELD(RTC_CNTL_CLK_CONF, FAST_CLK_RTC_SEL, 29, 1)
     FIELD(RTC_CNTL_CLK_CONF, SOC_CLK_SEL, 27, 2)
+
+/* CK8M_DIV_SEL = 2, DIG_CLK8M_D256_EN, CK8M_DIV = 1; SOC_CLK_SEL = XTAL. */
+#define ESP32_RTC_CNTL_CLK_CONF_RESET 0x00002210
 
 REG32(RTC_CNTL_SW_CPU_STALL, 0xac)
     FIELD(RTC_CNTL_SW_CPU_STALL, PROCPU_C1, 26, 6)

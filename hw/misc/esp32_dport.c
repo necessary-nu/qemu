@@ -121,6 +121,24 @@ static uint64_t esp32_dport_read(void *opaque, hwaddr addr, unsigned int size)
     case A_DPORT_SLAVE_SPI_CONFIG:
         r = s->slave_spi_config_reg;
         break;
+    case A_DPORT_PERI_CLK_EN:
+        r = s->peri_clk_en;
+        break;
+    case A_DPORT_PERI_RST_EN:
+        r = s->peri_rst_en;
+        break;
+    case A_DPORT_PERIP_CLK_EN:
+        r = s->perip_clk_en;
+        break;
+    case A_DPORT_PERIP_RST_EN:
+        r = s->perip_rst_en;
+        break;
+    case A_DPORT_WIFI_CLK_EN:
+        r = s->wifi_clk_en;
+        break;
+    case A_DPORT_CORE_RST_EN:
+        r = s->core_rst_en;
+        break;
     }
 
     return r;
@@ -224,6 +242,34 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
         s->slave_spi_config_reg = value;
         qemu_set_irq(s->flash_enc_en_gpio, FIELD_EX32(value, DPORT_SLAVE_SPI_CONFIG, SLAVE_SPI_ENCRYPT_ENABLE));
         qemu_set_irq(s->flash_dec_en_gpio, FIELD_EX32(value, DPORT_SLAVE_SPI_CONFIG, SLAVE_SPI_DECRYPT_ENABLE));
+        break;
+    /*
+     * [spec:nuos:req:emu.esp32.clock-gating]
+     * All bits read back as written; the reset bits are not self-clearing.
+     */
+    case A_DPORT_PERI_CLK_EN:
+        s->peri_clk_en = value;
+        qemu_irq_pulse(s->periph_clk_update_req);
+        break;
+    case A_DPORT_PERI_RST_EN:
+        s->peri_rst_en = value;
+        qemu_irq_pulse(s->periph_clk_update_req);
+        break;
+    case A_DPORT_PERIP_CLK_EN:
+        s->perip_clk_en = value;
+        qemu_irq_pulse(s->periph_clk_update_req);
+        break;
+    case A_DPORT_PERIP_RST_EN:
+        s->perip_rst_en = value;
+        qemu_irq_pulse(s->periph_clk_update_req);
+        break;
+    case A_DPORT_WIFI_CLK_EN:
+        s->wifi_clk_en = value;
+        qemu_irq_pulse(s->periph_clk_update_req);
+        break;
+    case A_DPORT_CORE_RST_EN:
+        s->core_rst_en = value;
+        qemu_irq_pulse(s->periph_clk_update_req);
         break;
     }
 }
@@ -372,6 +418,13 @@ static void esp32_dport_reset_hold(Object *obj, ResetType type)
     s->appcpu_reset_state = true;
     s->appcpu_stall_state = false;
     s->cache_ill_trap_en_reg = 0;
+    s->cpuperiod_sel = 0;
+    s->peri_clk_en = 0;
+    s->peri_rst_en = 0;
+    s->perip_clk_en = ESP32_DPORT_PERIP_CLK_EN_RESET;
+    s->perip_rst_en = 0;
+    s->wifi_clk_en = ESP32_DPORT_WIFI_CLK_EN_RESET;
+    s->core_rst_en = 0;
     esp32_cache_reset(&s->cache_state[0]);
     esp32_cache_reset(&s->cache_state[1]);
     qemu_irq_lower(s->appcpu_stall_req);
@@ -442,6 +495,8 @@ static void esp32_dport_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(sbd), &s->cache_ill_irq, ESP32_DPORT_CACHE_ILL_IRQ_GPIO, 1);
     qdev_init_gpio_out_named(DEVICE(sbd), &s->flash_enc_en_gpio, ESP32_DPORT_FLASH_ENC_EN_GPIO, 1);
     qdev_init_gpio_out_named(DEVICE(sbd), &s->flash_dec_en_gpio, ESP32_DPORT_FLASH_DEC_EN_GPIO, 1);
+    qdev_init_gpio_out_named(DEVICE(sbd), &s->periph_clk_update_req,
+                             ESP32_DPORT_PERIPH_CLK_UPDATE_GPIO, 1);
 }
 
 static const Property esp32_dport_properties[] = {

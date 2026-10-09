@@ -21,7 +21,7 @@
 #include "hw/misc/esp32_rtc_cntl.h"
 
 static void esp32_rtc_update_cpu_stall(Esp32RtcCntlState* s);
-static void esp32_rtc_update_clk(Esp32RtcCntlState* s);
+static void esp32_rtc_decode_clk_conf(Esp32RtcCntlState *s);
 
 static uint64_t esp32_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int size)
 {
@@ -56,9 +56,7 @@ static uint64_t esp32_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int size
         break;
 
     case A_RTC_CNTL_CLK_CONF:
-        r = FIELD_DP32(r, RTC_CNTL_CLK_CONF, SOC_CLK_SEL, s->soc_clk);
-        r = FIELD_DP32(r, RTC_CNTL_CLK_CONF, FAST_CLK_RTC_SEL, s->rtc_fastclk);
-        r = FIELD_DP32(r, RTC_CNTL_CLK_CONF, ANA_CLK_RTC_SEL, s->rtc_slowclk);
+        r = s->clk_conf_reg;
         break;
 
     case A_RTC_CNTL_SW_CPU_STALL:
@@ -124,10 +122,15 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
         break;
 
     case A_RTC_CNTL_CLK_CONF:
-        s->soc_clk = FIELD_EX32(value, RTC_CNTL_CLK_CONF, SOC_CLK_SEL);
-        s->rtc_fastclk = FIELD_EX32(value, RTC_CNTL_CLK_CONF, FAST_CLK_RTC_SEL);
-        s->rtc_slowclk = FIELD_EX32(value, RTC_CNTL_CLK_CONF, ANA_CLK_RTC_SEL);
-        esp32_rtc_update_clk(s);
+        if (FIELD_EX32(value, RTC_CNTL_CLK_CONF, ANA_CLK_RTC_SEL) == 3) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: reserved RTC_SLOW_CLK source 3\n", __func__);
+            value = FIELD_DP32(value, RTC_CNTL_CLK_CONF, ANA_CLK_RTC_SEL,
+                               s->rtc_slowclk);
+        }
+        s->clk_conf_reg = value;
+        esp32_rtc_decode_clk_conf(s);
+        qemu_irq_pulse(s->clk_update);
         break;
 
     case A_RTC_CNTL_SW_CPU_STALL:
@@ -161,13 +164,19 @@ static void esp32_rtc_update_cpu_stall(Esp32RtcCntlState* s)
     qemu_set_irq(s->cpu_stall_req[1], s->cpu_stall_state[1]);
 }
 
-static void esp32_rtc_update_clk(Esp32RtcCntlState* s)
+/* [spec:nuos:req:emu.esp32.clock-gating] */
+static void esp32_rtc_decode_clk_conf(Esp32RtcCntlState *s)
 {
-    const uint32_t slowclk_freq[] = {150000, 32768, 8000000/256};
+    const uint32_t slowclk_freq[] = {150000, 32768, 8000000 / 256};
     const uint32_t fastclk_freq[] = {s->xtal_apb_freq / 4, 8000000};
+
+    s->soc_clk = FIELD_EX32(s->clk_conf_reg, RTC_CNTL_CLK_CONF, SOC_CLK_SEL);
+    s->rtc_fastclk = FIELD_EX32(s->clk_conf_reg, RTC_CNTL_CLK_CONF,
+                                FAST_CLK_RTC_SEL);
+    s->rtc_slowclk = FIELD_EX32(s->clk_conf_reg, RTC_CNTL_CLK_CONF,
+                                ANA_CLK_RTC_SEL);
     s->rtc_slowclk_freq = slowclk_freq[s->rtc_slowclk];
     s->rtc_fastclk_freq = fastclk_freq[s->rtc_fastclk];
-    qemu_irq_pulse(s->clk_update);
 }
 
 static const MemoryRegionOps esp32_rtc_cntl_ops = {
@@ -181,6 +190,10 @@ static void esp32_rtc_cntl_reset_hold(Object *obj, ResetType type)
     Esp32RtcCntlState *s = ESP32_RTC_CNTL(obj);
 
     s->time_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /* RTC_CNTL is only reset by a system reset, which also resets the clock
+     * selection: XTAL_CLK for the SoC. */
+    s->clk_conf_reg = ESP32_RTC_CNTL_CLK_CONF_RESET;
+    esp32_rtc_decode_clk_conf(s);
 }
 
 static void esp32_rtc_cntl_realize(DeviceState *dev, Error **errp)
@@ -206,12 +219,9 @@ static void esp32_rtc_cntl_init(Object *obj)
         s->stat_vector_sel[i] = true;
     }
 
-    s->rtc_slowclk = ESP32_SLOW_CLK_RC;
-    s->rtc_fastclk = ESP32_FAST_CLK_8M;
-    s->soc_clk = ESP32_SOC_CLK_XTAL;
     s->xtal_apb_freq = 40000000;
-    s->pll_apb_freq = 80000000;
-    esp32_rtc_update_clk(s);
+    s->clk_conf_reg = ESP32_RTC_CNTL_CLK_CONF_RESET;
+    esp32_rtc_decode_clk_conf(s);
 }
 
 static void esp32_rtc_cntl_class_init(ObjectClass *klass, const void *data)
