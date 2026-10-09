@@ -200,6 +200,9 @@ static void esp32_soc_reset(DeviceState *dev)
         device_cold_reset(DEVICE(&s->twai));
         device_cold_reset(DEVICE(&s->efuse));
         device_cold_reset(DEVICE(&s->ledc));
+        for (int i = 0; i < ESP32_MCPWM_COUNT; i++) {
+            device_cold_reset(DEVICE(&s->mcpwm[i]));
+        }
         device_cold_reset(DEVICE(&s->sha));
         device_cold_reset(DEVICE(&s->rng));
         device_cold_reset(DEVICE(&s->sdmmc));
@@ -317,6 +320,11 @@ static void esp32_cpu_stall(void* opaque, int n, int level)
 static const uint32_t esp32_pll_cpu_hz[] = { 80000000, 160000000, 240000000 };
 #define ESP32_PLL_APB_HZ 80000000
 /*
+ * PLL_F160M_CLK, divided from PLL_CLK (TRM 7.2.4.5). The PLL's power and
+ * lock are not modelled: the clock always runs.
+ */
+#define ESP32_PLL_F160M_HZ 160000000
+/*
  * APLL_CLK's coefficients are programmed through the analog I2C bus, which
  * is not modelled. Until it is, the APLL is taken to run at the output of
  * its formula with every coefficient 0: 40 MHz * 4 / (2 * 2) = 40 MHz.
@@ -337,6 +345,9 @@ static void esp32_gate_update_clocks(Esp32SocState *s, Esp32PeriphGate *g)
     }
     if (g->ref_tick_clk) {
         clock_update_hz(g->ref_tick_clk, running ? s->ref_tick_hz : 0);
+    }
+    if (g->f160m_clk) {
+        clock_update_hz(g->f160m_clk, running ? ESP32_PLL_F160M_HZ : 0);
     }
 }
 
@@ -802,6 +813,69 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                ESP32_GATE_PERIP, R_DPORT_PERIP_LEDC_MASK,
                                R_DPORT_PERIP_LEDC_MASK);
 
+    /*
+     * [spec:nuos:req:emu.esp32.mcpwm]
+     * MCPWM0 and MCPWM1, behind their DPORT clock and reset bits. Their
+     * PWM outputs and their sync, fault and capture inputs are GPIO
+     * matrix signals (TRM table 6.9-1).
+     */
+    for (int i = 0; i < ESP32_MCPWM_COUNT; i++) {
+        static const hwaddr base[] = { DR_REG_PWM_BASE, DR_REG_PWM1_BASE };
+        static const uint32_t bit[] = {
+            R_DPORT_PERIP_PWM0_MASK, R_DPORT_PERIP_PWM1_MASK
+        };
+        static const int intr[] = {
+            ETS_PWM0_INTR_SOURCE, ETS_PWM1_INTR_SOURCE
+        };
+        static const int out_sig[] = {
+            ESP32_SIG_PWM0_OUT0A, ESP32_SIG_PWM1_OUT0A
+        };
+        static const int sync_sig[] = {
+            ESP32_SIG_PWM0_SYNC0_IN, ESP32_SIG_PWM1_SYNC0_IN
+        };
+        static const int fault_sig[] = {
+            ESP32_SIG_PWM0_F0_IN, ESP32_SIG_PWM1_F0_IN
+        };
+        static const int cap_sig[] = {
+            ESP32_SIG_PWM0_CAP0_IN, ESP32_SIG_PWM1_CAP0_IN
+        };
+        DeviceState *pwm = DEVICE(&s->mcpwm[i]);
+        Esp32PeriphGate *g;
+
+        qdev_realize(pwm, &s->periph_bus, &error_fatal);
+        g = esp32_soc_add_gated_device(s, &s->mcpwm[i], base[i],
+                                       ESP32_GATE_PERIP, bit[i], bit[i]);
+        g->apb_clk = s->mcpwm_apb_clk[i];
+        g->f160m_clk = s->mcpwm_f160m_clk[i];
+        sysbus_connect_irq(SYS_BUS_DEVICE(pwm), 0,
+                           qdev_get_gpio_in(intmatrix_dev, intr[i]));
+        for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+            qdev_connect_gpio_out_named(pwm, ESP32_MCPWM_OUT, n,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->gpio),
+                                            ESP32_GPIO_SIG_OUT,
+                                            out_sig[i] + n));
+        }
+        for (int n = 0; n < ESP32_MCPWM_SYNCS; n++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_IN,
+                                        sync_sig[i] + n,
+                                        qdev_get_gpio_in_named(
+                                            pwm, ESP32_MCPWM_SYNC_IN, n));
+        }
+        for (int n = 0; n < ESP32_MCPWM_FAULTS; n++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_IN,
+                                        fault_sig[i] + n,
+                                        qdev_get_gpio_in_named(
+                                            pwm, ESP32_MCPWM_FAULT_IN, n));
+        }
+        for (int n = 0; n < ESP32_MCPWM_CAPS; n++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_IN,
+                                        cap_sig[i] + n,
+                                        qdev_get_gpio_in_named(
+                                            pwm, ESP32_MCPWM_CAP_IN, n));
+        }
+    }
+
     qdev_realize(DEVICE(&s->apb_ctrl), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->apb_ctrl, DR_REG_APB_CTRL_BASE);
     qdev_connect_gpio_out_named(DEVICE(&s->apb_ctrl),
@@ -1246,6 +1320,19 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "aes", &s->aes, TYPE_ESP32_AES);
 
     object_initialize_child(obj, "ledc", &s->ledc, TYPE_ESP32_LEDC);
+
+    for (int i = 0; i < ESP32_MCPWM_COUNT; i++) {
+        snprintf(name, sizeof(name), "mcpwm%d", i);
+        object_initialize_child(obj, name, &s->mcpwm[i], TYPE_ESP32_MCPWM);
+        snprintf(name, sizeof(name), "mcpwm%d-apb", i);
+        s->mcpwm_apb_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(DEVICE(&s->mcpwm[i]), "apb",
+                              s->mcpwm_apb_clk[i]);
+        snprintf(name, sizeof(name), "mcpwm%d-f160m", i);
+        s->mcpwm_f160m_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(DEVICE(&s->mcpwm[i]), "f160m",
+                              s->mcpwm_f160m_clk[i]);
+    }
 
     object_initialize_child(obj, "rsa", &s->rsa, TYPE_ESP32_RSA);
 
