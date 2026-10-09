@@ -51,6 +51,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ARMv7MState, ARMV7M)
  * + Property "fetch-port": instruction fetch port decode interface
  *   (forwarded to CPU object; unset, the instruction port reaches every
  *   address the data port does)
+ * + Property "excl-monitor": the system's global exclusive monitor
+ *   (forwarded to CPU object; unset, QEMU's own exclusive monitor stands
+ *   in for both the core's local monitor and a global one)
  * + Property "init-svtor": secure VTOR reset value (forwarded to CPU object)
  * + Property "init-nsvtor": non-secure VTOR reset value (forwarded to CPU object)
  * + Property "vfp": enable VFP (forwarded to CPU object)
@@ -110,6 +113,7 @@ struct ARMv7MState {
     MemoryRegion *board_memory;
     Object *idau;
     Object *fetch_port;
+    Object *excl_monitor;
     uint32_t init_svtor;
     uint32_t init_nsvtor;
     uint64_t midr;

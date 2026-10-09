@@ -2043,6 +2043,15 @@ static void gen_load_exclusive(DisasContext *s, int rt, int rt2,
 
     s->is_ldex = true;
 
+    if (s->m_excl_monitor) {
+        /* M profile has no doubleword exclusives. */
+        gen_helper_v7m_ldrex(tmp, tcg_env, addr,
+                             tcg_constant_i32(make_memop_idx(opc,
+                                                get_mem_index(s))));
+        store_reg(s, rt, tmp);
+        return;
+    }
+
     if (size == 3) {
         TCGv_i32 tmp2 = tcg_temp_new_i32();
         TCGv_i64 t64 = tcg_temp_new_i64();
@@ -2088,6 +2097,23 @@ static void gen_store_exclusive(DisasContext *s, int rd, int rt, int rt2,
     TCGLabel *done_label;
     TCGLabel *fail_label;
     MemOp opc = size | MO_ALIGN | s->be_data;
+
+    if (s->m_excl_monitor) {
+        /*
+         * The helper decides with the monitors before it writes, so the
+         * write must not be rewound and replayed as an I/O access in the
+         * middle of a TB would be: make this the TB's last instruction.
+         */
+        translator_io_start(&s->base);
+        t0 = tcg_temp_new_i32();
+        gen_helper_v7m_strex(t0, tcg_env, addr, load_reg(s, rt),
+                             tcg_constant_i32(make_memop_idx(opc,
+                                                get_mem_index(s))),
+                             tcg_constant_i32(tb_cflags(s->base.tb) &
+                                              CF_PARALLEL ? 1 : 0));
+        tcg_gen_mov_i32(cpu_R[rd], t0);
+        return;
+    }
 
     /* if (env->exclusive_addr == addr && env->exclusive_val == [addr]) {
          [addr] = {Rt};
@@ -6502,6 +6528,8 @@ static void arm_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     dc->lse2 = false; /* applies only to aarch64 */
     dc->cp_regs = cpu->cp_regs;
     dc->features = env->features;
+    dc->m_excl_monitor = arm_feature(env, ARM_FEATURE_M) &&
+                         cpu->excl_monitor;
 
     /* Single step state. The code-generation logic here is:
      *  SS_ACTIVE == 0:

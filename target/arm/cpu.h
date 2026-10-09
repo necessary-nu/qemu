@@ -1058,6 +1058,14 @@ struct ArchCPU {
      */
     Object *fetch_port;
 
+    /*
+     * For M profile, pointer to the system's global exclusive monitor
+     * provided by the board/SoC; NULL if the system has none, in which
+     * case QEMU's own exclusive monitor stands in for both the local and
+     * the global monitor.
+     */
+    Object *excl_monitor;
+
     /* 'compatible' string for this CPU for Linux device trees */
     const char *dtb_compatible;
 

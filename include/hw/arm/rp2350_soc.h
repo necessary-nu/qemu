@@ -25,6 +25,7 @@
 #include "hw/misc/rp2350_coresight_trace.h"
 #include "hw/misc/rp2350_dcp.h"
 #include "hw/misc/rp2350_eppb.h"
+#include "hw/misc/rp2350_exclmon.h"
 #include "hw/misc/rp2350_m33_debug.h"
 #include "hw/misc/rp2350_hstx.h"
 #include "hw/misc/rp2350_pio.h"
@@ -218,6 +219,7 @@ struct RP2350State {
     RP2350SIOState sio;
     RP2350GPIOState gpio;
     RP2350RCPState rcp;
+    RP2350ExclMonState exclmon;
     RP2350BootRAMState bootram;
     RP2350BusCtrlState busctrl;
     RP2350DCPState dcp;

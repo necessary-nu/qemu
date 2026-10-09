@@ -74,6 +74,9 @@ DEF_HELPER_2(v7m_blxns, void, env, i32)
 
 DEF_HELPER_3(v7m_tt, i32, env, i32, i32)
 
+DEF_HELPER_3(v7m_ldrex, i32, env, i32, i32)
+DEF_HELPER_5(v7m_strex, i32, env, i32, i32, i32, i32)
+
 DEF_HELPER_1(v7m_preserve_fp_state, void, env)
 
 DEF_HELPER_2(v7m_vlstm, void, env, i32)

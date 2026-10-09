@@ -1296,6 +1296,13 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->accessctrl), 0,
                     RP2350_ACCESSCTRL_BASE);
 
+    /* [spec:nuos:req:emu.machine+1] */
+    object_property_set_link(OBJECT(&s->exclmon), "sram", OBJECT(&s->sram),
+                             &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->exclmon), errp)) {
+        return;
+    }
+
     for (i = 0; i < RP2350_NUM_CORES; i++) {
         DeviceState *armv7m = DEVICE(&s->armv7m[i]);
         int n;
@@ -1332,9 +1339,13 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                                  &error_abort);
         object_property_set_link(OBJECT(armv7m), "fetch-port", OBJECT(s),
                                  &error_abort);
+        /* [spec:nuos:req:emu.machine+1] */
+        object_property_set_link(OBJECT(armv7m), "excl-monitor",
+                                 OBJECT(&s->exclmon), &error_abort);
         if (!sysbus_realize(SYS_BUS_DEVICE(armv7m), errp)) {
             return;
         }
+        rp2350_exclmon_attach(&s->exclmon, i, CPU(s->armv7m[i].cpu));
         /* A core that locks up stops; the other core carries on. */
         /* [spec:nuos:req:emu.lockup] */
         s->armv7m[i].cpu->m_lockup_halts = true;
@@ -2018,6 +2029,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                                  OBJECT(&s->accessctrl), &error_abort);
         object_property_set_link(OBJECT(sbd), "busctrl", OBJECT(&s->busctrl),
                                  &error_abort);
+        object_property_set_link(OBJECT(sbd), "exclmon", OBJECT(&s->exclmon),
+                                 &error_abort);
         qdev_prop_set_uint32(dma, "sysclk-hz", RP2350_SYSCLK_HZ);
         if (!sysbus_realize(sbd, errp)) {
             return;
@@ -2162,6 +2175,7 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "sio", &s->sio, TYPE_RP2350_SIO);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_RP2350_GPIO);
     object_initialize_child(obj, "rcp", &s->rcp, TYPE_RP2350_RCP);
+    object_initialize_child(obj, "exclmon", &s->exclmon, TYPE_RP2350_EXCLMON);
     object_initialize_child(obj, "bootram", &s->bootram, TYPE_RP2350_BOOTRAM);
     object_initialize_child(obj, "busctrl", &s->busctrl, TYPE_RP2350_BUSCTRL);
     object_initialize_child(obj, "dcp", &s->dcp, TYPE_RP2350_DCP);
