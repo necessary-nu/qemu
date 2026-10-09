@@ -146,6 +146,7 @@ static void rp2350_core1_launch(void *opaque, uint32_t vtor, uint32_t sp,
 
 /* RESETS bits of the subsystems that have device models. */
 #define RP2350_RESET_BUSCTRL    1
+#define RP2350_RESET_HSTX       3
 #define RP2350_RESET_IO_BANK0   6
 #define RP2350_RESET_IO_QSPI    7
 #define RP2350_RESET_PADS_BANK0 9
@@ -167,6 +168,8 @@ static DeviceState *rp2350_subsystem(RP2350State *s, int bit)
     switch (bit) {
     case RP2350_RESET_BUSCTRL:
         return DEVICE(&s->busctrl);
+    case RP2350_RESET_HSTX:
+        return DEVICE(&s->hstx);
     case RP2350_RESET_PLL_SYS:
         return DEVICE(&s->pll_sys);
     case RP2350_RESET_PLL_USB:
@@ -890,6 +893,33 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         }
     }
 
+    /*
+     * HSTX, clocked by clk_hstx. Clock frequencies are not modelled: at
+     * reset CLK_HSTX_CTRL selects clk_sys undivided, which pico-sdk keeps,
+     * so clk_hstx is clk_sys. Its eight outputs drive the HSTX function
+     * of GPIOs 12-19. DREQ_HSTX is connected with the DMA's other
+     * sources.
+     */
+    /* [spec:nuos:req:emu.hstx] */
+    {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->hstx);
+        DeviceState *dev = DEVICE(&s->hstx);
+        int n;
+
+        qdev_connect_clock_in(dev, "clk", s->sysclk);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, RP2350_HSTX_CTRL_BASE);
+        sysbus_mmio_map(sbd, 1, RP2350_HSTX_FIFO_BASE);
+        for (n = 0; n < RP2350_GPIO_HSTX_SIGNALS; n++) {
+            qdev_connect_gpio_out_named(dev, RP2350_HSTX_OUT, n,
+                rp2350_gpio_out_line(&s->gpio, RP2350_GPIO_PORT_HSTX, n));
+            qdev_connect_gpio_out_named(dev, RP2350_HSTX_OE, n,
+                rp2350_gpio_oe_line(&s->gpio, RP2350_GPIO_PORT_HSTX, n));
+        }
+    }
+
     /* [spec:nuos:req:emu.uart] */
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         static const hwaddr base[] = { RP2350_UART0_BASE, RP2350_UART1_BASE };
@@ -1020,6 +1050,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                                    RP2350_DREQ_CORESIGHT));
         qdev_connect_gpio_out_named(DEVICE(&s->sha256), RP2350_SHA256_DREQ, 0,
             qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_SHA256));
+        qdev_connect_gpio_out_named(DEVICE(&s->hstx), RP2350_HSTX_DREQ, 0,
+            qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, RP2350_DREQ_HSTX));
     }
 
     for (i = 0; i < ARRAY_SIZE(rp2350_peripherals); i++) {
@@ -1069,6 +1101,7 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "trng", &s->trng, TYPE_RP2350_TRNG);
     object_initialize_child(obj, "sha256", &s->sha256, TYPE_RP2350_SHA256);
     object_initialize_child(obj, "pwm", &s->pwm, TYPE_RP2350_PWM);
+    object_initialize_child(obj, "hstx", &s->hstx, TYPE_RP2350_HSTX);
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
         object_initialize_child(obj, "timer[*]", &s->timer[i],
                                 TYPE_RP2350_TIMER);
