@@ -1334,7 +1334,9 @@ static void mps2tz_common_init(MachineState *machine)
 }
 
 static void mps2_tz_idau_check(IDAUInterface *ii, uint32_t address,
-                               int *iregion, bool *exempt, bool *ns, bool *nsc)
+                               MMUAccessType access_type, int *iregion,
+                               bool *exempt, bool *ns, bool *nsc,
+                               uint32_t *base, uint32_t *limit)
 {
     /*
      * The MPS2 TZ FPGA images have IDAUs in them which are connected to

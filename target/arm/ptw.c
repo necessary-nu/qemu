@@ -3160,9 +3160,17 @@ void v8m_security_lookup(CPUARMState *env, uint32_t address,
     if (cpu->idau) {
         IDAUInterfaceClass *iic = IDAU_INTERFACE_GET_CLASS(cpu->idau);
         IDAUInterface *ii = IDAU_INTERFACE(cpu->idau);
+        uint32_t idau_base = 0, idau_limit = UINT32_MAX;
 
-        iic->check(ii, address, &idau_region, &idau_exempt, &idau_ns,
-                   &idau_nsc);
+        iic->check(ii, address, access_type, &idau_region, &idau_exempt,
+                   &idau_ns, &idau_nsc, &idau_base, &idau_limit);
+        /*
+         * An IDAU response that does not hold for the whole page, or for
+         * every access type, must not be cached for the page.
+         */
+        if (idau_base > addr_page_base || idau_limit < addr_page_limit) {
+            sattrs->subpage = true;
+        }
     }
 
     if (access_type == MMU_INST_FETCH && extract32(address, 28, 4) == 0xf) {
