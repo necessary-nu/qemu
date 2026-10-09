@@ -162,6 +162,11 @@ struct SDBusClass {
      */
     void (*set_inserted)(DeviceState *dev, bool inserted);
     void (*set_readonly)(DeviceState *dev, bool readonly);
+    /*
+     * Called by an SDIO card to signal its interrupt to the controller:
+     * the level of the card's interrupt request, which it gives on DAT1.
+     */
+    void (*set_irq)(DeviceState *dev, bool level);
 };
 
 /* Functions to be used by qdevified callers (working via
@@ -234,5 +239,11 @@ void sdbus_reparent_card(SDBus *from, SDBus *to);
 /* Functions to be used by SD devices to report back to qdevified controllers */
 void sdbus_set_inserted(SDBus *sd, bool inserted);
 void sdbus_set_readonly(SDBus *sd, bool inserted);
+/**
+ * sdbus_set_irq: An SDIO card's interrupt request on its bus.
+ * @sd: bus
+ * @level: true while the card requests an interrupt
+ */
+void sdbus_set_irq(SDBus *sd, bool level);
 
 #endif /* HW_SD_H */

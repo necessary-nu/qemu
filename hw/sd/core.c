@@ -263,6 +263,16 @@ void sdbus_set_readonly(SDBus *sdbus, bool readonly)
     }
 }
 
+void sdbus_set_irq(SDBus *sdbus, bool level)
+{
+    SDBusClass *sbc = SD_BUS_GET_CLASS(sdbus);
+    BusState *qbus = BUS(sdbus);
+
+    if (sbc->set_irq) {
+        sbc->set_irq(qbus->parent, level);
+    }
+}
+
 void sdbus_reparent_card(SDBus *from, SDBus *to)
 {
     SDState *card = get_card(from);
