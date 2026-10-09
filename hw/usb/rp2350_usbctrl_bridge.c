@@ -416,16 +416,19 @@ static void br_run(void *opaque)
         br_set_state(s, BRIDGE_RESET, 0);
         return;
     case BRIDGE_RESET:
-        rp2350_usbctrl_dev_bus_reset(s);
+        timer_del(s->br_frame_timer);
+        rp2350_usbctrl_dev_bus_reset(s, true);
         br_set_state(s, BRIDGE_RECOVERY, BR_RESET_NS);
         return;
     case BRIDGE_RECOVERY:
+        /* SOFs start as the reset ends; requests after the recovery. */
+        rp2350_usbctrl_dev_bus_reset(s, false);
         s->br_addr = 0;
         s->br_mps0 = BR_MPS0_INITIAL;
         s->br_dtr_sent = false;
         s->br_tx_len = 0;
-        s->br_frame_ns = br_now() + BR_RECOVERY_NS;
-        timer_mod(s->br_frame_timer, s->br_frame_ns);
+        s->br_frame_ns = br_now();
+        br_frame(s);
         br_enum_step(s, STEP_GET_DEVICE8);
         br_set_state(s, BRIDGE_ENUMERATE, BR_RECOVERY_NS + br_xact_ns(0));
         return;
@@ -605,7 +608,8 @@ static void tok_execute(RP2350USBCtrlState *s, const uint8_t *req,
         }
         return;
     case 'R':
-        rp2350_usbctrl_dev_bus_reset(s);
+        rp2350_usbctrl_dev_bus_reset(s, true);
+        rp2350_usbctrl_dev_bus_reset(s, false);
         tok_reply(s, 'A', 0, NULL, 0);
         return;
     case 'F':

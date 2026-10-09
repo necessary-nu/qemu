@@ -394,7 +394,7 @@ static uint32_t line_state(RP2350USBCtrlState *s)
     if (host_mode(s)) {
         return s->host_speed == 1 ? 2 : s->host_speed ? 1 : 0;
     }
-    return rp2350_usbctrl_dev_present(s) ? 1 : 0;
+    return rp2350_usbctrl_dev_present(s) && !s->dev_bus_reset ? 1 : 0;
 }
 
 static uint32_t sie_status(RP2350USBCtrlState *s)
@@ -622,27 +622,43 @@ void rp2350_usbctrl_update_dev_port(RP2350USBCtrlState *s)
         } else {
             timer_del(s->dev_idle_timer);
             s->dev_suspended = false;
+            s->dev_bus_reset = false;
         }
         rp2350_usb_bridge_port_changed(s);
     }
     usb_update_irq(s);
 }
 
+/*
+ * Any token on the bus is activity; the device answers only those
+ * addressed to it.
+ */
 static bool dev_addressed(RP2350USBCtrlState *s, uint8_t addr)
 {
-    return rp2350_usbctrl_dev_present(s) &&
-           addr == (s->addr_endp[0] & ADDR_ENDP_ADDRESS);
+    if (!rp2350_usbctrl_dev_present(s)) {
+        return false;
+    }
+    dev_bus_activity(s, false);
+    return addr == (s->addr_endp[0] & ADDR_ENDP_ADDRESS);
 }
 
 /* [spec:nuos:req:emu.usb] */
-void rp2350_usbctrl_dev_bus_reset(RP2350USBCtrlState *s)
+/*
+ * The host drives SE0 for a bus reset: the device sees BUS_RESET as it
+ * starts, and the bus is not idle, so not suspending, until it ends.
+ */
+void rp2350_usbctrl_dev_bus_reset(RP2350USBCtrlState *s, bool asserted)
 {
     if (!rp2350_usbctrl_dev_present(s)) {
         return;
     }
     dev_bus_activity(s, true);
-    s->sie_status |= SIE_STATUS_BUS_RESET;
-    s->dev_buf_sel = 0;
+    s->dev_bus_reset = asserted;
+    if (asserted) {
+        timer_del(s->dev_idle_timer);
+        s->sie_status |= SIE_STATUS_BUS_RESET;
+        s->dev_buf_sel = 0;
+    }
     usb_update_irq(s);
 }
 
@@ -671,9 +687,9 @@ RP2350USBHandshake rp2350_usbctrl_dev_setup(RP2350USBCtrlState *s,
                                             const uint8_t *data)
 {
     if (!dev_addressed(s, addr)) {
+        usb_update_irq(s);
         return RP2350_USB_NORESP;
     }
-    dev_bus_activity(s, false);
     if (pid) {
         s->sie_status |= SIE_STATUS_DATA_SEQ_ERROR;
     }
@@ -696,7 +712,6 @@ static int dev_token(RP2350USBCtrlState *s, uint8_t addr, uint8_t ep,
     if (!dev_addressed(s, addr) || ep >= RP2350_USBCTRL_ENDPOINTS) {
         return -1;
     }
-    dev_bus_activity(s, false);
     *ep_ctrl = dev_ep_ctrl(s, ep, out);
     if (!(*ep_ctrl & EP_CTRL_ENABLE)) {
         return -1;
@@ -1010,7 +1025,8 @@ static void host_issue(RP2350USBCtrlState *s, int slot, int pid, uint8_t addr,
     s->xact_ep = ep;
     s->xact_sel = sel;
     s->xact_len = len;
-    host_kick(s, host_xact_ns(s, pid == USB_TOKEN_IN ? 0 : len));
+    timer_mod(s->host_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              host_xact_ns(s, pid == USB_TOKEN_IN ? 0 : len));
 
     /*
      * A device answers at address 0 once powered; QEMU's devices wait for
@@ -1052,6 +1068,10 @@ static void host_issue(RP2350USBCtrlState *s, int slot, int pid, uint8_t addr,
         return;
     }
     host_xact_done(s, s->packet.status, s->packet.actual_length);
+    if (pid == USB_TOKEN_IN) {
+        timer_mod(s->host_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  host_xact_ns(s, s->packet.actual_length));
+    }
 }
 
 static void host_epx_end(RP2350USBCtrlState *s)
@@ -1876,6 +1896,7 @@ static void rp2350_usbctrl_reset_hold(Object *obj, ResetType type)
     s->dev_connected = false;
     s->dev_suspended = false;
     s->dev_present = false;
+    s->dev_bus_reset = false;
     s->host_speed = 0;
     s->epx_active = false;
     s->epx_phase = EPX_PHASE_SETUP;
@@ -1996,6 +2017,7 @@ static const VMStateDescription vmstate_rp2350_usbctrl = {
         VMSTATE_BOOL(dev_connected, RP2350USBCtrlState),
         VMSTATE_BOOL(dev_suspended, RP2350USBCtrlState),
         VMSTATE_BOOL(dev_present, RP2350USBCtrlState),
+        VMSTATE_BOOL(dev_bus_reset, RP2350USBCtrlState),
         VMSTATE_TIMER_PTR(dev_idle_timer, RP2350USBCtrlState),
         VMSTATE_TIMER_PTR(host_frame_timer, RP2350USBCtrlState),
         VMSTATE_INT64(host_frame_ns, RP2350USBCtrlState),

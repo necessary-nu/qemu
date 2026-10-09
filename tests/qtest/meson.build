@@ -264,6 +264,7 @@ qtests_rp2350 = \
    'rp2350-pwm-test',
    'rp2350-otp-test',
    'rp2350-dma-test',
+   'rp2350-usbctrl-test',
    'rp2350-spi-test',
    'rp2350-m33-debug-test',
    'rp2350-hstx-test']

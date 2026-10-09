@@ -162,6 +162,8 @@ struct RP2350USBCtrlState {
     bool dev_suspended;
     /* Bus state as last seen, for the pull-up's connect/disconnect. */
     bool dev_present;
+    /* The host is driving a bus reset. */
+    bool dev_bus_reset;
     QEMUTimer *dev_idle_timer;
 
     /* Host controller */
@@ -246,7 +248,7 @@ struct RP2350USBCtrlState {
  * port: each call is one transaction, completed before it returns.
  */
 bool rp2350_usbctrl_dev_present(RP2350USBCtrlState *s);
-void rp2350_usbctrl_dev_bus_reset(RP2350USBCtrlState *s);
+void rp2350_usbctrl_dev_bus_reset(RP2350USBCtrlState *s, bool asserted);
 void rp2350_usbctrl_dev_sof(RP2350USBCtrlState *s, uint16_t frame);
 RP2350USBHandshake rp2350_usbctrl_dev_setup(RP2350USBCtrlState *s,
                                             uint8_t addr, int pid,
