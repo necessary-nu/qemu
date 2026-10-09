@@ -1014,8 +1014,12 @@ void rp2350_gpio_hold_blocks(RP2350GPIOState *s, unsigned blocks, bool hold)
  * Reset is the chip-level (always-on domain) reset: registers, the pad
  * isolation latches, which take the reset values of the controls they
  * hold, and the edge detectors. External drive and peripheral sources
- * belong to the board and the peripherals.
+ * belong to the board and the peripherals. The power manager's own
+ * resets (RESET_TYPE_WAKEUP) reset only the switched core: the latches
+ * and the pins keep their state, so isolated pads hold through a
+ * low-power state and power-up wake-ups see their inputs.
  */
+/* [spec:nuos:req:emu.powman] */
 static void rp2350_gpio_hold_reset(Object *obj, ResetType type)
 {
     RP2350GPIOState *s = RP2350_GPIO(obj);
@@ -1028,6 +1032,9 @@ static void rp2350_gpio_hold_reset(Object *obj, ResetType type)
     rp2350_gpio_reset_io(s, true);
     rp2350_gpio_reset_pads(s, false);
     rp2350_gpio_reset_pads(s, true);
+    if (type == RESET_TYPE_WAKEUP) {
+        return;
+    }
     memset(s->pad_level, 0, sizeof(s->pad_level));
 
     for (p = 0; p < RP2350_GPIO_PINS; p++) {

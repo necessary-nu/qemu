@@ -17,7 +17,9 @@
  *                 image given as well is mapped, so ROM function lookups
  *                 work, but not executed. Watchdog and PSM resets of the
  *                 processors restart them the same way, with the machine
- *                 honouring the boot ROM's watchdog boot vector.
+ *                 honouring the boot ROM's POWMAN and watchdog boot
+ *                 vectors, and so does a power-up from a low-power
+ *                 state.
  *
  * With neither, the boot ROM region is blank and the cores lock up at
  * reset, as on a part with an empty ROM.
@@ -59,12 +61,15 @@ struct RP2350MachineState {
 #define TYPE_RP2350_MACHINE MACHINE_TYPE_NAME("rp2350")
 OBJECT_DECLARE_SIMPLE_TYPE(RP2350MachineState, RP2350_MACHINE)
 
-/* Core 0 starts as the boot ROM would leave it for a flash image. */
-static void rp2350_direct_reset(void *opaque)
+/*
+ * A system reset is whichever chip-level reset the power manager has
+ * pending; with no ROM executing, core 0 then starts as the boot ROM
+ * would leave it for a flash image.
+ */
+/* [spec:nuos:req:emu.powman] */
+static void rp2350_machine_reset(MachineState *machine, ResetType type)
 {
-    RP2350MachineState *s = opaque;
-
-    rp2350_soc_boot_rom_handoff(&s->soc, 0);
+    rp2350_soc_system_reset(&RP2350_MACHINE(machine)->soc, type);
 }
 
 /*
@@ -127,10 +132,6 @@ static void rp2350_init(MachineState *machine)
                        RP2350_XIP_BASE, s->soc.flash_size);
     for (i = 1; i < RP2350_NUM_CORES; i++) {
         armv7m_load_kernel(s->soc.armv7m[i].cpu, NULL, 0, 0);
-    }
-    /* Registered after the CPU resets, so it runs after them. */
-    if (direct) {
-        qemu_register_reset(rp2350_direct_reset, s);
     }
 }
 
@@ -212,6 +213,7 @@ static void rp2350_machine_class_init(ObjectClass *oc, const void *data)
 
     mc->desc = "Raspberry Pi RP2350 (2x Cortex-M33)";
     mc->init = rp2350_init;
+    mc->reset = rp2350_machine_reset;
     mc->default_ram_size = RP2350_SRAM_SIZE;
     mc->min_cpus = RP2350_NUM_CORES;
     mc->max_cpus = RP2350_NUM_CORES;
