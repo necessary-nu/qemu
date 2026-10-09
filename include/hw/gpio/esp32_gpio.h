@@ -223,3 +223,17 @@ typedef struct Esp32GpioState {
 typedef struct Esp32GpioClass {
     SysBusDeviceClass parent_class;
 } Esp32GpioClass;
+
+/*
+ * The output signal that reaches input signal sig through a pad: the pad
+ * the GPIO matrix or IO_MUX connects to sig has its input enabled, is not
+ * driven from outside and is driven, push-pull, by output signal *src
+ * through the matrix or its IO_MUX function. *inverted says whether the
+ * path inverts the level. Returns false if sig has no such source.
+ *
+ * A peripheral that models a serial link at a coarser grain than single
+ * pad transitions, such as I2S passing whole frames, uses this to find
+ * which of its own output signals another of its inputs listens to.
+ */
+bool esp32_gpio_sig_in_source(Esp32GpioState *s, unsigned sig,
+                              unsigned *src, bool *inverted);
