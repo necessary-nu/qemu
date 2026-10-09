@@ -412,6 +412,7 @@ config RP2350_SOC
     select RP2350_BUSCTRL
     select RP2350_ROSC
     select RP2350_TRNG
+    select RP2350_SHA256
     select RP2350_CORESIGHT
     select RP2350_ACCESSCTRL
     select RP2350_XIP

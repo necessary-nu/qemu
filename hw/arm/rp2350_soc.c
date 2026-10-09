@@ -836,6 +836,17 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->trng), 0,
                        qdev_get_gpio_in(dev_soc, RP2350_TRNG_IRQ));
 
+    /*
+     * The SHA-256 DREQ is left for the DMA controller to connect, through
+     * the block's RP2350_SHA256_DREQ output.
+     */
+    /* [spec:nuos:req:emu.sha256] */
+    qdev_connect_clock_in(DEVICE(&s->sha256), "clk", s->sysclk);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->sha256), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->sha256), 0, RP2350_SHA256_BASE);
+
     /* [spec:nuos:req:emu.uart] */
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         static const hwaddr base[] = { RP2350_UART0_BASE, RP2350_UART1_BASE };
@@ -936,6 +947,7 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "dft", &s->dft, TYPE_RP2350_DFT);
     object_initialize_child(obj, "rosc", &s->rosc, TYPE_RP2350_ROSC);
     object_initialize_child(obj, "trng", &s->trng, TYPE_RP2350_TRNG);
+    object_initialize_child(obj, "sha256", &s->sha256, TYPE_RP2350_SHA256);
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
         object_initialize_child(obj, "timer[*]", &s->timer[i],
                                 TYPE_RP2350_TIMER);
