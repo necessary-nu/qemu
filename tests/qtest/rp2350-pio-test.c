@@ -1249,6 +1249,51 @@ static void test_delay_loops(void)
     qtest_quit(qts);
 }
 
+/* [spec:nuos:req:emu.pio/test] */
+static void test_outside_pin_changes(void)
+{
+    QTestState *qts = start();
+    static const uint16_t prog[] = {
+        /* SM0: GPIO 2 high and low on alternate cycles. */
+        I_SET(D_PINS, 1),
+        I_SET(D_PINS, 0),
+        /* SM1: GPIO 2 every cycle, its synchroniser bypassed. */
+        I_IN(S_PINS, 1),
+    };
+    int n;
+
+    /*
+     * Pins driven from outside while the blocks loop a pin back to
+     * themselves do not disturb the loop: the blocks' own pin changes
+     * still come back through the pads in the cycle after they are made.
+     */
+    pin_pio(qts, 0, 2);
+    qtest_writel(qts, PAD(9), PAD_IE);
+    load(qts, 0, 0, prog, 3);
+    wr(qts, 0, PINCTRL(0), PIN_SET(1, 2));
+    wr(qts, 0, EXECCTRL(0), EXEC_WRAP(0, 1));
+    exec(qts, 0, 0, I_SET(D_PINDIRS, 1));
+    exec(qts, 0, 0, I_SET(D_PINS, 0));
+    exec(qts, 0, 0, I_JMP(C_ALWAYS, 0));
+    wr(qts, 0, PINCTRL(1), PIN_IN(2));
+    wr(qts, 0, EXECCTRL(1), EXEC_WRAP(2, 2));
+    wr(qts, 0, SHIFTCTRL(1), SHIFT_IN_RIGHT | SHIFT_AUTOPUSH | SHIFT_PUSH(32));
+    wr(qts, 0, SYNC_BYPASS, 1u << 2);
+    exec(qts, 0, 1, I_JMP(C_ALWAYS, 2));
+    cycles(qts, 30);
+    wr(qts, 0, CTRL, CTRL_EN(3));
+    for (n = 0; n < 40; n++) {
+        drive(qts, 9, n & 1);
+        cycles(qts, 3);
+    }
+    /* The four words of the RX FIFO hold the first 128 samples. */
+    cycles(qts, 30);
+    for (n = 0; n < 4; n++) {
+        g_assert_cmphex(rd(qts, 0, RXF(1)), ==, 0xaaaaaaaa);
+    }
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     static const uint32_t blank[2];
@@ -1284,6 +1329,8 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/pio/reset-hold", test_reset_hold);
     qtest_add_func("/rp2350/pio/hstx-coupling", test_hstx_coupling);
     qtest_add_func("/rp2350/pio/delay-loops", test_delay_loops);
+    qtest_add_func("/rp2350/pio/outside-pin-changes",
+                   test_outside_pin_changes);
 
     ret = g_test_run();
     unlink(rom_path);

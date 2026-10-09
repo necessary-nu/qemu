@@ -68,6 +68,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350PIOState, RP2350_PIO)
 
 /* Input pin history entries; see RP2350PIOCore. */
 #define RP2350_PIO_IN_HIST 4
+/* Pin changes from outside waiting to be applied; see RP2350PIOState. */
+#define RP2350_PIO_IN_QUEUE 8
 
 typedef struct RP2350PIOSM {
     /* Configuration registers. EXEC_STALLED is derived, not stored. */
@@ -215,6 +217,16 @@ struct RP2350PIOState {
 
     /* The latest pin levels delivered on "in". */
     uint64_t in_level;
+    /*
+     * Pin changes from outside the blocks and the cycles they came in,
+     * oldest first. They arrive while the IO bank propagates, when the
+     * blocks cannot run (their pin changes would not reach the bank in
+     * time), so they wait here for a bottom half or the next catch-up.
+     */
+    uint64_t inq_vec[RP2350_PIO_IN_QUEUE];
+    uint64_t inq_cycle[RP2350_PIO_IN_QUEUE];
+    uint32_t inq_n;
+    QEMUBH *in_bh;
 
     /* Levels last driven on the outputs, GPIO-numbered for the pins. */
     uint64_t drv_out[RP2350_PIO_BLOCKS];

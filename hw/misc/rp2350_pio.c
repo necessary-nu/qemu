@@ -68,6 +68,7 @@
 #include "qemu/bitops.h"
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
@@ -1534,9 +1535,30 @@ static uint64_t pio_now(RP2350PIOState *s)
  * Bring the blocks up to the current virtual time: commit the run ahead
  * if it has come due, or else discard it and run the blocks themselves.
  */
+/*
+ * Apply the queued pin changes from outside, each in the cycle it came
+ * in. Returns false if the blocks ran out of host time on the way; the
+ * rest then apply at once.
+ */
+static bool pio_apply_inputs(RP2350PIOState *s)
+{
+    bool ok = true;
+    uint32_t k;
+
+    for (k = 0; k < s->inq_n; k++) {
+        if (ok && s->inq_cycle[k] > s->core.cycle) {
+            ok = core_run(s, &s->core, s->inq_cycle[k], false) != RUN_SLOW;
+        }
+        core_input(&s->core, s->inq_vec[k], s->core.cycle);
+    }
+    s->inq_n = 0;
+    return ok;
+}
+
 static void pio_sync(RP2350PIOState *s)
 {
     uint64_t now = pio_now(s);
+    bool slow;
 
     s->busy = true;
     if (s->spec_valid && s->spec.cycle <= now) {
@@ -1544,7 +1566,8 @@ static void pio_sync(RP2350PIOState *s)
         drive_all(s);
     }
     s->spec_valid = false;
-    if (core_run(s, &s->core, now, false) == RUN_SLOW) {
+    slow = !pio_apply_inputs(s);
+    if (slow || core_run(s, &s->core, now, false) == RUN_SLOW) {
         /*
          * The blocks cannot keep up with virtual time. Rather than fall
          * ever further behind, they let the cycles they could not run go:
@@ -1625,11 +1648,31 @@ static void pio_in(void *opaque, int n, int level)
     }
     s->in_level = vec;
     if (s->busy) {
+        /* The blocks' own pin change, coming back through the pads. */
         core_input(&s->core, vec, s->core.cycle);
         return;
     }
+    if (s->inq_n && s->inq_cycle[s->inq_n - 1] >= pio_now(s)) {
+        s->inq_vec[s->inq_n - 1] = vec;
+    } else if (s->inq_n < RP2350_PIO_IN_QUEUE) {
+        s->inq_vec[s->inq_n] = vec;
+        s->inq_cycle[s->inq_n] = pio_now(s);
+        s->inq_n++;
+    } else {
+        /* Changes this frequent are merged into the newest. */
+        s->inq_vec[s->inq_n - 1] = vec;
+    }
+    /* The run ahead assumed the pins would not change. */
+    s->spec_valid = false;
+    s->horizon = HORIZON_MIN;
+    qemu_bh_schedule(s->in_bh);
+}
+
+static void pio_in_bh(void *opaque)
+{
+    RP2350PIOState *s = opaque;
+
     pio_disturb(s);
-    core_input(&s->core, vec, s->core.cycle);
     pio_schedule(s);
 }
 
@@ -2137,6 +2180,7 @@ static void rp2350_pio_reset_hold(Object *obj, ResetType type)
     timer_del(s->timer);
     s->spec_valid = false;
     s->horizon = HORIZON_MIN;
+    s->inq_n = 0;
 
     /*
      * clk_sys runs on through the reset: the blocks keep counting its
@@ -2199,6 +2243,8 @@ static void rp2350_pio_realize(DeviceState *dev, Error **errp)
     RP2350PIOState *s = RP2350_PIO(dev);
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pio_timer_cb, s);
+    s->in_bh = qemu_bh_new_guarded(pio_in_bh, s,
+                                   &DEVICE(s)->mem_reentrancy_guard);
 }
 
 static const Property rp2350_pio_properties[] = {
@@ -2293,6 +2339,9 @@ static int rp2350_pio_post_load(void *opaque, int version_id)
 
     s->spec_valid = false;
     s->busy = false;
+    if (s->inq_n) {
+        qemu_bh_schedule(s->in_bh);
+    }
     return 0;
 }
 
@@ -2310,6 +2359,9 @@ static const VMStateDescription vmstate_rp2350_pio = {
         VMSTATE_INT64(base_ns, RP2350PIOState),
         VMSTATE_UINT64(base_cycle, RP2350PIOState),
         VMSTATE_UINT64(in_level, RP2350PIOState),
+        VMSTATE_UINT64_ARRAY(inq_vec, RP2350PIOState, RP2350_PIO_IN_QUEUE),
+        VMSTATE_UINT64_ARRAY(inq_cycle, RP2350PIOState, RP2350_PIO_IN_QUEUE),
+        VMSTATE_UINT32(inq_n, RP2350PIOState),
         VMSTATE_UINT64_ARRAY(drv_out, RP2350PIOState, RP2350_PIO_BLOCKS),
         VMSTATE_UINT64_ARRAY(drv_oe, RP2350PIOState, RP2350_PIO_BLOCKS),
         VMSTATE_UINT32(drv_irq, RP2350PIOState),
