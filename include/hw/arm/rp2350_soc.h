@@ -35,6 +35,7 @@
 #include "hw/misc/rp2350_trng.h"
 #include "hw/misc/rp2350_xip.h"
 #include "hw/misc/unimp.h"
+#include "hw/ssi/pl022.h"
 #include "hw/timer/rp2350_timer.h"
 #include "hw/watchdog/rp2350_watchdog.h"
 #include "qom/object.h"
@@ -45,6 +46,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_NUM_CORES 2
 #define RP2350_NUM_IRQS 52
 #define RP2350_NUM_UARTS 2
+#define RP2350_NUM_SPIS 2
 #define RP2350_NUM_TIMERS 2
 #define RP2350_MPU_REGIONS 8
 
@@ -68,6 +70,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_SIO_IRQ_BELL_NS 28
 #define RP2350_SIO_IRQ_MTIMECMP 29
 #define RP2350_CLOCKS_IRQ 30
+#define RP2350_SPI0_IRQ 31
+#define RP2350_SPI1_IRQ 32
 #define RP2350_UART0_IRQ 33
 #define RP2350_UART1_IRQ 34
 #define RP2350_OTP_IRQ 38
@@ -119,6 +123,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_TIMER0_BASE 0x400b0000
 #define RP2350_TIMER1_BASE 0x400b8000
 #define RP2350_UART1_BASE 0x40078000
+#define RP2350_SPI0_BASE 0x40080000
+#define RP2350_SPI1_BASE 0x40088000
 #define RP2350_PLL_SYS_BASE 0x40050000
 #define RP2350_PLL_USB_BASE 0x40058000
 #define RP2350_TICKS_BASE 0x40108000
@@ -178,12 +184,17 @@ struct RP2350State {
     RP2350PWMState pwm;
     RP2350TimerState timer[RP2350_NUM_TIMERS];
     PL011State uart[RP2350_NUM_UARTS];
+    PL022State spi[RP2350_NUM_SPIS];
+    /* Wires the chip selects of the SSI devices on the SPI buses. */
+    Notifier spi_cs_notifier;
     RP2350CoreSightState coresight;
     RP2350CoreSightTraceState coresight_trace;
     RP2350OTPState otp;
     RP2350DMAState dma;
     /* The UARTs' register windows plus their atomic aliases. */
     MemoryRegion uart_alias[RP2350_NUM_UARTS];
+    /* The SPI controllers' register windows plus their atomic aliases. */
+    MemoryRegion spi_alias[RP2350_NUM_SPIS];
     /* Core 0's SIO views as seen from system memory (debug, qtest). */
     MemoryRegion sio_sysmem[2];
     /* Core 0's EPPB as seen from system memory (debug, qtest). */
