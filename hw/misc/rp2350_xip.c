@@ -261,7 +261,7 @@ static uint8_t qspi_byte(RP2350XIPState *s, uint8_t tx)
  * the serial interface, plus the half SCK period of chip select hold.
  * A full RX FIFO stalls the interface until software pops it.
  */
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static void rp2350_xip_direct_run(RP2350XIPState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -360,7 +360,7 @@ static uint32_t rp2350_xip_direct_csr(RP2350XIPState *s)
  * sent to that device, applying the pane's ATRANS mapping unless
  * `translate` is false.
  */
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static MemTxResult qmi_translate(RP2350XIPState *s, uint32_t xa,
                                  bool translate, int *cs, uint32_t *phys)
 {
@@ -416,7 +416,7 @@ static MemTxResult qmi_read_byte(RP2350XIPState *s, uint32_t xa,
  * A memory-mapped write as the QMI issues it: prefix, 24-bit address,
  * suffix, dummy and data phases from the window's WFMT and WCMD.
  */
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static void qmi_write_byte(RP2350XIPState *s, int cs, uint32_t phys,
                            uint8_t data)
 {
@@ -507,7 +507,7 @@ static bool cache_invalidate_addr(RP2350XIPState *s, uint32_t xa)
  * have state here, so cleans, which write back dirty lines, change
  * nothing.
  */
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static void cache_maintain(RP2350XIPState *s, uint32_t xa)
 {
     int line = (xa / CACHE_LINE) % RP2350_XIP_CACHE_LINES;
@@ -571,7 +571,7 @@ static bool window_denied(RP2350XIPState *s, unsigned win, bool secure)
     return false;
 }
 
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static MemTxResult rp2350_xip_space_read(void *opaque, hwaddr addr,
                                          uint64_t *data, unsigned size,
                                          MemTxAttrs attrs)
@@ -618,7 +618,7 @@ static MemTxResult rp2350_xip_space_read(void *opaque, hwaddr addr,
     return MEMTX_OK;
 }
 
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static MemTxResult rp2350_xip_space_write(void *opaque, hwaddr addr,
                                           uint64_t value, unsigned size,
                                           MemTxAttrs attrs)
@@ -803,7 +803,7 @@ static void set_view(MemoryRegion *mr, bool enabled, hwaddr addr,
  * Map the arrays and the pinned cache lines directly wherever every access
  * would see exactly what space_io gives it.
  */
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static void rp2350_xip_remap(RP2350XIPState *s)
 {
     PinRun runs[RP2350_XIP_PIN_VIEWS] = { };
@@ -889,7 +889,7 @@ static void rp2350_xip_stream_schedule(RP2350XIPState *s)
  * One streamed word: a linear read through the QMI at STREAM_ADDR, in the
  * background, each taking the serial time of its data phase.
  */
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static void rp2350_xip_stream_tick(void *opaque)
 {
     RP2350XIPState *s = opaque;
@@ -959,7 +959,7 @@ static uint32_t rp2350_xip_ctrl_peek(RP2350XIPState *s, hwaddr reg)
     }
 }
 
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static MemTxResult rp2350_xip_ctrl_read(void *opaque, hwaddr addr,
                                         uint64_t *data, unsigned size,
                                         MemTxAttrs attrs)
@@ -988,7 +988,7 @@ static MemTxResult rp2350_xip_ctrl_read(void *opaque, hwaddr addr,
     return MEMTX_OK;
 }
 
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static MemTxResult rp2350_xip_ctrl_write(void *opaque, hwaddr addr,
                                          uint64_t value, unsigned size,
                                          MemTxAttrs attrs)
@@ -1076,7 +1076,7 @@ static uint32_t *qmi_mreg(RP2350XIPState *s, hwaddr reg, uint32_t *mask)
     }
 }
 
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static uint64_t rp2350_xip_qmi_read(void *opaque, hwaddr addr, unsigned size)
 {
     RP2350XIPState *s = opaque;
@@ -1101,7 +1101,7 @@ static uint64_t rp2350_xip_qmi_read(void *opaque, hwaddr addr, unsigned size)
     }
 }
 
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static void rp2350_xip_qmi_write(void *opaque, hwaddr addr, uint64_t value,
                                  unsigned size)
 {
@@ -1154,7 +1154,7 @@ static const MemoryRegionOps rp2350_xip_qmi_ops = {
 
 /* XIP_AUX: the FIFOs on a fast AHB port for DMA, with no atomic aliases. */
 
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static uint64_t rp2350_xip_aux_read(void *opaque, hwaddr addr, unsigned size)
 {
     RP2350XIPState *s = opaque;
@@ -1414,7 +1414,7 @@ static const Property rp2350_xip_properties[] = {
     DEFINE_PROP_UINT32("sysclk-hz", RP2350XIPState, sysclk_hz, 0),
 };
 
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static void rp2350_xip_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);

@@ -246,7 +246,7 @@ static const char *rp2350_flash_part(uint32_t size)
  * windows hold no flash.
  */
 /* [spec:nuos:req:emu.flash] */
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static bool rp2350_soc_realize_xip(RP2350State *s, Error **errp)
 {
     SysBusDevice *sbd = SYS_BUS_DEVICE(&s->xip);

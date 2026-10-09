@@ -186,7 +186,7 @@ static uint8_t flash_status(QTestState *qts)
     return sr;
 }
 
-/* [spec:nuos:req:emu.xip/test] */
+/* [spec:nuos:req:emu.xip+1/test] */
 static void test_reset(void)
 {
     QTestState *qts = start("flash-size=4M");
@@ -231,7 +231,7 @@ static void test_reset(void)
     qtest_quit(qts);
 }
 
-/* [spec:nuos:req:emu.xip/test] */
+/* [spec:nuos:req:emu.xip+1/test] */
 static void test_atomic_and_counters(void)
 {
     QTestState *qts = start("flash-size=4M");
@@ -251,7 +251,7 @@ static void test_atomic_and_counters(void)
     qtest_quit(qts);
 }
 
-/* [spec:nuos:req:emu.xip/test] */
+/* [spec:nuos:req:emu.xip+1/test] */
 static void test_jedec_id(void)
 {
     static const struct {
@@ -286,7 +286,7 @@ static void test_jedec_id(void)
     }
 }
 
-/* [spec:nuos:req:emu.xip/test] */
+/* [spec:nuos:req:emu.xip+1/test] */
 static void test_direct_fifos(void)
 {
     QTestState *qts = start("flash-size=4M");
@@ -340,7 +340,7 @@ static void test_direct_fifos(void)
     qtest_quit(qts);
 }
 
-/* [spec:nuos:req:emu.xip/test] */
+/* [spec:nuos:req:emu.xip+1/test] */
 static void test_program_erase(void)
 {
     QTestState *qts = start("flash-size=4M");
@@ -398,7 +398,7 @@ static void test_program_erase(void)
     qtest_quit(qts);
 }
 
-/* [spec:nuos:req:emu.xip/test] */
+/* [spec:nuos:req:emu.xip+1/test] */
 static void test_atrans(void)
 {
     QTestState *qts = start("flash-size=4M");
@@ -425,7 +425,7 @@ static void test_atrans(void)
     qtest_quit(qts);
 }
 
-/* [spec:nuos:req:emu.xip/test] */
+/* [spec:nuos:req:emu.xip+1/test] */
 static void test_pinned_lines(void)
 {
     QTestState *qts = start("flash-size=4M");
@@ -491,7 +491,7 @@ static void test_pinned_lines(void)
     qtest_quit(qts);
 }
 
-/* [spec:nuos:req:emu.xip/test] */
+/* [spec:nuos:req:emu.xip+1/test] */
 static void test_stream(void)
 {
     QTestState *qts = start("flash-size=4M");
@@ -523,7 +523,7 @@ static void test_stream(void)
     qtest_quit(qts);
 }
 
-/* [spec:nuos:req:emu.xip/test] */
+/* [spec:nuos:req:emu.xip+1/test] */
 static void test_psram(void)
 {
     g_autofree char *err = NULL;

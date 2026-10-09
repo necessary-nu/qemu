@@ -157,7 +157,7 @@ static void rp2350_get_psram_size(Object *obj, Visitor *v, const char *name,
     visit_type_size(v, name, &s->psram_size, errp);
 }
 
-/* [spec:nuos:req:emu.xip] */
+/* [spec:nuos:req:emu.xip+1] */
 static void rp2350_set_psram_size(Object *obj, Visitor *v, const char *name,
                                   void *opaque, Error **errp)
 {
