@@ -149,6 +149,9 @@ config RP2350_ROSC
 config RP2350_TRNG
     bool
 
+config RP2350_PWM
+    bool
+
 config RP2350_CORESIGHT
     bool
 

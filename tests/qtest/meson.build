@@ -256,6 +256,7 @@ qtests_rp2350 = \
    'rp2350-busctrl-test',
    'rp2350-rosc-test',
    'rp2350-trng-test',
+   'rp2350-pwm-test',
    'rp2350-coresight-test']
 
 qtests_xtensa = \

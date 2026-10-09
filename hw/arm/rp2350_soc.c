@@ -531,6 +531,41 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->trng), 0,
                        qdev_get_gpio_in(dev_soc, RP2350_TRNG_IRQ));
 
+    /*
+     * PWM. Each slice's A and B drive their GPIO function signals, and B
+     * returns the OR of the pins selecting it. The DREQ_PWM_WRAP0-11
+     * outputs ("dreq-wrap") are for the DMA and stay unconnected until
+     * it is modelled; unconnected, they cost nothing.
+     */
+    /* [spec:nuos:req:emu.pwm] */
+    {
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->pwm);
+        DeviceState *dev = DEVICE(&s->pwm);
+        int n;
+
+        qdev_connect_clock_in(dev, "clk", s->sysclk);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        sysbus_mmio_map(sbd, 0, RP2350_PWM_BASE);
+        sysbus_connect_irq(sbd, 0,
+                           qdev_get_gpio_in(dev_soc, RP2350_PWM_IRQ_WRAP_0));
+        sysbus_connect_irq(sbd, 1,
+                           qdev_get_gpio_in(dev_soc, RP2350_PWM_IRQ_WRAP_1));
+        for (n = 0; n < RP2350_GPIO_PWM_SIGNALS; n++) {
+            qdev_connect_gpio_out_named(dev, RP2350_PWM_OUT, n,
+                rp2350_gpio_out_line(&s->gpio, RP2350_GPIO_PORT_PWM, n));
+            qdev_connect_gpio_out_named(dev, RP2350_PWM_OE, n,
+                rp2350_gpio_oe_line(&s->gpio, RP2350_GPIO_PORT_PWM, n));
+        }
+        for (n = 0; n < RP2350_PWM_SLICES; n++) {
+            rp2350_gpio_connect_in(&s->gpio, RP2350_GPIO_PORT_PWM,
+                                   RP2350_GPIO_PWM(n, 1),
+                                   qdev_get_gpio_in_named(dev, RP2350_PWM_B_IN,
+                                                          n));
+        }
+    }
+
     /* [spec:nuos:req:emu.uart] */
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         static const hwaddr base[] = { RP2350_UART0_BASE, RP2350_UART1_BASE };
@@ -625,6 +660,7 @@ static void rp2350_soc_init(Object *obj)
     object_initialize_child(obj, "dft", &s->dft, TYPE_RP2350_DFT);
     object_initialize_child(obj, "rosc", &s->rosc, TYPE_RP2350_ROSC);
     object_initialize_child(obj, "trng", &s->trng, TYPE_RP2350_TRNG);
+    object_initialize_child(obj, "pwm", &s->pwm, TYPE_RP2350_PWM);
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
         object_initialize_child(obj, "timer[*]", &s->timer[i],
                                 TYPE_RP2350_TIMER);
