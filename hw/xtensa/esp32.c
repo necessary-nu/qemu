@@ -29,6 +29,7 @@
 #include "system/address-spaces.h"
 #include "hw/misc/ssi_psram.h"
 #include "hw/sd/dwc_sdmmc.h"
+#include "hw/sd/sdhci.h"
 #include "core-esp32/core-isa.h"
 #include "qemu/datadir.h"
 #include "system/system.h"
@@ -208,6 +209,7 @@ static void esp32_soc_reset(DeviceState *dev)
         device_cold_reset(DEVICE(&s->rng));
         device_cold_reset(DEVICE(&s->sdmmc));
         device_cold_reset(DEVICE(&s->emac));
+        device_cold_reset(DEVICE(&s->sdio));
 
         device_cold_reset(DEVICE(&s->rgb));
     }
@@ -1181,6 +1183,34 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                        qdev_get_gpio_in(intmatrix_dev,
                                         ETS_ETH_MAC_INTR_SOURCE));
 
+    /*
+     * [spec:nuos:req:emu.esp32.sdio-slave]
+     * The SDIO slave's three register blocks, SLC, SLCHOST and HINF, are
+     * behind one clock bit, WIFI_CLK_EN.SDIOSLAVE, and one reset bit,
+     * CORE_RST_EN.SDIO. Its SLC0 and SLC1 interrupts go to the matrix.
+     */
+    object_property_set_link(OBJECT(&s->sdio), "dma-mr", OBJECT(sys_mem),
+                             &error_abort);
+    qdev_realize(DEVICE(&s->sdio), &s->periph_bus, &error_fatal);
+    {
+        Esp32PeriphGate *g = esp32_soc_add_gated_device(
+            s, &s->sdio, DR_REG_SLC_BASE, ESP32_GATE_WIFI,
+            R_DPORT_WIFI_CLK_EN_SDIO_SLAVE_MASK, R_DPORT_CORE_RST_EN_SDIO_MASK);
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->sdio);
+
+        g->apb_clk = s->sdio_apb_clk;
+        esp32_gate_map(g, sysbus_mmio_get_region(sbd, ESP32_SDIO_MMIO_SLCHOST),
+                       DR_REG_SLCHOST_BASE, true, 0);
+        esp32_gate_map(g, sysbus_mmio_get_region(sbd, ESP32_SDIO_MMIO_HINF),
+                       DR_REG_HINF_BASE, true, 0);
+        sysbus_connect_irq(sbd, ESP32_SDIO_IRQ_SLC0,
+                           qdev_get_gpio_in(intmatrix_dev,
+                                            ETS_SLC0_INTR_SOURCE));
+        sysbus_connect_irq(sbd, ESP32_SDIO_IRQ_SLC1,
+                           qdev_get_gpio_in(intmatrix_dev,
+                                            ETS_SLC1_INTR_SOURCE));
+    }
+
     /* Provide internal RAM MemoryRegion to the RGB display */
     s->rgb.intram = dram;
     qdev_realize(DEVICE(&s->rgb), &s->periph_bus, &error_abort);
@@ -1190,9 +1220,6 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.analog", DR_REG_ANA_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_RTCIO_BASE, 0x400);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_SENS_BASE, 0x400);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.hinf", DR_REG_HINF_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.slc", DR_REG_SLC_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.slchost", DR_REG_SLCHOST_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s0", DR_REG_I2S_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rmt", DR_REG_RMT_BASE, 0x1000);
@@ -1349,6 +1376,10 @@ static void esp32_soc_init(Object *obj)
     qdev_connect_clock_in(DEVICE(&s->emac), "apb", s->emac_apb_clk);
     object_initialize_child(obj, "phy", &s->phy, TYPE_IP101_PHY);
 
+    object_initialize_child(obj, "sdio", &s->sdio, TYPE_ESP32_SDIO_SLAVE);
+    s->sdio_apb_clk = clock_new(obj, "sdio-apb");
+    qdev_connect_clock_in(DEVICE(&s->sdio), "apb", s->sdio_apb_clk);
+
     object_initialize_child(obj, "rgb", &s->rgb, TYPE_ESP_RGB);
 
     qdev_init_gpio_in_named(DEVICE(s), esp32_dig_reset, ESP32_RTC_DIG_RESET_GPIO, 1);
@@ -1404,6 +1435,7 @@ struct Esp32MachineState {
 
     Esp32SocState esp32;
     DeviceState *flash_dev;
+    bool sdio_host;
 };
 #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
 
@@ -1479,6 +1511,29 @@ static void esp32_machine_init_sd(Esp32SocState *ss)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.sdio-slave]
+ * An SD host for the SDIO slave. Nothing in the ESP32 can be the slave's
+ * host (its SD/MMC host's second slot uses the same pads), so with
+ * sdio-host=on the machine adds a standard SD host controller (SDHCI)
+ * outside the ESP32's address map, standing for an external host wired
+ * to the slave's pins, and plugs the slave's card into it. The
+ * controller's interrupt is its sysbus IRQ 0, wired to nothing.
+ */
+#define ESP32_SDIO_TEST_HOST_BASE 0x22000000
+
+static void esp32_machine_init_sdio_host(Esp32MachineState *ms)
+{
+    Esp32SocState *ss = &ms->esp32;
+    DeviceState *host = qdev_new(TYPE_SYSBUS_SDHCI);
+
+    object_property_add_child(OBJECT(ms), "sdio-sdhci", OBJECT(host));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(host), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(host), 0, ESP32_SDIO_TEST_HOST_BASE);
+    esp32_sdio_slave_attach(&ss->sdio,
+                            SD_BUS(qdev_get_child_bus(host, "sd-bus")));
+}
+
 static void esp32_machine_init(MachineState *machine)
 {
     BlockBackend* blk = NULL;
@@ -1521,6 +1576,10 @@ static void esp32_machine_init(MachineState *machine)
     esp32_machine_init_i2c(ss);
 
     esp32_machine_init_sd(ss);
+
+    if (ms->sdio_host) {
+        esp32_machine_init_sdio_host(ms);
+    }
 
     /* Need MMU initialized prior to ELF loading,
      * so that ELF gets loaded into virtual addresses
@@ -1591,6 +1650,16 @@ static void esp32_machine_init(MachineState *machine)
     }
 }
 
+static bool esp32_machine_get_sdio_host(Object *obj, Error **errp)
+{
+    return ESP32_MACHINE(obj)->sdio_host;
+}
+
+static void esp32_machine_set_sdio_host(Object *obj, bool value, Error **errp)
+{
+    ESP32_MACHINE(obj)->sdio_host = value;
+}
+
 /* Initialize machine type */
 static void esp32_machine_class_init(ObjectClass *oc, const void *data)
 {
@@ -1600,6 +1669,12 @@ static void esp32_machine_class_init(ObjectClass *oc, const void *data)
     mc->max_cpus = 2;
     mc->default_cpus = 2;
     mc->default_ram_size = 0;
+
+    object_class_property_add_bool(oc, "sdio-host",
+                                   esp32_machine_get_sdio_host,
+                                   esp32_machine_set_sdio_host);
+    object_class_property_set_description(oc, "sdio-host",
+        "Add an SDHCI at 0x22000000 as the SDIO slave's host");
 }
 
 static const TypeInfo esp32_info = {

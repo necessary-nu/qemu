@@ -28,6 +28,7 @@
 #include "hw/misc/esp32_flash_enc.h"
 #include "hw/net/can/esp32_twai.h"
 #include "hw/sd/dwc_sdmmc.h"
+#include "hw/sd/esp32_sdio_slave.h"
 #include "hw/display/esp_rgb.h"
 #include "hw/net/esp32_emac.h"
 #include "hw/net/ip101_phy.h"
@@ -39,7 +40,7 @@ typedef enum Esp32GateRegs {
     ESP32_GATE_WIFI,    /* WIFI_CLK_EN / CORE_RST_EN */
 } Esp32GateRegs;
 
-#define ESP32_GATE_MAX_MR 2
+#define ESP32_GATE_MAX_MR 3
 #define ESP32_GATE_MAX 32
 
 #define ESP32_UHCI_COUNT 2
@@ -115,6 +116,7 @@ struct Esp32SocState {
     DWCSDMMCState sdmmc;
     Esp32EmacState emac;
     IP101PhyState phy;
+    Esp32SdioSlaveState sdio;
 
     BusState rtc_bus;
     BusState periph_bus;
@@ -136,6 +138,7 @@ struct Esp32SocState {
     Clock *rmt_apb_clk;
     Clock *rmt_ref_tick_clk;
     Clock *emac_apb_clk;
+    Clock *sdio_apb_clk;
     /* APB_CLK to the GPIO block's sigma-delta modulators, never gated */
     Clock *gpio_apb_clk;
     Clock *pcnt_apb_clk;
