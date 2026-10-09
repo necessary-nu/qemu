@@ -44,6 +44,12 @@
 #include <sys/prctl.h>
 #endif
 
+#if !defined(CONFIG_PPOLL) && defined(CONFIG_DARWIN)
+#include <poll.h>
+#include <sys/event.h>
+#include "qemu/notify.h"
+#endif
+
 /***********************************************************/
 /* timers */
 
@@ -321,6 +327,78 @@ int qemu_timeout_ns_to_ms(int64_t ns)
 }
 
 
+#if !defined(CONFIG_PPOLL) && defined(CONFIG_DARWIN)
+/*
+ * Darwin has no ppoll(), and poll() takes a timeout in whole milliseconds
+ * that the kernel may further defer to coalesce wake-ups. Rounding every
+ * timer deadline up to the next millisecond (and then some) makes
+ * QEMU_CLOCK_VIRTUAL timers fire one to two milliseconds late, which a
+ * guest timing a peripheral against its own counters can see.
+ *
+ * A per-thread kqueue carries a one-shot EVFILT_TIMER with a nanosecond
+ * timeout and no coalescing leeway; its descriptor is polled alongside
+ * the caller's, so the poll ends at the exact deadline while every other
+ * descriptor keeps poll()'s semantics.
+ */
+typedef struct DarwinPoll {
+    int kq;
+    struct pollfd *fds;
+    guint cap;
+    Notifier exit;
+} DarwinPoll;
+
+static __thread DarwinPoll darwin_poll = { .kq = -1 };
+
+#define DARWIN_POLL_TIMER_IDENT 1
+
+static void darwin_poll_thread_exit(Notifier *n, void *unused)
+{
+    close(darwin_poll.kq);
+    darwin_poll.kq = -1;
+    g_free(darwin_poll.fds);
+    darwin_poll.fds = NULL;
+    darwin_poll.cap = 0;
+}
+
+/* Arm the calling thread's deadline timer; false if it is unavailable. */
+static bool darwin_poll_arm(int64_t timeout)
+{
+    struct kevent ev;
+
+    if (darwin_poll.kq < 0) {
+        darwin_poll.kq = kqueue();
+        if (darwin_poll.kq < 0) {
+            return false;
+        }
+        darwin_poll.exit.notify = darwin_poll_thread_exit;
+        qemu_thread_atexit_add(&darwin_poll.exit);
+    }
+    EV_SET(&ev, DARWIN_POLL_TIMER_IDENT, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
+           NOTE_NSECONDS | NOTE_CRITICAL, timeout, NULL);
+    return kevent(darwin_poll.kq, &ev, 1, NULL, 0, NULL) == 0;
+}
+
+/*
+ * Retire the deadline timer after a poll: consume its event if it fired
+ * (which also removes the one-shot knote), or delete it if the poll ended
+ * first, so that a stale expiry cannot wake a later poll.
+ */
+static void darwin_poll_disarm(bool fired)
+{
+    struct kevent ev;
+
+    if (fired) {
+        static const struct timespec zero;
+
+        kevent(darwin_poll.kq, NULL, 0, &ev, 1, &zero);
+    } else {
+        EV_SET(&ev, DARWIN_POLL_TIMER_IDENT, EVFILT_TIMER, EV_DELETE, 0, 0,
+               NULL);
+        kevent(darwin_poll.kq, &ev, 1, NULL, 0, NULL);
+    }
+}
+#endif
+
 /* qemu implementation of g_poll which uses a nanosecond timeout but is
  * otherwise identical to g_poll
  */
@@ -342,6 +420,41 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
         ts.tv_nsec = timeout % 1000000000LL;
         return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
     }
+#elif defined(CONFIG_DARWIN)
+    struct pollfd *pfds;
+    int ret;
+    bool timer_fired;
+
+    if (timeout <= 0 || !darwin_poll_arm(timeout)) {
+        return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+    }
+
+    if (darwin_poll.cap < nfds + 1) {
+        darwin_poll.cap = nfds + 1;
+        darwin_poll.fds = g_renew(struct pollfd, darwin_poll.fds,
+                                  darwin_poll.cap);
+    }
+    pfds = darwin_poll.fds;
+    memcpy(pfds, fds, nfds * sizeof(*pfds));
+    pfds[nfds] = (struct pollfd) { .fd = darwin_poll.kq, .events = POLLIN };
+
+    /*
+     * The kqueue timer ends the wait at the deadline; the poll timeout is
+     * only a backstop, rounded up so that it never expires first.
+     */
+    ret = poll(pfds, nfds + 1,
+               MIN((int64_t)qemu_timeout_ns_to_ms(timeout) + 1, INT32_MAX));
+    if (ret < 0) {
+        int err = errno;
+
+        darwin_poll_disarm(false);
+        errno = err;
+        return ret;
+    }
+    timer_fired = pfds[nfds].revents != 0;
+    darwin_poll_disarm(timer_fired);
+    memcpy(fds, pfds, nfds * sizeof(*pfds));
+    return timer_fired ? ret - 1 : ret;
 #else
     return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
 #endif
