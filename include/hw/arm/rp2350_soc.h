@@ -13,6 +13,7 @@
 #include "hw/arm/armv7m.h"
 #include "hw/char/pl011.h"
 #include "hw/core/clock.h"
+#include "hw/dma/rp2350_dma.h"
 #include "hw/gpio/rp2350_gpio.h"
 #include "hw/misc/rp2350_accessctrl.h"
 #include "hw/misc/rp2350_bootram.h"
@@ -180,6 +181,7 @@ struct RP2350State {
     RP2350CoreSightState coresight;
     RP2350CoreSightTraceState coresight_trace;
     RP2350OTPState otp;
+    RP2350DMAState dma;
     /* The UARTs' register windows plus their atomic aliases. */
     MemoryRegion uart_alias[RP2350_NUM_UARTS];
     /* Core 0's SIO views as seen from system memory (debug, qtest). */

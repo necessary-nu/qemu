@@ -262,12 +262,12 @@ qtests_rp2350 = \
    'rp2350-xip-test',
    'rp2350-watchdog-test',
    'rp2350-pwm-test',
-   'rp2350-otp-test']
+   'rp2350-otp-test',
+   'rp2350-dma-test']
 
 qtests_xtensa = \
   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ?
-    ['esp32-clock-test', 'esp32-spi-dma-test', 'esp32-gpio-test'] : [])
-    ['esp32-clock-test',
+    ['esp32-clock-test', 'esp32-spi-dma-test', 'esp32-gpio-test',
      'esp32-uhci-test'] : [])
 
 qtests_stm32l4x5 = \

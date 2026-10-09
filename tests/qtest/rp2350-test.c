@@ -75,7 +75,6 @@ static void test_memory_map(void)
         uint64_t size;
     } unimplemented[] = {
         { "rp2350.spi0",       0x40080000, 0x8000 },
-        { "rp2350.dma",        0x50000000, 0x100000 },
         { "rp2350.usbctrl",    0x50100000, 0x100000 },
         { "rp2350.pio0",       0x50200000, 0x100000 },
     };
@@ -134,6 +133,10 @@ static void test_memory_map(void)
                           "(prio 0, i/o): rp2350-sio-nonsec");
     assert_mtree_has(qts, "00000000e0080000-00000000e0083fff "
                           "(prio 0, i/o): rp2350-eppb");
+    assert_mtree_has(qts, "0000000050000000-0000000050003fff "
+                          "(prio 0, i/o): rp2350-dma");
+    assert_mtree_has(qts, "0000000050004000-00000000500fffff "
+                          "(prio -1000, i/o): rp2350.dma @0000000000004000");
     for (i = 0; i < ARRAY_SIZE(unimplemented); i++) {
         g_autofree char *entry = g_strdup_printf(
             "%016" PRIx64 "-%016" PRIx64 " (prio -1000, i/o): %s",

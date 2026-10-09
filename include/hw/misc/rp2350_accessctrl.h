@@ -120,6 +120,13 @@ uint32_t rp2350_accessctrl_gpio_nsmask(RP2350AccessCtrlState *s, int bank);
  */
 bool rp2350_accessctrl_ns_accessible(RP2350AccessCtrlState *s, hwaddr addr);
 
+/*
+ * The lowest DMA channel security level (RP2350_DMA_SECLEVEL_*) that may
+ * observe the DREQs of the governed block at `addr`, or 4 if no channel
+ * may.
+ */
+unsigned rp2350_accessctrl_dreq_level(RP2350AccessCtrlState *s, hwaddr addr);
+
 /* Called after any ACCESSCTRL register changes value. */
 void rp2350_accessctrl_add_notifier(RP2350AccessCtrlState *s, Notifier *n);
 

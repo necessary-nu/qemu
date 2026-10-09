@@ -420,6 +420,7 @@ config RP2350_SOC
     select RP2350_PSM
     select RP2350_WATCHDOG
     select RP2350_OTP
+    select RP2350_DMA
     select PL011
 
 config STM32L4X5_SOC

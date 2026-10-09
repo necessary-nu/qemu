@@ -28,6 +28,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(PL011State, PL011)
 /* Depth of UART FIFO in bytes, when FIFO mode is enabled (else depth == 1) */
 #define PL011_FIFO_DEPTH 16
 
+/*
+ * Named GPIO output array: the single-transfer DMA requests, TX
+ * (UARTTXDMASREQ) and RX (UARTRXDMASREQ). The burst requests and the
+ * DMACLR handshake are not modelled.
+ */
+#define PL011_DMA_REQ "dma-req"
+#define PL011_DMA_TX 0
+#define PL011_DMA_RX 1
+
 struct PL011State {
     SysBusDevice parent_obj;
 
@@ -49,6 +58,7 @@ struct PL011State {
     int read_trigger;
     CharFrontend chr;
     qemu_irq irq[6];
+    qemu_irq dma_req[2];
     Clock *clk;
     bool migrate_clk;
     bool logged_disabled_uart;
