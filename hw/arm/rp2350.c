@@ -24,6 +24,13 @@
  * flash is a Winbond W25Q part of that size on QSPI chip select 0. Boards
  * with PSRAM on chip select 1 add psram-size=8M for an APS6404L.
  *
+ * The serial ports are host serial adapters on UART pins: -serial (the
+ * first) is wired to GPIO 0 (UART0 TX) and GPIO 1 (UART0 RX), as a Pico 2's
+ * debug probe is, and a second -serial to GPIO 4 (UART1 TX) and GPIO 5
+ * (UART1 RX). They run 8N1 at 115200 baud, pico-sdk's default; to use
+ * another rate, -global uart-line.baud=RATE. Software sees the console
+ * only once it selects the UART function on those pins.
+ *
  * OTP starts as a blank chip and lives in RAM. To keep programmed rows
  * across runs, back it with a 16 KiB raw image:
  *
@@ -38,12 +45,15 @@
 #include "hw/arm/boot.h"
 #include "hw/arm/rp2350_soc.h"
 #include "hw/block/aps6404l.h"
+#include "hw/char/uart-line.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "qapi/visitor.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
+#include "system/system.h"
 
 struct RP2350MachineState {
     MachineState parent;
@@ -62,6 +72,41 @@ static void rp2350_direct_reset(void *opaque)
     RP2350MachineState *s = opaque;
 
     rp2350_soc_boot_rom_handoff(&s->soc, 0);
+}
+
+/* The board's UART wiring: each serial port's adapter and its pins. */
+static const struct {
+    int tx_pin;
+    int rx_pin;
+} rp2350_serial_pins[] = {
+    { 0, 1 },
+    { 4, 5 },
+};
+
+/*
+ * Attach serial port i's character device to its UART pins through a
+ * host serial adapter: the adapter receives what the chip drives on the
+ * TX pin and drives the RX pin.
+ */
+/* [spec:nuos:req:emu.uart] */
+static void rp2350_attach_serial(RP2350MachineState *s, int i)
+{
+    Chardev *chr = serial_hd(i);
+    DeviceState *gpio = DEVICE(&s->soc.gpio);
+    DeviceState *line;
+
+    if (!chr) {
+        return;
+    }
+    line = qdev_new(TYPE_UART_LINE);
+    qdev_prop_set_chr(line, "chardev", chr);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(line), &error_fatal);
+    qdev_connect_gpio_out_named(gpio, RP2350_GPIO_PAD_OUT,
+                                rp2350_serial_pins[i].tx_pin,
+                                qdev_get_gpio_in_named(line, UART_LINE_RX, 0));
+    qdev_connect_gpio_out_named(line, UART_LINE_TX, 0,
+                                qdev_get_gpio_in_named(gpio, RP2350_GPIO_PAD_IN,
+                                    rp2350_serial_pins[i].rx_pin));
 }
 
 /* [spec:nuos:req:emu.direct-load] */
@@ -101,6 +146,9 @@ static void rp2350_init(MachineState *machine)
     qdev_prop_set_uint32(soc, "init-svtor",
                          direct ? RP2350_XIP_BASE : RP2350_ROM_BASE);
     sysbus_realize(SYS_BUS_DEVICE(soc), &error_fatal);
+    for (i = 0; i < ARRAY_SIZE(rp2350_serial_pins); i++) {
+        rp2350_attach_serial(s, i);
+    }
 
     /* [spec:nuos:req:emu.bootrom+2] */
     if (machine->firmware) {

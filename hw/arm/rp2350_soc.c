@@ -746,6 +746,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
     clock_set_hz(s->sysclk, RP2350_SYSCLK_HZ);
     clock_set_hz(s->refclk, RP2350_REFCLK_HZ);
+    clock_set_hz(s->periclk, RP2350_CLK_PERI_HZ);
     clock_set_hz(s->adcclk, RP2350_CLK_ADC_HZ);
 
     /*
@@ -954,24 +955,6 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             rp2350_gpio_connect_in(&s->gpio, RP2350_GPIO_PORT_SIO, n,
                 qdev_get_gpio_in_named(DEVICE(&s->sio), "gpio-in", n));
         }
-        /*
-         * QEMU's PL011 sends and receives through its chardev and has no
-         * line-level TX, RX or modem signals. Their pins show the idle
-         * state: TX driven high (mark) and RTS driven high (deasserted).
-         */
-        for (n = 0; n < RP2350_NUM_UARTS; n++) {
-            RP2350GPIOPort port = n ? RP2350_GPIO_PORT_UART1
-                                    : RP2350_GPIO_PORT_UART0;
-
-            qemu_set_irq(rp2350_gpio_out_line(&s->gpio, port,
-                                              RP2350_GPIO_UART_TX), 1);
-            qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port,
-                                             RP2350_GPIO_UART_TX), 1);
-            qemu_set_irq(rp2350_gpio_out_line(&s->gpio, port,
-                                              RP2350_GPIO_UART_RTS), 1);
-            qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port,
-                                             RP2350_GPIO_UART_RTS), 1);
-        }
     }
 
     {
@@ -1135,17 +1118,40 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         }
     }
 
+    /*
+     * The UARTs are r1p5 PL011s with 32-entry FIFOs, clocked by clk_peri.
+     * They have no character device: their TX, RX, CTS and RTS signals go
+     * through the GPIO muxing like any other function's, and the board
+     * attaches the console to pins. TX and RTS are always outputs.
+     */
     /* [spec:nuos:req:emu.uart] */
+    /* [spec:nuos:req:emu.gpio] */
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         static const hwaddr base[] = { RP2350_UART0_BASE, RP2350_UART1_BASE };
         static const int irq[] = { RP2350_UART0_IRQ, RP2350_UART1_IRQ };
         SysBusDevice *sbd = SYS_BUS_DEVICE(&s->uart[i]);
+        DeviceState *uart = DEVICE(sbd);
+        RP2350GPIOPort port = i ? RP2350_GPIO_PORT_UART1
+                                : RP2350_GPIO_PORT_UART0;
 
-        qdev_prop_set_chr(DEVICE(sbd), "chardev", serial_hd(i));
-        qdev_connect_clock_in(DEVICE(sbd), "clk", s->sysclk);
+        qdev_prop_set_bit(uart, "line-level", true);
+        qdev_prop_set_uint32(uart, "fifo-depth", PL011_FIFO_MAX);
+        qdev_connect_clock_in(uart, "clk", s->periclk);
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
+        qdev_connect_gpio_out_named(uart, PL011_TXD, 0,
+            rp2350_gpio_out_line(&s->gpio, port, RP2350_GPIO_UART_TX));
+        qdev_connect_gpio_out_named(uart, PL011_NRTS, 0,
+            rp2350_gpio_out_line(&s->gpio, port, RP2350_GPIO_UART_RTS));
+        qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port, RP2350_GPIO_UART_TX),
+                     1);
+        qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port,
+                                         RP2350_GPIO_UART_RTS), 1);
+        rp2350_gpio_connect_in(&s->gpio, port, RP2350_GPIO_UART_RX,
+                               qdev_get_gpio_in_named(uart, PL011_RXD, 0));
+        rp2350_gpio_connect_in(&s->gpio, port, RP2350_GPIO_UART_CTS,
+                               qdev_get_gpio_in_named(uart, PL011_NCTS, 0));
         memory_region_init_io(&s->uart_alias[i], obj, &rp2350_alias_ops,
                               sysbus_mmio_get_region(sbd, 0),
                               i ? "rp2350-uart1" : "rp2350-uart0",
@@ -1451,6 +1457,7 @@ static void rp2350_soc_init(Object *obj)
 
     s->sysclk = qdev_init_clock_out(DEVICE(s), "sysclk");
     s->refclk = qdev_init_clock_out(DEVICE(s), "refclk");
+    s->periclk = qdev_init_clock_out(DEVICE(s), "periclk");
     s->adcclk = clock_new(obj, "adcclk");
 }
 

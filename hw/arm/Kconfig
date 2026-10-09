@@ -394,6 +394,7 @@ config RP2350
     default y
     depends on TCG && ARM
     select RP2350_SOC
+    select UART_LINE
 
 config RP2350_SOC
     bool
