@@ -283,6 +283,32 @@ static void test_gpio_nsmask(void)
     qtest_quit(qts);
 }
 
+/*
+ * Narrow reads return their byte lanes of the register. Narrow writes are
+ * replicated across the bus: a byte cannot carry the password, and a
+ * halfword carries it only by being 0xacce, which then also lands in the
+ * permission bits.
+ */
+/* [spec:nuos:req:emu.accessctrl/test] */
+static void test_narrow(void)
+{
+    QTestState *qts = start();
+
+    qtest_writel(qts, REG_UART0, PASSWORD | 0xa5);
+    g_assert_cmphex(qtest_readb(qts, REG_UART0), ==, 0xa5);
+    g_assert_cmphex(qtest_readb(qts, REG_UART0 + 1), ==, 0x00);
+    g_assert_cmphex(qtest_readw(qts, REG_UART0), ==, 0x00a5);
+    g_assert_cmphex(qtest_readw(qts, REG_UART0 + 2), ==, 0x0000);
+    g_assert_cmphex(qtest_readb(qts, REG_SHA256), ==, 0xf8);
+
+    qtest_writeb(qts, REG_UART0, 0xfc);
+    g_assert_cmphex(qtest_readl(qts, REG_UART0), ==, 0xa5);
+    qtest_writew(qts, REG_UART0 + 2, 0xacce);
+    g_assert_cmphex(qtest_readl(qts, REG_UART0), ==, 0xce);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     static const uint32_t blank[2];
@@ -303,6 +329,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/accessctrl/cfgreset", test_cfgreset);
     qtest_add_func("/rp2350/accessctrl/debugger", test_debugger);
     qtest_add_func("/rp2350/accessctrl/gpio-nsmask", test_gpio_nsmask);
+    qtest_add_func("/rp2350/accessctrl/narrow", test_narrow);
 
     ret = g_test_run();
     unlink(rom_path);

@@ -86,6 +86,13 @@ static const struct MemmapEntry {
 #define ESP32_SOC_RESET_DIG       (ESP32_SOC_RESET_PROCPU | ESP32_SOC_RESET_APPCPU | ESP32_SOC_RESET_PERIPH)
 #define ESP32_SOC_RESET_RTC       0x8
 #define ESP32_SOC_RESET_ALL       (ESP32_SOC_RESET_RTC | ESP32_SOC_RESET_DIG)
+/* The digital domain's reset is its power-down for deep sleep */
+#define ESP32_SOC_RESET_SLEEP     0x10
+
+/* What powered-down internal SRAM holds when it comes back */
+#define ESP32_LOST_SRAM_PATTERN   0xa5
+
+#define ESP32_DPORT_APPCPU_RESET_IN "dport-appcpu-reset"
 
 
 
@@ -113,6 +120,7 @@ static void esp32_dig_reset(void *opaque, int n, int level)
     }
 }
 
+/* RTC_CNTL resets a CPU, having recorded the reset's cause. */
 static void esp32_cpu_reset(void* opaque, int n, int level)
 {
     Esp32SocState *s = ESP32_SOC(opaque);
@@ -122,8 +130,72 @@ static void esp32_cpu_reset(void* opaque, int n, int level)
          * when -no-reboot option is given.
          */
         ShutdownCause cause = (n == 0) ? SHUTDOWN_CAUSE_GUEST_RESET : SHUTDOWN_CAUSE_SUBSYSTEM_RESET;
-        s->rtc_cntl.reset_cause[n] = ESP32_SW_CPU_RESET;
         qemu_system_reset_request(cause);
+    }
+}
+
+/* DPORT_APPCPU_RESETTING resets the APP CPU, a software CPU reset. */
+static void esp32_dport_appcpu_reset(void *opaque, int n, int level)
+{
+    Esp32SocState *s = ESP32_SOC(opaque);
+
+    if (level) {
+        s->rtc_cntl.reset_cause[1] = ESP32_SW_CPU_RESET;
+        esp32_cpu_reset(opaque, 1, level);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rtc]
+ * The RTC watchdog's RTC reset and the brownout reset: the digital domain
+ * and the RTC domain reset together.
+ */
+static void esp32_rtc_reset(void *opaque, int n, int level)
+{
+    Esp32SocState *s = ESP32_SOC(opaque);
+
+    if (level) {
+        esp32_dport_clear_ill_trap_state(&s->dport);
+        s->requested_reset = ESP32_SOC_RESET_ALL;
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rtc]
+ * Deep sleep powers the digital domain down. It is reset as it goes down,
+ * so that nothing in it runs during the sleep, and it comes back in that
+ * state when RTC_CNTL lets the CPUs go. The guest has not asked to stop
+ * the machine, so -no-reboot does not apply.
+ */
+static void esp32_sleep_reset(void *opaque, int n, int level)
+{
+    Esp32SocState *s = ESP32_SOC(opaque);
+
+    if (level) {
+        esp32_dport_clear_ill_trap_state(&s->dport);
+        s->requested_reset = ESP32_SOC_RESET_DIG | ESP32_SOC_RESET_SLEEP;
+        qemu_system_reset_request(SHUTDOWN_CAUSE_SUBSYSTEM_RESET);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rtc]
+ * Internal SRAM loses its contents while the digital domain is powered
+ * down. Writing through the address space drops any code translated from
+ * it.
+ */
+static void esp32_soc_lose_sram(Esp32SocState *s)
+{
+    MemoryRegion *mrs[] = { s->dram, s->iram };
+
+    for (int i = 0; i < ARRAY_SIZE(mrs); i++) {
+        uint64_t size = memory_region_size(mrs[i]);
+        g_autofree uint8_t *buf = g_malloc(size);
+
+        memset(buf, ESP32_LOST_SRAM_PATTERN, size);
+        address_space_write(&address_space_memory, mrs[i]->addr,
+                            MEMTXATTRS_UNSPECIFIED, buf, size);
     }
 }
 
@@ -161,15 +233,20 @@ static void esp32_soc_reset(DeviceState *dev)
     uint32_t strap_mode = s->gpio.strap_mode;
 
     bool flash_boot_mode = ((strap_mode & 0x10) || (strap_mode & 0x1f) == 0x0c);
+    uint32_t requested;
+
     qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->flash_enc), ESP32_FLASH_ENCRYPTION_DL_MODE_GPIO, 0), !flash_boot_mode);
 
     if (s->requested_reset == 0) {
         s->requested_reset = ESP32_SOC_RESET_ALL;
     }
+    requested = s->requested_reset;
     if (s->requested_reset & ESP32_SOC_RESET_RTC) {
+        s->rtc_cntl.flash_boot_mode = flash_boot_mode;
         device_cold_reset(DEVICE(&s->rtc_cntl));
         /* The board's PHY shares the chip's power-on and EN resets. */
         device_cold_reset(DEVICE(&s->phy));
+        device_cold_reset(DEVICE(&s->rtcio));
     }
     if (s->requested_reset & ESP32_SOC_RESET_PERIPH) {
         device_cold_reset(DEVICE(&s->dport));
@@ -183,6 +260,9 @@ static void esp32_soc_reset(DeviceState *dev)
         }
         for (int i = 0; i < ESP32_UHCI_COUNT; ++i) {
             device_cold_reset(DEVICE(&s->uhci[i]));
+        }
+        for (int i = 0; i < ESP32_I2S_COUNT; ++i) {
+            device_cold_reset(DEVICE(&s->i2s[i]));
         }
         for (int i = 0; i < ESP32_FRC_COUNT; ++i) {
             device_cold_reset(DEVICE(&s->frc_timer[i]));
@@ -231,6 +311,13 @@ static void esp32_soc_reset(DeviceState *dev)
     s->requested_reset = 0;
     esp32_soc_update_gates(s, true);
     esp32_soc_update_clocks(s);
+    if (requested & ESP32_SOC_RESET_SLEEP) {
+        if (s->rtc_cntl.dig_powered_down) {
+            esp32_soc_lose_sram(s);
+            s->rtc_cntl.dig_powered_down = false;
+        }
+        esp32_rtc_cntl_sleep_reset_done(&s->rtc_cntl);
+    }
 }
 
 /*
@@ -340,9 +427,14 @@ static bool esp32_gate_running(Esp32PeriphGate *g)
     return g->clk_on && !g->held;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.rtc]
+ * In light and deep sleep RTC_CNTL stops the digital domain's clocks: the
+ * APB peripherals' clocks stop as if gated.
+ */
 static void esp32_gate_update_clocks(Esp32SocState *s, Esp32PeriphGate *g)
 {
-    bool running = esp32_gate_running(g);
+    bool running = esp32_gate_running(g) && !s->rtc_cntl.dig_clk_gated;
 
     if (g->apb_clk) {
         clock_update_hz(g->apb_clk, running ? s->apb_hz : 0);
@@ -406,7 +498,7 @@ static void esp32_soc_update_clocks(Esp32SocState *s)
     s->ref_tick_hz = apb_hz / esp32_apb_ctrl_tick_div(&s->apb_ctrl,
                                                       s->rtc_cntl.soc_clk);
     clock_update_hz(s->cpu_clk, cpu_hz);
-    clock_update_hz(s->gpio_apb_clk, apb_hz);
+    clock_update_hz(s->gpio_apb_clk, s->rtc_cntl.dig_clk_gated ? 0 : apb_hz);
     for (unsigned i = 0; i < s->n_gates; i++) {
         esp32_gate_update_clocks(s, &s->gate[i]);
     }
@@ -640,9 +732,32 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     MemoryRegion *iram = g_new(MemoryRegion, 1);
     MemoryRegion *icache0 = g_new(MemoryRegion, 1);
     MemoryRegion *icache1 = g_new(MemoryRegion, 1);
-    MemoryRegion *rtcslow = g_new(MemoryRegion, 1);
-    MemoryRegion *rtcfast_i = g_new(MemoryRegion, 1);
     MemoryRegion *rtcfast_d = g_new(MemoryRegion, 1);
+
+    /*
+     * Each CPU sees the system memory map with its own private regions
+     * (ROM, RTC FAST memory, PID-gated views) layered over it. The view
+     * is built here rather than in instance_init so that an SoC object
+     * that is only introspected, never realized, owns no memory regions
+     * and finalizes cleanly. The SoC owns each view; the CPU's "memory"
+     * link holds its own reference, and qemu_init_vcpu builds the CPU's
+     * address space from it when the CPU is realized.
+     */
+    for (int i = 0; i < ms->smp.cpus; ++i) {
+        char name[16];
+
+        snprintf(name, sizeof(name), "cpu%d-mem", i);
+        memory_region_init(&s->cpu_specific_mem[i], OBJECT(dev), name,
+                           UINT32_MAX);
+        snprintf(name, sizeof(name), "cpu%d-sysmem", i);
+        memory_region_init_alias(&s->cpu_sysmem_view[i], OBJECT(dev), name,
+                                 sys_mem, 0, UINT32_MAX);
+        memory_region_add_subregion_overlap(&s->cpu_specific_mem[i], 0,
+                                            &s->cpu_sysmem_view[i], 0);
+        object_property_set_link(OBJECT(&s->cpu[i]), "memory",
+                                 OBJECT(&s->cpu_specific_mem[i]),
+                                 &error_abort);
+    }
 
     for (int i = 0; i < ms->smp.cpus; ++i) {
         assert(i >= 0 && i <= 9);
@@ -677,18 +792,33 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                            memmap[ESP32_MEMREGION_ICACHE1].size, &error_fatal);
     memory_region_add_subregion(sys_mem, memmap[ESP32_MEMREGION_ICACHE1].base, icache1);
 
-    memory_region_init_ram(rtcslow, NULL, "esp32.rtcslow",
-                           memmap[ESP32_MEMREGION_RTCSLOW].size, &error_fatal);
-    memory_region_add_subregion(sys_mem, memmap[ESP32_MEMREGION_RTCSLOW].base, rtcslow);
+    s->dram = dram;
+    s->iram = iram;
 
-    /* RTC Fast memory is only accessible by the PRO CPU */
+    /*
+     * [spec:nuos:req:emu.esp32.rtc]
+     * RTC_CNTL and RTCIO, in the RTC domain, and the RTC memories, which
+     * RTC_CNTL owns: the slow memory on the APB, the fast memory on the PRO
+     * CPU's instruction and data buses only.
+     */
+    object_property_set_link(OBJECT(&s->rtc_cntl), "rtcio", OBJECT(&s->rtcio),
+                             &error_abort);
+    object_property_set_link(OBJECT(&s->rtcio), "rtc-cntl",
+                             OBJECT(&s->rtc_cntl), &error_abort);
+    qdev_realize(DEVICE(&s->rtc_cntl), &s->rtc_bus, &error_fatal);
+    qdev_realize(DEVICE(&s->rtcio), &s->rtc_bus, &error_fatal);
 
-    memory_region_init_ram(rtcfast_i, NULL, "esp32.rtcfast_i",
-                           memmap[ESP32_MEMREGION_RTCSLOW].size, &error_fatal);
-    memory_region_add_subregion(&s->cpu_specific_mem[0], memmap[ESP32_MEMREGION_RTCFAST_I].base, rtcfast_i);
-
-    memory_region_init_alias(rtcfast_d, NULL, "esp32.rtcfast_d", rtcfast_i, 0, memmap[ESP32_MEMREGION_RTCFAST_D].size);
-    memory_region_add_subregion(&s->cpu_specific_mem[0], memmap[ESP32_MEMREGION_RTCFAST_D].base, rtcfast_d);
+    memory_region_add_subregion(sys_mem, memmap[ESP32_MEMREGION_RTCSLOW].base,
+                                &s->rtc_cntl.slow_mem);
+    memory_region_add_subregion(&s->cpu_specific_mem[0],
+                                memmap[ESP32_MEMREGION_RTCFAST_I].base,
+                                &s->rtc_cntl.fast_mem);
+    memory_region_init_alias(rtcfast_d, NULL, "esp32.rtcfast_d",
+                             &s->rtc_cntl.fast_mem, 0,
+                             memmap[ESP32_MEMREGION_RTCFAST_D].size);
+    memory_region_add_subregion(&s->cpu_specific_mem[0],
+                                memmap[ESP32_MEMREGION_RTCFAST_D].base,
+                                rtcfast_d);
 
     for (int i = 0; i < ms->smp.cpus; ++i) {
         qdev_realize(DEVICE(&s->cpu[i]), NULL, &error_fatal);
@@ -740,7 +870,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     memory_region_add_subregion(sys_mem, DR_REG_DPORT_BASE, dport_mem);
     qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_APPCPU_RESET_GPIO, 0,
-                                qdev_get_gpio_in_named(dev, ESP32_RTC_CPU_RESET_GPIO, 1));
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32_DPORT_APPCPU_RESET_IN, 0));
     qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_APPCPU_STALL_GPIO, 0,
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_CPU_STALL_GPIO, 1));
     qdev_connect_gpio_out_named(DEVICE(&s->dport),
@@ -918,11 +1049,22 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                 qdev_get_gpio_in_named(dev,
                                     ESP32_RTC_CLK_UPDATE_GPIO, 0));
 
-    qdev_realize(DEVICE(&s->rtc_cntl), &s->rtc_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->rtc_cntl, DR_REG_RTCCNTL_BASE);
+    esp32_soc_add_periph_device(sys_mem, &s->rtcio, DR_REG_RTCIO_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->rtc_cntl), 0,
+                       qdev_get_gpio_in(intmatrix_dev,
+                                        ETS_RTC_CORE_INTR_SOURCE));
 
     qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32_RTC_DIG_RESET_GPIO, 0,
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_DIG_RESET_GPIO, 0));
+    qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl),
+                                ESP32_RTC_RTC_RESET_GPIO, 0,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32_RTC_RTC_RESET_GPIO, 0));
+    qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl),
+                                ESP32_RTC_SLEEP_RESET_GPIO, 0,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32_RTC_SLEEP_RESET_GPIO, 0));
     qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32_RTC_CLK_UPDATE_GPIO, 0,
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_CLK_UPDATE_GPIO, 0));
     for (int i = 0; i < ms->smp.cpus; ++i) {
@@ -941,6 +1083,39 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     qdev_realize(DEVICE(&s->gpio), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->gpio, DR_REG_GPIO_BASE);
     esp32_soc_add_periph_region(sys_mem, &s->gpio, 1, DR_REG_IO_MUX_BASE);
+
+    /*
+     * [spec:nuos:req:emu.esp32.rtc]
+     * RTCIO takes the RTC pads over from the IO_MUX through MUX_SEL and
+     * reads them through their input buffers; the GPIO matrix's wakeup
+     * reaches RTC_CNTL.
+     */
+    for (int i = 0; i < ESP32_RTCIO_PAD_COUNT; i++) {
+        static const char *const ctl[][2] = {
+            { ESP32_RTCIO_PAD_MUX, ESP32_GPIO_RTC_MUX },
+            { ESP32_RTCIO_PAD_OUT, ESP32_GPIO_RTC_OUT },
+            { ESP32_RTCIO_PAD_OE, ESP32_GPIO_RTC_OE },
+            { ESP32_RTCIO_PAD_PU, ESP32_GPIO_RTC_PU },
+            { ESP32_RTCIO_PAD_PD, ESP32_GPIO_RTC_PD },
+            { ESP32_RTCIO_PAD_IE, ESP32_GPIO_RTC_IE },
+        };
+        int pad = esp32_rtcio_gpio[i];
+
+        for (int j = 0; j < ARRAY_SIZE(ctl); j++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->rtcio), ctl[j][0], i,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->gpio), ctl[j][1],
+                                            pad));
+        }
+        qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_RTC_IN, pad,
+                                    qdev_get_gpio_in_named(
+                                        DEVICE(&s->rtcio),
+                                        ESP32_RTCIO_PAD_IN, i));
+    }
+    qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_WAKEUP, 0,
+                                qdev_get_gpio_in_named(
+                                    DEVICE(&s->rtc_cntl),
+                                    ESP32_RTC_GPIO_WAKEUP_IN, 0));
     {
         static const struct {
             int cpu;
@@ -1291,12 +1466,56 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_periph_device(sys_mem, &s->rgb, DR_REG_FRAMEBUF_BASE);
     memory_region_add_subregion_overlap(sys_mem, esp32_memmap[ESP32_MEMREGION_FRAMEBUF].base, &s->rgb.vram, 0);
 
+    /*
+     * [spec:nuos:req:emu.esp32.i2s]
+     * I2S0 and I2S1, behind their DPORT clock and reset bits, with their
+     * DMA engines reaching SRAM and their signals on the GPIO matrix.
+     */
+    for (int i = 0; i < ESP32_I2S_COUNT; ++i) {
+        const hwaddr i2s_base[] = { DR_REG_I2S_BASE, DR_REG_I2S1_BASE };
+        const uint32_t i2s_bit[] = {
+            R_DPORT_PERIP_I2S0_MASK, R_DPORT_PERIP_I2S1_MASK
+        };
+        const int i2s_intr[] = {
+            ETS_I2S0_INTR_SOURCE, ETS_I2S1_INTR_SOURCE
+        };
+        DeviceState *i2s = DEVICE(&s->i2s[i]);
+        Esp32PeriphGate *g;
+
+        qdev_prop_set_uint8(i2s, "id", i);
+        object_property_set_link(OBJECT(i2s), "dma-mr", OBJECT(sys_mem),
+                                 &error_abort);
+        object_property_set_link(OBJECT(i2s), "gpio", OBJECT(&s->gpio),
+                                 &error_abort);
+        object_property_set_link(OBJECT(i2s), "apb-ctrl",
+                                 OBJECT(&s->apb_ctrl), &error_abort);
+        object_property_set_link(OBJECT(i2s), "peer",
+                                 OBJECT(&s->i2s[1 - i]), &error_abort);
+        qdev_realize(i2s, &s->periph_bus, &error_fatal);
+        g = esp32_soc_add_gated_device(s, &s->i2s[i], i2s_base[i],
+                                       ESP32_GATE_PERIP, i2s_bit[i],
+                                       i2s_bit[i]);
+        g->apb_clk = s->i2s_apb_clk[i];
+        g->f160m_clk = s->i2s_f160m_clk[i];
+        g->volatile_reg = ESP32_I2S_FIFO_RD_OFFSET;
+        g->has_volatile_reg = true;
+        sysbus_connect_irq(SYS_BUS_DEVICE(i2s), 0,
+                           qdev_get_gpio_in(intmatrix_dev, i2s_intr[i]));
+        for (int line = 0; line < ESP32_I2S_OUT_COUNT; line++) {
+            qdev_connect_gpio_out_named(i2s, ESP32_I2S_SIG_OUT, line,
+                qdev_get_gpio_in_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_OUT,
+                                       esp32_i2s_out_signal(i, line)));
+        }
+        for (int line = 0; line < ESP32_I2S_IN_COUNT; line++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_IN,
+                                        esp32_i2s_in_signal(i, line),
+                                        qdev_get_gpio_in_named(i2s,
+                                            ESP32_I2S_SIG_IN, line));
+        }
+    }
+
     esp32_soc_add_unimp_device(sys_mem, "esp32.analog", DR_REG_ANA_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_RTCIO_BASE, 0x400);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_SENS_BASE, 0x400);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.i2s0", DR_REG_I2S_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.rmt", DR_REG_RMT_BASE, 0x1000);
+    esp32_soc_add_unimp_device(sys_mem, "esp32.sens", DR_REG_SENS_BASE, 0x400);
 
     qemu_register_reset((QEMUResetHandler*) esp32_soc_reset, dev);
 }
@@ -1306,8 +1525,6 @@ static void esp32_soc_init(Object *obj)
     Esp32SocState *s = ESP32_SOC(obj);
     MachineState *ms = MACHINE(qdev_get_machine());
     char name[16];
-
-    MemoryRegion *system_memory = get_system_memory();
 
     qbus_init(&s->periph_bus, sizeof(s->periph_bus),
                         TYPE_SYSTEM_BUS, DEVICE(s), "esp32-periph-bus");
@@ -1325,18 +1542,6 @@ static void esp32_soc_init(Object *obj)
 
         const uint32_t cpuid[ESP32_CPU_COUNT] = { 0xcdcd, 0xabab };
         s->cpu[i].env.sregs[PRID] = cpuid[i];
-
-        snprintf(name, sizeof(name), "cpu%d-mem", i);
-        memory_region_init(&s->cpu_specific_mem[i], NULL, name, UINT32_MAX);
-
-        CPUState* cs = CPU(&s->cpu[i]);
-        cpu_address_space_init(cs, 0, "cpu-memory", &s->cpu_specific_mem[i]);
-
-        MemoryRegion *cpu_view_sysmem = g_new(MemoryRegion, 1);
-        snprintf(name, sizeof(name), "cpu%d-sysmem", i);
-        memory_region_init_alias(cpu_view_sysmem, NULL, name, system_memory, 0, UINT32_MAX);
-        memory_region_add_subregion_overlap(&s->cpu_specific_mem[i], 0, cpu_view_sysmem, 0);
-        cs->memory = &s->cpu_specific_mem[i];
     }
 
     for (int i = 0; i < ESP32_UART_COUNT; ++i) {
@@ -1357,6 +1562,23 @@ static void esp32_soc_init(Object *obj)
         snprintf(name, sizeof(name), "uhci%d-apb", i);
         s->uhci_apb_clk[i] = clock_new(obj, name);
         qdev_connect_clock_in(DEVICE(&s->uhci[i]), "apb", s->uhci_apb_clk[i]);
+    }
+
+    s->apll_clk = clock_new(obj, "apll");
+    clock_set_hz(s->apll_clk, ESP32_APLL_UNMODELLED_HZ);
+    for (int i = 0; i < ESP32_I2S_COUNT; ++i) {
+        DeviceState *i2s;
+
+        snprintf(name, sizeof(name), "i2s%d", i);
+        object_initialize_child(obj, name, &s->i2s[i], TYPE_ESP32_I2S);
+        i2s = DEVICE(&s->i2s[i]);
+        snprintf(name, sizeof(name), "i2s%d-apb", i);
+        s->i2s_apb_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(i2s, "apb", s->i2s_apb_clk[i]);
+        snprintf(name, sizeof(name), "i2s%d-f160m", i);
+        s->i2s_f160m_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(i2s, "pll-f160m", s->i2s_f160m_clk[i]);
+        qdev_connect_clock_in(i2s, "apll", s->apll_clk);
     }
 
     object_property_add_alias(obj, "serial0", OBJECT(&s->uart[0]), "chardev");
@@ -1381,6 +1603,7 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "crosscore_int", &s->crosscore_int, TYPE_ESP32_CROSSCORE_INT);
 
     object_initialize_child(obj, "rtc_cntl", &s->rtc_cntl, TYPE_ESP32_RTC_CNTL);
+    object_initialize_child(obj, "rtcio", &s->rtcio, TYPE_ESP32_RTCIO);
 
     for (int i = 0; i < ESP32_FRC_COUNT; ++i) {
         snprintf(name, sizeof(name), "frc%d", i);
@@ -1471,6 +1694,12 @@ static void esp32_soc_init(Object *obj)
 
     qdev_init_gpio_in_named(DEVICE(s), esp32_dig_reset, ESP32_RTC_DIG_RESET_GPIO, 1);
     qdev_init_gpio_in_named(DEVICE(s), esp32_cpu_reset, ESP32_RTC_CPU_RESET_GPIO, ESP32_CPU_COUNT);
+    qdev_init_gpio_in_named(DEVICE(s), esp32_dport_appcpu_reset,
+                            ESP32_DPORT_APPCPU_RESET_IN, 1);
+    qdev_init_gpio_in_named(DEVICE(s), esp32_rtc_reset,
+                            ESP32_RTC_RTC_RESET_GPIO, 1);
+    qdev_init_gpio_in_named(DEVICE(s), esp32_sleep_reset,
+                            ESP32_RTC_SLEEP_RESET_GPIO, 1);
     qdev_init_gpio_in_named(DEVICE(s), esp32_cpu_stall, ESP32_RTC_CPU_STALL_GPIO, ESP32_CPU_COUNT);
     qdev_init_gpio_in_named(DEVICE(s), esp32_clk_update, ESP32_RTC_CLK_UPDATE_GPIO, 1);
     qdev_init_gpio_in_named(DEVICE(s), esp32_periph_clk_update,
@@ -1639,6 +1868,12 @@ static void esp32_machine_init(MachineState *machine)
     if (blk) {
         ss->dport.flash_blk = blk;
     }
+    if (machine->audiodev) {
+        for (int i = 0; i < ESP32_I2S_COUNT; ++i) {
+            qdev_prop_set_string(DEVICE(&ss->i2s[i]), "audiodev",
+                                 machine->audiodev);
+        }
+    }
     qdev_prop_set_chr(DEVICE(ss), "serial0", serial_hd(0));
     qdev_prop_set_chr(DEVICE(ss), "serial1", serial_hd(1));
     qdev_prop_set_chr(DEVICE(ss), "serial2", serial_hd(2));
@@ -1762,6 +1997,7 @@ static void esp32_machine_class_init(ObjectClass *oc, const void *data)
                                    esp32_machine_set_sdio_host);
     object_class_property_set_description(oc, "sdio-host",
         "Add an SDHCI at 0x22000000 as the SDIO slave's host");
+    machine_add_audiodev_property(mc);
 }
 
 static const TypeInfo esp32_info = {

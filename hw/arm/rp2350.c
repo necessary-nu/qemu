@@ -8,7 +8,9 @@
  * Two boot paths:
  *
  *   -bios FILE    loads a raw boot ROM image at 0x00000000 and resets
- *                 core 0 through the ROM's vector table, as hardware does.
+ *                 both cores through the ROM's vector table, as hardware
+ *                 does: the ROM boots from flash, or with no bootable
+ *                 image enters BOOTSEL, and holds core 1 until launched.
  *   -kernel FILE  loads an ELF (or raw image into flash) directly and
  *                 resets core 0 through a vector table at the start of the
  *                 XIP flash window, skipping the boot ROM. This is a
@@ -19,10 +21,18 @@
  *                 processors restart them the same way, with the machine
  *                 honouring the boot ROM's watchdog boot vector.
  *
+ * With neither, the boot ROM region is blank and the cores lock up at
+ * reset, as on a part with an empty ROM.
+ *
  * The RP2350 has no internal flash. Boards set its size with
  * -M rp2350,flash-size=SIZE (a Pico 2 has 4M); there is no default. The
  * flash is a Winbond W25Q part of that size on QSPI chip select 0. Boards
  * with PSRAM on chip select 1 add psram-size=8M for an APS6404L.
+ *
+ * The flash starts erased. To give it contents, and keep what the guest
+ * erases and programs, back it with a raw image of exactly flash-size:
+ *
+ *   -drive if=mtd,format=raw,file=flash.img
  *
  * OTP starts as a blank chip and lives in RAM. To keep programmed rows
  * across runs, back it with a 16 KiB raw image:
@@ -43,6 +53,7 @@
 #include "hw/core/qdev-properties.h"
 #include "qapi/visitor.h"
 #include "system/address-spaces.h"
+#include "system/blockdev.h"
 #include "system/reset.h"
 
 struct RP2350MachineState {
@@ -64,6 +75,15 @@ static void rp2350_direct_reset(void *opaque)
     rp2350_soc_boot_rom_handoff(&s->soc, 0);
 }
 
+/*
+ * With neither -bios nor -kernel the machine still starts, as a chip
+ * whose mask ROM held no code would: the ROM region reads as zeros, so
+ * each core resets with SP and PC of zero. A PC without the Thumb bit
+ * raises an INVSTATE UsageFault, which escalates to HardFault, whose
+ * vector is zero as well, so the core enters Lockup (emu.lockup) and
+ * stays there until reset. Nothing is loaded into flash in this case, so
+ * a machine with no flash configured still has an empty XIP window.
+ */
 /* [spec:nuos:req:emu.direct-load] */
 static void rp2350_init(MachineState *machine)
 {
@@ -84,9 +104,9 @@ static void rp2350_init(MachineState *machine)
                      "-M rp2350,flash-size=SIZE");
         exit(1);
     }
-    if (!direct && !machine->firmware) {
-        error_report("rp2350: a boot ROM image (-bios) or a directly loaded "
-                     "image (-kernel) is required");
+    if (drive_get(IF_MTD, 0, 0) && s->flash_size == 0) {
+        error_report("rp2350: a flash image (-drive if=mtd) needs "
+                     "-M rp2350,flash-size=SIZE");
         exit(1);
     }
 

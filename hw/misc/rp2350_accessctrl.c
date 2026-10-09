@@ -420,14 +420,17 @@ static MemTxResult rp2350_accessctrl_read(void *opaque, hwaddr addr,
                                           MemTxAttrs attrs)
 {
     RP2350AccessCtrlPort *p = opaque;
-    hwaddr reg = rp2350_atomic_reg(addr);
+    hwaddr reg = rp2350_atomic_reg(addr & ~3ull);
+    uint32_t v = 0;
 
-    /* Every register is readable by any master in any state. */
+    /*
+     * Every register is readable by any master in any state. A narrow
+     * read returns its byte lanes of the register.
+     */
     if (reg <= LAST_REG && reg != A_CFGRESET) {
-        *data = reg_get(p->s, reg);
-    } else {
-        *data = 0;
+        v = reg_get(p->s, reg);
     }
+    *data = extract32(v, (addr & 3) * 8, size * 8);
     return MEMTX_OK;
 }
 
@@ -445,9 +448,22 @@ static MemTxResult rp2350_accessctrl_write(void *opaque, hwaddr addr,
     RP2350AccessCtrlPort *p = opaque;
     RP2350AccessCtrlState *s = p->s;
     RP2350BusMaster master = access_master(s, p->master, &attrs);
-    hwaddr reg = rp2350_atomic_reg(addr);
+    hwaddr reg = rp2350_atomic_reg(addr & ~3ull);
     bool password = reg != A_GPIO_NSMASK0 && reg != A_GPIO_NSMASK1;
     uint32_t old, new;
+
+    /*
+     * A narrow write is replicated across the 32-bit bus and writes the
+     * whole register (datasheet "Narrow IO register writes"): a byte
+     * write never carries the password, and a halfword write only when
+     * its value is the password.
+     */
+    if (size == 1) {
+        value = (value & 0xff) * 0x01010101u;
+    } else if (size == 2) {
+        value = (value & 0xffff) * 0x00010001u;
+    }
+    addr &= ~3ull;
 
     if (attrs.user || master == RP2350_MASTER_DMA) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -519,8 +535,10 @@ static const MemoryRegionOps rp2350_accessctrl_ops = {
     .read_with_attrs = rp2350_accessctrl_read,
     .write_with_attrs = rp2350_accessctrl_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 4,
+    .valid.min_access_size = 1,
     .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
 };
 
 MemoryRegion *rp2350_accessctrl_view(RP2350AccessCtrlState *s,

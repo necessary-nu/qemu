@@ -5,7 +5,9 @@
 #include "hw/misc/esp32_reg.h"
 #include "hw/char/esp32_uart.h"
 #include "hw/dma/esp32_uhci.h"
+#include "hw/audio/esp32_i2s.h"
 #include "hw/gpio/esp32_gpio.h"
+#include "hw/gpio/esp32_rtcio.h"
 #include "hw/misc/esp32_dport.h"
 #include "hw/misc/esp32_apb_ctrl.h"
 #include "hw/core/clock.h"
@@ -42,7 +44,7 @@ typedef enum Esp32GateRegs {
 } Esp32GateRegs;
 
 #define ESP32_GATE_MAX_MR 3
-#define ESP32_GATE_MAX 32
+#define ESP32_GATE_MAX 48
 
 #define ESP32_UHCI_COUNT 2
 #define ESP32_MCPWM_COUNT 2
@@ -98,9 +100,11 @@ struct Esp32SocState {
     Esp32TWAIState twai;
     ESP32UARTState uart[ESP32_UART_COUNT];
     Esp32UhciState uhci[ESP32_UHCI_COUNT];
+    Esp32I2sState i2s[ESP32_I2S_COUNT];
     Esp32GpioState gpio;
     Esp32RngState rng;
     Esp32RtcCntlState rtc_cntl;
+    Esp32RtcIoState rtcio;
     Esp32FrcTimerState frc_timer[ESP32_FRC_COUNT];
     Esp32TimgState timg[ESP32_TIMG_COUNT];
     Esp32SpiState spi[ESP32_SPI_COUNT];
@@ -126,6 +130,10 @@ struct Esp32SocState {
     BusState periph_bus;
 
     MemoryRegion cpu_specific_mem[ESP32_CPU_COUNT];
+    /* Internal SRAM, which deep sleep powers down */
+    MemoryRegion *dram;
+    MemoryRegion *iram;
+    MemoryRegion cpu_sysmem_view[ESP32_CPU_COUNT];
 
     uint32_t requested_reset;
 
@@ -145,6 +153,10 @@ struct Esp32SocState {
     Clock *sdio_apb_clk;
     Clock *mcpwm_apb_clk[ESP32_MCPWM_COUNT];
     Clock *mcpwm_f160m_clk[ESP32_MCPWM_COUNT];
+    Clock *i2s_apb_clk[ESP32_I2S_COUNT];
+    Clock *i2s_f160m_clk[ESP32_I2S_COUNT];
+    /* APLL_CLK, the other source of I2S_CLK */
+    Clock *apll_clk;
     /* APB_CLK to the GPIO block's sigma-delta modulators, never gated */
     Clock *gpio_apb_clk;
     Clock *pcnt_apb_clk;
