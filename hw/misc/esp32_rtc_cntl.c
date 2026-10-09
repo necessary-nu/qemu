@@ -888,6 +888,14 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
             qemu_irq_pulse(s->cpu_reset_req[0]);
         }
         esp32_rtc_update_cpu_stall(s);
+        /* [spec:nuos:req:emu.esp32.analog] The BBPLL's power */
+        qemu_irq_pulse(s->clk_update);
+        break;
+
+    case A_RTC_CNTL_ANA_CONF:
+        *r = v & writable;
+        /* [spec:nuos:req:emu.esp32.analog] The APLL's power */
+        qemu_irq_pulse(s->clk_update);
         break;
 
     case A_RTC_CNTL_SLP_TIMER0:
@@ -910,6 +918,8 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
         } else {
             esp32_rtc_check_wakeup(s);
         }
+        qemu_set_irq(s->touch_timer_en,
+                     FIELD_EX32(*r, RTC_CNTL_STATE0, TOUCH_SLP_TIMER_EN));
         break;
 
     case A_RTC_CNTL_RESET_STATE:
@@ -1044,7 +1054,7 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
                       HWADDR_PRIx "\n", addr);
         break;
 
-    case A_RTC_CNTL_TIMER1 ... A_RTC_CNTL_ANA_CONF:
+    case A_RTC_CNTL_TIMER1 ... A_RTC_CNTL_TIMER5:
     case A_RTC_CNTL_STORE0 ... A_RTC_CNTL_EXT_XTL_CONF:
     case A_RTC_CNTL_CPU_PERIOD_CONF ... A_RTC_CNTL_SDIO_ACT_CONF:
     case A_RTC_CNTL_SDIO_CONF ... A_RTC_CNTL_VREG:
@@ -1150,6 +1160,9 @@ static void esp32_rtc_cntl_reset_exit(Object *obj, ResetType type)
     esp32_rtc_wdt_update(s);
     esp32_rtc_update_irq(s);
     esp32_rtc_update_cpu_stall(s);
+    qemu_set_irq(s->touch_timer_en,
+                 FIELD_EX32(REG(s, RTC_CNTL_STATE0), RTC_CNTL_STATE0,
+                            TOUCH_SLP_TIMER_EN));
 }
 
 static void esp32_rtc_cntl_realize(DeviceState *dev, Error **errp)
@@ -1196,6 +1209,8 @@ static void esp32_rtc_cntl_init(Object *obj)
                              ESP32_RTC_CPU_STALL_GPIO, ESP32_CPU_COUNT);
     qdev_init_gpio_out_named(dev, &s->clk_update,
                              ESP32_RTC_CLK_UPDATE_GPIO, 1);
+    qdev_init_gpio_out_named(dev, &s->touch_timer_en,
+                             ESP32_RTC_TOUCH_TIMER_GPIO, 1);
     qdev_init_gpio_in_named(dev, esp32_rtc_wakeup_line,
                             ESP32_RTC_WAKEUP_IN, ESP32_RTC_WAKEUP_COUNT);
     qdev_init_gpio_in_named(dev, esp32_rtc_gpio_wakeup_line,

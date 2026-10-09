@@ -34,8 +34,10 @@ typedef struct Esp32RtcIoState Esp32RtcIoState;
  * - ESP32_RTC_CPU_RESET_GPIO (per CPU): reset one CPU.
  * - ESP32_RTC_CPU_STALL_GPIO (per CPU): the CPU's stall changed; the SoC
  *   reads cpu_stall_state.
- * - ESP32_RTC_CLK_UPDATE_GPIO: the clock selection or the digital domain's
- *   clock gating (dig_clk_gated) changed.
+ * - ESP32_RTC_CLK_UPDATE_GPIO: the clock selection, the BBPLL's or APLL's
+ *   power, or the digital domain's clock gating (dig_clk_gated) changed.
+ * - ESP32_RTC_TOUCH_TIMER_GPIO: RTC_CNTL_TOUCH_SLP_TIMER_EN, which lets the
+ *   touch sensor's timer start measurements.
  *
  * Inputs, from blocks that wake the chip or interrupt through RTC_CNTL:
  * - ESP32_RTC_WAKEUP_IN (ESP32_RTC_WAKEUP_COUNT lines, indexed by the
@@ -54,6 +56,7 @@ typedef struct Esp32RtcIoState Esp32RtcIoState;
 #define ESP32_RTC_CPU_RESET_GPIO    "cpu-reset"
 #define ESP32_RTC_CPU_STALL_GPIO    "cpu-stall"
 #define ESP32_RTC_CLK_UPDATE_GPIO   "clk-update"
+#define ESP32_RTC_TOUCH_TIMER_GPIO  "touch-timer-en"
 #define ESP32_RTC_WAKEUP_IN         "esp32-rtc-wakeup"
 #define ESP32_RTC_GPIO_WAKEUP_IN    "esp32-rtc-gpio-wakeup"
 #define ESP32_RTC_INT_IN            "esp32-rtc-int"
@@ -154,6 +157,9 @@ typedef enum Esp32RtcSleep {
 
 REG32(RTC_CNTL_OPTIONS0, 0x00)
     FIELD(RTC_CNTL_OPTIONS0, SW_SYS_RESET, 31, 1)
+    FIELD(RTC_CNTL_OPTIONS0, BIAS_I2C_FORCE_PD, 18, 1)
+    FIELD(RTC_CNTL_OPTIONS0, BBPLL_FORCE_PD, 10, 1)
+    FIELD(RTC_CNTL_OPTIONS0, BBPLL_I2C_FORCE_PD, 8, 1)
     FIELD(RTC_CNTL_OPTIONS0, SW_PROCPU_RESET, 5, 1)
     FIELD(RTC_CNTL_OPTIONS0, SW_APPCPU_RESET, 4, 1)
     FIELD(RTC_CNTL_OPTIONS0, SW_STALL_PROCPU_C0, 2, 2)
@@ -172,12 +178,15 @@ REG32(RTC_CNTL_STATE0, 0x18)
     FIELD(RTC_CNTL_STATE0, SLP_REJECT, 30, 1)
     FIELD(RTC_CNTL_STATE0, SLP_WAKEUP, 29, 1)
     FIELD(RTC_CNTL_STATE0, SDIO_ACTIVE_IND, 28, 1)
+    FIELD(RTC_CNTL_STATE0, TOUCH_SLP_TIMER_EN, 23, 1)
 REG32(RTC_CNTL_TIMER1, 0x1c)
 REG32(RTC_CNTL_TIMER2, 0x20)
 REG32(RTC_CNTL_TIMER3, 0x24)
 REG32(RTC_CNTL_TIMER4, 0x28)
 REG32(RTC_CNTL_TIMER5, 0x2c)
 REG32(RTC_CNTL_ANA_CONF, 0x30)
+    FIELD(RTC_CNTL_ANA_CONF, PLLA_FORCE_PU, 24, 1)
+    FIELD(RTC_CNTL_ANA_CONF, PLLA_FORCE_PD, 23, 1)
 REG32(RTC_CNTL_RESET_STATE, 0x34)
     FIELD(RTC_CNTL_RESET_STATE, PROCPU_STAT_VECTOR_SEL, 13, 1)
     FIELD(RTC_CNTL_RESET_STATE, APPCPU_STAT_VECTOR_SEL, 12, 1)
@@ -311,6 +320,7 @@ typedef struct Esp32RtcCntlState {
     qemu_irq cpu_reset_req[ESP32_CPU_COUNT];
     qemu_irq cpu_stall_req[ESP32_CPU_COUNT];
     qemu_irq clk_update;
+    qemu_irq touch_timer_en;
 
     Clock *xtal_clk;
     Clock *slow_clk;

@@ -45,7 +45,10 @@
  * per edge; the receiver samples I2SnI_Data_in[15:0] once per WS period as
  * master (the ADC mode's interface) or, in camera mode, on each rising edge
  * of I2SnI_WS_in (the camera's PCLK) while H_SYNC, V_SYNC and H_ENABLE are
- * high.
+ * high. I2S0's LCD mode also carries the built-in converters: with
+ * SYSCON_SARADC_DATA_TO_I2S the receiver takes the SAR ADC DIG
+ * controllers' results in place of the bus, and with
+ * SENS_SAR_DAC_DIG_FORCE the transmitter's data feeds the DACs.
  */
 
 #include "qemu/osdep.h"
@@ -60,6 +63,7 @@
 #include "hw/dma/esp32_lldesc.h"
 #include "hw/gpio/esp32_gpio.h"
 #include "hw/misc/esp32_apb_ctrl.h"
+#include "hw/misc/esp32_sens.h"
 #include "migration/vmstate.h"
 
 #define A_FIFO_WR               0x00
@@ -2017,6 +2021,18 @@ static void i2s_lcd_tx_event(Esp32I2sState *s, uint64_t e)
             return;
         }
         i2s_drive_bus(s, s->tx_frame[datum & 1], s->tx_bits);
+        if (s->id == 0 && s->sens && esp32_sens_dac_dma_enabled(s->sens)) {
+            /*
+             * [spec:nuos:req:emu.esp32.analog]
+             * I2S0's DAC mode (TRM 22.5.3): the right channel's datum
+             * goes to DAC1, the left's to DAC2, each its top 8 bits.
+             */
+            bool right = ((datum & 1) == 0) ==
+                         !!(s->conf & CONF_TX_RIGHT_FIRST);
+
+            esp32_sens_dac_dma(s->sens, right ? 0 : 1,
+                               s->tx_frame[datum & 1] >> 24);
+        }
     }
     i2s_drive(s, ESP32_I2S_OUT_O_WS, p & 1);
 }
@@ -2076,14 +2092,19 @@ static void i2s_rx_event(Esp32I2sState *s)
         i2s_rx_frame(s, l & 0xffff0000u, r & 0xffff0000u);
         break;
     case MODE_LCD:
-        if (s->id == 0 && s->apb_ctrl &&
+        if (s->id == 0 && s->apb_ctrl && s->sens &&
             (s->apb_ctrl->regs[R_APB_CTRL_SARADC_CTRL] &
              SARADC_DATA_TO_I2S)) {
-            if (!s->logged_adc) {
-                qemu_log_mask(LOG_UNIMP, "esp32_i2s: the SAR ADC's data to "
-                              "I2S0 is not modelled; nothing is "
-                              "received\n");
-                s->logged_adc = true;
+            /*
+             * [spec:nuos:req:emu.esp32.analog]
+             * I2S0's ADC mode: WS starts each scan step of the SAR ADC DIG
+             * controllers, whose DMA words take the place of the bus.
+             */
+            uint16_t words[2];
+            unsigned n = esp32_sens_dig_sample(s->sens, words);
+
+            for (unsigned i = 0; i < n; i++) {
+                i2s_rx_parallel(s, (uint32_t)words[i] << 16);
             }
             break;
         }
@@ -2229,11 +2250,9 @@ static void i2s_update_units(Esp32I2sState *s, bool reanchor)
     s->rx_mode_cur = rx;
     i2s_retime(s);
     if ((tx_restart || rx_restart) && (tx != MODE_OFF || rx != MODE_OFF) &&
-        (s->clkm_conf & CLKM_CLKA_ENA)) {
-        qemu_log_mask(LOG_UNIMP, "esp32_i2s: I2S%u runs from APLL_CLK, "
-                      "whose coefficients are not modelled; it is taken "
-                      "to run at %u Hz\n", s->id,
-                      clock_get_hz(s->apll_clk));
+        (s->clkm_conf & CLKM_CLKA_ENA) && clock_get_hz(s->apll_clk) == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR, "esp32_i2s: I2S%u runs from "
+                      "APLL_CLK while the APLL is off\n", s->id);
     }
 
     if (tx_restart || reanchor) {
@@ -2248,11 +2267,6 @@ static void i2s_update_units(Esp32I2sState *s, bool reanchor)
                               (s->pdm_conf & PDM_PCM2PDM_CONV_EN) ? "" :
                               ", and transmission without the PCM-to-PDM "
                               "converter is not modelled");
-            }
-            if (tx == MODE_LCD && s->id == 0) {
-                qemu_log_mask(LOG_UNIMP, "esp32_i2s: the built-in DAC is "
-                              "not modelled; I2S0's LCD data goes to the "
-                              "pads only\n");
             }
             if (tx != MODE_OFF && !(s->fifo_conf & FIFO_CONF_TX_FORCE_EN)) {
                 qemu_log_mask(LOG_GUEST_ERROR, "esp32_i2s: I2S%u transmits "
@@ -2276,7 +2290,6 @@ static void i2s_update_units(Esp32I2sState *s, bool reanchor)
             s->rx_have_first = false;
             s->rx_half_valid = false;
             s->rx_prev_sample = 0;
-            s->logged_adc = false;
             s->logged_pdm_in = false;
             if (rx != MODE_OFF && !(s->fifo_conf & FIFO_CONF_RX_FORCE_EN)) {
                 qemu_log_mask(LOG_GUEST_ERROR, "esp32_i2s: I2S%u receives "
@@ -2796,7 +2809,6 @@ static void esp32_i2s_reset_hold(Object *obj, ResetType type)
     timer_del(&s->rx_hung_timer);
     s->tx_hung_fired = false;
     s->rx_hung_fired = false;
-    s->logged_adc = false;
     s->logged_pdm_in = false;
     s->audio_out_num = 0;
     s->audio_in_num = 0;
@@ -3020,6 +3032,8 @@ static const Property esp32_i2s_properties[] = {
                      MemoryRegion *),
     DEFINE_PROP_LINK("gpio", Esp32I2sState, gpio, TYPE_ESP32_GPIO,
                      Esp32GpioState *),
+    DEFINE_PROP_LINK("sens", Esp32I2sState, sens, TYPE_ESP32_SENS,
+                     Esp32SensState *),
     DEFINE_PROP_LINK("apb-ctrl", Esp32I2sState, apb_ctrl, TYPE_ESP32_APB_CTRL,
                      Esp32ApbCtrlState *),
     DEFINE_PROP_LINK("peer", Esp32I2sState, peer, TYPE_ESP32_I2S,

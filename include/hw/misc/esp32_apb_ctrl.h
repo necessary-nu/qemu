@@ -18,6 +18,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(Esp32ApbCtrlState, ESP32_APB_CTRL)
 /* Pulsed whenever a register that shapes CPU_CLK, APB_CLK or REF_TICK is
  * written. */
 #define ESP32_APB_CTRL_CLK_UPDATE_GPIO "clk-update"
+/* Pulsed whenever SARADC_CTRL is written, for the SAR ADC DIG controllers */
+#define ESP32_APB_CTRL_SARADC_CTRL_GPIO "saradc-ctrl"
 
 REG32(APB_CTRL_SYSCLK_CONF, 0x00)
     FIELD(APB_CTRL_SYSCLK_CONF, PRE_DIV_CNT, 0, 10)
@@ -34,6 +36,7 @@ REG32(APB_CTRL_SARADC_CTRL, 0x10)
 REG32(APB_CTRL_SARADC_CTRL2, 0x14)
 REG32(APB_CTRL_SARADC_FSM, 0x18)
 REG32(APB_CTRL_SARADC_SAR1_PATT_TAB1, 0x1c)
+REG32(APB_CTRL_SARADC_SAR2_PATT_TAB1, 0x2c)
 REG32(APB_CTRL_SARADC_SAR2_PATT_TAB4, 0x38)
 REG32(APB_CTRL_APLL_TICK_CONF, 0x3c)
 REG32(APB_CTRL_QEMU_MARKER, 0x78)
@@ -47,6 +50,7 @@ struct Esp32ApbCtrlState {
 
     MemoryRegion iomem;
     qemu_irq clk_update;
+    qemu_irq saradc_ctrl;
 
     uint32_t regs[ESP32_APB_CTRL_NREGS];
 };

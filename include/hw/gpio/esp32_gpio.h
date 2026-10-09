@@ -291,6 +291,13 @@ int esp32_gpio_sig_in_pad(Esp32GpioState *s, unsigned sig);
 void esp32_gpio_add_route_notifier(Esp32GpioState *s, Notifier *n);
 
 /*
+ * Whether pad n is driven digitally, from outside the chip or by its own
+ * output driver, and if so, at what *level: for the analog blocks, which
+ * see such a pad at the supply or ground.
+ */
+bool esp32_gpio_pad_driven(Esp32GpioState *s, unsigned n, bool *level);
+
+/*
  * The output signal that reaches input signal sig through a pad: the pad
  * the GPIO matrix or IO_MUX connects to sig has its input enabled, is not
  * driven from outside and is driven, push-pull, by output signal *src

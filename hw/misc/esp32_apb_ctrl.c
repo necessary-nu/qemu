@@ -9,8 +9,9 @@
  * soc/esp32/register/soc/apb_ctrl_reg.h for the reset values. SYSCON holds
  * the CPU_CLK pre-divider used with XTAL_CLK and RC_FAST_CLK and the four
  * REF_TICK dividers, one per CPU_CLK source; the SoC derives the clock tree
- * from them. The SAR ADC control words also live here: they are plain
- * storage, as the SAR ADCs are not modelled.
+ * from them. The SAR ADC DIG controllers' configuration also lives here;
+ * SENS, which runs the conversions, reads it, and is told of each
+ * SARADC_CTRL write for its pattern table pointers' clear bits.
  */
 
 #include "qemu/osdep.h"
@@ -116,10 +117,7 @@ static void esp32_apb_ctrl_write(void *opaque, hwaddr addr, uint64_t value,
         qemu_irq_pulse(s->clk_update);
         break;
     case R_APB_CTRL_SARADC_CTRL:
-        if (value & (R_APB_CTRL_SARADC_CTRL_START_MASK |
-                     R_APB_CTRL_SARADC_CTRL_START_FORCE_MASK)) {
-            qemu_log_mask(LOG_UNIMP, "%s: SAR ADC not modelled\n", __func__);
-        }
+        qemu_irq_pulse(s->saradc_ctrl);
         break;
     }
 }
@@ -148,6 +146,8 @@ static void esp32_apb_ctrl_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_out_named(DEVICE(obj), &s->clk_update,
                              ESP32_APB_CTRL_CLK_UPDATE_GPIO, 1);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->saradc_ctrl,
+                             ESP32_APB_CTRL_SARADC_CTRL_GPIO, 1);
 }
 
 static const VMStateDescription vmstate_esp32_apb_ctrl = {
