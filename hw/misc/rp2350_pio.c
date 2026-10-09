@@ -1348,7 +1348,8 @@ static void drive_pins(RP2350PIOState *s, int b)
 
     /*
      * Record the levels before driving them: driving a pin feeds back
-     * into this device through its inputs.
+     * into this device through its inputs, and each line is driven with
+     * the latest level recorded for it.
      */
     s->drv_out[b] = out;
     s->drv_oe[b] = oe;
@@ -1356,41 +1357,47 @@ static void drive_pins(RP2350PIOState *s, int b)
         int p = ctz64(d_oe);
 
         d_oe &= d_oe - 1;
-        qemu_set_irq(s->oe[b * RP2350_PIO_GPIOS + p], (oe >> p) & 1);
+        qemu_set_irq(s->oe[b * RP2350_PIO_GPIOS + p],
+                     (s->drv_oe[b] >> p) & 1);
     }
     while (d_out) {
         int p = ctz64(d_out);
 
         d_out &= d_out - 1;
-        qemu_set_irq(s->out[b * RP2350_PIO_GPIOS + p], (out >> p) & 1);
+        qemu_set_irq(s->out[b * RP2350_PIO_GPIOS + p],
+                     (s->drv_out[b] >> p) & 1);
         if (p >= RP2350_PIO_HSTX_FIRST &&
             p < RP2350_PIO_HSTX_FIRST + RP2350_PIO_HSTX_BITS) {
             qemu_set_irq(s->hstx[b * RP2350_PIO_HSTX_BITS + p -
-                                 RP2350_PIO_HSTX_FIRST], (out >> p) & 1);
+                                 RP2350_PIO_HSTX_FIRST],
+                         (s->drv_out[b] >> p) & 1);
         }
     }
 }
 
+/*
+ * Drive the IRQ and DREQ lines that differ from what was last driven, one
+ * at a time from the current state: a DMA answering a DREQ accesses the
+ * FIFOs from within its edge, which can change the other lines.
+ */
 static void drive_lines(RP2350PIOState *s)
 {
-    uint32_t irq, dreq, d;
+    for (;;) {
+        uint32_t irq, dreq;
+        int n;
 
-    core_lines(&s->core, &irq, &dreq);
-    d = irq ^ s->drv_irq;
-    s->drv_irq = irq;
-    while (d) {
-        int n = ctz32(d);
-
-        d &= d - 1;
-        qemu_set_irq(s->irq[n], (irq >> n) & 1);
-    }
-    d = dreq ^ s->drv_dreq;
-    s->drv_dreq = dreq;
-    while (d) {
-        int n = ctz32(d);
-
-        d &= d - 1;
-        qemu_set_irq(s->dreq[n], (dreq >> n) & 1);
+        core_lines(&s->core, &irq, &dreq);
+        if (irq != s->drv_irq) {
+            n = ctz32(irq ^ s->drv_irq);
+            s->drv_irq ^= 1u << n;
+            qemu_set_irq(s->irq[n], (s->drv_irq >> n) & 1);
+        } else if (dreq != s->drv_dreq) {
+            n = ctz32(dreq ^ s->drv_dreq);
+            s->drv_dreq ^= 1u << n;
+            qemu_set_irq(s->dreq[n], (s->drv_dreq >> n) & 1);
+        } else {
+            return;
+        }
     }
 }
 
@@ -1476,6 +1483,14 @@ static PIORunResult core_run(RP2350PIOState *s, RP2350PIOCore *core,
                 if (ch.pins[b]) {
                     drive_pins(s, b);
                 }
+            }
+            /*
+             * DREQs and interrupts change in the cycle they happen. The
+             * DMA may access the FIFOs from within a DREQ's rising edge:
+             * that access happens here, between this cycle and the next.
+             */
+            if (ch.outputs) {
+                drive_lines(s);
             }
             continue;
         }
@@ -1632,9 +1647,11 @@ static void pio_settle(RP2350PIOState *s)
 /* Run the cycle in which an SMx_INSTR write executes. */
 static void pio_run_cycle(RP2350PIOState *s)
 {
+    bool busy = s->busy;
+
     s->busy = true;
     core_run(s, &s->core, s->core.cycle + 1, false);
-    s->busy = false;
+    s->busy = busy;
 }
 
 /* [spec:nuos:req:emu.pio] */
@@ -2052,15 +2069,41 @@ static void pio_write_reg(RP2350PIOState *s, int b, hwaddr reg,
     }
 }
 
+/*
+ * Bring the blocks to the time of a register access. An access made from
+ * within the blocks' own run (the DMA answering a DREQ they raised)
+ * happens at the cycle the run has reached: the blocks are not run on to
+ * the present first. Returns whether the access is such a one.
+ */
+static bool pio_access_begin(RP2350PIOState *s)
+{
+    if (s->busy) {
+        core_settle_loops(&s->core);
+        s->spec_valid = false;
+        return true;
+    }
+    pio_disturb(s);
+    return false;
+}
+
+static void pio_access_end(RP2350PIOState *s, bool nested)
+{
+    if (nested) {
+        drive_all(s);
+    } else {
+        pio_settle(s);
+    }
+}
+
 static uint64_t rp2350_pio_read(void *opaque, hwaddr addr, unsigned size)
 {
     RP2350PIOWindow *w = opaque;
     RP2350PIOState *s = w->s;
+    bool nested = pio_access_begin(s);
     uint32_t v;
 
-    pio_disturb(s);
     v = pio_read_reg(s, w->block, rp2350_atomic_reg(addr) & ~3);
-    pio_settle(s);
+    pio_access_end(s, nested);
     return extract32(v, (addr & 3) * 8, size * 8);
 }
 
@@ -2076,17 +2119,18 @@ static void rp2350_pio_write(void *opaque, hwaddr addr, uint64_t value,
     hwaddr reg = rp2350_atomic_reg(addr) & ~3;
     int alias = addr / RP2350_ATOMIC_ALIAS_SIZE;
     uint32_t raw = value, v;
+    bool nested;
 
     if (size == 1) {
         raw = (value & 0xff) * 0x01010101u;
     } else if (size == 2) {
         raw = (value & 0xffff) * 0x00010001u;
     }
-    pio_disturb(s);
+    nested = pio_access_begin(s);
     v = alias ? rp2350_atomic_apply(addr, pio_peek(s, w->block, reg), raw)
               : raw;
     pio_write_reg(s, w->block, reg, v, raw, alias);
-    pio_settle(s);
+    pio_access_end(s, nested);
 }
 
 static const MemoryRegionOps rp2350_pio_ops = {
