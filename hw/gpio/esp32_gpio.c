@@ -564,6 +564,71 @@ static bool esp32_gpio_sig_in(Esp32GpioState *s, unsigned sig, uint64_t in,
     return v ^ FIELD_EX32(cfg, GPIO_FUNC0_IN_SEL_CFG, IN_INV_SEL);
 }
 
+/* [spec:nuos:req:emu.esp32.i2s] */
+bool esp32_gpio_sig_in_source(Esp32GpioState *s, unsigned sig,
+                              unsigned *src, bool *inverted)
+{
+    uint32_t cfg = s->func_in_sel[sig];
+    uint32_t out_cfg;
+    bool inv = false, oe, oe_periph;
+    int pad = -1;
+    unsigned f, sel;
+    const IomuxFunc *fn;
+
+    if (FIELD_EX32(cfg, GPIO_FUNC0_IN_SEL_CFG, SIG_IN_SEL)) {
+        sel = FIELD_EX32(cfg, GPIO_FUNC0_IN_SEL_CFG, IN_SEL);
+        if (sel < ESP32_GPIO_PIN_COUNT) {
+            pad = sel;
+        }
+        inv = FIELD_EX32(cfg, GPIO_FUNC0_IN_SEL_CFG, IN_INV_SEL);
+    } else {
+        for (unsigned n = 0; n < ESP32_GPIO_PIN_COUNT; n++) {
+            fn = pad_func(s, n, &f);
+            if (bit64(PAD_VALID, n) && fn->kind == IOMUX_SIG &&
+                fn->sig_in == sig) {
+                pad = n;
+                break;
+            }
+        }
+    }
+    if (pad < 0 || !bit64(PAD_VALID, pad) || !bit64(PAD_OUTPUT, pad) ||
+        bit64(s->ext_driven, pad) ||
+        !FIELD_EX32(s->iomux[pad], IO_MUX_GPIO36, FUN_IE) ||
+        FIELD_EX32(s->pin[pad], GPIO_PIN0, PAD_DRIVER)) {
+        return false;
+    }
+
+    out_cfg = s->func_out_sel[pad];
+    fn = pad_func(s, pad, &f);
+    switch (fn->kind) {
+    case IOMUX_GPIO:
+        sel = FIELD_EX32(out_cfg, GPIO_FUNC0_OUT_SEL_CFG, OUT_SEL);
+        if (sel >= ESP32_GPIO_SIG_COUNT) {
+            return false;
+        }
+        inv ^= FIELD_EX32(out_cfg, GPIO_FUNC0_OUT_SEL_CFG, OUT_INV_SEL);
+        break;
+    case IOMUX_SIG:
+        if (fn->sig_out < 0) {
+            return false;
+        }
+        sel = fn->sig_out;
+        break;
+    default:
+        return false;
+    }
+    oe_periph = s->sig_oe[sel];
+    oe = FIELD_EX32(out_cfg, GPIO_FUNC0_OUT_SEL_CFG, OEN_SEL) ?
+         bit64(gpio_enable_all(s), pad) : oe_periph;
+    oe ^= FIELD_EX32(out_cfg, GPIO_FUNC0_OUT_SEL_CFG, OEN_INV_SEL);
+    if (!oe) {
+        return false;
+    }
+    *src = sel;
+    *inverted = inv;
+    return true;
+}
+
 static void esp32_gpio_propagate(Esp32GpioState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);

@@ -5,6 +5,7 @@
 #include "hw/misc/esp32_reg.h"
 #include "hw/char/esp32_uart.h"
 #include "hw/dma/esp32_uhci.h"
+#include "hw/audio/esp32_i2s.h"
 #include "hw/gpio/esp32_gpio.h"
 #include "hw/misc/esp32_dport.h"
 #include "hw/misc/esp32_apb_ctrl.h"
@@ -42,7 +43,7 @@ typedef enum Esp32GateRegs {
 } Esp32GateRegs;
 
 #define ESP32_GATE_MAX_MR 3
-#define ESP32_GATE_MAX 32
+#define ESP32_GATE_MAX 48
 
 #define ESP32_UHCI_COUNT 2
 #define ESP32_MCPWM_COUNT 2
@@ -98,6 +99,7 @@ struct Esp32SocState {
     Esp32TWAIState twai;
     ESP32UARTState uart[ESP32_UART_COUNT];
     Esp32UhciState uhci[ESP32_UHCI_COUNT];
+    Esp32I2sState i2s[ESP32_I2S_COUNT];
     Esp32GpioState gpio;
     Esp32RngState rng;
     Esp32RtcCntlState rtc_cntl;
@@ -145,6 +147,10 @@ struct Esp32SocState {
     Clock *sdio_apb_clk;
     Clock *mcpwm_apb_clk[ESP32_MCPWM_COUNT];
     Clock *mcpwm_f160m_clk[ESP32_MCPWM_COUNT];
+    Clock *i2s_apb_clk[ESP32_I2S_COUNT];
+    Clock *i2s_f160m_clk[ESP32_I2S_COUNT];
+    /* APLL_CLK, the other source of I2S_CLK */
+    Clock *apll_clk;
     /* APB_CLK to the GPIO block's sigma-delta modulators, never gated */
     Clock *gpio_apb_clk;
     Clock *pcnt_apb_clk;

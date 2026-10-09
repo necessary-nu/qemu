@@ -184,6 +184,9 @@ static void esp32_soc_reset(DeviceState *dev)
         for (int i = 0; i < ESP32_UHCI_COUNT; ++i) {
             device_cold_reset(DEVICE(&s->uhci[i]));
         }
+        for (int i = 0; i < ESP32_I2S_COUNT; ++i) {
+            device_cold_reset(DEVICE(&s->i2s[i]));
+        }
         for (int i = 0; i < ESP32_FRC_COUNT; ++i) {
             device_cold_reset(DEVICE(&s->frc_timer[i]));
         }
@@ -1291,11 +1294,57 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_periph_device(sys_mem, &s->rgb, DR_REG_FRAMEBUF_BASE);
     memory_region_add_subregion_overlap(sys_mem, esp32_memmap[ESP32_MEMREGION_FRAMEBUF].base, &s->rgb.vram, 0);
 
+    /*
+     * [spec:nuos:req:emu.esp32.i2s]
+     * I2S0 and I2S1, behind their DPORT clock and reset bits, with their
+     * DMA engines reaching SRAM and their signals on the GPIO matrix.
+     */
+    for (int i = 0; i < ESP32_I2S_COUNT; ++i) {
+        const hwaddr i2s_base[] = { DR_REG_I2S_BASE, DR_REG_I2S1_BASE };
+        const uint32_t i2s_bit[] = {
+            R_DPORT_PERIP_I2S0_MASK, R_DPORT_PERIP_I2S1_MASK
+        };
+        const int i2s_intr[] = {
+            ETS_I2S0_INTR_SOURCE, ETS_I2S1_INTR_SOURCE
+        };
+        DeviceState *i2s = DEVICE(&s->i2s[i]);
+        Esp32PeriphGate *g;
+
+        qdev_prop_set_uint8(i2s, "id", i);
+        object_property_set_link(OBJECT(i2s), "dma-mr", OBJECT(sys_mem),
+                                 &error_abort);
+        object_property_set_link(OBJECT(i2s), "gpio", OBJECT(&s->gpio),
+                                 &error_abort);
+        object_property_set_link(OBJECT(i2s), "apb-ctrl",
+                                 OBJECT(&s->apb_ctrl), &error_abort);
+        object_property_set_link(OBJECT(i2s), "peer",
+                                 OBJECT(&s->i2s[1 - i]), &error_abort);
+        qdev_realize(i2s, &s->periph_bus, &error_fatal);
+        g = esp32_soc_add_gated_device(s, &s->i2s[i], i2s_base[i],
+                                       ESP32_GATE_PERIP, i2s_bit[i],
+                                       i2s_bit[i]);
+        g->apb_clk = s->i2s_apb_clk[i];
+        g->f160m_clk = s->i2s_f160m_clk[i];
+        g->volatile_reg = ESP32_I2S_FIFO_RD_OFFSET;
+        g->has_volatile_reg = true;
+        sysbus_connect_irq(SYS_BUS_DEVICE(i2s), 0,
+                           qdev_get_gpio_in(intmatrix_dev, i2s_intr[i]));
+        for (int line = 0; line < ESP32_I2S_OUT_COUNT; line++) {
+            qdev_connect_gpio_out_named(i2s, ESP32_I2S_SIG_OUT, line,
+                qdev_get_gpio_in_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_OUT,
+                                       esp32_i2s_out_signal(i, line)));
+        }
+        for (int line = 0; line < ESP32_I2S_IN_COUNT; line++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), ESP32_GPIO_SIG_IN,
+                                        esp32_i2s_in_signal(i, line),
+                                        qdev_get_gpio_in_named(i2s,
+                                            ESP32_I2S_SIG_IN, line));
+        }
+    }
+
     esp32_soc_add_unimp_device(sys_mem, "esp32.analog", DR_REG_ANA_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_RTCIO_BASE, 0x400);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_SENS_BASE, 0x400);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.i2s0", DR_REG_I2S_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rmt", DR_REG_RMT_BASE, 0x1000);
 
     qemu_register_reset((QEMUResetHandler*) esp32_soc_reset, dev);
@@ -1357,6 +1406,23 @@ static void esp32_soc_init(Object *obj)
         snprintf(name, sizeof(name), "uhci%d-apb", i);
         s->uhci_apb_clk[i] = clock_new(obj, name);
         qdev_connect_clock_in(DEVICE(&s->uhci[i]), "apb", s->uhci_apb_clk[i]);
+    }
+
+    s->apll_clk = clock_new(obj, "apll");
+    clock_set_hz(s->apll_clk, ESP32_APLL_UNMODELLED_HZ);
+    for (int i = 0; i < ESP32_I2S_COUNT; ++i) {
+        DeviceState *i2s;
+
+        snprintf(name, sizeof(name), "i2s%d", i);
+        object_initialize_child(obj, name, &s->i2s[i], TYPE_ESP32_I2S);
+        i2s = DEVICE(&s->i2s[i]);
+        snprintf(name, sizeof(name), "i2s%d-apb", i);
+        s->i2s_apb_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(i2s, "apb", s->i2s_apb_clk[i]);
+        snprintf(name, sizeof(name), "i2s%d-f160m", i);
+        s->i2s_f160m_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(i2s, "pll-f160m", s->i2s_f160m_clk[i]);
+        qdev_connect_clock_in(i2s, "apll", s->apll_clk);
     }
 
     object_property_add_alias(obj, "serial0", OBJECT(&s->uart[0]), "chardev");
@@ -1639,6 +1705,12 @@ static void esp32_machine_init(MachineState *machine)
     if (blk) {
         ss->dport.flash_blk = blk;
     }
+    if (machine->audiodev) {
+        for (int i = 0; i < ESP32_I2S_COUNT; ++i) {
+            qdev_prop_set_string(DEVICE(&ss->i2s[i]), "audiodev",
+                                 machine->audiodev);
+        }
+    }
     qdev_prop_set_chr(DEVICE(ss), "serial0", serial_hd(0));
     qdev_prop_set_chr(DEVICE(ss), "serial1", serial_hd(1));
     qdev_prop_set_chr(DEVICE(ss), "serial2", serial_hd(2));
@@ -1762,6 +1834,7 @@ static void esp32_machine_class_init(ObjectClass *oc, const void *data)
                                    esp32_machine_set_sdio_host);
     object_class_property_set_description(oc, "sdio-host",
         "Add an SDHCI at 0x22000000 as the SDIO slave's host");
+    machine_add_audiodev_property(mc);
 }
 
 static const TypeInfo esp32_info = {
