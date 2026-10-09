@@ -26,6 +26,7 @@
 #include "hw/misc/esp32_flash_enc.h"
 #include "hw/net/can/esp32_twai.h"
 #include "hw/sd/dwc_sdmmc.h"
+#include "hw/sd/esp32_sdio_slave.h"
 #include "hw/display/esp_rgb.h"
 
 /* The DPORT register pairs that gate a peripheral's clock and reset it. */
@@ -35,7 +36,7 @@ typedef enum Esp32GateRegs {
     ESP32_GATE_WIFI,    /* WIFI_CLK_EN / CORE_RST_EN */
 } Esp32GateRegs;
 
-#define ESP32_GATE_MAX_MR 2
+#define ESP32_GATE_MAX_MR 3
 #define ESP32_GATE_MAX 32
 
 #define ESP32_UHCI_COUNT 2
@@ -107,6 +108,7 @@ struct Esp32SocState {
     ESPRgbState rgb;
 
     DWCSDMMCState sdmmc;
+    Esp32SdioSlaveState sdio;
     DeviceState *eth;
 
     BusState rtc_bus;
@@ -126,6 +128,7 @@ struct Esp32SocState {
     Clock *frc_apb_clk[ESP32_FRC_COUNT];
     Clock *timg_apb_clk[ESP32_TIMG_COUNT];
     Clock *spi_dma_clk[ESP32_SPI_DMA_COUNT];
+    Clock *sdio_apb_clk;
     /* APB_CLK to the GPIO block's sigma-delta modulators, never gated */
     Clock *gpio_apb_clk;
 
