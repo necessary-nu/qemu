@@ -318,6 +318,12 @@ void rp2350_gpio_connect_in(RP2350GPIOState *s, RP2350GPIOPort port, int n,
                             qemu_irq irq);
 
 /*
+ * The signals of `port` (at most 64) that some pin's FUNCSEL selects:
+ * those whose outputs can reach a pin.
+ */
+uint64_t rp2350_gpio_port_selected(RP2350GPIOState *s, RP2350GPIOPort port);
+
+/*
  * The digital level pin `p` is driven to: by the chip's own output driver
  * (with the pad's output enabled), else from outside through "pad-in";
  * -1 when neither drives it. An analogue input (ADC) on the pin reads 0 V
