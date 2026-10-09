@@ -10,6 +10,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
@@ -20,6 +21,7 @@
 #include "hw/block/aps6404l.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/unimp.h"
+#include "hw/ssi/ssi.h"
 #include "system/system.h"
 #include "target/arm/arm-powerctl.h"
 #include "target/arm/cpu.h"
@@ -152,6 +154,8 @@ static void rp2350_core1_launch(void *opaque, uint32_t vtor, uint32_t sp,
 #define RP2350_RESET_PADS_QSPI  10
 #define RP2350_RESET_PLL_SYS    14
 #define RP2350_RESET_PLL_USB    15
+#define RP2350_RESET_SPI0       18
+#define RP2350_RESET_SPI1       19
 #define RP2350_RESET_SYSCFG     20
 #define RP2350_RESET_SYSINFO    21
 #define RP2350_RESET_TBMAN      22
@@ -171,6 +175,10 @@ static DeviceState *rp2350_subsystem(RP2350State *s, int bit)
         return DEVICE(&s->pll_sys);
     case RP2350_RESET_PLL_USB:
         return DEVICE(&s->pll_usb);
+    case RP2350_RESET_SPI0:
+        return DEVICE(&s->spi[0]);
+    case RP2350_RESET_SPI1:
+        return DEVICE(&s->spi[1]);
     case RP2350_RESET_SYSCFG:
         return DEVICE(&s->syscfg);
     case RP2350_RESET_SYSINFO:
@@ -441,6 +449,66 @@ static void rp2350_soc_accessctrl_changed(Notifier *n, void *data)
     rp2350_gpio_set_nsmask(&s->gpio,
         (uint64_t)rp2350_accessctrl_gpio_nsmask(&s->accessctrl, 1) << 32 |
         rp2350_accessctrl_gpio_nsmask(&s->accessctrl, 0));
+}
+
+/*
+ * nSSPCTLOE of SPI controller n, the active-low output enable of its
+ * clock and frame select, which drive SCK and CSn: outputs in master
+ * mode, inputs in slave mode.
+ */
+/* [spec:nuos:req:emu.spi] */
+static void rp2350_soc_spi_ctloe(void *opaque, int n, int level)
+{
+    RP2350State *s = opaque;
+    RP2350GPIOPort port = n ? RP2350_GPIO_PORT_SPI1 : RP2350_GPIO_PORT_SPI0;
+
+    qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port, RP2350_GPIO_SPI_SCK),
+                 !level);
+    qemu_set_irq(rp2350_gpio_oe_line(&s->gpio, port, RP2350_GPIO_SPI_CSN),
+                 !level);
+}
+
+/*
+ * SSI devices on the SPI buses ("spi0", "spi1", e.g. -device
+ * w25q80bl,bus=spi0,cs=17) are off-chip devices: a device's chip select
+ * follows the level of the GPIO pin its "cs" property numbers, whether
+ * the SPI controller's CSn, SIO or anything else drives that pin. Devices
+ * are plugged after the SoC is realized, so they are wired once the
+ * machine is complete. Devices without an SSI chip select, such as a
+ * PL022 slave port, are left alone.
+ */
+/* [spec:nuos:req:emu.spi] */
+static void rp2350_soc_spi_wire_cs(Notifier *notifier, void *data)
+{
+    RP2350State *s = container_of(notifier, RP2350State, spi_cs_notifier);
+    DECLARE_BITMAP(used, RP2350_GPIO_PINS) = {};
+    int i;
+
+    for (i = 0; i < RP2350_NUM_SPIS; i++) {
+        BusChild *kid;
+
+        QTAILQ_FOREACH(kid, &BUS(s->spi[i].ssi)->children, sibling) {
+            DeviceState *dev = kid->child;
+            unsigned pin = SSI_PERIPHERAL(dev)->cs_index;
+
+            if (!object_property_find(OBJECT(dev), SSI_GPIO_CS "[0]")) {
+                continue;
+            }
+            if (pin >= RP2350_GPIO_PINS || test_bit(pin, used)) {
+                error_report("rp2350: %s on spi%d: cs=%u must name a GPIO "
+                             "pin (0-%d) no other SPI device uses",
+                             object_get_typename(OBJECT(dev)), i, pin,
+                             RP2350_GPIO_PINS - 1);
+                exit(1);
+            }
+            set_bit(pin, used);
+            qdev_connect_gpio_out_named(DEVICE(&s->gpio), RP2350_GPIO_PAD_OUT,
+                                        pin,
+                                        qdev_get_gpio_in_named(dev,
+                                                               SSI_GPIO_CS,
+                                                               0));
+        }
+    }
 }
 
 /* The Winbond W25Q parts that fit each supported flash size. */
@@ -912,6 +980,56 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
 
     /*
+     * SPI0 and SPI1, PL022 r1p4 controllers timed by clk_peri, which is
+     * modelled at clk_sys's rate (pico-sdk runs clk_peri from clk_sys).
+     * Each has its SSI bus "spi0"/"spi1" for off-chip devices, and drives
+     * its SCK, CSn and TX function signals; CSn's pin input is SSPFSSIN,
+     * the select of the controller in slave mode. The DREQs are connected
+     * with the DMA's other sources.
+     */
+    /* [spec:nuos:req:emu.spi] */
+    qdev_init_gpio_in_named(dev_soc, rp2350_soc_spi_ctloe, "spi-nctloe",
+                            RP2350_NUM_SPIS);
+    for (i = 0; i < RP2350_NUM_SPIS; i++) {
+        static const hwaddr base[] = { RP2350_SPI0_BASE, RP2350_SPI1_BASE };
+        static const int irq[] = { RP2350_SPI0_IRQ, RP2350_SPI1_IRQ };
+        RP2350GPIOPort port = i ? RP2350_GPIO_PORT_SPI1
+                                : RP2350_GPIO_PORT_SPI0;
+        SysBusDevice *sbd = SYS_BUS_DEVICE(&s->spi[i]);
+        DeviceState *dev = DEVICE(sbd);
+
+        qdev_prop_set_string(dev, "bus-name", i ? "spi1" : "spi0");
+        qdev_prop_set_uint8(dev, "revision", 3);
+        qdev_connect_clock_in(dev, "clk", s->sysclk);
+        if (!sysbus_realize(sbd, errp)) {
+            return;
+        }
+        memory_region_init_io(&s->spi_alias[i], obj, &rp2350_alias_ops,
+                              sysbus_mmio_get_region(sbd, 0),
+                              i ? "rp2350-spi1" : "rp2350-spi0",
+                              RP2350_ATOMIC_REGION_SIZE);
+        memory_region_add_subregion(s->board_memory, base[i],
+                                    &s->spi_alias[i]);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(dev_soc, irq[i]));
+
+        qdev_connect_gpio_out_named(dev, PL022_SSP_OUT, PL022_SSPCLKOUT,
+            rp2350_gpio_out_line(&s->gpio, port, RP2350_GPIO_SPI_SCK));
+        qdev_connect_gpio_out_named(dev, PL022_SSP_OUT, PL022_SSPFSSOUT,
+            rp2350_gpio_out_line(&s->gpio, port, RP2350_GPIO_SPI_CSN));
+        qdev_connect_gpio_out_named(dev, PL022_SSP_OUT, PL022_SSPTXD,
+            rp2350_gpio_out_line(&s->gpio, port, RP2350_GPIO_SPI_TX));
+        qdev_connect_gpio_out_named(dev, PL022_SSP_OUT, PL022_NSSPCTLOE,
+            qdev_get_gpio_in_named(dev_soc, "spi-nctloe", i));
+        qdev_connect_gpio_out_named(dev, PL022_SSP_OUT, PL022_NSSPOE,
+            qemu_irq_invert(rp2350_gpio_oe_line(&s->gpio, port,
+                                                RP2350_GPIO_SPI_TX)));
+        rp2350_gpio_connect_in(&s->gpio, port, RP2350_GPIO_SPI_CSN,
+            qdev_get_gpio_in_named(dev, PL022_SSPFSSIN, 0));
+    }
+    s->spi_cs_notifier.notify = rp2350_soc_spi_wire_cs;
+    qemu_add_machine_init_done_notifier(&s->spi_cs_notifier);
+
+    /*
      * The self-hosted debug window. Each core sees it through its own view
      * so that it is refused its own AHB-AP; each AHB-AP masters its core's
      * bus.
@@ -1005,6 +1123,15 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             qdev_connect_gpio_out_named(uart, PL011_DMA_REQ, PL011_DMA_RX,
                 qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, tx + 1));
         }
+        for (i = 0; i < RP2350_NUM_SPIS; i++) {
+            DeviceState *spi = DEVICE(&s->spi[i]);
+            int tx = i ? RP2350_DREQ_SPI1_TX : RP2350_DREQ_SPI0_TX;
+
+            qdev_connect_gpio_out_named(spi, PL022_DMA_REQ, PL022_DMA_TX,
+                qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, tx));
+            qdev_connect_gpio_out_named(spi, PL022_DMA_REQ, PL022_DMA_RX,
+                qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ, tx + 1));
+        }
         for (i = 0; i < RP2350_PWM_SLICES; i++) {
             qdev_connect_gpio_out_named(DEVICE(&s->pwm), RP2350_PWM_DREQ, i,
                 qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
@@ -1075,6 +1202,9 @@ static void rp2350_soc_init(Object *obj)
     }
     for (i = 0; i < RP2350_NUM_UARTS; i++) {
         object_initialize_child(obj, "uart[*]", &s->uart[i], TYPE_PL011);
+    }
+    for (i = 0; i < RP2350_NUM_SPIS; i++) {
+        object_initialize_child(obj, "spi[*]", &s->spi[i], TYPE_PL022);
     }
     object_initialize_child(obj, "coresight", &s->coresight,
                             TYPE_RP2350_CORESIGHT);

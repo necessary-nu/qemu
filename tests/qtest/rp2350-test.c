@@ -74,7 +74,6 @@ static void test_memory_map(void)
         uint64_t base;
         uint64_t size;
     } unimplemented[] = {
-        { "rp2350.spi0",       0x40080000, 0x8000 },
         { "rp2350.usbctrl",    0x50100000, 0x100000 },
         { "rp2350.pio0",       0x50200000, 0x100000 },
     };
@@ -114,6 +113,12 @@ static void test_memory_map(void)
                           "(prio 0, i/o): rp2350-uart0");
     assert_mtree_has(qts, "0000000040078000-000000004007bfff "
                           "(prio 0, i/o): rp2350-uart1");
+    assert_mtree_has(qts, "0000000040080000-0000000040083fff "
+                          "(prio 0, i/o): rp2350-spi0");
+    assert_mtree_has(qts, "0000000040084000-0000000040087fff "
+                          "(prio -1000, i/o): rp2350.spi0 @0000000000004000");
+    assert_mtree_has(qts, "0000000040088000-000000004008bfff "
+                          "(prio 0, i/o): rp2350-spi1");
     assert_mtree_has(qts, "00000000400a8000-00000000400abfff "
                           "(prio 0, i/o): rp2350-pwm");
     assert_mtree_has(qts, "00000000400b0000-00000000400b3fff "
