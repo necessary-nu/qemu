@@ -1718,10 +1718,20 @@ static void dw_target_realize(DeviceState *dev, Error **errp)
     }
 }
 
-static const Property dw_target_properties[] = {
-    DEFINE_PROP_LINK("controller", DesignWareI2CTarget, controller,
-                     TYPE_DESIGNWARE_I2C, DesignWareI2CState *),
-};
+/*
+ * "controller": the controller whose target logic this is. The link is
+ * weak: the controller's own target is its child, and a strong link back
+ * would hold a reference the controller never gives (it sets the field
+ * directly) and make a cycle of the two.
+ */
+static void dw_target_instance_init(Object *obj)
+{
+    DesignWareI2CTarget *t = DESIGNWARE_I2C_TARGET(obj);
+
+    object_property_add_link(obj, "controller", TYPE_DESIGNWARE_I2C,
+                             (Object **)&t->controller,
+                             qdev_prop_allow_set_link_before_realize, 0);
+}
 
 static const VMStateDescription vmstate_dw_target = {
     .name = TYPE_DESIGNWARE_I2C_TARGET,
@@ -1742,7 +1752,6 @@ static void dw_target_class_init(ObjectClass *klass, const void *data)
     dc->desc = "DesignWare I2C target logic on an I2C bus";
     dc->realize = dw_target_realize;
     dc->vmsd = &vmstate_dw_target;
-    device_class_set_props(dc, dw_target_properties);
     sc->match_and_add = dw_target_match_and_add;
     sc->event = dw_target_event;
     sc->send = dw_target_send;
@@ -1764,6 +1773,7 @@ static const TypeInfo designware_i2c_types[] = {
         .name = TYPE_DESIGNWARE_I2C_TARGET,
         .parent = TYPE_I2C_SLAVE,
         .instance_size = sizeof(DesignWareI2CTarget),
+        .instance_init = dw_target_instance_init,
         .class_init = dw_target_class_init,
     },
 };

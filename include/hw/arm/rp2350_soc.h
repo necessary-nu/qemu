@@ -27,6 +27,7 @@
 #include "hw/misc/rp2350_eppb.h"
 #include "hw/misc/rp2350_m33_debug.h"
 #include "hw/misc/rp2350_hstx.h"
+#include "hw/misc/rp2350_powman.h"
 #include "hw/misc/rp2350_psm.h"
 #include "hw/misc/rp2350_pwm.h"
 #include "hw/misc/rp2350_otp.h"
@@ -86,6 +87,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_I2C1_IRQ 37
 #define RP2350_OTP_IRQ 38
 #define RP2350_TRNG_IRQ 39
+#define RP2350_POWMAN_POW_IRQ 44
+#define RP2350_POWMAN_TIMER_IRQ 45
 #define RP2350_SPARE_IRQ_5 51
 
 #define RP2350_ROM_BASE 0x00000000
@@ -114,6 +117,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 
 #define RP2350_SRAM_BASE 0x20000000
 #define RP2350_SRAM_SIZE (520 * KiB)
+/*
+ * The SRAM power domains: SRAM0 is banks 0-3, the lower half of the
+ * striped window; SRAM1 is banks 4-7 and the SRAM8/9 scratch banks.
+ */
+#define RP2350_SRAM0_DOMAIN_SIZE (256 * KiB)
+#define RP2350_SRAM1_DOMAIN_SIZE (RP2350_SRAM_SIZE - RP2350_SRAM0_DOMAIN_SIZE)
 
 #define RP2350_EPPB_BASE 0xe0080000
 
@@ -152,6 +161,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_SHA256_BASE 0x400f8000
 #define RP2350_HSTX_CTRL_BASE 0x400c0000
 #define RP2350_HSTX_FIFO_BASE 0x50600000
+#define RP2350_POWMAN_BASE 0x40100000
 #define RP2350_USB_DPRAM_BASE 0x50100000
 #define RP2350_USB_DPRAM_SIZE (4 * KiB)
 #define RP2350_SIO_BASE 0xd0000000
@@ -195,6 +205,7 @@ struct RP2350State {
     RP2350ResetsState resets;
     RP2350PSMState psm;
     RP2350WatchdogState watchdog;
+    RP2350PowmanState powman;
     RP2350SIOState sio;
     RP2350GPIOState gpio;
     RP2350RCPState rcp;
@@ -245,6 +256,10 @@ struct RP2350State {
 
     MemoryRegion rom;
     MemoryRegion sram;
+    /* Over SRAM0 and SRAM1 while their power domain is down. */
+    MemoryRegion sram_off[2];
+    /* SRAM, for clearing a domain that powers down. */
+    AddressSpace sram_as;
     MemoryRegion usb_dpram;
 
     MemoryRegion *board_memory;
@@ -284,5 +299,14 @@ void rp2350_soc_attach_reset(RP2350State *s, int reset, DeviceState *dev);
  * mask sees it.
  */
 qemu_irq rp2350_soc_core_irq(RP2350State *s, int core, int n);
+
+/*
+ * Reset the machine as the chip-level reset the power manager has
+ * pending: a cold reset of `type` becomes that reset's type (see
+ * rp2350_powman_next_reset_type()). Processors stay off while the
+ * switched core is unpowered; otherwise, with no ROM executing, core 0
+ * starts as the boot ROM would hand it over.
+ */
+void rp2350_soc_system_reset(RP2350State *s, ResetType type);
 
 #endif

@@ -173,6 +173,9 @@ config RP2350_ACCESSCTRL
 config RP2350_PSM
     bool
 
+config RP2350_POWMAN
+    bool
+
 config RP2350_OTP
     bool
 
