@@ -45,6 +45,8 @@
  *     through which software configures the PLLs; and LP_SYS's
  *     BOOT_ADDR_HP_CORE1, the rest of whose registers are logged as
  *     unimplemented.
+ *   - The eFuse controller and its array; nothing takes its interrupt, as
+ *     the interrupt matrix is not modelled.
  *   - Every other peripheral block the chip decodes, as an unimplemented
  *     device named after the block. Addresses the chip does not decode,
  *     the reserved ranges of TRM table 9.3-1 and the unassigned slots
@@ -52,6 +54,14 @@
  *     access fault.
  *   - The CLINT and CLIC address ranges of the HP cores, also as
  *     unimplemented devices: the cores have no interrupt controller.
+ *
+ * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
+ * unless a raw file keeps them: 336 bytes of data, or the whole array in
+ * a file longer than 512 bytes. A blank, all-zero, file starts as a
+ * factory-fresh chip:
+ *
+ *   -drive file=efuse.bin,if=none,format=raw,id=efuse
+ *   -global driver=nvram.esp32p4.efuse,property=drive,value=efuse
  *
  * The flash size is a property of the board, with no default:
  *
@@ -230,7 +240,6 @@ static const struct {
     { "lp-gpio",          0x5012a000, 4 * KiB },
     { "lp-iomux",         0x5012b000, 4 * KiB },
     { "lp-intr",          0x5012c000, 4 * KiB },
-    { "efuse",            0x5012d000, 4 * KiB },
     { "lp-peri-pms",      0x5012e000, 2 * KiB },
     { "hp2lp-peri-pms",   0x5012e800, 2 * KiB },
     { "lp-tsens",         0x5012f000, 4 * KiB },
@@ -504,6 +513,19 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->lp_sys), 0, ESP32P4_LP_SYS_BASE);
 }
 
+/*
+ * The eFuse controller. Its interrupt, LP_EFUSE_INTR (source 17 of TRM
+ * table 13.4-1), goes to the interrupt matrix, which is not modelled.
+ */
+/* [spec:nuos:req:emu.esp32p4.efuse] */
+static void esp32p4_init_efuse(ESP32P4MachineState *s)
+{
+    object_initialize_child(OBJECT(s), "efuse", &s->efuse,
+                            TYPE_ESP32P4_EFUSE);
+    sysbus_realize(SYS_BUS_DEVICE(&s->efuse), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->efuse), 0, ESP32P4_EFUSE_BASE);
+}
+
 /* The memories -kernel can load into: those the cores address directly. */
 static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
 {
@@ -632,6 +654,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_memory(s);
     esp32p4_init_cpus(s);
     esp32p4_init_clocks(s);
+    esp32p4_init_efuse(s);
     esp32p4_init_flash(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(

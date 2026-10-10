@@ -989,8 +989,16 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
              * changes in system emulation.  So it's not safe to make a
              * direct jump to a TB spanning two pages because the mapping
              * for the second page can change.
+             *
+             * Nor to a TB not associated with a RAM page.  No page tracks
+             * such a TB, so nothing would ever unlink a jump to it, and
+             * tb_gen_code means it to be executed at most once, as code
+             * read through MMIO may differ the next time.  It may also
+             * span two pages without recording the second: when the
+             * second page is MMIO, translator_ld leaves the TB with no
+             * RAM page at all.
              */
-            if (tb_page_addr1(tb) != -1) {
+            if (tb_page_addr0(tb) == -1 || tb_page_addr1(tb) != -1) {
                 last_tb = NULL;
             }
 #endif
