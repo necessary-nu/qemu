@@ -819,8 +819,7 @@ static void esp32p4_hp_cpu_set_gpio_in(void *opaque, int n, int level)
 
 /*
  * The HP core's own trigger module replaces QEMU's, which the "debug"
- * property would otherwise enable; QEMU's trigger count is zero too, as
- * QEMU walks its triggers on every privilege change under icount.
+ * property would otherwise enable.
  */
 static void esp32p4_hp_cpu_init(Object *obj)
 {
@@ -830,7 +829,6 @@ static void esp32p4_hp_cpu_init(Object *obj)
 
     cpu->parent_obj.cfg.debug = false;
     cpu->parent_obj.cfg.ext_sdtrig = false;
-    cpu->parent_obj.env.num_triggers = 0;
     qdev_init_gpio_out_named(dev, cpu->gpio_out_irq, ESP32P4_CPU_GPIO_OUT,
                              ESP32P4_CPU_GPIOS);
     qdev_init_gpio_out_named(dev, cpu->gpio_oe_irq, ESP32P4_CPU_GPIO_OE,
