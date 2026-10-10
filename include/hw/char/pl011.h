@@ -116,6 +116,14 @@ struct PL011State {
     bool rx_zero;
     bool rx_wait_mark;
     bool rx_overrun;
+    /*
+     * Across a change of UARTCLK: the UARTCLK cycles since the transmit
+     * and receive frames started, and left of the receive timeout, held
+     * while UARTCLK is stopped.
+     */
+    uint64_t tx_held;
+    uint64_t rx_held;
+    uint64_t rt_held;
     /* Line levels: pins in, the receiver's inputs after loopback, outputs */
     uint8_t rxd_pin;
     uint8_t ncts_pin;

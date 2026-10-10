@@ -7,7 +7,8 @@
  *
  * Reference: RP2350 Datasheet, "Watchdog". The counter in CTRL.TIME
  * counts down once per tick of the TICKS block's WATCHDOG generator, which
- * divides clk_ref by its CYCLES setting. When the counter reaches zero, or
+ * divides clk_ref by its CYCLES setting (the "tick" clock), at the tick's
+ * current rate. When the counter reaches zero, or
  * TRIGGER is written, the watchdog records why in REASON and requests a
  * reset, which the PSM carries out (see rp2350_psm.c) unless POWMAN.WDSEL
  * makes it a chip-level reset (see rp2350_powman.c). The watchdog itself
@@ -28,7 +29,7 @@
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "hw/core/irq.h"
-#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/watchdog/rp2350_watchdog.h"
 #include "migration/vmstate.h"
@@ -44,17 +45,21 @@
 #define CTRL_PAUSE   0x07000000u /* PAUSE_DBG1, PAUSE_DBG0, PAUSE_JTAG */
 #define CTRL_TIME    0x00ffffffu
 
+/* [spec:nuos:req:emu.clock-tree] */
 static bool wd_should_run(RP2350WatchdogState *s)
 {
-    return (s->ctrl & CTRL_ENABLE) && s->cycles &&
-           rp2350_ticks_running(s->ticks, RP2350_TICK_WATCHDOG);
+    return (s->ctrl & CTRL_ENABLE) && clock_is_enabled(s->tick);
 }
 
 /* Virtual time taken by n ticks at the current rate, rounded up. */
 static int64_t wd_ticks_ns(RP2350WatchdogState *s, uint64_t n)
 {
-    return muldiv64_round_up(n * s->cycles, NANOSECONDS_PER_SECOND,
-                             s->ref_hz);
+    uint64_t ns = clock_ticks_to_ns(s->tick, n);
+
+    while (clock_ns_to_ticks(s->tick, ns) < n) {
+        ns++;
+    }
+    return MIN(ns, (uint64_t)INT64_MAX / 2);
 }
 
 /* Whole ticks since sync_ns. */
@@ -63,8 +68,7 @@ static uint64_t wd_elapsed(RP2350WatchdogState *s, int64_t now)
     if (!s->running || now <= s->sync_ns) {
         return 0;
     }
-    return muldiv64(now - s->sync_ns, s->ref_hz, NANOSECONDS_PER_SECOND) /
-           s->cycles;
+    return clock_ns_to_ticks(s->tick, now - s->sync_ns);
 }
 
 static uint32_t wd_time(RP2350WatchdogState *s, int64_t now)
@@ -125,13 +129,19 @@ static void wd_expired(void *opaque)
     }
 }
 
-/* The WATCHDOG tick generator started, stopped or changed rate. */
-static void wd_tick_changed(void *opaque)
+/*
+ * The WATCHDOG tick started, stopped or changed rate: count up to the
+ * change at the old rate, and the next tick afresh at the new one.
+ */
+static void wd_tick_changed(void *opaque, ClockEvent event)
 {
     RP2350WatchdogState *s = opaque;
 
-    wd_sync(s);
-    s->cycles = rp2350_ticks_cycles(s->ticks, RP2350_TICK_WATCHDOG);
+    if (event == ClockPreUpdate) {
+        wd_sync(s);
+        return;
+    }
+    s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     wd_restart(s);
 }
 
@@ -221,10 +231,7 @@ static void rp2350_watchdog_hold_reset(Object *obj, ResetType type)
 
 static void rp2350_watchdog_exit_reset(Object *obj, ResetType type)
 {
-    RP2350WatchdogState *s = RP2350_WATCHDOG(obj);
-
-    s->cycles = rp2350_ticks_cycles(s->ticks, RP2350_TICK_WATCHDOG);
-    wd_restart(s);
+    wd_restart(RP2350_WATCHDOG(obj));
 }
 
 /*
@@ -243,17 +250,11 @@ static void rp2350_watchdog_realize(DeviceState *dev, Error **errp)
 {
     RP2350WatchdogState *s = RP2350_WATCHDOG(dev);
 
-    if (!s->ticks) {
-        error_setg(errp, "ticks property was not set");
-        return;
-    }
-    if (!s->ref_hz) {
-        error_setg(errp, "ref-hz property must be set");
+    if (!clock_has_source(s->tick)) {
+        error_setg(errp, "the tick clock must be connected");
         return;
     }
     s->expiry = timer_new_ns(QEMU_CLOCK_VIRTUAL, wd_expired, s);
-    rp2350_ticks_set_notify(s->ticks, RP2350_TICK_WATCHDOG, wd_tick_changed,
-                            s);
 }
 
 static void rp2350_watchdog_init(Object *obj)
@@ -266,30 +267,26 @@ static void rp2350_watchdog_init(Object *obj)
     qdev_init_gpio_out(DEVICE(obj), &s->reset_req, 1);
     qdev_init_gpio_in_named(DEVICE(obj), rp2350_watchdog_chip_reset,
                             RP2350_WATCHDOG_CHIP_RESET, 1);
+    s->tick = qdev_init_clock_in(DEVICE(obj), "tick", wd_tick_changed, s,
+                                 ClockPreUpdate | ClockUpdate);
 }
 
 static const VMStateDescription vmstate_rp2350_watchdog = {
     .name = TYPE_RP2350_WATCHDOG,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
+        VMSTATE_CLOCK(tick, RP2350WatchdogState),
         VMSTATE_TIMER_PTR(expiry, RP2350WatchdogState),
         VMSTATE_UINT32(ctrl, RP2350WatchdogState),
         VMSTATE_UINT32(time, RP2350WatchdogState),
         VMSTATE_INT64(sync_ns, RP2350WatchdogState),
         VMSTATE_BOOL(running, RP2350WatchdogState),
-        VMSTATE_UINT32(cycles, RP2350WatchdogState),
         VMSTATE_UINT32(reason, RP2350WatchdogState),
         VMSTATE_UINT32_ARRAY(scratch, RP2350WatchdogState,
                              RP2350_WATCHDOG_SCRATCH),
         VMSTATE_END_OF_LIST()
     },
-};
-
-static const Property rp2350_watchdog_properties[] = {
-    DEFINE_PROP_LINK("ticks", RP2350WatchdogState, ticks, TYPE_RP2350_TICKS,
-                     RP2350ClkRegsState *),
-    DEFINE_PROP_UINT32("ref-hz", RP2350WatchdogState, ref_hz, 0),
 };
 
 /* [spec:nuos:req:emu.watchdog] */
@@ -302,7 +299,6 @@ static void rp2350_watchdog_class_init(ObjectClass *klass, const void *data)
     dc->vmsd = &vmstate_rp2350_watchdog;
     rc->phases.hold = rp2350_watchdog_hold_reset;
     rc->phases.exit = rp2350_watchdog_exit_reset;
-    device_class_set_props(dc, rp2350_watchdog_properties);
 }
 
 static const TypeInfo rp2350_watchdog_info = {

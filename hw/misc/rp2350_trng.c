@@ -7,7 +7,8 @@
  *
  * Reference: RP2350 Datasheet, "TRNG", and the pico-sdk trng.h register
  * descriptions. The block is Arm's TrustZone TRNG: it samples its own
- * free-running ring oscillator every SAMPLE_CNT1 rng_clk (clk_sys) cycles,
+ * free-running ring oscillator every SAMPLE_CNT1 rng_clk (clk_sys, the
+ * "clk" clock, at its current frequency) cycles,
  * passes the samples through the von Neumann decorrelator and the CRNGT
  * check, and collects 192 bits into the Entropy Holding Register (EHR).
  *
@@ -25,7 +26,7 @@
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "hw/core/irq.h"
-#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_trng.h"
 #include "migration/vmstate.h"
@@ -169,9 +170,22 @@ static uint64_t trng_sample_period(RP2350TRNGState *s)
     return MAX(s->sample_cnt1, 1);
 }
 
+/* [spec:nuos:req:emu.clock-tree] */
 static bool trng_sampling(RP2350TRNGState *s)
 {
-    return s->collecting && (s->rnd_source_enable & 1);
+    return s->collecting && (s->rnd_source_enable & 1) &&
+           clock_is_enabled(s->clk);
+}
+
+/* Virtual time taken by `cycles` rng_clk cycles, rounded up. */
+static int64_t trng_cycles_ns(RP2350TRNGState *s, uint64_t cycles)
+{
+    uint64_t ns = clock_ticks_to_ns(s->clk, cycles);
+
+    while (clock_ns_to_ticks(s->clk, ns) < cycles) {
+        ns++;
+    }
+    return MIN(ns, (uint64_t)INT64_MAX / 2);
 }
 
 /*
@@ -188,12 +202,10 @@ static void trng_sync(RP2350TRNGState *s)
         s->sync_ns = now;
         return;
     }
-    taken = muldiv64(now - s->sync_ns, s->sysclk_hz,
-                     NANOSECONDS_PER_SECOND) / period;
+    taken = clock_ns_to_ticks(s->clk, MAX(now - s->sync_ns, 0)) / period;
     taken = MIN(taken, s->samples_left);
     s->samples_left -= taken;
-    s->sync_ns += muldiv64(taken * period, NANOSECONDS_PER_SECOND,
-                           s->sysclk_hz);
+    s->sync_ns += trng_cycles_ns(s, taken * period);
 }
 
 static void trng_schedule(RP2350TRNGState *s)
@@ -201,9 +213,7 @@ static void trng_schedule(RP2350TRNGState *s)
     if (trng_sampling(s)) {
         uint64_t cycles = s->samples_left * trng_sample_period(s);
 
-        timer_mod(s->timer, s->sync_ns +
-                  muldiv64_round_up(cycles, NANOSECONDS_PER_SECOND,
-                                    s->sysclk_hz));
+        timer_mod(s->timer, s->sync_ns + trng_cycles_ns(s, cycles));
     } else {
         timer_del(s->timer);
     }
@@ -436,6 +446,22 @@ static void rp2350_trng_hold_reset(Object *obj, ResetType type)
     trng_update_irq(s);
 }
 
+/*
+ * rng_clk changes rate, starts or stops: count the samples taken at the
+ * old rate, and the next sample afresh at the new one.
+ */
+static void trng_clk_changed(void *opaque, ClockEvent event)
+{
+    RP2350TRNGState *s = opaque;
+
+    if (event == ClockPreUpdate) {
+        trng_sync(s);
+        return;
+    }
+    s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    trng_schedule(s);
+}
+
 static void rp2350_trng_init(Object *obj)
 {
     RP2350TRNGState *s = RP2350_TRNG(obj);
@@ -445,26 +471,25 @@ static void rp2350_trng_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, trng_collection_done, s);
+    s->clk = qdev_init_clock_in(DEVICE(obj), "clk", trng_clk_changed, s,
+                                ClockPreUpdate | ClockUpdate);
 }
 
 static void rp2350_trng_realize(DeviceState *dev, Error **errp)
 {
     RP2350TRNGState *s = RP2350_TRNG(dev);
 
-    if (!s->sysclk_hz) {
-        error_setg(errp, "sysclk-hz must be non-zero");
+    if (!clock_has_source(s->clk)) {
+        error_setg(errp, "the clk clock must be connected");
     }
 }
 
-static const Property rp2350_trng_properties[] = {
-    DEFINE_PROP_UINT32("sysclk-hz", RP2350TRNGState, sysclk_hz, 150000000),
-};
-
 static const VMStateDescription vmstate_rp2350_trng = {
     .name = TYPE_RP2350_TRNG,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
+        VMSTATE_CLOCK(clk, RP2350TRNGState),
         VMSTATE_TIMER_PTR(timer, RP2350TRNGState),
         VMSTATE_UINT32(imr, RP2350TRNGState),
         VMSTATE_UINT32(isr, RP2350TRNGState),
@@ -495,7 +520,6 @@ static void rp2350_trng_class_init(ObjectClass *klass, const void *data)
     dc->realize = rp2350_trng_realize;
     rc->phases.hold = rp2350_trng_hold_reset;
     dc->vmsd = &vmstate_rp2350_trng;
-    device_class_set_props(dc, rp2350_trng_properties);
 }
 
 /* [spec:nuos:req:emu.rosc-trng] */

@@ -9,6 +9,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "libqtest.h"
+#include "rp2350-clocks.h"
 #include "rp2350-resets.h"
 
 #define XOR                 0x1000
@@ -67,6 +68,7 @@ static QTestState *start(void)
 {
     QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
 
+    rp2350_clocks_init(qts);
     rp2350_unreset(qts, RP2350_RESETS_ALL);
     return qts;
 }

@@ -957,6 +957,10 @@ static void rp2350_hstx_clk_update(void *opaque, ClockEvent event)
 {
     RP2350HSTXState *s = opaque;
 
+    /* A block held in reset counts nothing: it restarts at the exit. */
+    if (device_is_in_reset(DEVICE(s))) {
+        return;
+    }
     if (event == ClockPreUpdate) {
         hstx_sync(s);
         s->base_ns = hstx_now();

@@ -13,6 +13,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-clocks.h"
 #include "rp2350-resets.h"
 
 #define ALIAS_XOR       0x1000
@@ -139,6 +140,7 @@ static QTestState *start(void)
     QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
 
     qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");
+    rp2350_clocks_init(qts);
     rp2350_unreset(qts, RP2350_RESETS_ALL);
     return qts;
 }
@@ -1110,6 +1112,7 @@ static void test_dreq(void)
     qtest_irq_intercept_out_named(qts, "/machine/soc/pio", "dreq");
     /* A reset drives every line, now that they are watched. */
     qtest_system_reset(qts);
+    rp2350_clocks_init(qts);
     rp2350_unreset(qts, RP2350_RESETS_ALL);
     /* TX DREQs are up while the FIFO has room; RX DREQs are down. */
     g_assert_true(qtest_get_irq(qts, 8 + 1));
@@ -1174,6 +1177,7 @@ static void test_hstx_coupling(void)
 
     qtest_irq_intercept_out_named(qts, "/machine/soc/pio", "hstx");
     qtest_system_reset(qts);
+    rp2350_clocks_init(qts);
     rp2350_unreset(qts, RP2350_RESETS_ALL);
     /* PIO2's outputs for GPIOs 12-19 reach HSTX, routed to a pin or not. */
     wr(qts, 2, PINCTRL(0), PIN_SET(5, 13));

@@ -9,6 +9,7 @@
 #ifndef HW_MISC_RP2350_XIP_H
 #define HW_MISC_RP2350_XIP_H
 
+#include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
 #include "hw/ssi/ssi.h"
 #include "qemu/fifo32.h"
@@ -98,7 +99,8 @@ struct RP2350XIPState {
 
     /* Properties: the size of the device on each chip select (0: none). */
     uint32_t cs_size[RP2350_QMI_CS];
-    uint32_t sysclk_hz;
+    /* clk_sys, which the QMI runs from. */
+    Clock *clk;
 
     /* XIP_CTRL */
     uint32_t ctrl;

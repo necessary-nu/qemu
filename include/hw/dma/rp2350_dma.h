@@ -36,6 +36,7 @@
 #ifndef HW_DMA_RP2350_DMA_H
 #define HW_DMA_RP2350_DMA_H
 
+#include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
 #include "hw/misc/rp2350_accessctrl.h"
 #include "hw/misc/rp2350_busctrl.h"
@@ -109,7 +110,8 @@ struct RP2350DMAState {
     RP2350BusCtrlState *busctrl;
     /* The global exclusive monitor, which watches the DMA's writes */
     RP2350ExclMonState *exclmon;
-    uint32_t sysclk_hz;
+    /* clk_sys, whose cycles the engine counts. */
+    Clock *clk;
 
     QEMUTimer *timer;
     QEMUBH *bh;
@@ -149,6 +151,9 @@ struct RP2350DMAState {
 
     /* clk_sys cycles the transfer engine has run up to. */
     uint64_t cycle;
+    /* Cycle base_cycle was reached at virtual time base_ns. */
+    uint64_t base_cycle;
+    int64_t base_ns;
     bool running;
 };
 

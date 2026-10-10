@@ -776,6 +776,10 @@ static void rp2350_pwm_clk_update(void *opaque, ClockEvent event)
 {
     RP2350PWMState *s = opaque;
 
+    /* A block held in reset counts nothing: it restarts at the exit. */
+    if (device_is_in_reset(DEVICE(s))) {
+        return;
+    }
     if (event == ClockPreUpdate) {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         uint64_t cycle = pwm_cycle_at(s, now);

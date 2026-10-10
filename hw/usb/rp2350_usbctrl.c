@@ -29,9 +29,13 @@
  * each device endpoint's toggle as a device would, which lets it raise
  * DATA_SEQ_ERROR when software's PIDs go out of step.
  *
- * Transactions take bus time at 12 Mb/s (1.5 Mb/s for a low-speed
- * device), frames are 1 ms of QEMU_CLOCK_VIRTUAL, and a NAKed EPX
- * transaction is retried after NAK_POLL's delay.
+ * The controller and its PHY run from clk_usb (the "clk" clock), which
+ * must be 48 MHz for the bus to work: transactions take 4 clk_usb cycles
+ * a bit (12 Mb/s; 32 for a low-speed device at 1.5 Mb/s), frames are
+ * 48000 cycles (1 ms), the SOF timestamps count clk_usb cycles, and a
+ * NAKed EPX transaction is retried after NAK_POLL's delay. While clk_usb
+ * is stopped the PHY is dead: the device is not on the bus and the host
+ * controller runs no frames or transactions.
  *
  * Not modelled: the PHY's direct drive (SIE_CTRL.DIRECT_*, USBPHY_DIRECT
  * overrides and the DP/DM pins as GPIO), the external PHY and digital-pad
@@ -46,6 +50,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/misc/rp2350_atomic.h"
@@ -257,14 +262,16 @@
 
 #define DPRAM_MASK                  (RP2350_USBCTRL_DPRAM_SIZE - 1)
 
-/* Full-speed bit time, and the bytes of a transaction besides its data. */
-#define FS_BIT_NS                   (NANOSECONDS_PER_SECOND / 12000000)
-#define LS_BIT_NS                   (8 * FS_BIT_NS)
+/*
+ * clk_usb cycles of a full-speed and a low-speed bit and of a frame; the
+ * bytes of a transaction besides its data; and the frames of bus idle
+ * that suspend a device.
+ */
+#define FS_BIT_CYCLES               4
+#define LS_BIT_CYCLES               (8 * FS_BIT_CYCLES)
+#define FRAME_CYCLES                48000
 #define XACT_OVERHEAD_BYTES         13
-#define FRAME_NS                    (NANOSECONDS_PER_SECOND / 1000)
-/* Bus idle that suspends a device, and the 48 MHz PHY clock. */
-#define SUSPEND_NS                  (3 * FRAME_NS)
-#define PHY_CLK_HZ                  48000000
+#define SUSPEND_FRAMES              3
 
 enum {
     EPX_PHASE_SETUP,
@@ -358,10 +365,33 @@ static bool overcurrent(RP2350USBCtrlState *s)
     return s->overcurr_in;
 }
 
-/* The controller drives the PHY, which is connected to the port. */
+/* Virtual time of `cycles` clk_usb cycles. */
+/* [spec:nuos:req:emu.clock-tree] */
+static int64_t usb_cycles_ns(RP2350USBCtrlState *s, uint64_t cycles)
+{
+    return clock_ticks_to_ns(s->clk, cycles);
+}
+
+/* clk_usb cycles counted by the PHY: SOF_TIMESTAMP_RAW's counter. */
+static uint64_t phy_cycles(RP2350USBCtrlState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (now <= s->phy_base_ns) {
+        return s->phy_base;
+    }
+    return s->phy_base + clock_ns_to_ticks(s->clk, now - s->phy_base_ns);
+}
+
+/*
+ * The controller drives the PHY, which is connected to the port, and
+ * clk_usb runs.
+ */
+/* [spec:nuos:req:emu.clock-tree] */
 static bool phy_live(RP2350USBCtrlState *s)
 {
-    return (s->main_ctrl & MAIN_CTRL_CONTROLLER_EN) &&
+    return clock_is_enabled(s->clk) &&
+           (s->main_ctrl & MAIN_CTRL_CONTROLLER_EN) &&
            !(s->main_ctrl & MAIN_CTRL_PHY_ISO) &&
            (s->usb_muxing & USB_MUXING_TO_PHY) &&
            !(s->sie_ctrl & SIE_CTRL_TRANSCEIVER_PD);
@@ -589,8 +619,9 @@ static void dev_bus_activity(RP2350USBCtrlState *s, bool reset)
             s->intr_events |= INTR_DEV_RESUME_FROM_HOST;
         }
     }
-    timer_mod(s->dev_idle_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SUSPEND_NS);
+    timer_mod(s->dev_idle_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                 usb_cycles_ns(s, SUSPEND_FRAMES *
+                                                  FRAME_CYCLES));
 }
 
 /* [spec:nuos:req:emu.usb] */
@@ -623,7 +654,8 @@ void rp2350_usbctrl_update_dev_port(RP2350USBCtrlState *s)
         s->dev_present = present;
         if (present) {
             timer_mod(s->dev_idle_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SUSPEND_NS);
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      usb_cycles_ns(s, SUSPEND_FRAMES * FRAME_CYCLES));
         } else {
             timer_del(s->dev_idle_timer);
             s->dev_suspended = false;
@@ -675,9 +707,7 @@ void rp2350_usbctrl_dev_sof(RP2350USBCtrlState *s, uint16_t frame)
     }
     dev_bus_activity(s, false);
     s->sof_rd = frame & FRAME_MASK;
-    s->sof_timestamp_last = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                                     PHY_CLK_HZ, NANOSECONDS_PER_SECOND) &
-                            SOF_TIMESTAMP_MASK;
+    s->sof_timestamp_last = phy_cycles(s) & SOF_TIMESTAMP_MASK;
     s->intr_events |= INTR_DEV_SOF;
     usb_update_irq(s);
 }
@@ -908,7 +938,8 @@ static USBDevice *host_root(RP2350USBCtrlState *s)
 
 static int64_t host_bit_ns(RP2350USBCtrlState *s)
 {
-    return s->host_speed == 1 ? LS_BIT_NS : FS_BIT_NS;
+    return usb_cycles_ns(s, s->host_speed == 1 ? LS_BIT_CYCLES
+                                               : FS_BIT_CYCLES);
 }
 
 static int64_t host_xact_ns(RP2350USBCtrlState *s, uint32_t len)
@@ -948,7 +979,7 @@ static void host_update_port(RP2350USBCtrlState *s)
         (s->sie_ctrl & (SIE_CTRL_SOF_EN | SIE_CTRL_KEEP_ALIVE_EN))) {
         if (!timer_pending(s->host_frame_timer)) {
             s->host_frame_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                               FRAME_NS;
+                               usb_cycles_ns(s, FRAME_CYCLES);
             timer_mod(s->host_frame_timer, s->host_frame_ns);
         }
     } else {
@@ -1333,7 +1364,7 @@ static void host_frame(void *opaque)
     if (!host_active(s)) {
         return;
     }
-    s->host_frame_ns += FRAME_NS;
+    s->host_frame_ns += usb_cycles_ns(s, FRAME_CYCLES);
     timer_mod(s->host_frame_timer, s->host_frame_ns);
     s->sof_rd = s->sof_wr;
     s->sof_wr = (s->sof_wr + 1) & FRAME_MASK;
@@ -1545,8 +1576,7 @@ static uint32_t usb_reg_read(RP2350USBCtrlState *s, hwaddr reg)
     case A_INTS:
         return usb_ints(s);
     case A_SOF_TIMESTAMP_RAW:
-        return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), PHY_CLK_HZ,
-                        NANOSECONDS_PER_SECOND) & SOF_TIMESTAMP_MASK;
+        return phy_cycles(s) & SOF_TIMESTAMP_MASK;
     case A_SOF_TIMESTAMP_LAST:
         return s->sof_timestamp_last;
     case A_SM_STATE:
@@ -1893,6 +1923,8 @@ static void rp2350_usbctrl_reset_hold(Object *obj, ResetType type)
     s->inte = 0;
     s->intf = 0;
     s->sof_timestamp_last = 0;
+    s->phy_base = 0;
+    s->phy_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->ep_tx_error = 0;
     s->ep_rx_error = 0;
     s->dev_sm_watchdog = 0;
@@ -1923,6 +1955,31 @@ static void rp2350_usbctrl_reset_exit(Object *obj, ResetType type)
     usb_update_irq(s);
 }
 
+/*
+ * clk_usb changes rate, starts or stops: the PHY's cycle count continues
+ * at the new rate, and the PHY comes alive or dies with the clock.
+ */
+static void rp2350_usbctrl_clk_changed(void *opaque, ClockEvent event)
+{
+    RP2350USBCtrlState *s = opaque;
+    uint32_t hz;
+
+    if (event == ClockPreUpdate) {
+        s->phy_base = phy_cycles(s);
+        s->phy_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        return;
+    }
+    hz = clock_get_hz(s->clk);
+    if (hz && (hz < 47880000 || hz > 48120000)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "rp2350-usbctrl: clk_usb at %u Hz "
+                      "is not 48 MHz +/- 0.25%%: the bus would not work\n",
+                      hz);
+    }
+    if (s->host_timer) {
+        usb_update_ports(s);
+    }
+}
+
 static void rp2350_usbctrl_init(Object *obj)
 {
     RP2350USBCtrlState *s = RP2350_USBCTRL(obj);
@@ -1941,6 +1998,8 @@ static void rp2350_usbctrl_init(Object *obj)
                             RP2350_USBCTRL_OVERCURR_DETECT, 1);
     qdev_init_gpio_out_named(DEVICE(obj), &s->vbus_en, RP2350_USBCTRL_VBUS_EN,
                              1);
+    s->clk = qdev_init_clock_in(DEVICE(obj), "clk", rp2350_usbctrl_clk_changed,
+                                s, ClockPreUpdate | ClockUpdate);
 }
 
 static void rp2350_usbctrl_realize(DeviceState *dev, Error **errp)
@@ -1979,8 +2038,8 @@ static int rp2350_usbctrl_pre_save(void *opaque)
 
 static const VMStateDescription vmstate_rp2350_usbctrl = {
     .name = TYPE_RP2350_USBCTRL,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .pre_save = rp2350_usbctrl_pre_save,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(dpram, RP2350USBCtrlState,
@@ -2010,6 +2069,9 @@ static const VMStateDescription vmstate_rp2350_usbctrl = {
         VMSTATE_UINT32(inte, RP2350USBCtrlState),
         VMSTATE_UINT32(intf, RP2350USBCtrlState),
         VMSTATE_UINT32(sof_timestamp_last, RP2350USBCtrlState),
+        VMSTATE_CLOCK(clk, RP2350USBCtrlState),
+        VMSTATE_UINT64(phy_base, RP2350USBCtrlState),
+        VMSTATE_INT64(phy_base_ns, RP2350USBCtrlState),
         VMSTATE_UINT32(ep_tx_error, RP2350USBCtrlState),
         VMSTATE_UINT32(ep_rx_error, RP2350USBCtrlState),
         VMSTATE_UINT32(dev_sm_watchdog, RP2350USBCtrlState),

@@ -26,12 +26,17 @@
  * datasheet calls the ROSC's. RANDOMBIT samples the host's random source
  * while the oscillator runs.
  *
+ * The divider's two outputs, rosc_clksrc and the phase-shifted
+ * rosc_clksrc_ph, are clocks at that frequency while the oscillator is
+ * enabled and stable, about 1us after it starts; the phase-shifted output
+ * also needs PHASE.ENABLE, or a PHASE password other than 0xaa. A shift
+ * of the phase does not change the frequency.
+ *
  * Writing the DORMANT keyword to DORMANT stops the oscillator until a
  * DORMANT wake event (the GPIO banks' dormant_wake interrupt or the AON
  * timer alarm, on the "dormant-wake" input). It then restarts in the same
- * configuration, and its output is ungated once it is stable, about 1us
- * later. The "dormant" output is high from entry until then, while the
- * SoC stops every clock running from the ROSC.
+ * configuration, and its output clocks run again once it is stable,
+ * about 1us later.
  */
 
 #include "qemu/osdep.h"
@@ -40,6 +45,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_rosc.h"
 #include "migration/vmstate.h"
@@ -88,6 +94,7 @@
 #define PHASE_PASSWD_SHIFT  4
 #define PHASE_PASSWD_MASK   0xffu
 #define PHASE_PASSWD        0xaau
+#define PHASE_ENABLE        0x8u
 #define PHASE_RESET         0x8u
 
 #define STATUS_ENABLED      (1u << 12)
@@ -230,15 +237,37 @@ static uint32_t rosc_status(RP2350ROSCState *s)
     return st;
 }
 
-bool rp2350_rosc_dormant(RP2350ROSCState *s)
+/*
+ * Drive the divider's outputs: running once the oscillator is enabled and
+ * stable and DORMANT does not gate it.
+ */
+/* [spec:nuos:req:emu.clock-tree] */
+static void rosc_update_clocks(RP2350ROSCState *s)
 {
-    return s->gated;
+    bool phase_on = ((s->phase >> PHASE_PASSWD_SHIFT) & PHASE_PASSWD_MASK) !=
+                    PHASE_PASSWD || (s->phase & PHASE_ENABLE);
+    uint32_t hz = 0;
+
+    if (rosc_running(s) && !s->gated &&
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->stable_ns) {
+        hz = rosc_output_hz(s);
+    }
+    clock_update_hz(s->out, hz);
+    clock_update_hz(s->out_ph, phase_on ? hz : 0);
+}
+
+/* [spec:nuos:req:emu.clock-tree] */
+void rp2350_rosc_boot_rom_handoff(RP2350ROSCState *s)
+{
+    rosc_count_sync(s);
+    s->div = DIV_PASS + 2;
+    rosc_update_clocks(s);
 }
 
 static void rosc_set_gated(RP2350ROSCState *s, bool gated)
 {
     s->gated = gated;
-    qemu_set_irq(s->dormant_irq, gated);
+    rosc_update_clocks(s);
 }
 
 /*
@@ -266,9 +295,10 @@ static void rosc_startup_cb(void *opaque)
 {
     RP2350ROSCState *s = opaque;
 
-    if (!s->dormant_stopped) {
+    if (!s->dormant_stopped && s->gated) {
         rosc_set_gated(s, false);
     }
+    rosc_update_clocks(s);
 }
 
 /* [spec:nuos:req:emu.rosc-trng] */
@@ -350,7 +380,9 @@ static void rosc_write_ctrl(RP2350ROSCState *s, uint32_t value)
         s->stable_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                        ROSC_STARTUP_NS;
         s->count_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        timer_mod(s->startup_timer, s->stable_ns);
     }
+    rosc_update_clocks(s);
 }
 
 static uint32_t rosc_write_freq(RP2350ROSCState *s, uint32_t value,
@@ -380,10 +412,12 @@ static void rp2350_rosc_write(void *opaque, hwaddr addr, uint64_t value64,
     case A_FREQA:
         s->freqa = rp2350_atomic_apply(addr, s->freqa, value) & FREQA_MASK;
         s->freqa_applied = rosc_write_freq(s, s->freqa, FREQA_MASK);
+        rosc_update_clocks(s);
         break;
     case A_FREQB:
         s->freqb = rp2350_atomic_apply(addr, s->freqb, value) & FREQB_MASK;
         s->freqb_applied = rosc_write_freq(s, s->freqb, FREQB_MASK);
+        rosc_update_clocks(s);
         break;
     case A_RANDOM:
         /* Seeds and restarts the LFSR that randomises stages 0 and 1. */
@@ -405,19 +439,20 @@ static void rp2350_rosc_write(void *opaque, hwaddr addr, uint64_t value64,
         }
         rosc_count_sync(s);
         s->div = value;
+        rosc_update_clocks(s);
         break;
     case A_PHASE:
         value = rp2350_atomic_apply(addr, s->phase, value) & PHASE_MASK;
         /*
          * Any other password enables the phase-shifted output with no
-         * shift. The phase-shifted output only feeds clock muxes, whose
-         * clocks are not modelled.
+         * shift.
          */
         if (((value >> PHASE_PASSWD_SHIFT) & PHASE_PASSWD_MASK) !=
             PHASE_PASSWD) {
             s->badwrite = true;
         }
         s->phase = value;
+        rosc_update_clocks(s);
         break;
     case A_STATUS:
         /* BADWRITE is write-1-to-clear through any alias. */
@@ -481,7 +516,7 @@ static void rp2350_rosc_exit_reset(Object *obj, ResetType type)
 {
     RP2350ROSCState *s = RP2350_ROSC(obj);
 
-    qemu_set_irq(s->dormant_irq, s->gated);
+    rosc_update_clocks(s);
 }
 
 static void rp2350_rosc_init(Object *obj)
@@ -494,15 +529,17 @@ static void rp2350_rosc_init(Object *obj)
     s->startup_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rosc_startup_cb, s);
     qdev_init_gpio_in_named(DEVICE(obj), rosc_set_wake,
                             RP2350_OSC_DORMANT_WAKE, 1);
-    qdev_init_gpio_out_named(DEVICE(obj), &s->dormant_irq,
-                             RP2350_OSC_DORMANT, 1);
+    s->out = qdev_init_clock_out(DEVICE(obj), RP2350_ROSC_CLK);
+    s->out_ph = qdev_init_clock_out(DEVICE(obj), RP2350_ROSC_CLK_PH);
 }
 
 static const VMStateDescription vmstate_rp2350_rosc = {
     .name = TYPE_RP2350_ROSC,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
+        VMSTATE_CLOCK(out, RP2350ROSCState),
+        VMSTATE_CLOCK(out_ph, RP2350ROSCState),
         VMSTATE_UINT32(ctrl, RP2350ROSCState),
         VMSTATE_UINT32(freqa, RP2350ROSCState),
         VMSTATE_UINT32(freqb, RP2350ROSCState),

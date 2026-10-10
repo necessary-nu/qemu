@@ -17,6 +17,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-clocks.h"
 #include "rp2350-resets.h"
 
 #define ALIAS_SET       0x2000
@@ -186,6 +187,7 @@ static QTestState *start(void)
         rom_path, EEPROM);
 
     qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");
+    rp2350_clocks_init(qts);
     rp2350_unreset(qts, RESET_DMA | RESET_I2C0 | RESET_I2C1 | RESET_IO_BANK0 |
                    RESET_PADS_BANK0);
     return qts;

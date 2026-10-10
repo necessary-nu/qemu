@@ -9,8 +9,8 @@
 #ifndef HW_WATCHDOG_RP2350_WATCHDOG_H
 #define HW_WATCHDOG_RP2350_WATCHDOG_H
 
+#include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
-#include "hw/misc/rp2350_clocks.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -39,21 +39,15 @@ struct RP2350WatchdogState {
     QEMUTimer *expiry;
     qemu_irq reset_req;
 
-    /* The TICKS block, whose WATCHDOG generator clocks the counter. */
-    RP2350ClkRegsState *ticks;
-    /* clk_ref, which the TICKS generators divide. */
-    uint32_t ref_hz;
+    /* The TICKS block's WATCHDOG tick, which clocks the counter. */
+    Clock *tick;
 
     /* CTRL's ENABLE and PAUSE_* bits. */
     uint32_t ctrl;
-    /*
-     * The counter as of virtual time sync_ns, whether it has counted since,
-     * and the generator's CYCLES in effect since.
-     */
+    /* The counter as of virtual time sync_ns; whether it has counted since. */
     uint32_t time;
     int64_t sync_ns;
     bool running;
-    uint32_t cycles;
     uint32_t reason;
     uint32_t scratch[RP2350_WATCHDOG_SCRATCH];
 };

@@ -9,6 +9,7 @@
 #ifndef HW_MISC_RP2350_TRNG_H
 #define HW_MISC_RP2350_TRNG_H
 
+#include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -25,8 +26,8 @@ struct RP2350TRNGState {
     QEMUTimer *timer;
     qemu_irq irq;
 
-    /* rng_clk, which times SAMPLE_CNT1. */
-    uint32_t sysclk_hz;
+    /* rng_clk (clk_sys), which times SAMPLE_CNT1. */
+    Clock *clk;
 
     uint32_t imr;
     uint32_t isr;

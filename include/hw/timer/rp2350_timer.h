@@ -9,8 +9,8 @@
 #ifndef HW_TIMER_RP2350_TIMER_H
 #define HW_TIMER_RP2350_TIMER_H
 
+#include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
-#include "hw/misc/rp2350_clocks.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -28,19 +28,14 @@ struct RP2350TimerState {
     int64_t alarm_due_ns[RP2350_TIMER_ALARMS];
     qemu_irq irq[RP2350_TIMER_ALARMS];
 
-    /* The TICKS block and the generator that clocks this timer. */
-    RP2350ClkRegsState *ticks;
-    uint32_t tick;
-    /* The frequencies of clk_ref, which the tick divides, and clk_sys. */
-    uint32_t ref_hz;
-    uint32_t sysclk_hz;
+    /* Its TICKS generator's tick, and clk_sys. */
+    Clock *tick;
+    Clock *clk_sys;
 
     /* The counter as of virtual time sync_ns, and whether it was running. */
     uint64_t count;
     int64_t sync_ns;
     bool running;
-    /* The generator's CYCLES the counter is running at. */
-    uint32_t cycles;
 
     uint32_t timelw;
     uint32_t latched_hi;

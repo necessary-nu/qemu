@@ -9,6 +9,7 @@
 #ifndef HW_USB_RP2350_USBCTRL_H
 #define HW_USB_RP2350_USBCTRL_H
 
+#include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
 #include "hw/usb/usb.h"
 #include "chardev/char-fe.h"
@@ -166,6 +167,11 @@ struct RP2350USBCtrlState {
     /* The host is driving a bus reset. */
     bool dev_bus_reset;
     QEMUTimer *dev_idle_timer;
+
+    /* clk_usb, and its cycle phy_base, reached at virtual time phy_base_ns. */
+    Clock *clk;
+    uint64_t phy_base;
+    int64_t phy_base_ns;
 
     /* Host controller */
     USBBus bus;

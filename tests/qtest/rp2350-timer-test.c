@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-clocks.h"
 #include "rp2350-resets.h"
 
 #define TIMER0      0x400b0000
@@ -52,6 +53,7 @@ static QTestState *start(bool intercept)
 {
     QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
 
+    rp2350_clocks_init(qts);
     rp2350_unreset(qts, RP2350_RESETS_ALL);
     if (intercept) {
         qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");

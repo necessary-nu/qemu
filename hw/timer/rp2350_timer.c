@@ -7,17 +7,18 @@
  *
  * Reference: RP2350 Datasheet, "System timers". The 64-bit counter
  * follows QEMU's virtual clock, counting the ticks of its TICKS generator
- * (one every CYCLES clk_ref cycles; a microsecond once software sets
- * CYCLES to clk_ref's frequency in MHz) or, when SOURCE selects it,
- * clk_sys cycles. It stops while paused, while that tick generator is
- * disabled or has CYCLES 0, or while the clock it counts is stopped
- * (DORMANT). Debug pause is not modelled.
+ * (the "tick" clock: one every CYCLES clk_ref cycles; a microsecond once
+ * software sets CYCLES to clk_ref's frequency in MHz) or, when SOURCE
+ * selects it, clk_sys cycles (the "clk-sys" clock), at the clock's
+ * current rate. It stops while paused and while the clock it counts is
+ * stopped. Debug pause is not modelled.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/timer/rp2350_timer.h"
@@ -43,23 +44,17 @@
 
 #define ALARM_MASK  0xf
 
-/*
- * The counter advances once every timer_div() cycles of a clock running
- * at timer_hz(): clk_ref divided by the generator's CYCLES, or clk_sys.
- */
-static uint64_t timer_hz(RP2350TimerState *s)
+/* The clock the counter counts: its tick, or clk_sys. */
+/* [spec:nuos:req:emu.clock-tree] */
+static Clock *timer_clock(RP2350TimerState *s)
 {
-    return s->source ? s->sysclk_hz : s->ref_hz;
-}
-
-static uint64_t timer_div(RP2350TimerState *s)
-{
-    return s->source ? 1 : s->cycles;
+    return s->source ? s->clk_sys : s->tick;
 }
 
 /*
  * The counter stops while the timer is held in reset, and while the clock
- * it counts (its tick, or clk_sys) is stopped, as by DORMANT.
+ * it counts is stopped (a tick generator that is disabled or has CYCLES 0,
+ * or clk_ref or clk_sys stopped).
  */
 /* [spec:nuos:req:emu.resets] */
 /* [spec:nuos:req:emu.timer] */
@@ -68,18 +63,19 @@ static bool timer_should_run(RP2350TimerState *s)
     if (s->pause || device_is_in_reset(DEVICE(s))) {
         return false;
     }
-    if (s->source) {
-        return rp2350_ticks_sys_running(s->ticks);
-    }
-    /* A generator with CYCLES 0 never completes a tick. */
-    return s->cycles && rp2350_ticks_running(s->ticks, s->tick);
+    return clock_is_enabled(timer_clock(s));
 }
 
 /* Virtual time taken by n counts at the current rate, rounded up. */
 static int64_t timer_counts_ns(RP2350TimerState *s, uint64_t n)
 {
-    return muldiv64_round_up(n * timer_div(s), NANOSECONDS_PER_SECOND,
-                             timer_hz(s));
+    Clock *clk = timer_clock(s);
+    uint64_t ns = clock_ticks_to_ns(clk, n);
+
+    while (clock_ns_to_ticks(clk, ns) < n) {
+        ns++;
+    }
+    return MIN(ns, (uint64_t)INT64_MAX / 2);
 }
 
 /* Whole counts since sync_ns. */
@@ -88,8 +84,7 @@ static uint64_t timer_elapsed(RP2350TimerState *s, int64_t now)
     if (!s->running || now <= s->sync_ns) {
         return 0;
     }
-    return muldiv64(now - s->sync_ns, timer_hz(s), NANOSECONDS_PER_SECOND) /
-           timer_div(s);
+    return clock_ns_to_ticks(timer_clock(s), now - s->sync_ns);
 }
 
 static uint64_t timer_count(RP2350TimerState *s, int64_t now)
@@ -164,29 +159,44 @@ static void timer_sync(RP2350TimerState *s)
     s->sync_ns += timer_counts_ns(s, n);
 }
 
-/*
- * Take up the generator's CYCLES and re-evaluate whether the counter
- * runs, after a timer_sync() at the old rate. A change of rate starts the
- * next count afresh.
- */
+/* Re-evaluate whether the counter runs, after a timer_sync(). */
 static void timer_restart(RP2350TimerState *s)
 {
-    uint64_t hz = timer_hz(s), div = timer_div(s);
-
-    s->cycles = rp2350_ticks_cycles(s->ticks, s->tick);
     s->running = timer_should_run(s);
-    if (timer_hz(s) != hz || timer_div(s) != div) {
-        s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    }
     timer_schedule(s);
 }
 
-static void timer_tick_changed(void *opaque)
+/*
+ * The clock the counter counts changes rate, starts or stops: count up to
+ * the change at the old rate, then start the next count afresh at the
+ * new one.
+ */
+static void timer_clock_changed(RP2350TimerState *s, Clock *clk,
+                                ClockEvent event)
+{
+    if (clk != timer_clock(s)) {
+        return;
+    }
+    if (event == ClockPreUpdate) {
+        timer_sync(s);
+        return;
+    }
+    s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    timer_restart(s);
+}
+
+static void timer_tick_changed(void *opaque, ClockEvent event)
 {
     RP2350TimerState *s = opaque;
 
-    timer_sync(s);
-    timer_restart(s);
+    timer_clock_changed(s, s->tick, event);
+}
+
+static void timer_sys_changed(void *opaque, ClockEvent event)
+{
+    RP2350TimerState *s = opaque;
+
+    timer_clock_changed(s, s->clk_sys, event);
 }
 
 /* Fire every armed alarm whose target the counter has reached. */
@@ -258,7 +268,7 @@ static void rp2350_timer_write(void *opaque, hwaddr addr, uint64_t value,
 {
     RP2350TimerState *s = opaque;
     hwaddr reg = rp2350_atomic_reg(addr);
-    uint64_t hz, div;
+    uint32_t source;
     int n;
 
     switch (reg) {
@@ -300,10 +310,10 @@ static void rp2350_timer_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     case A_SOURCE:
         timer_sync(s);
-        hz = timer_hz(s);
-        div = timer_div(s);
-        s->source = rp2350_atomic_apply(addr, s->source, value) & 1;
-        if (timer_hz(s) != hz || timer_div(s) != div) {
+        source = rp2350_atomic_apply(addr, s->source, value) & 1;
+        if (source != s->source) {
+            /* A change of clock starts the next count afresh. */
+            s->source = source;
             s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         }
         timer_restart(s);
@@ -355,7 +365,6 @@ static void rp2350_timer_hold_reset(Object *obj, ResetType type)
     s->count = 0;
     s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->running = false;
-    s->cycles = 0;
     s->timelw = 0;
     s->latched_hi = 0;
     s->armed = 0;
@@ -383,23 +392,14 @@ static void rp2350_timer_realize(DeviceState *dev, Error **errp)
     RP2350TimerState *s = RP2350_TIMER(dev);
     int i;
 
-    if (!s->ticks) {
-        error_setg(errp, "ticks property was not set");
-        return;
-    }
-    if (s->tick >= RP2350_NUM_TICKS) {
-        error_setg(errp, "tick must be a TICKS generator index");
-        return;
-    }
-    if (!s->ref_hz || !s->sysclk_hz) {
-        error_setg(errp, "ref-hz and sysclk-hz must be set");
+    if (!clock_has_source(s->tick) || !clock_has_source(s->clk_sys)) {
+        error_setg(errp, "the tick and clk-sys clocks must be connected");
         return;
     }
     for (i = 0; i < RP2350_TIMER_ALARMS; i++) {
         s->alarm_timer[i] = timer_new_ns(QEMU_CLOCK_VIRTUAL, timer_alarm_cb,
                                          s);
     }
-    rp2350_ticks_set_notify(s->ticks, s->tick, timer_tick_changed, s);
 }
 
 static void rp2350_timer_init(Object *obj)
@@ -413,13 +413,19 @@ static void rp2350_timer_init(Object *obj)
     for (i = 0; i < RP2350_TIMER_ALARMS; i++) {
         sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[i]);
     }
+    s->tick = qdev_init_clock_in(DEVICE(obj), "tick", timer_tick_changed, s,
+                                 ClockPreUpdate | ClockUpdate);
+    s->clk_sys = qdev_init_clock_in(DEVICE(obj), "clk-sys", timer_sys_changed,
+                                    s, ClockPreUpdate | ClockUpdate);
 }
 
 static const VMStateDescription vmstate_rp2350_timer = {
     .name = TYPE_RP2350_TIMER,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
+        VMSTATE_CLOCK(tick, RP2350TimerState),
+        VMSTATE_CLOCK(clk_sys, RP2350TimerState),
         VMSTATE_TIMER_PTR_ARRAY(alarm_timer, RP2350TimerState,
                                 RP2350_TIMER_ALARMS),
         VMSTATE_INT64_ARRAY(alarm_due_ns, RP2350TimerState,
@@ -427,7 +433,6 @@ static const VMStateDescription vmstate_rp2350_timer = {
         VMSTATE_UINT64(count, RP2350TimerState),
         VMSTATE_INT64(sync_ns, RP2350TimerState),
         VMSTATE_BOOL(running, RP2350TimerState),
-        VMSTATE_UINT32(cycles, RP2350TimerState),
         VMSTATE_UINT32(timelw, RP2350TimerState),
         VMSTATE_UINT32(latched_hi, RP2350TimerState),
         VMSTATE_UINT32_ARRAY(alarm, RP2350TimerState, RP2350_TIMER_ALARMS),
@@ -443,14 +448,6 @@ static const VMStateDescription vmstate_rp2350_timer = {
     },
 };
 
-static const Property rp2350_timer_properties[] = {
-    DEFINE_PROP_LINK("ticks", RP2350TimerState, ticks, TYPE_RP2350_TICKS,
-                     RP2350ClkRegsState *),
-    DEFINE_PROP_UINT32("tick", RP2350TimerState, tick, RP2350_NUM_TICKS),
-    DEFINE_PROP_UINT32("ref-hz", RP2350TimerState, ref_hz, 0),
-    DEFINE_PROP_UINT32("sysclk-hz", RP2350TimerState, sysclk_hz, 0),
-};
-
 static void rp2350_timer_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -460,7 +457,6 @@ static void rp2350_timer_class_init(ObjectClass *klass, const void *data)
     dc->vmsd = &vmstate_rp2350_timer;
     rc->phases.hold = rp2350_timer_hold_reset;
     rc->phases.exit = rp2350_timer_exit_reset;
-    device_class_set_props(dc, rp2350_timer_properties);
 }
 
 static const TypeInfo rp2350_timer_info = {

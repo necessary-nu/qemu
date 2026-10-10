@@ -278,7 +278,9 @@ static void pl011_loopback_tx(PL011State *s, uint32_t value)
  * start bit half a bit later and samples each following bit one bit
  * period apart, once in the middle of the bit rather than as a majority
  * of three. UARTEN, TXE and RXE gate the start of a frame; a frame in
- * progress completes, as on hardware.
+ * progress completes, as on hardware. The frames follow UARTCLK: a change
+ * of its rate takes effect from the change, and while it is stopped the
+ * frames in progress hold where they are and no frame starts.
  */
 
 /* Time of `ticks` Baud16 periods at divisor `brd`. */
@@ -405,6 +407,10 @@ static void pl011_line_tx_start(PL011State *s, int64_t now)
     if (s->tx_busy || s->tx_count == 0 || (s->lcr & LCR_BRK) ||
         (s->cr & (CR_UARTEN | CR_TXE)) != (CR_UARTEN | CR_TXE) ||
         ((s->cr & CR_CTSEN) && s->ncts_level)) {
+        return;
+    }
+    if (!clock_get_hz(s->clk)) {
+        /* UARTCLK is stopped: the frame waits for it to run. */
         return;
     }
     if (!pl011_baud_runs(s, s->brd)) {
@@ -730,6 +736,9 @@ static void pl011_line_reset(PL011State *s)
     s->rx_bit = -1;
     s->rx_wait_mark = false;
     s->rx_overrun = false;
+    s->tx_held = 0;
+    s->rx_held = 0;
+    s->rt_held = 0;
     s->rx_level = s->rxd_pin;
     s->ncts_level = s->ncts_pin;
     s->txd = 1;
@@ -1094,11 +1103,69 @@ static void pl011_event(void *opaque, QEMUChrEvent event)
     }
 }
 
+/*
+ * In line-level mode, carry the frames in progress across a change of
+ * UARTCLK: before it, note the cycles they have run and the receive
+ * timeout has left; after it, re-time them at the new rate, or hold them
+ * while the clock is stopped.
+ */
+static void pl011_line_clock_update(PL011State *s, ClockEvent event)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (event == ClockPreUpdate) {
+        if (!clock_get(s->clk)) {
+            return;
+        }
+        if (s->tx_busy) {
+            s->tx_held = clock_ns_to_ticks(s->clk, MAX(now - s->tx_start, 0));
+            timer_del(s->tx_timer);
+        }
+        if (s->rx_bit >= 0) {
+            s->rx_held = clock_ns_to_ticks(s->clk, MAX(now - s->rx_start, 0));
+            timer_del(s->rx_timer);
+        }
+        if (timer_pending(s->rt_timer)) {
+            s->rt_held = clock_ns_to_ticks(s->clk,
+                MAX(timer_expire_time_ns(s->rt_timer) - now, 0));
+            timer_del(s->rt_timer);
+        } else {
+            s->rt_held = 0;
+        }
+        return;
+    }
+    if (!clock_get(s->clk)) {
+        return;
+    }
+    if (s->tx_busy) {
+        s->tx_start = now - clock_ticks_to_ns(s->clk, s->tx_held);
+        s->tx_next = s->tx_start +
+                     pl011_baud16_ns(s, s->tx_brd, 16 * (s->tx_bit + 1));
+        timer_mod(s->tx_timer, MAX(s->tx_next, now));
+    }
+    if (s->rx_bit >= 0) {
+        s->rx_start = now - clock_ticks_to_ns(s->clk, s->rx_held);
+        s->rx_next = s->rx_start +
+                     pl011_baud16_ns(s, s->rx_brd, 8 + 16 * s->rx_bit);
+        timer_mod(s->rx_timer, MAX(s->rx_next, now));
+    }
+    if (s->rt_held) {
+        timer_mod(s->rt_timer, now + clock_ticks_to_ns(s->clk, s->rt_held));
+        s->rt_held = 0;
+    }
+    pl011_line_tx_start(s, now);
+}
+
 static void pl011_clock_update(void *opaque, ClockEvent event)
 {
     PL011State *s = PL011(opaque);
 
-    pl011_trace_baudrate_change(s);
+    if (s->line_level) {
+        pl011_line_clock_update(s, event);
+    }
+    if (event == ClockUpdate) {
+        pl011_trace_baudrate_change(s);
+    }
 }
 
 static const MemoryRegionOps pl011_ops = {
@@ -1166,7 +1233,7 @@ static bool pl011_line_needed(void *opaque)
 
 static const VMStateDescription vmstate_pl011_line = {
     .name = "pl011/line",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .needed = pl011_line_needed,
     .fields = (const VMStateField[]) {
@@ -1201,6 +1268,9 @@ static const VMStateDescription vmstate_pl011_line = {
         VMSTATE_UINT8(ncts_level, PL011State),
         VMSTATE_UINT8(txd, PL011State),
         VMSTATE_UINT8(nrts, PL011State),
+        VMSTATE_UINT64_V(tx_held, PL011State, 2),
+        VMSTATE_UINT64_V(rx_held, PL011State, 2),
+        VMSTATE_UINT64_V(rt_held, PL011State, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1260,7 +1330,7 @@ static void pl011_init(Object *obj)
                              ARRAY_SIZE(s->dma_req));
 
     s->clk = qdev_init_clock_in(DEVICE(obj), "clk", pl011_clock_update, s,
-                                ClockUpdate);
+                                ClockPreUpdate | ClockUpdate);
 
     s->id = pl011_id_arm;
 

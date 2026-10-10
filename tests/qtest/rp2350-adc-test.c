@@ -15,6 +15,7 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
+#include "rp2350-clocks.h"
 #include "rp2350-resets.h"
 
 #define ALIAS_XOR       0x1000
@@ -94,6 +95,7 @@ static QTestState *start(void)
     QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
 
     qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");
+    rp2350_clocks_init(qts);
     /* Releasing them takes a whole number of 6-cycle steps. */
     G_STATIC_ASSERT(RP2350_RESETS_RELEASE_NS % 125 == 0);
     rp2350_unreset(qts, RESETS_USED);
