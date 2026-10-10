@@ -221,12 +221,13 @@ struct RP2350PIOState {
      * Pin changes from outside the blocks and the cycles they came in,
      * oldest first. They arrive while the IO bank propagates, when the
      * blocks cannot run (their pin changes would not reach the bank in
-     * time), so they wait here for a bottom half or the next catch-up.
+     * time), so they wait here for in_timer, due at once, or the next
+     * catch-up.
      */
     uint64_t inq_vec[RP2350_PIO_IN_QUEUE];
     uint64_t inq_cycle[RP2350_PIO_IN_QUEUE];
     uint32_t inq_n;
-    QEMUBH *in_bh;
+    QEMUTimer *in_timer;
 
     /* Levels last driven on the outputs, GPIO-numbered for the pins. */
     uint64_t drv_out[RP2350_PIO_BLOCKS];

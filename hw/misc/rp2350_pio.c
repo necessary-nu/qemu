@@ -68,7 +68,6 @@
 #include "qemu/bitops.h"
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
-#include "qemu/main-loop.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
@@ -1682,10 +1681,15 @@ static void pio_in(void *opaque, int n, int level)
     /* The run ahead assumed the pins would not change. */
     s->spec_valid = false;
     s->horizon = HORIZON_MIN;
-    qemu_bh_schedule(s->in_bh);
+    timer_mod(s->in_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
-static void pio_in_bh(void *opaque)
+/*
+ * Catch up with the queued pin changes once the access that made them
+ * has completed, at the same virtual time: under icount, before the vCPU
+ * executes on.
+ */
+static void pio_in_timer_cb(void *opaque)
 {
     RP2350PIOState *s = opaque;
 
@@ -2222,6 +2226,7 @@ static void rp2350_pio_reset_hold(Object *obj, ResetType type)
     int b;
 
     timer_del(s->timer);
+    timer_del(s->in_timer);
     s->spec_valid = false;
     s->horizon = HORIZON_MIN;
     s->inq_n = 0;
@@ -2287,8 +2292,7 @@ static void rp2350_pio_realize(DeviceState *dev, Error **errp)
     RP2350PIOState *s = RP2350_PIO(dev);
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pio_timer_cb, s);
-    s->in_bh = qemu_bh_new_guarded(pio_in_bh, s,
-                                   &DEVICE(s)->mem_reentrancy_guard);
+    s->in_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pio_in_timer_cb, s);
 }
 
 static const Property rp2350_pio_properties[] = {
@@ -2384,7 +2388,7 @@ static int rp2350_pio_post_load(void *opaque, int version_id)
     s->spec_valid = false;
     s->busy = false;
     if (s->inq_n) {
-        qemu_bh_schedule(s->in_bh);
+        timer_mod(s->in_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }
     return 0;
 }
