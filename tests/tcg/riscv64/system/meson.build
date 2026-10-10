@@ -25,6 +25,7 @@ tests += {
   'test-minstret-ecall.S': setup + {'qemu_args': ['-icount', 'shift=1', qemu_args]},
   'test-misa-w.S': setup + {'qemu_args': ['-cpu', 'rv64,x-misa-w=true,c=true,v=true', qemu_args]},
   'test-icount-nodebug.S': setup + {'qemu_args': ['-cpu', 'rv64,debug=false', '-icount', 'shift=1', qemu_args]},
+  'test-sfence-vma-no-smode.S': setup + {'qemu_args': ['-cpu', 'rv64,h=false,s=false', qemu_args]},
 }
 
 tests += {
