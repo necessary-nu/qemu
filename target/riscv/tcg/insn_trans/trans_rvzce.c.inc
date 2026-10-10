@@ -176,6 +176,18 @@ static int push_pop_reg(DisasContext *ctx, int n)
     return ctx->cfg_ptr->zcmp_ra_highest ? n : X_Sn + 11 - n;
 }
 
+static void gen_push_pop_check(DisasContext *ctx, TCGv addr,
+                               uint32_t reg_bitmap, int reg_size,
+                               MMUAccessType access_type)
+{
+    if (ctx->cfg_ptr->zcmp_check_first) {
+        gen_helper_cm_check(tcg_env, addr,
+                            tcg_constant_i32(ctpop32(reg_bitmap)),
+                            tcg_constant_i32(reg_size),
+                            tcg_constant_i32(access_type));
+    }
+}
+
 static bool gen_pop(DisasContext *ctx, arg_cmpp *a, bool ret, bool ret_val)
 {
     REQUIRE_ZCMP(ctx);
@@ -194,6 +206,7 @@ static bool gen_pop(DisasContext *ctx, arg_cmpp *a, bool ret, bool ret_val)
     int i, n;
 
     tcg_gen_addi_tl(addr, sp, stack_adj - reg_size);
+    gen_push_pop_check(ctx, addr, reg_bitmap, reg_size, MMU_DATA_LOAD);
 
     memop |= ctx->mo_endianness;
     for (n = 0; n < X_Sn + 12; n++) {
@@ -249,6 +262,7 @@ static bool trans_cm_push(DisasContext *ctx, arg_cm_push *a)
     int i, n;
 
     tcg_gen_subi_tl(addr, sp, reg_size);
+    gen_push_pop_check(ctx, addr, reg_bitmap, reg_size, MMU_DATA_STORE);
 
     memop |= ctx->mo_endianness;
     for (n = 0; n < X_Sn + 12; n++) {

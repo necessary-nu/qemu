@@ -172,6 +172,12 @@ BOOL_FIELD(misa_w)
  * reverse of the ratified Zcmp order, as the ESP32-P4 HP core does.
  */
 BOOL_FIELD(zcmp_ra_highest)
+/*
+ * cm.push, cm.pop and cm.popret check every access to the stack before
+ * making any, so that one the PMP refuses raises its access fault with no
+ * store made and no register loaded.
+ */
+BOOL_FIELD(zcmp_check_first)
 
 BOOL_FIELD(short_isa_string)
 

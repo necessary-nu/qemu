@@ -53,8 +53,13 @@
  *     the reserved ranges of TRM table 9.3-1 and the unassigned slots
  *     between blocks, answer with a bus error, which the cores take as an
  *     access fault.
- *   - The CLINT and CLIC address ranges of the HP cores, also as
- *     unimplemented devices: the cores have no interrupt controller.
+ *   - Each HP core's CLIC and CLINT (TRM 2.8, 2.9): the CLIC registers at
+ *     0x20800000 and their user-mode view at 0x20B00000, the CLINT at
+ *     0x20000000, each core seeing its own at the base and the other
+ *     core's 64 KiB above; the CLINT's counter counts CPU_CLK, each
+ *     core's registers behind its CLIC bus clock, and each core's CLIC
+ *     resets with the core. Nothing drives the CLICs' external interrupts
+ *     yet, as the interrupt matrix is not modelled.
  *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
@@ -111,11 +116,6 @@ static const struct {
     hwaddr base;
     hwaddr size;
 } esp32p4_unimplemented[] = {
-    /* The HP cores' local interrupt controllers (TRM table 2.8-1). */
-    { "clint",            0x20000000, 128 * KiB },
-    { "clic",             0x20800000, 128 * KiB },
-    { "clic-user",        0x20b00000, 128 * KiB },
-
     /* HP CPU peripherals. */
     { "trace0",           0x3ff04000, 4 * KiB },
     { "trace1",           0x3ff05000, 4 * KiB },
@@ -485,9 +485,18 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
         DeviceState *cpu = DEVICE(&s->hp_cpu[i]);
         g_autofree char *clk = g_strdup_printf("core%d-cpu", i);
 
+        /* A core's reset also resets its CLIC. */
+        object_initialize_child(OBJECT(s), "core-reset-split[*]",
+                                &s->core_reset_split[i], TYPE_SPLIT_IRQ);
+        qdev_prop_set_uint16(DEVICE(&s->core_reset_split[i]), "num-lines",
+                             2);
+        qdev_realize(DEVICE(&s->core_reset_split[i]), NULL, &error_fatal);
+        qdev_connect_gpio_out(DEVICE(&s->core_reset_split[i]), 0,
+                              qdev_get_gpio_in_named(cpu, ESP32P4_CPU_RESET,
+                                                     0));
         qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_CORE_RESET, i,
-                                    qdev_get_gpio_in_named(cpu,
-                                        ESP32P4_CPU_RESET, 0));
+                                    qdev_get_gpio_in(DEVICE(
+                                        &s->core_reset_split[i]), 0));
         qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_CORE_CLOCK, i,
                                     qdev_get_gpio_in_named(cpu,
                                         ESP32P4_CPU_CLOCK, 0));
@@ -512,6 +521,60 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
                             TYPE_ESP32P4_LP_SYS);
     sysbus_realize(SYS_BUS_DEVICE(&s->lp_sys), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->lp_sys), 0, ESP32P4_LP_SYS_BASE);
+}
+
+/*
+ * The HP cores' CLINT and CLICs: the CLINT's software and timer interrupts
+ * go to each core's CLIC interrupts 3 and 7, and its counter counts
+ * CPU_CLK, which the TRM does not name; each core's CLIC and CLINT
+ * registers are behind its CLIC bus clock, and its CLIC resets with the
+ * core.
+ */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static void esp32p4_init_core_local(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    DeviceState *clint, *clic;
+    int i;
+
+    object_initialize_child(OBJECT(s), "clint", &s->clint,
+                            TYPE_ESP32P4_CLINT);
+    object_initialize_child(OBJECT(s), "clic", &s->clic, TYPE_ESP32P4_CLIC);
+    clint = DEVICE(&s->clint);
+    clic = DEVICE(&s->clic);
+
+    qdev_connect_clock_in(clint, "mtime", qdev_get_clock_out(clkrst, "cpu"));
+    for (i = 0; i < ESP32P4_HP_CORES; i++) {
+        g_autofree char *link = g_strdup_printf("cpu%d", i);
+        g_autofree char *in = g_strdup_printf("core%d", i);
+        g_autofree char *bus = g_strdup_printf("core%d-clic", i);
+
+        object_property_set_link(OBJECT(clint), link, OBJECT(&s->hp_cpu[i]),
+                                 &error_abort);
+        object_property_set_link(OBJECT(clic), link, OBJECT(&s->hp_cpu[i]),
+                                 &error_abort);
+        qdev_connect_clock_in(clint, in, qdev_get_clock_out(clkrst, bus));
+        qdev_connect_clock_in(clic, in, qdev_get_clock_out(clkrst, bus));
+    }
+    sysbus_realize(SYS_BUS_DEVICE(clint), &error_fatal);
+    sysbus_realize(SYS_BUS_DEVICE(clic), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(clint), 0, ESP32P4_CLINT_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(clic), ESP32P4_CLIC_MMIO_M,
+                    ESP32P4_CLIC_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(clic), ESP32P4_CLIC_MMIO_U,
+                    ESP32P4_CLIC_U_BASE);
+
+    for (i = 0; i < ESP32P4_HP_CORES; i++) {
+        qdev_connect_gpio_out_named(clint, ESP32P4_CLINT_MSIP, i,
+            qdev_get_gpio_in_named(clic, ESP32P4_CLIC_IRQ,
+                ESP32P4_CLIC_IRQ_LINE(i, ESP32P4_CLIC_IRQ_MSIP)));
+        qdev_connect_gpio_out_named(clint, ESP32P4_CLINT_MTIP, i,
+            qdev_get_gpio_in_named(clic, ESP32P4_CLIC_IRQ,
+                ESP32P4_CLIC_IRQ_LINE(i, ESP32P4_CLIC_IRQ_MTIP)));
+        qdev_connect_gpio_out(DEVICE(&s->core_reset_split[i]), 1,
+                              qdev_get_gpio_in_named(clic,
+                                  ESP32P4_CLIC_CORE_RESET, i));
+    }
 }
 
 /*
@@ -667,6 +730,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_memory(s);
     esp32p4_init_cpus(s);
     esp32p4_init_clocks(s);
+    esp32p4_init_core_local(s);
     esp32p4_init_efuse(s);
     esp32p4_init_flash(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {

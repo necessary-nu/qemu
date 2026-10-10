@@ -1,7 +1,8 @@
 #
 # Espressif ESP32-P4 HP core: the hardware loop instructions (Xesploop,
 # TRM table 2.7-2) on the custom-1 opcode; MRET, whose return also
-# restores the core's trigger and bus-error enables; SFENCE.VMA, which
+# restores the core's trigger and bus-error enables and its CLIC state;
+# URET, the return from a user-mode interrupt handler; SFENCE.VMA, which
 # a core without supervisor mode does not have; and the Processor
 # Instruction Extensions (Xespv2p2, TRM chapter 4).
 #
@@ -43,6 +44,7 @@ esp_lp_setup    ............ ..... 100 --.- . 0101011 @lp_setup
 esp_lp_setupi   ............ ..... 101 .... . 0101011 @lp_setupi
 
 esp_mret        0011000 00010 00000 000 00000 1110011
+esp_uret        0000000 00010 00000 000 00000 1110011
 esp_sfence_vma  0001001 ----- ----- 000 00000 1110011
 
 # Processor Instruction Extensions (Xespv2p2), TRM 4.7.2, one pattern per

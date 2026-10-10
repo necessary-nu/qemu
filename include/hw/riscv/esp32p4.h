@@ -12,6 +12,9 @@
 #include "qemu/units.h"
 #include "hw/core/boards.h"
 #include "hw/cpu/cluster.h"
+#include "hw/core/split-irq.h"
+#include "hw/intc/esp32p4_clic.h"
+#include "hw/intc/esp32p4_clint.h"
 #include "hw/ssi/ssi.h"
 #include "hw/misc/esp32p4_ana.h"
 #include "hw/misc/esp32p4_clkrst.h"
@@ -82,6 +85,11 @@ struct ESP32P4MachineState {
     MemoryRegion l2mem_direct;
     MemoryRegion lp_sram;
     MemoryRegion psram;
+
+    /* The HP cores' resets, to each core and its CLIC. */
+    SplitIRQ core_reset_split[ESP32P4_HP_CORES];
+    ESP32P4ClintState clint;
+    ESP32P4ClicState clic;
 
     ESP32P4ClkRstState clkrst;
     ESP32P4AnaState ana;

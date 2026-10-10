@@ -144,7 +144,8 @@ DEF_HELPER_1(itrigger_match, void, env)
 /* ESP32-P4 HP core: hardware loops and trap return */
 DEF_HELPER_FLAGS_5(esp32p4_hwlp_set, TCG_CALL_NO_WG, void, env, i32, tl, tl, tl)
 DEF_HELPER_4(esp32p4_hwlp_end, tl, env, tl, tl, tl)
-DEF_HELPER_2(esp32p4_mret, void, env, i64)
+DEF_HELPER_3(esp32p4_mret, tl, env, i64, tl)
+DEF_HELPER_1(esp32p4_uret, tl, env)
 #include "target/riscv/esp32p4_pie_helper.h"
 #endif
 
@@ -1246,6 +1247,7 @@ DEF_HELPER_FLAGS_3(sm4ks, TCG_CALL_NO_RWG_SE, tl, tl, tl, tl)
 
 /* Zce helper */
 DEF_HELPER_FLAGS_2(cm_jalt, TCG_CALL_NO_WG, tl, env, i32)
+DEF_HELPER_FLAGS_5(cm_check, TCG_CALL_NO_WG, void, env, tl, i32, i32, i32)
 
 /* BF16 functions */
 DEF_HELPER_FLAGS_2(fcvt_bf16_s, TCG_CALL_NO_RWG, i64, env, i64)
