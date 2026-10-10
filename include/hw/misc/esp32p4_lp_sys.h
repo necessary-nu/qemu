@@ -21,7 +21,20 @@ struct ESP32P4LPSysState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
+    qemu_irq irq;
     uint32_t boot_addr_hp_core1;
+    uint32_t lp_addrhole_addr;
+    uint32_t lp_addrhole_info;
+    uint32_t int_raw;
+    uint32_t int_ena;
 };
+
+/*
+ * An access the LP AHB matrix refused: one the LP APM did not permit
+ * (@illegal false) or one to an address nothing decodes (@illegal true),
+ * by the master with ID @id (the AXI ICM's CPU master IDs), at @addr.
+ */
+void esp32p4_lp_sys_addrhole(ESP32P4LPSysState *s, uint32_t addr,
+                             uint8_t id, bool write, bool illegal);
 
 #endif

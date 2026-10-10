@@ -43,8 +43,8 @@
  *     LPPERI, with the clock tree from the crystal, the RC oscillators and
  *     the PLLs to every block's clocks, and the analog I2C controller
  *     through which software configures the PLLs; and LP_SYS's
- *     BOOT_ADDR_HP_CORE1, the rest of whose registers are logged as
- *     unimplemented.
+ *     BOOT_ADDR_HP_CORE1 and its record of refused accesses, the rest of
+ *     whose registers are logged as unimplemented.
  *   - The eFuse controller and its array, on its clock and reset from
  *     LPPERI, its interrupt a source of the interrupt matrix.
  *   - The system timer, the two timer groups (each two timers, an MWDT
@@ -53,6 +53,13 @@
  *     watchdogs reset the HP cores, the HP core (the HP blocks and both
  *     cores, the LP system running on) or the whole system, each with its
  *     reset cause in LP_CLKRST.
+ *   - Permission control (TRM chapter 20): the HP, LP and DMA access
+ *     permission managers, through which every core (and DMA master)
+ *     reaches the bus, each access carrying its master and privilege mode,
+ *     with their registers HP_PERI_PMS, LP2HP_PERI_PMS, HP_DMA_PMS,
+ *     LP_PERI_PMS and HP2LP_PERI_PMS; an access they refuse answers with a
+ *     bus error and is recorded by the AXI ICM's registers (0x500A4000),
+ *     raising SYS_ICM_INTR, or by LP_SYS's, raising LP_SYSREG_INTR.
  *   - Every other peripheral block the chip decodes, as an unimplemented
  *     device named after the block. Addresses the chip does not decode,
  *     the reserved ranges of TRM table 9.3-1 and the unassigned slots
@@ -72,6 +79,15 @@
  *     (0x500E5000), the cores' software interrupts CPU_INTR_FROM_CPU_0 to
  *     _3, sources of the matrix; the rest of its registers are logged as
  *     unimplemented. A source no modelled block drives stays low.
+ *   - The GPIO matrix and IO MUX (TRM chapter 10), HP and LP, with
+ *     GPIO_EXT's sigma-delta modulators, glitch filters and ETM, behind
+ *     IOMUX_APB_CLK and the LP IO MUX's clock and their resets, timed by
+ *     the IO MUX operating clocks: the 55 pads, their interrupts as
+ *     interrupt sources 74 to 78 and 10, and the HP cores' fast GPIO as
+ *     matrix signals 214 to 229. GPIO_STRAP latches the board's strapping
+ *     at reset, the machine's strap-mode property, by default SPI boot:
+ *
+ *       -M esp32p4,strap-mode=0x08
  *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
@@ -182,10 +198,8 @@ static const struct {
     { "isp",              0x500a1000, 4 * KiB },
     { "rmt",              0x500a2000, 4 * KiB },
     { "bitscrambler",     0x500a3000, 4 * KiB },
-    { "axi-icm",          0x500a4000, 4 * KiB },
-    { "hp-peri-pms",      0x500a5000, 2 * KiB },
-    { "lp2hp-peri-pms",   0x500a5800, 2 * KiB },
-    { "dma-pms",          0x500a6000, 4 * KiB },
+    /* The AXI ICM's QoS command interface, above its own registers. */
+    { "axi-icm-qos",      0x500a4400, 3 * KiB },
     { "h264-dma",         0x500a7000, 4 * KiB },
 
     /* HP peripherals 1. */
@@ -216,8 +230,7 @@ static const struct {
     { "lcd-cam",          0x500dc000, 4 * KiB },
     { "adc",              0x500de000, 4 * KiB },
     { "uhci",             0x500df000, 4 * KiB },
-    { "gpio",             0x500e0000, 4 * KiB },
-    { "io-mux",           0x500e1000, 4 * KiB },
+    { "iomux-mspi-pin",   0x500e1200, 4 * KiB - 0x200 },
     { "mem-monitor",      0x500e3000, 4 * KiB },
     { "audio-addc",       0x500e4000, 4 * KiB },
 
@@ -243,11 +256,7 @@ static const struct {
     { "lp-trng",          0x50126000, 4 * KiB },
     { "lp-adc",           0x50127000, 4 * KiB },
     { "lp-touch",         0x50128000, 4 * KiB },
-    { "lp-gpio",          0x5012a000, 4 * KiB },
-    { "lp-iomux",         0x5012b000, 4 * KiB },
     { "lp-intr",          0x5012c000, 4 * KiB },
-    { "lp-peri-pms",      0x5012e000, 2 * KiB },
-    { "hp2lp-peri-pms",   0x5012e800, 2 * KiB },
     { "lp-tsens",         0x5012f000, 4 * KiB },
 };
 
@@ -373,6 +382,17 @@ static void esp32p4_init_flash(ESP32P4MachineState *s)
     ssi_realize_and_unref(flash, s->flash_bus, &error_fatal);
 }
 
+/*
+ * The bus as every master sees it, through the access permission managers
+ * (hw/misc/esp32p4_pms.c): the cores take it as their memory as they are
+ * realized, before the blocks the APMs record refusals in exist.
+ */
+/* [spec:nuos:req:emu.esp32p4.pms] */
+static void esp32p4_init_bus(ESP32P4MachineState *s)
+{
+    object_initialize_child(OBJECT(s), "pms", &s->pms, TYPE_ESP32P4_PMS);
+}
+
 /* [spec:nuos:req:emu.esp32p4.machine] */
 static void esp32p4_init_cpus(ESP32P4MachineState *s)
 {
@@ -386,6 +406,9 @@ static void esp32p4_init_cpus(ESP32P4MachineState *s)
                                 &s->hp_cpu[i], TYPE_ESP32P4_HP_CPU);
         qdev_prop_set_uint64(DEVICE(&s->hp_cpu[i]), "resetvec",
                              ESP32P4_HP_RESET_VECTOR);
+        object_property_set_link(OBJECT(&s->hp_cpu[i]), "memory",
+                                 OBJECT(esp32p4_pms_bus(&s->pms)),
+                                 &error_abort);
         s->hp_cpu[i].parent_obj.env.mhartid = i;
         qdev_realize(DEVICE(&s->hp_cpu[i]), NULL, &error_fatal);
         qemu_register_resettable(OBJECT(&s->hp_cpu[i]));
@@ -400,6 +423,8 @@ static void esp32p4_init_cpus(ESP32P4MachineState *s)
                             TYPE_ESP32P4_LP_CPU);
     qdev_prop_set_uint64(DEVICE(&s->lp_cpu), "resetvec",
                          ESP32P4_LP_RESET_VECTOR);
+    object_property_set_link(OBJECT(&s->lp_cpu), "memory",
+                             OBJECT(esp32p4_pms_bus(&s->pms)), &error_abort);
     s->lp_cpu.parent_obj.env.mhartid = 0;
     qdev_realize(DEVICE(&s->lp_cpu), NULL, &error_fatal);
     qemu_register_resettable(OBJECT(&s->lp_cpu));
@@ -679,9 +704,11 @@ static void esp32p4_init_efuse(ESP32P4MachineState *s)
 
 /*
  * The HP core reset of the HP blocks with no reset line of their own,
- * HP_SYSTEM's registers and the CLINT; the rest take theirs from the
- * reset and clock control, which holds every HP block reset line and the
- * HP cores through it.
+ * HP_SYSTEM's registers, the CLINT and the AXI ICM; the rest take theirs
+ * from the reset and clock control, which holds every HP block reset line
+ * and the HP cores through it. (The HP and DMA access permission managers
+ * have no reset of their own in the PMS model, which resets them only with
+ * the system.)
  */
 /* [spec:nuos:req:emu.esp32p4.timers] */
 static void esp32p4_hp_core_reset(void *opaque, int n, int level)
@@ -691,6 +718,7 @@ static void esp32p4_hp_core_reset(void *opaque, int n, int level)
     if (level) {
         device_cold_reset(DEVICE(&s->hp_sys));
         device_cold_reset(DEVICE(&s->clint));
+        device_cold_reset(DEVICE(&s->icm));
     }
 }
 
@@ -712,18 +740,23 @@ static void esp32p4_hp_core_reset(void *opaque, int n, int level)
  * and tasks, the RTC timer's wakeups and the LP core's timer interrupt
  * are named GPIO lines (see the devices' headers) that nothing drives or
  * takes until the ETM, the PMU and the LP core's interrupts are modelled.
- * The boot mode that runs the watchdogs' flash boot protection is the
- * strapping's, GPIO_STRAP, which the GPIO block latches; nothing drives
- * the "spi-boot" inputs, so the chip is in a boot mode without it, as the
- * boot ROM, reading GPIO_STRAP as 0, finds. LP_SYSTEM's FIB control of the
- * super watchdog's reset is not modelled either: the "swd-reset-en" input
- * stays low, as the FIB's analog default leaves it.
+ * MWDT0 and the RTC watchdog run their flash boot protection when the
+ * chip boots from flash through the boot ROM in SPI boot mode: when the
+ * board's strapping (the strap-mode property) has GPIO35 high and there
+ * is no -kernel, which loads the program in the ROM's place, with no flash
+ * boot to protect. Pads driven from outside at reset, which GPIO_STRAP
+ * latches in place of the strapping, and LP_SYSTEM_FORCE_DOWNLOAD_BOOT do
+ * not change it. LP_SYSTEM's FIB control of the super watchdog's reset is
+ * not modelled: the "swd-reset-en" input stays low, as the FIB's analog
+ * default leaves it.
  */
 /* [spec:nuos:req:emu.esp32p4.timers] */
 static void esp32p4_init_timers(ESP32P4MachineState *s)
 {
     DeviceState *clkrst = DEVICE(&s->clkrst);
     DeviceState *dev, *split;
+    bool spi_boot = !MACHINE(s)->kernel_filename &&
+                    (s->strap_mode & ESP32P4_GPIO_STRAP_SPI_BOOT);
     int i, n;
 
     for (n = 0; n < ESP32P4_HP_CORES; n++) {
@@ -802,6 +835,8 @@ static void esp32p4_init_timers(ESP32P4MachineState *s)
                                             ESP32P4_CLKRST_MWDT_LINE(i, n)));
         }
     }
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->timg[0]),
+                                        ESP32P4_TIMG_SPI_BOOT, 0), spi_boot);
 
     object_initialize_child(OBJECT(s), "lp-wdt", &s->lp_wdt,
                             TYPE_ESP32P4_LP_WDT);
@@ -825,6 +860,8 @@ static void esp32p4_init_timers(ESP32P4MachineState *s)
                                     qdev_get_gpio_in_named(clkrst,
                                         ESP32P4_CLKRST_RWDT_CORE_RESET, n));
     }
+    qemu_set_irq(qdev_get_gpio_in_named(dev, ESP32P4_LP_WDT_SPI_BOOT, 0),
+                 spi_boot);
 
     object_initialize_child(OBJECT(s), "lp-timer", &s->lp_timer,
                             TYPE_ESP32P4_LP_TIMER);
@@ -859,6 +896,133 @@ static void esp32p4_init_timers(ESP32P4MachineState *s)
     qdev_connect_gpio_out(split, 1,
                           qdev_get_gpio_in_named(dev,
                               ESP32P4_LP_TIMER_HP_SYS_RESET, 0));
+}
+
+/*
+ * The GPIO matrices and IO MUXes, HP and LP, their registers behind
+ * IOMUX_APB_CLK and the LP IO MUX's clock, their resets taken directly
+ * (the strapping latch survives them); their interrupts, sources 74 to 78
+ * and 10 of the interrupt matrix; and each HP core's fast GPIO, matrix
+ * signals 214 + 8 * core + n. The cores' cpu_gpio_oen is the outputs'
+ * enable inverted: ESP-IDF's dedic_gpio_cpu_ll.h for the P4 enables an
+ * output by clearing its bit ("the OEN register is active low"), where
+ * the TRM's register description has 1 enable it.
+ */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_gpio(ESP32P4MachineState *s)
+{
+    static const struct {
+        hwaddr base;
+        unsigned clock;
+    } map[] = {
+        [ESP32P4_GPIO_MMIO_GPIO] = { ESP32P4_GPIO_BASE,
+                                     ESP32P4_CLK_IOMUX_APB },
+        [ESP32P4_GPIO_MMIO_IO_MUX] = { ESP32P4_IO_MUX_BASE,
+                                       ESP32P4_CLK_IOMUX_APB },
+        [ESP32P4_GPIO_MMIO_LP_GPIO] = { ESP32P4_LP_GPIO_BASE,
+                                        ESP32P4_CLK_LP_IOMUX },
+        [ESP32P4_GPIO_MMIO_LP_IOMUX] = { ESP32P4_LP_IOMUX_BASE,
+                                         ESP32P4_CLK_LP_IOMUX },
+    };
+    DeviceState *gpio, *clkrst = DEVICE(&s->clkrst);
+    int i, core;
+
+    object_initialize_child(OBJECT(s), "gpio", &s->gpio, TYPE_ESP32P4_GPIO);
+    gpio = DEVICE(&s->gpio);
+    qdev_prop_set_uint32(gpio, "strap-mode", s->strap_mode);
+    qdev_connect_clock_in(gpio, "iomux", qdev_get_clock_out(clkrst, "iomux"));
+    qdev_connect_clock_in(gpio, "lp", qdev_get_clock_out(clkrst, "lp-iomux"));
+    sysbus_realize(SYS_BUS_DEVICE(gpio), &error_fatal);
+    for (i = 0; i < ARRAY_SIZE(map); i++) {
+        esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(gpio), i,
+                                 map[i].base, map[i].clock,
+                                 ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    }
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_IOMUX,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_RESET,
+                                    ESP32P4_GPIO_RESET_HP));
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_LP_IOMUX,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_RESET,
+                                    ESP32P4_GPIO_RESET_LP));
+    for (i = 0; i < 4; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(gpio), ESP32P4_GPIO_IRQ_INTR0 + i,
+                           esp32p4_intr_source(s, ESP32P4_INTR_GPIO_INTR0 + i));
+    }
+    sysbus_connect_irq(SYS_BUS_DEVICE(gpio), ESP32P4_GPIO_IRQ_PAD_COMP,
+                       esp32p4_intr_source(s, ESP32P4_INTR_GPIO_PAD_COMP));
+    sysbus_connect_irq(SYS_BUS_DEVICE(gpio), ESP32P4_GPIO_IRQ_LP,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_GPIO));
+
+    for (core = 0; core < ESP32P4_HP_CORES; core++) {
+        DeviceState *cpu = DEVICE(&s->hp_cpu[core]);
+
+        for (i = 0; i < ESP32P4_CPU_GPIOS; i++) {
+            int n = core * ESP32P4_CPU_GPIOS + i;
+
+            qdev_connect_gpio_out_named(cpu, ESP32P4_CPU_GPIO_OUT, i,
+                qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                    ESP32P4_SIG_CORE_GPIO_OUT_PAD_OUT0 + n));
+            qdev_connect_gpio_out_named(cpu, ESP32P4_CPU_GPIO_OE, i,
+                qemu_irq_invert(qdev_get_gpio_in_named(gpio,
+                    ESP32P4_GPIO_SIG_OE,
+                    ESP32P4_SIG_CORE_GPIO_OUT_PAD_OUT0 + n)));
+            qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                ESP32P4_SIG_CORE_GPIO_IN_PAD_IN0 + n,
+                qdev_get_gpio_in_named(cpu, ESP32P4_CPU_GPIO_IN, i));
+        }
+    }
+}
+
+/*
+ * The access permission managers and the blocks that record what they
+ * refuse: the AXI ICM, its registers behind ICM_APB_CLK, whose interrupt
+ * is SYS_ICM_INTR (source 21), and LP_SYS, whose interrupt is
+ * LP_SYSREG_INTR (source 19). The LP APM's registers, LP_PERI_PMS and
+ * HP2LP_PERI_PMS, are behind LPPERI's LP_PMS clock and reset; the HP and
+ * DMA APMs' have neither clock gate nor reset in HP_SYS_CLKRST, and reset
+ * with the system.
+ */
+/* [spec:nuos:req:emu.esp32p4.pms] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_pms(ESP32P4MachineState *s)
+{
+    SysBusDevice *pms = SYS_BUS_DEVICE(&s->pms);
+    SysBusDevice *icm;
+
+    object_initialize_child(OBJECT(s), "icm", &s->icm, TYPE_ESP32P4_ICM);
+    icm = SYS_BUS_DEVICE(&s->icm);
+    sysbus_realize(icm, &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, icm, 0, ESP32P4_ICM_BASE,
+                             ESP32P4_CLK_ICM_APB,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    sysbus_connect_irq(icm, 0, esp32p4_intr_source(s, ESP32P4_INTR_SYS_ICM));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->lp_sys), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_SYSREG));
+
+    object_property_set_link(OBJECT(pms), "icm", OBJECT(icm), &error_abort);
+    object_property_set_link(OBJECT(pms), "lp-sys", OBJECT(&s->lp_sys),
+                             &error_abort);
+    sysbus_realize(pms, &error_fatal);
+    sysbus_mmio_map(pms, ESP32P4_PMS_MMIO_HP_PERI, ESP32P4_HP_PERI_PMS_BASE);
+    sysbus_mmio_map(pms, ESP32P4_PMS_MMIO_LP2HP_PERI,
+                    ESP32P4_LP2HP_PERI_PMS_BASE);
+    sysbus_mmio_map(pms, ESP32P4_PMS_MMIO_DMA, ESP32P4_DMA_PMS_BASE);
+    esp32p4_clkrst_map_gated(&s->clkrst, pms, ESP32P4_PMS_MMIO_LP_PERI,
+                             ESP32P4_LP_PERI_PMS_BASE, ESP32P4_CLK_LP_PMS,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    esp32p4_clkrst_map_gated(&s->clkrst, pms, ESP32P4_PMS_MMIO_HP2LP_PERI,
+                             ESP32P4_HP2LP_PERI_PMS_BASE, ESP32P4_CLK_LP_PMS,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    qdev_connect_gpio_out_named(DEVICE(&s->clkrst), ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_LP_PMS,
+                                qdev_get_gpio_in_named(DEVICE(pms),
+                                    ESP32P4_PMS_LP_RESET, 0));
 }
 
 /* The memories -kernel can load into: those the cores address directly. */
@@ -987,12 +1151,15 @@ static void esp32p4_init(MachineState *machine)
     }
 
     esp32p4_init_memory(s);
+    esp32p4_init_bus(s);
     esp32p4_init_cpus(s);
     esp32p4_init_clocks(s);
     esp32p4_init_core_local(s);
     esp32p4_init_intmatrix(s);
     esp32p4_init_efuse(s);
     esp32p4_init_timers(s);
+    esp32p4_init_gpio(s);
+    esp32p4_init_pms(s);
     esp32p4_init_flash(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
@@ -1032,6 +1199,36 @@ static void esp32p4_set_flash_size(Object *obj, Visitor *v, const char *name,
     ESP32P4_MACHINE(obj)->flash_size = size;
 }
 
+static void esp32p4_get_strap_mode(Object *obj, Visitor *v,
+                                   const char *name, void *opaque,
+                                   Error **errp)
+{
+    visit_type_uint32(v, name, &ESP32P4_MACHINE(obj)->strap_mode, errp);
+}
+
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+static void esp32p4_set_strap_mode(Object *obj, Visitor *v,
+                                   const char *name, void *opaque,
+                                   Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value >> ESP32P4_GPIO_STRAP_PINS) {
+        error_setg(errp, "strap-mode has a bit for each of GPIO38 (bit 0) "
+                   "to GPIO34 (bit 4); 0x%x has more", value);
+        return;
+    }
+    ESP32P4_MACHINE(obj)->strap_mode = value;
+}
+
+static void esp32p4_machine_instance_init(Object *obj)
+{
+    ESP32P4_MACHINE(obj)->strap_mode = ESP32P4_GPIO_STRAP_SPI_BOOT;
+}
+
 /* [spec:nuos:req:emu.esp32p4.machine] */
 static void esp32p4_machine_class_init(ObjectClass *oc, const void *data)
 {
@@ -1042,6 +1239,12 @@ static void esp32p4_machine_class_init(ObjectClass *oc, const void *data)
                               NULL, NULL);
     object_class_property_set_description(oc, "flash-size",
         "Size of the board's off-package flash (no default: no flash)");
+    object_class_property_add(oc, "strap-mode", "uint32",
+                              esp32p4_get_strap_mode, esp32p4_set_strap_mode,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "strap-mode",
+        "The board's strapping of GPIO38 (bit 0) to GPIO34 (bit 4), which "
+        "GPIO_STRAP latches at reset (default 0x08: SPI boot)");
 
     mc->desc = "Espressif ESP32-P4NRW32X (2x HP RV32IMAFC, LP RV32IMAC)";
     mc->init = esp32p4_init;
@@ -1057,6 +1260,7 @@ static const TypeInfo esp32p4_machine_types[] = {
         .name          = TYPE_ESP32P4_MACHINE,
         .parent        = TYPE_MACHINE,
         .instance_size = sizeof(ESP32P4MachineState),
+        .instance_init = esp32p4_machine_instance_init,
         .class_init    = esp32p4_machine_class_init,
     },
 };

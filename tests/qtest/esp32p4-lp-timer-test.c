@@ -68,10 +68,14 @@
 
 static int64_t now;
 
+/*
+ * A board strapped for Joint Download Boot (GPIO36 high, GPIO35 low), so
+ * that the watchdogs' flash boot protection does not run.
+ */
 static QTestState *start(void)
 {
     now = 0;
-    return qtest_init("-M esp32p4");
+    return qtest_init("-M esp32p4,strap-mode=0x04");
 }
 
 static void step(QTestState *qts, int64_t ns)

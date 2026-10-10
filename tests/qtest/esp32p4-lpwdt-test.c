@@ -76,10 +76,14 @@
 
 static int64_t now;
 
+/*
+ * A board strapped for Joint Download Boot (GPIO36 high, GPIO35 low), so
+ * that the watchdogs' flash boot protection does not run.
+ */
 static QTestState *start(void)
 {
     now = 0;
-    return qtest_init("-M esp32p4");
+    return qtest_init("-M esp32p4,strap-mode=0x04");
 }
 
 static void step(QTestState *qts, int64_t ns)
@@ -372,6 +376,29 @@ static void test_flashboot(void)
     qtest_quit(qts);
 }
 
+/*
+ * Strapped for SPI boot, as by default, and booting through the ROM (no
+ * -kernel), MWDT0's flash boot protection resets the HP core every
+ * 650 ms and the RTC watchdog's resets the system after 2.67 s.
+ */
+/* [spec:nuos:req:emu.esp32p4.timers/test] */
+static void test_spi_boot_strap(void)
+{
+    QTestState *qts = qtest_init("-M esp32p4");
+
+    now = 0;
+    step(qts, 650 * MS - 1);
+    g_assert_cmphex(CORE0_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0x01);
+    step(qts, 1);
+    g_assert_cmphex(CORE0_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0x07);
+    g_assert_cmphex(LP_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0x01);
+    step(qts, 2666 * MS - now);
+    g_assert_cmphex(LP_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0x01);
+    await_reset(qts, 1 * MS);
+    g_assert_cmphex(LP_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0x10);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -382,5 +409,6 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/lp-wdt/system-reset", test_system_reset);
     qtest_add_func("/esp32p4/lp-wdt/swd", test_swd);
     qtest_add_func("/esp32p4/lp-wdt/flashboot", test_flashboot);
+    qtest_add_func("/esp32p4/lp-wdt/spi-boot-strap", test_spi_boot_strap);
     return g_test_run();
 }

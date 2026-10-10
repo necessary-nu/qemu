@@ -340,6 +340,9 @@ RISCVException esp32p4_clic_nxti(ESP32P4CPU *cpu, int priv,
 bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,
                          MMUAccessType access_type, int mmu_idx,
                          bool probe, uintptr_t retaddr);
+bool esp32p4_lp_tlb_fill(CPUState *cs, vaddr address, int size,
+                         MMUAccessType access_type, int mmu_idx,
+                         bool probe, uintptr_t retaddr);
 target_ulong esp32p4_pmpcfg_read(ESP32P4CPU *cpu, int reg);
 void esp32p4_pmpcfg_write(ESP32P4CPU *cpu, int reg, target_ulong val);
 target_ulong esp32p4_pmpaddr_read(ESP32P4CPU *cpu, int n);

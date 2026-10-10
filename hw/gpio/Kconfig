@@ -16,6 +16,9 @@ config SIFIVE_GPIO
 config RP2350_GPIO
     bool
 
+config ESP32_LINE
+    bool
+
 config STM32L4X5_GPIO
     bool
 

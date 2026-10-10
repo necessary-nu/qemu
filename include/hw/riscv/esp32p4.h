@@ -13,6 +13,7 @@
 #include "hw/core/boards.h"
 #include "hw/cpu/cluster.h"
 #include "hw/core/split-irq.h"
+#include "hw/gpio/esp32p4_gpio.h"
 #include "hw/intc/esp32p4_clic.h"
 #include "hw/intc/esp32p4_clint.h"
 #include "hw/intc/esp32p4_intmatrix.h"
@@ -21,7 +22,9 @@
 #include "hw/misc/esp32p4_clkrst.h"
 #include "hw/misc/esp32p4_hp_sys.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
+#include "hw/misc/esp32p4_icm.h"
 #include "hw/misc/esp32p4_lp_sys.h"
+#include "hw/misc/esp32p4_pms.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/timer/esp32p4_lp_timer.h"
 #include "hw/timer/esp32p4_lp_wdt.h"
@@ -108,6 +111,12 @@ struct ESP32P4MachineState {
     /* The entry point of the -kernel ELF, which core 0 starts at; or 0. */
     uint64_t kernel_entry;
     ESP32P4EfuseState efuse;
+    ESP32P4GpioState gpio;
+    /* The board's strapping of GPIO34 to GPIO38, in GPIO_STRAP's layout */
+    uint32_t strap_mode;
+    /* The access permission managers, every master's way onto the bus. */
+    ESP32P4PmsState pms;
+    ESP32P4IcmState icm;
 
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];

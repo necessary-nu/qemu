@@ -124,7 +124,7 @@ static inline int pmp_get_granularity_g(CPURISCVState *env)
 /*
  * Count the number of active rules.
  */
-uint32_t pmp_get_num_rules(CPURISCVState *env)
+static uint32_t pmp_get_num_rules(CPURISCVState *env)
 {
      return env->pmp_state.num_rules;
 }
@@ -201,12 +201,14 @@ static bool pmp_write_cfg(CPURISCVState *env, uint32_t pmp_index, uint8_t val)
 
 void pmp_unlock_entries(CPURISCVState *env)
 {
-    uint32_t pmp_num = pmp_get_num_rules(env);
+    uint8_t pmp_regions = riscv_cpu_cfg(env)->pmp_regions;
     int i;
 
-    for (i = 0; i < pmp_num; i++) {
+    for (i = 0; i < pmp_regions; i++) {
         env->pmp_state.pmp[i].cfg_reg &= ~(PMP_LOCK | PMP_AMATCH);
+        pmp_update_rule_addr(env, i);
     }
+    pmp_update_rule_nums(env);
 }
 
 static void pmp_decode_napot(hwaddr a, hwaddr *sa, hwaddr *ea)
@@ -253,7 +255,9 @@ void pmp_update_rule_addr(CPURISCVState *env, uint32_t pmp_index)
             this_addr = ROUND_DOWN(this_addr, granule);
         }
         if (prev_addr >= this_addr) {
-            sa = ea = 0u;
+            /* The entry matches no address: an empty range, sa > ea. */
+            sa = 1u;
+            ea = 0u;
             break;
         }
         sa = prev_addr << 2; /* shift up from [xx:0] to [xx+2:2] */
@@ -346,7 +350,8 @@ static bool pmp_hart_has_privs_default(CPURISCVState *env, pmp_priv_t privs,
         return ret;
     }
 
-    if (!riscv_cpu_cfg(env)->pmp || (mode == PRV_M)) {
+    if (!riscv_cpu_cfg(env)->pmp || !riscv_cpu_cfg(env)->pmp_regions ||
+        (mode == PRV_M)) {
         /*
          * Privileged spec v1.10 states if HW doesn't implement any PMP entry
          * or no PMP entry matches an M-Mode access, the access succeeds.
@@ -759,6 +764,11 @@ uint64_t pmp_get_tlb_size(CPURISCVState *env, hwaddr addr)
 
         pmp_sa = env->pmp_state.addr[i].sa;
         pmp_ea = env->pmp_state.addr[i].ea;
+
+        /* An entry that matches no address does not split the page. */
+        if (pmp_sa > pmp_ea) {
+            continue;
+        }
 
         /*
          * Only the first PMP entry that covers (whole or partial of) the TLB
