@@ -22,7 +22,9 @@
 #include "hw/misc/esp32p4_clkrst.h"
 #include "hw/misc/esp32p4_hp_sys.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
+#include "hw/misc/esp32p4_icm.h"
 #include "hw/misc/esp32p4_lp_sys.h"
+#include "hw/misc/esp32p4_pms.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "system/memory.h"
 #include "target/riscv/esp32p4_cpu.h"
@@ -108,6 +110,9 @@ struct ESP32P4MachineState {
     ESP32P4GpioState gpio;
     /* The board's strapping of GPIO34 to GPIO38, in GPIO_STRAP's layout */
     uint32_t strap_mode;
+    /* The access permission managers, every master's way onto the bus. */
+    ESP32P4PmsState pms;
+    ESP32P4IcmState icm;
 
     SSIBus *flash_bus;
     uint64_t flash_size;
