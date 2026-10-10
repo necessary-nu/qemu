@@ -220,3 +220,8 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
   'esp32_ulp.c',
   'ssi_psram.c',
 ))
+
+system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
+  'esp32p4_hp_sys_clkrst.c',
+  'esp32p4_lp_sys.c',
+))
