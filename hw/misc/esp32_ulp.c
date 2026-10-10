@@ -28,12 +28,20 @@
  * Instructions with no effect outside the ULP (ALU, jumps, WAIT, SLEEP)
  * may run ahead of virtual time; every other instruction is carried out at
  * the moment its cycle count puts it.
+ *
+ * Both clocks come from RTC_CNTL as Clock inputs. A change of either's rate
+ * keeps the cycles already made at the old rate and counts the rest at the
+ * new one: RTC_FAST_CLK's for the instructions, the waits of WAIT, I2C,
+ * ADC and TSENS among them, and HALT; RTC_SLOW_CLK's for the ULP timer and
+ * the FSM's power-up and power-down. While a clock is stopped what it
+ * times holds, and goes on once it runs again.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
@@ -117,57 +125,80 @@ static void mem_write(Esp32UlpState *s, uint32_t word, uint32_t v)
     memory_region_set_dirty(&s->rtc_cntl->slow_mem, 4 * word, 4);
 }
 
-static int64_t slow_ns(Esp32UlpState *s, uint64_t cycles)
+/* ---- Timing ---- */
+
+/* Phases timed by RTC_FAST_CLK: the run_* fields */
+static bool phase_fast(Esp32UlpState *s)
 {
-    return muldiv64(cycles, NANOSECONDS_PER_SECOND,
-                    s->rtc_cntl->rtc_slowclk_freq);
+    return s->phase == ESP32_ULP_RUNNING || s->phase == ESP32_ULP_HALTING;
 }
 
-/* When the next instruction starts */
+/* Phases timed by RTC_SLOW_CLK: the slow_* fields */
+static bool phase_slow(Esp32UlpState *s)
+{
+    return s->phase == ESP32_ULP_SLEEP || s->phase == ESP32_ULP_WAKING ||
+           s->phase == ESP32_ULP_POWER_DOWN;
+}
+
+/* When the next instruction starts, with RTC_FAST_CLK at its current rate */
 static int64_t run_next_ns(Esp32UlpState *s)
 {
-    return s->run_base_ns + muldiv64(s->run_cycles, NANOSECONDS_PER_SECOND,
-                                     s->run_hz);
+    return s->run_base_ns + clock_ticks_to_ns(s->fast_clk, s->run_cycles);
 }
 
-/* RTC_FAST_CLK may have changed: count on at its new rate from here. */
-static void run_rebase(Esp32UlpState *s)
+/* Arm the timer for the next instruction; none while RTC_FAST_CLK stops */
+static void run_schedule(Esp32UlpState *s)
 {
-    uint32_t hz = s->rtc_cntl->rtc_fastclk_freq;
-
-    if (hz != s->run_hz) {
-        s->run_base_ns = run_next_ns(s);
-        s->run_cycles = 0;
-        s->run_hz = hz;
+    if (!clock_is_enabled(s->fast_clk)) {
+        timer_del(&s->timer);
+        return;
     }
+    timer_mod(&s->timer, run_next_ns(s));
 }
 
-static void ulp_set_phase(Esp32UlpState *s, Esp32UlpPhase phase,
-                          int64_t deadline)
+/* Arm the timer for the slow phase's end; none while RTC_SLOW_CLK stops */
+static void slow_schedule(Esp32UlpState *s)
+{
+    if (!clock_is_enabled(s->slow_clk)) {
+        timer_del(&s->timer);
+        return;
+    }
+    timer_mod(&s->timer, s->slow_base_ns +
+              clock_ticks_to_ns(s->slow_clk, s->slow_left));
+}
+
+/* Enter phase, which lasts cycles of RTC_SLOW_CLK from from_ns */
+static void slow_phase(Esp32UlpState *s, Esp32UlpPhase phase,
+                       int64_t from_ns, uint64_t cycles)
 {
     s->phase = phase;
-    timer_mod(&s->timer, deadline);
+    s->slow_base_ns = from_ns;
+    s->slow_left = cycles;
+    slow_schedule(s);
 }
 
 /*
- * [spec:nuos:req:emu.esp32.ulp]
- * The ULP timer starts counting the selected period from `from`. A stopped
- * RTC_SLOW_CLK stops it.
+ * The cycles clk has made since *base_ns, up to now, come off *left: the
+ * rest is counted from now at whatever rate clk takes. A stopped clock
+ * makes none.
  */
+static void clk_fold(Clock *clk, int64_t now, int64_t *base_ns,
+                     uint64_t *left)
+{
+    uint64_t done = now > *base_ns ? clock_ns_to_ticks(clk, now - *base_ns)
+                                   : 0;
+
+    *left -= MIN(done, *left);
+    *base_ns = now;
+}
+
+/* [spec:nuos:req:emu.esp32.ulp] The ULP timer counts the selected period */
 static void ulp_arm_sleep(Esp32UlpState *s, int64_t from)
 {
     uint32_t period = s->sens->regs[A_SENS_ULP_CP_SLEEP_CYC0 / 4 +
                                     s->sleep_sel];
 
-    s->phase = ESP32_ULP_SLEEP;
-    timer_del(&s->timer);
-    if (!s->rtc_cntl->rtc_slowclk_freq) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "esp32_ulp: the ULP timer counts RTC_SLOW_CLK, which "
-                      "is stopped\n");
-        return;
-    }
-    ulp_set_phase(s, ESP32_ULP_SLEEP, from + slow_ns(s, MAX(period, 1)));
+    slow_phase(s, ESP32_ULP_SLEEP, from, MAX(period, 1));
 }
 
 /* [spec:nuos:req:emu.esp32.ulp] Power the ULP up and wait for its clock. */
@@ -176,12 +207,7 @@ static void ulp_wake(Esp32UlpState *s, int64_t from)
     uint32_t wait = FIELD_EX32(s->rtc_cntl->regs[A_RTC_CNTL_TIMER2 / 4],
                                RTC_CNTL_TIMER2, ULPCP_TOUCH_START_WAIT);
 
-    if (!s->rtc_cntl->rtc_slowclk_freq) {
-        ulp_set_phase(s, ESP32_ULP_WAKING, from);
-        return;
-    }
-    ulp_set_phase(s, ESP32_ULP_WAKING,
-                  from + slow_ns(s, WAKEUP_CYCLES + wait));
+    slow_phase(s, ESP32_ULP_WAKING, from, WAKEUP_CYCLES + wait);
 }
 
 /* [spec:nuos:req:emu.esp32.ulp] WAKE: interrupt RTC_CNTL, wake the chip */
@@ -536,19 +562,30 @@ static uint32_t exec_insn(Esp32UlpState *s, uint32_t insn)
 
 /*
  * [spec:nuos:req:emu.esp32.ulp]
+ * [spec:nuos:req:emu.esp32.clock-gating]
  * Run the program up to now: every instruction whose start time has come,
- * and those with no outside effect beyond, a bounded number of them.
+ * and those with no outside effect beyond, a bounded number of them. With
+ * RTC_FAST_CLK stopped nothing runs.
  */
 static void ulp_run(Esp32UlpState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     unsigned ahead = 0;
 
-    run_rebase(s);
     while (s->phase == ESP32_ULP_RUNNING) {
-        int64_t start = run_next_ns(s);
-        uint32_t insn = mem_read(s, s->pc);
+        int64_t start;
+        uint32_t insn, cycles;
 
+        /*
+         * Checked on every instruction: one may stop RTC_FAST_CLK itself,
+         * with a REG_WR to RTC_CNTL_CLK_CONF.
+         */
+        if (!clock_is_enabled(s->fast_clk)) {
+            timer_del(&s->timer);
+            return;
+        }
+        start = run_next_ns(s);
+        insn = mem_read(s, s->pc);
         if (start > now) {
             if (insn_external(insn) || ahead >= RUN_AHEAD_LIMIT) {
                 timer_mod(&s->timer, start);
@@ -556,13 +593,15 @@ static void ulp_run(Esp32UlpState *s)
             }
             ahead++;
         }
-        s->run_cycles += exec_insn(s, insn);
+        /*
+         * The instruction may change RTC_FAST_CLK, which folds run_cycles
+         * at the change: its own cycles go on after.
+         */
+        cycles = exec_insn(s, insn);
+        s->run_cycles += cycles;
     }
     if (s->phase == ESP32_ULP_HALTING) {
-        ulp_set_phase(s, ESP32_ULP_HALTING,
-                      run_next_ns(s) +
-                      (s->rtc_cntl->rtc_slowclk_freq ?
-                       slow_ns(s, PREPARE_CYCLES) : 0));
+        run_schedule(s);
     }
 }
 
@@ -586,13 +625,15 @@ static void ulp_timer_cb(void *opaque)
         s->pc = FIELD_EX32(force, SENS_SAR_START_FORCE, PC_INIT);
         s->run_base_ns = now;
         s->run_cycles = 0;
-        s->run_hz = s->rtc_cntl->rtc_fastclk_freq;
         ulp_run(s);
         break;
     case ESP32_ULP_RUNNING:
         ulp_run(s);
         break;
     case ESP32_ULP_HALTING:
+        slow_phase(s, ESP32_ULP_POWER_DOWN, now, PREPARE_CYCLES);
+        break;
+    case ESP32_ULP_POWER_DOWN:
         if (s->timer_en) {
             ulp_arm_sleep(s, now);
         } else {
@@ -640,6 +681,50 @@ static void esp32_ulp_start(void *opaque, int n, int level)
     }
 }
 
+/* ---- Clock changes ---- */
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp]
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * RTC_FAST_CLK or RTC_SLOW_CLK is about to change (ClockPreUpdate): the
+ * phase it times keeps the cycles made at the old rate. Once it has
+ * changed (ClockUpdate) the phase runs on at the new rate, or holds while
+ * the clock is stopped.
+ */
+static void esp32_ulp_clk_event(Esp32UlpState *s, Clock *clk,
+                                ClockEvent event)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (clk == s->fast_clk && phase_fast(s)) {
+        if (event == ClockPreUpdate) {
+            clk_fold(clk, now, &s->run_base_ns, &s->run_cycles);
+        } else {
+            run_schedule(s);
+        }
+    } else if (clk == s->slow_clk && phase_slow(s)) {
+        if (event == ClockPreUpdate) {
+            clk_fold(clk, now, &s->slow_base_ns, &s->slow_left);
+        } else {
+            slow_schedule(s);
+        }
+    }
+}
+
+static void esp32_ulp_fast_clk_update(void *opaque, ClockEvent event)
+{
+    Esp32UlpState *s = opaque;
+
+    esp32_ulp_clk_event(s, s->fast_clk, event);
+}
+
+static void esp32_ulp_slow_clk_update(void *opaque, ClockEvent event)
+{
+    Esp32UlpState *s = opaque;
+
+    esp32_ulp_clk_event(s, s->slow_clk, event);
+}
+
 static void esp32_ulp_reset_hold(Object *obj, ResetType type)
 {
     Esp32UlpState *s = ESP32_ULP(obj);
@@ -656,7 +741,8 @@ static void esp32_ulp_reset_hold(Object *obj, ResetType type)
     s->sleep_sel = 0;
     s->run_base_ns = 0;
     s->run_cycles = 0;
-    s->run_hz = 0;
+    s->slow_base_ns = 0;
+    s->slow_left = 0;
 }
 
 static void esp32_ulp_realize(DeviceState *dev, Error **errp)
@@ -682,6 +768,12 @@ static void esp32_ulp_init(Object *obj)
     qdev_init_gpio_in_named(dev, esp32_ulp_start, ESP32_ULP_START_IN, 1);
     qdev_init_gpio_out_named(dev, &s->wakeup, ESP32_ULP_WAKEUP, 1);
     qdev_init_gpio_out_named(dev, &s->irq, ESP32_ULP_INT, 1);
+    s->fast_clk = qdev_init_clock_in(dev, ESP32_ULP_FAST_CLK,
+                                     esp32_ulp_fast_clk_update, s,
+                                     ClockPreUpdate | ClockUpdate);
+    s->slow_clk = qdev_init_clock_in(dev, ESP32_ULP_SLOW_CLK,
+                                     esp32_ulp_slow_clk_update, s,
+                                     ClockPreUpdate | ClockUpdate);
 }
 
 static const Property esp32_ulp_properties[] = {
@@ -695,8 +787,8 @@ static const Property esp32_ulp_properties[] = {
 
 static const VMStateDescription vmstate_esp32_ulp = {
     .name = TYPE_ESP32_ULP,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER(timer, Esp32UlpState),
         VMSTATE_UINT32(phase, Esp32UlpState),
@@ -710,7 +802,10 @@ static const VMStateDescription vmstate_esp32_ulp = {
         VMSTATE_UINT32(sleep_sel, Esp32UlpState),
         VMSTATE_INT64(run_base_ns, Esp32UlpState),
         VMSTATE_UINT64(run_cycles, Esp32UlpState),
-        VMSTATE_UINT32(run_hz, Esp32UlpState),
+        VMSTATE_INT64(slow_base_ns, Esp32UlpState),
+        VMSTATE_UINT64(slow_left, Esp32UlpState),
+        VMSTATE_CLOCK(fast_clk, Esp32UlpState),
+        VMSTATE_CLOCK(slow_clk, Esp32UlpState),
         VMSTATE_END_OF_LIST()
     },
 };
