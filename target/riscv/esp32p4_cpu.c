@@ -10,13 +10,32 @@
  * and Clock).
  *
  * The two HP cores implement RV32IMAFC with Zcb, Zcmp and Zcmt (Zc
- * specification v1.0.4-3) and the Zb extensions (Zba, Zbb, Zbc and Zbs of
- * the v1.0.0 specification), in machine and user mode. The LP core
- * implements RV32IMAC in machine mode only. These types carry the standard
- * ISA only: none of Espressif's custom CSRs or instructions (PIE, the
- * hardware loops), the CLIC or the PMA checker. QEMU only provides the Zc
- * and Zb extensions to cores of privileged specification 1.12, so the HP
- * cores are of that version; the TRM gives 1.10, which the LP core is.
+ * specification v1.0.4-3, so with Zca and, on RV32F, Zcf) and the Zb
+ * extensions (Zba, Zbb, Zbc and Zbs of the v1.0.0 specification), in
+ * machine and user mode, with the hardware loop extension (Xesploop),
+ * Espressif's CSRs and a three-trigger debug module; the CSRs, triggers
+ * and hardware loops are in tcg/esp32p4_*.c. The LP core implements
+ * RV32IMAC in machine mode only. Neither type carries the CLIC, the PMA
+ * checker or the PIE extension.
+ *
+ * misa on an HP core reads 0x40901127: RV32 with A, B, C, F, I, M, U and
+ * X. The TRM's register table gives B and X but clears F, while the TRM
+ * itself and the silicon describe an RV32IMAFC core, and earlier silicon
+ * reads 0x40901125, F included; B is new with the Zb extensions of v3.x.
+ *
+ * QEMU only provides the Zc and Zb extensions to cores of privileged
+ * specification 1.12, so the HP cores are of that version, without the
+ * 1.11 and 1.12 CSRs (mstatush, menvcfg, mconfigptr) the core lacks and
+ * with MRET keeping mstatus.MPRV, as the TRM's 1.10 has it; the LP core is
+ * of 1.10.
+ *
+ * Where the HP core departs from the ratified Zcmp, cm.push stores ra at
+ * the highest address and the rest of its list below in register order,
+ * and cm.pop and cm.popret load from there: ESP-IDF builds for the core
+ * with GCC's -mno-cm-push-reverse, which lays frames out that way.
+ * Misaligned loads and stores are handled by the core, the only misaligned
+ * exception being cause 6, which a misaligned LR.W raises as well as SC.W
+ * and the AMOs.
  *
  * Each core has a reset input and a clock enable, which the chip's reset
  * and clock control drive. A core whose reset is held does not run and
@@ -37,6 +56,8 @@
 #include "internals.h"
 #ifdef CONFIG_TCG
 #include "accel/tcg/cpu-ops.h"
+#include "accel/tcg/cpu-loop.h"
+#include "target/riscv/tcg/csr.h"
 #endif
 
 #define ESP32P4_HP_MVENDORID 0x612
@@ -45,6 +66,13 @@
 
 #define ESP32P4_HP_PMP_REGIONS     32
 #define ESP32P4_HP_PMP_GRANULARITY 128
+
+/* The HP core's programmable counters: mhpmcounter8, 9 and 13. */
+#define ESP32P4_HP_PMU_MASK (BIT(8) | BIT(9) | BIT(13))
+
+#define ESP32P4_MEXSTATUS_RESET (ESP32P4_MEXSTATUS_CLIC_INHV | \
+                                 ESP32P4_MEXSTATUS_NMFT |      \
+                                 ESP32P4_MEXSTATUS_PPBEXE)
 
 static bool esp32p4_cpu_held(ESP32P4CPU *cpu)
 {
@@ -140,6 +168,291 @@ static void esp32p4_cpu_set_clock(void *opaque, int n, int level)
                      RUN_ON_CPU_NULL);
 }
 
+#ifdef CONFIG_TCG
+/*
+ * The hooks of the HP core's TCG operations, wrapping the RISC-V ones
+ * in esp32p4_tcg_ops.
+ */
+static TCGCPUOps esp32p4_tcg_ops;
+static TCGCPUOps esp32p4_hp_tcg_ops;
+
+static ESP32P4CPU *esp32p4_cpu_of(CPUState *cs)
+{
+    return container_of(cs, ESP32P4CPU, parent_obj.parent_obj);
+}
+
+/* The CSR a CSR instruction accesses, or -1 for another instruction. */
+static int esp32p4_insn_csr(uint32_t insn)
+{
+    uint32_t funct3 = extract32(insn, 12, 3);
+
+    if ((insn & 0x7f) != 0x73 || funct3 == 0 || funct3 == 4) {
+        return -1;
+    }
+    return insn >> 20;
+}
+
+/* A single-precision instruction of the F extension, or a Zcf one. */
+static bool esp32p4_insn_is_fp(uint32_t insn)
+{
+    if ((insn & 3) != 3) {
+        uint32_t funct3 = extract32(insn, 13, 3);
+
+        return (insn & 3) != 1 && (funct3 == 3 || funct3 == 7);
+    }
+    switch (insn & 0x7f) {
+    case 0x07: /* FLW */
+    case 0x27: /* FSW */
+        return extract32(insn, 12, 3) == 2;
+    case 0x43: /* FMADD.S */
+    case 0x47: /* FMSUB.S */
+    case 0x4b: /* FNMSUB.S */
+    case 0x4f: /* FNMADD.S */
+    case 0x53: /* OP-FP */
+        return extract32(insn, 25, 2) == 0;
+    default:
+        return false;
+    }
+}
+
+static bool esp32p4_csr_is_fp(int csr)
+{
+    return csr == CSR_FFLAGS || csr == CSR_FRM || csr == CSR_FCSR ||
+           csr == 0x800;
+}
+
+/* A hardware loop instruction (custom-1, funct3 0 to 5). */
+static bool esp32p4_insn_is_hwlp(uint32_t insn)
+{
+    return (insn & 0x7f) == 0x2b && extract32(insn, 12, 3) <= 5;
+}
+
+static bool esp32p4_csr_is_hwlp(int csr)
+{
+    return (csr >= 0x7c6 && csr <= 0x7cb) || (csr >= 0x8c0 && csr <= 0x8c5);
+}
+
+/*
+ * mext_ill records an illegal instruction exception raised because the
+ * instruction, or the CSR it accesses, belongs to an extension that is
+ * off: F with mstatus.FS off, or the hardware loops with
+ * mhwloop_state_reg.STATE off.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static uint32_t esp32p4_illegal_reason(ESP32P4CPU *cpu, uint32_t insn)
+{
+    CPURISCVState *env = &cpu->parent_obj.env;
+    int csr = esp32p4_insn_csr(insn);
+    uint32_t reason = 0;
+
+    if (!riscv_cpu_fp_enabled(env) &&
+        (esp32p4_insn_is_fp(insn) || esp32p4_csr_is_fp(csr))) {
+        reason |= ESP32P4_EXT_ILL_FPU;
+    }
+    if ((cpu->hwlp_state & ESP32P4_HWLP_STATE) == ESP32P4_EXT_OFF &&
+        (esp32p4_insn_is_hwlp(insn) || esp32p4_csr_is_hwlp(csr))) {
+        reason |= ESP32P4_EXT_ILL_HWLP;
+    }
+    return reason;
+}
+
+/*
+ * Entering a trap, which on the HP core is always taken in machine mode:
+ * mexstatus records it (EXPT_VLD) and, for an access fault, whether a bus
+ * error or the PMP or PMA raised it, saves PBEXE in PPBEXE and clears it;
+ * tcontrol saves MTE in MPTE and clears it, disabling the triggers; and
+ * mext_ill records why an illegal instruction was illegal.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static void esp32p4_hp_trap_entry(ESP32P4CPU *cpu, int32_t excp)
+{
+    CPURISCVState *env = &cpu->parent_obj.env;
+
+    if (!(excp & RISCV_EXCP_INT_FLAG)) {
+        switch (excp) {
+        case RISCV_EXCP_ILLEGAL_INST:
+            cpu->ext_ill |= esp32p4_illegal_reason(cpu, env->bins);
+            break;
+        case RISCV_EXCP_LOAD_ACCESS_FAULT:
+        case RISCV_EXCP_STORE_AMO_ACCESS_FAULT:
+            cpu->mexstatus |= cpu->bus_error ? ESP32P4_MEXSTATUS_BUS_ERR
+                                             : ESP32P4_MEXSTATUS_PMP_ERR;
+            break;
+        case RISCV_EXCP_INST_ACCESS_FAULT:
+            if (cpu->bus_error) {
+                cpu->mexstatus |= ESP32P4_MEXSTATUS_FETCH_ERR;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    cpu->bus_error = false;
+
+    cpu->mexstatus &= ~ESP32P4_MEXSTATUS_PPBEXE;
+    if (cpu->mexstatus & ESP32P4_MEXSTATUS_PBEXE) {
+        cpu->mexstatus |= ESP32P4_MEXSTATUS_PPBEXE;
+    }
+    cpu->mexstatus &= ~ESP32P4_MEXSTATUS_PBEXE;
+    cpu->mexstatus |= ESP32P4_MEXSTATUS_EXPT_VLD;
+
+    cpu->tcontrol &= ~ESP32P4_TCONTROL_MPTE;
+    if (cpu->tcontrol & ESP32P4_TCONTROL_MTE) {
+        cpu->tcontrol |= ESP32P4_TCONTROL_MPTE;
+    }
+    cpu->tcontrol &= ~ESP32P4_TCONTROL_MTE;
+}
+
+static void esp32p4_hp_do_interrupt(CPUState *cs)
+{
+    if (cs->exception_index != RISCV_EXCP_SEMIHOST) {
+        esp32p4_hp_trap_entry(esp32p4_cpu_of(cs), cs->exception_index);
+    }
+    esp32p4_tcg_ops.do_interrupt(cs);
+}
+
+/*
+ * A pending bus error that mexstatus.PBEXE enables raises its access
+ * fault again, at the instruction about to execute.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static bool esp32p4_hp_cpu_exec_interrupt(CPUState *cs, int request)
+{
+    ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
+    CPURISCVState *env = &cpu->parent_obj.env;
+    uint32_t pending = ESP32P4_MEXSTATUS_BUS_ERR | ESP32P4_MEXSTATUS_PBEXE;
+
+    if (request & ESP32P4_CPU_INTERRUPT_BUS_ERROR) {
+        cpu_reset_interrupt(cs, ESP32P4_CPU_INTERRUPT_BUS_ERROR);
+        if ((cpu->mexstatus & (pending | ESP32P4_MEXSTATUS_NMFT)) ==
+            pending) {
+            if (cpu->bus_error_store) {
+                cs->exception_index = RISCV_EXCP_STORE_AMO_ACCESS_FAULT;
+                env->badaddr = cpu->sttval[0];
+            } else {
+                cs->exception_index = RISCV_EXCP_LOAD_ACCESS_FAULT;
+                env->badaddr = cpu->ldtval[0];
+            }
+            env->excp_uw2 = 0;
+            cpu->bus_error = true;
+            esp32p4_hp_do_interrupt(cs);
+            return true;
+        }
+    }
+    return esp32p4_tcg_ops.cpu_exec_interrupt(cs, request);
+}
+
+/*
+ * A bus error, which the core takes as an access fault, is recorded with
+ * the faulting instruction's address and valid bit in ldpc or stpc and
+ * the access address in ldtval or sttval, the newest entry first. The
+ * core reports load and store bus errors asynchronously unless mhint.SBE
+ * is set, so on hardware the fault may be taken a few instructions after
+ * the access; here it is always taken at the access.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static void esp32p4_hp_do_transaction_failed(CPUState *cs, hwaddr physaddr,
+                                             vaddr addr, unsigned size,
+                                             MMUAccessType access_type,
+                                             int mmu_idx, MemTxAttrs attrs,
+                                             MemTxResult response,
+                                             uintptr_t retaddr)
+{
+    ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
+    uint32_t pc;
+
+    if (retaddr) {
+        cpu_restore_state(cs, retaddr);
+    }
+    pc = (cpu->parent_obj.env.pc & ~1) | 1;
+    if (access_type == MMU_DATA_LOAD) {
+        cpu->ldpc[1] = cpu->ldpc[0];
+        cpu->ldtval[1] = cpu->ldtval[0];
+        cpu->ldpc[0] = pc;
+        cpu->ldtval[0] = addr;
+        cpu->bus_error_store = false;
+    } else if (access_type == MMU_DATA_STORE) {
+        for (int i = ARRAY_SIZE(cpu->stpc) - 1; i > 0; i--) {
+            cpu->stpc[i] = cpu->stpc[i - 1];
+            cpu->sttval[i] = cpu->sttval[i - 1];
+        }
+        cpu->stpc[0] = pc;
+        cpu->sttval[0] = addr;
+        cpu->bus_error_store = true;
+    }
+    cpu->bus_error = true;
+    esp32p4_tcg_ops.do_transaction_failed(cs, physaddr, addr, size,
+                                          access_type, mmu_idx, attrs,
+                                          response, 0);
+}
+
+/*
+ * The only load that must be aligned is LR.W, whose misaligned address
+ * the core reports as cause 6, a store or AMO misaligned address.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static G_NORETURN void esp32p4_hp_do_unaligned_access(CPUState *cs,
+                                                      vaddr addr,
+                                                      MMUAccessType access_type,
+                                                      int mmu_idx,
+                                                      uintptr_t retaddr)
+{
+    if (access_type == MMU_DATA_LOAD) {
+        access_type = MMU_DATA_STORE;
+    }
+    esp32p4_tcg_ops.do_unaligned_access(cs, addr, access_type, mmu_idx,
+                                        retaddr);
+}
+
+/*
+ * The hardware loop state the translation of a block depends on: whether
+ * the loop instructions may be used, and whether a loop counts.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static TCGTBCPUState esp32p4_hp_get_tb_cpu_state(CPUState *cs)
+{
+    ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
+    TCGTBCPUState s = esp32p4_tcg_ops.get_tb_cpu_state(cs);
+
+    if (esp32p4_hwlp_enabled(cpu)) {
+        s.cs_base = FIELD_DP64(s.cs_base, EXT_TB_FLAGS, ESP32P4_HWLP_EN, 1);
+        if (cpu->hwlp_count[0] || cpu->hwlp_count[1]) {
+            s.cs_base = FIELD_DP64(s.cs_base, EXT_TB_FLAGS,
+                                   ESP32P4_HWLP_ARMED, 1);
+        }
+    }
+    return s;
+}
+
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static void esp32p4_hp_reset_hold(ESP32P4CPU *cpu)
+{
+    memset(cpu->hwlp_start, 0, sizeof(cpu->hwlp_start));
+    memset(cpu->hwlp_end, 0, sizeof(cpu->hwlp_end));
+    memset(cpu->hwlp_count, 0, sizeof(cpu->hwlp_count));
+    cpu->hwlp_state = 0;
+    cpu->pie_state = 0;
+    cpu->ext_ill = 0;
+    cpu->mexstatus = ESP32P4_MEXSTATUS_RESET;
+    cpu->mhint = 0;
+    cpu->mhcr = 0;
+    cpu->fxcr_dqnan = false;
+    esp32p4_hp_update_fp_status(cpu);
+    cpu->gpio_oen = 0;
+    cpu->gpio_out = 0;
+    memset(cpu->ldpc, 0, sizeof(cpu->ldpc));
+    memset(cpu->ldtval, 0, sizeof(cpu->ldtval));
+    memset(cpu->stpc, 0, sizeof(cpu->stpc));
+    memset(cpu->sttval, 0, sizeof(cpu->sttval));
+    cpu->bus_error = false;
+    cpu->bus_error_store = false;
+    memset(cpu->mhpmevent, 0, sizeof(cpu->mhpmevent));
+    cpu->mcountinhibit_tm = false;
+    esp32p4_triggers_reset(cpu);
+    cpu_reset_interrupt(CPU(cpu), ESP32P4_CPU_INTERRUPT_BUS_ERROR);
+}
+#endif
+
 /*
  * The reset inputs are not the core's own state and survive its reset: a
  * core reset while its reset is held, or its clock stopped, stays halted.
@@ -154,6 +467,26 @@ static void esp32p4_cpu_reset_hold(Object *obj, ResetType type)
     }
     CPU(obj)->halted = esp32p4_cpu_held(cpu);
     cpu->clock_halted = !cpu->reset && cpu->clock_stopped;
+#ifdef CONFIG_TCG
+    if (esp32p4_env_is_hp(&cpu->parent_obj.env)) {
+        esp32p4_hp_reset_hold(cpu);
+    }
+#endif
+}
+
+static void esp32p4_cpu_reset_exit(Object *obj, ResetType type)
+{
+    ESP32P4CPU *cpu = ESP32P4_CPU(obj);
+    ESP32P4CPUClass *ecc = ESP32P4_CPU_GET_CLASS(obj);
+
+    if (ecc->parent_phases.exit) {
+        ecc->parent_phases.exit(obj, type);
+    }
+#ifdef CONFIG_TCG
+    if (esp32p4_env_is_hp(&cpu->parent_obj.env)) {
+        esp32p4_hp_gpio_update(cpu);
+    }
+#endif
 }
 
 static void esp32p4_cpu_init(Object *obj)
@@ -174,6 +507,59 @@ static bool esp32p4_cpu_get_clock_running(Object *obj, Error **errp)
     return !ESP32P4_CPU(obj)->clock_stopped;
 }
 
+#ifdef CONFIG_TCG
+static bool esp32p4_hp_state_needed(void *opaque)
+{
+    return esp32p4_env_is_hp(&ESP32P4_CPU(opaque)->parent_obj.env);
+}
+
+static int esp32p4_hp_state_post_load(void *opaque, int version_id)
+{
+    ESP32P4CPU *cpu = ESP32P4_CPU(opaque);
+
+    esp32p4_hp_update_fp_status(cpu);
+    esp32p4_triggers_rebuild(cpu);
+    return 0;
+}
+
+static const VMStateDescription vmstate_esp32p4_hp_state = {
+    .name = "esp32p4-cpu/hp",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = esp32p4_hp_state_needed,
+    .post_load = esp32p4_hp_state_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(hwlp_start, ESP32P4CPU, ESP32P4_HWLP_LOOPS),
+        VMSTATE_UINT32_ARRAY(hwlp_end, ESP32P4CPU, ESP32P4_HWLP_LOOPS),
+        VMSTATE_UINT32_ARRAY(hwlp_count, ESP32P4CPU, ESP32P4_HWLP_LOOPS),
+        VMSTATE_UINT32(hwlp_state, ESP32P4CPU),
+        VMSTATE_UINT32(pie_state, ESP32P4CPU),
+        VMSTATE_UINT32(ext_ill, ESP32P4CPU),
+        VMSTATE_UINT32(mexstatus, ESP32P4CPU),
+        VMSTATE_UINT32(mhint, ESP32P4CPU),
+        VMSTATE_UINT32(mhcr, ESP32P4CPU),
+        VMSTATE_BOOL(fxcr_dqnan, ESP32P4CPU),
+        VMSTATE_UINT32(gpio_oen, ESP32P4CPU),
+        VMSTATE_UINT32(gpio_out, ESP32P4CPU),
+        VMSTATE_UINT32(gpio_in, ESP32P4CPU),
+        VMSTATE_UINT32_ARRAY(ldpc, ESP32P4CPU, 2),
+        VMSTATE_UINT32_ARRAY(ldtval, ESP32P4CPU, 2),
+        VMSTATE_UINT32_ARRAY(stpc, ESP32P4CPU, 3),
+        VMSTATE_UINT32_ARRAY(sttval, ESP32P4CPU, 3),
+        VMSTATE_BOOL(bus_error_store, ESP32P4CPU),
+        VMSTATE_UINT32_ARRAY(mhpmevent, ESP32P4CPU, 3),
+        VMSTATE_BOOL(mcountinhibit_tm, ESP32P4CPU),
+        VMSTATE_UINT32(tselect, ESP32P4CPU),
+        VMSTATE_UINT32_ARRAY(tdata1, ESP32P4CPU, ESP32P4_TRIGGERS),
+        VMSTATE_UINT32_ARRAY(tdata2, ESP32P4CPU, ESP32P4_TRIGGERS),
+        VMSTATE_UINT32_ARRAY(tdata3, ESP32P4CPU, ESP32P4_TRIGGERS),
+        VMSTATE_UINT32(tcontrol, ESP32P4CPU),
+        VMSTATE_UINT32(mcontext, ESP32P4CPU),
+        VMSTATE_END_OF_LIST()
+    },
+};
+#endif
+
 static const VMStateDescription vmstate_esp32p4_cpu = {
     .name = "esp32p4-cpu",
     .version_id = 1,
@@ -186,16 +572,20 @@ static const VMStateDescription vmstate_esp32p4_cpu = {
         VMSTATE_BOOL(clock_halted, ESP32P4CPU),
         VMSTATE_END_OF_LIST()
     },
+#ifdef CONFIG_TCG
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_esp32p4_hp_state,
+        NULL
+    },
+#endif
 };
 
 /*
  * The hooks that ask whether a halted core has work, wrapped so that a
- * held core never does. Both types share one copy of each table.
+ * held core never does. Both types share one copy of each table, which
+ * the HP type extends in its own TCG table.
  */
 static SysemuCPUOps esp32p4_sysemu_ops;
-#ifdef CONFIG_TCG
-static TCGCPUOps esp32p4_tcg_ops;
-#endif
 
 static void esp32p4_cpu_class_init(ObjectClass *oc, const void *data)
 {
@@ -204,7 +594,8 @@ static void esp32p4_cpu_class_init(ObjectClass *oc, const void *data)
     ESP32P4CPUClass *ecc = ESP32P4_CPU_CLASS(oc);
 
     resettable_class_set_parent_phases(RESETTABLE_CLASS(oc), NULL,
-                                       esp32p4_cpu_reset_hold, NULL,
+                                       esp32p4_cpu_reset_hold,
+                                       esp32p4_cpu_reset_exit,
                                        &ecc->parent_phases);
 
     esp32p4_sysemu_ops = *cc->sysemu_ops;
@@ -228,7 +619,64 @@ static void esp32p4_cpu_class_init(ObjectClass *oc, const void *data)
         "The core's clock enable is high");
 }
 
+#ifdef CONFIG_TCG
+static void esp32p4_hp_cpu_set_gpio_in(void *opaque, int n, int level)
+{
+    ESP32P4CPU *cpu = opaque;
+
+    qatomic_set(&cpu->gpio_in, deposit32(qatomic_read(&cpu->gpio_in), n, 1,
+                                         level != 0));
+}
+#endif
+
+/*
+ * The HP core's own trigger module replaces QEMU's, which the "debug"
+ * property would otherwise enable; QEMU's trigger count is zero too, as
+ * QEMU walks its triggers on every privilege change under icount.
+ */
+static void esp32p4_hp_cpu_init(Object *obj)
+{
+#ifdef CONFIG_TCG
+    ESP32P4CPU *cpu = ESP32P4_CPU(obj);
+    DeviceState *dev = DEVICE(obj);
+
+    cpu->parent_obj.cfg.debug = false;
+    cpu->parent_obj.cfg.ext_sdtrig = false;
+    cpu->parent_obj.env.num_triggers = 0;
+    qdev_init_gpio_out_named(dev, cpu->gpio_out_irq, ESP32P4_CPU_GPIO_OUT,
+                             ESP32P4_CPU_GPIOS);
+    qdev_init_gpio_out_named(dev, cpu->gpio_oe_irq, ESP32P4_CPU_GPIO_OE,
+                             ESP32P4_CPU_GPIOS);
+    qdev_init_gpio_in_named(dev, esp32p4_hp_cpu_set_gpio_in,
+                            ESP32P4_CPU_GPIO_IN, ESP32P4_CPU_GPIOS);
+#endif
+}
+
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static void esp32p4_hp_cpu_class_init(ObjectClass *oc, const void *data)
+{
+#ifdef CONFIG_TCG
+    CPUClass *cc = CPU_CLASS(oc);
+
+    esp32p4_hp_tcg_ops = esp32p4_tcg_ops;
+    esp32p4_hp_tcg_ops.get_tb_cpu_state = esp32p4_hp_get_tb_cpu_state;
+    esp32p4_hp_tcg_ops.do_interrupt = esp32p4_hp_do_interrupt;
+    esp32p4_hp_tcg_ops.cpu_exec_interrupt = esp32p4_hp_cpu_exec_interrupt;
+    esp32p4_hp_tcg_ops.do_transaction_failed =
+        esp32p4_hp_do_transaction_failed;
+    esp32p4_hp_tcg_ops.do_unaligned_access = esp32p4_hp_do_unaligned_access;
+    esp32p4_hp_tcg_ops.debug_excp_handler = esp32p4_debug_excp_handler;
+    esp32p4_hp_tcg_ops.debug_check_breakpoint =
+        esp32p4_debug_check_breakpoint;
+    esp32p4_hp_tcg_ops.debug_check_watchpoint =
+        esp32p4_debug_check_watchpoint;
+    cc->tcg_ops = &esp32p4_hp_tcg_ops;
+    esp32p4_hp_csr_class_init();
+#endif
+}
+
 /* [spec:nuos:req:emu.esp32p4.machine] */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
 static const TypeInfo esp32p4_cpu_types[] = {
     {
         .name = TYPE_ESP32P4_CPU,
@@ -242,27 +690,36 @@ static const TypeInfo esp32p4_cpu_types[] = {
     {
         .name = TYPE_ESP32P4_HP_CPU,
         .parent = TYPE_ESP32P4_CPU,
+        .instance_init = esp32p4_hp_cpu_init,
+        .class_init = esp32p4_hp_cpu_class_init,
         .class_data = &(const RISCVCPUDef) {
             .misa_mxl_max = MXL_RV32,
-            .misa_ext = RVI | RVM | RVA | RVF | RVC | RVU,
+            .misa_ext = RVI | RVM | RVA | RVF | RVC | RVB | RVU | RVX,
             .priv_spec = PRIV_VERSION_1_12_0,
             .vext_spec = RISCV_PROFILE_ATTR_UNUSED,
             .cfg.max_satp_mode = VM_1_10_MBARE,
             .cfg.ext_zicsr = true,
             .cfg.ext_zifencei = true,
+            .cfg.ext_zicclsm = true,
             .cfg.ext_zcb = true,
             .cfg.ext_zcmp = true,
             .cfg.ext_zcmt = true,
+            .cfg.zcmp_ra_highest = true,
             .cfg.ext_zba = true,
             .cfg.ext_zbb = true,
             .cfg.ext_zbc = true,
             .cfg.ext_zbs = true,
+            .cfg.ext_xesploop = true,
             .cfg.pmp = true,
             .cfg.pmp_regions = ESP32P4_HP_PMP_REGIONS,
             .cfg.pmp_granularity = ESP32P4_HP_PMP_GRANULARITY,
+            .cfg.pmu_mask = ESP32P4_HP_PMU_MASK,
             .cfg.mvendorid = ESP32P4_HP_MVENDORID,
             .cfg.marchid = ESP32P4_HP_MARCHID,
             .cfg.mimpid = ESP32P4_HP_MIMPID,
+#ifdef CONFIG_TCG
+            .custom_csrs = esp32p4_hp_csr_list,
+#endif
         },
     },
     {

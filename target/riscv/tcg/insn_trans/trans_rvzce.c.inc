@@ -166,6 +166,16 @@ static uint32_t decode_push_pop_list(DisasContext *ctx, target_ulong rlist)
     return reg_bitmap;
 }
 
+/*
+ * The register cm.push stores n-th, from the highest address down, and
+ * cm.pop loads from there: the highest-numbered register first, or ra
+ * first on a core with zcmp_ra_highest.
+ */
+static int push_pop_reg(DisasContext *ctx, int n)
+{
+    return ctx->cfg_ptr->zcmp_ra_highest ? n : X_Sn + 11 - n;
+}
+
 static bool gen_pop(DisasContext *ctx, arg_cmpp *a, bool ret, bool ret_val)
 {
     REQUIRE_ZCMP(ctx);
@@ -181,12 +191,13 @@ static bool gen_pop(DisasContext *ctx, arg_cmpp *a, bool ret, bool ret_val)
                              a->spimm;
     TCGv sp = dest_gpr(ctx, xSP);
     TCGv addr = tcg_temp_new();
-    int i;
+    int i, n;
 
     tcg_gen_addi_tl(addr, sp, stack_adj - reg_size);
 
     memop |= ctx->mo_endianness;
-    for (i = X_Sn + 11; i >= 0; i--) {
+    for (n = 0; n < X_Sn + 12; n++) {
+        i = push_pop_reg(ctx, n);
         if (reg_bitmap & (1 << i)) {
             TCGv dest = dest_gpr(ctx, i);
             tcg_gen_qemu_ld_tl(dest, addr, ctx->mem_idx, memop);
@@ -235,12 +246,13 @@ static bool trans_cm_push(DisasContext *ctx, arg_cm_push *a)
                              a->spimm;
     TCGv sp = dest_gpr(ctx, xSP);
     TCGv addr = tcg_temp_new();
-    int i;
+    int i, n;
 
     tcg_gen_subi_tl(addr, sp, reg_size);
 
     memop |= ctx->mo_endianness;
-    for (i = X_Sn + 11; i >= 0; i--) {
+    for (n = 0; n < X_Sn + 12; n++) {
+        i = push_pop_reg(ctx, n);
         if (reg_bitmap & (1 << i)) {
             TCGv val = get_gpr(ctx, i, EXT_NONE);
             tcg_gen_qemu_st_tl(val, addr, ctx->mem_idx, memop);

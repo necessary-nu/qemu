@@ -994,9 +994,7 @@ static bool trans_fence_i(DisasContext *ctx, arg_fence_i *a)
      * FENCE_I is a no-op in QEMU,
      * however we need to end the translation block
      */
-    gen_update_pc(ctx, ctx->cur_insn_len);
-    exit_tb(ctx);
-    ctx->base.is_jmp = DISAS_NORETURN;
+    gen_exit_tb_next(ctx);
     return true;
 }
 
@@ -1005,9 +1003,7 @@ static bool do_csr_post(DisasContext *ctx)
     /* The helper may raise ILLEGAL_INSN -- record binv for unwind. */
     decode_save_opc(ctx, 0);
     /* We may have changed important cpu state -- exit to main loop. */
-    gen_update_pc(ctx, ctx->cur_insn_len);
-    exit_tb(ctx);
-    ctx->base.is_jmp = DISAS_NORETURN;
+    gen_exit_tb_next(ctx);
     return true;
 }
 

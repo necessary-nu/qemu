@@ -30,6 +30,7 @@
 #include "semihosting/semihost.h"
 
 #include "internals.h"
+#include "target/riscv/esp32p4_cpu.h"
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -126,6 +127,9 @@ typedef struct DisasContext {
     bool bcfi_enabled;
     /* Data endianness from MSTATUS UBE/SBE/MBE */
     MemOp mo_endianness;
+    /* ESP32-P4 HP core: hardware loops may be used, and one is counting. */
+    bool hwlp_en;
+    bool hwlp_armed;
 } DisasContext;
 
 static inline bool has_ext(DisasContext *ctx, uint32_t ext)
@@ -301,6 +305,30 @@ static void exit_tb(DisasContext *ctx)
     }
 #endif
     tcg_gen_exit_tb(NULL, 0);
+}
+
+#ifndef CONFIG_USER_ONLY
+static void gen_esp32p4_hwlp_end(DisasContext *ctx, TCGv next,
+                                 bool main_loop);
+static void gen_esp32p4_hwlp_check(DisasContext *ctx);
+#endif
+
+/*
+ * End the TB after an instruction that continues with the next one,
+ * returning to the main loop, as an instruction that may have changed
+ * CPU state does.
+ */
+static void gen_exit_tb_next(DisasContext *ctx)
+{
+#ifndef CONFIG_USER_ONLY
+    if (ctx->cfg_ptr->ext_xesploop) {
+        gen_esp32p4_hwlp_end(ctx, NULL, true);
+        return;
+    }
+#endif
+    gen_update_pc(ctx, ctx->cur_insn_len);
+    exit_tb(ctx);
+    ctx->base.is_jmp = DISAS_NORETURN;
 }
 
 static void gen_goto_tb(DisasContext *ctx, unsigned tb_slot_idx,
@@ -1246,10 +1274,12 @@ static uint32_t opcode_at(DisasContextBase *dcbase, target_ulong pc)
 #include "decode-xthead.c.inc"
 #include "decode-xmips.c.inc"
 #include "decode-xlrbr.c.inc"
+#include "decode-esp32p4.c.inc"
 #include "insn_trans/trans_xthead.c.inc"
 #include "insn_trans/trans_xventanacondops.c.inc"
 #include "insn_trans/trans_xmips.c.inc"
 #include "insn_trans/trans_xlrbr.c.inc"
+#include "insn_trans/trans_esp32p4.c.inc"
 
 /* Include the auto-generated decoder for 16 bit insn */
 #include "decode-insn16.c.inc"
@@ -1265,6 +1295,8 @@ static uint32_t opcode_at(DisasContextBase *dcbase, target_ulong pc)
 #define MAX_INSN_LEN  4
 
 const RISCVDecoder decoder_table[] = {
+    /* Ahead of the standard decoder, as it replaces MRET and SFENCE.VMA. */
+    { has_xesploop_p, decode_esp32p4 },
     { always_true_p, decode_insn32 },
     { has_xmips_p, decode_xmips},
     { has_xthead_p, decode_xthead},
@@ -1385,6 +1417,9 @@ static void riscv_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->decoders = cpu->decoders;
     ctx->mo_endianness = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, BIG_ENDIAN)
                          ? MO_BE : MO_LE;
+    ctx->hwlp_en = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, ESP32P4_HWLP_EN);
+    ctx->hwlp_armed = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS,
+                                 ESP32P4_HWLP_ARMED);
 }
 
 static void riscv_tr_tb_start(DisasContextBase *db, CPUState *cpu)
@@ -1410,6 +1445,11 @@ static void riscv_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     CPURISCVState *env = cpu_env(cpu);
 
     decode_opc(env, ctx);
+#ifndef CONFIG_USER_ONLY
+    if (ctx->hwlp_armed && ctx->base.is_jmp == DISAS_NEXT) {
+        gen_esp32p4_hwlp_check(ctx);
+    }
+#endif
     ctx->base.pc_next += ctx->cur_insn_len;
 
     /*

@@ -394,8 +394,8 @@ static void test_cores(void)
     g_assert_cmphex(dump_reg(regs, 2, "pc"), ==, 0x50100000);
     g_assert_cmphex(dump_reg(regs, 1, "mhartid"), ==, 1);
     g_assert_cmphex(dump_reg(regs, 2, "mhartid"), ==, 0);
-    /* RV32IMAFCU and RV32IMAC. */
-    g_assert_cmphex(dump_reg(regs, 0, "misa"), ==, 0x40101125);
+    /* RV32IMAFCBU with Espressif's extensions (X), and RV32IMAC. */
+    g_assert_cmphex(dump_reg(regs, 0, "misa"), ==, 0x40901127);
     g_assert_cmphex(dump_reg(regs, 2, "misa"), ==, 0x40001105);
 
     /* Core 0 runs; core 1 is held in reset with its clock gated. */
