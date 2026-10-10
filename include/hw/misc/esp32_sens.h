@@ -13,6 +13,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/registerfields.h"
 #include "qemu/timer.h"
+#include "hw/core/clock.h"
 
 #define TYPE_ESP32_SENS "misc.esp32.sens"
 OBJECT_DECLARE_SIMPLE_TYPE(Esp32SensState, ESP32_SENS)
@@ -35,6 +36,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(Esp32SensState, ESP32_SENS)
 #define ESP32_SENS_TOUCH_TIMER_IN   "esp32-sens-touch-timer"
 #define ESP32_SENS_SARADC_CTRL_IN   "esp32-sens-saradc-ctrl"
 #define ESP32_SENS_ULP_START        "esp32-sens-ulp-start"
+
+/*
+ * Clock inputs, from RTC_CNTL:
+ * - ESP32_SENS_FAST_CLK: RTC_FAST_CLK, which times the RTC controllers'
+ *   conversions, the touch FSM's measurements, the cosine generator and
+ *   the RTC I2C interface.
+ * - ESP32_SENS_SLOW_CLK: RTC_SLOW_CLK, which times the touch FSM's sleep.
+ */
+#define ESP32_SENS_FAST_CLK         "fast-clk"
+#define ESP32_SENS_SLOW_CLK         "slow-clk"
 
 #define ESP32_SENS_SIZE 0x400
 #define ESP32_SENS_REG_COUNT 64
@@ -152,6 +163,17 @@ typedef enum Esp32TouchPhase {
     ESP32_TOUCH_SLEEP,
 } Esp32TouchPhase;
 
+/*
+ * A wait of a number of cycles of one clock: `left` cycles counted from
+ * base_ns, ending when timer fires. While the clock is stopped the timer
+ * is not armed and the wait holds.
+ */
+typedef struct Esp32SensWait {
+    QEMUTimer timer;
+    int64_t base_ns;
+    uint64_t left;
+} Esp32SensWait;
+
 typedef struct Esp32RtcCntlState Esp32RtcCntlState;
 typedef struct Esp32RtcIoState Esp32RtcIoState;
 typedef struct Esp32GpioState Esp32GpioState;
@@ -165,6 +187,8 @@ struct Esp32SensState {
     qemu_irq touch_int;
     qemu_irq touch_wakeup;
     qemu_irq ulp_start;
+    Clock *fast_clk;
+    Clock *slow_clk;
 
     Esp32RtcCntlState *rtc_cntl;
     Esp32RtcIoState *rtcio;
@@ -175,22 +199,25 @@ struct Esp32SensState {
     uint32_t regs[ESP32_SENS_REG_COUNT];
 
     /* The RTC controllers' conversions in progress, and their results */
-    QEMUTimer adc_timer[ESP32_ADC_UNITS];
+    Esp32SensWait adc_wait[ESP32_ADC_UNITS];
     bool adc_busy[ESP32_ADC_UNITS];
     uint32_t adc_result[ESP32_ADC_UNITS];
     /* The pad each ADC's ULP-side selection (its last ADC instruction) has */
     uint32_t ulp_pads[ESP32_ADC_UNITS];
 
-    /* An RTC I2C transaction is in progress until i2c_timer fires */
-    QEMUTimer i2c_timer;
+    /* An RTC I2C transaction is in progress until i2c_wait ends */
+    Esp32SensWait i2c_wait;
     bool i2c_busy;
 
     /* The DIG controllers' pattern table pointers, and alternate mode's */
     uint8_t patt_ptr[ESP32_ADC_UNITS];
     uint8_t alt_unit;
 
-    QEMUTimer touch_timer;
+    /* The touch FSM's current phase, which ends with touch_wait */
+    Esp32SensWait touch_wait;
     uint32_t touch_phase;
+    /* When the current measurement phase began */
+    int64_t touch_meas_ns;
     bool touch_timer_en;
     bool touch_wakeup_level;
 

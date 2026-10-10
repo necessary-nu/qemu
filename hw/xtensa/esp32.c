@@ -1712,8 +1712,15 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
      * [spec:nuos:req:emu.esp32.analog]
      * SENS, in the RTC domain, with the SAR ADCs, the DACs, the touch
      * sensor and the Hall sensor: the touch interrupt and wakeup go to
-     * RTC_CNTL, and I2S0's ADC and DAC modes reach the converters.
+     * RTC_CNTL, and I2S0's ADC and DAC modes reach the converters. It runs
+     * on RTC_FAST_CLK, the touch FSM's sleep on RTC_SLOW_CLK.
      */
+    qdev_connect_clock_in(DEVICE(&s->sens), ESP32_SENS_FAST_CLK,
+                          qdev_get_clock_out(DEVICE(&s->rtc_cntl),
+                                             ESP32_RTC_FAST_CLK));
+    qdev_connect_clock_in(DEVICE(&s->sens), ESP32_SENS_SLOW_CLK,
+                          qdev_get_clock_out(DEVICE(&s->rtc_cntl),
+                                             ESP32_RTC_SLOW_CLK));
     object_property_set_link(OBJECT(&s->sens), "rtc-cntl",
                              OBJECT(&s->rtc_cntl), &error_abort);
     object_property_set_link(OBJECT(&s->sens), "rtcio", OBJECT(&s->rtcio),

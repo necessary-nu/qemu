@@ -37,6 +37,13 @@
 #define PLLA_FORCE_PD           (1u << 23)
 #define INT_TOUCH               (1u << 6)
 #define SOC_CLK_SEL_SHIFT       27
+#define ANA_CLK_RTC_SEL_MASK    (3u << 30)
+#define ANA_CLK_RTC_SEL_8MD256  (2u << 30)
+#define FAST_CLK_RTC_SEL_8M     (1u << 29)
+#define CK8M_DIV_SEL_MASK       (7u << 12)
+#define ENB_CK8M                (1u << 6)
+/* RC_FAST_CLK's start-up: the reset CK8M_WAIT, 16 cycles of RC_SLOW_CLK */
+#define CK8M_STARTUP_NS         106667
 
 #define RTCIO                   0x3ff48400
 #define RTCIO_HALL_SENS         (RTCIO + 0x78)
@@ -140,6 +147,25 @@ static uint32_t rd(QTestState *qts, uint64_t a)
 static void wr(QTestState *qts, uint64_t a, uint32_t v)
 {
     qtest_writel(qts, a, v);
+}
+
+/*
+ * RTC_FAST_CLK from the 8 MHz oscillator undivided, as ESP-IDF's
+ * rtc_clk_init leaves it. It resets to XTAL / 4, 10 MHz, and CK8M_DIV_SEL
+ * to 2 (divide by 3).
+ */
+static void fast_clk_8m(QTestState *qts)
+{
+    wr(qts, CLK_CONF, (rd(qts, CLK_CONF) & ~CK8M_DIV_SEL_MASK) |
+       FAST_CLK_RTC_SEL_8M);
+}
+
+/* Power RC_FAST_CLK's oscillator down or up */
+static void rc_fast_power(QTestState *qts, bool on)
+{
+    uint32_t v = rd(qts, CLK_CONF);
+
+    wr(qts, CLK_CONF, on ? v & ~ENB_CK8M : v | ENB_CK8M);
 }
 
 static void set_prop(QTestState *qts, const char *prop, int64_t value)
@@ -421,12 +447,14 @@ static void test_hall(void)
 /*
  * DAC1 on GPIO25 from RTCIO's PDAC1_DAC, observed as a QOM property and by
  * ADC2 channel 8 on the same pad; then from the cosine generator at
- * 8 MHz * SW_FSTEP / 65536, offset binary (DAC_INV1 2).
+ * RTC_FAST_CLK (8 MHz) * SW_FSTEP / 65536, offset binary (DAC_INV1 2).
  */
 /* [spec:nuos:req:emu.esp32.analog/test] */
 static void test_dac(void)
 {
     QTestState *qts = start();
+
+    fast_clk_8m(qts);
 
     g_assert_cmphex(rd(qts, DAC_CTRL2), ==, 0x03000000);
     wr(qts, RTCIO_PAD_DAC1, PDAC_DAC(128));
@@ -460,15 +488,17 @@ static void touch_sw_start(QTestState *qts)
 
 /*
  * A software-started touch measurement: TOUCH_XPD_WAIT (4) and
- * TOUCH_MEAS_DELAY (0x1000) cycles of the 8 MHz clock. Pad T3 with the
- * reset slope (4 uA) and DREFH - DREFL (2.2 V) counts 46 cycles at 10 pF
- * and 93 at 5 pF; below its threshold it is touched, which raises
+ * TOUCH_MEAS_DELAY (0x1000) cycles of the 8 MHz RTC_FAST_CLK. Pad T3 with
+ * the reset slope (4 uA) and DREFH - DREFL (2.2 V) counts 46 cycles at
+ * 10 pF and 93 at 5 pF; below its threshold it is touched, which raises
  * RTC_CNTL's TOUCH interrupt. Channel 9 measures pad T8.
  */
 /* [spec:nuos:req:emu.esp32.analog/test] */
 static void test_touch(void)
 {
     QTestState *qts = start();
+
+    fast_clk_8m(qts);
 
     g_assert_cmphex(rd(qts, TOUCH_CTRL1), ==, 0x02041000);
     g_assert_cmphex(rd(qts, TOUCH_CTRL2), ==, 0x00400800);
@@ -518,6 +548,8 @@ static void test_touch_timer(void)
 {
     QTestState *qts = start();
 
+    fast_clk_8m(qts);
+
     wr(qts, RTCIO_TOUCH_PAD(3), rd(qts, RTCIO_TOUCH_PAD(3)) | TOUCH_XPD);
     wr(qts, TOUCH_THRES(3), 60);
     wr(qts, STATE0, rd(qts, STATE0) | TOUCH_SLP_TIMER_EN);
@@ -536,6 +568,173 @@ static void test_touch_timer(void)
     wr(qts, INT_CLR, INT_TOUCH);
     qtest_clock_step(qts, 5000 * US);
     g_assert_cmphex(rd(qts, INT_RAW) & INT_TOUCH, ==, 0);
+    qtest_quit(qts);
+}
+
+/*
+ * The touch FSM counts RTC_FAST_CLK as it runs. At the reset XTAL / 4
+ * (10 MHz) a measurement of 4 + 0x1000 cycles takes 410 us and pad T3
+ * counts 37 rather than 8 MHz's 46, the pad oscillating on its own for a
+ * shorter time. Switched to 8 MHz halfway, the rest runs at 8 MHz. Stopped
+ * by powering RC_FAST_CLK down, the measurement holds until the
+ * oscillator runs again, and the pad counts over the stretched time.
+ */
+/* [spec:nuos:req:emu.esp32.analog/test] */
+/* [spec:nuos:req:emu.esp32.clock-gating/test] */
+static void test_touch_rtc_fast(void)
+{
+    QTestState *qts = start();
+
+    wr(qts, RTCIO_TOUCH_PAD(3), rd(qts, RTCIO_TOUCH_PAD(3)) | TOUCH_XPD);
+
+    /* 10 MHz: done after 410 us */
+    touch_sw_start(qts);
+    qtest_clock_step(qts, 409 * US);
+    g_assert_cmphex(rd(qts, TOUCH_CTRL2) & TOUCH_MEAS_DONE, ==, 0);
+    qtest_clock_step(qts, 2 * US);
+    g_assert_cmphex(rd(qts, TOUCH_CTRL2) & TOUCH_MEAS_DONE, ==,
+                    TOUCH_MEAS_DONE);
+    g_assert_cmpuint(rd(qts, TOUCH_OUT(3)) & 0xffff, ==, 37);
+
+    /*
+     * 2050 cycles at 10 MHz (205 us), then RC_FAST_CLK undivided: the
+     * other 2050 take 256.25 us
+     */
+    wr(qts, CLK_CONF, rd(qts, CLK_CONF) & ~CK8M_DIV_SEL_MASK);
+    touch_sw_start(qts);
+    qtest_clock_step(qts, 205 * US);
+    wr(qts, CLK_CONF, rd(qts, CLK_CONF) | FAST_CLK_RTC_SEL_8M);
+    qtest_clock_step(qts, 255 * US);
+    g_assert_cmphex(rd(qts, TOUCH_CTRL2) & TOUCH_MEAS_DONE, ==, 0);
+    qtest_clock_step(qts, 2 * US);
+    g_assert_cmphex(rd(qts, TOUCH_CTRL2) & TOUCH_MEAS_DONE, ==,
+                    TOUCH_MEAS_DONE);
+    /* 460.85 us of measurement */
+    g_assert_cmpuint(rd(qts, TOUCH_OUT(3)) & 0xffff, ==, 41);
+
+    /* 8 MHz, stopped for 1 ms after 100 us */
+    touch_sw_start(qts);
+    qtest_clock_step(qts, 100 * US);
+    rc_fast_power(qts, false);
+    qtest_clock_step(qts, 1000 * US);
+    g_assert_cmphex(rd(qts, TOUCH_CTRL2) & TOUCH_MEAS_DONE, ==, 0);
+    rc_fast_power(qts, true);
+    qtest_clock_step(qts, CK8M_STARTUP_NS + 411 * US);
+    g_assert_cmphex(rd(qts, TOUCH_CTRL2) & TOUCH_MEAS_DONE, ==, 0);
+    qtest_clock_step(qts, 2 * US);
+    g_assert_cmphex(rd(qts, TOUCH_CTRL2) & TOUCH_MEAS_DONE, ==,
+                    TOUCH_MEAS_DONE);
+    g_assert_cmpuint(rd(qts, TOUCH_OUT(3)) & 0xffff, >, 46 * 2);
+    qtest_quit(qts);
+}
+
+/*
+ * The touch FSM's sleep counts RTC_SLOW_CLK: stopped (8MD256 with the
+ * oscillator down), it holds, and goes on with the cycles left once
+ * RTC_SLOW_CLK runs again.
+ */
+/* [spec:nuos:req:emu.esp32.analog/test] */
+/* [spec:nuos:req:emu.esp32.clock-gating/test] */
+static void test_touch_slow_clk_stopped(void)
+{
+    QTestState *qts = start();
+    uint32_t conf;
+
+    fast_clk_8m(qts);
+    wr(qts, RTCIO_TOUCH_PAD(3), rd(qts, RTCIO_TOUCH_PAD(3)) | TOUCH_XPD);
+    wr(qts, TOUCH_THRES(3), 60);
+    wr(qts, STATE0, rd(qts, STATE0) | TOUCH_SLP_TIMER_EN);
+    /* 150 of the sleep's 256 cycles */
+    qtest_clock_step(qts, 1000 * US);
+    conf = rd(qts, CLK_CONF);
+    wr(qts, CLK_CONF, (conf & ~ANA_CLK_RTC_SEL_MASK) |
+       ANA_CLK_RTC_SEL_8MD256 | ENB_CK8M);
+    qtest_clock_step(qts, 5000 * US);
+    g_assert_cmphex(rd(qts, TOUCH_CTRL2) & TOUCH_MEAS_DONE, ==, 0);
+    /* RC_SLOW_CLK again: 106 cycles (707 us) of sleep, then 512.5 us */
+    wr(qts, CLK_CONF, conf);
+    qtest_clock_step(qts, 1150 * US);
+    g_assert_cmphex(rd(qts, TOUCH_CTRL2) & TOUCH_MEAS_DONE, ==, 0);
+    qtest_clock_step(qts, 150 * US);
+    g_assert_cmphex(rd(qts, TOUCH_CTRL2) & TOUCH_MEAS_DONE, ==,
+                    TOUCH_MEAS_DONE);
+    qtest_quit(qts);
+}
+
+/*
+ * The cosine generator steps its phase once per RTC_FAST_CLK cycle: a
+ * quarter period of SW_FSTEP 1 is 1.6384 ms at the reset 10 MHz and
+ * 2.048 ms at 8 MHz. With RTC_FAST_CLK stopped the phase holds.
+ */
+/* [spec:nuos:req:emu.esp32.analog/test] */
+/* [spec:nuos:req:emu.esp32.clock-gating/test] */
+static void test_dac_rtc_fast(void)
+{
+    QTestState *qts = start();
+
+    wr(qts, RTCIO_PAD_DAC1, PDAC_XPD_DAC | PDAC_XPD_FORCE);
+    wr(qts, DAC_CTRL2, CW_EN1 | INV1(2));
+    wr(qts, DAC_CTRL1, SW_TONE_EN | 1);
+    g_assert_cmpint(get_prop(qts, "dac1-mv"), ==, 3300);
+    /* 10 MHz: phase 16384 */
+    qtest_clock_step(qts, 1638400);
+    g_assert_cmpint(get_prop(qts, "dac1-mv"), ==, 1656);
+
+    /* RTC_FAST_CLK from the oscillator, powered down: stopped */
+    rc_fast_power(qts, false);
+    wr(qts, CLK_CONF, (rd(qts, CLK_CONF) & ~CK8M_DIV_SEL_MASK) |
+       FAST_CLK_RTC_SEL_8M);
+    qtest_clock_step(qts, 3000 * US);
+    g_assert_cmpint(get_prop(qts, "dac1-mv"), ==, 1656);
+
+    /* Back on XTAL / 4: phase 32768 */
+    wr(qts, CLK_CONF, rd(qts, CLK_CONF) & ~FAST_CLK_RTC_SEL_8M);
+    qtest_clock_step(qts, 1638400);
+    g_assert_cmpint(get_prop(qts, "dac1-mv"), ==, 12);
+
+    /*
+     * The oscillator starts up while XTAL / 4 runs the generator (phase
+     * 49152), then runs it at 8 MHz (phase 0)
+     */
+    rc_fast_power(qts, true);
+    qtest_clock_step(qts, 1638400);
+    g_assert_cmpint(get_prop(qts, "dac1-mv"), ==, 1656);
+    wr(qts, CLK_CONF, rd(qts, CLK_CONF) | FAST_CLK_RTC_SEL_8M);
+    qtest_clock_step(qts, 2048 * US);
+    g_assert_cmpint(get_prop(qts, "dac1-mv"), ==, 3300);
+    qtest_quit(qts);
+}
+
+/*
+ * An RTC controller conversion counts RTC_FAST_CLK: 44 cycles at 8 MHz
+ * are 5.5 us, but with the oscillator powered down the conversion waits
+ * for it to start up.
+ */
+/* [spec:nuos:req:emu.esp32.analog/test] */
+/* [spec:nuos:req:emu.esp32.clock-gating/test] */
+static void test_adc_rtc_fast_stopped(void)
+{
+    QTestState *qts = start();
+
+    fast_clk_8m(qts);
+    set_prop(qts, "adc1-ch6-mv", 1000);
+    wr(qts, READ_CTRL, rd(qts, READ_CTRL) | DATA_INV);
+    adc1_start(qts, 6);
+    qtest_clock_step(qts, 5 * US);
+    g_assert_cmphex(rd(qts, MEAS_START1) & MEAS_DONE, ==, 0);
+    qtest_clock_step(qts, 1 * US);
+    g_assert_cmphex(rd(qts, MEAS_START1) & MEAS_DONE, ==, MEAS_DONE);
+
+    rc_fast_power(qts, false);
+    adc1_start(qts, 6);
+    qtest_clock_step(qts, 1000 * US);
+    g_assert_cmphex(rd(qts, MEAS_START1) & MEAS_DONE, ==, 0);
+    rc_fast_power(qts, true);
+    qtest_clock_step(qts, CK8M_STARTUP_NS + 5 * US);
+    g_assert_cmphex(rd(qts, MEAS_START1) & MEAS_DONE, ==, 0);
+    qtest_clock_step(qts, 1 * US);
+    g_assert_cmphex(rd(qts, MEAS_START1) & MEAS_DONE, ==, MEAS_DONE);
+    g_assert_cmpuint(rd(qts, MEAS_START1) & 0xffff, ==, 1050);
     qtest_quit(qts);
 }
 
@@ -627,6 +826,12 @@ int main(int argc, char **argv)
     qtest_add_func("esp32/analog/dac", test_dac);
     qtest_add_func("esp32/analog/touch", test_touch);
     qtest_add_func("esp32/analog/touch-timer", test_touch_timer);
+    qtest_add_func("esp32/analog/touch-rtc-fast", test_touch_rtc_fast);
+    qtest_add_func("esp32/analog/touch-slow-clk-stopped",
+                   test_touch_slow_clk_stopped);
+    qtest_add_func("esp32/analog/dac-rtc-fast", test_dac_rtc_fast);
+    qtest_add_func("esp32/analog/adc-rtc-fast-stopped",
+                   test_adc_rtc_fast_stopped);
     qtest_add_func("esp32/analog/dig-adc", test_dig_adc);
     qtest_add_func("esp32/analog/dac-dma", test_dac_dma);
 
