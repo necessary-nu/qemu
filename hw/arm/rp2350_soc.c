@@ -16,6 +16,7 @@
 #include "qapi/error.h"
 #include "hw/arm/rp2350_soc.h"
 #include "hw/core/qdev-clock.h"
+#include "exec/icount.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/block/aps6404l.h"
@@ -1344,6 +1345,12 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             return;
         }
         rp2350_exclmon_attach(&s->exclmon, i, CPU(s->armv7m[i].cpu));
+        /*
+         * Under icount a core executes an instruction per clk_sys cycle,
+         * at clk_sys's current frequency, alongside the other core.
+         */
+        /* [spec:nuos:req:emu.clock-tree] */
+        icount_set_cpu_clock(CPU(s->armv7m[i].cpu), CLK(s, SYS));
         /* A core that locks up stops; the other core carries on. */
         /* [spec:nuos:req:emu.lockup] */
         s->armv7m[i].cpu->m_lockup_halts = true;
