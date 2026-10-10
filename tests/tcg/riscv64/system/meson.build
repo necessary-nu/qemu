@@ -60,6 +60,13 @@ tests += {
 }
 
 tests += {
+  'test-pmp-tor-empty.S': {
+    'cflags': cflags + ['-march=rv64gc_zicbom'],
+    'qemu_args': qemu_args,
+  }
+}
+
+tests += {
   'test-vle32ff.S': {
     'cflags': cflags + ['-march=rv64gcv'],
     'qemu_args': ['-cpu', 'rv64,v=true', qemu_args],

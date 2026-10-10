@@ -255,7 +255,9 @@ void pmp_update_rule_addr(CPURISCVState *env, uint32_t pmp_index)
             this_addr = ROUND_DOWN(this_addr, granule);
         }
         if (prev_addr >= this_addr) {
-            sa = ea = 0u;
+            /* The entry matches no address: an empty range, sa > ea. */
+            sa = 1u;
+            ea = 0u;
             break;
         }
         sa = prev_addr << 2; /* shift up from [xx:0] to [xx+2:2] */
@@ -761,6 +763,11 @@ uint64_t pmp_get_tlb_size(CPURISCVState *env, hwaddr addr)
 
         pmp_sa = env->pmp_state.addr[i].sa;
         pmp_ea = env->pmp_state.addr[i].ea;
+
+        /* An entry that matches no address does not split the page. */
+        if (pmp_sa > pmp_ea) {
+            continue;
+        }
 
         /*
          * Only the first PMP entry that covers (whole or partial of) the TLB
