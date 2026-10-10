@@ -233,6 +233,7 @@ static void esp32p4_cpu_set_clock(void *opaque, int n, int level)
  */
 static TCGCPUOps esp32p4_tcg_ops;
 static TCGCPUOps esp32p4_hp_tcg_ops;
+static TCGCPUOps esp32p4_lp_tcg_ops;
 
 static ESP32P4CPU *esp32p4_cpu_of(CPUState *cs)
 {
@@ -819,8 +820,7 @@ static void esp32p4_hp_cpu_set_gpio_in(void *opaque, int n, int level)
 
 /*
  * The HP core's own trigger module replaces QEMU's, which the "debug"
- * property would otherwise enable; QEMU's trigger count is zero too, as
- * QEMU walks its triggers on every privilege change under icount.
+ * property would otherwise enable.
  */
 static void esp32p4_hp_cpu_init(Object *obj)
 {
@@ -830,7 +830,6 @@ static void esp32p4_hp_cpu_init(Object *obj)
 
     cpu->parent_obj.cfg.debug = false;
     cpu->parent_obj.cfg.ext_sdtrig = false;
-    cpu->parent_obj.env.num_triggers = 0;
     qdev_init_gpio_out_named(dev, cpu->gpio_out_irq, ESP32P4_CPU_GPIO_OUT,
                              ESP32P4_CPU_GPIOS);
     qdev_init_gpio_out_named(dev, cpu->gpio_oe_irq, ESP32P4_CPU_GPIO_OE,
@@ -862,6 +861,22 @@ static void esp32p4_hp_cpu_class_init(ObjectClass *oc, const void *data)
         esp32p4_debug_check_watchpoint;
     cc->tcg_ops = &esp32p4_hp_tcg_ops;
     esp32p4_hp_csr_class_init();
+#endif
+}
+
+/*
+ * The LP core's TCG table: its accesses carry its identity to the access
+ * permission managers.
+ */
+/* [spec:nuos:req:emu.esp32p4.pms] */
+static void esp32p4_lp_cpu_class_init(ObjectClass *oc, const void *data)
+{
+#ifdef CONFIG_TCG
+    CPUClass *cc = CPU_CLASS(oc);
+
+    esp32p4_lp_tcg_ops = esp32p4_tcg_ops;
+    esp32p4_lp_tcg_ops.tlb_fill = esp32p4_lp_tlb_fill;
+    cc->tcg_ops = &esp32p4_lp_tcg_ops;
 #endif
 }
 
@@ -913,6 +928,7 @@ static const TypeInfo esp32p4_cpu_types[] = {
     {
         .name = TYPE_ESP32P4_LP_CPU,
         .parent = TYPE_ESP32P4_CPU,
+        .class_init = esp32p4_lp_cpu_class_init,
         .class_data = &(const RISCVCPUDef) {
             .misa_mxl_max = MXL_RV32,
             .misa_ext = RVI | RVM | RVA | RVC,

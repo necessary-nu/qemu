@@ -203,10 +203,9 @@ static void test_memory_map(void)
                           "(prio 0, ram): esp32p4.lp-sram");
 
     /*
-     * The two addresses of L2MEM are one memory: what is written at the
-     * direct address reads the same through the cache, which qtest's
-     * accesses, as HP core 0's, go through (esp32p4-cache-test has the
-     * caches). The L2 cache takes its first 128 KiB from reset.
+     * The two addresses of L2MEM are one memory, after the 128 KiB the L2
+     * cache takes from reset. qtest's accesses are no core's, so they do
+     * not go through the caches.
      */
     assert_mtree_has(qts, "000000004ff00000-000000004ff1ffff "
                           "(prio 1, i/o): esp32p4.l2mem-l2-cache");

@@ -22,7 +22,9 @@
 #include "hw/misc/esp32p4_clkrst.h"
 #include "hw/misc/esp32p4_hp_sys.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
+#include "hw/misc/esp32p4_icm.h"
 #include "hw/misc/esp32p4_lp_sys.h"
+#include "hw/misc/esp32p4_pms.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/ssi/esp32p4_mspi.h"
 #include "system/memory.h"
@@ -92,9 +94,9 @@ struct ESP32P4MachineState {
     MemoryRegion l2mem_direct;
     MemoryRegion lp_sram;
     MemoryRegion psram;
-    /* The HP cores' address space, and the system's in it. */
+    /* The HP cores' address space, and the bus in it. */
     MemoryRegion hp_mem;
-    MemoryRegion hp_sys_mem;
+    MemoryRegion hp_bus;
 
     /* The HP cores' resets, to each core and its CLIC. */
     SplitIRQ core_reset_split[ESP32P4_HP_CORES];
@@ -112,6 +114,9 @@ struct ESP32P4MachineState {
     /* The entry point of the -kernel ELF, which core 0 starts at; or 0. */
     uint64_t kernel_entry;
     ESP32P4EfuseState efuse;
+    /* The access permission managers, every master's way onto the bus. */
+    ESP32P4PmsState pms;
+    ESP32P4IcmState icm;
 
     ESP32P4MSPIState flash_mspi;
     ESP32P4MSPIState psram_mspi;

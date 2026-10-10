@@ -93,11 +93,6 @@
 #define CSR_ESP_UINTSTATUS      0xcb1
 #define CSR_ESP_MINTSTATUS      0xfb1
 
-/* mstatus fields the core implements, other than the read-only XS and SD. */
-#define ESP32P4_MSTATUS_MASK (MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP | \
-                              MSTATUS_FS | MSTATUS_MPRV | MSTATUS_TW | \
-                              MSTATUS_UIE | MSTATUS_UPIE)
-
 /*
  * The user-mode interrupt enables, which QEMU's mstatus does not keep:
  * this table writes them itself.
@@ -321,8 +316,6 @@ static RISCVException write_mstatus(CPURISCVState *env, int csrno,
     if (!esp32p4_env_is_hp(env)) {
         return std_write(env, csrno, val, ra);
     }
-    val = (env->mstatus & ~ESP32P4_MSTATUS_MASK) |
-          (val & ESP32P4_MSTATUS_MASK);
     val = set_field(val, MSTATUS_MPP, (val & BIT(11)) ? PRV_M : PRV_U);
     ret = std_write(env, csrno, val, ra);
     if (ret == RISCV_EXCP_NONE) {

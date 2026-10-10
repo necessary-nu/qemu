@@ -46,7 +46,9 @@
  * page's other lines as an L2 autoload of the neighbouring lines would.
  * Each core's accesses go through a translation per page (an IOMMU region
  * in its address space) to the L1 contents or, while the page is not all
- * held, to the controller.
+ * held, to the controller. An access through those translations that no
+ * core makes, qtest's, goes to the bus past the caches, as every other
+ * master's does; a debugger's reads the L1 where it holds the line.
  *
  * What the model does not keep apart: the instruction caches and the data
  * cache share the L1 contents, so a core executes what was written
@@ -130,6 +132,7 @@
 #include "exec/cputlb.h"
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
+#include "system/address-spaces.h"
 #include "system/tcg.h"
 #include "hw/core/cpu.h"
 #include "hw/core/irq.h"
@@ -914,7 +917,7 @@ static IOMMUTLBEntry cache_view_translate(IOMMUMemoryRegion *iommu,
 {
     ESP32P4CacheView *v = container_of(iommu, ESP32P4CacheView, iommu);
     hwaddr page = addr & ~(hwaddr)(FILL - 1);
-    bool fast = view_page_fast(v, page, cache_core());
+    bool fast = current_cpu && view_page_fast(v, page, cache_core());
     IOMMUTLBEntry ret = {
         .target_as = &v->target_as,
         .iova = page,
@@ -1338,6 +1341,17 @@ static MemTxResult cache_view_access(ESP32P4CacheView *v, uint32_t off,
     bool dbus;
     MemTxResult r;
 
+    if (!current_cpu && !attrs.debug) {
+        if (write) {
+            stn_le_p(buf, size, *data);
+        }
+        r = address_space_rw(&address_space_memory, view_vaddr(v, off), attrs,
+                             buf, size, write);
+        if (!write) {
+            *data = ldn_le_p(buf, size);
+        }
+        return r;
+    }
     if (view_occupied(v, off)) {
         return cache_l2mem_occupied(c, off, data, write, attrs);
     }

@@ -188,13 +188,6 @@ static bool trans_esp_uret(DisasContext *ctx, arg_esp_uret *a)
     return true;
 }
 
-/* The core has no supervisor mode, so SFENCE.VMA is illegal. */
-static bool trans_esp_sfence_vma(DisasContext *ctx, arg_esp_sfence_vma *a)
-{
-    gen_exception_illegal(ctx);
-    return true;
-}
-
 #else
 
 static bool trans_esp_lp_starti(DisasContext *ctx, arg_lp_imm *a)
@@ -233,11 +226,6 @@ static bool trans_esp_mret(DisasContext *ctx, arg_esp_mret *a)
 }
 
 static bool trans_esp_uret(DisasContext *ctx, arg_esp_uret *a)
-{
-    return false;
-}
-
-static bool trans_esp_sfence_vma(DisasContext *ctx, arg_esp_sfence_vma *a)
 {
     return false;
 }

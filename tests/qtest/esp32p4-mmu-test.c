@@ -5,10 +5,10 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * qtest's accesses go through HP core 0's address space: at 0x4xxxxxxx
- * they go through its caches, as its cacheable accesses do, and at
- * 0x8xxxxxxx to the MSPI controllers and L2MEM directly. The flash is a
- * raw image with a pattern in each 64 KiB page.
+ * qtest's accesses are no core's: at 0x4xxxxxxx they reach the memories
+ * past the caches, as the other masters' do. The caches' behaviour is the
+ * guest tests' to see. The flash is a raw image with a pattern in each
+ * 64 KiB page.
  */
 
 #include "qemu/osdep.h"
@@ -206,11 +206,11 @@ static void test_flash_pages(void)
 }
 
 /*
- * The caches are virtually tagged: a changed MMU entry is seen through
- * them only once the lines from the old mapping are invalidated.
+ * At 0x4xxxxxxx qtest sees what the bus does: the windows as the MMU maps
+ * them now, whatever the caches hold.
  */
 /* [spec:nuos:req:emu.esp32p4.memory/test] */
-static void test_cached_remap(void)
+static void test_bus_view(void)
 {
     char *image;
     QTestState *qts = start(&image);
@@ -219,15 +219,13 @@ static void test_cached_remap(void)
     mmu_set(qts, SPI0_FLASH, 2, FLASH_VALID | 3);
     g_assert_cmphex(qtest_readl(qts, FLASH_CACHED + 2 * PAGE + 0x100), ==,
                     pattern(3, 0x100));
-
     mmu_set(qts, SPI0_FLASH, 2, FLASH_VALID | 5);
-    g_assert_cmphex(qtest_readl(qts, FLASH_DIRECT + 2 * PAGE + 0x100), ==,
-                    pattern(5, 0x100));
     g_assert_cmphex(qtest_readl(qts, FLASH_CACHED + 2 * PAGE + 0x100), ==,
-                    pattern(3, 0x100));
+                    pattern(5, 0x100));
+
+    /* The caches' operations complete at once, with their done bits. */
     cache_sync(qts, SYNC_INVALIDATE, MAP_ALL, FLASH_CACHED + 2 * PAGE, PAGE);
-    g_assert_cmphex(qtest_readl(qts, FLASH_CACHED + 2 * PAGE + 0x100), ==,
-                    pattern(5, 0x100));
+    cache_sync(qts, SYNC_WRITEBACK, MAP_L1_D, 0, 0);
     finish(qts, image);
 }
 
@@ -244,10 +242,7 @@ static void test_psram_pages(void)
     g_assert_cmphex(qtest_readl(qts, PSRAM_DIRECT + 4 * PAGE + 0x80), ==,
                     0x12345678);
 
-    /* A write through the caches reaches the PSRAM when written back. */
     qtest_writel(qts, PSRAM_CACHED + 4 * PAGE + 0x80, 0xcafef00d);
-    g_assert_cmphex(qtest_readl(qts, PSRAM_DIRECT + 0x80), ==, 0x12345678);
-    cache_sync(qts, SYNC_WRITEBACK, MAP_ALL, PSRAM_CACHED + 4 * PAGE, PAGE);
     g_assert_cmphex(qtest_readl(qts, PSRAM_DIRECT + 0x80), ==, 0xcafef00d);
 
     /* Writes through an invalid entry: dropped, and recorded. */
@@ -302,7 +297,7 @@ int main(int argc, char **argv)
 
     qtest_add_func("/esp32p4/mmu/table", test_table);
     qtest_add_func("/esp32p4/mmu/flash-pages", test_flash_pages);
-    qtest_add_func("/esp32p4/mmu/cached-remap", test_cached_remap);
+    qtest_add_func("/esp32p4/mmu/bus-view", test_bus_view);
     qtest_add_func("/esp32p4/mmu/psram-pages", test_psram_pages);
     qtest_add_func("/esp32p4/mmu/l2mem-split", test_l2mem_split);
     return g_test_run();

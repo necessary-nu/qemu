@@ -48,10 +48,17 @@
  *     LPPERI, with the clock tree from the crystal, the RC oscillators and
  *     the PLLs to every block's clocks, and the analog I2C controller
  *     through which software configures the PLLs; and LP_SYS's
- *     BOOT_ADDR_HP_CORE1, the rest of whose registers are logged as
- *     unimplemented.
+ *     BOOT_ADDR_HP_CORE1 and its record of refused accesses, the rest of
+ *     whose registers are logged as unimplemented.
  *   - The eFuse controller and its array, on its clock and reset from
  *     LPPERI, its interrupt a source of the interrupt matrix.
+ *   - Permission control (TRM chapter 20): the HP, LP and DMA access
+ *     permission managers, through which every core (and DMA master)
+ *     reaches the bus, each access carrying its master and privilege mode,
+ *     with their registers HP_PERI_PMS, LP2HP_PERI_PMS, HP_DMA_PMS,
+ *     LP_PERI_PMS and HP2LP_PERI_PMS; an access they refuse answers with a
+ *     bus error and is recorded by the AXI ICM's registers (0x500A4000),
+ *     raising SYS_ICM_INTR, or by LP_SYS's, raising LP_SYSREG_INTR.
  *   - Every other peripheral block the chip decodes, as an unimplemented
  *     device named after the block. Addresses the chip does not decode,
  *     the reserved ranges of TRM table 9.3-1 and the unassigned slots
@@ -169,10 +176,8 @@ static const struct {
     { "isp",              0x500a1000, 4 * KiB },
     { "rmt",              0x500a2000, 4 * KiB },
     { "bitscrambler",     0x500a3000, 4 * KiB },
-    { "axi-icm",          0x500a4000, 4 * KiB },
-    { "hp-peri-pms",      0x500a5000, 2 * KiB },
-    { "lp2hp-peri-pms",   0x500a5800, 2 * KiB },
-    { "dma-pms",          0x500a6000, 4 * KiB },
+    /* The AXI ICM's QoS command interface, above its own registers. */
+    { "axi-icm-qos",      0x500a4400, 3 * KiB },
     { "h264-dma",         0x500a7000, 4 * KiB },
 
     /* HP peripherals 1. */
@@ -238,8 +243,6 @@ static const struct {
     { "lp-gpio",          0x5012a000, 4 * KiB },
     { "lp-iomux",         0x5012b000, 4 * KiB },
     { "lp-intr",          0x5012c000, 4 * KiB },
-    { "lp-peri-pms",      0x5012e000, 2 * KiB },
-    { "hp2lp-peri-pms",   0x5012e800, 2 * KiB },
     { "lp-tsens",         0x5012f000, 4 * KiB },
 };
 
@@ -295,15 +298,6 @@ static void esp32p4_init_memory(ESP32P4MachineState *s)
     /* Behind the PSRAM windows, for the MMU to map. */
     memory_region_init_ram(&s->psram, owner, "esp32p4.psram",
                            ESP32P4_PSRAM_SIZE, &error_fatal);
-
-    /*
-     * The HP cores' address space: the system's, with the caches' views
-     * over it at 0x4xxxxxxx (esp32p4_init_ext_memory()).
-     */
-    memory_region_init(&s->hp_mem, owner, "esp32p4.hp-mem", UINT64_MAX);
-    memory_region_init_alias(&s->hp_sys_mem, owner, "esp32p4.hp-system",
-                             sys_mem, 0, UINT64_MAX);
-    memory_region_add_subregion_overlap(&s->hp_mem, 0, &s->hp_sys_mem, 0);
 }
 
 /* The Winbond W25Q parts of each flash size. */
@@ -372,6 +366,25 @@ static void esp32p4_init_flash(ESP32P4MachineState *s)
                                                        0));
 }
 
+/*
+ * The bus as every master sees it, through the access permission managers
+ * (hw/misc/esp32p4_pms.c): the cores take it as their memory as they are
+ * realized, before the blocks the APMs record refusals in exist. The HP
+ * cores take it with the caches' views over it at 0x4xxxxxxx
+ * (esp32p4_init_ext_memory()): their cached accesses are for their PMP
+ * alone.
+ */
+/* [spec:nuos:req:emu.esp32p4.pms] */
+/* [spec:nuos:req:emu.esp32p4.memory] */
+static void esp32p4_init_bus(ESP32P4MachineState *s)
+{
+    object_initialize_child(OBJECT(s), "pms", &s->pms, TYPE_ESP32P4_PMS);
+    memory_region_init(&s->hp_mem, OBJECT(s), "esp32p4.hp-mem", UINT64_MAX);
+    memory_region_init_alias(&s->hp_bus, OBJECT(s), "esp32p4.hp-bus",
+                             esp32p4_pms_bus(&s->pms), 0, UINT64_MAX);
+    memory_region_add_subregion_overlap(&s->hp_mem, 0, &s->hp_bus, 0);
+}
+
 /* [spec:nuos:req:emu.esp32p4.machine] */
 static void esp32p4_init_cpus(ESP32P4MachineState *s)
 {
@@ -385,9 +398,9 @@ static void esp32p4_init_cpus(ESP32P4MachineState *s)
                                 &s->hp_cpu[i], TYPE_ESP32P4_HP_CPU);
         qdev_prop_set_uint64(DEVICE(&s->hp_cpu[i]), "resetvec",
                              ESP32P4_HP_RESET_VECTOR);
-        s->hp_cpu[i].parent_obj.env.mhartid = i;
         object_property_set_link(OBJECT(&s->hp_cpu[i]), "memory",
                                  OBJECT(&s->hp_mem), &error_abort);
+        s->hp_cpu[i].parent_obj.env.mhartid = i;
         qdev_realize(DEVICE(&s->hp_cpu[i]), NULL, &error_fatal);
         qemu_register_resettable(OBJECT(&s->hp_cpu[i]));
     }
@@ -401,6 +414,8 @@ static void esp32p4_init_cpus(ESP32P4MachineState *s)
                             TYPE_ESP32P4_LP_CPU);
     qdev_prop_set_uint64(DEVICE(&s->lp_cpu), "resetvec",
                          ESP32P4_LP_RESET_VECTOR);
+    object_property_set_link(OBJECT(&s->lp_cpu), "memory",
+                             OBJECT(esp32p4_pms_bus(&s->pms)), &error_abort);
     s->lp_cpu.parent_obj.env.mhartid = 0;
     qdev_realize(DEVICE(&s->lp_cpu), NULL, &error_fatal);
     qemu_register_resettable(OBJECT(&s->lp_cpu));
@@ -839,6 +854,52 @@ static void esp32p4_init_ext_memory(ESP32P4MachineState *s)
     sysbus_connect_irq(sbd, 0, esp32p4_intr_source(s, ESP32P4_INTR_CACHE));
 }
 
+/*
+ * The access permission managers and the blocks that record what they
+ * refuse: the AXI ICM, its registers behind ICM_APB_CLK, whose interrupt
+ * is SYS_ICM_INTR (source 21), and LP_SYS, whose interrupt is
+ * LP_SYSREG_INTR (source 19). The LP APM's registers, LP_PERI_PMS and
+ * HP2LP_PERI_PMS, are behind LPPERI's LP_PMS clock and reset; the HP and
+ * DMA APMs' have neither clock gate nor reset in HP_SYS_CLKRST, and reset
+ * with the system.
+ */
+/* [spec:nuos:req:emu.esp32p4.pms] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_pms(ESP32P4MachineState *s)
+{
+    SysBusDevice *pms = SYS_BUS_DEVICE(&s->pms);
+    SysBusDevice *icm;
+
+    object_initialize_child(OBJECT(s), "icm", &s->icm, TYPE_ESP32P4_ICM);
+    icm = SYS_BUS_DEVICE(&s->icm);
+    sysbus_realize(icm, &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, icm, 0, ESP32P4_ICM_BASE,
+                             ESP32P4_CLK_ICM_APB,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    sysbus_connect_irq(icm, 0, esp32p4_intr_source(s, ESP32P4_INTR_SYS_ICM));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->lp_sys), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_SYSREG));
+
+    object_property_set_link(OBJECT(pms), "icm", OBJECT(icm), &error_abort);
+    object_property_set_link(OBJECT(pms), "lp-sys", OBJECT(&s->lp_sys),
+                             &error_abort);
+    sysbus_realize(pms, &error_fatal);
+    sysbus_mmio_map(pms, ESP32P4_PMS_MMIO_HP_PERI, ESP32P4_HP_PERI_PMS_BASE);
+    sysbus_mmio_map(pms, ESP32P4_PMS_MMIO_LP2HP_PERI,
+                    ESP32P4_LP2HP_PERI_PMS_BASE);
+    sysbus_mmio_map(pms, ESP32P4_PMS_MMIO_DMA, ESP32P4_DMA_PMS_BASE);
+    esp32p4_clkrst_map_gated(&s->clkrst, pms, ESP32P4_PMS_MMIO_LP_PERI,
+                             ESP32P4_LP_PERI_PMS_BASE, ESP32P4_CLK_LP_PMS,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    esp32p4_clkrst_map_gated(&s->clkrst, pms, ESP32P4_PMS_MMIO_HP2LP_PERI,
+                             ESP32P4_HP2LP_PERI_PMS_BASE, ESP32P4_CLK_LP_PMS,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    qdev_connect_gpio_out_named(DEVICE(&s->clkrst), ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_LP_PMS,
+                                qdev_get_gpio_in_named(DEVICE(pms),
+                                    ESP32P4_PMS_LP_RESET, 0));
+}
+
 /* The memories -kernel can load into: those the cores address directly. */
 static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
 {
@@ -966,11 +1027,13 @@ static void esp32p4_init(MachineState *machine)
     }
 
     esp32p4_init_memory(s);
+    esp32p4_init_bus(s);
     esp32p4_init_cpus(s);
     esp32p4_init_clocks(s);
     esp32p4_init_core_local(s);
     esp32p4_init_intmatrix(s);
     esp32p4_init_efuse(s);
+    esp32p4_init_pms(s);
     esp32p4_init_ext_memory(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
