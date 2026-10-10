@@ -21,6 +21,8 @@
 #include "internals.h"
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
+#include "accel/tcg/probe.h"
+#include "exec/target_page.h"
 
 target_ulong HELPER(cm_jalt)(CPURISCVState *env, uint32_t index)
 {
@@ -57,4 +59,31 @@ target_ulong HELPER(cm_jalt)(CPURISCVState *env, uint32_t index)
     }
 
     return target & ~0x1;
+}
+
+/*
+ * Check the count accesses of size bytes a cm.push or cm.pop makes, from
+ * addr downwards in the order it makes them, raising the fault the first
+ * refused one raises.
+ */
+void HELPER(cm_check)(CPURISCVState *env, target_ulong addr, uint32_t count,
+                      uint32_t size, uint32_t access_type)
+{
+    int mmu_idx = riscv_env_mmu_index(env, false);
+    uintptr_t ra = GETPC();
+    void *host;
+
+    for (uint32_t i = 0; i < count; i++, addr -= size) {
+        target_ulong a = addr;
+        uint32_t left = size;
+
+        while (left) {
+            uint32_t n = MIN(left, TARGET_PAGE_SIZE - (a & ~TARGET_PAGE_MASK));
+
+            probe_access_flags(env, a, n, access_type, mmu_idx, false, &host,
+                               ra);
+            a += n;
+            left -= n;
+        }
+    }
 }
