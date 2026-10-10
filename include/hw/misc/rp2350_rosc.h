@@ -9,6 +9,7 @@
 #ifndef HW_MISC_RP2350_ROSC_H
 #define HW_MISC_RP2350_ROSC_H
 
+#include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
 #include "hw/misc/rp2350_clocks.h"
 #include "qom/object.h"
@@ -21,8 +22,9 @@ struct RP2350ROSCState {
 
     MemoryRegion iomem;
     QEMUTimer *startup_timer;
-    /* RP2350_OSC_DORMANT; the input is RP2350_OSC_DORMANT_WAKE. */
-    qemu_irq dormant_irq;
+    /* The divider's outputs, rosc_clksrc and rosc_clksrc_ph. */
+    Clock *out;
+    Clock *out_ph;
 
     /* Registers as last written (raw, including invalid codes). */
     uint32_t ctrl;
@@ -62,7 +64,14 @@ struct RP2350ROSCState {
     uint32_t randombit;
 };
 
-/* Whether the ROSC's output is gated by DORMANT. */
-bool rp2350_rosc_dormant(RP2350ROSCState *s);
+/* Named clock outputs of ROSC: rosc_clksrc and rosc_clksrc_ph. */
+#define RP2350_ROSC_CLK "clk"
+#define RP2350_ROSC_CLK_PH "clk-ph"
+
+/*
+ * Configure the ROSC as the boot ROM's early boot path leaves it: DIV
+ * lowered from 8 to 2, quadrupling the boot clk_sys.
+ */
+void rp2350_rosc_boot_rom_handoff(RP2350ROSCState *s);
 
 #endif

@@ -48,6 +48,7 @@
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_xip.h"
@@ -184,9 +185,11 @@ static void counter_inc(uint32_t *ctr)
     }
 }
 
+/* The QMI runs from clk_sys, at its current frequency. */
+/* [spec:nuos:req:emu.clock-tree] */
 static int64_t sysclk_ns(RP2350XIPState *s, uint64_t cycles)
 {
-    return muldiv64(cycles, NANOSECONDS_PER_SECOND, s->sysclk_hz);
+    return clock_ticks_to_ns(s->clk, cycles);
 }
 
 static unsigned clkdiv(uint32_t field)
@@ -878,8 +881,10 @@ static void rp2350_xip_stream_schedule(RP2350XIPState *s)
                                           FMT_DATA_WIDTH_SHIFT, 2));
     uint64_t cycles = 32 / width * clkdiv(s->timing[cs] & TIMING_CLKDIV_MASK);
 
+    /* [spec:nuos:req:emu.clock-tree] */
     if (s->stream_ctr && !fifo32_is_full(&s->stream_fifo) &&
-        !(s->direct_csr & CSR_EN) && !timer_pending(s->stream_timer)) {
+        !(s->direct_csr & CSR_EN) && !timer_pending(s->stream_timer) &&
+        clock_is_enabled(s->clk)) {
         timer_mod(s->stream_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                                    sysclk_ns(s, cycles));
     }
@@ -1284,6 +1289,12 @@ void rp2350_xip_power_down(RP2350XIPState *s)
     rp2350_xip_remap(s);
 }
 
+/* A stream stalled by clk_sys stopping resumes when it restarts. */
+static void rp2350_xip_clk_changed(void *opaque, ClockEvent event)
+{
+    rp2350_xip_stream_schedule(opaque);
+}
+
 static void rp2350_xip_init(Object *obj)
 {
     RP2350XIPState *s = RP2350_XIP(obj);
@@ -1305,6 +1316,8 @@ static void rp2350_xip_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(obj), s->cs, "cs", RP2350_QMI_CS);
     qdev_init_gpio_out_named(DEVICE(obj), s->dreq, "dreq",
                              RP2350_XIP_NUM_DREQ);
+    s->clk = qdev_init_clock_in(DEVICE(obj), "clk", rp2350_xip_clk_changed, s,
+                                ClockUpdate);
 }
 
 static void rp2350_xip_realize(DeviceState *dev, Error **errp)
@@ -1313,8 +1326,8 @@ static void rp2350_xip_realize(DeviceState *dev, Error **errp)
     Object *obj = OBJECT(dev);
     int cs, i;
 
-    if (!s->sysclk_hz) {
-        error_setg(errp, "sysclk-hz must be set");
+    if (!clock_has_source(s->clk)) {
+        error_setg(errp, "the clk clock must be connected");
         return;
     }
     for (cs = 0; cs < RP2350_QMI_CS; cs++) {
@@ -1398,10 +1411,11 @@ static int rp2350_xip_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_rp2350_xip = {
     .name = TYPE_RP2350_XIP,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = rp2350_xip_post_load,
     .fields = (const VMStateField[]) {
+        VMSTATE_CLOCK(clk, RP2350XIPState),
         VMSTATE_UINT32(ctrl, RP2350XIPState),
         VMSTATE_UINT32(ctr_hit, RP2350XIPState),
         VMSTATE_UINT32(ctr_acc, RP2350XIPState),
@@ -1430,7 +1444,6 @@ static const VMStateDescription vmstate_rp2350_xip = {
 static const Property rp2350_xip_properties[] = {
     DEFINE_PROP_UINT32("cs0-size", RP2350XIPState, cs_size[0], 0),
     DEFINE_PROP_UINT32("cs1-size", RP2350XIPState, cs_size[1], 0),
-    DEFINE_PROP_UINT32("sysclk-hz", RP2350XIPState, sysclk_hz, 0),
 };
 
 /* [spec:nuos:req:emu.xip+1] */

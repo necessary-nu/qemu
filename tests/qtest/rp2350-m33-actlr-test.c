@@ -13,6 +13,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-clocks.h"
 
 #define AHBAP1          0x40144000
 #define CSW             0xd00
@@ -47,6 +48,7 @@ static QTestState *start(void)
 {
     QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
 
+    rp2350_clocks_init(qts);
     qtest_writel(qts, AHBAP1 + CSW, CSW_PRIV);
     return qts;
 }

@@ -11,6 +11,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-clocks.h"
 
 #define CS              0x40140000
 #define ROM             (CS + 0x0000)
@@ -54,7 +55,10 @@ static char *rom_path;
 
 static QTestState *start(void)
 {
-    return qtest_initf("-M rp2350 -bios %s", rom_path);
+    QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
+
+    rp2350_clocks_init(qts);
+    return qts;
 }
 
 typedef struct Ident {

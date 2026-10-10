@@ -9,13 +9,15 @@
  * and reset values from the pico-sdk dma.h.
  *
  * Timing: the DMA issues at most one transfer (a read and its paired
- * write) per clk_sys cycle, round-robin over the requesting channels with
- * high-priority channels first. The model keeps a cycle count, `cycle`,
- * up to which the engine has run. Each run of the engine issues the
- * transfers of every cycle between the last run and now; then, while a
- * channel paced by a DREQ requests, it goes on issuing transfers in the
- * cycles after now, one a cycle, so that a DREQ is answered when it is
- * raised rather than when a timer next fires. The engine runs:
+ * write) per clk_sys cycle (the "clk" clock, at its current frequency;
+ * nothing happens while it is stopped), round-robin over the requesting
+ * channels with high-priority channels first. The model keeps a cycle
+ * count, `cycle`, up to which the engine has run. Each run of the engine
+ * issues the transfers of every cycle between the last run and now;
+ * then, while a channel paced by a DREQ requests, it goes on issuing
+ * transfers in the cycles after now, one a cycle, so that a DREQ is
+ * answered when it is raised rather than when a timer next fires. The
+ * engine runs:
  *
  *  - from inside a DREQ change, unless the change comes from a vCPU or a
  *    transfer would reach a device in the middle of a register access,
@@ -44,6 +46,7 @@
 #include "qapi/error.h"
 #include "hw/core/cpu.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/dma/rp2350_dma.h"
 #include "hw/misc/rp2350_atomic.h"
@@ -234,17 +237,41 @@ static unsigned ch_mode(RP2350DMAChannel *c)
     return c->trans_count >> MODE_SHIFT;
 }
 
-/* Clock conversions: the engine counts clk_sys cycles. */
+/*
+ * Clock conversions: the engine counts clk_sys cycles, cycle base_cycle
+ * having been reached at virtual time base_ns at the current rate.
+ */
+/* [spec:nuos:req:emu.clock-tree] */
 static uint64_t now_cycle(RP2350DMAState *s)
 {
-    return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), s->sysclk_hz,
-                    NANOSECONDS_PER_SECOND);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (now <= s->base_ns) {
+        return s->base_cycle;
+    }
+    return s->base_cycle + clock_ns_to_ticks(s->clk, now - s->base_ns);
 }
 
-/* The first virtual time at which `cycle` has been reached. */
+/*
+ * The first virtual time at which `cycle` has been reached, which never
+ * comes while clk_sys is stopped.
+ */
 static int64_t cycle_ns(RP2350DMAState *s, uint64_t cycle)
 {
-    return muldiv64(cycle, NANOSECONDS_PER_SECOND, s->sysclk_hz) + 1;
+    uint64_t d, ns;
+
+    if (cycle <= s->base_cycle) {
+        return s->base_ns;
+    }
+    if (!clock_is_enabled(s->clk)) {
+        return INT64_MAX;
+    }
+    d = cycle - s->base_cycle;
+    ns = clock_ticks_to_ns(s->clk, d);
+    while (clock_ns_to_ticks(s->clk, ns) < d) {
+        ns++;
+    }
+    return s->base_ns + MIN(ns, (uint64_t)INT64_MAX / 2);
 }
 
 /* Interrupts. */
@@ -885,7 +912,8 @@ static bool engine_run(RP2350DMAState *s, EngineMode mode)
     uint64_t limit = MAX(s->cycle, target) + ENGINE_QUANTUM;
     bool done = true;
 
-    if (s->running) {
+    /* Nothing runs, not even ahead of now, while clk_sys is stopped. */
+    if (s->running || !clock_is_enabled(s->clk)) {
         return true;
     }
     s->running = true;
@@ -999,6 +1027,10 @@ static void engine_kick(RP2350DMAState *s)
             timer_del(s->timer);
             return;
         }
+    }
+    if (!clock_is_enabled(s->clk)) {
+        timer_del(s->timer);
+        return;
     }
     timer_mod(s->timer, cycle_ns(s, s->cycle + wait));
 }
@@ -1552,12 +1584,32 @@ static void rp2350_dma_reset_hold(Object *obj, ResetType type)
     s->hp_served = 0;
     s->rr_high = RP2350_DMA_CHANNELS - 1;
     s->rr_low = RP2350_DMA_CHANNELS - 1;
-    s->cycle = now_cycle(s);
+    s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->base_cycle = 0;
+    s->cycle = 0;
 }
 
 static void rp2350_dma_reset_exit(Object *obj, ResetType type)
 {
     update_irq(RP2350_DMA(obj));
+}
+
+/*
+ * clk_sys changes rate, starts or stops: cycles up to now count at the old
+ * rate, and the engine's timer is re-armed for the new one.
+ */
+static void rp2350_dma_clk_changed(void *opaque, ClockEvent event)
+{
+    RP2350DMAState *s = opaque;
+
+    if (event == ClockPreUpdate) {
+        s->base_cycle = now_cycle(s);
+        s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        return;
+    }
+    if (s->timer) {
+        engine_kick(s);
+    }
 }
 
 static void rp2350_dma_init(Object *obj)
@@ -1578,6 +1630,8 @@ static void rp2350_dma_init(Object *obj)
     }
     qdev_init_gpio_in_named(DEVICE(obj), dreq_set, RP2350_DMA_DREQ,
                             RP2350_DMA_NUM_DREQ);
+    s->clk = qdev_init_clock_in(DEVICE(obj), "clk", rp2350_dma_clk_changed, s,
+                                ClockPreUpdate | ClockUpdate);
 }
 
 static void rp2350_dma_realize(DeviceState *dev, Error **errp)
@@ -1589,8 +1643,8 @@ static void rp2350_dma_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "bus property was not set");
         return;
     }
-    if (!s->sysclk_hz) {
-        error_setg(errp, "sysclk-hz must be nonzero");
+    if (!clock_has_source(s->clk)) {
+        error_setg(errp, "the clk clock must be connected");
         return;
     }
     memory_region_init(&s->port, obj, "rp2350-dma.port", UINT64_MAX);
@@ -1637,8 +1691,8 @@ static const VMStateDescription vmstate_rp2350_dma_channel = {
 
 static const VMStateDescription vmstate_rp2350_dma = {
     .name = TYPE_RP2350_DMA,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = rp2350_dma_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(ch, RP2350DMAState, RP2350_DMA_CHANNELS, 1,
@@ -1664,6 +1718,9 @@ static const VMStateDescription vmstate_rp2350_dma = {
         VMSTATE_UINT32(rr_high, RP2350DMAState),
         VMSTATE_UINT32(rr_low, RP2350DMAState),
         VMSTATE_UINT64(cycle, RP2350DMAState),
+        VMSTATE_CLOCK(clk, RP2350DMAState),
+        VMSTATE_UINT64(base_cycle, RP2350DMAState),
+        VMSTATE_INT64(base_ns, RP2350DMAState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1677,7 +1734,6 @@ static const Property rp2350_dma_properties[] = {
                      TYPE_RP2350_BUSCTRL, RP2350BusCtrlState *),
     DEFINE_PROP_LINK("exclmon", RP2350DMAState, exclmon,
                      TYPE_RP2350_EXCLMON, RP2350ExclMonState *),
-    DEFINE_PROP_UINT32("sysclk-hz", RP2350DMAState, sysclk_hz, 150000000),
 };
 
 static void rp2350_dma_class_init(ObjectClass *klass, const void *data)

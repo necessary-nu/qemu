@@ -91,6 +91,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_I2C1_IRQ 37
 #define RP2350_OTP_IRQ 38
 #define RP2350_TRNG_IRQ 39
+#define RP2350_PLL_SYS_IRQ 42
+#define RP2350_PLL_USB_IRQ 43
 #define RP2350_POWMAN_POW_IRQ 44
 #define RP2350_POWMAN_TIMER_IRQ 45
 #define RP2350_SPARE_IRQ_5 51
@@ -171,7 +173,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 #define RP2350_SIO_BASE 0xd0000000
 #define RP2350_SIO_NONSEC_BASE 0xd0020000
 
-#define RP2350_SYSCLK_HZ 150000000
 /*
  * SYST_CALIB as the RP2350 hardwires it on both cores: TENMS is 100,000
  * (datasheet 8.5.1, "Tick generators"), with NOREF and SKEW clear. The
@@ -179,20 +180,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
  * not a fixed clock.
  */
 #define RP2350_SYST_CALIB 100000
-/*
- * clk_ref, which the TICKS generators divide. Clock frequencies are not
- * otherwise modelled: this is both the ring oscillator's nominal rate,
- * which clk_ref runs from at reset, and a Pico 2's 12 MHz crystal, which
- * pico-sdk switches it to.
- */
-#define RP2350_CLK_REF_HZ 12000000
-/*
- * clk_peri, the UARTs' UARTCLK, at the clk_sys frequency pico-sdk runs it
- * from. Its divider and enable are not modelled.
- */
-#define RP2350_CLK_PERI_HZ 150000000
-/* clk_adc, as pico-sdk sets it up from PLL_USB. */
-#define RP2350_CLK_ADC_HZ 48000000
+/* The LPOSC, an ideal 32.768 kHz oscillator. */
+#define RP2350_LPOSC_HZ 32768
+/* A Pico 2's crystal. */
+#define RP2350_XOSC_DEFAULT_HZ 12000000
 
 /* Device models and bus windows per RESETS subsystem. */
 #define RP2350_RESET_MAX_DEVICES 4
@@ -224,11 +215,11 @@ struct RP2350State {
     RP2350BusCtrlState busctrl;
     RP2350DCPState dcp;
     RP2350XIPState xip;
-    RP2350ClkRegsState clocks;
+    RP2350ClocksState clocks;
     RP2350XOSCState xosc;
-    RP2350ClkRegsState pll_sys;
-    RP2350ClkRegsState pll_usb;
-    RP2350ClkRegsState ticks;
+    RP2350PLLState pll_sys;
+    RP2350PLLState pll_usb;
+    RP2350TicksState ticks;
     RP2350SysInfoState sysinfo;
     RP2350SysCfgState syscfg;
     RP2350TBManState tbman;
@@ -278,15 +269,17 @@ struct RP2350State {
 
     /*
      * DORMANT: the wake events' levels (the GPIO banks' dormant_wake
-     * interrupt and the AON alarm), whether clk_sys is stopped, and which
-     * cores were halted because it stopped.
+     * interrupt and the AON alarm).
      */
     bool dormant_wake[2];
+    /* Whether clk_sys is stopped, and which cores stopped with it. */
     bool clk_sys_stopped;
     bool core_clock_halted[RP2350_NUM_CORES];
 
     uint32_t flash_size;
     uint32_t psram_size;
+    /* The board's crystal on XIN and XOUT. */
+    uint32_t xosc_hz;
     uint32_t init_svtor;
     bool core1_launch;
 
@@ -297,11 +290,9 @@ struct RP2350State {
     uint32_t sysresetreq_pending;
     QEMUBH *sysresetreq_bh;
 
-    Clock *sysclk;
-    /* Each core's SysTick reference: its TICKS PROC0/PROC1 generator. */
-    Clock *refclk[RP2350_NUM_CORES];
-    Clock *periclk;
-    Clock *adcclk;
+    /* The LPOSC; and clk_sys, as the processors see it. */
+    Clock *lposc;
+    Clock *clk_sys;
 };
 
 /*
@@ -309,6 +300,12 @@ struct RP2350State {
  * code. Called after the core is reset when no boot ROM runs.
  */
 void rp2350_soc_boot_rom_handoff(RP2350State *s, int core);
+
+/*
+ * Leave the clocks as the boot ROM's early boot path configures them on
+ * every boot. Called when core 0 starts without the ROM executing.
+ */
+void rp2350_soc_boot_rom_clocks(RP2350State *s);
 
 /*
  * Make `dev` part of RESETS subsystem `reset` (an RP2350_RESET_* number):

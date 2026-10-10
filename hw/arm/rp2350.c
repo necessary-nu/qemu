@@ -166,6 +166,9 @@ static void rp2350_init(MachineState *machine)
                              OBJECT(get_system_memory()), &error_abort);
     qdev_prop_set_uint32(soc, "flash-size", s->flash_size);
     qdev_prop_set_uint32(soc, "psram-size", s->psram_size);
+    /* A Pico 2's 12 MHz crystal. */
+    /* [spec:nuos:req:emu.clock-tree] */
+    qdev_prop_set_uint32(soc, "xosc-hz", 12000000);
     /* With no ROM executing, the machine launches core 1 itself. */
     qdev_prop_set_bit(soc, "core1-launch", direct);
     qdev_prop_set_uint32(soc, "init-svtor",

@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-clocks.h"
 #include "rp2350-resets.h"
 
 #define WATCHDOG        0x400d8000
@@ -61,7 +62,10 @@ static char *rom_path;
 
 static QTestState *start(void)
 {
-    return qtest_initf("-M rp2350 -bios %s", rom_path);
+    QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
+
+    rp2350_clocks_init(qts);
+    return qts;
 }
 
 static uint32_t wd_read(QTestState *qts, uint32_t reg)
@@ -304,6 +308,7 @@ static void test_domains(void)
     g_assert_cmphex(qtest_readl(qts, RESETS + RESETS_RESET), ==, 0);
 
     /* RESETS.WDSEL resets a subsystem alone; RESET keeps its value. */
+    rp2350_clocks_init(qts);
     qtest_writel(qts, TICK_CYCLES(TICK_TIMER0), 12);
     qtest_writel(qts, TICK_CTRL(TICK_TIMER0), 1);
     qtest_clock_step(qts, 100 * US);

@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "rp2350-clocks.h"
 
 #define RESETS_BASE 0x40020000
 #define RESET       (RESETS_BASE + 0x0)
@@ -180,6 +181,7 @@ static void test_timer_stops_in_reset(void)
     uint32_t now;
 
     qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");
+    rp2350_clocks_init(qts);
     /* A 1 us tick: twelve cycles of the 12 MHz clk_ref. */
     qtest_writel(qts, TICK_TIMER0_CYCLES, 12);
     qtest_writel(qts, TICK_TIMER0_CTRL, 1);

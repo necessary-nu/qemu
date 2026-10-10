@@ -205,6 +205,22 @@ void rp2350_soc_boot_rom_handoff(RP2350State *s, int core)
     env->v7m.nsacr |= NSACR_CP7;
 }
 
+/*
+ * The released A4 ROM's early boot path, on every boot outcome, lowers
+ * the ROSC divider from 8 to 2 and raises clk_ref's from 1 to 4, so that
+ * clk_sys runs from the ROSC at four times its reset frequency and clk_ref
+ * near its nominal one. Everything else in the clock tree is left at its
+ * reset state for a flash image: clk_peri stopped, and the XOSC and PLLs
+ * off.
+ */
+/* [spec:nuos:req:emu.clock-tree] */
+/* [spec:nuos:req:emu.direct-load] */
+void rp2350_soc_boot_rom_clocks(RP2350State *s)
+{
+    rp2350_rosc_boot_rom_handoff(&s->rosc);
+    rp2350_clocks_boot_rom_handoff(&s->clocks);
+}
+
 typedef struct RP2350Core1Start {
     RP2350State *soc;
     uint32_t sp;
@@ -255,6 +271,9 @@ typedef struct RP2350ResetWindow {
  * Each RESETS subsystem and the bus windows of its registers. JTAG has no
  * registers on the system bus.
  */
+/* CLOCKS generator `name` (REF, SYS, PERI, ...). */
+#define CLK(s, name) ((s)->clocks.clk[RP2350_CLK_##name])
+
 static const struct {
     const char *name;
     RP2350ResetWindow window[RP2350_RESET_MAX_WINDOWS];
@@ -545,6 +564,7 @@ static void rp2350_soc_reset_core(RP2350State *s, int n, bool hold,
     }
     if (n == 0) {
         rp2350_resets_boot_rom_handoff(&s->resets);
+        rp2350_soc_boot_rom_clocks(s);
         rp2350_soc_boot_rom_handoff(s, 0);
         rp2350_soc_boot_vectors(s);
     } else if (!sio_reset) {
@@ -724,38 +744,6 @@ static const MemoryRegionOps rp2350_alias_ops = {
     .impl.min_access_size = 1,
     .impl.max_access_size = 4,
 };
-
-/*
- * Drive core n's SysTick reference clock from its TICKS generator: one
- * tick every CYCLES clk_ref cycles while the generator is enabled, and no
- * ticks while it is stopped or CYCLES is 0, so a SysTick counting the
- * reference holds its value.
- */
-/* [spec:nuos:req:emu.clocks] */
-static void rp2350_soc_proc_tick_update(RP2350State *s, int n)
-{
-    static const int tick[] = { RP2350_TICK_PROC0, RP2350_TICK_PROC1 };
-    uint32_t cycles = rp2350_ticks_cycles(&s->ticks, tick[n]);
-
-    if (!rp2350_ticks_running(&s->ticks, tick[n])) {
-        cycles = 0;
-    }
-    /* The period in 2^-32 ns units, exact for 1 us ticks. */
-    clock_set(s->refclk[n],
-              muldiv64(CLOCK_PERIOD_FROM_NS(NANOSECONDS_PER_SECOND), cycles,
-                       RP2350_CLK_REF_HZ));
-    clock_propagate(s->refclk[n]);
-}
-
-static void rp2350_soc_proc0_tick(void *opaque)
-{
-    rp2350_soc_proc_tick_update(opaque, 0);
-}
-
-static void rp2350_soc_proc1_tick(void *opaque)
-{
-    rp2350_soc_proc_tick_update(opaque, 1);
-}
 
 /*
  * System-level interrupts are wired to the same IRQ number on both cores'
@@ -987,41 +975,25 @@ static void rp2350_soc_core_clock_start(CPUState *cs, run_on_cpu_data data)
     }
 }
 
-static bool rp2350_soc_root_running(RP2350State *s, RP2350ClockRoot root)
-{
-    switch (root) {
-    case RP2350_ROOT_XOSC:
-        return !rp2350_xosc_dormant(&s->xosc);
-    case RP2350_ROOT_ROSC:
-        return !rp2350_rosc_dormant(&s->rosc);
-    default:
-        return true;
-    }
-}
-
 /*
- * Stop or restart the clocks that run from an oscillator in DORMANT.
- * clk_ref drives the TICKS generators, so TIMER0/1, the watchdog and the
- * other tick consumers stop with it. clk_sys clocks the processors: they
- * stop executing, and nothing but the clock restarting resumes them.
+ * clk_sys clocks the processors: while it is stopped (DORMANT stopping
+ * its oscillator, or a source that stops or never starts) they stop
+ * executing, and nothing but the clock restarting resumes them.
  *
  * A core stops at the end of the code block it is executing, so on the
- * core that entered DORMANT, the instructions after the write in the same
- * straight-line run complete before the clock stops rather than after it
- * restarts; a STATUS poll, as pico-sdk follows the write with, reads the
- * oscillator stopped and so does not complete.
+ * core that stopped the clock, the instructions after the write in the
+ * same straight-line run complete before the clock stops rather than
+ * after it restarts; a STATUS poll, as pico-sdk follows a DORMANT write
+ * with, reads the oscillator stopped and so does not complete.
  */
 /* [spec:nuos:req:emu.clocks] */
-static void rp2350_soc_clocks_update(void *opaque)
+/* [spec:nuos:req:emu.clock-tree] */
+static void rp2350_soc_clk_sys_changed(void *opaque, ClockEvent event)
 {
     RP2350State *s = opaque;
-    bool ref = rp2350_soc_root_running(s, rp2350_clocks_root(&s->clocks,
-                                                             false));
-    bool sys = rp2350_soc_root_running(s, rp2350_clocks_root(&s->clocks,
-                                                             true));
+    bool sys = clock_is_enabled(s->clk_sys);
     int i;
 
-    rp2350_ticks_set_clocks(&s->ticks, ref, sys);
     if (s->clk_sys_stopped == !sys) {
         return;
     }
@@ -1034,17 +1006,6 @@ static void rp2350_soc_clocks_update(void *opaque)
                                  : rp2350_soc_core_clock_stop,
                          RUN_ON_CPU_HOST_PTR(s));
     }
-}
-
-/* An oscillator entered DORMANT, or became stable after waking. */
-static void rp2350_soc_osc_dormant(void *opaque, int n, int level)
-{
-    RP2350State *s = opaque;
-
-    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->powman),
-                                        RP2350_POWMAN_XOSC_DORMANT, 0),
-                 rp2350_xosc_dormant(&s->xosc));
-    rp2350_soc_clocks_update(s);
 }
 
 /*
@@ -1133,9 +1094,42 @@ void rp2350_soc_system_reset(RP2350State *s, ResetType type)
         return;
     }
     if (s->core1_launch) {
+        rp2350_soc_boot_rom_clocks(s);
         rp2350_soc_boot_rom_handoff(s, 0);
         rp2350_soc_boot_vectors(s);
     }
+}
+
+/*
+ * The clock tree: the oscillators and PLLs feed CLOCKS, whose clk_ref
+ * drives the TICKS generators. The PLLs' reference is the crystal
+ * oscillator, as is the clock muxes' PLL_USB reference input. GPIN0/1 and
+ * the OTP's frequency counter clock have no source, so selecting them
+ * stops a clock. clk_sys also reaches the SoC, which stops the processors
+ * while it is stopped.
+ */
+/* [spec:nuos:req:emu.clock-tree] */
+static void rp2350_soc_wire_clocks(RP2350State *s)
+{
+    DeviceState *clocks = DEVICE(&s->clocks);
+    DeviceState *rosc = DEVICE(&s->rosc);
+    Clock *xosc = s->xosc.out;
+
+    clock_set_hz(s->lposc, RP2350_LPOSC_HZ);
+    qdev_prop_set_uint32(DEVICE(&s->xosc), "xtal-hz", s->xosc_hz);
+    qdev_connect_clock_in(DEVICE(&s->pll_sys), RP2350_PLL_REF, xosc);
+    qdev_connect_clock_in(DEVICE(&s->pll_usb), RP2350_PLL_REF, xosc);
+    qdev_connect_clock_in(clocks, "rosc",
+                          qdev_get_clock_out(rosc, RP2350_ROSC_CLK));
+    qdev_connect_clock_in(clocks, "rosc-ph",
+                          qdev_get_clock_out(rosc, RP2350_ROSC_CLK_PH));
+    qdev_connect_clock_in(clocks, "xosc", xosc);
+    qdev_connect_clock_in(clocks, "pll-usb-ref", xosc);
+    qdev_connect_clock_in(clocks, "lposc", s->lposc);
+    qdev_connect_clock_in(clocks, "pll-sys", s->pll_sys.out);
+    qdev_connect_clock_in(clocks, "pll-usb", s->pll_usb.out);
+    qdev_connect_clock_in(DEVICE(&s->ticks), RP2350_TICKS_REF, CLK(s, REF));
+    clock_set_source(s->clk_sys, CLK(s, SYS));
 }
 
 /* The Winbond W25Q parts that fit each supported flash size. */
@@ -1179,7 +1173,7 @@ static bool rp2350_soc_realize_xip(RP2350State *s, Error **errp)
 
     qdev_prop_set_uint32(DEVICE(sbd), "cs0-size", s->flash_size);
     qdev_prop_set_uint32(DEVICE(sbd), "cs1-size", s->psram_size);
-    qdev_prop_set_uint32(DEVICE(sbd), "sysclk-hz", RP2350_SYSCLK_HZ);
+    qdev_connect_clock_in(DEVICE(sbd), "clk", CLK(s, SYS));
     if (!sysbus_realize(sbd, errp)) {
         return false;
     }
@@ -1247,6 +1241,12 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
 
+    if (s->xosc_hz < 1000000 || s->xosc_hz > 50000000) {
+        error_setg(errp, "xosc-hz must be from 1 MHz to 50 MHz");
+        return;
+    }
+    rp2350_soc_wire_clocks(s);
+
     if (!memory_region_init_rom(&s->rom, obj, "rp2350.rom", RP2350_ROM_SIZE,
                                 errp)) {
         return;
@@ -1278,10 +1278,6 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             RP2350_SRAM_BASE + (i ? RP2350_SRAM0_DOMAIN_SIZE : 0),
             &s->sram_off[i], 1);
     }
-
-    clock_set_hz(s->sysclk, RP2350_SYSCLK_HZ);
-    clock_set_hz(s->periclk, RP2350_CLK_PERI_HZ);
-    clock_set_hz(s->adcclk, RP2350_CLK_ADC_HZ);
 
     /*
      * The bus filters stand between each core and board memory, so every
@@ -1327,8 +1323,10 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         /* [spec:nuos:req:emu.core1-launch] */
         qdev_prop_set_bit(armv7m, "start-powered-off",
                           i != 0 && s->core1_launch);
-        qdev_connect_clock_in(armv7m, "cpuclk", s->sysclk);
-        qdev_connect_clock_in(armv7m, "refclk", s->refclk[i]);
+        /* [spec:nuos:req:emu.clock-tree] */
+        qdev_connect_clock_in(armv7m, "cpuclk", CLK(s, SYS));
+        qdev_connect_clock_in(armv7m, "refclk",
+                              s->ticks.tick[RP2350_TICK_PROC0 + i]);
         /* [spec:nuos:req:emu.clocks] */
         qdev_prop_set_uint32(armv7m, "systick-calib", RP2350_SYST_CALIB);
         object_property_set_link(OBJECT(armv7m), "memory",
@@ -1380,7 +1378,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
          * so these take priority over the armv7m container's regions.
          */
         /* [spec:nuos:req:emu.coresight] */
-        qdev_connect_clock_in(DEVICE(&s->m33_debug[i]), "cpuclk", s->sysclk);
+        qdev_connect_clock_in(DEVICE(&s->m33_debug[i]), "cpuclk",
+                              CLK(s, SYS));
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->m33_debug[i]), errp)) {
             return;
         }
@@ -1536,11 +1535,6 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             { SYS_BUS_DEVICE(&s->rosc), RP2350_ROSC_BASE },
         };
 
-        rp2350_ticks_set_notify(&s->ticks, RP2350_TICK_PROC0,
-                                rp2350_soc_proc0_tick, s);
-        rp2350_ticks_set_notify(&s->ticks, RP2350_TICK_PROC1,
-                                rp2350_soc_proc1_tick, s);
-
         for (i = 0; i < ARRAY_SIZE(blocks); i++) {
             if (!sysbus_realize(blocks[i].dev, errp)) {
                 return;
@@ -1555,9 +1549,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->psm), 0, RP2350_PSM_BASE);
-    object_property_set_link(OBJECT(&s->watchdog), "ticks", OBJECT(&s->ticks),
-                             &error_abort);
-    qdev_prop_set_uint32(DEVICE(&s->watchdog), "ref-hz", RP2350_CLK_REF_HZ);
+    qdev_connect_clock_in(DEVICE(&s->watchdog), "tick",
+                          s->ticks.tick[RP2350_TICK_WATCHDOG]);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->watchdog), errp)) {
         return;
     }
@@ -1576,7 +1569,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
         object_property_set_link(OBJECT(sbd), "psm", OBJECT(&s->psm),
                                  &error_abort);
-        qdev_prop_set_uint32(powman, "ref-hz", RP2350_CLK_REF_HZ);
+        qdev_prop_set_uint32(powman, "lposc-hz", RP2350_LPOSC_HZ);
+        qdev_connect_clock_in(powman, "clk-ref", CLK(s, REF));
         qdev_prop_set_uint32(powman, "bonded-gpios", RP2350_GPIO_QFN60_PINS);
         rp2350_powman_set_ops(&s->powman, &rp2350_soc_powman_ops, s);
         if (!sysbus_realize(sbd, errp)) {
@@ -1603,19 +1597,23 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
     /*
      * DORMANT. The GPIO banks' dormant_wake interrupt and the AON timer
-     * alarm wake the oscillators, and an oscillator in DORMANT stops the
-     * clocks running from it.
+     * alarm wake the oscillators; an oscillator in DORMANT stops its
+     * output clock, and so the clocks running from it.
      */
     /* [spec:nuos:req:emu.clocks] */
     qdev_connect_gpio_out_named(DEVICE(&s->gpio), RP2350_GPIO_DORMANT_WAKE, 0,
         qdev_get_gpio_in_named(DEVICE(s), "dormant-wake", 0));
     qdev_connect_gpio_out_named(DEVICE(&s->powman), RP2350_POWMAN_ALARM_WAKE,
         0, qdev_get_gpio_in_named(DEVICE(s), "dormant-wake", 1));
-    qdev_connect_gpio_out_named(DEVICE(&s->xosc), RP2350_OSC_DORMANT, 0,
-        qdev_get_gpio_in_named(DEVICE(s), "osc-dormant", 0));
-    qdev_connect_gpio_out_named(DEVICE(&s->rosc), RP2350_OSC_DORMANT, 0,
-        qdev_get_gpio_in_named(DEVICE(s), "osc-dormant", 0));
-    rp2350_clocks_set_notify(&s->clocks, rp2350_soc_clocks_update, s);
+
+    /* CLOCKS' resus interrupt and the PLLs' loss-of-lock interrupts. */
+    /* [spec:nuos:req:emu.clock-tree] */
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->clocks), 0,
+                       qdev_get_gpio_in(dev_soc, RP2350_CLOCKS_IRQ));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->pll_sys), 0,
+                       qdev_get_gpio_in(dev_soc, RP2350_PLL_SYS_IRQ));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->pll_usb), 0,
+                       qdev_get_gpio_in(dev_soc, RP2350_PLL_USB_IRQ));
 
     /* [spec:nuos:req:emu.timer] */
     for (i = 0; i < RP2350_NUM_TIMERS; i++) {
@@ -1627,11 +1625,9 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         SysBusDevice *sbd = SYS_BUS_DEVICE(&s->timer[i]);
         int n;
 
-        object_property_set_link(OBJECT(sbd), "ticks", OBJECT(&s->ticks),
-                                 &error_abort);
-        qdev_prop_set_uint32(DEVICE(sbd), "tick", tick[i]);
-        qdev_prop_set_uint32(DEVICE(sbd), "ref-hz", RP2350_CLK_REF_HZ);
-        qdev_prop_set_uint32(DEVICE(sbd), "sysclk-hz", RP2350_SYSCLK_HZ);
+        /* [spec:nuos:req:emu.clock-tree] */
+        qdev_connect_clock_in(DEVICE(sbd), "tick", s->ticks.tick[tick[i]]);
+        qdev_connect_clock_in(DEVICE(sbd), "clk-sys", CLK(s, SYS));
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
@@ -1642,7 +1638,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
 
     /* [spec:nuos:req:emu.rosc-trng] */
-    qdev_prop_set_uint32(DEVICE(&s->trng), "sysclk-hz", RP2350_SYSCLK_HZ);
+    qdev_connect_clock_in(DEVICE(&s->trng), "clk", CLK(s, SYS));
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->trng), errp)) {
         return;
     }
@@ -1652,7 +1648,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
     /* The SHA-256 DREQ is connected with the DMA's other sources. */
     /* [spec:nuos:req:emu.sha256] */
-    qdev_connect_clock_in(DEVICE(&s->sha256), "clk", s->sysclk);
+    qdev_connect_clock_in(DEVICE(&s->sha256), "clk", CLK(s, SYS));
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->sha256), errp)) {
         return;
     }
@@ -1669,7 +1665,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         DeviceState *dev = DEVICE(&s->pwm);
         int n;
 
-        qdev_connect_clock_in(dev, "clk", s->sysclk);
+        qdev_connect_clock_in(dev, "clk", CLK(s, SYS));
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
@@ -1704,7 +1700,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         DeviceState *dev = DEVICE(&s->pio);
         int b, n;
 
-        qdev_connect_clock_in(dev, "clk", s->sysclk);
+        qdev_connect_clock_in(dev, "clk", CLK(s, SYS));
         object_property_set_link(OBJECT(dev), "gpio", OBJECT(&s->gpio),
                                  &error_abort);
         if (!sysbus_realize(sbd, errp)) {
@@ -1742,7 +1738,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     /* [spec:nuos:req:emu.adc] */
     object_property_set_link(OBJECT(&s->adc), "gpio", OBJECT(&s->gpio),
                              &error_abort);
-    qdev_connect_clock_in(DEVICE(&s->adc), "clk", s->adcclk);
+    /* [spec:nuos:req:emu.clock-tree] */
+    qdev_connect_clock_in(DEVICE(&s->adc), "clk", CLK(s, ADC));
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->adc), errp)) {
         return;
     }
@@ -1751,10 +1748,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                        qdev_get_gpio_in(dev_soc, RP2350_ADC_IRQ_FIFO));
 
     /*
-     * HSTX, clocked by clk_hstx. Clock frequencies are not modelled: at
-     * reset CLK_HSTX_CTRL selects clk_sys undivided, which pico-sdk keeps,
-     * so clk_hstx is clk_sys. Its eight outputs drive the HSTX function
-     * of GPIOs 12-19. DREQ_HSTX is connected with the DMA's other
+     * HSTX, clocked by clk_hstx. Its eight outputs drive the HSTX
+     * function of GPIOs 12-19. DREQ_HSTX is connected with the DMA's other
      * sources.
      */
     /* [spec:nuos:req:emu.hstx] */
@@ -1763,7 +1758,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         DeviceState *dev = DEVICE(&s->hstx);
         int n;
 
-        qdev_connect_clock_in(dev, "clk", s->sysclk);
+        /* [spec:nuos:req:emu.clock-tree] */
+        qdev_connect_clock_in(dev, "clk", CLK(s, HSTX));
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
@@ -1793,6 +1789,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         SysBusDevice *sbd = SYS_BUS_DEVICE(&s->usbctrl);
         DeviceState *dev = DEVICE(&s->usbctrl);
 
+        /* [spec:nuos:req:emu.clock-tree] */
+        qdev_connect_clock_in(dev, "clk", CLK(s, USB));
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
@@ -1835,7 +1833,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
         qdev_prop_set_bit(uart, "line-level", true);
         qdev_prop_set_uint32(uart, "fifo-depth", PL011_FIFO_MAX);
-        qdev_connect_clock_in(uart, "clk", s->periclk);
+        /* [spec:nuos:req:emu.clock-tree] */
+        qdev_connect_clock_in(uart, "clk", CLK(s, PERI));
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
@@ -1862,8 +1861,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
 
     /*
-     * SPI0 and SPI1, PL022 r1p4 controllers timed by clk_peri, which is
-     * modelled at clk_sys's rate (pico-sdk runs clk_peri from clk_sys).
+     * SPI0 and SPI1, PL022 r1p4 controllers timed by clk_peri (SSPCLK).
      * Each has its SSI bus "spi0"/"spi1" for off-chip devices, and drives
      * its SCK, CSn and TX function signals; CSn's pin input is SSPFSSIN,
      * the select of the controller in slave mode. The DREQs are connected
@@ -1882,7 +1880,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
         qdev_prop_set_string(dev, "bus-name", i ? "spi1" : "spi0");
         qdev_prop_set_uint8(dev, "revision", 3);
-        qdev_connect_clock_in(dev, "clk", s->sysclk);
+        /* [spec:nuos:req:emu.clock-tree] */
+        qdev_connect_clock_in(dev, "clk", CLK(s, PERI));
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
@@ -1918,7 +1917,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
      * output enable pulling SCL low. It sees the pin levels, so a bus is
      * usable once the pins select the I2C function with their input
      * enabled and are pulled up. Otherwise SCL and SDA read low and
-     * transfers wait for an idle bus, as on hardware.
+     * transfers wait for an idle bus, as on hardware. Every clock of the
+     * controller, ic_clk included, is clk_sys.
      */
     /* [spec:nuos:req:emu.i2c] */
     for (i = 0; i < RP2350_NUM_I2C; i++) {
@@ -1931,7 +1931,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         int n;
 
         qdev_prop_set_string(dev, "bus-name", i ? "i2c1" : "i2c0");
-        qdev_connect_clock_in(dev, "clk", s->sysclk);
+        /* [spec:nuos:req:emu.clock-tree] */
+        qdev_connect_clock_in(dev, "clk", CLK(s, SYS));
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
@@ -1968,7 +1969,7 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         object_property_set_link(OBJECT(sbd), "core1-memory",
                                  OBJECT(&s->armv7m[1].container),
                                  &error_abort);
-        qdev_connect_clock_in(DEVICE(sbd), "clk", s->sysclk);
+        qdev_connect_clock_in(DEVICE(sbd), "clk", CLK(s, SYS));
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
@@ -2031,7 +2032,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                                  &error_abort);
         object_property_set_link(OBJECT(sbd), "exclmon", OBJECT(&s->exclmon),
                                  &error_abort);
-        qdev_prop_set_uint32(dma, "sysclk-hz", RP2350_SYSCLK_HZ);
+        /* [spec:nuos:req:emu.clock-tree] */
+        qdev_connect_clock_in(dma, "clk", CLK(s, SYS));
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
@@ -2228,14 +2230,11 @@ static void rp2350_soc_init(Object *obj)
     s->sysresetreq_bh = qemu_bh_new(rp2350_soc_sysresetreq_run, s);
     qdev_init_gpio_in_named(DEVICE(s), rp2350_soc_dormant_wake,
                             "dormant-wake", 2);
-    qdev_init_gpio_in_named(DEVICE(s), rp2350_soc_osc_dormant,
-                            "osc-dormant", 1);
 
-    s->sysclk = qdev_init_clock_out(DEVICE(s), "sysclk");
-    s->refclk[0] = qdev_init_clock_out(DEVICE(s), "refclk0");
-    s->refclk[1] = qdev_init_clock_out(DEVICE(s), "refclk1");
-    s->periclk = qdev_init_clock_out(DEVICE(s), "periclk");
-    s->adcclk = clock_new(obj, "adcclk");
+    s->lposc = clock_new(obj, "lposc");
+    s->clk_sys = qdev_init_clock_in(DEVICE(s), "clk-sys",
+                                    rp2350_soc_clk_sys_changed, s,
+                                    ClockUpdate);
 }
 
 static const Property rp2350_soc_properties[] = {
@@ -2243,6 +2242,8 @@ static const Property rp2350_soc_properties[] = {
                      MemoryRegion *),
     DEFINE_PROP_UINT32("flash-size", RP2350State, flash_size, 0),
     DEFINE_PROP_UINT32("psram-size", RP2350State, psram_size, 0),
+    DEFINE_PROP_UINT32("xosc-hz", RP2350State, xosc_hz,
+                       RP2350_XOSC_DEFAULT_HZ),
     DEFINE_PROP_UINT32("init-svtor", RP2350State, init_svtor, RP2350_ROM_BASE),
     /* Emulate the boot ROM's core 1 launch handshake (no ROM executing). */
     DEFINE_PROP_BOOL("core1-launch", RP2350State, core1_launch, false),

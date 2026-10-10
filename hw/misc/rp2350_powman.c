@@ -57,7 +57,8 @@
  *
  * The AON timer counts ticks of its source: the LPOSC (an ideal oscillator
  * at the lposc-hz property, which matches the OTP LPOSC_CALIB row), the
- * XOSC through clk_ref, falling edges of the selected EXT_TIME_REF GPIO as
+ * XOSC through clk_ref (the "clk-ref" clock, at its current frequency,
+ * whatever it runs from), falling edges of the selected EXT_TIME_REF GPIO as
  * a 1 kHz tick, or GPIO edges replacing the LPOSC (DRIVE_LPCK). The
  * fractional divider divides the source by LPOSC_FREQ_KHZ or
  * XOSC_FREQ_KHZ (16.16, at least 2.0) to make the tick. Switching to the
@@ -68,7 +69,8 @@
  * edge before the boundary advances it to the boundary. The alarm fires
  * when the count reaches ALARM_TIME while ALARM_ENAB is set (the rising
  * edge of that comparison), setting TIMER.ALARM; that event also wakes
- * the chip from DORMANT, which stops an AON timer running from the XOSC.
+ * the chip from DORMANT, which stops an AON timer running from the XOSC
+ * by stopping clk_ref.
  *
  * The regulator and brown-out detector have no analogue behaviour to
  * model: VREG accepts writes once VREG_CTRL.UNLOCK is set, shows
@@ -86,6 +88,7 @@
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_powman.h"
@@ -396,11 +399,12 @@ static bool aon_clock(RP2350PowmanState *s, uint64_t *hz, uint64_t *div)
     if (!(s->timer & TIMER_RUN)) {
         return false;
     }
+    /* [spec:nuos:req:emu.clock-tree] */
     if (s->timer & TIMER_USING_XOSC) {
-        if (s->xosc_dormant) {
+        if (!clock_is_enabled(s->clk_ref)) {
             return false;
         }
-        *hz = s->ref_hz;
+        *hz = clock_get_hz(s->clk_ref);
         *div = aon_div(s->xosc_freq_int, s->xosc_freq_frac);
         return true;
     }
@@ -768,6 +772,22 @@ static uint32_t powman_delay(RP2350PowmanState *s, int shift, int bits)
 }
 
 /*
+ * The time clk_ref, the fast POWMAN clock, takes for `cycles`. A stopped
+ * clk_ref makes no progress.
+ */
+/* [spec:nuos:req:emu.clock-tree] */
+static int64_t powman_ref_ns(RP2350PowmanState *s, uint64_t cycles)
+{
+    if (!cycles) {
+        return 0;
+    }
+    if (!clock_is_enabled(s->clk_ref)) {
+        return INT64_MAX / 4;
+    }
+    return clock_ticks_to_ns(s->clk_ref, cycles);
+}
+
+/*
  * How long the sequencer takes from power state `from` to `to`: SWCORE
  * and XIP steps in LPOSC periods, SRAM steps in POWMAN ticks.
  */
@@ -792,15 +812,14 @@ static int64_t powman_seq_ns(RP2350PowmanState *s, uint32_t from, uint32_t to)
         lposc_cycles += sram_ticks;
     }
     return muldiv64(lposc_cycles, NANOSECONDS_PER_SECOND, s->lposc_hz) +
-           muldiv64(ref_cycles, NANOSECONDS_PER_SECOND, s->ref_hz);
+           powman_ref_ns(s, ref_cycles);
 }
 
 /* The polling interval while WAITING: one POWMAN tick. */
 static int64_t powman_tick_ns(RP2350PowmanState *s)
 {
     if (s->seq_cfg & SEQ_CFG_USING_FAST_POWCK) {
-        return muldiv64(MAX(s->pow_fastdiv, 1), NANOSECONDS_PER_SECOND,
-                        s->ref_hz);
+        return powman_ref_ns(s, MAX(s->pow_fastdiv, 1));
     }
     return muldiv64(1, NANOSECONDS_PER_SECOND, s->lposc_hz);
 }
@@ -1727,8 +1746,8 @@ static void rp2350_powman_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "psm property was not set");
         return;
     }
-    if (!s->lposc_hz || !s->ref_hz) {
-        error_setg(errp, "lposc-hz and ref-hz must be set");
+    if (!s->lposc_hz) {
+        error_setg(errp, "lposc-hz must be set");
         return;
     }
     if (s->bonded_gpios > RP2350_GPIO_BANK0_PINS) {
@@ -1742,17 +1761,20 @@ static void rp2350_powman_realize(DeviceState *dev, Error **errp)
     s->vreg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vreg_cb, s);
 }
 
-/* [spec:nuos:req:emu.powman] */
-static void powman_xosc_dormant(void *opaque, int n, int level)
+/*
+ * clk_ref changes rate, starts or stops: count up to the change at the
+ * old rate.
+ */
+/* [spec:nuos:req:emu.clock-tree] */
+static void powman_clk_ref_changed(void *opaque, ClockEvent event)
 {
     RP2350PowmanState *s = opaque;
 
-    if (s->xosc_dormant == !!level) {
-        return;
+    if (event == ClockPreUpdate) {
+        aon_sync(s);
+    } else {
+        aon_update(s);
     }
-    aon_sync(s);
-    s->xosc_dormant = level;
-    aon_update(s);
 }
 
 static void rp2350_powman_init(Object *obj)
@@ -1775,8 +1797,8 @@ static void rp2350_powman_init(Object *obj)
     qdev_init_gpio_out_named(dev, &s->psm_reset, RP2350_POWMAN_PSM_RESET, 1);
     qdev_init_gpio_out_named(dev, &s->watchdog_reset,
                              RP2350_POWMAN_WATCHDOG_RESET, 1);
-    qdev_init_gpio_in_named(dev, powman_xosc_dormant,
-                            RP2350_POWMAN_XOSC_DORMANT, 1);
+    s->clk_ref = qdev_init_clock_in(dev, "clk-ref", powman_clk_ref_changed, s,
+                                    ClockPreUpdate | ClockUpdate);
     qdev_init_gpio_out_named(dev, &s->alarm_wake, RP2350_POWMAN_ALARM_WAKE,
                              1);
     /* The first reset is the power-on reset. */
@@ -1785,8 +1807,8 @@ static void rp2350_powman_init(Object *obj)
 
 static const VMStateDescription vmstate_rp2350_powman = {
     .name = TYPE_RP2350_POWMAN,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(seq_timer, RP2350PowmanState),
         VMSTATE_TIMER_PTR(alarm_timer, RP2350PowmanState),
@@ -1830,7 +1852,7 @@ static const VMStateDescription vmstate_rp2350_powman = {
         VMSTATE_UINT64(aon_sec_limit, RP2350PowmanState),
         VMSTATE_UINT32(aon_lpck_acc, RP2350PowmanState),
         VMSTATE_BOOL(alarm_cmp, RP2350PowmanState),
-        VMSTATE_BOOL(xosc_dormant, RP2350PowmanState),
+        VMSTATE_CLOCK(clk_ref, RP2350PowmanState),
         VMSTATE_UINT32_ARRAY(pwrup, RP2350PowmanState, RP2350_POWMAN_PWRUPS),
         VMSTATE_UINT32(pwrup_latch, RP2350PowmanState),
         VMSTATE_UINT32(last_swcore_pwrup, RP2350PowmanState),
@@ -1852,7 +1874,6 @@ static const Property rp2350_powman_properties[] = {
     DEFINE_PROP_LINK("psm", RP2350PowmanState, psm, TYPE_RP2350_PSM,
                      RP2350PSMState *),
     DEFINE_PROP_UINT32("lposc-hz", RP2350PowmanState, lposc_hz, 32768),
-    DEFINE_PROP_UINT32("ref-hz", RP2350PowmanState, ref_hz, 0),
     DEFINE_PROP_UINT32("bonded-gpios", RP2350PowmanState, bonded_gpios,
                        RP2350_GPIO_BANK0_PINS),
 };

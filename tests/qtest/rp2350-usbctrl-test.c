@@ -11,6 +11,7 @@
 #include <sys/un.h>
 #include "libqtest.h"
 #include "qobject/qdict.h"
+#include "rp2350-clocks.h"
 #include "rp2350-resets.h"
 
 #define XOR                     0x1000
@@ -130,6 +131,7 @@ static QTestState *start(const char *extra)
     QTestState *qts = qtest_initf("-M rp2350 -bios %s %s", rom_path,
                                   extra ? extra : "");
 
+    rp2350_clocks_init(qts);
     rp2350_unreset(qts, RESET_USBCTRL);
     return qts;
 }

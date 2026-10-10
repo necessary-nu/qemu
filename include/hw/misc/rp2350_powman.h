@@ -9,6 +9,7 @@
 #ifndef HW_MISC_RP2350_POWMAN_H
 #define HW_MISC_RP2350_POWMAN_H
 
+#include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
 #include "hw/gpio/rp2350_gpio.h"
 #include "hw/misc/rp2350_psm.h"
@@ -48,8 +49,9 @@ enum {
  *   "glitch-reset"  a glitch detector trigger resetting the chip
  *   "gpio"          one line per pin (RP2350_GPIO_PINS), the pin's input
  *                   level, for the power-up and time reference sources
- *   "xosc-dormant"  high while the XOSC is stopped by DORMANT, which stops
- *                   an AON timer running from it
+ * Named clock input:
+ *   "clk-ref"       clk_ref, the fast POWMAN clock and the AON timer's
+ *                   XOSC tick source
  * Named GPIO outputs:
  *   "psm-watchdog"  the watchdog reset passed on to the PSM
  *   "psm-reset"     pulsed to run the PSM's full sequence (a chip-level
@@ -67,7 +69,6 @@ enum {
 #define RP2350_POWMAN_PSM_WATCHDOG "psm-watchdog"
 #define RP2350_POWMAN_PSM_RESET "psm-reset"
 #define RP2350_POWMAN_WATCHDOG_RESET "watchdog-reset"
-#define RP2350_POWMAN_XOSC_DORMANT "xosc-dormant"
 #define RP2350_POWMAN_ALARM_WAKE "alarm-wake"
 
 /*
@@ -106,7 +107,8 @@ struct RP2350PowmanState {
     /* Properties */
     RP2350PSMState *psm;
     uint32_t lposc_hz;
-    uint32_t ref_hz;
+    /* clk_ref: the fast POWMAN clock, and the AON timer's XOSC source. */
+    Clock *clk_ref;
     uint32_t bonded_gpios;
 
     const RP2350PowmanOps *ops;
@@ -166,8 +168,6 @@ struct RP2350PowmanState {
     uint32_t aon_lpck_acc;
     /* The alarm comparison, whose rising edge sets TIMER.ALARM. */
     bool alarm_cmp;
-    /* The XOSC is stopped by DORMANT. */
-    bool xosc_dormant;
 
     uint32_t pwrup[RP2350_POWMAN_PWRUPS];
     /* Latched edges of the edge-sensitive power-up sources. */
