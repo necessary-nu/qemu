@@ -18,14 +18,19 @@
  * The sequence itself is instantaneous, so DONE shows every stage that is
  * not forced off. FRCE_ON does nothing on production devices and is only
  * stored. The resets are carried out by the SoC, through the function set
- * with rp2350_psm_set_reset_fn(). A sequence that resets a processor runs
- * in a bottom half that first pauses every vCPU, since a core can request
- * its own reset and must stop before it is reset.
+ * with rp2350_psm_set_reset_fn(). A sequence that resets a processor first
+ * pauses every vCPU, since a core can request its own reset and must stop
+ * before it is reset. Requested from a vCPU thread (a core's write, or a
+ * timer under icount), it runs there once that vCPU has left its block,
+ * before any vCPU executes on, so that under icount it happens at the
+ * same point of the instruction stream every time; otherwise it runs in a
+ * bottom half.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
+#include "hw/core/cpu.h"
 #include "hw/core/irq.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_psm.h"
@@ -77,6 +82,11 @@ static void psm_run(void *opaque)
     resume_all_vcpus();
 }
 
+static void psm_run_on_cpu(CPUState *cs, run_on_cpu_data data)
+{
+    psm_run(data.host_ptr);
+}
+
 /*
  * Run the sequence for `stages`. Device resets take effect at once, but
  * a sequence that resets a processor waits for every vCPU to pause; a
@@ -92,8 +102,11 @@ static void psm_request(RP2350PSMState *s, uint32_t stages, bool watchdog)
         psm_sequence(s);
         return;
     }
-    cpu_stop_current();
-    qemu_bh_schedule(s->bh);
+    if (current_cpu) {
+        async_run_on_cpu(current_cpu, psm_run_on_cpu, RUN_ON_CPU_HOST_PTR(s));
+    } else {
+        qemu_bh_schedule(s->bh);
+    }
 }
 
 /* [spec:nuos:req:emu.watchdog] */

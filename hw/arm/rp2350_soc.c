@@ -647,8 +647,9 @@ static void rp2350_soc_psm_reset(void *opaque, uint32_t reset, uint32_t held,
  * that code started afresh does not see a stale timeout.
  *
  * The requesting core stops at the end of its current instruction block
- * and the reset runs once every vCPU has paused, as the PSM's processor
- * resets do; the other core resumes where it was.
+ * and the reset runs once every vCPU has paused, from the requesting
+ * core's thread as the PSM's processor resets do; the other core resumes
+ * where it was.
  */
 /* [spec:nuos:req:emu.watchdog] */
 static void rp2350_soc_sysresetreq_run(void *opaque)
@@ -676,6 +677,11 @@ static void rp2350_soc_sysresetreq_run(void *opaque)
     }
 }
 
+static void rp2350_soc_sysresetreq_on_cpu(CPUState *cs, run_on_cpu_data data)
+{
+    rp2350_soc_sysresetreq_run(data.host_ptr);
+}
+
 /* [spec:nuos:req:emu.watchdog] */
 static void rp2350_soc_sysresetreq(void *opaque, int n, int level)
 {
@@ -689,8 +695,12 @@ static void rp2350_soc_sysresetreq(void *opaque, int n, int level)
         rp2350_soc_sysresetreq_run(s);
         return;
     }
-    cpu_stop_current();
-    qemu_bh_schedule(s->sysresetreq_bh);
+    if (current_cpu) {
+        async_run_on_cpu(current_cpu, rp2350_soc_sysresetreq_on_cpu,
+                         RUN_ON_CPU_HOST_PTR(s));
+    } else {
+        qemu_bh_schedule(s->sysresetreq_bh);
+    }
 }
 
 /*
