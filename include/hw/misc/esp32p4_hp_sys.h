@@ -28,12 +28,44 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4HPSysState, ESP32P4_HP_SYS)
  */
 #define ESP32P4_HP_SYS_CPU_INTR "cpu-intr-from-cpu"
 
+/*
+ * Named GPIO output ESP32P4_HP_SYS_CRYPTO_CTRL: HP_SYSTEM_CRYPTO_CTRL's
+ * four enables, ENABLE_SPI_MANUAL_ENCRYPT, ENABLE_DOWNLOAD_DB_ENCRYPT,
+ * ENABLE_DOWNLOAD_G0CB_DECRYPT and ENABLE_DOWNLOAD_MANUAL_ENCRYPT, to the
+ * MSPI controllers' "crypto-ctrl" inputs.
+ */
+#define ESP32P4_HP_SYS_CRYPTO_CTRL "crypto-ctrl"
+#define ESP32P4_HP_SYS_CRYPTO_CTRL_LINES 4
+
+/*
+ * Named GPIO output ESP32P4_HP_SYS_L2MEM_ERR_RESP: HP_SYSTEM_L2_MEM_ERR_
+ * RESP_EN, high while an access to the part of L2MEM the L2 cache occupies
+ * is answered with an error, to the cache controller.
+ */
+#define ESP32P4_HP_SYS_L2MEM_ERR_RESP "l2mem-err-resp"
+
 struct ESP32P4HPSysState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     uint32_t cpu_int_from_cpu[ESP32P4_HP_SYS_CPU_INTRS];
     qemu_irq cpu_intr[ESP32P4_HP_SYS_CPU_INTRS];
+    uint32_t crypto_ctrl;
+    qemu_irq crypto_ctrl_out[ESP32P4_HP_SYS_CRYPTO_CTRL_LINES];
+    uint32_t l2_mem_int_raw;
+    uint32_t l2_mem_int_ena;
+    uint32_t l2_mem_int_record0;
+    uint32_t l2_mem_err_resp_ctrl;
+    qemu_irq l2mem_err_resp;
+    /* HP_SYSREG_INTR, sysbus IRQ 0. */
+    qemu_irq sysreg_irq;
 };
+
+/*
+ * An access to the part of L2MEM the L2 cache occupies, at `offset` into
+ * L2MEM: the cache controller's report, which raises EXCEED_ADDR.
+ */
+void esp32p4_hp_sys_l2mem_exceed(ESP32P4HPSysState *s, uint32_t offset,
+                                 bool write);
 
 #endif

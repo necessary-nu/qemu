@@ -28,7 +28,8 @@
  *   of the valid type the accesses its R, W and X bits allow, and an
  *   address no entry matches is open. Its lock only stops the entry's
  *   registers being written. Its four attribute bits go to the cache
- *   controller and do nothing here.
+ *   controller with each access; of them the model takes the first,
+ *   non-cacheable (bit 27), below.
  *
  * Both match OFF, TOR and NAPOT. The TRM lists the NA4 encoding as
  * unsupported without saying what it does; it is kept as written (the PMA
@@ -58,6 +59,17 @@
  * An access the checks allow goes to the bus with the privilege mode it
  * is made in, MemTxAttrs.user set for user mode, as the bus carries it to
  * the blocks that check it (the interrupt matrix's secure fields).
+ *
+ * Cacheability (TRM 9.3.1, table 9.3-1): the 0x4xxxxxxx addresses (the
+ * flash and PSRAM windows, the HP ROM and L2MEM) are reached through the
+ * caches when the access is cacheable, and otherwise as at their direct
+ * addresses, 0x8xxxxxxx. An access is cacheable when a PMA entry matches
+ * it with ATTRIBUTE bit 27 clear: an address no entry matches is not, as
+ * the ROM's CPU_ATTR_Cacheable, which sets entry 15 over 0x40000000 to
+ * 0x4FFFFFFF to make them cacheable, and ESP-IDF's cpu_region_protect.c
+ * show (the ROM keeps its stack in L2MEM across its invalidation of the L1
+ * data cache, before it sets that entry). The other attribute bits,
+ * write-through and no-allocate, are not modelled.
  */
 
 #include "qemu/osdep.h"
@@ -99,6 +111,7 @@
 #define ESP32P4_PMA_W      BIT(3)
 #define ESP32P4_PMA_R      BIT(4)
 #define ESP32P4_PMA_ATTR   (0xfu << 24)
+#define ESP32P4_PMA_NONCACHEABLE BIT(27)
 #define ESP32P4_PMA_LOCK   BIT(29)
 #define ESP32P4_PMA_A_SHIFT 30
 #define ESP32P4_PMA_CFG_MASK (ESP32P4_PMA_TYPE | ESP32P4_PMA_X |          \
@@ -217,6 +230,34 @@ static int esp32p4_pma_privs(ESP32P4CPU *cpu, uint64_t addr)
     return ESP32P4_RWX;
 }
 
+/* Whether an access to addr is cacheable: see the top of the file. */
+/* [spec:nuos:req:emu.esp32p4.memory] */
+static bool esp32p4_pma_cacheable(ESP32P4CPU *cpu, uint64_t addr)
+{
+    for (int i = 0; i < ESP32P4_PMA_ENTRIES; i++) {
+        uint64_t lo, hi;
+
+        if (esp32p4_pma_region(cpu, i, &lo, &hi) &&
+            addr >= lo && addr < hi) {
+            return !(cpu->pma_cfg[i] & ESP32P4_PMA_NONCACHEABLE);
+        }
+    }
+    return false;
+}
+
+/*
+ * The address an access to addr is made at: a non-cacheable one to the
+ * addresses the caches serve, at their direct address.
+ */
+/* [spec:nuos:req:emu.esp32p4.memory] */
+static hwaddr esp32p4_phys(ESP32P4CPU *cpu, uint64_t addr)
+{
+    if ((addr >> 28) == 0x4 && !esp32p4_pma_cacheable(cpu, addr)) {
+        return addr + 0x40000000;
+    }
+    return addr;
+}
+
 /*
  * Whether a region overlaps [lo, hi), and if so whether it covers all of
  * it.
@@ -305,12 +346,13 @@ bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,
 
     if (part >= end) {
         if (esp32p4_uniform(cpu, page, page + TARGET_PAGE_SIZE, priv)) {
-            tlb_set_page_with_attrs(cs, page, page, attrs,
+            tlb_set_page_with_attrs(cs, page, esp32p4_phys(cpu, page), attrs,
                                     esp32p4_page_prot(privs), mmu_idx,
                                     TARGET_PAGE_SIZE);
         } else {
-            tlb_set_page_with_attrs(cs, address, address, attrs,
-                                    esp32p4_page_prot(privs), mmu_idx, 1);
+            tlb_set_page_with_attrs(cs, address, esp32p4_phys(cpu, address),
+                                    attrs, esp32p4_page_prot(privs), mmu_idx,
+                                    1);
         }
         return true;
     }
