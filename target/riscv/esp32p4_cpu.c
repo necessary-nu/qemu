@@ -14,9 +14,11 @@
  * extensions (Zba, Zbb, Zbc and Zbs of the v1.0.0 specification), in
  * machine and user mode, with the hardware loop extension (Xesploop),
  * Espressif's CSRs and a three-trigger debug module; the CSRs, triggers
- * and hardware loops are in tcg/esp32p4_*.c. The LP core implements
- * RV32IMAC in machine mode only. Neither type carries the CLIC, the PMA
- * checker or the PIE extension.
+ * and hardware loops are in tcg/esp32p4_*.c, as are the PMP and the PMA
+ * checker, which check every access the core makes. The LP core
+ * implements RV32IMAC in machine mode only, without PMP or PMA. The HP
+ * core takes its interrupts from its CLIC (tcg/esp32p4_clic.c). Neither
+ * type carries the PIE extension.
  *
  * misa on an HP core reads 0x40901127: RV32 with A, B, C, F, I, M, U and
  * X. The TRM's register table gives B and X but clears F, while the TRM
@@ -63,9 +65,6 @@
 #define ESP32P4_HP_MVENDORID 0x612
 #define ESP32P4_HP_MARCHID   0x80000003
 #define ESP32P4_HP_MIMPID    0x1
-
-#define ESP32P4_HP_PMP_REGIONS     32
-#define ESP32P4_HP_PMP_GRANULARITY 128
 
 /* The HP core's programmable counters: mhpmcounter8, 9 and 13. */
 #define ESP32P4_HP_PMU_MASK (BIT(8) | BIT(9) | BIT(13))
@@ -531,6 +530,7 @@ static void esp32p4_hp_reset_hold(ESP32P4CPU *cpu)
     memset(cpu->mhpmevent, 0, sizeof(cpu->mhpmevent));
     cpu->mcountinhibit_tm = false;
     esp32p4_triggers_reset(cpu);
+    esp32p4_pmp_reset(cpu);
     cpu_reset_interrupt(CPU(cpu), ESP32P4_CPU_INTERRUPT_BUS_ERROR);
     esp32p4_clic_cpu_reset(cpu);
 }
@@ -638,6 +638,10 @@ static const VMStateDescription vmstate_esp32p4_hp_state = {
         VMSTATE_UINT32_ARRAY(tdata3, ESP32P4CPU, ESP32P4_TRIGGERS),
         VMSTATE_UINT32(tcontrol, ESP32P4CPU),
         VMSTATE_UINT32(mcontext, ESP32P4CPU),
+        VMSTATE_UINT8_ARRAY(pmp_cfg, ESP32P4CPU, ESP32P4_PMP_ENTRIES),
+        VMSTATE_UINT32_ARRAY(pmp_addr, ESP32P4CPU, ESP32P4_PMP_ENTRIES),
+        VMSTATE_UINT32_ARRAY(pma_cfg, ESP32P4CPU, ESP32P4_PMA_ENTRIES),
+        VMSTATE_UINT32_ARRAY(pma_addr, ESP32P4CPU, ESP32P4_PMA_ENTRIES),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -774,6 +778,7 @@ static void esp32p4_hp_cpu_class_init(ObjectClass *oc, const void *data)
     esp32p4_hp_tcg_ops.do_transaction_failed =
         esp32p4_hp_do_transaction_failed;
     esp32p4_hp_tcg_ops.do_unaligned_access = esp32p4_hp_do_unaligned_access;
+    esp32p4_hp_tcg_ops.tlb_fill = esp32p4_hp_tlb_fill;
     esp32p4_hp_tcg_ops.debug_excp_handler = esp32p4_debug_excp_handler;
     esp32p4_hp_tcg_ops.debug_check_breakpoint =
         esp32p4_debug_check_breakpoint;
@@ -814,14 +819,12 @@ static const TypeInfo esp32p4_cpu_types[] = {
             .cfg.ext_zcmp = true,
             .cfg.ext_zcmt = true,
             .cfg.zcmp_ra_highest = true,
+            .cfg.zcmp_check_first = true,
             .cfg.ext_zba = true,
             .cfg.ext_zbb = true,
             .cfg.ext_zbc = true,
             .cfg.ext_zbs = true,
             .cfg.ext_xesploop = true,
-            .cfg.pmp = true,
-            .cfg.pmp_regions = ESP32P4_HP_PMP_REGIONS,
-            .cfg.pmp_granularity = ESP32P4_HP_PMP_GRANULARITY,
             .cfg.pmu_mask = ESP32P4_HP_PMU_MASK,
             .cfg.mvendorid = ESP32P4_HP_MVENDORID,
             .cfg.marchid = ESP32P4_HP_MARCHID,

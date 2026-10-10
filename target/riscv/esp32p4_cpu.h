@@ -41,6 +41,10 @@ OBJECT_DECLARE_TYPE(ESP32P4CPU, ESP32P4CPUClass, ESP32P4_CPU)
 #define ESP32P4_HWLP_LOOPS 2
 #define ESP32P4_TRIGGERS 3
 
+/* The HP core's PMP and PMA checker entries (TRM 2.10). */
+#define ESP32P4_PMP_ENTRIES 32
+#define ESP32P4_PMA_ENTRIES 16
+
 /* The state field of mhwloop_state_reg and mext_pie_status. */
 #define ESP32P4_EXT_OFF     0
 #define ESP32P4_EXT_INITIAL 1
@@ -226,6 +230,12 @@ struct ESP32P4CPU {
     /* The exception being raised comes from a vector table fetch. */
     bool clic_inhv_fault;
 
+    /* PMP: pmpXcfg and pmpaddrn; PMA checker: pma_cfgn and pma_addrn. */
+    uint8_t pmp_cfg[ESP32P4_PMP_ENTRIES];
+    uint32_t pmp_addr[ESP32P4_PMP_ENTRIES];
+    uint32_t pma_cfg[ESP32P4_PMA_ENTRIES];
+    uint32_t pma_addr[ESP32P4_PMA_ENTRIES];
+
     qemu_irq gpio_out_irq[ESP32P4_CPU_GPIOS];
     qemu_irq gpio_oe_irq[ESP32P4_CPU_GPIOS];
 };
@@ -308,6 +318,18 @@ RISCVException esp32p4_clic_nxti(ESP32P4CPU *cpu, int priv,
                                  target_ulong *ret_value,
                                  target_ulong new_value,
                                  target_ulong write_mask);
+
+/* esp32p4_pmp.c */
+bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,
+                         MMUAccessType access_type, int mmu_idx,
+                         bool probe, uintptr_t retaddr);
+target_ulong esp32p4_pmpcfg_read(ESP32P4CPU *cpu, int reg);
+void esp32p4_pmpcfg_write(ESP32P4CPU *cpu, int reg, target_ulong val);
+target_ulong esp32p4_pmpaddr_read(ESP32P4CPU *cpu, int n);
+void esp32p4_pmpaddr_write(ESP32P4CPU *cpu, int n, target_ulong val);
+target_ulong esp32p4_pma_read(ESP32P4CPU *cpu, int csrno);
+void esp32p4_pma_write(ESP32P4CPU *cpu, int csrno, target_ulong val);
+void esp32p4_pmp_reset(ESP32P4CPU *cpu);
 #endif
 
 #endif

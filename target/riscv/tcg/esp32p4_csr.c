@@ -17,8 +17,9 @@
  * this table.
  *
  * Absent on the HP core, and so illegal: mstatush, menvcfg, menvcfgh and
- * mconfigptr (the core follows privileged architecture 1.10), and every
- * event selector but mhpmevent8, 9 and 13. The counters other than those
+ * mconfigptr (the core follows privileged architecture 1.10), every
+ * event selector but mhpmevent8, 9 and 13, and pmpcfg8-15 and
+ * pmpaddr32-63 beyond its 32 PMP entries. The counters other than those
  * three are left out by the CPU's PMU mask.
  *
  * An access the core does not permit raises an illegal instruction
@@ -69,6 +70,8 @@
 #define CSR_ESP_STTVAL1         0xbf9
 #define CSR_ESP_STTVAL2         0xbfa
 #define CSR_ESP_TCONTROL        0x7a5
+#define CSR_ESP_PMACFG0         0xbc0
+#define CSR_ESP_PMAADDR0        0xbd0
 
 /* The CLIC's CSRs (TRM 2.5, 2.9.2.2). */
 #define CSR_ESP_USTATUS         0x000
@@ -433,6 +436,73 @@ static RISCVException write_mhpmevent(CPURISCVState *env, int csrno,
         return RISCV_EXCP_NONE;
     }
     return std_write(env, csrno, val, ra);
+}
+
+/* Memory protection */
+
+/*
+ * pmpcfg0-7 and pmpaddr0-31 are the HP core's 32 PMP entries, which
+ * esp32p4_pmp.c models; pmpcfg8-15 and pmpaddr32-63 do not exist on it.
+ */
+/* [spec:nuos:req:emu.esp32p4.pmp] */
+static RISCVException read_pmpcfg(CPURISCVState *env, int csrno,
+                                  target_ulong *val)
+{
+    if (esp32p4_env_is_hp(env)) {
+        *val = esp32p4_pmpcfg_read(esp32p4_cpu_from_env(env),
+                                   csrno - CSR_PMPCFG0);
+        return RISCV_EXCP_NONE;
+    }
+    return std_read(env, csrno, val);
+}
+
+static RISCVException write_pmpcfg(CPURISCVState *env, int csrno,
+                                   target_ulong val, uintptr_t ra)
+{
+    if (esp32p4_env_is_hp(env)) {
+        esp32p4_pmpcfg_write(esp32p4_cpu_from_env(env), csrno - CSR_PMPCFG0,
+                             val);
+        return RISCV_EXCP_NONE;
+    }
+    return std_write(env, csrno, val, ra);
+}
+
+static RISCVException read_pmpaddr(CPURISCVState *env, int csrno,
+                                   target_ulong *val)
+{
+    if (esp32p4_env_is_hp(env)) {
+        *val = esp32p4_pmpaddr_read(esp32p4_cpu_from_env(env),
+                                    csrno - CSR_PMPADDR0);
+        return RISCV_EXCP_NONE;
+    }
+    return std_read(env, csrno, val);
+}
+
+static RISCVException write_pmpaddr(CPURISCVState *env, int csrno,
+                                    target_ulong val, uintptr_t ra)
+{
+    if (esp32p4_env_is_hp(env)) {
+        esp32p4_pmpaddr_write(esp32p4_cpu_from_env(env), csrno - CSR_PMPADDR0,
+                              val);
+        return RISCV_EXCP_NONE;
+    }
+    return std_write(env, csrno, val, ra);
+}
+
+/* pma_cfg0-15 and pma_addr0-15: the HP core's PMA checker. */
+/* [spec:nuos:req:emu.esp32p4.pmp] */
+static RISCVException read_pma(CPURISCVState *env, int csrno,
+                               target_ulong *val)
+{
+    *val = esp32p4_pma_read(esp32p4_cpu_from_env(env), csrno);
+    return RISCV_EXCP_NONE;
+}
+
+static RISCVException write_pma(CPURISCVState *env, int csrno,
+                                target_ulong val, uintptr_t ra)
+{
+    esp32p4_pma_write(esp32p4_cpu_from_env(env), csrno, val);
+    return RISCV_EXCP_NONE;
 }
 
 /* Trigger module */
@@ -1250,6 +1320,22 @@ static RISCVException write_xclicbase(CPURISCVState *env, int csrno,
     HP_CSR(CSR_MCOUNTINHIBIT + (n), "mhpmevent" #n, mhpmevent_predicate, \
            read_mhpmevent, write_mhpmevent)
 
+#define PMPCFG(n) \
+    HP_CSR(CSR_PMPCFG0 + (n), "pmpcfg" #n, hp_std, read_pmpcfg, write_pmpcfg)
+#define PMPADDR(n) \
+    HP_CSR(CSR_PMPADDR0 + (n), "pmpaddr" #n, hp_std, read_pmpaddr, \
+           write_pmpaddr)
+#define PMPCFG_ABSENT(n) \
+    HP_CSR(CSR_PMPCFG0 + (n), "pmpcfg" #n, hp_absent, read_absent, \
+           write_absent)
+#define PMPADDR_ABSENT(n) \
+    HP_CSR(CSR_PMPADDR0 + (n), "pmpaddr" #n, hp_absent, read_absent, \
+           write_absent)
+#define PMACFG(n) \
+    HP_CSR(CSR_ESP_PMACFG0 + (n), "pma_cfg" #n, hp, read_pma, write_pma)
+#define PMAADDR(n) \
+    HP_CSR(CSR_ESP_PMAADDR0 + (n), "pma_addr" #n, hp, read_pma, write_pma)
+
 /* [spec:nuos:req:emu.esp32p4.cpu] */
 const RISCVCSR esp32p4_hp_csr_list[] = {
     HP_CSR(CSR_MSTATUS, "mstatus", hp_std, read_mstatus, write_mstatus),
@@ -1296,6 +1382,35 @@ const RISCVCSR esp32p4_hp_csr_list[] = {
     MHPMEVENT(21), MHPMEVENT(22), MHPMEVENT(23), MHPMEVENT(24),
     MHPMEVENT(25), MHPMEVENT(26), MHPMEVENT(27), MHPMEVENT(28),
     MHPMEVENT(29), MHPMEVENT(30), MHPMEVENT(31),
+    PMPCFG(0), PMPCFG(1), PMPCFG(2), PMPCFG(3),
+    PMPCFG(4), PMPCFG(5), PMPCFG(6), PMPCFG(7),
+    PMPCFG_ABSENT(8), PMPCFG_ABSENT(9), PMPCFG_ABSENT(10),
+    PMPCFG_ABSENT(11), PMPCFG_ABSENT(12), PMPCFG_ABSENT(13),
+    PMPCFG_ABSENT(14), PMPCFG_ABSENT(15),
+    PMPADDR(0), PMPADDR(1), PMPADDR(2), PMPADDR(3), PMPADDR(4), PMPADDR(5),
+    PMPADDR(6), PMPADDR(7), PMPADDR(8), PMPADDR(9), PMPADDR(10),
+    PMPADDR(11), PMPADDR(12), PMPADDR(13), PMPADDR(14), PMPADDR(15),
+    PMPADDR(16), PMPADDR(17), PMPADDR(18), PMPADDR(19), PMPADDR(20),
+    PMPADDR(21), PMPADDR(22), PMPADDR(23), PMPADDR(24), PMPADDR(25),
+    PMPADDR(26), PMPADDR(27), PMPADDR(28), PMPADDR(29), PMPADDR(30),
+    PMPADDR(31),
+    PMPADDR_ABSENT(32), PMPADDR_ABSENT(33), PMPADDR_ABSENT(34),
+    PMPADDR_ABSENT(35), PMPADDR_ABSENT(36), PMPADDR_ABSENT(37),
+    PMPADDR_ABSENT(38), PMPADDR_ABSENT(39), PMPADDR_ABSENT(40),
+    PMPADDR_ABSENT(41), PMPADDR_ABSENT(42), PMPADDR_ABSENT(43),
+    PMPADDR_ABSENT(44), PMPADDR_ABSENT(45), PMPADDR_ABSENT(46),
+    PMPADDR_ABSENT(47), PMPADDR_ABSENT(48), PMPADDR_ABSENT(49),
+    PMPADDR_ABSENT(50), PMPADDR_ABSENT(51), PMPADDR_ABSENT(52),
+    PMPADDR_ABSENT(53), PMPADDR_ABSENT(54), PMPADDR_ABSENT(55),
+    PMPADDR_ABSENT(56), PMPADDR_ABSENT(57), PMPADDR_ABSENT(58),
+    PMPADDR_ABSENT(59), PMPADDR_ABSENT(60), PMPADDR_ABSENT(61),
+    PMPADDR_ABSENT(62), PMPADDR_ABSENT(63),
+    PMACFG(0), PMACFG(1), PMACFG(2), PMACFG(3), PMACFG(4), PMACFG(5),
+    PMACFG(6), PMACFG(7), PMACFG(8), PMACFG(9), PMACFG(10), PMACFG(11),
+    PMACFG(12), PMACFG(13), PMACFG(14), PMACFG(15),
+    PMAADDR(0), PMAADDR(1), PMAADDR(2), PMAADDR(3), PMAADDR(4), PMAADDR(5),
+    PMAADDR(6), PMAADDR(7), PMAADDR(8), PMAADDR(9), PMAADDR(10),
+    PMAADDR(11), PMAADDR(12), PMAADDR(13), PMAADDR(14), PMAADDR(15),
     HP_CSR(CSR_TSELECT, "tselect", hp_std, read_tselect, write_tselect),
     HP_CSR(CSR_TDATA1, "tdata1", hp_std, read_tdata, write_tdata),
     HP_CSR(CSR_TDATA2, "tdata2", hp_std, read_tdata, write_tdata),
