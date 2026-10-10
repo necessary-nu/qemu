@@ -1761,7 +1761,9 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
      * The RTC I2C controller, whose lines RTCIO puts on the touch pads, and
      * the ULP coprocessor: its timer enable from RTC_CNTL and software
      * start from SENS, its WAKE to RTC_CNTL's ULP wakeup and interrupt,
-     * and REG_RD and REG_WR to the RTC peripherals on the system bus.
+     * and REG_RD and REG_WR to the RTC peripherals on the system bus. It
+     * runs on RTC_FAST_CLK, its timer and power sequencing on
+     * RTC_SLOW_CLK.
      */
     qdev_realize(DEVICE(&s->rtc_i2c), &s->rtc_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->rtc_i2c, DR_REG_RTC_I2C_BASE);
@@ -1788,6 +1790,12 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                         DEVICE(&s->rtc_i2c),
                                         ESP32_RTC_I2C_SDA_IN, 0));
     }
+    qdev_connect_clock_in(DEVICE(&s->ulp), ESP32_ULP_FAST_CLK,
+                          qdev_get_clock_out(DEVICE(&s->rtc_cntl),
+                                             ESP32_RTC_FAST_CLK));
+    qdev_connect_clock_in(DEVICE(&s->ulp), ESP32_ULP_SLOW_CLK,
+                          qdev_get_clock_out(DEVICE(&s->rtc_cntl),
+                                             ESP32_RTC_SLOW_CLK));
     object_property_set_link(OBJECT(&s->ulp), "rtc-cntl",
                              OBJECT(&s->rtc_cntl), &error_abort);
     object_property_set_link(OBJECT(&s->ulp), "sens", OBJECT(&s->sens),

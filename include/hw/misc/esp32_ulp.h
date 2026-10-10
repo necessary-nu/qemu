@@ -10,6 +10,7 @@
 #define HW_MISC_ESP32_ULP_H
 
 #include "hw/core/sysbus.h"
+#include "hw/core/clock.h"
 #include "qemu/timer.h"
 #include "system/memory.h"
 
@@ -31,6 +32,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(Esp32UlpState, ESP32_ULP)
 #define ESP32_ULP_WAKEUP        "esp32-ulp-wakeup"
 #define ESP32_ULP_INT           "esp32-ulp-int"
 
+/*
+ * Clock inputs, from RTC_CNTL:
+ * - ESP32_ULP_FAST_CLK: RTC_FAST_CLK, which times the instructions.
+ * - ESP32_ULP_SLOW_CLK: RTC_SLOW_CLK, which times the ULP timer and the
+ *   FSM's power-up and power-down.
+ */
+#define ESP32_ULP_FAST_CLK      "fast-clk"
+#define ESP32_ULP_SLOW_CLK      "slow-clk"
+
 /* The FSM's phases (TRM 1.5) */
 typedef enum Esp32UlpPhase {
     /* Halted, with its timer stopped */
@@ -40,8 +50,10 @@ typedef enum Esp32UlpPhase {
     /* Powering up, then waiting ULPCP_TOUCH_START_WAIT */
     ESP32_ULP_WAKING,
     ESP32_ULP_RUNNING,
-    /* Executed HALT; powering down */
+    /* Executed HALT, taking its RTC_FAST_CLK cycles */
     ESP32_ULP_HALTING,
+    /* Powering down after HALT */
+    ESP32_ULP_POWER_DOWN,
 } Esp32UlpPhase;
 
 #define ESP32_ULP_REGS 4
@@ -61,6 +73,8 @@ struct Esp32UlpState {
     qemu_irq wakeup;
     qemu_irq irq;
     QEMUTimer timer;
+    Clock *fast_clk;
+    Clock *slow_clk;
 
     uint32_t phase;
     bool timer_en;
@@ -76,12 +90,19 @@ struct Esp32UlpState {
     uint32_t sleep_sel;
 
     /*
-     * Execution timing: the next instruction starts run_cycles cycles of
-     * RTC_FAST_CLK, at run_hz, after run_base_ns.
+     * Execution timing (RUNNING, HALTING): the next instruction starts
+     * run_cycles cycles of RTC_FAST_CLK, at its current rate, after
+     * run_base_ns.
      */
     int64_t run_base_ns;
     uint64_t run_cycles;
-    uint32_t run_hz;
+    /*
+     * The RTC_SLOW_CLK-timed phases (SLEEP, WAKING, POWER_DOWN) end
+     * slow_left cycles of RTC_SLOW_CLK, at its current rate, after
+     * slow_base_ns.
+     */
+    int64_t slow_base_ns;
+    uint64_t slow_left;
 };
 
 #endif

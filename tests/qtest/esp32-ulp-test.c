@@ -21,7 +21,11 @@
 #define ULP_CP_SLP_TIMER_EN     (1u << 24)
 #define INT_ULP_CP              (1u << 5)
 #define FAST_CLK_RTC_SEL_8M     (1u << 29)
+#define ANA_CLK_RTC_SEL_MASK    (3u << 30)
+#define ANA_CLK_RTC_SEL(v)      ((v) << 30)
 #define CK8M_DIV_SEL_MASK       (7u << 12)
+#define CK8M_DIV_SEL(v)         ((v) << 12)
+#define ENB_CK8M                (1u << 6)
 #define START_WAIT(v)           ((v) << 15)
 #define START_WAIT_MASK         (0x1ffu << 15)
 
@@ -149,6 +153,14 @@
 #define MS                      (1000 * US)
 /* RTC_FAST_CLK at 8 MHz */
 #define FAST_NS                 125
+/* RTC_FAST_CLK from XTAL_CLK / 4, 10 MHz */
+#define XTAL_D4_NS              100
+/* Cycles of the 150 kHz RC_SLOW_CLK, in whole nanoseconds */
+#define SLOW_NS(n)              ((n) * (uint64_t)(1000 * MS) / 150000)
+/* RTC_SLOW_CLK from 8MD256: RC_FAST_CLK / 256, 31.25 kHz */
+#define D256_NS                 32000
+/* RC_FAST_CLK's start-up: CK8M_WAIT's reset value 16 of RC_SLOW_CLK */
+#define CK8M_START_NS           SLOW_NS(16)
 
 static QTestState *start(void)
 {
@@ -193,6 +205,35 @@ static void run(QTestState *qts, unsigned pc)
     wr(qts, START_FORCE, START_FORCE_RESET | PC_INIT(pc) | FORCE_START_TOP);
     wr(qts, START_FORCE, START_FORCE_RESET | PC_INIT(pc) | FORCE_START_TOP |
        START_TOP);
+}
+
+static void clk_conf(QTestState *qts, uint32_t clear, uint32_t set)
+{
+    wr(qts, CLK_CONF, (rd(qts, CLK_CONF) & ~clear) | set);
+}
+
+/*
+ * Start the ULP at pc with START_WAIT 0; returns when it runs: 2
+ * RTC_SLOW_CLK cycles on.
+ */
+static uint64_t run_now(QTestState *qts, unsigned pc)
+{
+    uint64_t t;
+
+    wr(qts, TIMER2, rd(qts, TIMER2) & ~START_WAIT_MASK);
+    t = qtest_clock_step(qts, 1);
+    run(qts, pc);
+    return t + SLOW_NS(2);
+}
+
+/* RTC slow memory's word holds v from at on, and not 1 ns before */
+static void assert_lands(QTestState *qts, uint64_t at, unsigned word,
+                         uint32_t v)
+{
+    qtest_clock_set(qts, at - 1);
+    g_assert_cmphex(mem(qts, word), ==, 0);
+    qtest_clock_set(qts, at);
+    g_assert_cmphex(mem(qts, word), ==, v);
 }
 
 static void set_sens_prop(QTestState *qts, const char *prop, int64_t value)
@@ -619,6 +660,150 @@ static void test_jump_register(void)
     qtest_quit(qts);
 }
 
+/* A WAIT, then an ST whose time shows how the WAIT was counted */
+static const uint32_t wait_prog[] = {
+    /* 0 */ I_MOVI(2, DATA),
+    /* 1 */ I_WAIT(7990),
+    /* 2 */ I_ST(2, 2, 0),
+    /* 3 */ I_HALT(),
+};
+/* The ST starts after MOVE (6 cycles) and WAIT (2 + 7990 + 4) */
+#define WAIT_PROG_CYCLES        (6 + 2 + 7990 + 4)
+#define WAIT_PROG_ST            ((2u << 21) | (2u << 16) | DATA)
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp/test]
+ * [spec:nuos:req:emu.esp32.clock-gating/test]
+ * RTC_FAST_CLK switched from RC_FAST_CLK (8 MHz) to XTAL_CLK / 4 (10 MHz)
+ * in the middle of a WAIT: the cycles made at 8 MHz stand, the rest go at
+ * 10 MHz.
+ */
+static void test_fast_clk_switch_mid_wait(void)
+{
+    QTestState *qts = start();
+    uint64_t t0, sw;
+
+    load(qts, 0, wait_prog, ARRAY_SIZE(wait_prog));
+    wr(qts, RTC_SLOW_MEM + 4 * DATA, 0);
+    t0 = run_now(qts, 0);
+    sw = t0 + 4002 * FAST_NS;
+    qtest_clock_set(qts, sw);
+    clk_conf(qts, FAST_CLK_RTC_SEL_8M, 0);
+    assert_lands(qts, sw + (WAIT_PROG_CYCLES - 4002) * XTAL_D4_NS, DATA,
+                 WAIT_PROG_ST);
+    qtest_quit(qts);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp/test]
+ * [spec:nuos:req:emu.esp32.clock-gating/test]
+ * RC_FAST_CLK powered down (ENB_CK8M) in the middle of a run: the ULP
+ * holds, past the time its ST would have come, and goes on with the cycles
+ * it had left once the oscillator is powered again and has started up.
+ */
+static void test_rc_fast_stopped_mid_run(void)
+{
+    QTestState *qts = start();
+    uint64_t t0, on;
+
+    load(qts, 0, wait_prog, ARRAY_SIZE(wait_prog));
+    wr(qts, RTC_SLOW_MEM + 4 * DATA, 0);
+    t0 = run_now(qts, 0);
+    qtest_clock_set(qts, t0 + 4002 * FAST_NS);
+    clk_conf(qts, 0, ENB_CK8M);
+    on = t0 + 2 * MS;
+    qtest_clock_set(qts, on);
+    g_assert_cmphex(mem(qts, DATA), ==, 0);
+    clk_conf(qts, ENB_CK8M, 0);
+    assert_lands(qts, on + CK8M_START_NS +
+                 (WAIT_PROG_CYCLES - 4002) * FAST_NS, DATA, WAIT_PROG_ST);
+    qtest_quit(qts);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp/test]
+ * [spec:nuos:req:emu.esp32.clock-gating/test]
+ * CK8M_DIV_SEL changed from 0 to 1, RTC_FAST_CLK from 8 to 4 MHz: by
+ * software in the middle of a TSENS's wait, and by the ULP itself with a
+ * REG_WR, whose own cycles and the instructions after it go at 4 MHz.
+ */
+static void test_fast_clk_divider(void)
+{
+    QTestState *qts = start();
+    const uint32_t tsens[] = {
+        /* 0 */ I_MOVI(2, DATA),
+        /* 1 */ I_TSENS(1, 4000),
+        /* 2 */ I_ST(2, 2, 0),
+        /* 3 */ I_HALT(),
+    };
+    const uint32_t self[] = {
+        /* 16 */ I_MOVI(2, DATA + 1),
+        /* 17 */ I_REG_WR(CLK_CONF, 14, 12, 1),
+        /* 18 */ I_WAIT(1000),
+        /* 19 */ I_ST(2, 2, 0),
+        /* 20 */ I_HALT(),
+    };
+    /* TSENS takes 2 + XPD_WAIT (2 at reset) + its wait, then the fetch */
+    uint32_t tsens_cycles = 2 + (rd(qts, TSENS_CTRL) & 0xfff) + 4000 + 4;
+    uint64_t t0, sw;
+
+    load(qts, 0, tsens, ARRAY_SIZE(tsens));
+    load(qts, 16, self, ARRAY_SIZE(self));
+    wr(qts, RTC_SLOW_MEM + 4 * DATA, 0);
+    wr(qts, RTC_SLOW_MEM + 4 * (DATA + 1), 0);
+
+    t0 = run_now(qts, 0);
+    sw = t0 + (6 + 2000) * FAST_NS;
+    qtest_clock_set(qts, sw);
+    clk_conf(qts, CK8M_DIV_SEL_MASK, CK8M_DIV_SEL(1));
+    assert_lands(qts, sw + (tsens_cycles - 2000) * 2 * FAST_NS, DATA,
+                 (2u << 21) | (2u << 16) | DATA);
+    qtest_clock_step(qts, 1 * MS);
+
+    clk_conf(qts, CK8M_DIV_SEL_MASK, 0);
+    t0 = run_now(qts, 16);
+    /* MOVE at 8 MHz; REG_WR (8 + 4) and WAIT (2 + 1000 + 4) at 4 MHz */
+    assert_lands(qts, t0 + 6 * FAST_NS + (12 + 1006) * 2 * FAST_NS,
+                 DATA + 1, (19u << 21) | (2u << 16) | (DATA + 1));
+    g_assert_cmphex(rd(qts, CLK_CONF) & CK8M_DIV_SEL_MASK, ==,
+                    CK8M_DIV_SEL(1));
+    qtest_quit(qts);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp/test]
+ * [spec:nuos:req:emu.esp32.clock-gating/test]
+ * The ULP's start-up wait on RTC_SLOW_CLK (2 + START_WAIT cycles): 60 of
+ * its 102 cycles at RC_SLOW_CLK's 150 kHz, a hold while RTC_SLOW_CLK is
+ * XTAL32K_CLK with no crystal (stopped), and the other 42 at 8MD256's
+ * 31.25 kHz.
+ */
+static void test_slow_clk_start_wait(void)
+{
+    QTestState *qts = start();
+    const uint32_t prog[] = {
+        I_MOVI(2, DATA),
+        I_ST(2, 2, 0),
+        I_HALT(),
+    };
+    uint64_t t0, on;
+
+    load(qts, 0, prog, ARRAY_SIZE(prog));
+    wr(qts, RTC_SLOW_MEM + 4 * DATA, 0);
+    wr(qts, TIMER2, (rd(qts, TIMER2) & ~START_WAIT_MASK) | START_WAIT(100));
+    t0 = qtest_clock_step(qts, 1);
+    run(qts, 0);
+    qtest_clock_set(qts, t0 + SLOW_NS(60) + 1);
+    clk_conf(qts, ANA_CLK_RTC_SEL_MASK, ANA_CLK_RTC_SEL(1));
+    on = t0 + 5 * MS;
+    qtest_clock_set(qts, on);
+    g_assert_cmphex(mem(qts, DATA), ==, 0);
+    clk_conf(qts, ANA_CLK_RTC_SEL_MASK, ANA_CLK_RTC_SEL(2));
+    assert_lands(qts, on + 42 * D256_NS + 6 * FAST_NS, DATA,
+                 (1u << 21) | (2u << 16) | DATA);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -631,5 +816,12 @@ int main(int argc, char **argv)
     qtest_add_func("esp32/ulp/adc", test_adc);
     qtest_add_func("esp32/ulp/tsens", test_tsens);
     qtest_add_func("esp32/ulp/i2c", test_i2c);
+    qtest_add_func("esp32/ulp/fast-clk-switch-mid-wait",
+                   test_fast_clk_switch_mid_wait);
+    qtest_add_func("esp32/ulp/rc-fast-stopped-mid-run",
+                   test_rc_fast_stopped_mid_run);
+    qtest_add_func("esp32/ulp/fast-clk-divider", test_fast_clk_divider);
+    qtest_add_func("esp32/ulp/slow-clk-start-wait",
+                   test_slow_clk_start_wait);
     return g_test_run();
 }
