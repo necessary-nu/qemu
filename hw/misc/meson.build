@@ -222,6 +222,8 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
 ))
 
 system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
-  'esp32p4_hp_sys_clkrst.c',
+  'esp32p4_ana.c',
+  'esp32p4_clkrst.c',
+  'esp32p4_i2c_ana_mst.c',
   'esp32p4_lp_sys.c',
 ))

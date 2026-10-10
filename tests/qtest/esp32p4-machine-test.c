@@ -270,7 +270,13 @@ static void test_unimplemented(void)
     assert_mtree_has(qts, "000000005012f000-000000005012ffff "
                           "(prio 0, i/o): esp32p4.lp-tsens");
     assert_mtree_has(qts, "00000000500e6000-00000000500e6fff "
-                          "(prio 0, i/o): esp32p4-hp-sys-clkrst");
+                          "(prio 0, i/o): esp32p4.hp-sys-clkrst");
+    assert_mtree_has(qts, "0000000050111000-0000000050111fff "
+                          "(prio 0, i/o): esp32p4.lp-clkrst");
+    assert_mtree_has(qts, "0000000050120000-0000000050120fff "
+                          "(prio 0, i/o): esp32p4.lp-peri");
+    assert_mtree_has(qts, "0000000050124000-0000000050124fff "
+                          "(prio 0, i/o): esp32p4.lp-i2c-ana-mst");
     assert_mtree_has(qts, "0000000050110000-0000000050110fff "
                           "(prio 0, i/o): esp32p4-lp-sys");
 
@@ -282,13 +288,13 @@ static void test_unimplemented(void)
     /* An access to a block with no model is logged as unimplemented. */
     g_assert_cmphex(qtest_readl(qts, 0x500ca000), ==, 0);
     qtest_writel(qts, 0x500c2000, 1);
-    g_assert_cmphex(qtest_readl(qts, 0x500e6000), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, 0x50110000), ==, 0);
     qtest_quit(qts);
 
     g_assert(g_file_get_contents(log, &text, NULL, NULL));
     g_assert(strstr(text, "esp32p4.uart0: unimplemented device read"));
     g_assert(strstr(text, "esp32p4.timg0: unimplemented device write"));
-    g_assert(strstr(text, "esp32p4-hp-sys-clkrst: unimplemented read"));
+    g_assert(strstr(text, "esp32p4-lp-sys: unimplemented read"));
     g_assert(strstr(text, "LP ROM's contents are not published"));
     unlink(log);
 }

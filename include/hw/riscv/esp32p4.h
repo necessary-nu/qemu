@@ -13,7 +13,9 @@
 #include "hw/core/boards.h"
 #include "hw/cpu/cluster.h"
 #include "hw/ssi/ssi.h"
-#include "hw/misc/esp32p4_hp_sys_clkrst.h"
+#include "hw/misc/esp32p4_ana.h"
+#include "hw/misc/esp32p4_clkrst.h"
+#include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "system/memory.h"
@@ -54,6 +56,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 
 #define ESP32P4_HP_SYS_CLKRST_BASE  0x500e6000
 #define ESP32P4_LP_SYS_BASE         0x50110000
+#define ESP32P4_LP_CLKRST_BASE      0x50111000
+#define ESP32P4_LPPERI_BASE         0x50120000
+#define ESP32P4_I2C_ANA_MST_BASE    0x50124000
 #define ESP32P4_EFUSE_BASE          0x5012d000
 
 /* Where each core starts from reset. */
@@ -78,8 +83,14 @@ struct ESP32P4MachineState {
     MemoryRegion lp_sram;
     MemoryRegion psram;
 
-    ESP32P4HPSysClkRstState hp_sys_clkrst;
+    ESP32P4ClkRstState clkrst;
+    ESP32P4AnaState ana;
+    ESP32P4I2CAnaMstState i2c_ana_mst;
     ESP32P4LPSysState lp_sys;
+    /* The HP cores' reset vector inputs from LP_CLKRST_*_STAT_VECTOR_SEL. */
+    qemu_irq *core_vector;
+    /* The entry point of the -kernel ELF, which core 0 starts at; or 0. */
+    uint64_t kernel_entry;
     ESP32P4EfuseState efuse;
 
     SSIBus *flash_bus;

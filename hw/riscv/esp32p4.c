@@ -19,10 +19,13 @@
  *     The HP cores start at the HP ROM, 0x4FC00000, where
  *     LP_CLKRST_HPCORE<n>_STAT_VECTOR_SEL points them out of reset (TRM
  *     section 11.1.3 gives 0x30100000, which the register's description,
- *     ESP-IDF and the ROM's own entry point contradict); core 1 is held in
- *     reset with its clock gated until software releases it through
- *     HP_SYS_CLKRST. The LP core, which starts at the LP ROM, is held in
- *     reset: the PMU, which starts it, is not modelled.
+ *     ESP-IDF and the ROM's own entry point contradict), or at LP SRAM
+ *     once software clears it; core 1 is held in reset with its clock
+ *     gated until software releases it through HP_SYS_CLKRST. The LP core,
+ *     which starts at the LP ROM, is held in reset: the PMU, which starts
+ *     it, is not modelled. Each core executes at the clock that drives it,
+ *     the HP cores at CPU_CLK and the LP core at LP_DYN_FAST_CLK, and
+ *     under icount an instruction takes a cycle of it.
  *   - The HP ROM (128 KiB) at 0x4FC00000, and at 0x8FC00000 for direct
  *     access; HP L2MEM (768 KiB) at 0x4FF00000, and at 0x8FF00000 for
  *     direct access; the HP TCM (8 KiB) at 0x30100000; the LP ROM (16 KiB)
@@ -36,14 +39,20 @@
  *     the flash a W25Q part on the bus of the flash MSPI controllers; as
  *     nothing maps them, and the controllers are not modelled either, the
  *     cores cannot reach them.
- *   - Every peripheral block the chip decodes, as an unimplemented device
- *     named after the block, except HP_SYS_CLKRST and LP_SYS, which model
- *     the registers that start core 1 and log the rest of their registers
- *     as unimplemented. Addresses the chip does not decode, the reserved
- *     ranges of TRM table 9.3-1 and the unassigned slots between blocks,
- *     answer with a bus error, which the cores take as an access fault.
- *   - The eFuse controller and its array, which are modelled; nothing
- *     takes its interrupt, as the interrupt matrix is not.
+ *   - The reset and clock control, HP_SYS_CLKRST, LP_AON_CLKRST and
+ *     LPPERI, with the clock tree from the crystal, the RC oscillators and
+ *     the PLLs to every block's clocks, and the analog I2C controller
+ *     through which software configures the PLLs; and LP_SYS's
+ *     BOOT_ADDR_HP_CORE1, the rest of whose registers are logged as
+ *     unimplemented.
+ *   - The eFuse controller and its array, on its clock and reset from
+ *     LPPERI; nothing takes its interrupt, as the interrupt matrix is not
+ *     modelled.
+ *   - Every other peripheral block the chip decodes, as an unimplemented
+ *     device named after the block. Addresses the chip does not decode,
+ *     the reserved ranges of TRM table 9.3-1 and the unassigned slots
+ *     between blocks, answer with a bus error, which the cores take as an
+ *     access fault.
  *   - The CLINT and CLIC address ranges of the HP cores, also as
  *     unimplemented devices: the cores have no interrupt controller.
  *
@@ -80,7 +89,9 @@
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "elf.h"
+#include "exec/icount.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/unimp.h"
@@ -211,7 +222,6 @@ static const struct {
     { "mipi-dsi-mem",     0x50105000, 4 * KiB },
 
     /* LP always-on peripherals. */
-    { "lp-clkrst",        0x50111000, 4 * KiB },
     { "lp-timer",         0x50112000, 4 * KiB },
     { "lp-analog-peri",   0x50113000, 4 * KiB },
     { "lp-huk",           0x50114000, 4 * KiB },
@@ -221,11 +231,9 @@ static const struct {
     { "rtc-cali",         0x50119000, 4 * KiB },
 
     /* LP peripherals. */
-    { "lp-peri",          0x50120000, 4 * KiB },
     { "lp-uart",          0x50121000, 4 * KiB },
     { "lp-i2c",           0x50122000, 4 * KiB },
     { "lp-spi",           0x50123000, 4 * KiB },
-    { "lp-i2c-ana-mst",   0x50124000, 4 * KiB },
     { "lp-i2s",           0x50125000, 4 * KiB },
     { "lp-trng",          0x50126000, 4 * KiB },
     { "lp-adc",           0x50127000, 4 * KiB },
@@ -391,37 +399,114 @@ static void esp32p4_init_cpus(ESP32P4MachineState *s)
     qdev_realize(DEVICE(&s->lp_cpu), NULL, &error_fatal);
     qemu_register_resettable(OBJECT(&s->lp_cpu));
     qdev_realize(DEVICE(&s->lp_cluster), NULL, &error_fatal);
-
-    /* The PMU, which releases the LP core, is not modelled. */
-    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->lp_cpu),
-                                        ESP32P4_CPU_RESET, 0), 1);
 }
 
 /*
- * The registers that release core 1: its clock gate and reset in
- * HP_SYS_CLKRST, and the entry point the ROM on core 1 takes from LP_SYS.
+ * LP_CLKRST_HPCORE<n>_STAT_VECTOR_SEL: the HP ROM, where core 0 with
+ * -kernel starts at the ELF's entry point instead, or LP SRAM.
+ */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+static void esp32p4_core_vector(void *opaque, int n, int level)
+{
+    ESP32P4MachineState *s = opaque;
+    uint64_t vector = ESP32P4_LP_SRAM_BASE;
+
+    if (level) {
+        vector = n == 0 && s->kernel_entry ? s->kernel_entry
+                                           : ESP32P4_HP_RESET_VECTOR;
+    }
+    s->hp_cpu[n].parent_obj.env.resetvec = vector;
+}
+
+/*
+ * The reset and clock control and the analog blocks it takes the PLLs
+ * from, through the analog I2C controller; the cores' resets, clock
+ * enables and reset vectors; and the clocks each core executes at. The
+ * entry point the ROM on core 1 takes comes from LP_SYS.
  */
 /* [spec:nuos:req:emu.esp32p4.machine] */
-static void esp32p4_init_core_release(ESP32P4MachineState *s)
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+static void esp32p4_init_clocks(ESP32P4MachineState *s)
 {
-    DeviceState *clkrst;
+    DeviceState *clkrst, *ana, *mst;
     int i;
 
-    object_initialize_child(OBJECT(s), "hp-sys-clkrst", &s->hp_sys_clkrst,
-                            TYPE_ESP32P4_HP_SYS_CLKRST);
-    clkrst = DEVICE(&s->hp_sys_clkrst);
+    object_initialize_child(OBJECT(s), "ana", &s->ana, TYPE_ESP32P4_ANA);
+    object_initialize_child(OBJECT(s), "clkrst", &s->clkrst,
+                            TYPE_ESP32P4_CLKRST);
+    object_initialize_child(OBJECT(s), "lp-i2c-ana-mst", &s->i2c_ana_mst,
+                            TYPE_ESP32P4_I2C_ANA_MST);
+    ana = DEVICE(&s->ana);
+    clkrst = DEVICE(&s->clkrst);
+    mst = DEVICE(&s->i2c_ana_mst);
+
+    qdev_connect_clock_in(ana, "xtal", qdev_get_clock_out(clkrst,
+                                                          "osc-xtal"));
+    for (i = 0; i < ESP32P4_ANA_NUM_PLLS; i++) {
+        g_autofree char *in = g_strdup_printf("%s-in",
+                                              esp32p4_ana_pll_names[i]);
+
+        qdev_connect_clock_in(clkrst, in,
+                              qdev_get_clock_out(ana,
+                                                 esp32p4_ana_pll_names[i]));
+    }
+    sysbus_realize(SYS_BUS_DEVICE(ana), &error_fatal);
     sysbus_realize(SYS_BUS_DEVICE(clkrst), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(clkrst), 0, ESP32P4_HP_SYS_CLKRST_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(clkrst), ESP32P4_CLKRST_MMIO_HP,
+                    ESP32P4_HP_SYS_CLKRST_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(clkrst), ESP32P4_CLKRST_MMIO_LP,
+                    ESP32P4_LP_CLKRST_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(clkrst), ESP32P4_CLKRST_MMIO_LPPERI,
+                    ESP32P4_LPPERI_BASE);
+    for (i = 0; i < ESP32P4_ANA_NUM_PLLS; i++) {
+        qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_PLL_CAL_STOP, i,
+                                    qdev_get_gpio_in_named(ana,
+                                        ESP32P4_ANA_CAL_STOP, i));
+        qdev_connect_gpio_out_named(ana, ESP32P4_ANA_CAL_END, i,
+                                    qdev_get_gpio_in_named(clkrst,
+                                        ESP32P4_CLKRST_PLL_CAL_END, i));
+    }
+
+    object_property_set_link(OBJECT(mst), "ana", OBJECT(ana), &error_abort);
+    qdev_connect_clock_in(mst, "bus", qdev_get_clock_out(clkrst,
+                                                         "lp-i2cmst"));
+    qdev_connect_clock_in(mst, "lp-fast", qdev_get_clock_out(clkrst,
+                                                             "lp-fast"));
+    qdev_connect_clock_in(mst, "pll-f160m", qdev_get_clock_out(clkrst,
+                                                               "pll-f160m"));
+    sysbus_realize(SYS_BUS_DEVICE(mst), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(mst), 0,
+                             ESP32P4_I2C_ANA_MST_BASE, ESP32P4_CLK_LP_I2CMST,
+                             ESP32P4_RST_LP_I2CMST, 0);
+
+    s->core_vector = qemu_allocate_irqs(esp32p4_core_vector, s,
+                                        ESP32P4_HP_CORES);
     for (i = 0; i < ESP32P4_HP_CORES; i++) {
         DeviceState *cpu = DEVICE(&s->hp_cpu[i]);
+        g_autofree char *clk = g_strdup_printf("core%d-cpu", i);
 
-        qdev_connect_gpio_out_named(clkrst, ESP32P4_HP_SYS_CLKRST_CORE_RESET,
-                                    i, qdev_get_gpio_in_named(cpu,
+        qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_CORE_RESET, i,
+                                    qdev_get_gpio_in_named(cpu,
                                         ESP32P4_CPU_RESET, 0));
-        qdev_connect_gpio_out_named(clkrst, ESP32P4_HP_SYS_CLKRST_CORE_CLOCK,
-                                    i, qdev_get_gpio_in_named(cpu,
+        qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_CORE_CLOCK, i,
+                                    qdev_get_gpio_in_named(cpu,
                                         ESP32P4_CPU_CLOCK, 0));
+        qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_CORE_VECTOR, i,
+                                    s->core_vector[i]);
+        /*
+         * Under icount a core executes an instruction per cycle of its
+         * CPU_CLK, at its current frequency, alongside the other cores.
+         */
+        icount_set_cpu_clock(CPU(cpu), qdev_get_clock_out(clkrst, clk));
     }
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_LP_CORE_RESET, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->lp_cpu),
+                                    ESP32P4_CPU_RESET, 0));
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_LP_CORE_CLOCK, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->lp_cpu),
+                                    ESP32P4_CPU_CLOCK, 0));
+    icount_set_cpu_clock(CPU(&s->lp_cpu), qdev_get_clock_out(clkrst,
+                                                             "lp-core"));
 
     object_initialize_child(OBJECT(s), "lp-sys", &s->lp_sys,
                             TYPE_ESP32P4_LP_SYS);
@@ -430,16 +515,28 @@ static void esp32p4_init_core_release(ESP32P4MachineState *s)
 }
 
 /*
- * The eFuse controller. Its interrupt, LP_EFUSE_INTR (source 17 of TRM
+ * The eFuse controller, on its clock and reset from LPPERI, its registers
+ * behind its bus clock. Its interrupt, LP_EFUSE_INTR (source 17 of TRM
  * table 13.4-1), goes to the interrupt matrix, which is not modelled.
  */
 /* [spec:nuos:req:emu.esp32p4.efuse] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
 static void esp32p4_init_efuse(ESP32P4MachineState *s)
 {
+    DeviceState *efuse, *clkrst = DEVICE(&s->clkrst);
+
     object_initialize_child(OBJECT(s), "efuse", &s->efuse,
                             TYPE_ESP32P4_EFUSE);
-    sysbus_realize(SYS_BUS_DEVICE(&s->efuse), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(&s->efuse), 0, ESP32P4_EFUSE_BASE);
+    efuse = DEVICE(&s->efuse);
+    qdev_connect_clock_in(efuse, "clk", qdev_get_clock_out(clkrst, "efuse"));
+    sysbus_realize(SYS_BUS_DEVICE(efuse), &error_fatal);
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_LP_EFUSE,
+                                qdev_get_gpio_in_named(efuse,
+                                    ESP32P4_EFUSE_RESET, 0));
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(efuse), 0,
+                             ESP32P4_EFUSE_BASE, ESP32P4_CLK_LP_EFUSE,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
 }
 
 /* The memories -kernel can load into: those the cores address directly. */
@@ -546,6 +643,7 @@ static void esp32p4_load(ESP32P4MachineState *s)
                      machine->kernel_filename);
         exit(1);
     }
+    s->kernel_entry = entry;
     s->hp_cpu[0].parent_obj.env.resetvec = entry;
 }
 
@@ -568,7 +666,7 @@ static void esp32p4_init(MachineState *machine)
 
     esp32p4_init_memory(s);
     esp32p4_init_cpus(s);
-    esp32p4_init_core_release(s);
+    esp32p4_init_clocks(s);
     esp32p4_init_efuse(s);
     esp32p4_init_flash(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
