@@ -120,8 +120,16 @@ static unsigned pl022_frame_bits(PL022State *s)
     }
 }
 
-/* Frames are timed only with SSPCLK connected and running. */
+/*
+ * Frames are timed only with SSPCLK connected. Connected but stopped, it
+ * holds a frame on the wire and starts none.
+ */
 static bool pl022_timed(PL022State *s)
+{
+    return clock_has_source(s->clk);
+}
+
+static bool pl022_clocked(PL022State *s)
 {
     return clock_get(s->clk) != 0;
 }
@@ -216,7 +224,7 @@ static void pl022_update(PL022State *s)
 /* Restart the receive timeout after receive FIFO activity. */
 static void pl022_rt_restart(PL022State *s)
 {
-    if (s->rx_fifo_len && pl022_timed(s)) {
+    if (s->rx_fifo_len && pl022_timed(s) && pl022_clocked(s)) {
         timer_mod(s->rt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   pl022_ns(s, PL022_RT_BITS));
     } else {
@@ -311,14 +319,19 @@ static void pl022_end_frame(PL022State *s)
 
 /*
  * A master transmits while it is enabled and its transmit FIFO holds
- * data, the next frame starting at virtual time `start`. Without SSPCLK,
- * frames complete at once, and the transmitter stalls while the receive
- * FIFO is full rather than lose data.
+ * data, the next frame starting at virtual time `start`, while SSPCLK
+ * runs. With no SSPCLK connected, frames complete at once, and the
+ * transmitter stalls while the receive FIFO is full rather than lose
+ * data.
  */
 static void pl022_xfer_at(PL022State *s, int64_t start)
 {
     bool timed = pl022_timed(s);
 
+    if (timed && !pl022_clocked(s)) {
+        pl022_update(s);
+        return;
+    }
     while (pl022_enabled(s) && !pl022_slave(s) && !s->busy &&
            s->tx_fifo_len &&
            (timed || s->rx_fifo_len < PL022_FIFO_DEPTH)) {
@@ -559,6 +572,7 @@ static void pl022_reset_hold(Object *obj, ResetType type)
     s->rx_fifo_head = 0;
     s->tx_fifo_head = 0;
     s->busy = false;
+    s->frame_left = 0;
     s->shift = 0;
     s->im = 0;
     s->is = PL022_INT_TX;
@@ -600,7 +614,7 @@ static int pl022_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_pl022 = {
     .name = "pl022_ssp",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = pl022_post_load,
     .fields = (const VMStateField[]) {
@@ -639,16 +653,48 @@ static const VMStateDescription vmstate_pl022 = {
         VMSTATE_TIMER_PTR_V(frame_timer, PL022State, 2),
         VMSTATE_TIMER_PTR_V(rt_timer, PL022State, 2),
         VMSTATE_CLOCK_V(clk, PL022State, 2),
+        VMSTATE_UINT64_V(frame_left, PL022State, 3),
         VMSTATE_END_OF_LIST()
     }
 };
+
+/*
+ * SSPCLK changes rate, stops or starts: the frame on the wire keeps the
+ * cycles it has left, held while the clock is stopped, and once the clock
+ * runs the transmitter carries on.
+ */
+static void pl022_clk_update(void *opaque, ClockEvent event)
+{
+    PL022State *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (event == ClockPreUpdate) {
+        if (s->busy && timer_pending(s->frame_timer)) {
+            s->frame_left = clock_ns_to_ticks(s->clk,
+                                              MAX(s->frame_end - now, 0));
+            timer_del(s->frame_timer);
+        }
+        timer_del(s->rt_timer);
+        return;
+    }
+    if (!pl022_clocked(s)) {
+        return;
+    }
+    if (s->busy && !timer_pending(s->frame_timer)) {
+        s->frame_end = now + clock_ticks_to_ns(s->clk, s->frame_left);
+        timer_mod(s->frame_timer, s->frame_end);
+    }
+    pl022_rt_restart(s);
+    pl022_xfer(s);
+}
 
 static void pl022_init(Object *obj)
 {
     PL022State *s = PL022(obj);
     DeviceState *dev = DEVICE(obj);
 
-    s->clk = qdev_init_clock_in(dev, "clk", NULL, NULL, 0);
+    s->clk = qdev_init_clock_in(dev, "clk", pl022_clk_update, s,
+                                ClockPreUpdate | ClockUpdate);
     s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pl022_frame_done, s);
     s->rt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pl022_rt_expired, s);
     qdev_init_gpio_out_named(dev, s->dma_req, PL022_DMA_REQ,

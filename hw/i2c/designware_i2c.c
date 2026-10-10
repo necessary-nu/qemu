@@ -417,6 +417,46 @@ static int64_t dw_cycles_ns(DesignWareI2CState *s, uint64_t cycles)
     return cycles * DEFAULT_IC_CLK_NS;
 }
 
+/*
+ * Arm the timer `cycles` ic_clk cycles from now. A connected ic_clk that
+ * is stopped holds them until it runs again.
+ */
+static void dw_timer_in(DesignWareI2CState *s, uint64_t cycles)
+{
+    if (clock_has_source(s->clk) && !clock_get(s->clk)) {
+        timer_del(s->timer);
+        s->timer_held = true;
+        s->held_cycles = cycles;
+        return;
+    }
+    s->timer_held = false;
+    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                        dw_cycles_ns(s, cycles));
+}
+
+/*
+ * ic_clk changes rate, stops or starts: the timer keeps the cycles it
+ * has left, held while the clock is stopped.
+ */
+static void dw_clk_update(void *opaque, ClockEvent event)
+{
+    DesignWareI2CState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (event == ClockPreUpdate) {
+        if (clock_get(s->clk) && timer_pending(s->timer)) {
+            s->timer_held = true;
+            s->held_cycles = clock_ns_to_ticks(s->clk,
+                MAX(timer_expire_time_ns(s->timer) - now, 0));
+            timer_del(s->timer);
+        }
+        return;
+    }
+    if (clock_get(s->clk) && s->timer_held) {
+        dw_timer_in(s, s->held_cycles);
+    }
+}
+
 /* Target logic. */
 
 /*
@@ -757,7 +797,6 @@ static void dw_mst_begin_step(DesignWareI2CState *s)
     bool start = step == DW_I2C_STEP_SBYTE || step == DW_I2C_STEP_ADDR ||
                  step == DW_I2C_STEP_ADDR_R;
     bool read = s->mst_cmd & DATA_CMD_CMD;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (step == DW_I2C_STEP_DATA && read && rx_count(s) == FIFO_DEPTH &&
         (s->con & CON_RX_FIFO_FULL_HLD_CTRL)) {
@@ -773,7 +812,7 @@ static void dw_mst_begin_step(DesignWareI2CState *s)
         }
         if (i2c_bus_busy(s->bus)) {
             s->mst_polling = true;
-            timer_mod(s->timer, now + dw_cycles_ns(s, dw_bit_cycles(s)));
+            dw_timer_in(s, dw_bit_cycles(s));
             return;
         }
     } else if (!s->scl_in) {
@@ -792,7 +831,7 @@ static void dw_mst_begin_step(DesignWareI2CState *s)
         s->raw_intr |= INTR_START_DET | INTR_ACTIVITY;
     }
     s->mst_stepping = true;
-    timer_mod(s->timer, now + dw_cycles_ns(s, dw_step_cycles(s, step)));
+    dw_timer_in(s, dw_step_cycles(s, step));
     dw_i2c_update(s);
 }
 
@@ -1423,6 +1462,8 @@ static void designware_i2c_enter_reset(Object *obj, ResetType type)
     DesignWareI2CClass *dc = DESIGNWARE_I2C_GET_CLASS(s);
 
     timer_del(s->timer);
+    s->timer_held = false;
+    s->held_cycles = 0;
     s->con = dc->con_reset;
     s->tar = dc->tar_reset;
     s->sar = dc->sar_reset;
@@ -1506,7 +1547,7 @@ static int designware_i2c_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_designware_i2c = {
     .name = TYPE_DESIGNWARE_I2C,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = designware_i2c_post_load,
     .fields = (const VMStateField[]) {
@@ -1546,6 +1587,8 @@ static const VMStateDescription vmstate_designware_i2c = {
         VMSTATE_BOOL(scl_hold, DesignWareI2CState),
         VMSTATE_BOOL(ic_en, DesignWareI2CState),
         VMSTATE_TIMER_PTR(timer, DesignWareI2CState),
+        VMSTATE_BOOL_V(timer_held, DesignWareI2CState, 2),
+        VMSTATE_UINT64_V(held_cycles, DesignWareI2CState, 2),
         VMSTATE_BOOL(mst_owned, DesignWareI2CState),
         VMSTATE_BOOL(mst_xfer_open, DesignWareI2CState),
         VMSTATE_BOOL(mst_read, DesignWareI2CState),
@@ -1600,7 +1643,8 @@ static void designware_i2c_instance_init(Object *obj)
     qdev_init_gpio_out_named(dev, &s->scl_oe, DESIGNWARE_I2C_SCL_OE, 1);
     qdev_init_gpio_in_named(dev, dw_i2c_scl_in, DESIGNWARE_I2C_SCL_IN, 1);
     qdev_init_gpio_in_named(dev, dw_i2c_sda_in, DESIGNWARE_I2C_SDA_IN, 1);
-    s->clk = qdev_init_clock_in(dev, "clk", NULL, NULL, 0);
+    s->clk = qdev_init_clock_in(dev, "clk", dw_clk_update, s,
+                                ClockPreUpdate | ClockUpdate);
 }
 
 static void designware_i2c_realize(DeviceState *dev, Error **errp)

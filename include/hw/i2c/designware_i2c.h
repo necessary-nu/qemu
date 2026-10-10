@@ -115,6 +115,12 @@ struct DesignWareI2CState {
     qemu_irq scl_oe;
     Clock *clk;
     QEMUTimer *timer;
+    /*
+     * ic_clk cycles left on the timer, held while a connected ic_clk is
+     * stopped.
+     */
+    bool timer_held;
+    uint64_t held_cycles;
 
     /* Registers. RAW_INTR_STAT's TX_EMPTY and RX_FULL are derived. */
     uint32_t con;

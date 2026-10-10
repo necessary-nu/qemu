@@ -103,6 +103,8 @@ struct PL022State {
     uint16_t shift;
     /* When the frame on the wire ends, in QEMU_CLOCK_VIRTUAL ns. */
     int64_t frame_end;
+    /* The SSPCLK cycles left of a frame held while SSPCLK is stopped. */
+    uint64_t frame_left;
     bool fssin;
 
     QEMUTimer *frame_timer;
