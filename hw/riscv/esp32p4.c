@@ -76,10 +76,10 @@
  *     external interrupts 16 to 47 of either HP core, remapped as each
  *     core's mode and its CLIC's user-mode interrupts decide. Of HP_SYSTEM
  *     (0x500E5000), the cores' software interrupts CPU_INTR_FROM_CPU_0 to
- *     _3, sources of the matrix, the external memory encryption enables
- *     and the L2MEM error response and interrupt; the rest of its
- *     registers are logged as unimplemented. A source no modelled block
- *     drives stays low.
+ *     _3, sources of the matrix, the L1 caches' resets, the external
+ *     memory encryption enables and the L2MEM error response and
+ *     interrupt; the rest of its registers are logged as unimplemented. A
+ *     source no modelled block drives stays low.
  *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
@@ -846,6 +846,12 @@ static void esp32p4_init_ext_memory(ESP32P4MachineState *s)
                                     cache_resets[i],
                                     qdev_get_gpio_in_named(cache,
                                         ESP32P4_CACHE_CACHE_RESET, i));
+    }
+    for (i = 0; i < ESP32P4_HP_SYS_CACHE_RESET_LINES; i++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->hp_sys),
+                                    ESP32P4_HP_SYS_CACHE_RESET, i,
+                                    qdev_get_gpio_in_named(cache,
+                                        ESP32P4_CACHE_SYS_CACHE_RESET, i));
     }
     qdev_connect_gpio_out_named(DEVICE(&s->hp_sys),
                                 ESP32P4_HP_SYS_L2MEM_ERR_RESP, 0,

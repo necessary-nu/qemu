@@ -108,7 +108,8 @@
  * contents are kept apart from L2MEM's, which keeps what it held.
  *
  * The registers are behind L1CACHE_CPU_CLK and RST_EN_HP_CACHE; the four
- * cache resets ("cache-reset") empty their caches.
+ * cache resets ("cache-reset"), and HP_SYSTEM_CACHE_RESET_CONFIG's for the
+ * L1 caches ("sys-cache-reset"), empty their caches.
  *
  * Not modelled: the access counters (*_ACS_*_CNT), which count nothing
  * (logged as unimplemented when enabled); access to the tag and data
@@ -1816,20 +1817,39 @@ static const MemoryRegionOps cache_ops = {
 
 /* Reset, hooks, realize */
 
-static void cache_set_cache_reset(void *opaque, int n, int level)
+/*
+ * Cache `n`'s reset, from HP_SYS_CLKRST (`line` cache_reset) or HP_SYSTEM
+ * (sys_cache_reset): either empties the cache as it is asserted.
+ */
+static void cache_reset_line(ESP32P4CacheState *c, bool *line, int n,
+                             int level)
 {
-    ESP32P4CacheState *c = opaque;
     static const uint32_t map[ESP32P4_CACHE_NRESETS] = {
         [ESP32P4_CACHE_RESET_L1_I0] = MAP_L1_I0,
         [ESP32P4_CACHE_RESET_L1_I1] = MAP_L1_I1,
         [ESP32P4_CACHE_RESET_L1_D] = MAP_L1_D,
         [ESP32P4_CACHE_RESET_L2] = MAP_L2,
     };
+    bool was = c->cache_reset[n] || c->sys_cache_reset[n];
 
-    if (level && !c->cache_reset[n]) {
+    line[n] = level;
+    if (!was && (c->cache_reset[n] || c->sys_cache_reset[n])) {
         cache_empty(c, map[n]);
     }
-    c->cache_reset[n] = level;
+}
+
+static void cache_set_cache_reset(void *opaque, int n, int level)
+{
+    ESP32P4CacheState *c = opaque;
+
+    cache_reset_line(c, c->cache_reset, n, level);
+}
+
+static void cache_set_sys_cache_reset(void *opaque, int n, int level)
+{
+    ESP32P4CacheState *c = opaque;
+
+    cache_reset_line(c, c->sys_cache_reset, n, level);
 }
 
 static void cache_set_l2mem_err_resp(void *opaque, int n, int level)
@@ -1969,6 +1989,9 @@ static void cache_init(Object *obj)
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &c->irq);
     qdev_init_gpio_in_named(dev, cache_set_cache_reset,
                             ESP32P4_CACHE_CACHE_RESET, ESP32P4_CACHE_NRESETS);
+    qdev_init_gpio_in_named(dev, cache_set_sys_cache_reset,
+                            ESP32P4_CACHE_SYS_CACHE_RESET,
+                            ESP32P4_CACHE_NRESETS);
     qdev_init_gpio_in_named(dev, cache_set_l2mem_err_resp,
                             ESP32P4_CACHE_L2MEM_ERR_RESP, 1);
 }
@@ -2006,6 +2029,8 @@ static const VMStateDescription vmstate_esp32p4_cache = {
         VMSTATE_UINT32_ARRAY(regs, ESP32P4CacheState, ESP32P4_CACHE_NREGS),
         VMSTATE_UINT32(l2_cache_size, ESP32P4CacheState),
         VMSTATE_BOOL_ARRAY(cache_reset, ESP32P4CacheState,
+                           ESP32P4_CACHE_NRESETS),
+        VMSTATE_BOOL_ARRAY(sys_cache_reset, ESP32P4CacheState,
                            ESP32P4_CACHE_NRESETS),
         VMSTATE_BOOL(l2mem_err_resp, ESP32P4CacheState),
         VMSTATE_BOOL(counters_logged, ESP32P4CacheState),

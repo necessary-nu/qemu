@@ -44,12 +44,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4HPSysState, ESP32P4_HP_SYS)
  */
 #define ESP32P4_HP_SYS_L2MEM_ERR_RESP "l2mem-err-resp"
 
+/*
+ * Named GPIO output ESP32P4_HP_SYS_CACHE_RESET: HP_SYSTEM_CACHE_RESET_
+ * CONFIG's L1_I0_CACHE_RESET, L1_I1_CACHE_RESET and L1_D_CACHE_RESET, in
+ * that order, each high while set, to the cache controller's
+ * "sys-cache-reset" inputs.
+ */
+#define ESP32P4_HP_SYS_CACHE_RESET "cache-reset"
+#define ESP32P4_HP_SYS_CACHE_RESET_LINES 3
+
 struct ESP32P4HPSysState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     uint32_t cpu_int_from_cpu[ESP32P4_HP_SYS_CPU_INTRS];
     qemu_irq cpu_intr[ESP32P4_HP_SYS_CPU_INTRS];
+    uint32_t cache_clk_config;
+    uint32_t cache_reset_config;
+    qemu_irq cache_reset[ESP32P4_HP_SYS_CACHE_RESET_LINES];
     uint32_t crypto_ctrl;
     qemu_irq crypto_ctrl_out[ESP32P4_HP_SYS_CRYPTO_CTRL_LINES];
     uint32_t l2_mem_int_raw;

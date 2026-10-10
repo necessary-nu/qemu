@@ -17,6 +17,11 @@
  *     Each register's bit 0 is read-write and its interrupt is high while
  *     it is set; software clears it by writing 0, as ESP-IDF's
  *     crosscore_int_ll does.
+ *   - HP_SYSTEM_CACHE_CLK_CONFIG_REG (0x20) and _CACHE_RESET_CONFIG_REG
+ *     (0x24): the L1 caches' resets, each emptying its cache, to the cache
+ *     controller ("cache-reset" outputs); the caches' clock enables are
+ *     held, a cache with its clock stopped working on (logged as
+ *     unimplemented).
  *   - HP_SYSTEM_CRYPTO_CTRL_REG (0x70): the four enables of the external
  *     memory encryption blocks, which go to the MSPI controllers
  *     ("crypto-ctrl" outputs).
@@ -46,6 +51,10 @@
 #define A_CPU_INT_FROM_CPU_0    0x10
 #define A_CPU_INT_FROM_CPU_3    0x1c
 #define CPU_INT_FROM_CPU        BIT(0)
+#define A_CACHE_CLK_CONFIG      0x20
+#define CACHE_CLK_CONFIG_MASK   0x33
+#define A_CACHE_RESET_CONFIG    0x24
+#define CACHE_RESET_CONFIG_MASK 0x32
 #define A_CRYPTO_CTRL           0x70
 #define CRYPTO_CTRL_MASK        0xf
 #define A_L2_MEM_INT_RAW        0x9c
@@ -91,6 +100,10 @@ static uint32_t esp32p4_hp_sys_reg(ESP32P4HPSysState *s, hwaddr addr,
         return s->cpu_int_from_cpu[(addr - A_CPU_INT_FROM_CPU_0) / 4];
     }
     switch (addr & ~3) {
+    case A_CACHE_CLK_CONFIG:
+        return s->cache_clk_config;
+    case A_CACHE_RESET_CONFIG:
+        return s->cache_reset_config;
     case A_CRYPTO_CTRL:
         return s->crypto_ctrl;
     case A_L2_MEM_INT_RAW:
@@ -132,6 +145,17 @@ static void esp32p4_hp_sys_update_crypto(ESP32P4HPSysState *s)
     }
 }
 
+/* L1_I0_CACHE_RESET (bit 5), L1_I1_CACHE_RESET (4), L1_D_CACHE_RESET (1). */
+static void esp32p4_hp_sys_update_cache_reset(ESP32P4HPSysState *s)
+{
+    static const int bit[ESP32P4_HP_SYS_CACHE_RESET_LINES] = { 5, 4, 1 };
+
+    for (int i = 0; i < ESP32P4_HP_SYS_CACHE_RESET_LINES; i++) {
+        qemu_set_irq(s->cache_reset[i],
+                     extract32(s->cache_reset_config, bit[i], 1));
+    }
+}
+
 /* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
 /* [spec:nuos:req:emu.esp32p4.memory] */
 static void esp32p4_hp_sys_write(void *opaque, hwaddr addr, uint64_t value,
@@ -151,6 +175,21 @@ static void esp32p4_hp_sys_write(void *opaque, hwaddr addr, uint64_t value,
         return;
     }
     switch (addr & ~3) {
+    case A_CACHE_CLK_CONFIG:
+        s->cache_clk_config = ((s->cache_clk_config & ~mask) | (v & mask)) &
+                              CACHE_CLK_CONFIG_MASK;
+        if (s->cache_clk_config != CACHE_CLK_CONFIG_MASK) {
+            qemu_log_mask(LOG_UNIMP, "%s: stopping a cache's clock "
+                          "(CACHE_CLK_CONFIG 0x%02" PRIx32 ") is not "
+                          "modelled; the caches keep working\n",
+                          TYPE_ESP32P4_HP_SYS, s->cache_clk_config);
+        }
+        break;
+    case A_CACHE_RESET_CONFIG:
+        s->cache_reset_config = ((s->cache_reset_config & ~mask) |
+                                 (v & mask)) & CACHE_RESET_CONFIG_MASK;
+        esp32p4_hp_sys_update_cache_reset(s);
+        break;
     case A_CRYPTO_CTRL:
         s->crypto_ctrl = ((s->crypto_ctrl & ~mask) | (v & mask)) &
                          CRYPTO_CTRL_MASK;
@@ -198,6 +237,8 @@ static void esp32p4_hp_sys_reset_hold(Object *obj, ResetType type)
     ESP32P4HPSysState *s = ESP32P4_HP_SYS(obj);
 
     memset(s->cpu_int_from_cpu, 0, sizeof(s->cpu_int_from_cpu));
+    s->cache_clk_config = CACHE_CLK_CONFIG_MASK;
+    s->cache_reset_config = 0;
     s->crypto_ctrl = 0;
     s->l2_mem_int_raw = 0;
     s->l2_mem_int_ena = 0;
@@ -212,6 +253,7 @@ static void esp32p4_hp_sys_reset_exit(Object *obj, ResetType type)
     for (int i = 0; i < ESP32P4_HP_SYS_CPU_INTRS; i++) {
         qemu_set_irq(s->cpu_intr[i], s->cpu_int_from_cpu[i]);
     }
+    esp32p4_hp_sys_update_cache_reset(s);
     esp32p4_hp_sys_update_crypto(s);
     qemu_set_irq(s->l2mem_err_resp, s->l2_mem_err_resp_ctrl);
     esp32p4_hp_sys_update_irq(s);
@@ -228,6 +270,9 @@ static void esp32p4_hp_sys_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(obj), s->cpu_intr,
                              ESP32P4_HP_SYS_CPU_INTR,
                              ESP32P4_HP_SYS_CPU_INTRS);
+    qdev_init_gpio_out_named(DEVICE(obj), s->cache_reset,
+                             ESP32P4_HP_SYS_CACHE_RESET,
+                             ESP32P4_HP_SYS_CACHE_RESET_LINES);
     qdev_init_gpio_out_named(DEVICE(obj), s->crypto_ctrl_out,
                              ESP32P4_HP_SYS_CRYPTO_CTRL,
                              ESP32P4_HP_SYS_CRYPTO_CTRL_LINES);
@@ -242,6 +287,8 @@ static const VMStateDescription vmstate_esp32p4_hp_sys = {
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(cpu_int_from_cpu, ESP32P4HPSysState,
                              ESP32P4_HP_SYS_CPU_INTRS),
+        VMSTATE_UINT32(cache_clk_config, ESP32P4HPSysState),
+        VMSTATE_UINT32(cache_reset_config, ESP32P4HPSysState),
         VMSTATE_UINT32(crypto_ctrl, ESP32P4HPSysState),
         VMSTATE_UINT32(l2_mem_int_raw, ESP32P4HPSysState),
         VMSTATE_UINT32(l2_mem_int_ena, ESP32P4HPSysState),

@@ -61,12 +61,16 @@ enum {
  *   and every cache are reset.
  * "cache-reset": 4 lines, RST_EN_L1_I0_CACHE, _L1_I1_CACHE, _L1_D_CACHE and
  *   _L2_CACHE, each emptying its cache while held.
+ * "sys-cache-reset": 4 lines in the same order, HP_SYSTEM_CACHE_RESET_
+ *   CONFIG's, which has no L2 reset: each empties its cache as the
+ *   "cache-reset" line does.
  * "l2mem-err-resp": HP_SYSTEM_L2_MEM_ERR_RESP_EN.
  *
  * Its interrupt, CACHE_INTR (source 83), is sysbus IRQ 0.
  */
 #define ESP32P4_CACHE_RESET         "reset"
 #define ESP32P4_CACHE_CACHE_RESET   "cache-reset"
+#define ESP32P4_CACHE_SYS_CACHE_RESET "sys-cache-reset"
 #define ESP32P4_CACHE_L2MEM_ERR_RESP "l2mem-err-resp"
 
 enum {
@@ -121,6 +125,7 @@ struct ESP32P4CacheState {
     uint32_t regs[ESP32P4_CACHE_NREGS];
     uint32_t l2_cache_size;
     bool cache_reset[ESP32P4_CACHE_NRESETS];
+    bool sys_cache_reset[ESP32P4_CACHE_NRESETS];
     bool l2mem_err_resp;
     bool counters_logged;
 };
