@@ -15,6 +15,7 @@
 #include "hw/ssi/ssi.h"
 #include "hw/misc/esp32p4_hp_sys_clkrst.h"
 #include "hw/misc/esp32p4_lp_sys.h"
+#include "hw/nvram/esp32p4_efuse.h"
 #include "system/memory.h"
 #include "target/riscv/esp32p4_cpu.h"
 
@@ -53,6 +54,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 
 #define ESP32P4_HP_SYS_CLKRST_BASE  0x500e6000
 #define ESP32P4_LP_SYS_BASE         0x50110000
+#define ESP32P4_EFUSE_BASE          0x5012d000
 
 /* Where each core starts from reset. */
 #define ESP32P4_HP_RESET_VECTOR     ESP32P4_HP_ROM_BASE
@@ -78,6 +80,7 @@ struct ESP32P4MachineState {
 
     ESP32P4HPSysClkRstState hp_sys_clkrst;
     ESP32P4LPSysState lp_sys;
+    ESP32P4EfuseState efuse;
 
     SSIBus *flash_bus;
     uint64_t flash_size;
