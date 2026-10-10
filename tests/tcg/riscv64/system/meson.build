@@ -29,6 +29,7 @@ tests += {
   'test-mstatus-modes.S': setup,
   'test-pmp-mret-fetch.S': setup,
   'test-pmp-reset.S': setup,
+  'test-pmp-no-entries.S': setup + {'qemu_args': ['-cpu', 'rv64,num-pmp-regions=0', qemu_args]},
 }
 
 tests += {
