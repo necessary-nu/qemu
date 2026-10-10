@@ -10,5 +10,6 @@
 #define ACCEL_DUMMY_CPUS_H
 
 void dummy_start_vcpu_thread(CPUState *cpu);
+void dummy_kick_vcpu_thread(CPUState *cpu);
 
 #endif

@@ -263,6 +263,7 @@ static void nitro_accel_ops_class_init(ObjectClass *oc, const void *data)
 {
     AccelOpsClass *ops = ACCEL_OPS_CLASS(oc);
     ops->create_vcpu_thread = dummy_start_vcpu_thread;
+    ops->kick_vcpu_thread = dummy_kick_vcpu_thread;
     ops->handle_interrupt = generic_handle_interrupt;
     ops->cpus_are_resettable = nitro_cpus_are_resettable;
 }
