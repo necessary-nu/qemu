@@ -26,6 +26,21 @@ tests += {
   'test-misa-w.S': setup + {'qemu_args': ['-cpu', 'rv64,x-misa-w=true,c=true,v=true', qemu_args]},
   'test-icount-nodebug.S': setup + {'qemu_args': ['-cpu', 'rv64,debug=false', '-icount', 'shift=1', qemu_args]},
   'test-sfence-vma-no-smode.S': setup + {'qemu_args': ['-cpu', 'rv64,h=false,s=false', qemu_args]},
+  'test-mstatus-modes.S': setup,
+}
+
+tests += {
+  'test-mstatus-modes.S': {
+    'test_name': 'test-mstatus-modes-no-smode',
+    'qemu_args': ['-cpu', 'rv64,h=false,s=false', qemu_args],
+  }
+}
+
+tests += {
+  'test-mstatus-modes.S': {
+    'test_name': 'test-mstatus-modes-no-umode',
+    'qemu_args': ['-cpu', 'rv64,h=false,s=false,u=false', qemu_args],
+  }
 }
 
 tests += {

@@ -2038,14 +2038,20 @@ static RISCVException write_mstatus(CPURISCVState *env, int csrno,
      */
     val = legalize_mpp(env, get_field(mstatus, MSTATUS_MPP), val);
 
-    /* flush tlb on mstatus fields that affect VM */
-    if ((val ^ mstatus) & MSTATUS_MXR) {
-        tlb_flush(env_cpu(env));
+    mask = MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP;
+
+    /*
+     * The fields that control or record a less privileged mode are
+     * read-only zero when the hart does not implement that mode.
+     */
+    if (riscv_has_ext(env, RVU)) {
+        mask |= MSTATUS_MPRV | MSTATUS_TW;
     }
-    mask = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_MIE | MSTATUS_MPIE |
-        MSTATUS_SPP | MSTATUS_MPRV | MSTATUS_SUM |
-        MSTATUS_MPP | MSTATUS_MXR | MSTATUS_TVM | MSTATUS_TSR |
-        MSTATUS_TW;
+
+    if (riscv_has_ext(env, RVS)) {
+        mask |= MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM |
+                MSTATUS_MXR | MSTATUS_TVM | MSTATUS_TSR;
+    }
 
     if (riscv_has_ext(env, RVF)) {
         mask |= MSTATUS_FS;
@@ -2070,12 +2076,12 @@ static RISCVException write_mstatus(CPURISCVState *env, int csrno,
     }
 
     if (xl != MXL_RV32 || env->debugger) {
-        if ((val & MSTATUS64_SXL) != 0) {
+        if ((val & MSTATUS64_SXL) != 0 && riscv_has_ext(env, RVS)) {
             mask |= MSTATUS64_SXL;
             val = riscv_write_uxl(env, val, MSTATUS64_SXL);
         }
 
-        if ((val & MSTATUS64_UXL) != 0) {
+        if ((val & MSTATUS64_UXL) != 0 && riscv_has_ext(env, RVU)) {
             mask |= MSTATUS64_UXL;
             val = riscv_write_uxl(env, val, MSTATUS64_UXL);
         }
@@ -2083,10 +2089,18 @@ static RISCVException write_mstatus(CPURISCVState *env, int csrno,
 
     /* If cfi lp extension is available, then apply cfi lp mask */
     if (env_archcpu(env)->cfg.ext_zicfilp) {
-        mask |= (MSTATUS_MPELP | MSTATUS_SPELP);
+        mask |= MSTATUS_MPELP;
+        if (riscv_has_ext(env, RVS)) {
+            mask |= MSTATUS_SPELP;
+        }
     }
 
     mstatus = (mstatus & ~mask) | (val & mask);
+
+    /* flush tlb on mstatus fields that affect VM */
+    if ((mstatus ^ env->mstatus) & MSTATUS_MXR) {
+        tlb_flush(env_cpu(env));
+    }
 
     env->mstatus = mstatus;
 
