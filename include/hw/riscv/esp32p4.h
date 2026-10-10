@@ -23,6 +23,10 @@
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/nvram/esp32p4_efuse.h"
+#include "hw/timer/esp32p4_lp_timer.h"
+#include "hw/timer/esp32p4_lp_wdt.h"
+#include "hw/timer/esp32p4_systimer.h"
+#include "hw/timer/esp32p4_timg.h"
 #include "system/memory.h"
 #include "target/riscv/esp32p4_cpu.h"
 
@@ -104,6 +108,15 @@ struct ESP32P4MachineState {
     /* The entry point of the -kernel ELF, which core 0 starts at; or 0. */
     uint64_t kernel_entry;
     ESP32P4EfuseState efuse;
+
+    ESP32P4SysTimerState systimer;
+    ESP32P4TimgState timg[2];
+    ESP32P4LPWdtState lp_wdt;
+    ESP32P4LPTimerState lp_timer;
+    /* Each HP core's stall, to the system timer and the RTC timer. */
+    SplitIRQ core_stall_split[ESP32P4_HP_CORES];
+    /* The HP core reset, to the machine and the RTC timer. */
+    SplitIRQ hp_core_reset_split;
 
     SSIBus *flash_bus;
     uint64_t flash_size;

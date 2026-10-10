@@ -364,7 +364,8 @@ qtests_riscv32 = \
   (config_all_devices.has_key('CONFIG_SIFIVE_E_AON') ? ['sifive-e-aon-watchdog-test'] : []) + \
   (config_all_devices.has_key('CONFIG_ESP32P4') ?
     ['esp32p4-machine-test', 'esp32p4-clocks-test', 'esp32p4-efuse-test',
-     'esp32p4-clic-test', 'esp32p4-intmatrix-test'] :
+     'esp32p4-clic-test', 'esp32p4-intmatrix-test', 'esp32p4-systimer-test',
+     'esp32p4-timg-test', 'esp32p4-lpwdt-test', 'esp32p4-lp-timer-test'] :
     [])
 
 qtests_riscv64 = ['riscv-csr-test'] + \
