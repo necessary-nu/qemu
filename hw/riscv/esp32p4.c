@@ -66,6 +66,15 @@
  *     (0x500E5000), the cores' software interrupts CPU_INTR_FROM_CPU_0 to
  *     _3, sources of the matrix; the rest of its registers are logged as
  *     unimplemented. A source no modelled block drives stays low.
+ *   - The GPIO matrix and IO MUX (TRM chapter 10), HP and LP, with
+ *     GPIO_EXT's sigma-delta modulators, glitch filters and ETM, behind
+ *     IOMUX_APB_CLK and the LP IO MUX's clock and their resets, timed by
+ *     the IO MUX operating clocks: the 55 pads, their interrupts as
+ *     interrupt sources 74 to 78 and 10, and the HP cores' fast GPIO as
+ *     matrix signals 214 to 229. GPIO_STRAP latches the board's strapping
+ *     at reset, the machine's strap-mode property, by default SPI boot:
+ *
+ *       -M esp32p4,strap-mode=0x08
  *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
@@ -212,8 +221,7 @@ static const struct {
     { "lcd-cam",          0x500dc000, 4 * KiB },
     { "adc",              0x500de000, 4 * KiB },
     { "uhci",             0x500df000, 4 * KiB },
-    { "gpio",             0x500e0000, 4 * KiB },
-    { "io-mux",           0x500e1000, 4 * KiB },
+    { "iomux-mspi-pin",   0x500e1200, 4 * KiB - 0x200 },
     { "systimer",         0x500e2000, 4 * KiB },
     { "mem-monitor",      0x500e3000, 4 * KiB },
     { "audio-addc",       0x500e4000, 4 * KiB },
@@ -242,8 +250,6 @@ static const struct {
     { "lp-trng",          0x50126000, 4 * KiB },
     { "lp-adc",           0x50127000, 4 * KiB },
     { "lp-touch",         0x50128000, 4 * KiB },
-    { "lp-gpio",          0x5012a000, 4 * KiB },
-    { "lp-iomux",         0x5012b000, 4 * KiB },
     { "lp-intr",          0x5012c000, 4 * KiB },
     { "lp-peri-pms",      0x5012e000, 2 * KiB },
     { "hp2lp-peri-pms",   0x5012e800, 2 * KiB },
@@ -676,6 +682,87 @@ static void esp32p4_init_efuse(ESP32P4MachineState *s)
                        esp32p4_intr_source(s, ESP32P4_INTR_LP_EFUSE));
 }
 
+/*
+ * The GPIO matrices and IO MUXes, HP and LP, their registers behind
+ * IOMUX_APB_CLK and the LP IO MUX's clock, their resets taken directly
+ * (the strapping latch survives them); their interrupts, sources 74 to 78
+ * and 10 of the interrupt matrix; and each HP core's fast GPIO, matrix
+ * signals 214 + 8 * core + n. The cores' cpu_gpio_oen is the outputs'
+ * enable inverted: ESP-IDF's dedic_gpio_cpu_ll.h for the P4 enables an
+ * output by clearing its bit ("the OEN register is active low"), where
+ * the TRM's register description has 1 enable it.
+ */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_gpio(ESP32P4MachineState *s)
+{
+    static const struct {
+        hwaddr base;
+        unsigned clock;
+    } map[] = {
+        [ESP32P4_GPIO_MMIO_GPIO] = { ESP32P4_GPIO_BASE,
+                                     ESP32P4_CLK_IOMUX_APB },
+        [ESP32P4_GPIO_MMIO_IO_MUX] = { ESP32P4_IO_MUX_BASE,
+                                       ESP32P4_CLK_IOMUX_APB },
+        [ESP32P4_GPIO_MMIO_LP_GPIO] = { ESP32P4_LP_GPIO_BASE,
+                                        ESP32P4_CLK_LP_IOMUX },
+        [ESP32P4_GPIO_MMIO_LP_IOMUX] = { ESP32P4_LP_IOMUX_BASE,
+                                         ESP32P4_CLK_LP_IOMUX },
+    };
+    DeviceState *gpio, *clkrst = DEVICE(&s->clkrst);
+    int i, core;
+
+    object_initialize_child(OBJECT(s), "gpio", &s->gpio, TYPE_ESP32P4_GPIO);
+    gpio = DEVICE(&s->gpio);
+    qdev_prop_set_uint32(gpio, "strap-mode", s->strap_mode);
+    qdev_connect_clock_in(gpio, "iomux", qdev_get_clock_out(clkrst, "iomux"));
+    qdev_connect_clock_in(gpio, "lp", qdev_get_clock_out(clkrst, "lp-iomux"));
+    sysbus_realize(SYS_BUS_DEVICE(gpio), &error_fatal);
+    for (i = 0; i < ARRAY_SIZE(map); i++) {
+        esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(gpio), i,
+                                 map[i].base, map[i].clock,
+                                 ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    }
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_IOMUX,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_RESET,
+                                    ESP32P4_GPIO_RESET_HP));
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_LP_IOMUX,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_RESET,
+                                    ESP32P4_GPIO_RESET_LP));
+    for (i = 0; i < 4; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(gpio), ESP32P4_GPIO_IRQ_INTR0 + i,
+                           esp32p4_intr_source(s, ESP32P4_INTR_GPIO_INTR0 + i));
+    }
+    sysbus_connect_irq(SYS_BUS_DEVICE(gpio), ESP32P4_GPIO_IRQ_PAD_COMP,
+                       esp32p4_intr_source(s, ESP32P4_INTR_GPIO_PAD_COMP));
+    sysbus_connect_irq(SYS_BUS_DEVICE(gpio), ESP32P4_GPIO_IRQ_LP,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_GPIO));
+
+    for (core = 0; core < ESP32P4_HP_CORES; core++) {
+        DeviceState *cpu = DEVICE(&s->hp_cpu[core]);
+
+        for (i = 0; i < ESP32P4_CPU_GPIOS; i++) {
+            int n = core * ESP32P4_CPU_GPIOS + i;
+
+            qdev_connect_gpio_out_named(cpu, ESP32P4_CPU_GPIO_OUT, i,
+                qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                    ESP32P4_SIG_CORE_GPIO_OUT_PAD_OUT0 + n));
+            qdev_connect_gpio_out_named(cpu, ESP32P4_CPU_GPIO_OE, i,
+                qemu_irq_invert(qdev_get_gpio_in_named(gpio,
+                    ESP32P4_GPIO_SIG_OE,
+                    ESP32P4_SIG_CORE_GPIO_OUT_PAD_OUT0 + n)));
+            qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                ESP32P4_SIG_CORE_GPIO_IN_PAD_IN0 + n,
+                qdev_get_gpio_in_named(cpu, ESP32P4_CPU_GPIO_IN, i));
+        }
+    }
+}
+
 /* The memories -kernel can load into: those the cores address directly. */
 static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
 {
@@ -807,6 +894,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_core_local(s);
     esp32p4_init_intmatrix(s);
     esp32p4_init_efuse(s);
+    esp32p4_init_gpio(s);
     esp32p4_init_flash(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
@@ -846,6 +934,36 @@ static void esp32p4_set_flash_size(Object *obj, Visitor *v, const char *name,
     ESP32P4_MACHINE(obj)->flash_size = size;
 }
 
+static void esp32p4_get_strap_mode(Object *obj, Visitor *v,
+                                   const char *name, void *opaque,
+                                   Error **errp)
+{
+    visit_type_uint32(v, name, &ESP32P4_MACHINE(obj)->strap_mode, errp);
+}
+
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+static void esp32p4_set_strap_mode(Object *obj, Visitor *v,
+                                   const char *name, void *opaque,
+                                   Error **errp)
+{
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value >> ESP32P4_GPIO_STRAP_PINS) {
+        error_setg(errp, "strap-mode has a bit for each of GPIO38 (bit 0) "
+                   "to GPIO34 (bit 4); 0x%x has more", value);
+        return;
+    }
+    ESP32P4_MACHINE(obj)->strap_mode = value;
+}
+
+static void esp32p4_machine_instance_init(Object *obj)
+{
+    ESP32P4_MACHINE(obj)->strap_mode = ESP32P4_GPIO_STRAP_SPI_BOOT;
+}
+
 /* [spec:nuos:req:emu.esp32p4.machine] */
 static void esp32p4_machine_class_init(ObjectClass *oc, const void *data)
 {
@@ -856,6 +974,12 @@ static void esp32p4_machine_class_init(ObjectClass *oc, const void *data)
                               NULL, NULL);
     object_class_property_set_description(oc, "flash-size",
         "Size of the board's off-package flash (no default: no flash)");
+    object_class_property_add(oc, "strap-mode", "uint32",
+                              esp32p4_get_strap_mode, esp32p4_set_strap_mode,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "strap-mode",
+        "The board's strapping of GPIO38 (bit 0) to GPIO34 (bit 4), which "
+        "GPIO_STRAP latches at reset (default 0x08: SPI boot)");
 
     mc->desc = "Espressif ESP32-P4NRW32X (2x HP RV32IMAFC, LP RV32IMAC)";
     mc->init = esp32p4_init;
@@ -871,6 +995,7 @@ static const TypeInfo esp32p4_machine_types[] = {
         .name          = TYPE_ESP32P4_MACHINE,
         .parent        = TYPE_MACHINE,
         .instance_size = sizeof(ESP32P4MachineState),
+        .instance_init = esp32p4_machine_instance_init,
         .class_init    = esp32p4_machine_class_init,
     },
 };

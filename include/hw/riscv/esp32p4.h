@@ -13,6 +13,7 @@
 #include "hw/core/boards.h"
 #include "hw/cpu/cluster.h"
 #include "hw/core/split-irq.h"
+#include "hw/gpio/esp32p4_gpio.h"
 #include "hw/intc/esp32p4_clic.h"
 #include "hw/intc/esp32p4_clint.h"
 #include "hw/intc/esp32p4_intmatrix.h"
@@ -104,6 +105,9 @@ struct ESP32P4MachineState {
     /* The entry point of the -kernel ELF, which core 0 starts at; or 0. */
     uint64_t kernel_entry;
     ESP32P4EfuseState efuse;
+    ESP32P4GpioState gpio;
+    /* The board's strapping of GPIO34 to GPIO38, in GPIO_STRAP's layout */
+    uint32_t strap_mode;
 
     SSIBus *flash_bus;
     uint64_t flash_size;
