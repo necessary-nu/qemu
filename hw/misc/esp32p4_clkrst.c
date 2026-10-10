@@ -58,7 +58,9 @@
  *     and XTAL_D2_CLK.
  *   - Every block's bus clocks (SOC_CLK_CTRL0..3: CPU_CLK, MEM_CLK,
  *     SYS_CLK or APB_CLK, gated), and its function clocks (PERI_CLK_CTRL*,
- *     LP_CLKRST's USB clocks, LPPERI): a source mux, a gate and a divider,
+ *     LP_CLKRST's USB clocks, LPPERI, and the eFuse controller's 20 MHz
+ *     XTAL_D2_CLK, which TRM table 11.2-7 gives it and LPPERI_CK_EN_LP_EFUSE
+ *     gates): a source mux, a gate and a divider,
  *     integer, fractional as above, or I2S's N + b/a from its X, Y, Z and
  *     YN1. Each divider register holds its divisor less one; I2S's N is
  *     the divisor's integer part. A mux setting the TRM calls invalid
@@ -1004,6 +1006,7 @@ static const ClkDesc esp32p4_clk_desc[ESP32P4_NUM_CLOCKS] = {
                                   PNONE),
                           .sel = F(LPPERI_CORE_CLK_SEL, 30, 2),
                           .gate = { B(LPPERI_CLK_EN, 29) } },
+    GATE(EFUSE, XTAL_D2, LPPERI_CLK_EN, 19),
     [C(LP_CORE)] = { .kind = SPECIAL },
 };
 
@@ -1301,7 +1304,6 @@ static uint64_t esp32p4_clkrst_rc_fast(ESP32P4ClkRstState *s)
     return CLOCK_PERIOD_FROM_HZ(hz);
 }
 
-/* A SPECIAL clock. */
 static uint64_t esp32p4_clkrst_special(ESP32P4ClkRstState *s, int id)
 {
     uint32_t v, sel;
@@ -2134,12 +2136,13 @@ ESP32P4ClkRstGate *esp32p4_clkrst_map_gated(ESP32P4ClkRstState *s,
     g_autofree char *as_name = g_strdup_printf("%s-gate",
                                                memory_region_name(mr));
 
-    assert(bus_clock < ESP32P4_NUM_CLOCKS && reset < ESP32P4_NUM_RESETS);
+    assert(bus_clock < ESP32P4_NUM_CLOCKS &&
+           reset <= ESP32P4_CLKRST_GATE_NO_RESET);
     g->s = s;
     g->dev = DEVICE(dev);
     g->clock = bus_clock;
     g->reset = reset;
-    g->held = s->reset_level[reset];
+    g->held = reset != ESP32P4_CLKRST_GATE_NO_RESET && s->reset_level[reset];
     address_space_init(&g->dev_as, mr, as_name);
     /*
      * No owner: an owner's re-entrancy guard would block the forwarded
@@ -2305,7 +2308,8 @@ static int esp32p4_clkrst_post_load(void *opaque, int version_id)
         s->reset_level[i] = esp32p4_clkrst_reset_held(s, i);
     }
     QTAILQ_FOREACH(g, &s->gates, next) {
-        g->held = s->reset_level[g->reset];
+        g->held = g->reset != ESP32P4_CLKRST_GATE_NO_RESET &&
+                  s->reset_level[g->reset];
     }
     return 0;
 }

@@ -69,6 +69,17 @@
 #define CTRL_WRITE          (1u << 24)
 #define CTRL_BUSY           (1u << 25)
 
+#define EFUSE_BASE          0x5012d000
+#define EFUSE_CONF          (EFUSE_BASE + 0x1cc)
+#define EFUSE_STATUS        (EFUSE_BASE + 0x1d0)
+#define EFUSE_CMD           (EFUSE_BASE + 0x1d4)
+#define EFUSE_READ_OP_CODE  0x5aa5
+#define EFUSE_CMD_READ      1
+#define EFUSE_STATE_RESET   0
+#define EFUSE_STATE_IDLE    1
+/* A read with the reset timing: 15 + 128 * 4 + 1 cycles of 20 MHz. */
+#define EFUSE_READ_NS       ((15 + 128 * 4 + 1) * 50)
+
 #define SLAVE_CPU_PLL       0x67
 #define SLAVE_MSPI          0x63
 #define SLAVE_PLLA          0x6f
@@ -989,6 +1000,51 @@ static void test_lp_uart_wakeup(void)
     qtest_quit(qts);
 }
 
+/* [spec:nuos:req:emu.esp32p4.clocks/test] */
+static void test_efuse(void)
+{
+    QTestState *qts = qtest_init("-M esp32p4");
+
+    /* The controller's 20 MHz: XTAL_D2_CLK, not LP_FAST_CLK's. */
+    assert_hz(qts, "efuse", 20 * MHZ);
+    g_assert_cmpuint(path_hz(qts, "/machine/efuse/clk"), ==, 20 * MHZ);
+    qtest_writel(qts, LP_CLK_CONF, 0);
+    assert_hz(qts, "efuse", 20 * MHZ);
+    assert_hz(qts, "lp-efuse", 20 * MHZ);
+    qtest_writel(qts, LP_CLK_CONF, 4);
+
+    /* A read stalls while LPPERI_CK_EN_LP_EFUSE gates the clock. */
+    qtest_writel(qts, EFUSE_CONF, EFUSE_READ_OP_CODE);
+    qtest_writel(qts, EFUSE_CMD, EFUSE_CMD_READ);
+    qtest_clock_step(qts, 10 * US);
+    clear_bits(qts, LPPERI_CLK_EN, 1u << 19);
+    assert_hz(qts, "efuse", 0);
+    g_assert_cmpuint(path_hz(qts, "/machine/efuse/clk"), ==, 0);
+    qtest_clock_step(qts, EFUSE_READ_NS);
+    g_assert_cmphex(qtest_readl(qts, EFUSE_CMD), ==, EFUSE_CMD_READ);
+    /* Its registers, behind the gated bus clock, drop writes. */
+    qtest_writel(qts, EFUSE_CONF, 0);
+    g_assert_cmphex(qtest_readl(qts, EFUSE_CONF), ==, EFUSE_READ_OP_CODE);
+    set_bits(qts, LPPERI_CLK_EN, 1u << 19);
+    qtest_clock_step(qts, EFUSE_READ_NS - 10 * US);
+    g_assert_cmphex(qtest_readl(qts, EFUSE_CMD), ==, 0);
+
+    /* LPPERI_RST_EN_LP_EFUSE holds it; released, it loads the array. */
+    set_bits(qts, LPPERI_RESET_EN, 1u << 20);
+    g_assert_cmpuint(qtest_readl(qts, EFUSE_STATUS) & 0xf, ==,
+                     EFUSE_STATE_RESET);
+    g_assert_cmphex(qtest_readl(qts, EFUSE_CONF), ==, 0);
+    qtest_writel(qts, EFUSE_CONF, EFUSE_READ_OP_CODE);
+    g_assert_cmphex(qtest_readl(qts, EFUSE_CONF), ==, 0);
+    clear_bits(qts, LPPERI_RESET_EN, 1u << 20);
+    g_assert_cmpuint(qtest_readl(qts, EFUSE_STATUS) & 0xf, !=,
+                     EFUSE_STATE_IDLE);
+    qtest_clock_step(qts, EFUSE_READ_NS);
+    g_assert_cmpuint(qtest_readl(qts, EFUSE_STATUS) & 0xf, ==,
+                     EFUSE_STATE_IDLE);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1004,5 +1060,6 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/clocks/block-resets", test_block_resets);
     qtest_add_func("/esp32p4/clocks/core-resets", test_core_resets);
     qtest_add_func("/esp32p4/clocks/lp-uart-wakeup", test_lp_uart_wakeup);
+    qtest_add_func("/esp32p4/clocks/efuse", test_efuse);
     return g_test_run();
 }

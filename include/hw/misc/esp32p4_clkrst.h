@@ -65,6 +65,8 @@ enum {
  *     ("osc-xtal", "osc-rc-fast", ...), "root", "cpu", "mem", "sys",
  *     "apb", the PLL_FxxM dividers ("pll-f80m", ...), "lp-slow",
  *     "lp-fast", "lp-dyn-slow", "lp-dyn-fast", "lp-peri" and "xtal-d2".
+ *   - "efuse": the eFuse controller's 20 MHz, XTAL_D2_CLK as
+ *     LPPERI_CK_EN_LP_EFUSE gates it (TRM table 11.2-7).
  *
  * esp32p4_clock_names[] lists them all, indexed by ESP32P4_CLK_*.
  *
@@ -76,13 +78,21 @@ enum {
  * LPPERI_RESET_EN is a line of the named GPIO output ESP32P4_CLKRST_RESET,
  * indexed by ESP32P4_RST_*: high while the block is held in reset, its
  * RST_EN bit set and, where the block has one, its FORCE_NORST bit clear.
- * A block model connects its reset input to its line, resets itself when
- * the line rises and stays in its reset state until it falls.
  *
  * Gating. A block whose bus clock is gated or which is held in reset
- * does not operate: esp32p4_clkrst_map_gated() maps a block's registers
+ * does not operate. esp32p4_clkrst_map_gated() maps a block's registers
  * behind its bus clock and reset, so that they behave as gated hardware
- * does, and resets the block as its reset line rises and falls.
+ * does, and resets the block as its reset line rises and again as it
+ * falls:
+ *
+ *   esp32p4_clkrst_map_gated(clkrst, SYS_BUS_DEVICE(uart), 0, 0x500ca000,
+ *                            ESP32P4_CLK_UART0_APB, ESP32P4_RST_UART0_APB,
+ *                            0);
+ *
+ * A block whose reset does more than a device reset, or which has more
+ * than one, takes its lines itself, connecting a reset input to each,
+ * and is mapped behind its bus clock alone (ESP32P4_CLKRST_GATE_NO_RESET),
+ * as the eFuse controller is.
  *
  * The HP cores take their reset and clock enable from the "core-reset"
  * and "core-clock" outputs and execute at "core0-cpu" and "core1-cpu";
@@ -388,6 +398,7 @@ enum {
     X(LP_I2S_TX, "lp-i2s-tx") \
     X(LP_I2C_SCLK, "lp-i2c-sclk") \
     X(LP_UART_SCLK, "lp-uart-sclk") \
+    X(EFUSE, "efuse") \
     X(LP_CORE, "lp-core")
 
 #define ESP32P4_CLKRST_ENUM_IN(id, name) ESP32P4_CLKIN_##id,
@@ -695,10 +706,15 @@ struct ESP32P4ClkRstState {
     uint32_t xtal32k_hz;
 };
 
+/* The @reset of esp32p4_clkrst_map_gated() for a block that has none. */
+#define ESP32P4_CLKRST_GATE_NO_RESET ESP32P4_NUM_RESETS
+
 /*
  * Map region @n of @dev at @addr in system memory behind the bus clock
- * ESP32P4_CLK_@bus_clock and the reset line ESP32P4_RST_@reset: while the
- * clock is stopped or the reset held, the block does not operate. Its
+ * ESP32P4_CLK_@bus_clock and the reset line ESP32P4_RST_@reset, or
+ * behind the clock alone with ESP32P4_CLKRST_GATE_NO_RESET for a block
+ * that takes its reset line itself: while the clock is stopped or the
+ * reset held, the block does not operate. Its
  * registers' flops cannot latch a write, so writes are dropped (and
  * logged); reads return what the registers hold, their last values or,
  * held in reset, their reset values. The TRM does not say what an access

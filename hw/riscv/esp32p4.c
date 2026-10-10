@@ -45,8 +45,9 @@
  *     through which software configures the PLLs; and LP_SYS's
  *     BOOT_ADDR_HP_CORE1, the rest of whose registers are logged as
  *     unimplemented.
- *   - The eFuse controller and its array; nothing takes its interrupt, as
- *     the interrupt matrix is not modelled.
+ *   - The eFuse controller and its array, on its clock and reset from
+ *     LPPERI; nothing takes its interrupt, as the interrupt matrix is not
+ *     modelled.
  *   - Every other peripheral block the chip decodes, as an unimplemented
  *     device named after the block. Addresses the chip does not decode,
  *     the reserved ranges of TRM table 9.3-1 and the unassigned slots
@@ -514,16 +515,28 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
 }
 
 /*
- * The eFuse controller. Its interrupt, LP_EFUSE_INTR (source 17 of TRM
+ * The eFuse controller, on its clock and reset from LPPERI, its registers
+ * behind its bus clock. Its interrupt, LP_EFUSE_INTR (source 17 of TRM
  * table 13.4-1), goes to the interrupt matrix, which is not modelled.
  */
 /* [spec:nuos:req:emu.esp32p4.efuse] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
 static void esp32p4_init_efuse(ESP32P4MachineState *s)
 {
+    DeviceState *efuse, *clkrst = DEVICE(&s->clkrst);
+
     object_initialize_child(OBJECT(s), "efuse", &s->efuse,
                             TYPE_ESP32P4_EFUSE);
-    sysbus_realize(SYS_BUS_DEVICE(&s->efuse), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(&s->efuse), 0, ESP32P4_EFUSE_BASE);
+    efuse = DEVICE(&s->efuse);
+    qdev_connect_clock_in(efuse, "clk", qdev_get_clock_out(clkrst, "efuse"));
+    sysbus_realize(SYS_BUS_DEVICE(efuse), &error_fatal);
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_LP_EFUSE,
+                                qdev_get_gpio_in_named(efuse,
+                                    ESP32P4_EFUSE_RESET, 0));
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(efuse), 0,
+                             ESP32P4_EFUSE_BASE, ESP32P4_CLK_LP_EFUSE,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
 }
 
 /* The memories -kernel can load into: those the cores address directly. */
