@@ -124,7 +124,7 @@ static inline int pmp_get_granularity_g(CPURISCVState *env)
 /*
  * Count the number of active rules.
  */
-uint32_t pmp_get_num_rules(CPURISCVState *env)
+static uint32_t pmp_get_num_rules(CPURISCVState *env)
 {
      return env->pmp_state.num_rules;
 }

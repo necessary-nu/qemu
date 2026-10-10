@@ -27,6 +27,7 @@ tests += {
   'test-icount-nodebug.S': setup + {'qemu_args': ['-cpu', 'rv64,debug=false', '-icount', 'shift=1', qemu_args]},
   'test-sfence-vma-no-smode.S': setup + {'qemu_args': ['-cpu', 'rv64,h=false,s=false', qemu_args]},
   'test-mstatus-modes.S': setup,
+  'test-pmp-mret-fetch.S': setup,
 }
 
 tests += {
