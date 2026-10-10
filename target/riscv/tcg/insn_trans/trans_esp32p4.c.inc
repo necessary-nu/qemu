@@ -158,7 +158,8 @@ static bool trans_esp_lp_setup(DisasContext *ctx, arg_lp_setup *a)
 
 /*
  * MRET, followed by the core's own trap-return effects on the trigger
- * enable and the bus-error state, given mstatus from before the return.
+ * enable, the bus-error state and the CLIC, given mstatus from before the
+ * return.
  */
 static bool trans_esp_mret(DisasContext *ctx, arg_esp_mret *a)
 {
@@ -169,7 +170,19 @@ static bool trans_esp_mret(DisasContext *ctx, arg_esp_mret *a)
     gen_update_pc(ctx, 0);
     tcg_gen_ld_i64(mstatus, tcg_env, offsetof(CPURISCVState, mstatus));
     gen_helper_mret(cpu_pc, tcg_env);
-    gen_helper_esp32p4_mret(tcg_env, mstatus);
+    gen_helper_esp32p4_mret(cpu_pc, tcg_env, mstatus, cpu_pc);
+    exit_tb(ctx);
+    ctx->base.is_jmp = DISAS_NORETURN;
+    return true;
+}
+
+/* URET, which the core has for its user-mode interrupt handlers. */
+static bool trans_esp_uret(DisasContext *ctx, arg_esp_uret *a)
+{
+    decode_save_opc(ctx, 0);
+    translator_io_start(&ctx->base);
+    gen_update_pc(ctx, 0);
+    gen_helper_esp32p4_uret(cpu_pc, tcg_env);
     exit_tb(ctx);
     ctx->base.is_jmp = DISAS_NORETURN;
     return true;
@@ -215,6 +228,11 @@ static bool trans_esp_lp_setup(DisasContext *ctx, arg_lp_setup *a)
 }
 
 static bool trans_esp_mret(DisasContext *ctx, arg_esp_mret *a)
+{
+    return false;
+}
+
+static bool trans_esp_uret(DisasContext *ctx, arg_esp_uret *a)
 {
     return false;
 }

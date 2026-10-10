@@ -144,7 +144,8 @@ DEF_HELPER_1(itrigger_match, void, env)
 /* ESP32-P4 HP core: hardware loops and trap return */
 DEF_HELPER_FLAGS_5(esp32p4_hwlp_set, TCG_CALL_NO_WG, void, env, i32, tl, tl, tl)
 DEF_HELPER_4(esp32p4_hwlp_end, tl, env, tl, tl, tl)
-DEF_HELPER_2(esp32p4_mret, void, env, i64)
+DEF_HELPER_3(esp32p4_mret, tl, env, i64, tl)
+DEF_HELPER_1(esp32p4_uret, tl, env)
 #endif
 
 /* Hypervisor functions */
