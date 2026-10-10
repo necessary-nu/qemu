@@ -21,7 +21,9 @@
 #include "hw/misc/esp32p4_clkrst.h"
 #include "hw/misc/esp32p4_hp_sys.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
+#include "hw/misc/esp32p4_icm.h"
 #include "hw/misc/esp32p4_lp_sys.h"
+#include "hw/misc/esp32p4_pms.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "system/memory.h"
 #include "target/riscv/esp32p4_cpu.h"
@@ -104,6 +106,9 @@ struct ESP32P4MachineState {
     /* The entry point of the -kernel ELF, which core 0 starts at; or 0. */
     uint64_t kernel_entry;
     ESP32P4EfuseState efuse;
+    /* The access permission managers, every master's way onto the bus. */
+    ESP32P4PmsState pms;
+    ESP32P4IcmState icm;
 
     SSIBus *flash_bus;
     uint64_t flash_size;

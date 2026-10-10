@@ -56,8 +56,13 @@
  * access, and its code runs one instruction per translation.
  *
  * An access the checks allow goes to the bus with the privilege mode it
- * is made in, MemTxAttrs.user set for user mode, as the bus carries it to
- * the blocks that check it (the interrupt matrix's secure fields).
+ * is made in, MemTxAttrs.user set for user mode, and the core's identity
+ * in MemTxAttrs.requester_id, as the bus carries them to the blocks that
+ * check them: the access permission managers (hw/misc/esp32p4_pms.c) and
+ * the interrupt matrix's secure fields.
+ *
+ * The LP core has machine mode only, no address translation and no PMP:
+ * every access it makes goes to the bus, marked as the LP core's.
  */
 
 #include "qemu/osdep.h"
@@ -70,6 +75,7 @@
 #include "accel/tcg/cpu-loop.h"
 #include "internals.h"
 #include "target/riscv/esp32p4_cpu.h"
+#include "hw/misc/esp32p4_pms.h"
 
 /* The grain both units match at: 128 bytes, the RISC-V G of 5. */
 #define ESP32P4_GRAIN      128
@@ -286,7 +292,10 @@ bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,
     ESP32P4CPU *cpu = container_of(cs, ESP32P4CPU, parent_obj.parent_obj);
     CPURISCVState *env = &cpu->parent_obj.env;
     int priv = mmuidx_priv(mmu_idx);
-    MemTxAttrs attrs = { .user = priv == PRV_U };
+    MemTxAttrs attrs = {
+        .user = priv == PRV_U,
+        .requester_id = ESP32P4_REQUESTER_CPU(env->mhartid),
+    };
     int privs = ESP32P4_RWX;
     uint64_t end = (uint64_t)address + MAX(size, 1);
     uint64_t page = address & TARGET_PAGE_MASK;
@@ -339,6 +348,22 @@ bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,
     env->two_stage_lookup = false;
     env->two_stage_indirect_lookup = false;
     cpu_loop_exit_restore(cs, retaddr);
+}
+
+/* [spec:nuos:req:emu.esp32p4.pms] */
+bool esp32p4_lp_tlb_fill(CPUState *cs, vaddr address, int size,
+                         MMUAccessType access_type, int mmu_idx,
+                         bool probe, uintptr_t retaddr)
+{
+    MemTxAttrs attrs = {
+        .requester_id = ESP32P4_REQUESTER_CPU(ESP32P4_MASTER_LP_CORE),
+    };
+    vaddr page = address & TARGET_PAGE_MASK;
+
+    tlb_set_page_with_attrs(cs, page, page, attrs,
+                            PAGE_READ | PAGE_WRITE | PAGE_EXEC, mmu_idx,
+                            TARGET_PAGE_SIZE);
+    return true;
 }
 
 /* PMP registers */

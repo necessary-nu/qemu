@@ -233,6 +233,7 @@ static void esp32p4_cpu_set_clock(void *opaque, int n, int level)
  */
 static TCGCPUOps esp32p4_tcg_ops;
 static TCGCPUOps esp32p4_hp_tcg_ops;
+static TCGCPUOps esp32p4_lp_tcg_ops;
 
 static ESP32P4CPU *esp32p4_cpu_of(CPUState *cs)
 {
@@ -865,6 +866,22 @@ static void esp32p4_hp_cpu_class_init(ObjectClass *oc, const void *data)
 #endif
 }
 
+/*
+ * The LP core's TCG table: its accesses carry its identity to the access
+ * permission managers.
+ */
+/* [spec:nuos:req:emu.esp32p4.pms] */
+static void esp32p4_lp_cpu_class_init(ObjectClass *oc, const void *data)
+{
+#ifdef CONFIG_TCG
+    CPUClass *cc = CPU_CLASS(oc);
+
+    esp32p4_lp_tcg_ops = esp32p4_tcg_ops;
+    esp32p4_lp_tcg_ops.tlb_fill = esp32p4_lp_tlb_fill;
+    cc->tcg_ops = &esp32p4_lp_tcg_ops;
+#endif
+}
+
 /* [spec:nuos:req:emu.esp32p4.machine] */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
 static const TypeInfo esp32p4_cpu_types[] = {
@@ -913,6 +930,7 @@ static const TypeInfo esp32p4_cpu_types[] = {
     {
         .name = TYPE_ESP32P4_LP_CPU,
         .parent = TYPE_ESP32P4_CPU,
+        .class_init = esp32p4_lp_cpu_class_init,
         .class_data = &(const RISCVCPUDef) {
             .misa_mxl_max = MXL_RV32,
             .misa_ext = RVI | RVM | RVA | RVC,
