@@ -1301,7 +1301,7 @@ static uint32_t opcode_at(DisasContextBase *dcbase, target_ulong pc)
 #define MAX_INSN_LEN  4
 
 const RISCVDecoder decoder_table[] = {
-    /* Ahead of the standard decoder, as it replaces MRET and SFENCE.VMA. */
+    /* Ahead of the standard decoder, as it replaces MRET. */
     { has_xesploop_p, decode_esp32p4 },
     { always_true_p, decode_insn32 },
     { has_xmips_p, decode_xmips},
