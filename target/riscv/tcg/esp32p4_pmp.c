@@ -48,8 +48,9 @@
  * they were.
  *
  * The PMP is this model's own rather than QEMU's generic one, which the
- * CPU's configuration leaves off: that one would fault an MRET to user
- * mode while no entry is set, rather than the fetch that follows it.
+ * CPU's configuration leaves off: that one has neither XL nor the PMA
+ * checker, and refuses an access that lies partly inside an entry rather
+ * than checking it part by part.
  *
  * QEMU's TLB caches a page's permissions only when one entry of each unit,
  * or none, decides the whole page; any other page is checked on every
