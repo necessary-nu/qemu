@@ -758,6 +758,12 @@ FIELD(EXT_TB_FLAGS, BIG_ENDIAN, 33, 1)
  */
 FIELD(EXT_TB_FLAGS, ESP32P4_HWLP_EN, 34, 1)
 FIELD(EXT_TB_FLAGS, ESP32P4_HWLP_ARMED, 35, 1)
+/*
+ * ESP32-P4 HP core PIE extension: its instructions may be used
+ * (mext_pie_status.STATE is not OFF), and its state is already DIRTY.
+ */
+FIELD(EXT_TB_FLAGS, ESP32P4_PIE_EN, 36, 1)
+FIELD(EXT_TB_FLAGS, ESP32P4_PIE_DIRTY, 37, 1)
 
 #ifdef TARGET_RISCV32
 #define riscv_cpu_mxl(env)  ((void)(env), MXL_RV32)

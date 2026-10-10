@@ -231,6 +231,7 @@ void esp32p4_clic_take(ESP32P4CPU *cpu, uint32_t sel)
         cpu->minhv = false;
         cpu->mil = sel_level(sel);
         riscv_cpu_set_mode(env, PRV_M, false);
+        esp32p4_hp_priv_update(cpu);
         handler = env->mtvec & XTVEC_BASE_MASK;
     } else {
         s = set_field(s, MSTATUS_UPIE, get_field(s, MSTATUS_UIE));
@@ -334,6 +335,7 @@ target_ulong helper_esp32p4_uret(CPURISCVState *env)
     cpu->uil = cpu->upil;
     if (env->priv != PRV_U) {
         riscv_cpu_set_mode(env, PRV_U, false);
+        esp32p4_hp_priv_update(cpu);
     }
     return esp32p4_clic_return(cpu, retpc, cpu->uinhv);
 }

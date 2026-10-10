@@ -10,6 +10,7 @@
 #define TARGET_RISCV_ESP32P4_CPU_H
 
 #include "target/riscv/cpu.h"
+#include "target/riscv/esp32p4_pie.h"
 #include "qom/object.h"
 
 #define TYPE_ESP32P4_CPU "esp32p4-cpu"
@@ -36,6 +37,12 @@ OBJECT_DECLARE_TYPE(ESP32P4CPU, ESP32P4CPUClass, ESP32P4_CPU)
 #define ESP32P4_CPU_GPIO_OUT "cpu-gpio-out"
 #define ESP32P4_CPU_GPIO_OE "cpu-gpio-oe"
 #define ESP32P4_CPU_GPIO_IN "cpu-gpio-in"
+
+/*
+ * Named GPIO output of the HP core: high while it executes in machine
+ * mode, for the interrupt matrix's remapping (TRM 13.4.4).
+ */
+#define ESP32P4_CPU_M_MODE "m-mode"
 
 /* The HP core's hardware loops (TRM 2.7.1) and debug triggers (2.11.3). */
 #define ESP32P4_HWLP_LOOPS 2
@@ -161,6 +168,8 @@ struct ESP32P4CPU {
     uint32_t hwlp_state;
     /* mext_pie_status.STATE, the PIE extension's context status. */
     uint32_t pie_state;
+    /* The PIE extension's registers. */
+    ESP32P4PIE pie;
     /* mext_ill */
     uint32_t ext_ill;
     uint32_t mexstatus;
@@ -238,6 +247,9 @@ struct ESP32P4CPU {
 
     qemu_irq gpio_out_irq[ESP32P4_CPU_GPIOS];
     qemu_irq gpio_oe_irq[ESP32P4_CPU_GPIOS];
+    /* ESP32P4_CPU_M_MODE and the level last driven on it. */
+    qemu_irq m_mode_irq;
+    bool m_mode_level;
 };
 
 struct ESP32P4CPUClass {
@@ -303,8 +315,13 @@ void esp32p4_tdata_write(ESP32P4CPU *cpu, int index, target_ulong val);
 /* esp32p4_helper.c */
 void esp32p4_bus_error_check_pending(ESP32P4CPU *cpu);
 
+/* esp32p4_pie.c */
+bool esp32p4_insn_is_pie(uint32_t insn);
+void esp32p4_pie_reset(ESP32P4CPU *cpu);
+
 /* esp32p4_cpu.c */
 void esp32p4_hp_do_interrupt(CPUState *cs);
+void esp32p4_hp_priv_update(ESP32P4CPU *cpu);
 
 /* esp32p4_clic.c */
 void esp32p4_clic_cpu_reset(ESP32P4CPU *cpu);

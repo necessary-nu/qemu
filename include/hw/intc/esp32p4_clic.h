@@ -49,6 +49,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4ClicState, ESP32P4_CLIC)
  * CLIC as it rises and again as it falls; held high, the CLIC presents
  * nothing and ignores writes.
  *
+ * Named GPIO outputs.
+ *
+ * ESP32P4_CLIC_USER: line ESP32P4_CLIC_IRQ_LINE(core, id), high while
+ * interrupt @id of HP core @core is a user-mode one (clicintattr.MODE as
+ * mcliccfg.NMBITS has it), which the interrupt matrix's remapping takes
+ * into account.
+ *
  * Clock inputs "core0" and "core1": each CLIC's bus clock,
  * HP_SYS_CLKRST's CORE<n>_CLIC_CLK. A CLIC whose clock is stopped
  * presents no interrupt, latches no edge and drops writes.
@@ -58,6 +65,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4ClicState, ESP32P4_CLIC)
 #define ESP32P4_CLIC_IRQ        "irq"
 #define ESP32P4_CLIC_IRQ_LINE(core, id) ((core) * ESP32P4_CLIC_NUM_IRQS + (id))
 #define ESP32P4_CLIC_CORE_RESET "core-reset"
+#define ESP32P4_CLIC_USER       "user"
 
 typedef struct ESP32P4ClicCore {
     ESP32P4ClicState *s;
@@ -81,6 +89,9 @@ typedef struct ESP32P4ClicCore {
     uint8_t nmbits;
     uint8_t unlbits;
     bool in_reset;
+    /* The ESP32P4_CLIC_USER outputs and the levels last driven on them. */
+    qemu_irq user_irq[ESP32P4_CLIC_NUM_IRQS];
+    uint64_t user_level;
 } ESP32P4ClicCore;
 
 struct ESP32P4ClicState {

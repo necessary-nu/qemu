@@ -46,8 +46,7 @@
  *     BOOT_ADDR_HP_CORE1, the rest of whose registers are logged as
  *     unimplemented.
  *   - The eFuse controller and its array, on its clock and reset from
- *     LPPERI; nothing takes its interrupt, as the interrupt matrix is not
- *     modelled.
+ *     LPPERI, its interrupt a source of the interrupt matrix.
  *   - Every other peripheral block the chip decodes, as an unimplemented
  *     device named after the block. Addresses the chip does not decode,
  *     the reserved ranges of TRM table 9.3-1 and the unassigned slots
@@ -58,8 +57,15 @@
  *     0x20000000, each core seeing its own at the base and the other
  *     core's 64 KiB above; the CLINT's counter counts CPU_CLK, each
  *     core's registers behind its CLIC bus clock, and each core's CLIC
- *     resets with the core. Nothing drives the CLICs' external interrupts
- *     yet, as the interrupt matrix is not modelled.
+ *     resets with the core.
+ *   - The interrupt matrix (TRM chapter 13) at 0x500D6000, core 0's and
+ *     core 1's 2 KiB above, behind its bus clock and reset: every
+ *     peripheral interrupt source, as its source input, to the CLIC
+ *     external interrupts 16 to 47 of either HP core, remapped as each
+ *     core's mode and its CLIC's user-mode interrupts decide. Of HP_SYSTEM
+ *     (0x500E5000), the cores' software interrupts CPU_INTR_FROM_CPU_0 to
+ *     _3, sources of the matrix; the rest of its registers are logged as
+ *     unimplemented. A source no modelled block drives stays low.
  *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
@@ -198,7 +204,6 @@ static const struct {
     { "usb-serial-jtag",  0x500d2000, 4 * KiB },
     { "ledc",             0x500d3000, 4 * KiB },
     { "etm",              0x500d5000, 4 * KiB },
-    { "intmtx",           0x500d6000, 4 * KiB },
     { "twai0",            0x500d7000, 4 * KiB },
     { "twai1",            0x500d8000, 4 * KiB },
     { "twai2",            0x500d9000, 4 * KiB },
@@ -212,7 +217,6 @@ static const struct {
     { "systimer",         0x500e2000, 4 * KiB },
     { "mem-monitor",      0x500e3000, 4 * KiB },
     { "audio-addc",       0x500e4000, 4 * KiB },
-    { "hp-sys",           0x500e5000, 4 * KiB },
 
     /* The LP ROM, whose contents Espressif does not publish. */
     { "lp-rom",           ESP32P4_LP_ROM_BASE, ESP32P4_LP_ROM_SIZE },
@@ -578,12 +582,80 @@ static void esp32p4_init_core_local(ESP32P4MachineState *s)
 }
 
 /*
+ * The interrupt matrix's input for interrupt source @source, an
+ * ESP32P4_INTR_* number, to which the machine connects the interrupt
+ * output of the block that raises it (hw/intc/esp32p4_intmatrix.h).
+ */
+static qemu_irq esp32p4_intr_source(ESP32P4MachineState *s, int source)
+{
+    return qdev_get_gpio_in_named(DEVICE(&s->intmatrix),
+                                  ESP32P4_INTMATRIX_SOURCE, source);
+}
+
+/*
+ * The interrupt matrix, its registers behind INTRMTX_APB_CLK and its
+ * reset, between the sources and the CLIC external interrupts of both HP
+ * cores; for its remapping, each core's machine mode and which of its
+ * CLIC's interrupts are user-mode ones. And HP_SYSTEM's software
+ * interrupts, behind SYSREG_APB_CLK, which are among its sources.
+ */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_intmatrix(ESP32P4MachineState *s)
+{
+    DeviceState *clic = DEVICE(&s->clic);
+    DeviceState *intmatrix, *hp_sys;
+    int core, n;
+
+    object_initialize_child(OBJECT(s), "intmatrix", &s->intmatrix,
+                            TYPE_ESP32P4_INTMATRIX);
+    intmatrix = DEVICE(&s->intmatrix);
+    sysbus_realize(SYS_BUS_DEVICE(intmatrix), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(intmatrix), 0,
+                             ESP32P4_INTMATRIX_BASE, ESP32P4_CLK_INTRMTX_APB,
+                             ESP32P4_RST_INTRMTX, 0);
+    for (core = 0; core < ESP32P4_HP_CORES; core++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->hp_cpu[core]),
+                                    ESP32P4_CPU_M_MODE, 0,
+                                    qdev_get_gpio_in_named(intmatrix,
+                                        ESP32P4_INTMATRIX_CORE_M_MODE,
+                                        core));
+        for (n = 0; n < ESP32P4_INTMATRIX_LINES; n++) {
+            int line = core * ESP32P4_INTMATRIX_LINES + n;
+            int id = ESP32P4_CLIC_IRQ_LINE(core, ESP32P4_CLIC_IRQ_EXT0 + n);
+
+            qdev_connect_gpio_out_named(intmatrix, ESP32P4_INTMATRIX_IRQ,
+                                        line,
+                                        qdev_get_gpio_in_named(clic,
+                                            ESP32P4_CLIC_IRQ, id));
+            qdev_connect_gpio_out_named(clic, ESP32P4_CLIC_USER, id,
+                                        qdev_get_gpio_in_named(intmatrix,
+                                            ESP32P4_INTMATRIX_LINE_USER,
+                                            line));
+        }
+    }
+
+    object_initialize_child(OBJECT(s), "hp-sys", &s->hp_sys,
+                            TYPE_ESP32P4_HP_SYS);
+    hp_sys = DEVICE(&s->hp_sys);
+    sysbus_realize(SYS_BUS_DEVICE(hp_sys), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(hp_sys), 0,
+                             ESP32P4_HP_SYS_BASE, ESP32P4_CLK_SYSREG_APB,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    for (n = 0; n < ESP32P4_HP_SYS_CPU_INTRS; n++) {
+        qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_CPU_INTR, n,
+                                    esp32p4_intr_source(s,
+                                        ESP32P4_INTR_FROM_CPU_INTR0 + n));
+    }
+}
+
+/*
  * The eFuse controller, on its clock and reset from LPPERI, its registers
- * behind its bus clock. Its interrupt, LP_EFUSE_INTR (source 17 of TRM
- * table 13.4-1), goes to the interrupt matrix, which is not modelled.
+ * behind its bus clock. Its interrupt is LP_EFUSE_INTR, source 17 of the
+ * interrupt matrix.
  */
 /* [spec:nuos:req:emu.esp32p4.efuse] */
 /* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
 static void esp32p4_init_efuse(ESP32P4MachineState *s)
 {
     DeviceState *efuse, *clkrst = DEVICE(&s->clkrst);
@@ -600,6 +672,8 @@ static void esp32p4_init_efuse(ESP32P4MachineState *s)
     esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(efuse), 0,
                              ESP32P4_EFUSE_BASE, ESP32P4_CLK_LP_EFUSE,
                              ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(efuse), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_EFUSE));
 }
 
 /* The memories -kernel can load into: those the cores address directly. */
@@ -731,6 +805,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_cpus(s);
     esp32p4_init_clocks(s);
     esp32p4_init_core_local(s);
+    esp32p4_init_intmatrix(s);
     esp32p4_init_efuse(s);
     esp32p4_init_flash(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {

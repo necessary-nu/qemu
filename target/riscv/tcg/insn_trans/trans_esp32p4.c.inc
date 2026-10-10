@@ -243,3 +243,5 @@ static bool trans_esp_sfence_vma(DisasContext *ctx, arg_esp_sfence_vma *a)
 }
 
 #endif
+
+#include "trans_esp32p4_pie.c.inc"
