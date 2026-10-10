@@ -1,0 +1,45 @@
+#
+# Espressif ESP32-P4 HP core: the hardware loop instructions (Xesploop,
+# TRM table 2.7-2) on the custom-1 opcode; MRET, whose return also
+# restores the core's trigger and bus-error enables; and SFENCE.VMA, which
+# a core without supervisor mode does not have.
+#
+# Copyright (c) 2026 Necessary Innovations AB
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Bits the TRM marks "X" are ignored. Offsets are unsigned and in
+# halfwords; lp.setupi splits its end offset between bits 11:8 (offset
+# bits 9:6) and 19:15 (offset bits 5:1). Bit 9 of lp.setup gives the size
+# of the loop's last instruction, which a zero count skips: set for a
+# 32-bit instruction, clear for a 16-bit one.
+
+%lp_loop     7:1
+%lp_rs1      15:5
+%lp_uimm     20:12
+%lp_off12    20:12        !function=ex_shift_1
+%lp_off10    8:4 15:5     !function=ex_shift_1
+%lp_size32   9:1
+
+&lp_imm      loop imm
+&lp_reg      loop rs1
+&lp_setup    loop rs1 off size32
+&lp_setupi   loop count off
+
+@lp_off      ............ ----- ... ---- . ....... &lp_imm loop=%lp_loop imm=%lp_off12
+@lp_cnti     ............ ----- ... ---- . ....... &lp_imm loop=%lp_loop imm=%lp_uimm
+@lp_reg      ------------ ..... ... ---- . ....... &lp_reg loop=%lp_loop rs1=%lp_rs1
+@lp_setup    ............ ..... ... --.- . ....... &lp_setup \
+             loop=%lp_loop rs1=%lp_rs1 off=%lp_off12 size32=%lp_size32
+@lp_setupi   ............ ..... ... .... . ....... &lp_setupi \
+             loop=%lp_loop count=%lp_uimm off=%lp_off10
+
+esp_lp_starti   ............ ----- 000 ---- . 0101011 @lp_off
+esp_lp_endi     ............ ----- 001 ---- . 0101011 @lp_off
+esp_lp_count    ------------ ..... 010 ---- . 0101011 @lp_reg
+esp_lp_counti   ............ ----- 011 ---- . 0101011 @lp_cnti
+esp_lp_setup    ............ ..... 100 --.- . 0101011 @lp_setup
+esp_lp_setupi   ............ ..... 101 .... . 0101011 @lp_setupi
+
+esp_mret        0011000 00010 00000 000 00000 1110011
+esp_sfence_vma  0001001 ----- ----- 000 00000 1110011

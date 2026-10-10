@@ -159,12 +159,19 @@ BOOL_FIELD(ext_xmipscbop)
 BOOL_FIELD(ext_xmipscmov)
 BOOL_FIELD(ext_xmipslsp)
 BOOL_FIELD(ext_xlrbr)
+BOOL_FIELD(ext_xesploop)
 
 BOOL_FIELD(big_endian)
 BOOL_FIELD(mmu)
 BOOL_FIELD(pmp)
 BOOL_FIELD(debug)
 BOOL_FIELD(misa_w)
+/*
+ * cm.push stores its register list from ra upwards starting at the
+ * highest address, and cm.pop and cm.popret load it from there, the
+ * reverse of the ratified Zcmp order, as the ESP32-P4 HP core does.
+ */
+BOOL_FIELD(zcmp_ra_highest)
 
 BOOL_FIELD(short_isa_string)
 

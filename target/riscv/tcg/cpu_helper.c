@@ -418,7 +418,8 @@ bool riscv_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
         int interruptno = riscv_cpu_local_irq_pending(env);
         if (interruptno >= 0) {
             cs->exception_index = RISCV_EXCP_INT_FLAG | interruptno;
-            riscv_cpu_do_interrupt(cs);
+            /* Through the class hook, which a CPU type may extend. */
+            cs->cc->tcg_ops->do_interrupt(cs);
             return true;
         }
     }

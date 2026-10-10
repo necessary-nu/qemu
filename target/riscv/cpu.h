@@ -751,6 +751,13 @@ FIELD(TB_FLAGS, PM_SIGNEXTEND, 31, 1)
 FIELD(EXT_TB_FLAGS, MISA_EXT, 0, 32)
 FIELD(EXT_TB_FLAGS, ALTFMT, 32, 1)
 FIELD(EXT_TB_FLAGS, BIG_ENDIAN, 33, 1)
+/*
+ * ESP32-P4 HP core hardware loops: their instructions and CSRs may be
+ * used, and a loop is counting, so that every instruction may be the end
+ * of one.
+ */
+FIELD(EXT_TB_FLAGS, ESP32P4_HWLP_EN, 34, 1)
+FIELD(EXT_TB_FLAGS, ESP32P4_HWLP_ARMED, 35, 1)
 
 #ifdef TARGET_RISCV32
 #define riscv_cpu_mxl(env)  ((void)(env), MXL_RV32)
