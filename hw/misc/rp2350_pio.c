@@ -1551,8 +1551,10 @@ static uint64_t pio_now(RP2350PIOState *s)
  */
 /*
  * Apply the queued pin changes from outside, each in the cycle it came
- * in. Returns false if the blocks ran out of host time on the way; the
- * rest then apply at once.
+ * in, to the pins it changed: the blocks' own pins, which come back
+ * through the pads as the blocks run up to that cycle, keep the levels
+ * the blocks gave them. Returns false if the blocks ran out of host time
+ * on the way; the rest then apply at once.
  */
 static bool pio_apply_inputs(RP2350PIOState *s)
 {
@@ -1563,7 +1565,9 @@ static bool pio_apply_inputs(RP2350PIOState *s)
         if (ok && s->inq_cycle[k] > s->core.cycle) {
             ok = core_run(s, &s->core, s->inq_cycle[k], false) != RUN_SLOW;
         }
-        core_input(&s->core, s->inq_vec[k], s->core.cycle);
+        core_input(&s->core,
+                   (s->core.in_val[s->core.in_n - 1] & ~s->inq_mask[k]) |
+                   (s->inq_vec[k] & s->inq_mask[k]), s->core.cycle);
     }
     s->inq_n = 0;
     return ok;
@@ -1668,16 +1672,20 @@ static void pio_in(void *opaque, int n, int level)
         core_input(&s->core, vec, s->core.cycle);
         return;
     }
-    if (s->inq_n && s->inq_cycle[s->inq_n - 1] >= pio_now(s)) {
-        s->inq_vec[s->inq_n - 1] = vec;
-    } else if (s->inq_n < RP2350_PIO_IN_QUEUE) {
-        s->inq_vec[s->inq_n] = vec;
+    if (!s->inq_n || (s->inq_cycle[s->inq_n - 1] < pio_now(s) &&
+                      s->inq_n < RP2350_PIO_IN_QUEUE)) {
+        s->inq_vec[s->inq_n] = 0;
+        s->inq_mask[s->inq_n] = 0;
         s->inq_cycle[s->inq_n] = pio_now(s);
         s->inq_n++;
-    } else {
-        /* Changes this frequent are merged into the newest. */
-        s->inq_vec[s->inq_n - 1] = vec;
     }
+    /*
+     * Changes in the same cycle, or more frequent than the queue holds,
+     * are merged into the newest.
+     */
+    s->inq_vec[s->inq_n - 1] = deposit64(s->inq_vec[s->inq_n - 1], n, 1,
+                                         level != 0);
+    s->inq_mask[s->inq_n - 1] |= BIT_ULL(n);
     /* The run ahead assumed the pins would not change. */
     s->spec_valid = false;
     s->horizon = HORIZON_MIN;
@@ -2387,6 +2395,12 @@ static int rp2350_pio_post_load(void *opaque, int version_id)
 
     s->spec_valid = false;
     s->busy = false;
+    if (version_id < 2) {
+        /* Entries from before inq_mask carry every pin's level. */
+        for (uint32_t k = 0; k < s->inq_n; k++) {
+            s->inq_mask[k] = UINT64_MAX;
+        }
+    }
     if (s->inq_n) {
         timer_mod(s->in_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }
@@ -2395,7 +2409,7 @@ static int rp2350_pio_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_rp2350_pio = {
     .name = TYPE_RP2350_PIO,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = rp2350_pio_post_load,
     .fields = (const VMStateField[]) {
@@ -2410,6 +2424,8 @@ static const VMStateDescription vmstate_rp2350_pio = {
         VMSTATE_UINT64_ARRAY(inq_vec, RP2350PIOState, RP2350_PIO_IN_QUEUE),
         VMSTATE_UINT64_ARRAY(inq_cycle, RP2350PIOState, RP2350_PIO_IN_QUEUE),
         VMSTATE_UINT32(inq_n, RP2350PIOState),
+        VMSTATE_UINT64_ARRAY_V(inq_mask, RP2350PIOState, RP2350_PIO_IN_QUEUE,
+                               2),
         VMSTATE_UINT64_ARRAY(drv_out, RP2350PIOState, RP2350_PIO_BLOCKS),
         VMSTATE_UINT64_ARRAY(drv_oe, RP2350PIOState, RP2350_PIO_BLOCKS),
         VMSTATE_UINT32(drv_irq, RP2350PIOState),
