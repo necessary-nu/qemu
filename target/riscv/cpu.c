@@ -982,6 +982,10 @@ static void riscv_cpu_reset_hold(Object *obj, ResetType type)
     env->misa_mxl = mcc->def->misa_mxl_max;
     env->priv = PRV_M;
     env->mstatus &= ~(MSTATUS_MIE | MSTATUS_MPRV);
+    /* MPP holds M-mode alone on a hart without U-mode. */
+    if (!riscv_has_ext(env, RVU)) {
+        env->mstatus = set_field(env->mstatus, MSTATUS_MPP, PRV_M);
+    }
     if (env->misa_mxl > MXL_RV32) {
         /*
          * The reset status of SXL/UXL is undefined, but mstatus is WARL

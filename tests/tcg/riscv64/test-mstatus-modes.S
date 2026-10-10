@@ -3,7 +3,8 @@
  *
  * SIE, SPIE, SPP, SUM, MXR, TVM, TSR and SXL are read-only zero on a hart
  * without S-mode, and MPRV, TW and UXL on a hart without U-mode; otherwise
- * they are writable. misa says which modes the hart has.
+ * they are writable. MPP holds M-mode alone on a hart without U-mode.
+ * misa says which modes the hart has.
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -13,6 +14,7 @@
 #define MSTATUS_SIE	(1 << 1)
 #define MSTATUS_SPIE	(1 << 5)
 #define MSTATUS_SPP	(1 << 8)
+#define MSTATUS_MPP	(3 << 11)
 #define MSTATUS_MPRV	(1 << 17)
 #define MSTATUS_SUM	(1 << 18)
 #define MSTATUS_MXR	(1 << 19)
@@ -39,6 +41,21 @@
 _start:
 	lla	t0, fail
 	csrw	mtvec, t0
+
+	/* Without U-mode, MPP holds M-mode from reset on. */
+	csrr	t0, misa
+	li	t1, MISA_U
+	and	t1, t0, t1
+	bnez	t1, 0f
+	li	t0, MSTATUS_MPP
+	csrr	t1, mstatus
+	and	t1, t1, t0
+	bne	t1, t0, fail
+	csrc	mstatus, t0
+	csrr	t1, mstatus
+	and	t1, t1, t0
+	bne	t1, t0, fail
+0:
 
 	/* The fields that should stick, given the modes in misa. */
 	li	s0, 0
