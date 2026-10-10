@@ -13,10 +13,10 @@
  * specification v1.0.4-3, so with Zca and, on RV32F, Zcf) and the Zb
  * extensions (Zba, Zbb, Zbc and Zbs of the v1.0.0 specification), in
  * machine and user mode, with the hardware loop extension (Xesploop),
- * Espressif's CSRs and a three-trigger debug module; the CSRs, triggers
- * and hardware loops are in tcg/esp32p4_*.c. The LP core implements
- * RV32IMAC in machine mode only. Neither type carries the CLIC, the PMA
- * checker or the PIE extension.
+ * the Processor Instruction Extensions (Xespv2p2), Espressif's CSRs and a
+ * three-trigger debug module; the CSRs, triggers, hardware loops and PIE
+ * are in tcg/esp32p4_*.c. The LP core implements RV32IMAC in machine mode
+ * only. Neither type carries the CLIC or the PMA checker.
  *
  * misa on an HP core reads 0x40901127: RV32 with A, B, C, F, I, M, U and
  * X. The TRM's register table gives B and X but clears F, while the TRM
@@ -235,10 +235,11 @@ static bool esp32p4_csr_is_hwlp(int csr)
 /*
  * mext_ill records an illegal instruction exception raised because the
  * instruction, or the CSR it accesses, belongs to an extension that is
- * off: F with mstatus.FS off, or the hardware loops with
- * mhwloop_state_reg.STATE off.
+ * off: F with mstatus.FS off, the hardware loops with
+ * mhwloop_state_reg.STATE off, or PIE with mext_pie_status.STATE off.
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
+/* [spec:nuos:req:emu.esp32p4.pie] */
 static uint32_t esp32p4_illegal_reason(ESP32P4CPU *cpu, uint32_t insn)
 {
     CPURISCVState *env = &cpu->parent_obj.env;
@@ -252,6 +253,10 @@ static uint32_t esp32p4_illegal_reason(ESP32P4CPU *cpu, uint32_t insn)
     if ((cpu->hwlp_state & ESP32P4_HWLP_STATE) == ESP32P4_EXT_OFF &&
         (esp32p4_insn_is_hwlp(insn) || esp32p4_csr_is_hwlp(csr))) {
         reason |= ESP32P4_EXT_ILL_HWLP;
+    }
+    if ((cpu->pie_state & ESP32P4_HWLP_STATE) == ESP32P4_EXT_OFF &&
+        esp32p4_insn_is_pie(insn)) {
+        reason |= ESP32P4_EXT_ILL_PIE;
     }
     return reason;
 }
@@ -303,12 +308,24 @@ static void esp32p4_hp_trap_entry(ESP32P4CPU *cpu, int32_t excp)
     cpu->tcontrol &= ~ESP32P4_TCONTROL_MTE;
 }
 
+/*
+ * The PIE illegal instruction exception (cause 0x1f) leaves the
+ * instruction in mtval, which QEMU's trap code only does for its own
+ * illegal instruction cause.
+ */
+/* [spec:nuos:req:emu.esp32p4.pie] */
 static void esp32p4_hp_do_interrupt(CPUState *cs)
 {
-    if (cs->exception_index != RISCV_EXCP_SEMIHOST) {
-        esp32p4_hp_trap_entry(esp32p4_cpu_of(cs), cs->exception_index);
+    CPURISCVState *env = cpu_env(cs);
+    int32_t excp = cs->exception_index;
+
+    if (excp != RISCV_EXCP_SEMIHOST) {
+        esp32p4_hp_trap_entry(esp32p4_cpu_of(cs), excp);
     }
     esp32p4_tcg_ops.do_interrupt(cs);
+    if (excp == ESP32P4_EXCP_PIE_ILLEGAL) {
+        env->mtval = env->bins;
+    }
 }
 
 /*
@@ -405,10 +422,13 @@ static G_NORETURN void esp32p4_hp_do_unaligned_access(CPUState *cs,
 }
 
 /*
- * The hardware loop state the translation of a block depends on: whether
- * the loop instructions may be used, and whether a loop counts.
+ * The hardware loop and PIE state the translation of a block depends on:
+ * whether the loop instructions may be used, and whether a loop counts;
+ * whether the PIE instructions may be used, and whether the PIE state is
+ * already dirty.
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
+/* [spec:nuos:req:emu.esp32p4.pie] */
 static TCGTBCPUState esp32p4_hp_get_tb_cpu_state(CPUState *cs)
 {
     ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
@@ -420,6 +440,16 @@ static TCGTBCPUState esp32p4_hp_get_tb_cpu_state(CPUState *cs)
             s.cs_base = FIELD_DP64(s.cs_base, EXT_TB_FLAGS,
                                    ESP32P4_HWLP_ARMED, 1);
         }
+    }
+    switch (cpu->pie_state & ESP32P4_HWLP_STATE) {
+    case ESP32P4_EXT_OFF:
+        break;
+    case ESP32P4_EXT_DIRTY:
+        s.cs_base = FIELD_DP64(s.cs_base, EXT_TB_FLAGS, ESP32P4_PIE_DIRTY, 1);
+        /* fall through */
+    default:
+        s.cs_base = FIELD_DP64(s.cs_base, EXT_TB_FLAGS, ESP32P4_PIE_EN, 1);
+        break;
     }
     return s;
 }
@@ -449,6 +479,7 @@ static void esp32p4_hp_reset_hold(ESP32P4CPU *cpu)
     memset(cpu->mhpmevent, 0, sizeof(cpu->mhpmevent));
     cpu->mcountinhibit_tm = false;
     esp32p4_triggers_reset(cpu);
+    esp32p4_pie_reset(cpu);
     cpu_reset_interrupt(CPU(cpu), ESP32P4_CPU_INTERRUPT_BUS_ERROR);
 }
 #endif
@@ -522,6 +553,26 @@ static int esp32p4_hp_state_post_load(void *opaque, int version_id)
     return 0;
 }
 
+/* [spec:nuos:req:emu.esp32p4.pie] */
+static const VMStateDescription vmstate_esp32p4_pie = {
+    .name = "esp32p4-cpu/pie",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = esp32p4_hp_state_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64_2DARRAY(pie.q, ESP32P4CPU, ESP32P4_PIE_QREGS, 2),
+        VMSTATE_UINT64_ARRAY(pie.qacc, ESP32P4CPU, 8),
+        VMSTATE_UINT64_ARRAY(pie.ua_state, ESP32P4CPU, 2),
+        VMSTATE_UINT64(pie.xacc, ESP32P4CPU),
+        VMSTATE_UINT32(pie.sar, ESP32P4CPU),
+        VMSTATE_UINT32(pie.sar_byte, ESP32P4CPU),
+        VMSTATE_UINT32(pie.fft_bit_width, ESP32P4CPU),
+        VMSTATE_UINT32(pie.cfg, ESP32P4CPU),
+        VMSTATE_UINT32(pie.perf, ESP32P4CPU),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_esp32p4_hp_state = {
     .name = "esp32p4-cpu/hp",
     .version_id = 1,
@@ -575,6 +626,7 @@ static const VMStateDescription vmstate_esp32p4_cpu = {
 #ifdef CONFIG_TCG
     .subsections = (const VMStateDescription * const []) {
         &vmstate_esp32p4_hp_state,
+        &vmstate_esp32p4_pie,
         NULL
     },
 #endif

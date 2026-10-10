@@ -22,6 +22,7 @@ riscv_system_ss.add(files(
   'debug.c',
   'esp32p4_csr.c',
   'esp32p4_helper.c',
+  'esp32p4_pie.c',
   'esp32p4_trigger.c',
   'mips_csr.c',
   'pmp.c',

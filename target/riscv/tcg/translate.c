@@ -130,6 +130,12 @@ typedef struct DisasContext {
     /* ESP32-P4 HP core: hardware loops may be used, and one is counting. */
     bool hwlp_en;
     bool hwlp_armed;
+    /*
+     * ESP32-P4 HP core: PIE instructions may be used, and the extension's
+     * state is DIRTY, as it is after any PIE instruction.
+     */
+    bool pie_en;
+    bool pie_dirty;
 } DisasContext;
 
 static inline bool has_ext(DisasContext *ctx, uint32_t ext)
@@ -1420,6 +1426,9 @@ static void riscv_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->hwlp_en = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, ESP32P4_HWLP_EN);
     ctx->hwlp_armed = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS,
                                  ESP32P4_HWLP_ARMED);
+    ctx->pie_en = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, ESP32P4_PIE_EN);
+    ctx->pie_dirty = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS,
+                                ESP32P4_PIE_DIRTY);
 }
 
 static void riscv_tr_tb_start(DisasContextBase *db, CPUState *cpu)
