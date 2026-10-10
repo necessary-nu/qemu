@@ -7,7 +7,7 @@
  *
  * Reference: ESP32-P4 Technical Reference Manual (v3.x silicon), 2.5
  * (Configuration and Status Registers), 2.6.3 (F Extension), 2.7.1
- * (Hardware Loop) and 2.11.3 (Hardware Trigger).
+ * (Hardware Loop), 2.9.2 (CLIC) and 2.11.3 (Hardware Trigger).
  *
  * The CSRs the HP core has beyond, or differently from, the standard set
  * QEMU's RISC-V CPU provides for its configuration. QEMU's vendor CSR
@@ -19,7 +19,8 @@
  * Absent on the HP core, and so illegal: mstatush, menvcfg, menvcfgh and
  * mconfigptr (the core follows privileged architecture 1.10), every
  * event selector but mhpmevent8, 9 and 13, and pmpcfg8-15 and
- * pmpaddr32-63 beyond its 32 PMP entries. The counters other than those
+ * pmpaddr32-63 beyond its 32 PMP entries; timeh, uie, uip and utval,
+ * which the TRM's CSR list leaves out. The counters other than those
  * three are left out by the CPU's PMU mask.
  *
  * An access the core does not permit raises an illegal instruction
@@ -73,9 +74,57 @@
 #define CSR_ESP_PMACFG0         0xbc0
 #define CSR_ESP_PMAADDR0        0xbd0
 
+/* The CLIC's CSRs (TRM 2.5, 2.9.2.2). */
+#define CSR_ESP_USTATUS         0x000
+#define CSR_ESP_UTVEC           0x005
+#define CSR_ESP_UTVT            0x007
+#define CSR_ESP_USCRATCH        0x040
+#define CSR_ESP_UEPC            0x041
+#define CSR_ESP_UCAUSE          0x042
+#define CSR_ESP_UNXTI           0x045
+#define CSR_ESP_UINTTHRESH      0x047
+#define CSR_ESP_UCLICBASE       0x050
+#define CSR_ESP_MTVT            0x307
+#define CSR_ESP_MNXTI           0x345
+#define CSR_ESP_MINTTHRESH      0x347
+#define CSR_ESP_MSCRATCHCSW     0x348
+#define CSR_ESP_MSCRATCHCSWL    0x349
+#define CSR_ESP_MCLICBASE       0x350
+#define CSR_ESP_UINTSTATUS      0xcb1
+#define CSR_ESP_MINTSTATUS      0xfb1
+
 /* mstatus fields the core implements, other than the read-only XS and SD. */
 #define ESP32P4_MSTATUS_MASK (MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP | \
-                              MSTATUS_FS | MSTATUS_MPRV | MSTATUS_TW)
+                              MSTATUS_FS | MSTATUS_MPRV | MSTATUS_TW | \
+                              MSTATUS_UIE | MSTATUS_UPIE)
+
+/*
+ * The user-mode interrupt enables, which QEMU's mstatus does not keep:
+ * this table writes them itself.
+ */
+#define ESP32P4_MSTATUS_U_IE (MSTATUS_UIE | MSTATUS_UPIE)
+
+/*
+ * ustatus: the fields of mstatus user mode sees, of which FS, UIE and
+ * UPIE are writable.
+ */
+#define ESP32P4_USTATUS_MASK (MSTATUS32_SD | MSTATUS_TW | MSTATUS_MPRV | \
+                              MSTATUS_XS | MSTATUS_FS | MSTATUS_MPP | \
+                              MSTATUS_MPIE | MSTATUS_UPIE | MSTATUS_MIE | \
+                              MSTATUS_UIE)
+#define ESP32P4_USTATUS_WMASK (MSTATUS_FS | MSTATUS_UIE | MSTATUS_UPIE)
+
+/* mcause and ucause in CLIC mode. */
+#define ESP32P4_XCAUSE_INT      BIT(31)
+#define ESP32P4_XCAUSE_INHV     BIT(30)
+#define ESP32P4_MCAUSE_MPP      (3u << 28)
+#define ESP32P4_XCAUSE_PIE      BIT(27)
+#define ESP32P4_XCAUSE_PIL_SHIFT 16
+#define ESP32P4_XCAUSE_CODE     0x3f
+
+/* mtvec, utvec, mtvt and utvt: 64-byte aligned bases; MODE is CLIC. */
+#define ESP32P4_XTVEC_BASE      (~(target_ulong)0x3f)
+#define ESP32P4_XTVEC_MODE_CLIC 3
 
 /* mhcr: the return stack, branch prediction and branch target buffer. */
 #define ESP32P4_MHCR_MASK (BIT(4) | BIT(5) | BIT(12))
@@ -155,6 +204,40 @@ static RISCVException std_write(CPURISCVState *env, int csrno,
 }
 
 /*
+ * The standard access to a CSR whose operation this table replaces with a
+ * read-modify-write one, as QEMU's CSR access would make it.
+ */
+static RISCVException std_op(CPURISCVState *env, int csrno,
+                             target_ulong *ret_value, target_ulong new_value,
+                             target_ulong write_mask)
+{
+    const riscv_csr_operations *ops = esp32p4_std(csrno);
+    target_ulong old_value = 0;
+    RISCVException ret;
+
+    if (ops->op) {
+        return ops->op(env, csrno, ret_value, new_value, write_mask);
+    }
+    if (ret_value) {
+        ret = std_read(env, csrno, &old_value);
+        if (ret != RISCV_EXCP_NONE) {
+            return ret;
+        }
+    }
+    if (write_mask) {
+        ret = std_write(env, csrno, (old_value & ~write_mask) |
+                                    (new_value & write_mask), 0);
+        if (ret != RISCV_EXCP_NONE) {
+            return ret;
+        }
+    }
+    if (ret_value) {
+        *ret_value = old_value;
+    }
+    return RISCV_EXCP_NONE;
+}
+
+/*
  * Save the standard operations of the CSRs the table below replaces,
  * before any HP core installs it.
  */
@@ -229,20 +312,35 @@ static RISCVException read_mstatus(CPURISCVState *env, int csrno,
 }
 
 /* [spec:nuos:req:emu.esp32p4.cpu] */
+/* [spec:nuos:req:emu.esp32p4.clic] */
 static RISCVException write_mstatus(CPURISCVState *env, int csrno,
                                     target_ulong val, uintptr_t ra)
 {
-    if (esp32p4_env_is_hp(env)) {
-        val = (env->mstatus & ~ESP32P4_MSTATUS_MASK) |
-              (val & ESP32P4_MSTATUS_MASK);
-        val = set_field(val, MSTATUS_MPP,
-                        (val & BIT(11)) ? PRV_M : PRV_U);
+    RISCVException ret;
+
+    if (!esp32p4_env_is_hp(env)) {
+        return std_write(env, csrno, val, ra);
     }
-    return std_write(env, csrno, val, ra);
+    val = (env->mstatus & ~ESP32P4_MSTATUS_MASK) |
+          (val & ESP32P4_MSTATUS_MASK);
+    val = set_field(val, MSTATUS_MPP, (val & BIT(11)) ? PRV_M : PRV_U);
+    ret = std_write(env, csrno, val, ra);
+    if (ret == RISCV_EXCP_NONE) {
+        env->mstatus = (env->mstatus & ~ESP32P4_MSTATUS_U_IE) |
+                       (val & ESP32P4_MSTATUS_U_IE);
+    }
+    return ret;
 }
 
 static RISCVException read_absent(CPURISCVState *env, int csrno,
                                   target_ulong *val)
+{
+    return std_read(env, csrno, val);
+}
+
+/* A standard CSR whose reads the HP core leaves as they are. */
+static RISCVException read_std(CPURISCVState *env, int csrno,
+                               target_ulong *val)
 {
     return std_read(env, csrno, val);
 }
@@ -876,8 +974,348 @@ static RISCVException write_bus_error(CPURISCVState *env, int csrno,
     return RISCV_EXCP_NONE;
 }
 
+/* CLIC */
+
+/*
+ * mie, mip and mideleg: inactive in CLIC mode, they read zero and ignore
+ * writes, which do not trap; the boot ROM clears mie.
+ */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException rmw_clint_ie_ip(CPURISCVState *env, int csrno,
+                                      target_ulong *ret_value,
+                                      target_ulong new_value,
+                                      target_ulong write_mask)
+{
+    if (!esp32p4_env_is_hp(env)) {
+        return std_op(env, csrno, ret_value, new_value, write_mask);
+    }
+    if (ret_value) {
+        *ret_value = 0;
+    }
+    return RISCV_EXCP_NONE;
+}
+
+/* mtvec: MODE is hard-wired to CLIC mode, and the base 64-byte aligned. */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException write_mtvec(CPURISCVState *env, int csrno,
+                                  target_ulong val, uintptr_t ra)
+{
+    if (!esp32p4_env_is_hp(env)) {
+        return std_write(env, csrno, val, ra);
+    }
+    env->mtvec = (val & ESP32P4_XTVEC_BASE) | ESP32P4_XTVEC_MODE_CLIC;
+    return RISCV_EXCP_NONE;
+}
+
+/*
+ * mcause: INT and the code are the standard register's; MPP and MPIE are
+ * mstatus's, MPP's upper bit following its lower one as there; MPIL and
+ * MINHV are the CLIC's.
+ */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException read_mcause(CPURISCVState *env, int csrno,
+                                  target_ulong *val)
+{
+    ESP32P4CPU *cpu;
+
+    if (!esp32p4_env_is_hp(env)) {
+        return std_read(env, csrno, val);
+    }
+    cpu = esp32p4_cpu_from_env(env);
+    *val = (env->mcause & (ESP32P4_XCAUSE_INT | ESP32P4_XCAUSE_CODE)) |
+           (cpu->minhv ? ESP32P4_XCAUSE_INHV : 0) |
+           (get_field(env->mstatus, MSTATUS_MPP) << 28) |
+           (get_field(env->mstatus, MSTATUS_MPIE) ? ESP32P4_XCAUSE_PIE : 0) |
+           (cpu->mpil << ESP32P4_XCAUSE_PIL_SHIFT);
+    return RISCV_EXCP_NONE;
+}
+
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException write_mcause(CPURISCVState *env, int csrno,
+                                   target_ulong val, uintptr_t ra)
+{
+    ESP32P4CPU *cpu;
+
+    if (!esp32p4_env_is_hp(env)) {
+        return std_write(env, csrno, val, ra);
+    }
+    cpu = esp32p4_cpu_from_env(env);
+    env->mcause = val & (ESP32P4_XCAUSE_INT | ESP32P4_XCAUSE_CODE);
+    cpu->minhv = val & ESP32P4_XCAUSE_INHV;
+    cpu->mpil = extract32(val, ESP32P4_XCAUSE_PIL_SHIFT, 8);
+    env->mstatus = set_field(env->mstatus, MSTATUS_MPP,
+                             (val & BIT(28)) ? PRV_M : PRV_U);
+    env->mstatus = set_field(env->mstatus, MSTATUS_MPIE,
+                             !!(val & ESP32P4_XCAUSE_PIE));
+    return RISCV_EXCP_NONE;
+}
+
+/* A CSR of the CLIC, which only the HP core has. */
+static RISCVException clic(CPURISCVState *env, int csrno)
+{
+    if (esp32p4_env_is_hp(env)) {
+        return RISCV_EXCP_NONE;
+    }
+    return std_predicate(env, csrno);
+}
+
+static uint32_t *clic_csr(ESP32P4CPU *cpu, int csrno)
+{
+    switch (csrno) {
+    case CSR_ESP_MTVT:
+        return &cpu->mtvt;
+    case CSR_ESP_UTVEC:
+        return &cpu->utvec;
+    case CSR_ESP_UTVT:
+        return &cpu->utvt;
+    case CSR_ESP_UEPC:
+        return &cpu->uepc;
+    default:
+        return &cpu->uscratch;
+    }
+}
+
+/* mtvt, utvt, utvec, uepc and uscratch. */
+static RISCVException read_clic_csr(CPURISCVState *env, int csrno,
+                                    target_ulong *val)
+{
+    if (!esp32p4_env_is_hp(env)) {
+        return std_read(env, csrno, val);
+    }
+    *val = *clic_csr(esp32p4_cpu_from_env(env), csrno);
+    return RISCV_EXCP_NONE;
+}
+
+/*
+ * The vector table bases are 64-byte aligned, as is utvec's trap vector
+ * base, whose MODE is CLIC mode; uepc holds 16-bit aligned addresses.
+ */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException write_clic_csr(CPURISCVState *env, int csrno,
+                                     target_ulong val, uintptr_t ra)
+{
+    if (!esp32p4_env_is_hp(env)) {
+        return std_write(env, csrno, val, ra);
+    }
+    switch (csrno) {
+    case CSR_ESP_MTVT:
+    case CSR_ESP_UTVT:
+        val &= ESP32P4_XTVEC_BASE;
+        break;
+    case CSR_ESP_UTVEC:
+        val = (val & ESP32P4_XTVEC_BASE) | ESP32P4_XTVEC_MODE_CLIC;
+        break;
+    case CSR_ESP_UEPC:
+        val &= ~(target_ulong)1;
+        break;
+    default:
+        break;
+    }
+    *clic_csr(esp32p4_cpu_from_env(env), csrno) = val;
+    return RISCV_EXCP_NONE;
+}
+
+/* ustatus: user mode's view of mstatus. */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException read_ustatus(CPURISCVState *env, int csrno,
+                                   target_ulong *val)
+{
+    RISCVException ret;
+
+    if (!esp32p4_env_is_hp(env)) {
+        return std_read(env, csrno, val);
+    }
+    ret = read_mstatus(env, CSR_MSTATUS, val);
+    *val &= ESP32P4_USTATUS_MASK;
+    return ret;
+}
+
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException write_ustatus(CPURISCVState *env, int csrno,
+                                    target_ulong val, uintptr_t ra)
+{
+    if (!esp32p4_env_is_hp(env)) {
+        return std_write(env, csrno, val, ra);
+    }
+    return write_mstatus(env, CSR_MSTATUS,
+                         (env->mstatus & ~ESP32P4_USTATUS_WMASK) |
+                         (val & ESP32P4_USTATUS_WMASK), ra);
+}
+
+/*
+ * ucause: INT and the code, UINHV and UPIL are the CLIC's; UPIE is
+ * ustatus's.
+ */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException read_ucause(CPURISCVState *env, int csrno,
+                                  target_ulong *val)
+{
+    ESP32P4CPU *cpu;
+
+    if (!esp32p4_env_is_hp(env)) {
+        return std_read(env, csrno, val);
+    }
+    cpu = esp32p4_cpu_from_env(env);
+    *val = cpu->ucause | (cpu->uinhv ? ESP32P4_XCAUSE_INHV : 0) |
+           (get_field(env->mstatus, MSTATUS_UPIE) ? ESP32P4_XCAUSE_PIE : 0) |
+           (cpu->upil << ESP32P4_XCAUSE_PIL_SHIFT);
+    return RISCV_EXCP_NONE;
+}
+
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException write_ucause(CPURISCVState *env, int csrno,
+                                   target_ulong val, uintptr_t ra)
+{
+    ESP32P4CPU *cpu;
+
+    if (!esp32p4_env_is_hp(env)) {
+        return std_write(env, csrno, val, ra);
+    }
+    cpu = esp32p4_cpu_from_env(env);
+    cpu->ucause = val & (ESP32P4_XCAUSE_INT | ESP32P4_XCAUSE_CODE);
+    cpu->uinhv = val & ESP32P4_XCAUSE_INHV;
+    cpu->upil = extract32(val, ESP32P4_XCAUSE_PIL_SHIFT, 8);
+    env->mstatus = set_field(env->mstatus, MSTATUS_UPIE,
+                             !!(val & ESP32P4_XCAUSE_PIE));
+    return RISCV_EXCP_NONE;
+}
+
+/* mnxti and unxti: see esp32p4_clic_nxti(). */
+static RISCVException rmw_xnxti(CPURISCVState *env, int csrno,
+                                target_ulong *ret_value,
+                                target_ulong new_value,
+                                target_ulong write_mask)
+{
+    if (!esp32p4_env_is_hp(env)) {
+        return std_op(env, csrno, ret_value, new_value, write_mask);
+    }
+    return esp32p4_clic_nxti(esp32p4_cpu_from_env(env),
+                             csrno == CSR_ESP_MNXTI ? PRV_M : PRV_U,
+                             ret_value, new_value, write_mask);
+}
+
+/*
+ * mintstatus and uintstatus: the current interrupt level of machine mode
+ * (MIL) and of user mode (UIL), the latter in both.
+ */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException read_xintstatus(CPURISCVState *env, int csrno,
+                                      target_ulong *val)
+{
+    ESP32P4CPU *cpu;
+
+    if (!esp32p4_env_is_hp(env)) {
+        return std_read(env, csrno, val);
+    }
+    cpu = esp32p4_cpu_from_env(env);
+    *val = cpu->uil;
+    if (csrno == CSR_ESP_MINTSTATUS) {
+        *val |= (target_ulong)cpu->mil << 24;
+    }
+    return RISCV_EXCP_NONE;
+}
+
+/* mintthresh and uintthresh: an 8-bit level threshold. */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException read_xintthresh(CPURISCVState *env, int csrno,
+                                      target_ulong *val)
+{
+    ESP32P4CPU *cpu;
+
+    if (!esp32p4_env_is_hp(env)) {
+        return std_read(env, csrno, val);
+    }
+    cpu = esp32p4_cpu_from_env(env);
+    *val = csrno == CSR_ESP_MINTTHRESH ? esp32p4_cpu_mintthresh(cpu)
+                                       : cpu->uintthresh;
+    return RISCV_EXCP_NONE;
+}
+
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException write_xintthresh(CPURISCVState *env, int csrno,
+                                       target_ulong val, uintptr_t ra)
+{
+    ESP32P4CPU *cpu;
+
+    if (!esp32p4_env_is_hp(env)) {
+        return std_write(env, csrno, val, ra);
+    }
+    cpu = esp32p4_cpu_from_env(env);
+    if (csrno == CSR_ESP_MINTTHRESH) {
+        qatomic_set(&cpu->mintthresh, val & 0xff);
+    } else {
+        cpu->uintthresh = val & 0xff;
+    }
+    return RISCV_EXCP_NONE;
+}
+
+/*
+ * mscratchcsw (CSRRW rd, mscratchcsw, rs1): swap mscratch with rs1 if the
+ * trap came from another privilege mode (mstatus.MPP is not machine mode),
+ * otherwise rd = rs1. mscratchcswl likewise swaps when exactly one of the
+ * interrupted level (mcause.MPIL) and the current level (MIL) is zero,
+ * between application code and an interrupt handler.
+ */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException rmw_mscratchcsw(CPURISCVState *env, int csrno,
+                                      target_ulong *ret_value,
+                                      target_ulong new_value,
+                                      target_ulong write_mask)
+{
+    ESP32P4CPU *cpu;
+    bool swap;
+
+    if (!esp32p4_env_is_hp(env)) {
+        return std_op(env, csrno, ret_value, new_value, write_mask);
+    }
+    cpu = esp32p4_cpu_from_env(env);
+    if (csrno == CSR_ESP_MSCRATCHCSW) {
+        swap = get_field(env->mstatus, MSTATUS_MPP) != PRV_M;
+    } else {
+        swap = (cpu->mpil == 0) != (cpu->mil == 0);
+    }
+    if (!swap) {
+        if (ret_value) {
+            *ret_value = new_value;
+        }
+        return RISCV_EXCP_NONE;
+    }
+    if (ret_value) {
+        *ret_value = env->mscratch;
+    }
+    if (write_mask) {
+        env->mscratch = (env->mscratch & ~write_mask) |
+                        (new_value & write_mask);
+    }
+    return RISCV_EXCP_NONE;
+}
+
+/* mclicbase and uclicbase: writing a read-only CSR is illegal. */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static RISCVException read_xclicbase(CPURISCVState *env, int csrno,
+                                     target_ulong *val)
+{
+    if (!esp32p4_env_is_hp(env)) {
+        return std_read(env, csrno, val);
+    }
+    *val = csrno == CSR_ESP_MCLICBASE ? ESP32P4_MCLICBASE : ESP32P4_UCLICBASE;
+    return RISCV_EXCP_NONE;
+}
+
+static RISCVException write_xclicbase(CPURISCVState *env, int csrno,
+                                      target_ulong val, uintptr_t ra)
+{
+    if (!esp32p4_env_is_hp(env)) {
+        return std_write(env, csrno, val, ra);
+    }
+    return RISCV_EXCP_ILLEGAL_INST;
+}
+
 #define HP_CSR(no, name, pred, rd, wr) \
     { .csrno = (no), .csr_ops = { (name), (pred), (rd), (wr) } }
+
+#define HP_CSR_OP(no, name, pred, op) \
+    { .csrno = (no), .csr_ops = { (name), (pred), NULL, NULL, (op) } }
 
 #define MHPMEVENT(n) \
     HP_CSR(CSR_MCOUNTINHIBIT + (n), "mhpmevent" #n, mhpmevent_predicate, \
@@ -907,6 +1345,35 @@ const RISCVCSR esp32p4_hp_csr_list[] = {
     HP_CSR(CSR_MENVCFGH, "menvcfgh", hp_absent, read_absent, write_absent),
     HP_CSR(CSR_MCONFIGPTR, "mconfigptr", hp_absent, read_absent,
            write_absent),
+
+    HP_CSR_OP(CSR_MIDELEG, "mideleg", hp_std, rmw_clint_ie_ip),
+    HP_CSR_OP(CSR_MIE, "mie", hp_std, rmw_clint_ie_ip),
+    HP_CSR_OP(CSR_MIP, "mip", hp_std, rmw_clint_ie_ip),
+    HP_CSR(CSR_MTVEC, "mtvec", hp_std, read_std, write_mtvec),
+    HP_CSR(CSR_MCAUSE, "mcause", hp_std, read_mcause, write_mcause),
+    HP_CSR(CSR_ESP_MTVT, "mtvt", clic, read_clic_csr, write_clic_csr),
+    HP_CSR_OP(CSR_ESP_MNXTI, "mnxti", clic, rmw_xnxti),
+    HP_CSR(CSR_ESP_MINTSTATUS, "mintstatus", clic, read_xintstatus, NULL),
+    HP_CSR(CSR_ESP_MINTTHRESH, "mintthresh", clic, read_xintthresh,
+           write_xintthresh),
+    HP_CSR_OP(CSR_ESP_MSCRATCHCSW, "mscratchcsw", clic, rmw_mscratchcsw),
+    HP_CSR_OP(CSR_ESP_MSCRATCHCSWL, "mscratchcswl", clic, rmw_mscratchcsw),
+    HP_CSR(CSR_ESP_MCLICBASE, "mclicbase", clic, read_xclicbase,
+           write_xclicbase),
+    HP_CSR(CSR_ESP_USTATUS, "ustatus", clic, read_ustatus, write_ustatus),
+    HP_CSR(CSR_ESP_UTVEC, "utvec", clic, read_clic_csr, write_clic_csr),
+    HP_CSR(CSR_ESP_UTVT, "utvt", clic, read_clic_csr, write_clic_csr),
+    HP_CSR(CSR_ESP_USCRATCH, "uscratch", clic, read_clic_csr, write_clic_csr),
+    HP_CSR(CSR_ESP_UEPC, "uepc", clic, read_clic_csr, write_clic_csr),
+    HP_CSR(CSR_ESP_UCAUSE, "ucause", clic, read_ucause, write_ucause),
+    HP_CSR_OP(CSR_ESP_UNXTI, "unxti", clic, rmw_xnxti),
+    HP_CSR(CSR_ESP_UINTSTATUS, "uintstatus", clic, read_xintstatus, NULL),
+    HP_CSR(CSR_ESP_UINTTHRESH, "uintthresh", clic, read_xintthresh,
+           write_xintthresh),
+    HP_CSR(CSR_ESP_UCLICBASE, "uclicbase", clic, read_xclicbase,
+           write_xclicbase),
+    HP_CSR(CSR_TIMEH, "timeh", hp_absent, read_absent, write_absent),
+
     HP_CSR(CSR_MCOUNTINHIBIT, "mcountinhibit", hp_std, read_mcountinhibit,
            write_mcountinhibit),
     MHPMEVENT(3), MHPMEVENT(4), MHPMEVENT(5), MHPMEVENT(6), MHPMEVENT(7),

@@ -93,6 +93,45 @@ OBJECT_DECLARE_TYPE(ESP32P4CPU, ESP32P4CPUClass, ESP32P4_CPU)
  */
 #define ESP32P4_CPU_INTERRUPT_BUS_ERROR CPU_INTERRUPT_TGT_INT_0
 
+/*
+ * A request, through the CPU's interrupt_request, held while the core's
+ * CLIC presents an interrupt: the core decides whether to take it before
+ * the next instruction, and a core in WFI whether to wake.
+ */
+#define ESP32P4_CPU_INTERRUPT_CLIC CPU_INTERRUPT_TGT_EXT_1
+
+/*
+ * The interrupt the CLIC presents to its core, its highest-ranked pending
+ * and enabled one (esp32p4_cpu_clic_present()), packed in a word: whether
+ * there is one, whether it is selectively hardware vectored, its privilege
+ * mode, level and ID.
+ */
+#define ESP32P4_CLIC_SEL_VALID      BIT(31)
+#define ESP32P4_CLIC_SEL_SHV        BIT(30)
+#define ESP32P4_CLIC_SEL_PRIV_SHIFT 24
+#define ESP32P4_CLIC_SEL_LEVEL_SHIFT 16
+#define ESP32P4_CLIC_SEL_ID_MASK    0xff
+
+static inline uint32_t esp32p4_clic_sel(bool shv, int priv, int level, int id)
+{
+    return ESP32P4_CLIC_SEL_VALID | (shv ? ESP32P4_CLIC_SEL_SHV : 0) |
+           (priv << ESP32P4_CLIC_SEL_PRIV_SHIFT) |
+           (level << ESP32P4_CLIC_SEL_LEVEL_SHIFT) | id;
+}
+
+/* The CLIC's interface to its core. */
+typedef struct ESP32P4ClicOps {
+    /*
+     * The core services interrupt @id, taking it hardware vectored or
+     * through mnxti/unxti: an edge-triggered interrupt stops pending.
+     */
+    void (*claim)(void *opaque, int id);
+} ESP32P4ClicOps;
+
+/* The base addresses mclicbase and uclicbase hold. */
+#define ESP32P4_MCLICBASE 0x20800000
+#define ESP32P4_UCLICBASE 0x20b00000
+
 struct ESP32P4CPU {
     RISCVCPU parent_obj;
 
@@ -158,6 +197,39 @@ struct ESP32P4CPU {
     /* Triggers that matched the breakpoint or watchpoint being taken. */
     uint32_t triggers_fired;
 
+    /*
+     * The CLIC (TRM 2.9): the interrupt it presents, ESP32P4_CLIC_SEL_*,
+     * which the CLIC sets under the BQL from any thread; and its
+     * interface.
+     */
+    uint32_t clic_sel;
+    const ESP32P4ClicOps *clic_ops;
+    void *clic_opaque;
+    /*
+     * The CLIC CSRs. mtvec, mepc, mscratch and the INT and code fields of
+     * mcause are the standard CSRs' state; ucause keeps its own INT and
+     * code. The interrupt levels of mintstatus (MIL) and uintstatus (UIL),
+     * the thresholds, and the previous levels and table-entry flags of
+     * mcause and ucause. mintthresh is also memory mapped, so any core may
+     * write it.
+     */
+    uint32_t mtvt;
+    uint32_t utvec;
+    uint32_t utvt;
+    uint32_t uepc;
+    uint32_t uscratch;
+    uint32_t ucause;
+    uint8_t mil;
+    uint8_t uil;
+    uint8_t mintthresh;
+    uint8_t uintthresh;
+    uint8_t mpil;
+    uint8_t upil;
+    bool minhv;
+    bool uinhv;
+    /* The exception being raised comes from a vector table fetch. */
+    bool clic_inhv_fault;
+
     /* PMP: pmpXcfg and pmpaddrn; PMA checker: pma_cfgn and pma_addrn. */
     uint8_t pmp_cfg[ESP32P4_PMP_ENTRIES];
     uint32_t pmp_addr[ESP32P4_PMP_ENTRIES];
@@ -201,6 +273,18 @@ static inline bool esp32p4_hwlp_enabled(ESP32P4CPU *cpu)
 }
 
 #ifndef CONFIG_USER_ONLY
+/*
+ * esp32p4_cpu.c: the CLIC's side. The CLIC connects itself to its core,
+ * presents its highest-ranked pending and enabled interrupt (0 for none),
+ * and reads and writes mintthresh, which it also maps; it calls these
+ * with the BQL held.
+ */
+void esp32p4_cpu_clic_connect(ESP32P4CPU *cpu, const ESP32P4ClicOps *ops,
+                              void *opaque);
+void esp32p4_cpu_clic_present(ESP32P4CPU *cpu, uint32_t sel);
+uint8_t esp32p4_cpu_mintthresh(ESP32P4CPU *cpu);
+void esp32p4_cpu_set_mintthresh(ESP32P4CPU *cpu, uint8_t th);
+
 /* esp32p4_csr.c */
 void esp32p4_hp_csr_class_init(void);
 void esp32p4_hp_update_fp_status(ESP32P4CPU *cpu);
@@ -218,6 +302,22 @@ void esp32p4_tdata_write(ESP32P4CPU *cpu, int index, target_ulong val);
 
 /* esp32p4_helper.c */
 void esp32p4_bus_error_check_pending(ESP32P4CPU *cpu);
+
+/* esp32p4_cpu.c */
+void esp32p4_hp_do_interrupt(CPUState *cs);
+
+/* esp32p4_clic.c */
+void esp32p4_clic_cpu_reset(ESP32P4CPU *cpu);
+bool esp32p4_clic_takes(ESP32P4CPU *cpu, uint32_t sel);
+bool esp32p4_clic_wakes(ESP32P4CPU *cpu);
+void esp32p4_clic_take(ESP32P4CPU *cpu, uint32_t sel);
+void esp32p4_clic_exception_taken(ESP32P4CPU *cpu, int prev_priv,
+                                  uint8_t prev_mil);
+target_ulong esp32p4_clic_mret(ESP32P4CPU *cpu, target_ulong retpc);
+RISCVException esp32p4_clic_nxti(ESP32P4CPU *cpu, int priv,
+                                 target_ulong *ret_value,
+                                 target_ulong new_value,
+                                 target_ulong write_mask);
 
 /* esp32p4_pmp.c */
 bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,

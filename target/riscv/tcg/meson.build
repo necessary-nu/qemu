@@ -20,6 +20,7 @@ riscv_ss.add(files(
 
 riscv_system_ss.add(files(
   'debug.c',
+  'esp32p4_clic.c',
   'esp32p4_csr.c',
   'esp32p4_helper.c',
   'esp32p4_pmp.c',

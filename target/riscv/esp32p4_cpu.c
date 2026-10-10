@@ -16,8 +16,9 @@
  * Espressif's CSRs and a three-trigger debug module; the CSRs, triggers
  * and hardware loops are in tcg/esp32p4_*.c, as are the PMP and the PMA
  * checker, which check every access the core makes. The LP core
- * implements RV32IMAC in machine mode only, without PMP or PMA. Neither
- * type carries the CLIC or the PIE extension.
+ * implements RV32IMAC in machine mode only, without PMP or PMA. The HP
+ * core takes its interrupts from its CLIC (tcg/esp32p4_clic.c). Neither
+ * type carries the PIE extension.
  *
  * misa on an HP core reads 0x40901127: RV32 with A, B, C, F, I, M, U and
  * X. The TRM's register table gives B and X but clears F, while the TRM
@@ -77,11 +78,64 @@ static bool esp32p4_cpu_held(ESP32P4CPU *cpu)
     return qatomic_read(&cpu->reset) || qatomic_read(&cpu->clock_stopped);
 }
 
+/*
+ * A core in WFI wakes for the interrupts that wake it from the CLIC, on
+ * the HP core, as well as the standard ones.
+ */
+/* [spec:nuos:req:emu.esp32p4.clic] */
 static bool esp32p4_cpu_has_work(CPUState *cs)
 {
     ESP32P4CPU *cpu = container_of(cs, ESP32P4CPU, parent_obj.parent_obj);
 
-    return !esp32p4_cpu_held(cpu) && riscv_cpu_has_work(cs);
+    if (esp32p4_cpu_held(cpu)) {
+        return false;
+    }
+#ifdef CONFIG_TCG
+    if (esp32p4_env_is_hp(&cpu->parent_obj.env) && esp32p4_clic_wakes(cpu)) {
+        return true;
+    }
+#endif
+    return riscv_cpu_has_work(cs);
+}
+
+void esp32p4_cpu_clic_connect(ESP32P4CPU *cpu, const ESP32P4ClicOps *ops,
+                              void *opaque)
+{
+    cpu->clic_ops = ops;
+    cpu->clic_opaque = opaque;
+}
+
+/*
+ * The CLIC presents a new interrupt, or none: the core reconsiders before
+ * its next instruction, and a core in WFI whether to wake.
+ */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+void esp32p4_cpu_clic_present(ESP32P4CPU *cpu, uint32_t sel)
+{
+    CPUState *cs = CPU(cpu);
+
+    qatomic_set(&cpu->clic_sel, sel);
+    if (sel & ESP32P4_CLIC_SEL_VALID) {
+        cpu_interrupt(cs, ESP32P4_CPU_INTERRUPT_CLIC);
+    } else {
+        cpu_reset_interrupt(cs, ESP32P4_CPU_INTERRUPT_CLIC);
+    }
+}
+
+uint8_t esp32p4_cpu_mintthresh(ESP32P4CPU *cpu)
+{
+    return qatomic_read(&cpu->mintthresh);
+}
+
+/*
+ * mintthresh written through the CLIC's registers, perhaps by the other
+ * core: the core reconsiders the interrupt the CLIC presents.
+ */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+void esp32p4_cpu_set_mintthresh(ESP32P4CPU *cpu, uint8_t th)
+{
+    qatomic_set(&cpu->mintthresh, th);
+    esp32p4_cpu_clic_present(cpu, qatomic_read(&cpu->clic_sel));
 }
 
 /* Run on the core when its reset input rises. */
@@ -301,19 +355,35 @@ static void esp32p4_hp_trap_entry(ESP32P4CPU *cpu, int32_t excp)
     cpu->tcontrol &= ~ESP32P4_TCONTROL_MTE;
 }
 
-static void esp32p4_hp_do_interrupt(CPUState *cs)
+/*
+ * An exception, the only trap that the standard trap entry takes on the
+ * HP core: the CLIC's own interrupts are taken by esp32p4_clic_take().
+ */
+void esp32p4_hp_do_interrupt(CPUState *cs)
 {
-    if (cs->exception_index != RISCV_EXCP_SEMIHOST) {
-        esp32p4_hp_trap_entry(esp32p4_cpu_of(cs), cs->exception_index);
+    ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
+    CPURISCVState *env = &cpu->parent_obj.env;
+    int prev_priv = env->priv;
+    uint8_t prev_mil = cpu->mil;
+
+    if (cs->exception_index == RISCV_EXCP_SEMIHOST) {
+        esp32p4_tcg_ops.do_interrupt(cs);
+        return;
     }
+    esp32p4_hp_trap_entry(cpu, cs->exception_index);
     esp32p4_tcg_ops.do_interrupt(cs);
+    if (!(cs->exception_index & RISCV_EXCP_INT_FLAG)) {
+        esp32p4_clic_exception_taken(cpu, prev_priv, prev_mil);
+    }
 }
 
 /*
  * A pending bus error that mexstatus.PBEXE enables raises its access
- * fault again, at the instruction about to execute.
+ * fault again, at the instruction about to execute. Otherwise the core
+ * takes the interrupt its CLIC presents, if it may.
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
+/* [spec:nuos:req:emu.esp32p4.clic] */
 static bool esp32p4_hp_cpu_exec_interrupt(CPUState *cs, int request)
 {
     ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
@@ -334,6 +404,19 @@ static bool esp32p4_hp_cpu_exec_interrupt(CPUState *cs, int request)
             env->excp_uw2 = 0;
             cpu->bus_error = true;
             esp32p4_hp_do_interrupt(cs);
+            return true;
+        }
+    }
+    if (request & ESP32P4_CPU_INTERRUPT_CLIC) {
+        uint32_t sel = qatomic_read(&cpu->clic_sel);
+
+        if (esp32p4_clic_takes(cpu, sel)) {
+            int id = sel & ESP32P4_CLIC_SEL_ID_MASK;
+
+            if (extract32(sel, ESP32P4_CLIC_SEL_PRIV_SHIFT, 2) == PRV_M) {
+                esp32p4_hp_trap_entry(cpu, RISCV_EXCP_INT_FLAG | id);
+            }
+            esp32p4_clic_take(cpu, sel);
             return true;
         }
     }
@@ -449,6 +532,7 @@ static void esp32p4_hp_reset_hold(ESP32P4CPU *cpu)
     esp32p4_triggers_reset(cpu);
     esp32p4_pmp_reset(cpu);
     cpu_reset_interrupt(CPU(cpu), ESP32P4_CPU_INTERRUPT_BUS_ERROR);
+    esp32p4_clic_cpu_reset(cpu);
 }
 #endif
 
@@ -561,6 +645,31 @@ static const VMStateDescription vmstate_esp32p4_hp_state = {
         VMSTATE_END_OF_LIST()
     },
 };
+
+static const VMStateDescription vmstate_esp32p4_hp_clic = {
+    .name = "esp32p4-cpu/clic",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = esp32p4_hp_state_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(clic_sel, ESP32P4CPU),
+        VMSTATE_UINT32(mtvt, ESP32P4CPU),
+        VMSTATE_UINT32(utvec, ESP32P4CPU),
+        VMSTATE_UINT32(utvt, ESP32P4CPU),
+        VMSTATE_UINT32(uepc, ESP32P4CPU),
+        VMSTATE_UINT32(uscratch, ESP32P4CPU),
+        VMSTATE_UINT32(ucause, ESP32P4CPU),
+        VMSTATE_UINT8(mil, ESP32P4CPU),
+        VMSTATE_UINT8(uil, ESP32P4CPU),
+        VMSTATE_UINT8(mintthresh, ESP32P4CPU),
+        VMSTATE_UINT8(uintthresh, ESP32P4CPU),
+        VMSTATE_UINT8(mpil, ESP32P4CPU),
+        VMSTATE_UINT8(upil, ESP32P4CPU),
+        VMSTATE_BOOL(minhv, ESP32P4CPU),
+        VMSTATE_BOOL(uinhv, ESP32P4CPU),
+        VMSTATE_END_OF_LIST()
+    },
+};
 #endif
 
 static const VMStateDescription vmstate_esp32p4_cpu = {
@@ -578,6 +687,7 @@ static const VMStateDescription vmstate_esp32p4_cpu = {
 #ifdef CONFIG_TCG
     .subsections = (const VMStateDescription * const []) {
         &vmstate_esp32p4_hp_state,
+        &vmstate_esp32p4_hp_clic,
         NULL
     },
 #endif

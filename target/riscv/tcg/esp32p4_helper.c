@@ -115,14 +115,18 @@ void esp32p4_bus_error_check_pending(ESP32P4CPU *cpu)
 }
 
 /*
- * After MRET, given mstatus from before it: the core keeps mstatus.MPRV,
- * as privileged architecture 1.10 has it; the trigger enable
- * tcontrol.MTE comes back from MPTE; mexstatus.PBEXE comes back from
- * PPBEXE, which becomes set; the PMP and fetch error flags clear, and so
- * does the bus error flag when mexstatus.NMFT is set.
+ * After MRET, given mstatus from before it and the address it returns to:
+ * the core keeps mstatus.MPRV, as privileged architecture 1.10 has it; the
+ * trigger enable tcontrol.MTE comes back from MPTE; mexstatus.PBEXE comes
+ * back from PPBEXE, which becomes set; the PMP and fetch error flags
+ * clear, and so does the bus error flag when mexstatus.NMFT is set. Then
+ * the CLIC's state returns (esp32p4_clic_mret()), which gives the address
+ * the core continues at.
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
-void helper_esp32p4_mret(CPURISCVState *env, uint64_t old_mstatus)
+/* [spec:nuos:req:emu.esp32p4.clic] */
+target_ulong helper_esp32p4_mret(CPURISCVState *env, uint64_t old_mstatus,
+                                 target_ulong retpc)
 {
     ESP32P4CPU *cpu = esp32p4_cpu_from_env(env);
 
@@ -144,4 +148,5 @@ void helper_esp32p4_mret(CPURISCVState *env, uint64_t old_mstatus)
         cpu->mexstatus &= ~ESP32P4_MEXSTATUS_BUS_ERR;
     }
     esp32p4_bus_error_check_pending(cpu);
+    return esp32p4_clic_mret(cpu, retpc);
 }
