@@ -7,7 +7,7 @@
  *
  * Reference: ESP32-P4 Technical Reference Manual (v3.x silicon), 2.5
  * (Configuration and Status Registers), 2.6.3 (F Extension), 2.7.1
- * (Hardware Loop) and 2.11.3 (Hardware Trigger).
+ * (Hardware Loop), 2.9.2 (CLIC) and 2.11.3 (Hardware Trigger).
  *
  * The CSRs the HP core has beyond, or differently from, the standard set
  * QEMU's RISC-V CPU provides for its configuration. QEMU's vendor CSR
@@ -19,7 +19,8 @@
  * Absent on the HP core, and so illegal: mstatush, menvcfg, menvcfgh and
  * mconfigptr (the core follows privileged architecture 1.10), every
  * event selector but mhpmevent8, 9 and 13, and pmpcfg8-15 and
- * pmpaddr32-63 beyond its 32 PMP entries. The counters other than those
+ * pmpaddr32-63 beyond its 32 PMP entries; timeh, uie, uip and utval,
+ * which the TRM's CSR list leaves out. The counters other than those
  * three are left out by the CPU's PMU mask.
  *
  * An access the core does not permit raises an illegal instruction
