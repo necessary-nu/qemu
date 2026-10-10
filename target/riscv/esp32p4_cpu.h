@@ -10,6 +10,7 @@
 #define TARGET_RISCV_ESP32P4_CPU_H
 
 #include "target/riscv/cpu.h"
+#include "target/riscv/esp32p4_pie.h"
 #include "qom/object.h"
 
 #define TYPE_ESP32P4_CPU "esp32p4-cpu"
@@ -161,6 +162,8 @@ struct ESP32P4CPU {
     uint32_t hwlp_state;
     /* mext_pie_status.STATE, the PIE extension's context status. */
     uint32_t pie_state;
+    /* The PIE extension's registers. */
+    ESP32P4PIE pie;
     /* mext_ill */
     uint32_t ext_ill;
     uint32_t mexstatus;
@@ -302,6 +305,10 @@ void esp32p4_tdata_write(ESP32P4CPU *cpu, int index, target_ulong val);
 
 /* esp32p4_helper.c */
 void esp32p4_bus_error_check_pending(ESP32P4CPU *cpu);
+
+/* esp32p4_pie.c */
+bool esp32p4_insn_is_pie(uint32_t insn);
+void esp32p4_pie_reset(ESP32P4CPU *cpu);
 
 /* esp32p4_cpu.c */
 void esp32p4_hp_do_interrupt(CPUState *cs);
