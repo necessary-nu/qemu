@@ -540,6 +540,7 @@ static void esp32_rtc_update_clock_outputs(Esp32RtcCntlState *s)
 
     clock_update_hz(s->xtal_clk, s->xtal_apb_freq);
     clock_update_hz(s->slow_clk, s->rtc_slowclk_freq);
+    clock_update_hz(s->fast_clk, s->rtc_fastclk_freq);
     clock_update_hz(s->d256_dig_clk,
                     FIELD_EX32(conf, RTC_CNTL_CLK_CONF, DIG_CLK8M_D256_EN) ?
                     s->rc_fast_d256_freq : 0);
@@ -1319,6 +1320,7 @@ static void esp32_rtc_cntl_init(Object *obj)
                             ESP32_RTC_BROWNOUT_IN, 1);
     s->xtal_clk = qdev_init_clock_out(dev, ESP32_RTC_XTAL_CLK);
     s->slow_clk = qdev_init_clock_out(dev, ESP32_RTC_SLOW_CLK);
+    s->fast_clk = qdev_init_clock_out(dev, ESP32_RTC_FAST_CLK);
     s->d256_dig_clk = qdev_init_clock_out(dev, ESP32_RTC_D256_DIG_CLK);
     s->xtal32k_dig_clk = qdev_init_clock_out(dev, ESP32_RTC_XTAL32K_DIG_CLK);
 

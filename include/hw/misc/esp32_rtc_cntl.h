@@ -70,6 +70,8 @@ typedef struct Esp32RtcIoState Esp32RtcIoState;
  * Clock outputs, stopped (0 Hz) while their source does not run:
  * - ESP32_RTC_XTAL_CLK: XTAL_CLK, the main crystal.
  * - ESP32_RTC_SLOW_CLK: RTC_SLOW_CLK, as ANA_CLK_RTC_SEL selects it.
+ * - ESP32_RTC_FAST_CLK: RTC_FAST_CLK, as FAST_CLK_RTC_SEL selects it: the
+ *   clock of the on-chip sensors (SENS) and the ULP coprocessor.
  * - ESP32_RTC_D256_DIG_CLK: RC_FAST_DIV_CLK (8MD256) as the digital domain
  *   sees it, behind DIG_CLK8M_D256_EN.
  * - ESP32_RTC_XTAL32K_DIG_CLK: XTAL32K_CLK as the digital domain sees it,
@@ -77,6 +79,7 @@ typedef struct Esp32RtcIoState Esp32RtcIoState;
  */
 #define ESP32_RTC_XTAL_CLK          "xtal-clk"
 #define ESP32_RTC_SLOW_CLK          "slow-clk"
+#define ESP32_RTC_FAST_CLK          "fast-clk"
 #define ESP32_RTC_D256_DIG_CLK      "rc-fast-d256-dig-clk"
 #define ESP32_RTC_XTAL32K_DIG_CLK   "xtal32k-dig-clk"
 
@@ -346,6 +349,7 @@ typedef struct Esp32RtcCntlState {
 
     Clock *xtal_clk;
     Clock *slow_clk;
+    Clock *fast_clk;
     Clock *d256_dig_clk;
     Clock *xtal32k_dig_clk;
     /*

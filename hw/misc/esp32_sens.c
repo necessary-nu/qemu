@@ -38,8 +38,18 @@
  * - The touch FSM: started by software (TOUCH_START_FORCE, TOUCH_START_EN)
  *   or by its timer every TOUCH_SLEEP_CYCLES of RTC_SLOW_CLK while
  *   RTC_CNTL_TOUCH_SLP_TIMER_EN is set, it powers the pads up for
- *   TOUCH_XPD_WAIT cycles of the 8 MHz clock, then counts each working
- *   pad's charge and discharge cycles for TOUCH_MEAS_DELAY cycles.
+ *   TOUCH_XPD_WAIT cycles of RTC_FAST_CLK, then counts each working pad's
+ *   charge and discharge cycles for TOUCH_MEAS_DELAY cycles.
+ *
+ * SENS is clocked by RTC_FAST_CLK (TRM 7.2.6, "RTC_FAST_CLK is used to
+ * clock the On-chip Sensor module", and 31.2.3, "The sensor is operated by
+ * RTC_FAST_CLK, which normally runs at 8 MHz"). The registers' "8 MHz
+ * cycles" are RTC_FAST_CLK cycles at the 8 MHz ESP-IDF runs it at:
+ * RC_FAST_CLK undivided. The cosine generator runs from it too (ESP-IDF's
+ * DAC_COSINE_CLK_SRC_RTC_FAST; the TRM's dig_clk_rtc). Every wait counts
+ * cycles of the clock as it currently runs: a change of rate takes effect
+ * from the moment of the change, and a stopped clock holds the wait and
+ * the cosine generator's phase until it runs again.
  *
  * The analog inputs are QOM properties of the device: each ADC channel's
  * pad voltage, adc<u>-ch<n>-mv, which a digitally driven pad overrides with
@@ -72,6 +82,7 @@
 #include "qapi/visitor.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-clock.h"
 #include "migration/vmstate.h"
 #include "hw/misc/esp32_sens.h"
 #include "hw/misc/esp32_rtc_cntl.h"
@@ -84,9 +95,6 @@
 #define VDD_MV                  3300
 /* The SAR ADCs' reference voltage */
 #define ADC_VREF_MV             1100
-/* The 8 MHz clock of the touch FSM and the cosine generator */
-#define RC_FAST_HZ              8000000
-
 /*
  * The Hall sensor's output: microvolts per microtesla on each of VP and
  * VN. ESP32 documents no sensitivity; this one makes a 10 mT field read
@@ -210,6 +218,45 @@ static uint32_t rtcio_reg(Esp32SensState *s, hwaddr addr)
     return s->rtcio->regs[addr / 4];
 }
 
+/* ---- Waits counted in clock cycles ---- */
+
+/* When w ends, with clk running at its current rate */
+static int64_t wait_end_ns(Esp32SensWait *w, Clock *clk)
+{
+    return w->base_ns + MAX(clock_ticks_to_ns(clk, w->left), 1);
+}
+
+/* Arm w's timer for its remaining cycles at clk's current rate */
+static void wait_schedule(Esp32SensWait *w, Clock *clk)
+{
+    if (!clock_is_enabled(clk)) {
+        timer_del(&w->timer);
+        return;
+    }
+    timer_mod(&w->timer, wait_end_ns(w, clk));
+}
+
+/*
+ * Wait for cycles cycles of clk from from_ns: now, or the end of the wait
+ * before it, which a late timer callback must not stretch.
+ */
+static void wait_start(Esp32SensWait *w, Clock *clk, int64_t from_ns,
+                       uint64_t cycles)
+{
+    w->base_ns = from_ns;
+    w->left = cycles;
+    wait_schedule(w, clk);
+}
+
+/* clk is about to change: take off the cycles it has made since base_ns */
+static void wait_fold(Esp32SensWait *w, Clock *clk, int64_t now)
+{
+    uint64_t done = clock_ns_to_ticks(clk, now - w->base_ns);
+
+    w->left -= MIN(done, w->left);
+    w->base_ns = now;
+}
+
 /* ---- The DACs ---- */
 
 static uint32_t cw_phase_at(Esp32SensState *s, int64_t now)
@@ -220,13 +267,15 @@ static uint32_t cw_phase_at(Esp32SensState *s, int64_t now)
     if (!FIELD_EX32(ctrl1, SENS_SAR_DAC_CTRL1, SW_TONE_EN)) {
         return s->cw_phase;
     }
-    ticks = muldiv64(now - s->cw_anchor_ns, RC_FAST_HZ,
-                     NANOSECONDS_PER_SECOND);
+    ticks = clock_ns_to_ticks(s->fast_clk, now - s->cw_anchor_ns);
     return (s->cw_phase +
             ticks * FIELD_EX32(ctrl1, SENS_SAR_DAC_CTRL1, SW_FSTEP)) & 0xffff;
 }
 
-/* Fold the generator's progress into its phase before a change of step */
+/*
+ * Fold the generator's progress into its phase before a change of step or
+ * of RTC_FAST_CLK
+ */
 static void cw_reanchor(Esp32SensState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -238,7 +287,8 @@ static void cw_reanchor(Esp32SensState *s)
 /*
  * [spec:nuos:req:emu.esp32.analog]
  * The cosine generator's output for DAC ch (TRM 31.4.4): a signed cosine
- * of amplitude 127 at 8 MHz * SW_FSTEP / 65536, scaled by DAC_SCALEn,
+ * of amplitude 127 at RTC_FAST_CLK * SW_FSTEP / 65536, one SW_FSTEP phase
+ * step per RTC_FAST_CLK cycle, scaled by DAC_SCALEn,
  * offset by the signed DAC_DCn and saturated, then made a DAC code by
  * DAC_INVn: 0 as is, 1 inverted, 2 with the MSB inverted (offset binary),
  * 3 with the other bits inverted (offset binary, negated).
@@ -510,15 +560,12 @@ static uint32_t rtc_adc_code(Esp32SensState *s, unsigned unit)
 static void rtc_adc_begin(Esp32SensState *s, unsigned unit, uint32_t code,
                           uint32_t cycles)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-
     s->adc_result[unit] = code;
     s->adc_busy[unit] = true;
     s->regs[meas_start_reg(unit) / 4] &= ~R_SENS_SAR_MEAS_START1_DONE_MASK;
     update_meas_status(s);
-    timer_mod(&s->adc_timer[unit],
-              now + muldiv64(cycles, NANOSECONDS_PER_SECOND,
-                             s->rtc_cntl->rtc_fastclk_freq));
+    wait_start(&s->adc_wait[unit], s->fast_clk,
+               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), cycles);
 }
 
 /*
@@ -715,15 +762,16 @@ unsigned esp32_sens_dig_sample(Esp32SensState *s, uint16_t out[2])
  * [spec:nuos:req:emu.esp32.analog]
  * The count of touch channel n over one measurement: the pad charges and
  * discharges between DREFL and DREFH (RTCIO_TOUCH_CFG) at the current its
- * slope sets, so it completes MEAS_DELAY / 8 MHz * I / (2 C dV) cycles.
+ * slope sets, so it completes t * I / (2 C dV) cycles in the measurement's
+ * t = TOUCH_MEAS_DELAY cycles of RTC_FAST_CLK, meas_ns nanoseconds. The
+ * pads oscillate on their own: a measurement RTC_FAST_CLK stretches, by
+ * running slower or stopping, counts for longer.
  */
-static uint32_t touch_count(Esp32SensState *s, unsigned n)
+static uint32_t touch_count(Esp32SensState *s, unsigned n, uint64_t meas_ns)
 {
     static const uint32_t atten_mv[4] = { 1500, 1000, 500, 0 };
     uint32_t cfg = rtcio_reg(s, A_RTCIO_TOUCH_CFG);
     uint32_t pad = rtcio_reg(s, A_RTCIO_TOUCH_PAD0 + 4 * n);
-    uint32_t delay = FIELD_EX32(REG(s, SENS_SAR_TOUCH_CTRL1),
-                                SENS_SAR_TOUCH_CTRL1, MEAS_DELAY);
     int32_t vh = 2400 + 100 * RTCIO_TOUCH_DREFH(cfg) -
                  atten_mv[RTCIO_TOUCH_DRANGE(cfg)];
     int32_t vl = 500 + 100 * RTCIO_TOUCH_DREFL(cfg);
@@ -743,8 +791,8 @@ static uint32_t touch_count(Esp32SensState *s, unsigned n)
     if (c_ff == 0) {
         return 0xffff;
     }
-    /* delay / 8e6 s * ua 1e-6 A / (2 * c_ff 1e-15 F * dV 1e-3 V) */
-    count = (uint64_t)delay * ua * 62500 / (c_ff * (vh - vl));
+    /* meas_ns 1e-9 s * ua 1e-6 A / (2 * c_ff 1e-15 F * dV 1e-3 V) */
+    count = muldiv64(meas_ns, ua * 500, c_ff * (vh - vl));
     return MIN(count, 0xffff);
 }
 
@@ -770,9 +818,18 @@ static void touch_update_wakeup(Esp32SensState *s)
     }
 }
 
-static int64_t touch_ns(uint64_t cycles, uint64_t hz)
+/* The clock the FSM's current phase counts: RTC_SLOW_CLK while it sleeps */
+static Clock *touch_clk(Esp32SensState *s)
 {
-    return MAX(muldiv64(cycles, NANOSECONDS_PER_SECOND, hz), 1);
+    return s->touch_phase == ESP32_TOUCH_SLEEP ? s->slow_clk : s->fast_clk;
+}
+
+/* Enter phase at from_ns for cycles of its clock */
+static void touch_enter(Esp32SensState *s, Esp32TouchPhase phase,
+                        int64_t from_ns, uint64_t cycles)
+{
+    s->touch_phase = phase;
+    wait_start(&s->touch_wait, touch_clk(s), from_ns, cycles);
 }
 
 static bool touch_timer_mode(Esp32SensState *s)
@@ -782,18 +839,16 @@ static bool touch_timer_mode(Esp32SensState *s)
                        START_FORCE);
 }
 
-static void touch_sleep(Esp32SensState *s)
+static void touch_sleep(Esp32SensState *s, int64_t from_ns)
 {
     uint32_t cycles = FIELD_EX32(REG(s, SENS_SAR_TOUCH_CTRL2),
                                  SENS_SAR_TOUCH_CTRL2, SLEEP_CYCLES);
 
-    s->touch_phase = ESP32_TOUCH_SLEEP;
-    timer_mod(&s->touch_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              touch_ns(cycles, s->rtc_cntl->rtc_slowclk_freq));
+    touch_enter(s, ESP32_TOUCH_SLEEP, from_ns, cycles);
 }
 
 /* [spec:nuos:req:emu.esp32.analog] A measurement starts: power the pads */
-static void touch_start(Esp32SensState *s)
+static void touch_start(Esp32SensState *s, int64_t from_ns)
 {
     uint32_t wait = FIELD_EX32(REG(s, SENS_SAR_TOUCH_CTRL1),
                                SENS_SAR_TOUCH_CTRL1, XPD_WAIT);
@@ -808,9 +863,7 @@ static void touch_start(Esp32SensState *s)
         return;
     }
     REG(s, SENS_SAR_TOUCH_CTRL2) &= ~R_SENS_SAR_TOUCH_CTRL2_MEAS_DONE_MASK;
-    s->touch_phase = ESP32_TOUCH_XPD_WAIT;
-    timer_mod(&s->touch_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              touch_ns(wait, RC_FAST_HZ));
+    touch_enter(s, ESP32_TOUCH_XPD_WAIT, from_ns, wait);
 }
 
 /*
@@ -822,12 +875,13 @@ static void touch_start(Esp32SensState *s)
  * TOUCH_OUT_1EN, SET2 has one too; the wakeup request follows the same
  * condition.
  */
-static void touch_finish(Esp32SensState *s)
+static void touch_finish(Esp32SensState *s, int64_t end_ns)
 {
     uint32_t worken = FIELD_EX32(REG(s, SENS_SAR_TOUCH_ENABLE),
                                  SENS_SAR_TOUCH_ENABLE, WORKEN);
     bool above = FIELD_EX32(REG(s, SENS_SAR_TOUCH_CTRL1),
                             SENS_SAR_TOUCH_CTRL1, OUT_SEL);
+    uint64_t meas_ns = end_ns - s->touch_meas_ns;
     uint32_t touched = 0;
 
     for (unsigned n = 0; n < ESP32_TOUCH_PADS; n++) {
@@ -840,7 +894,7 @@ static void touch_finish(Esp32SensState *s)
         if (!bit32(worken, n)) {
             continue;
         }
-        count = touch_count(s, n);
+        count = touch_count(s, n, meas_ns);
         *out = deposit32(*out, shift, 16, count);
         if (above ? count > thr : count < thr) {
             touched |= 1u << n;
@@ -859,23 +913,23 @@ static void touch_timer_cb(void *opaque)
     Esp32SensState *s = opaque;
     uint32_t delay = FIELD_EX32(REG(s, SENS_SAR_TOUCH_CTRL1),
                                 SENS_SAR_TOUCH_CTRL1, MEAS_DELAY);
+    int64_t end = wait_end_ns(&s->touch_wait, touch_clk(s));
 
     switch (s->touch_phase) {
     case ESP32_TOUCH_XPD_WAIT:
-        s->touch_phase = ESP32_TOUCH_MEASURE;
-        timer_mod(&s->touch_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  touch_ns(delay, RC_FAST_HZ));
+        s->touch_meas_ns = end;
+        touch_enter(s, ESP32_TOUCH_MEASURE, end, delay);
         break;
     case ESP32_TOUCH_MEASURE:
-        touch_finish(s);
+        touch_finish(s, end);
         if (touch_timer_mode(s)) {
-            touch_sleep(s);
+            touch_sleep(s, end);
         } else {
             s->touch_phase = ESP32_TOUCH_IDLE;
         }
         break;
     case ESP32_TOUCH_SLEEP:
-        touch_start(s);
+        touch_start(s, end);
         break;
     default:
         break;
@@ -887,10 +941,10 @@ static void touch_update_mode(Esp32SensState *s)
 {
     if (touch_timer_mode(s)) {
         if (s->touch_phase == ESP32_TOUCH_IDLE) {
-            touch_sleep(s);
+            touch_sleep(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         }
     } else if (s->touch_phase == ESP32_TOUCH_SLEEP) {
-        timer_del(&s->touch_timer);
+        timer_del(&s->touch_wait.timer);
         s->touch_phase = ESP32_TOUCH_IDLE;
     }
 }
@@ -901,6 +955,62 @@ static void esp32_sens_touch_timer(void *opaque, int n, int level)
 
     s->touch_timer_en = level;
     touch_update_mode(s);
+}
+
+/* ---- Clock changes ---- */
+
+/*
+ * [spec:nuos:req:emu.esp32.analog]
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * RTC_FAST_CLK or RTC_SLOW_CLK is about to change (ClockPreUpdate): the
+ * waits counting it, and the cosine generator on RTC_FAST_CLK, keep the
+ * cycles made at the old rate. Once it has changed (ClockUpdate) the
+ * waits run on at the new rate, or hold while it is stopped.
+ */
+static void esp32_sens_clk_event(Esp32SensState *s, Clock *clk,
+                                 ClockEvent event)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    Esp32SensWait *waits[ESP32_ADC_UNITS + 2];
+    unsigned n = 0;
+
+    if (clk == s->fast_clk) {
+        for (unsigned u = 0; u < ESP32_ADC_UNITS; u++) {
+            if (s->adc_busy[u]) {
+                waits[n++] = &s->adc_wait[u];
+            }
+        }
+        if (s->i2c_busy) {
+            waits[n++] = &s->i2c_wait;
+        }
+        if (event == ClockPreUpdate) {
+            cw_reanchor(s);
+        }
+    }
+    if (s->touch_phase != ESP32_TOUCH_IDLE && touch_clk(s) == clk) {
+        waits[n++] = &s->touch_wait;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        if (event == ClockPreUpdate) {
+            wait_fold(waits[i], clk, now);
+        } else {
+            wait_schedule(waits[i], clk);
+        }
+    }
+}
+
+static void esp32_sens_fast_clk_update(void *opaque, ClockEvent event)
+{
+    Esp32SensState *s = opaque;
+
+    esp32_sens_clk_event(s, s->fast_clk, event);
+}
+
+static void esp32_sens_slow_clk_update(void *opaque, ClockEvent event)
+{
+    Esp32SensState *s = opaque;
+
+    esp32_sens_clk_event(s, s->slow_clk, event);
 }
 
 /* ---- The temperature sensor ---- */
@@ -967,7 +1077,6 @@ uint32_t esp32_sens_rtc_i2c(Esp32SensState *s, uint32_t ctrl,
     bool write = extract32(ctrl, 27, 1);
     uint32_t mask, addr, *a4 = &REG(s, SENS_SAR_SLAVE_ADDR4);
     uint8_t rdata;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (sel > 7) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -998,9 +1107,8 @@ uint32_t esp32_sens_rtc_i2c(Esp32SensState *s, uint32_t ctrl,
     rdata = write ? 0 : rdata & mask;
     *a4 = FIELD_DP32(*a4, SENS_SAR_SLAVE_ADDR4, I2C_RDATA, rdata);
     s->i2c_busy = true;
-    timer_mod(&s->i2c_timer,
-              now + muldiv64(*cycles, NANOSECONDS_PER_SECOND,
-                             s->rtc_cntl->rtc_fastclk_freq));
+    wait_start(&s->i2c_wait, s->fast_clk,
+               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), *cycles);
     return rdata;
 }
 
@@ -1144,7 +1252,7 @@ static void esp32_sens_write(void *opaque, hwaddr addr, uint64_t value,
             FIELD_EX32(v & ~old, SENS_SAR_TOUCH_CTRL2, START_EN) &&
             (s->touch_phase == ESP32_TOUCH_IDLE ||
              s->touch_phase == ESP32_TOUCH_SLEEP)) {
-            touch_start(s);
+            touch_start(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         }
         touch_update_mode(s);
         touch_update_wakeup(s);
@@ -1225,16 +1333,16 @@ static void esp32_sens_reset_hold(Object *obj, ResetType type)
         s->regs[i] = reg_info[i].reset;
     }
     for (unsigned u = 0; u < ESP32_ADC_UNITS; u++) {
-        timer_del(&s->adc_timer[u]);
+        timer_del(&s->adc_wait[u].timer);
         s->adc_busy[u] = false;
         s->adc_result[u] = 0;
         s->patt_ptr[u] = 0;
     }
     s->alt_unit = 0;
     memset(s->ulp_pads, 0, sizeof(s->ulp_pads));
-    timer_del(&s->i2c_timer);
+    timer_del(&s->i2c_wait.timer);
     s->i2c_busy = false;
-    timer_del(&s->touch_timer);
+    timer_del(&s->touch_wait.timer);
     s->touch_phase = ESP32_TOUCH_IDLE;
     s->cw_anchor_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->cw_phase = 0;
@@ -1271,10 +1379,19 @@ static void esp32_sens_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &esp32_sens_ops, s,
                           TYPE_ESP32_SENS, ESP32_SENS_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
-    timer_init_ns(&s->adc_timer[0], QEMU_CLOCK_VIRTUAL, adc1_timer_cb, s);
-    timer_init_ns(&s->adc_timer[1], QEMU_CLOCK_VIRTUAL, adc2_timer_cb, s);
-    timer_init_ns(&s->touch_timer, QEMU_CLOCK_VIRTUAL, touch_timer_cb, s);
-    timer_init_ns(&s->i2c_timer, QEMU_CLOCK_VIRTUAL, i2c_timer_cb, s);
+    timer_init_ns(&s->adc_wait[0].timer, QEMU_CLOCK_VIRTUAL, adc1_timer_cb,
+                  s);
+    timer_init_ns(&s->adc_wait[1].timer, QEMU_CLOCK_VIRTUAL, adc2_timer_cb,
+                  s);
+    timer_init_ns(&s->touch_wait.timer, QEMU_CLOCK_VIRTUAL, touch_timer_cb,
+                  s);
+    timer_init_ns(&s->i2c_wait.timer, QEMU_CLOCK_VIRTUAL, i2c_timer_cb, s);
+    s->fast_clk = qdev_init_clock_in(dev, ESP32_SENS_FAST_CLK,
+                                     esp32_sens_fast_clk_update, s,
+                                     ClockPreUpdate | ClockUpdate);
+    s->slow_clk = qdev_init_clock_in(dev, ESP32_SENS_SLOW_CLK,
+                                     esp32_sens_slow_clk_update, s,
+                                     ClockPreUpdate | ClockUpdate);
     qdev_init_gpio_out_named(dev, &s->ulp_start, ESP32_SENS_ULP_START, 1);
     qdev_init_gpio_out_named(dev, &s->touch_int, ESP32_SENS_TOUCH_INT, 1);
     qdev_init_gpio_out_named(dev, &s->touch_wakeup, ESP32_SENS_TOUCH_WAKEUP,
@@ -1322,21 +1439,39 @@ static const Property esp32_sens_properties[] = {
                      TYPE_ESP32_RTC_I2C, Esp32RtcI2cState *),
 };
 
+static const VMStateDescription vmstate_esp32_sens_wait = {
+    .name = TYPE_ESP32_SENS "/wait",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_TIMER(timer, Esp32SensWait),
+        VMSTATE_INT64(base_ns, Esp32SensWait),
+        VMSTATE_UINT64(left, Esp32SensWait),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_esp32_sens = {
     .name = TYPE_ESP32_SENS,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
+        VMSTATE_CLOCK(fast_clk, Esp32SensState),
+        VMSTATE_CLOCK(slow_clk, Esp32SensState),
         VMSTATE_UINT32_ARRAY(regs, Esp32SensState, ESP32_SENS_REG_COUNT),
         VMSTATE_UINT32_ARRAY(ulp_pads, Esp32SensState, ESP32_ADC_UNITS),
-        VMSTATE_TIMER(i2c_timer, Esp32SensState),
+        VMSTATE_STRUCT(i2c_wait, Esp32SensState, 1, vmstate_esp32_sens_wait,
+                       Esp32SensWait),
         VMSTATE_BOOL(i2c_busy, Esp32SensState),
-        VMSTATE_TIMER_ARRAY(adc_timer, Esp32SensState, ESP32_ADC_UNITS),
+        VMSTATE_STRUCT_ARRAY(adc_wait, Esp32SensState, ESP32_ADC_UNITS, 1,
+                             vmstate_esp32_sens_wait, Esp32SensWait),
         VMSTATE_BOOL_ARRAY(adc_busy, Esp32SensState, ESP32_ADC_UNITS),
         VMSTATE_UINT32_ARRAY(adc_result, Esp32SensState, ESP32_ADC_UNITS),
         VMSTATE_UINT8_ARRAY(patt_ptr, Esp32SensState, ESP32_ADC_UNITS),
         VMSTATE_UINT8(alt_unit, Esp32SensState),
-        VMSTATE_TIMER(touch_timer, Esp32SensState),
+        VMSTATE_STRUCT(touch_wait, Esp32SensState, 1,
+                       vmstate_esp32_sens_wait, Esp32SensWait),
+        VMSTATE_INT64(touch_meas_ns, Esp32SensState),
         VMSTATE_UINT32(touch_phase, Esp32SensState),
         VMSTATE_BOOL(touch_timer_en, Esp32SensState),
         VMSTATE_BOOL(touch_wakeup_level, Esp32SensState),
