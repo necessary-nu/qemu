@@ -54,6 +54,10 @@
  * QEMU's TLB caches a page's permissions only when one entry of each unit,
  * or none, decides the whole page; any other page is checked on every
  * access, and its code runs one instruction per translation.
+ *
+ * An access the checks allow goes to the bus with the privilege mode it
+ * is made in, MemTxAttrs.user set for user mode, as the bus carries it to
+ * the blocks that check it (the interrupt matrix's secure fields).
  */
 
 #include "qemu/osdep.h"
@@ -272,7 +276,7 @@ static int esp32p4_page_prot(int privs)
 
 /*
  * The HP core's TLB fill: the core has no address translation, so the
- * checks above alone decide an access.
+ * checks above alone decide an access, which carries its privilege mode.
  */
 /* [spec:nuos:req:emu.esp32p4.pmp] */
 bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,
@@ -282,6 +286,7 @@ bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,
     ESP32P4CPU *cpu = container_of(cs, ESP32P4CPU, parent_obj.parent_obj);
     CPURISCVState *env = &cpu->parent_obj.env;
     int priv = mmuidx_priv(mmu_idx);
+    MemTxAttrs attrs = { .user = priv == PRV_U };
     int privs = ESP32P4_RWX;
     uint64_t end = (uint64_t)address + MAX(size, 1);
     uint64_t page = address & TARGET_PAGE_MASK;
@@ -300,11 +305,12 @@ bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,
 
     if (part >= end) {
         if (esp32p4_uniform(cpu, page, page + TARGET_PAGE_SIZE, priv)) {
-            tlb_set_page(cs, page, page, esp32p4_page_prot(privs), mmu_idx,
-                         TARGET_PAGE_SIZE);
+            tlb_set_page_with_attrs(cs, page, page, attrs,
+                                    esp32p4_page_prot(privs), mmu_idx,
+                                    TARGET_PAGE_SIZE);
         } else {
-            tlb_set_page(cs, address, address, esp32p4_page_prot(privs),
-                         mmu_idx, 1);
+            tlb_set_page_with_attrs(cs, address, address, attrs,
+                                    esp32p4_page_prot(privs), mmu_idx, 1);
         }
         return true;
     }
