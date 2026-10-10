@@ -482,6 +482,12 @@ static void test_tree_at_reset(void)
     assert_hz(qts, "lp-i2cmst", 40 * MHZ);
     assert_hz(qts, "lp-uart-sclk", 20 * MHZ);
     assert_hz(qts, "lp-core", 0);
+    assert_hz(qts, "pvt", 0);
+    assert_hz(qts, "pvt-peri-group1", 0);
+    /* LP_PERI_CLK by LPADC_FUNC_DIV_NUM + 1, then the SARs' by theirs. */
+    assert_hz(qts, "lp-adc-func", 8 * MHZ);
+    assert_hz(qts, "lp-adc-sar1", 1600000);
+    assert_hz(qts, "lp-adc-sar2", 1600000);
     qtest_quit(qts);
 }
 
@@ -573,6 +579,12 @@ static void test_block_clocks(void)
     assert_hz(qts, "i2s0-mst", 0);
     set_bits(qts, PERI_CLK_CTRL14, 1 << 19);
     assert_hz(qts, "i2s0-mst", 8888888);
+
+    /* The PVT monitor's clocks, as ESP-IDF sets them up: 160 / 2 MHz. */
+    qtest_writel(qts, HP_BASE + 0xa4, 0x00000404 | (1 << 16) | (1 << 24));
+    qtest_writel(qts, HP_BASE + 0xa8, 0x007fc000 | 1 | (0xf << 8));
+    assert_hz(qts, "pvt", 80 * MHZ);
+    assert_hz(qts, "pvt-peri-group4", 80 * MHZ);
 
     /* The calibration clock: RC_FAST_CLK, then RC32K, which the PMU powers. */
     qtest_writel(qts, PERI_CLK_CTRL21, 0x52400000 | 7);

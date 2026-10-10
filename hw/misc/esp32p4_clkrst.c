@@ -67,6 +67,12 @@
  *     selects a stopped clock; where the TRM calls invalid a setting
  *     ESP-IDF uses (I2S's PLL_F160M, the calibration clock's RC32K and
  *     the DSI PHY's clock), the model follows ESP-IDF.
+ *   - The PVT monitor's clocks from PLL_F160M_CLK, which ESP-IDF enables
+ *     for them (pmu_pvt.c), and the LP ADC's function clock from its bus
+ *     clock, LP_PERI_CLK, as TRM table 11.2-7 has it, and its SAR clocks
+ *     from that, as the HP ADC's are from its function clock. (The TRM
+ *     gives LPADC_SAR1_DIV_NUM and LPADC_SAR2_DIV_NUM each the other's
+ *     description; the model follows their names.)
  *   - The SDIO host's clocks: in low-speed mode its source divided by
  *     (SDIO_LS_CLK_DIV_NUM + 1) and by EDGE_N + 1 of the edge counts
  *     SDIO_LS_CLK_EDGE_CFG_UPDATE takes, in high-speed mode the SDIO PLL's
@@ -97,6 +103,12 @@
  *
  * HP_SYS_CLKRST_ANA_PLL_CTRL0's calibration controls drive the analog
  * blocks', and show their calibrations' end.
+ *
+ * Held as written, as nothing documents what they clock: the test-mode
+ * clocks (REF_CLK_CTRL*'s TM_*_CLK_EN), the pad BIST clocks
+ * (PERI_CLK_CTRL26/27's PADBIST_*), EMAC_UNUSED0/1_CLK_EN, the USB 2.0
+ * OTG's ULPI clock enable, LP_CLKRST_LP_CLK_PO_EN and
+ * ETM_EVENT_TICK_EN.
  *
  * Not modelled: halting a core on reset for the debugger
  * (OCD_HALT_ON_RESET), the lockup reset (the cores do not report a
@@ -934,6 +946,14 @@ static const ClkDesc esp32p4_clk_desc[ESP32P4_NUM_CLOCKS] = {
                       PERI_CLK_CTRL23, 17) },
     [C(ADC_SAR1)] = { PARENTS(C(ADC)), INTDIV(PERI_CLK_CTRL24, 0, 8) },
     [C(ADC_SAR2)] = { PARENTS(C(ADC)), INTDIV(PERI_CLK_CTRL24, 8, 8) },
+    [C(PVT)] = { PARENTS(C(PLL_F160M)), .gate = { B(PERI_CLK_CTRL24, 24) },
+                 INTDIV(PERI_CLK_CTRL24, 16, 8) },
+    [C(PVT_PERI_GROUP)] = { PARENTS(C(PLL_F160M)),
+                            INTDIV(PERI_CLK_CTRL25, 0, 8) },
+    GATE(PVT_PERI_GROUP1, PVT_PERI_GROUP, PERI_CLK_CTRL25, 8),
+    GATE(PVT_PERI_GROUP2, PVT_PERI_GROUP, PERI_CLK_CTRL25, 9),
+    GATE(PVT_PERI_GROUP3, PVT_PERI_GROUP, PERI_CLK_CTRL25, 10),
+    GATE(PVT_PERI_GROUP4, PVT_PERI_GROUP, PERI_CLK_CTRL25, 11),
     [C(CRYPTO)] = { PARENTS(C(XTAL), C(RC_FAST), C(PLL_F240M), C(PLL_F160M)),
                     .sel = F(PERI_CLK_CTRL25, 12, 2) },
     GATE(CRYPTO_AES, CRYPTO, PERI_CLK_CTRL25, 14),
@@ -1006,6 +1026,12 @@ static const ClkDesc esp32p4_clk_desc[ESP32P4_NUM_CLOCKS] = {
                                   PNONE),
                           .sel = F(LPPERI_CORE_CLK_SEL, 30, 2),
                           .gate = { B(LPPERI_CLK_EN, 29) } },
+    [C(LP_ADC_FUNC)] = { PARENTS(C(LP_ADC)),
+                         INTDIV(LPPERI_ADC_CTRL, 8, 8) },
+    [C(LP_ADC_SAR1)] = { PARENTS(C(LP_ADC_FUNC)),
+                         INTDIV(LPPERI_ADC_CTRL, 24, 8) },
+    [C(LP_ADC_SAR2)] = { PARENTS(C(LP_ADC_FUNC)),
+                         INTDIV(LPPERI_ADC_CTRL, 16, 8) },
     GATE(EFUSE, XTAL_D2, LPPERI_CLK_EN, 19),
     [C(LP_CORE)] = { .kind = SPECIAL },
 };
@@ -1600,6 +1626,13 @@ void esp32p4_clkrst_record_reset(ESP32P4ClkRstState *s, unsigned cores,
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+void esp32p4_clkrst_set_system_reset_cause(ESP32P4ClkRstState *s,
+                                           uint8_t cause)
+{
+    s->system_reset_cause = cause;
+}
+
 /*
  * Time the current phase of core @n's CPU reset, in cycles of its clock;
  * while that clock is stopped the phase waits for it.
@@ -2166,9 +2199,10 @@ void esp32p4_clkrst_gate_volatile(ESP32P4ClkRstGate *g, hwaddr offset,
 
 /*
  * [spec:nuos:req:emu.esp32p4.clocks]
- * A chip reset: every register takes its reset value, the dividers in
- * effect theirs, the CPU resets in progress end, and LP_CLKRST_RESET_CAUSE
- * records a chip reset for every core.
+ * A chip or system reset: every register takes its reset value, the
+ * dividers in effect theirs, the CPU resets in progress end, and
+ * LP_CLKRST_RESET_CAUSE records the reset for every core, as a chip reset
+ * unless a block has given another cause.
  */
 static void esp32p4_clkrst_reset_hold(Object *obj, ResetType type)
 {
@@ -2199,7 +2233,9 @@ static void esp32p4_clkrst_reset_hold(Object *obj, ResetType type)
     esp32p4_clkrst_record_reset(s, ESP32P4_CLKRST_CORE_HP0 |
                                 ESP32P4_CLKRST_CORE_HP1 |
                                 ESP32P4_CLKRST_CORE_LP,
+                                s->system_reset_cause ?:
                                 ESP32P4_RESET_CAUSE_CHIP);
+    s->system_reset_cause = 0;
     s->resetting = true;
     esp32p4_clkrst_update(s, true);
     s->resetting = false;
@@ -2353,6 +2389,7 @@ static const VMStateDescription vmstate_esp32p4_clkrst = {
         VMSTATE_BOOL(lp_core_reset_level, ESP32P4ClkRstState),
         VMSTATE_BOOL(lp_core_clock_level, ESP32P4ClkRstState),
         VMSTATE_UINT64_ARRAY(checked_soc, ESP32P4ClkRstState, 4),
+        VMSTATE_UINT8(system_reset_cause, ESP32P4ClkRstState),
         VMSTATE_END_OF_LIST()
     },
 };

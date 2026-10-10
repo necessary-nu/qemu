@@ -359,6 +359,12 @@ enum {
     X(ADC, "adc") \
     X(ADC_SAR1, "adc-sar1") \
     X(ADC_SAR2, "adc-sar2") \
+    X(PVT, "pvt") \
+    X(PVT_PERI_GROUP, "pvt-peri-group") \
+    X(PVT_PERI_GROUP1, "pvt-peri-group1") \
+    X(PVT_PERI_GROUP2, "pvt-peri-group2") \
+    X(PVT_PERI_GROUP3, "pvt-peri-group3") \
+    X(PVT_PERI_GROUP4, "pvt-peri-group4") \
     X(CRYPTO, "crypto") \
     X(CRYPTO_AES, "crypto-aes") \
     X(CRYPTO_DS, "crypto-ds") \
@@ -398,6 +404,9 @@ enum {
     X(LP_I2S_TX, "lp-i2s-tx") \
     X(LP_I2C_SCLK, "lp-i2c-sclk") \
     X(LP_UART_SCLK, "lp-uart-sclk") \
+    X(LP_ADC_FUNC, "lp-adc-func") \
+    X(LP_ADC_SAR1, "lp-adc-sar1") \
+    X(LP_ADC_SAR2, "lp-adc-sar2") \
     X(EFUSE, "efuse") \
     X(LP_CORE, "lp-core")
 
@@ -699,6 +708,8 @@ struct ESP32P4ClkRstState {
     uint64_t checked_soc[4];
     /* In the device's own reset, which does not reset the gated blocks. */
     bool resetting;
+    /* The cause the next system reset records; 0 for a chip reset. */
+    uint8_t system_reset_cause;
 
     QTAILQ_HEAD(, ESP32P4ClkRstGate) gates;
 
@@ -741,5 +752,13 @@ void esp32p4_clkrst_gate_volatile(ESP32P4ClkRstGate *g, hwaddr offset,
  */
 void esp32p4_clkrst_record_reset(ESP32P4ClkRstState *s, unsigned cores,
                                  uint8_t cause);
+
+/*
+ * The cause the next system reset records for every core, in place of a
+ * chip reset's: a block that resets the system (a watchdog's system
+ * reset, LP_SYSTEM_SYS_SW_RST) sets it before it requests the reset.
+ */
+void esp32p4_clkrst_set_system_reset_cause(ESP32P4ClkRstState *s,
+                                           uint8_t cause);
 
 #endif
