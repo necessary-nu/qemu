@@ -53,8 +53,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350HSTXState, RP2350_HSTX)
  * faster than anything outside the chip model could follow, so the
  * device keeps exact records of what it emitted and drives the "out"
  * lines only at coarse instants: whenever its state is synchronised (a
- * register access, a DREQ edge, a coupled-mode PIO input change) and
- * every "pin-refresh-ns" while it is shifting. At each instant a line
+ * register access, a DREQ edge, a coupled-mode PIO input change), every
+ * "pin-refresh-ns" while it is shifting, and in the cycle in which it
+ * stops shifting. At each instant a line
  * shows the level of the last half-cycle emitted, or while the shift
  * register is stopped, the crossbar applied to its current contents.
  *

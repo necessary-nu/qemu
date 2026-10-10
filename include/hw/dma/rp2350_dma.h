@@ -25,9 +25,10 @@
  * A DREQ source must expect the DMA to access its registers from within
  * the qemu_set_irq() that raises its DREQ: the transfer the rising edge
  * asks for is issued there and then, unless the source is in the middle
- * of a register access (or the change comes from a vCPU), when it is
- * issued from a bottom half instead. A line still high when that call
- * returns asks for more transfers, issued in virtual time. A source
+ * of a register access (or the change comes from a vCPU's), when it is
+ * issued at the same virtual time once that access completes instead. A
+ * line still high when that call returns asks for more transfers, issued
+ * in virtual time. A source
  * that runs itself forward over a span of time should change its DREQ at
  * each event in that span, and treat register accesses made meanwhile as
  * happening at that event.
@@ -114,7 +115,8 @@ struct RP2350DMAState {
     Clock *clk;
 
     QEMUTimer *timer;
-    QEMUBH *bh;
+    /* Runs the engine at the end of an access it could not run within. */
+    QEMUTimer *defer;
     qemu_irq irq[RP2350_DMA_IRQS];
 
     RP2350DMAChannel ch[RP2350_DMA_CHANNELS];

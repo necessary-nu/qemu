@@ -575,6 +575,38 @@ static void test_tmds_repeat(void)
     qtest_quit(qts);
 }
 
+/*
+ * The pins settle on the stopped shift register's bits in the cycle the
+ * block stops shifting, with no access to the block and no periodic
+ * refresh to drive them.
+ */
+/* [spec:nuos:req:emu.hstx/test] */
+static void test_pins_settle(void)
+{
+    QTestState *qts;
+
+    qts = qtest_initf("-M rp2350 -bios %s "
+                      "-global rp2350-hstx.pin-refresh-ns=0", rom_path);
+    vnow = rp2350_clocks_init(qts);
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
+    vnow += RP2350_RESETS_RELEASE_NS;
+
+    qtest_writel(qts, PAD(12), PAD_IE);
+    qtest_writel(qts, CTRL(12), FUNC_HSTX);
+    /* Two bits a cycle on GPIO 12, five shifts by 2: bits 0 to 9. */
+    qtest_writel(qts, BITN(0), BITN_SEL_P(0) | BITN_SEL_N(1));
+    qtest_writel(qts, CSR, CSR_EN | CSR_N_SHIFTS(5) | CSR_SHIFT(2));
+    qtest_writel(qts, FIFO, 1u << 10);
+    /* While it shifts out bits 0 to 9, all clear, the pin is low. */
+    cycles(qts, 3);
+    g_assert_cmphex(qtest_readl(qts, STATUS(12)) & STATUS_OUTTOPAD, ==, 0);
+    /* Stopped, rotated by 10: bit 0 is the word's bit 10. */
+    cycles(qts, 10);
+    g_assert_cmphex(qtest_readl(qts, STATUS(12)) & STATUS_OUTTOPAD, ==,
+                    STATUS_OUTTOPAD);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     static const uint32_t blank[2];
@@ -594,6 +626,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/hstx/expander-raw", test_expander_raw);
     qtest_add_func("/rp2350/hstx/tmds", test_tmds);
     qtest_add_func("/rp2350/hstx/tmds-repeat", test_tmds_repeat);
+    qtest_add_func("/rp2350/hstx/pins-settle", test_pins_settle);
     ret = g_test_run();
 
     unlink(rom_path);

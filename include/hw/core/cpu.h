@@ -442,6 +442,13 @@ struct qemu_work_item;
  * @crash_occurred: Indicates the OS reported a crash (panic) for this CPU
  * @singlestep_flags: Flags for single-stepping.
  * @icount_extra: Instructions until next timer event.
+ * @icount_clock: Under icount, the clock this CPU executes one instruction
+ *   per cycle of, or NULL to execute one every 2^shift ns. Set with
+ *   icount_set_cpu_clock().
+ * @icount_period: The period of @icount_clock, in Clock units (2^-32 ns).
+ * @icount_insn_time: Virtual time one instruction of the current run
+ *   accounts for, in Clock units, or 0 for 2^shift ns. Written only by
+ *   the vCPU thread when it prepares a run.
  * @cpu_ases: Pointer to array of CPUAddressSpaces (which define the
  *            AddressSpaces this CPU has)
  * @as: Pointer to the first AddressSpace, for the convenience of targets which
@@ -508,6 +515,9 @@ struct CPUState {
     unsigned singlestep_flags;
     int64_t icount_budget;
     int64_t icount_extra;
+    Clock *icount_clock;
+    uint64_t icount_period;
+    uint64_t icount_insn_time;
     uint64_t random_seed;
     sigjmp_buf jmp_env;
 

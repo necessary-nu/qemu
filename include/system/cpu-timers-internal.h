@@ -54,6 +54,14 @@ typedef struct TimersState {
 
     /* Only written by TCG thread */
     int64_t qemu_icount;
+    /*
+     * The virtual time the executed instructions account for, in ns and
+     * 2^-32 ns. Each instruction accounts for its CPU's instruction time
+     * (2^icount_time_shift ns, or a cycle of its icount clock) when it
+     * executes, so the time already passed stays put when that changes.
+     */
+    int64_t qemu_icount_time;
+    uint32_t qemu_icount_time_frac;
 
     /* for adjusting icount */
     QEMUTimer *icount_rt_timer;

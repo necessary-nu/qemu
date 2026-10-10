@@ -35,6 +35,7 @@
 #include "system/system.h"
 #include "system/reset.h"
 #include "system/cpus.h"
+#include "exec/icount.h"
 #include "system/runstate.h"
 #include "system/blockdev.h"
 #include "system/block-backend.h"
@@ -1001,6 +1002,12 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     for (int i = 0; i < ms->smp.cpus; ++i) {
         qdev_realize(DEVICE(&s->cpu[i]), NULL, &error_fatal);
+        /*
+         * [spec:nuos:req:emu.esp32.clock-gating]
+         * Under icount a CPU executes an instruction per CPU_CLK cycle, at
+         * CPU_CLK's current frequency, alongside the other CPU.
+         */
+        icount_set_cpu_clock(CPU(&s->cpu[i]), s->cpu_clk);
     }
 
     s->dport.get_pid = esp32_get_pid;

@@ -145,10 +145,14 @@ void HELPER(intclear)(CPUXtensaState *env, uint32_t v)
 
 /*
  * Count an instruction against each running countdown; one that has run
- * out expires before this instruction, which then runs anew.
+ * out expires before this instruction, which then runs anew. The block is
+ * left there: under icount the instructions not run are not counted, and
+ * the hooks may read the virtual clock and raise interrupts as at the end
+ * of a block.
  */
 void HELPER(ext_countdown)(CPUXtensaState *env, uint32_t pc)
 {
+    CPUState *cs = env_cpu(env);
     unsigned expired = 0;
 
     for (unsigned i = 0; i < XTENSA_EXT_COUNTDOWNS; ++i) {
@@ -160,7 +164,9 @@ void HELPER(ext_countdown)(CPUXtensaState *env, uint32_t pc)
         }
     }
     if (expired) {
+        cpu_restore_state(cs, GETPC());
         env->pc = pc;
+        cs->neg.can_do_io = true;
         bql_lock();
         for (unsigned i = 0; i < XTENSA_EXT_COUNTDOWNS; ++i) {
             if ((expired & (1u << i)) && env->ext_hooks &&
@@ -169,7 +175,7 @@ void HELPER(ext_countdown)(CPUXtensaState *env, uint32_t pc)
             }
         }
         bql_unlock();
-        cpu_loop_exit(env_cpu(env));
+        cpu_loop_exit(cs);
     }
 }
 

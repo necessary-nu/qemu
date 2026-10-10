@@ -23,8 +23,9 @@
  * The block is not ticked. It holds its state as of a clk_hstx cycle and
  * is run forward to the current cycle whenever it is observed or written,
  * at the cycle in which a pop makes room in a full FIFO (raising
- * DREQ_HSTX), and every pin-refresh-ns while it is shifting, to drive its
- * GPIO outputs at that coarse resolution. Cycles in which nothing but the
+ * DREQ_HSTX), every pin-refresh-ns while it is shifting, to drive its
+ * GPIO outputs at that coarse resolution, and at the cycle in which it
+ * stops shifting, to drive their final levels. Cycles in which nothing but the
  * output shift register changes are run in bulk, and an infinite
  * RAW_REPEAT or TMDS_REPEAT command, whose output is eventually periodic,
  * is run forward by whole periods.
@@ -702,13 +703,41 @@ static void hstx_drive(RP2350HSTXState *s)
 }
 
 /*
- * Wake at the cycle in which a pop makes room in a full FIFO, and every
- * pin-refresh-ns while shifting.
+ * The clk_hstx cycle in which the block, left alone, stops shifting, from
+ * which its outputs hold the crossbar's view of the stopped shift
+ * register; UINT64_MAX if that is not within POP_LOOKAHEAD cycles (an
+ * infinite repeat never stops).
+ */
+static uint64_t hstx_stop_cycle(RP2350HSTXState *s)
+{
+    RP2350HSTXCore c = s->core;
+    uint64_t limit = c.cycle + POP_LOOKAHEAD;
+
+    while (!hstx_idle(s, &c)) {
+        if (c.cycle >= limit || hstx_steady(s, &c)) {
+            return UINT64_MAX;
+        }
+        hstx_cycle(s, &c, NULL);
+        if (c.sr_left > 1 && !hstx_wants_pop(s, &c)) {
+            uint64_t k = c.sr_left - 1;
+
+            hstx_shift_n(s, &c, k, NULL);
+            c.cycle += k;
+        }
+    }
+    return c.cycle;
+}
+
+/*
+ * Wake at the cycle in which a pop makes room in a full FIFO, every
+ * pin-refresh-ns while shifting, and at the cycle in which shifting stops,
+ * so that the outputs settle on their final levels when they do.
  */
 static void hstx_schedule(RP2350HSTXState *s)
 {
     int64_t now = hstx_now();
     int64_t due = INT64_MAX;
+    uint64_t stop;
 
     if (!clock_is_enabled(s->clk) || hstx_idle(s, &s->core)) {
         timer_del(s->timer);
@@ -727,6 +756,10 @@ static void hstx_schedule(RP2350HSTXState *s)
     }
     if (s->pin_refresh_ns) {
         due = MIN(due, now + s->pin_refresh_ns);
+    }
+    stop = hstx_stop_cycle(s);
+    if (stop != UINT64_MAX) {
+        due = MIN(due, hstx_ns_at(s, stop));
     }
     if (due == INT64_MAX) {
         timer_del(s->timer);

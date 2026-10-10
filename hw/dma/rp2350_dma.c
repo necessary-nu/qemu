@@ -19,14 +19,19 @@
  * answered when it is raised rather than when a timer next fires. The
  * engine runs:
  *
- *  - from inside a DREQ change, unless the change comes from a vCPU or a
- *    transfer would reach a device in the middle of a register access,
- *    so that a peripheral running itself forward over a span of time sees
- *    its FIFO serviced at each DREQ in that span, as on hardware;
- *  - from a bottom half when a DREQ change cannot be answered in place,
- *    and after a register write leaves a DREQ-paced channel requesting;
+ *  - from inside a DREQ change, unless the change comes from a vCPU's
+ *    register access or a transfer would reach a device in the middle of
+ *    one, so that a peripheral running itself forward over a span of time
+ *    sees its FIFO serviced at each DREQ in that span, as on hardware;
+ *  - from a timer at the current virtual time when a DREQ change cannot
+ *    be answered in place, and after a register write leaves a DREQ-paced
+ *    channel requesting; under icount that is at the end of the vCPU's
+ *    access, before it executes on;
  *  - from a timer in virtual time, armed for when there is more work, for
- *    the permanent request, the pacing timers and DREQs held high.
+ *    the permanent request, the pacing timers and DREQs held high. Only
+ *    memory sees a run's transfers late, in a batch: while a requesting
+ *    channel reads or writes a device, the timer wakes the engine every
+ *    cycle, so that the device sees each transfer in its own cycle.
  *
  * A register access never issues a transfer itself: it only brings the
  * idle engine (and the pacing timers) up to date.
@@ -38,7 +43,6 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
-#include "qemu/main-loop.h"
 #include "qemu/rcu.h"
 #include "qemu/bswap.h"
 #include "qemu/host-utils.h"
@@ -168,7 +172,7 @@ typedef enum EngineMode {
      * the first cycle in which a transfer or completion is due.
      */
     ENGINE_SYNC,
-    /* Issue transfers, from the timer or the bottom half. */
+    /* Issue transfers, from a timer. */
     ENGINE_ISSUE,
     /* Issue transfers from inside a DREQ change. */
     ENGINE_SERVICE,
@@ -966,7 +970,7 @@ static bool engine_run(RP2350DMAState *s, EngineMode mode)
         rr_low = s->rr_low;
         n = arbitrate(s, req);
         if (mode == ENGINE_SERVICE && !ch_targets_free(s, n)) {
-            /* The bottom half takes over from this very arbitration. */
+            /* The deferred run takes over from this very arbitration. */
             s->hp_served = hp_served;
             s->rr_high = rr_high;
             s->rr_low = rr_low;
@@ -983,6 +987,29 @@ static bool engine_run(RP2350DMAState *s, EngineMode mode)
     s->running = false;
     update_irq(s);
     return done;
+}
+
+/* Whether `addr`, on the DMA's port, is anything but memory. */
+static bool addr_is_device(RP2350DMAState *s, uint32_t addr)
+{
+    MemoryRegion *mr;
+    hwaddr xlat, len = 1;
+
+    RCU_READ_LOCK_GUARD();
+    mr = address_space_translate(&s->as, addr, &xlat, &len, false,
+                                 MEMTXATTRS_UNSPECIFIED);
+    if (s->accessctrl && mr->owner == OBJECT(s->accessctrl)) {
+        len = 1;
+        mr = address_space_translate(&s->accessctrl->bus_as, addr, &xlat,
+                                     &len, false, MEMTXATTRS_UNSPECIFIED);
+    }
+    return !memory_region_is_ram(mr) && !memory_region_is_romd(mr);
+}
+
+static bool ch_reaches_device(RP2350DMAState *s, int n)
+{
+    return addr_is_device(s, s->ch[n].read_addr) ||
+           addr_is_device(s, s->ch[n].write_addr);
 }
 
 /* Arm the engine's timer for the next cycle with work to do. */
@@ -1012,6 +1039,11 @@ static void engine_kick(RP2350DMAState *s)
             if (!(req & (1u << n))) {
                 continue;
             }
+            if (ch_reaches_device(s, n)) {
+                /* A device sees each transfer in its own cycle. */
+                wait = 1;
+                break;
+            }
             if (!level) {
                 wait += c->dreq_credit;
             } else if (ch_mode(c) == MODE_ENDLESS) {
@@ -1035,7 +1067,7 @@ static void engine_kick(RP2350DMAState *s)
     timer_mod(s->timer, cycle_ns(s, s->cycle + wait));
 }
 
-/* The engine's timer and bottom half. */
+/* The engine's timers. */
 static void engine_wake(void *opaque)
 {
     RP2350DMAState *s = opaque;
@@ -1045,18 +1077,36 @@ static void engine_wake(void *opaque)
 }
 
 /*
- * A DREQ input. A rising edge is a credit for each busy channel that
- * paces on it and can see it (paused with EN clear or not), answered at
- * once: in place, unless a vCPU is making a register access or a transfer
- * would re-enter a device in the middle of one, else from the bottom
- * half. A level held high requests further transfers, which the engine's
- * timer issues. Answering in place, the engine heeds credits only: the
- * source may yet lower this line, as a pulse does, and it and other
- * sources may be part way through updating their lines, when their levels
- * are not yet to be trusted. A channel that is not busy takes no credits:
- * on hardware it starts its DREQ handshake afresh when triggered, so edges
- * from before (from whatever its TREQ_SEL then selected, DREQ_PIO0_TX0 at
- * reset) do not count.
+ * Issue the transfers that cannot be issued in place at the current
+ * virtual time, once the access in progress has completed.
+ */
+static void engine_defer(RP2350DMAState *s)
+{
+    timer_mod(s->defer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+/*
+ * Whether a vCPU is executing, and so making a register access: a vCPU
+ * thread also runs timers between executing (under icount, for one),
+ * when current_cpu stays set.
+ */
+static bool vcpu_access(void)
+{
+    return current_cpu && qatomic_read(&current_cpu->running);
+}
+
+/*
+ * A DREQ input. A rising edge is a credit for each busy channel that paces on
+ * it and can see it (paused with EN clear or not), answered at once: in place,
+ * unless a vCPU is making a register access or a transfer would re-enter a
+ * device in the middle of one, else deferred to the end of that access. A
+ * level held high requests further transfers, which the engine's timer issues.
+ * Answering in place, the engine heeds credits only: the source may yet lower
+ * this line, as a pulse does, and it and other sources may be part way through
+ * updating their lines, when their levels are not yet to be trusted. A channel
+ * that is not busy takes no credits: on hardware it starts its DREQ handshake
+ * afresh when triggered, so edges from before (from whatever its TREQ_SEL then
+ * selected, DREQ_PIO0_TX0 at reset) do not count.
  */
 /* [spec:nuos:req:emu.dma] */
 static void dreq_set(void *opaque, int dreq, int level)
@@ -1082,8 +1132,8 @@ static void dreq_set(void *opaque, int dreq, int level)
     if (rising) {
         s->edges_only = true;
         if ((requesting(s) & dreq_paced(s)) &&
-            (current_cpu || !engine_run(s, ENGINE_SERVICE))) {
-            qemu_bh_schedule(s->bh);
+            (vcpu_access() || !engine_run(s, ENGINE_SERVICE))) {
+            engine_defer(s);
         }
         s->edges_only = false;
     }
@@ -1512,7 +1562,7 @@ static MemTxResult rp2350_dma_write(void *opaque, hwaddr addr, uint64_t value,
     update_irq(s);
     /* A trigger, say, may leave a DREQ-paced channel requesting. */
     if (requesting(s) & dreq_paced(s)) {
-        qemu_bh_schedule(s->bh);
+        engine_defer(s);
     }
     engine_kick(s);
     return r;
@@ -1557,7 +1607,7 @@ static void rp2350_dma_reset_hold(Object *obj, ResetType type)
     int n;
 
     timer_del(s->timer);
-    qemu_bh_cancel(s->bh);
+    timer_del(s->defer);
     for (n = 0; n < RP2350_DMA_CHANNELS; n++) {
         s->ch[n] = (RP2350DMAChannel) {
             .seccfg = SECCFG_S | SECCFG_P,
@@ -1658,8 +1708,7 @@ static void rp2350_dma_realize(DeviceState *dev, Error **errp)
                                         &s->port_hole, 1);
     address_space_init(&s->as, &s->port, "rp2350-dma");
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, engine_wake, s);
-    s->bh = qemu_bh_new_guarded(engine_wake, s,
-                                &DEVICE(s)->mem_reentrancy_guard);
+    s->defer = timer_new_ns(QEMU_CLOCK_VIRTUAL, engine_wake, s);
 }
 
 static int rp2350_dma_post_load(void *opaque, int version_id)
@@ -1667,7 +1716,7 @@ static int rp2350_dma_post_load(void *opaque, int version_id)
     RP2350DMAState *s = opaque;
 
     if (requesting(s) & dreq_paced(s)) {
-        qemu_bh_schedule(s->bh);
+        engine_defer(s);
     }
     engine_kick(s);
     return 0;

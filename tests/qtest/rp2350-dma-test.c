@@ -857,6 +857,40 @@ static void test_busctrl_counts_dma(void)
     qtest_quit(qts);
 }
 
+#define HSTX_CSR        0x400c0000
+#define HSTX_STAT       0x50600000
+#define HSTX_FIFO       0x50600004
+#define HSTX_EXPAND     ((5u << 16) | (2u << 8) | 3u)
+#define HSTX_FULL_WOF   ((1u << 10) | (1u << 8) | 8u)
+#define STALL_WORDS     22
+
+/*
+ * A device sees each of an unpaced channel's transfers in the cycle it is
+ * issued, not in a batch: into HSTX's FIFO behind an infinite RAW_REPEAT,
+ * which pops the command and its data word in the first cycles and then
+ * nothing more, the FIFO fills to eight words and the rest overflow.
+ */
+/* [spec:nuos:req:emu.dma/test] */
+static void test_device_each_cycle(void)
+{
+    QTestState *qts = start();
+    int i;
+
+    qtest_writel(qts, SRC, 0x1000);         /* RAW_REPEAT, for ever */
+    qtest_writel(qts, SRC + 4, 0x354);
+    for (i = 2; i < STALL_WORDS; i++) {
+        qtest_writel(qts, SRC + 4 * i, 0xf000);     /* NOP */
+    }
+    qtest_writel(qts, HSTX_CSR, HSTX_EXPAND);
+    setup(qts, 0, SRC, HSTX_FIFO, STALL_WORDS);
+    qtest_writel(qts, CH(0) + CTRL_TRIG, EN | SIZE_WORD | INCR_READ |
+                 CHAIN_TO(0) | TREQ(TREQ_PERMANENT));
+    settle(qts);
+    g_assert_cmphex(qtest_readl(qts, CH(0) + CTRL_TRIG) & BUSY, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, HSTX_STAT), ==, HSTX_FULL_WOF);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     static const uint32_t blank[2];
@@ -898,6 +932,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/dma/bus-errors", test_bus_errors);
     qtest_add_func("/rp2350/dma/security", test_security);
     qtest_add_func("/rp2350/dma/busctrl", test_busctrl_counts_dma);
+    qtest_add_func("/rp2350/dma/device-each-cycle", test_device_each_cycle);
 
     ret = g_test_run();
     unlink(rom_path);
