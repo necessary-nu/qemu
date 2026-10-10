@@ -291,39 +291,25 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     }
 }
 
-static bool translator_ld(CPUArchState *env, DisasContextBase *db,
-                          void *dest, vaddr pc, size_t len)
+/*
+ * Note the second page reached by a read of [pc, last], or check it
+ * against the one noted by an earlier read.  Return false if the read
+ * lies entirely within the first page.
+ *
+ * Every read is noted, including those that translator_ld leaves to the
+ * slow path: record_save relies on pc_second_page to place the bytes
+ * that the slow path reads from the second page.
+ */
+static bool translator_note_page1(DisasContextBase *db, vaddr pc, vaddr last)
 {
-    TranslationBlock *tb = db->tb;
-    vaddr last = pc + len - 1;
-    void *host;
-    vaddr base;
-
-    /* Use slow path if first page is MMIO. */
-    if (unlikely(tb_page_addr0(tb) == -1)) {
-        /* We capped translation with first page MMIO in tb_gen_code. */
-        tcg_debug_assert(db->max_insns == 1);
+    if (likely(((db->pc_first ^ last) & TARGET_PAGE_MASK) == 0)) {
+        /* Entire read is from the first page. */
         return false;
     }
 
-    host = db->host_addr[0];
-    base = db->pc_first;
-
-    if (likely(((base ^ last) & TARGET_PAGE_MASK) == 0)) {
-        /* Entire read is from the first page. */
-        goto do_read;
-    }
-
-    if (unlikely(((base ^ pc) & TARGET_PAGE_MASK) == 0)) {
-        /*
-         * Read begins on the first page and extends to the second.
-         * The unaligned read is never atomic.
-         */
-        size_t len0 = -(pc | TARGET_PAGE_MASK);
-        memcpy(dest, host + (pc - base), len0);
-        pc += len0;
-        dest += len0;
-        len -= len0;
+    if (((db->pc_first ^ pc) & TARGET_PAGE_MASK) == 0) {
+        /* Skip the part of the read that is on the first page. */
+        pc += -(pc | TARGET_PAGE_MASK);
     }
 
     /*
@@ -340,6 +326,45 @@ static bool translator_ld(CPUArchState *env, DisasContextBase *db,
         assert((pc & TARGET_PAGE_MASK) == db->pc_second_page);
     }
     assert((last & TARGET_PAGE_MASK) == db->pc_second_page);
+    return true;
+}
+
+static bool translator_ld(CPUArchState *env, DisasContextBase *db,
+                          void *dest, vaddr pc, size_t len)
+{
+    TranslationBlock *tb = db->tb;
+    vaddr last = pc + len - 1;
+    bool page1 = translator_note_page1(db, pc, last);
+    void *host;
+    vaddr base;
+
+    /* Use slow path if first page is MMIO. */
+    if (unlikely(tb_page_addr0(tb) == -1)) {
+        /* We capped translation with first page MMIO in tb_gen_code. */
+        tcg_debug_assert(db->max_insns == 1);
+        return false;
+    }
+
+    host = db->host_addr[0];
+    base = db->pc_first;
+
+    if (likely(!page1)) {
+        /* Entire read is from the first page. */
+        goto do_read;
+    }
+
+    if (unlikely(((base ^ pc) & TARGET_PAGE_MASK) == 0)) {
+        /*
+         * Read begins on the first page and extends to the second.
+         * The unaligned read is never atomic.
+         */
+        size_t len0 = -(pc | TARGET_PAGE_MASK);
+        memcpy(dest, host + (pc - base), len0);
+        pc += len0;
+        dest += len0;
+        len -= len0;
+    }
+
     base = db->pc_second_page;
     host = db->host_addr[1];
 
