@@ -24,6 +24,7 @@ tests += {
   'test-crc32.S': setup + {'qemu_args': ['-cpu', 'rv64,xlrbr=true', qemu_args]},
   'test-minstret-ecall.S': setup + {'qemu_args': ['-icount', 'shift=1', qemu_args]},
   'test-misa-w.S': setup + {'qemu_args': ['-cpu', 'rv64,x-misa-w=true,c=true,v=true', qemu_args]},
+  'test-icount-nodebug.S': setup + {'qemu_args': ['-cpu', 'rv64,debug=false', '-icount', 'shift=1', qemu_args]},
 }
 
 tests += {
