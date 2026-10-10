@@ -47,10 +47,16 @@
  * WFI. Both act at the end of the code block the core is executing, so
  * when a core stops itself, the instructions after the store in the same
  * straight-line run complete first.
+ *
+ * An HP core tells the interrupt matrix whether it is in machine mode,
+ * through its ESP32P4_CPU_M_MODE output, as each trap and trap return
+ * changes the mode.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
+#include "qemu/main-loop.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev.h"
 #include "hw/core/sysemu-cpu-ops.h"
 #include "migration/vmstate.h"
@@ -361,6 +367,23 @@ static void esp32p4_hp_trap_entry(ESP32P4CPU *cpu, int32_t excp)
 }
 
 /*
+ * After a trap or a trap return, which may have changed the core's
+ * privilege mode: the ESP32P4_CPU_M_MODE output follows it.
+ */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+void esp32p4_hp_priv_update(ESP32P4CPU *cpu)
+{
+    bool m_mode = cpu->parent_obj.env.priv == PRV_M;
+
+    if (m_mode != cpu->m_mode_level) {
+        BQL_LOCK_GUARD();
+
+        cpu->m_mode_level = m_mode;
+        qemu_set_irq(cpu->m_mode_irq, m_mode);
+    }
+}
+
+/*
  * An exception, the only trap that the standard trap entry takes on the
  * HP core: the CLIC's own interrupts are taken by esp32p4_clic_take().
  * The PIE illegal instruction exception (cause 0x1f) leaves the
@@ -388,6 +411,7 @@ void esp32p4_hp_do_interrupt(CPUState *cs)
     if (!(cs->exception_index & RISCV_EXCP_INT_FLAG)) {
         esp32p4_clic_exception_taken(cpu, prev_priv, prev_mil);
     }
+    esp32p4_hp_priv_update(cpu);
 }
 
 /*
@@ -595,6 +619,8 @@ static void esp32p4_cpu_reset_exit(Object *obj, ResetType type)
 #ifdef CONFIG_TCG
     if (esp32p4_env_is_hp(&cpu->parent_obj.env)) {
         esp32p4_hp_gpio_update(cpu);
+        cpu->m_mode_level = cpu->parent_obj.env.priv == PRV_M;
+        qemu_set_irq(cpu->m_mode_irq, cpu->m_mode_level);
     }
 #endif
 }
@@ -629,6 +655,7 @@ static int esp32p4_hp_state_post_load(void *opaque, int version_id)
 
     esp32p4_hp_update_fp_status(cpu);
     esp32p4_triggers_rebuild(cpu);
+    cpu->m_mode_level = cpu->parent_obj.env.priv == PRV_M;
     return 0;
 }
 
@@ -810,6 +837,7 @@ static void esp32p4_hp_cpu_init(Object *obj)
                              ESP32P4_CPU_GPIOS);
     qdev_init_gpio_in_named(dev, esp32p4_hp_cpu_set_gpio_in,
                             ESP32P4_CPU_GPIO_IN, ESP32P4_CPU_GPIOS);
+    qdev_init_gpio_out_named(dev, &cpu->m_mode_irq, ESP32P4_CPU_M_MODE, 1);
 #endif
 }
 

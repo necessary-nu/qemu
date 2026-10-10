@@ -15,9 +15,11 @@
 #include "hw/core/split-irq.h"
 #include "hw/intc/esp32p4_clic.h"
 #include "hw/intc/esp32p4_clint.h"
+#include "hw/intc/esp32p4_intmatrix.h"
 #include "hw/ssi/ssi.h"
 #include "hw/misc/esp32p4_ana.h"
 #include "hw/misc/esp32p4_clkrst.h"
+#include "hw/misc/esp32p4_hp_sys.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/nvram/esp32p4_efuse.h"
@@ -90,6 +92,8 @@ struct ESP32P4MachineState {
     SplitIRQ core_reset_split[ESP32P4_HP_CORES];
     ESP32P4ClintState clint;
     ESP32P4ClicState clic;
+    ESP32P4IntMatrixState intmatrix;
+    ESP32P4HPSysState hp_sys;
 
     ESP32P4ClkRstState clkrst;
     ESP32P4AnaState ana;

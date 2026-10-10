@@ -55,7 +55,8 @@
  * answers with a bus error; qtest and the debugger see core 0's view.
  *
  * The CLINT's interrupts (hw/intc/esp32p4_clint.c) arrive on lines 3 and
- * 7; the interrupt matrix drives lines 16 to 47.
+ * 7; the interrupt matrix drives lines 16 to 47, and takes which of them
+ * are user-mode interrupts for its remapping.
  */
 
 #include "qemu/osdep.h"
@@ -124,6 +125,23 @@ static int clic_irq_level(ESP32P4ClicCore *c, int id)
     int nlbits = clic_irq_priv(c, id) == PRV_M ? c->mnlbits : c->unlbits;
 
     return c->ctl[id] | (0xff >> nlbits);
+}
+
+/*
+ * Drive the ESP32P4_CLIC_USER outputs: which interrupts are user-mode
+ * ones, for the interrupt matrix's remapping.
+ */
+/* [spec:nuos:req:emu.esp32p4.clic] */
+static void clic_update_user(ESP32P4ClicCore *c)
+{
+    for (int id = 0; id < ESP32P4_CLIC_NUM_IRQS; id++) {
+        bool user = clic_irq_exists(id) && clic_irq_priv(c, id) == PRV_U;
+
+        if (user != extract64(c->user_level, id, 1)) {
+            c->user_level = deposit64(c->user_level, id, 1, user);
+            qemu_set_irq(c->user_irq[id], user);
+        }
+    }
 }
 
 /*
@@ -363,6 +381,7 @@ static MemTxResult clic_access(ESP32P4ClicState *s, hwaddr addr,
             clic_int_write(c, id, *data << shift,
                            MAKE_64BIT_MASK(off & 3, size), user);
             clic_update(c);
+            clic_update_user(c);
             return MEMTX_OK;
         }
         v = 0;
@@ -380,6 +399,7 @@ static MemTxResult clic_access(ESP32P4ClicState *s, hwaddr addr,
             clic_cfg_write(c, (v & ~mask32) | ((*data << shift) & mask32),
                            user);
             clic_update(c);
+            clic_update_user(c);
             return MEMTX_OK;
         }
         break;
@@ -478,6 +498,7 @@ static void clic_set_core_reset(void *opaque, int n, int level)
     c->in_reset = level;
     clic_core_reset(c);
     clic_update(c);
+    clic_update_user(c);
 }
 
 static void clic_clock_update(void *opaque, ClockEvent event)
@@ -509,6 +530,10 @@ static void esp32p4_clic_init(Object *obj)
                             ESP32P4_CLIC_CORES * ESP32P4_CLIC_NUM_IRQS);
     qdev_init_gpio_in_named(dev, clic_set_core_reset,
                             ESP32P4_CLIC_CORE_RESET, ESP32P4_CLIC_CORES);
+    for (int i = 0; i < ESP32P4_CLIC_CORES; i++) {
+        qdev_init_gpio_out_named(dev, s->core[i].user_irq, ESP32P4_CLIC_USER,
+                                 ESP32P4_CLIC_NUM_IRQS);
+    }
 }
 
 static void esp32p4_clic_realize(DeviceState *dev, Error **errp)
@@ -539,6 +564,7 @@ static void esp32p4_clic_reset_exit(Object *obj, ResetType type)
 
     for (int i = 0; i < ESP32P4_CLIC_CORES; i++) {
         clic_update(&s->core[i]);
+        clic_update_user(&s->core[i]);
     }
 }
 
@@ -566,6 +592,7 @@ static const VMStateDescription vmstate_esp32p4_clic_core = {
         VMSTATE_UINT8(nmbits, ESP32P4ClicCore),
         VMSTATE_UINT8(unlbits, ESP32P4ClicCore),
         VMSTATE_BOOL(in_reset, ESP32P4ClicCore),
+        VMSTATE_UINT64(user_level, ESP32P4ClicCore),
         VMSTATE_CLOCK(clk, ESP32P4ClicCore),
         VMSTATE_END_OF_LIST()
     },

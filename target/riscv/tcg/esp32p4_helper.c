@@ -148,5 +148,6 @@ target_ulong helper_esp32p4_mret(CPURISCVState *env, uint64_t old_mstatus,
         cpu->mexstatus &= ~ESP32P4_MEXSTATUS_BUS_ERR;
     }
     esp32p4_bus_error_check_pending(cpu);
+    esp32p4_hp_priv_update(cpu);
     return esp32p4_clic_mret(cpu, retpc);
 }
