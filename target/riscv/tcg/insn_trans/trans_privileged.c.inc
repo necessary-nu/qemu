@@ -154,6 +154,7 @@ static bool trans_wfi(DisasContext *ctx, arg_wfi *a)
 static bool trans_sfence_vma(DisasContext *ctx, arg_sfence_vma *a)
 {
 #ifndef CONFIG_USER_ONLY
+    REQUIRE_EXT(ctx, RVS);
     decode_save_opc(ctx, 0);
     gen_helper_tlb_flush(tcg_env);
     return true;

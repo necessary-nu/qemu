@@ -982,13 +982,24 @@ static void riscv_cpu_reset_hold(Object *obj, ResetType type)
     env->misa_mxl = mcc->def->misa_mxl_max;
     env->priv = PRV_M;
     env->mstatus &= ~(MSTATUS_MIE | MSTATUS_MPRV);
+    /* MPP holds M-mode alone on a hart without U-mode. */
+    if (!riscv_has_ext(env, RVU)) {
+        env->mstatus = set_field(env->mstatus, MSTATUS_MPP, PRV_M);
+    }
     if (env->misa_mxl > MXL_RV32) {
         /*
          * The reset status of SXL/UXL is undefined, but mstatus is WARL
          * and we must ensure that the value after init is valid for read.
+         * Each is read-only zero if the hart lacks its privilege mode.
          */
-        env->mstatus = set_field(env->mstatus, MSTATUS64_SXL, env->misa_mxl);
-        env->mstatus = set_field(env->mstatus, MSTATUS64_UXL, env->misa_mxl);
+        if (riscv_has_ext(env, RVS)) {
+            env->mstatus = set_field(env->mstatus, MSTATUS64_SXL,
+                                     env->misa_mxl);
+        }
+        if (riscv_has_ext(env, RVU)) {
+            env->mstatus = set_field(env->mstatus, MSTATUS64_UXL,
+                                     env->misa_mxl);
+        }
         if (riscv_has_ext(env, RVH)) {
             env->vsstatus = set_field(env->vsstatus,
                                       MSTATUS64_SXL, env->misa_mxl);
@@ -1008,8 +1019,10 @@ static void riscv_cpu_reset_hold(Object *obj, ResetType type)
      * CPU configuration and are intentionally not writable via status CSRs.
      */
     env->mstatus = set_field(env->mstatus, MSTATUS_MBE, cpu->cfg.big_endian);
-    env->mstatus = set_field(env->mstatus, MSTATUS_SBE, cpu->cfg.big_endian);
-    env->mstatus = set_field(env->mstatus, MSTATUS_UBE, cpu->cfg.big_endian);
+    env->mstatus = set_field(env->mstatus, MSTATUS_SBE,
+                             cpu->cfg.big_endian && riscv_has_ext(env, RVS));
+    env->mstatus = set_field(env->mstatus, MSTATUS_UBE,
+                             cpu->cfg.big_endian && riscv_has_ext(env, RVU));
     env->mcause = 0;
     env->miclaim = MIP_SGEIP;
     env->pc = env->resetvec;
