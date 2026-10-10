@@ -79,6 +79,8 @@ blobs = [
   'npcm8xx_bootrom.bin',
   'esp32-v3-rom.bin',
   'esp32-v3-rom-app.bin',
+  'esp32p4-rev3-rom.bin',
+  'esp32p4-rev3-rom-LICENSE',
   'vof.bin',
   'vof-nvram.bin',
 ]

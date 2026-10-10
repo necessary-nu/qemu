@@ -100,3 +100,19 @@
   They are built form the SeaBIOS-hppa sources, which is a fork of SeaBIOS
   adapted for hppa.
   SeaBIOS-hppa is available at https://github.com/hdeller/seabios-hppa
+
+- esp32p4-rev3-rom.bin is the 128 KiB HP boot ROM of Espressif's ESP32-P4
+  v3.x silicon, which the esp32p4 machine maps at 0x4FC00000. The ROM is
+  copyright Espressif Systems (Shanghai) Co. Ltd. and not open source;
+  Espressif publishes it as esp32p4_rev300_rom.elf in the esp-rom-elfs
+  release 20260528 (https://github.com/espressif/esp-rom-elfs/releases),
+  and permits its use under the Apache License 2.0, whose text is in
+  esp32p4-rev3-rom-LICENSE. The image is that ELF converted to the ROM's
+  contents, every section at its load address: the code and read-only data
+  are copied from their segments; the initial values of the .data sections,
+  which the ELF links at their L2MEM addresses, are placed at the ROM
+  addresses the ROM's own copy table gives them; the .rodata.interface
+  pointer table at the top of the ROM is placed at its address; and the
+  .eh_frame unwinding tables, linked at the flash window, are left out.
+  Bytes no section covers are zero. NuOS's emu/scripts/esp32p4-rom.py does
+  the conversion and checks the release against pinned SHA-256s.
