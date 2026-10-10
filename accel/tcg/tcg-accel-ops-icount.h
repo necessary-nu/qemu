@@ -10,6 +10,12 @@
 #ifndef TCG_ACCEL_OPS_ICOUNT_H
 #define TCG_ACCEL_OPS_ICOUNT_H
 
+/*
+ * The "quantum" option: the most virtual time, in ns, a vCPU runs before
+ * the next takes its turn, 0 for no limit, or -1 when not given.
+ */
+extern int64_t icount_quantum;
+
 void icount_handle_deadline(void);
 void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget);
 int64_t icount_percpu_budget(int cpu_count);

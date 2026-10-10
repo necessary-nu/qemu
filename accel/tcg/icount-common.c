@@ -24,6 +24,8 @@
 
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
+#include "qemu/host-utils.h"
+#include "hw/core/clock.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -37,6 +39,7 @@
 #include "hw/core/cpu.h"
 #include "exec/icount.h"
 #include "system/cpu-timers-internal.h"
+#include "tcg-accel-ops-icount.h"
 
 /*
  * ICOUNT: Instruction Counter
@@ -52,6 +55,9 @@ bool icount_align_option;
 
 /* Do not count executed instructions */
 ICountMode use_icount = ICOUNT_DISABLED;
+
+/* The "quantum" option, in ns, or -1 when not given. */
+int64_t icount_quantum = -1;
 
 static void icount_enable_precise(void)
 {
@@ -77,6 +83,28 @@ static int64_t icount_get_executed(CPUState *cpu)
 }
 
 /*
+ * Add the virtual time @executed instructions of @cpu's current run take:
+ * each its run's instruction time, or 2^shift ns. Fractions of a ns carry
+ * over, so a clock whose period is not a whole number of ns keeps its
+ * rate over any number of instructions.
+ */
+static void icount_account_time(CPUState *cpu, int64_t executed)
+{
+    uint64_t insn_time = cpu->icount_insn_time;
+    uint64_t lo, hi, frac;
+
+    if (!insn_time) {
+        insn_time = (uint64_t)1 << (32 + timers_state.icount_time_shift);
+    }
+    mulu64(&lo, &hi, executed, insn_time);
+    frac = (uint64_t)timers_state.qemu_icount_time_frac + (uint32_t)lo;
+    qatomic_set(&timers_state.qemu_icount_time,
+                timers_state.qemu_icount_time +
+                (int64_t)((hi << 32) | (lo >> 32)) + (int64_t)(frac >> 32));
+    timers_state.qemu_icount_time_frac = (uint32_t)frac;
+}
+
+/*
  * Update the global shared timer_state.qemu_icount to take into
  * account executed instructions. This is done by the TCG vCPU
  * thread so the main-loop can see time has moved forward.
@@ -88,6 +116,7 @@ static void icount_update_locked(CPUState *cpu)
 
     qatomic_set(&timers_state.qemu_icount,
                 timers_state.qemu_icount + executed);
+    icount_account_time(cpu, executed);
 }
 
 /*
@@ -122,8 +151,9 @@ static int64_t icount_get_raw_locked(void)
 
 static int64_t icount_get_locked(void)
 {
-    int64_t icount = icount_get_raw_locked();
-    return qatomic_read(&timers_state.qemu_icount_bias) + icount_to_ns(icount);
+    icount_get_raw_locked();
+    return qatomic_read(&timers_state.qemu_icount_bias) +
+           qatomic_read(&timers_state.qemu_icount_time);
 }
 
 int64_t icount_get_raw(void)
@@ -200,9 +230,6 @@ static void icount_adjust(void)
                     timers_state.icount_time_shift + 1);
     }
     timers_state.last_delta = delta;
-    qatomic_set(&timers_state.qemu_icount_bias,
-                cur_icount - (timers_state.qemu_icount
-                              << timers_state.icount_time_shift));
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
                          &timers_state.vm_clock_lock);
 }
@@ -427,7 +454,21 @@ bool icount_configure(QemuOpts *opts, Error **errp)
             error_setg(errp, "Please specify shift option when using align");
             return false;
         }
+        if (qemu_opt_get(opts, "quantum") != NULL) {
+            error_setg(errp, "Please specify shift option when using quantum");
+            return false;
+        }
         return true;
+    }
+
+    if (qemu_opt_get(opts, "quantum") != NULL) {
+        uint64_t quantum = qemu_opt_get_number(opts, "quantum", 0);
+
+        if (quantum > INT32_MAX) {
+            error_setg(errp, "icount: Invalid quantum value");
+            return false;
+        }
+        icount_quantum = quantum;
     }
 
     if (align && !sleep) {
@@ -489,6 +530,37 @@ bool icount_configure(QemuOpts *opts, Error **errp)
                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                    NANOSECONDS_PER_SECOND / 10);
     return true;
+}
+
+/*
+ * The CPU's icount clock changed: later runs of the CPU take its new
+ * period per instruction. A CPU changing its own clock (a write to a clock
+ * control register) leaves its run at the end of the access, so the rest
+ * of the run, and its budget to the next timer deadline, are not counted
+ * at the old rate. A stopped clock leaves the last period: stopping the
+ * clock that executes the CPU is the machine's to model (by halting it).
+ */
+static void icount_cpu_clock_update(void *opaque, ClockEvent event)
+{
+    CPUState *cpu = opaque;
+    uint64_t period = clock_get(cpu->icount_clock);
+
+    if (period) {
+        qatomic_set(&cpu->icount_period, period);
+        if (icount_enabled() && cpu == current_cpu) {
+            cpu_exit(cpu);
+        }
+    }
+}
+
+void icount_set_cpu_clock(CPUState *cpu, Clock *clk)
+{
+    assert(!cpu->icount_clock);
+    cpu->icount_clock = clock_new(OBJECT(cpu), "icount-clock");
+    clock_set_callback(cpu->icount_clock, icount_cpu_clock_update, cpu,
+                       ClockUpdate);
+    clock_set_source(cpu->icount_clock, clk);
+    qatomic_set(&cpu->icount_period, clock_get(cpu->icount_clock));
 }
 
 void icount_notify_exit(void)

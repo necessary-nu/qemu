@@ -30,3 +30,6 @@ void icount_notify_exit(void)
 {
     abort();
 }
+void icount_set_cpu_clock(CPUState *cpu, Clock *clk)
+{
+}

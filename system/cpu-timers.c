@@ -197,6 +197,41 @@ static const VMStateDescription icount_vmstate_shift = {
 };
 
 /*
+ * The time the executed instructions account for. A stream that lacks it
+ * counts 2^shift ns for every instruction executed.
+ */
+static const VMStateDescription icount_vmstate_time = {
+    .name = "timer/icount/time",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = icount_state_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_INT64(qemu_icount_time, TimersState),
+        VMSTATE_UINT32(qemu_icount_time_frac, TimersState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static int icount_timers_pre_load(void *opaque)
+{
+    TimersState *s = opaque;
+
+    s->qemu_icount_time = -1;
+    return 0;
+}
+
+static int icount_timers_post_load(void *opaque, int version_id)
+{
+    TimersState *s = opaque;
+
+    if (s->qemu_icount_time == -1) {
+        s->qemu_icount_time = s->qemu_icount << s->icount_time_shift;
+        s->qemu_icount_time_frac = 0;
+    }
+    return 0;
+}
+
+/*
  * This is a subsection for icount migration.
  */
 static const VMStateDescription icount_vmstate_timers = {
@@ -204,6 +239,8 @@ static const VMStateDescription icount_vmstate_timers = {
     .version_id = 1,
     .minimum_version_id = 1,
     .needed = icount_state_needed,
+    .pre_load = icount_timers_pre_load,
+    .post_load = icount_timers_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_INT64(qemu_icount_bias, TimersState),
         VMSTATE_INT64(qemu_icount, TimersState),
@@ -213,6 +250,7 @@ static const VMStateDescription icount_vmstate_timers = {
         &icount_vmstate_warp_timer,
         &icount_vmstate_adjust_timers,
         &icount_vmstate_shift,
+        &icount_vmstate_time,
         NULL
     }
 };

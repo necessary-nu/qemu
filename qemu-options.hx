@@ -5331,13 +5331,14 @@ SRST
 ERST
 
 DEF("icount", HAS_ARG, QEMU_OPTION_icount, \
-    "-icount [shift=N|auto][,align=on|off][,sleep=on|off][,rr=record|replay,rrfile=<filename>[,rrsnapshot=<snapshot>]]\n" \
+    "-icount [shift=N|auto][,align=on|off][,sleep=on|off][,quantum=ns][,rr=record|replay,rrfile=<filename>[,rrsnapshot=<snapshot>]]\n" \
     "                enable virtual instruction counter with 2^N clock ticks per\n" \
     "                instruction, enable aligning the host and virtual clocks\n" \
-    "                or disable real time cpu sleeping, and optionally enable\n" \
+    "                or disable real time cpu sleeping, bound the time each\n" \
+    "                vCPU runs before the next, and optionally enable\n" \
     "                record-and-replay mode\n", QEMU_ARCH_ALL)
 SRST
-``-icount [shift=N|auto][,align=on|off][,sleep=on|off][,rr=record|replay,rrfile=filename[,rrsnapshot=snapshot]]``
+``-icount [shift=N|auto][,align=on|off][,sleep=on|off][,quantum=ns][,rr=record|replay,rrfile=filename[,rrsnapshot=snapshot]]``
     Enable virtual instruction counter. The virtual cpu will execute one
     instruction every 2^N ns of virtual time. If ``auto`` is specified
     then the virtual cpu speed will be automatically adjusted to keep
@@ -5370,6 +5371,16 @@ SRST
     Typically this happens when the shift value is high (how high
     depends on the host machine). The default if icount is enabled
     is ``align=off``.
+
+    With a fixed ``shift``, a machine can tie a CPU to its clock: each
+    instruction of that CPU then takes one cycle of the clock, at its
+    current frequency, instead of 2^N ns. Such CPUs run as if in
+    parallel: while several are busy each still executes at its clock's
+    rate, and they take turns of at most ``quantum`` ns (by default 1000)
+    of their own time each, so that code on one CPU waiting for another
+    sees it make progress. For other CPUs ``quantum`` bounds the
+    virtual time each runs before the next takes its turn, when given.
+    ``quantum=0`` sets no bound.
 
     When the ``rr`` option is specified deterministic record/replay is
     enabled. The ``rrfile=`` option must also be provided to

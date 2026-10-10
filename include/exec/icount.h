@@ -68,6 +68,25 @@ bool icount_configure(QemuOpts *opts, Error **errp);
 /* used by tcg vcpu thread to calc icount budget */
 int64_t icount_round(int64_t count);
 
+/**
+ * icount_set_cpu_clock: execute a CPU's instructions at its clock's rate
+ * @cpu: the CPU
+ * @clk: the clock the CPU executes one instruction per cycle of
+ *
+ * With a fixed "shift", each instruction @cpu executes takes one period
+ * of @clk, as it is when the instruction executes, instead of 2^shift ns.
+ * CPUs with a clock run as if in parallel: while N of them are not idle,
+ * each executes at its clock's rate and an instruction moves virtual time
+ * on by 1/N of its period, and they take turns at most a quantum of their
+ * own time long (the "quantum" option, by default 1 us), so code on one
+ * waiting for another sees it make progress as on real cores. In adaptive
+ * mode and under record/replay the clock is ignored.
+ *
+ * Stopping @clk does not stop @cpu: a machine whose clock stops its CPUs
+ * halts them itself.
+ */
+void icount_set_cpu_clock(CPUState *cpu, Clock *clk);
+
 /* if the CPUs are idle, start accounting real time to virtual clock. */
 void icount_start_warp_timer(void);
 void icount_account_warp_timer(void);
