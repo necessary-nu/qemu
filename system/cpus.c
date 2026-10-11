@@ -681,3 +681,25 @@ void cpu_stop_current(void)
         cpu_exit(current_cpu);
     }
 }
+
+/*
+ * Stop every vCPU, as pause_all_vcpus() does but without waiting for them,
+ * which neither a vCPU thread nor device code may do: the calling vCPU
+ * stops at the end of its current instruction block, the others when they
+ * next look. With TCG's single round-robin thread (as under icount) none
+ * of them executes another block, so the instructions executed up to the
+ * call, and hence icount's virtual time, are those at the call.
+ */
+void cpu_stop_all(void)
+{
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        cpu->stop = true;
+        if (cpu == current_cpu) {
+            cpu_exit(cpu);
+        } else {
+            qemu_cpu_kick(cpu);
+        }
+    }
+}
