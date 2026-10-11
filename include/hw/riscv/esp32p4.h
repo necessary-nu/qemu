@@ -12,12 +12,16 @@
 #include "qemu/units.h"
 #include "hw/audio/esp32p4_i2s.h"
 #include "hw/core/boards.h"
+#include "hw/char/esp32_uart_terminal.h"
+#include "hw/char/esp32p4_uart.h"
+#include "hw/char/esp32p4_usb_serial_jtag.h"
 #include "hw/cpu/cluster.h"
 #include "hw/core/or-irq.h"
 #include "hw/core/split-irq.h"
 #include "hw/dma/esp32p4_bitscrambler.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/dma/esp32p4_gdma.h"
+#include "hw/dma/esp32p4_uhci.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "hw/i2c/esp32p4_i2c.h"
 #include "hw/i3c/esp32p4_i3c.h"
@@ -63,6 +67,9 @@
 OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 
 #define ESP32P4_HP_CORES 2
+
+/* The board's serial ports: UART0 to UART4, then the LP UART. */
+#define ESP32P4_SERIAL_PORTS (ESP32P4_UART_COUNT + 1)
 
 /* The internal memories (TRM table 9.3-1). */
 #define ESP32P4_TCM_BASE            0x30100000
@@ -211,6 +218,14 @@ struct ESP32P4MachineState {
     ESP32P4EmacState emac;
     IP101PhyState phy;
     SplitIRQ pps_split;
+
+    ESP32P4UartState uart[ESP32P4_UART_COUNT];
+    ESP32P4UartState lp_uart;
+    SplitIRQ uart_wakeup_en_split;
+    SplitIRQ lp_uart_wakeup_split;
+    Esp32UartTerminalState terminal[ESP32P4_SERIAL_PORTS];
+    ESP32P4UhciState uhci;
+    ESP32P4UsjState usj;
 
     ESP32P4AssistDebugState assist_debug;
     ESP32P4AxiPerfMonState axi_perf_mon;

@@ -306,13 +306,13 @@ static void test_unimplemented(void)
     assert_mtree_lacks(qts, "0000000050117000-");
 
     /* An access to a block with no model is logged as unimplemented. */
-    g_assert_cmphex(qtest_readl(qts, 0x500ca000), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, 0x5009e000), ==, 0);
     qtest_writel(qts, 0x500e4000, 1);
     g_assert_cmphex(qtest_readl(qts, 0x50119000), ==, 0);
     qtest_quit(qts);
 
     g_assert(g_file_get_contents(log, &text, NULL, NULL));
-    g_assert(strstr(text, "esp32p4.uart0: unimplemented device read"));
+    g_assert(strstr(text, "esp32p4.pvt: unimplemented device read"));
     g_assert(strstr(text, "esp32p4.audio-addc: unimplemented device write"));
     g_assert(strstr(text, "esp32p4.rtc-cali: unimplemented device read"));
     g_assert(strstr(text, "LP ROM's contents are not published"));
