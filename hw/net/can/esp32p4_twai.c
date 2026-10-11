@@ -74,6 +74,16 @@
  * standby levels rather than each frame's bits; twai_clkout is TWAIn_CLK
  * divided per CLOCK_DIVIDER, evaluated whenever software samples the pads.
  *
+ * Every timed event (a frame's actions on the bus, its start on the
+ * bus's bit grid, a failing transmission's bits, bus-off recovery, the
+ * timestamp counter's wrap, the standby countdown) happens at its own
+ * time, however late the QEMU timer that runs it: a late event runs as of
+ * its time (esp32_line_run_at()), and what it times from there it times
+ * from that. Register accesses, clock changes, resets, pad and routing
+ * changes and frames from the QEMU CAN bus first take the events that
+ * fell due before them, in time order, so that software sees each
+ * controller as it is at the access.
+ *
  * The TRM leaves some things open, decided here as follows: the timestamp
  * counter counts TWAIn_CLK / (TS_DIV_NUM + 1) from 0 while TS_ENABLE is
  * set and is held at 0 while it is clear, and stamps each received frame
@@ -232,9 +242,31 @@ static const unsigned twai_sig_rx[] = {
     ESP32P4_SIG_TWAI2_RX_PAD_IN,
 };
 
+/*
+ * The present: the time of the event being taken, or of the change being
+ * made (include/hw/gpio/esp32_line.h).
+ */
 static int64_t twai_now(void)
 {
-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return esp32_line_time();
+}
+
+/* Arm @t for @when, which *@due keeps for when the timer runs late. */
+static void twai_arm(QEMUTimer *t, int64_t *due, int64_t when)
+{
+    *due = when;
+    timer_mod(t, when);
+}
+
+/* Take the timed event @fn at @when, its changes catching up nothing. */
+static void twai_run_event(ESP32P4TwaiState *s, int64_t when,
+                           void (*fn)(void *opaque), void *opaque)
+{
+    bool was = s->in_event;
+
+    s->in_event = true;
+    esp32_line_run_at(when, fn, opaque);
+    s->in_event = was;
 }
 
 static uint8_t bitmask(int i)
@@ -824,8 +856,8 @@ static void twai_standby_schedule(ESP32P4TwaiCtrl *c)
         timer_del(c->standby_timer);
         return;
     }
-    timer_mod(c->standby_timer,
-              c->idle_since + clock_ticks_to_ns(c->clk, c->hw_standby_cnt));
+    twai_arm(c->standby_timer, &c->standby_due,
+             c->idle_since + clock_ticks_to_ns(c->clk, c->hw_standby_cnt));
 }
 
 static void twai_set_standby(ESP32P4TwaiCtrl *c, bool on)
@@ -838,9 +870,16 @@ static void twai_set_standby(ESP32P4TwaiCtrl *c, bool on)
     twai_standby_schedule(c);
 }
 
-static void twai_standby_timer(void *opaque)
+static void twai_standby_run(void *opaque)
 {
     twai_set_standby(opaque, true);
+}
+
+static void twai_standby_timer(void *opaque)
+{
+    ESP32P4TwaiCtrl *c = opaque;
+
+    twai_run_event(c->s, c->standby_due, twai_standby_run, c);
 }
 
 /* The bus became busy (@busy) or idle at @t, as the controller sees it. */
@@ -885,9 +924,9 @@ static void twai_ts_schedule(ESP32P4TwaiCtrl *c)
         return;
     }
     next = (twai_ts_count(c, twai_now()) | 0xffffffffULL) + 1;
-    timer_mod(c->ts_timer, c->ts_base_ns +
-              clock_ticks_to_ns(c->clk, (next - c->ts_count_base) *
-                                        twai_ts_div(c)));
+    twai_arm(c->ts_timer, &c->ts_due, c->ts_base_ns +
+             clock_ticks_to_ns(c->clk, (next - c->ts_count_base) *
+                                       twai_ts_div(c)));
 }
 
 /* Carry the count over a change of its clock or divider. */
@@ -899,12 +938,19 @@ static void twai_ts_rebase(ESP32P4TwaiCtrl *c)
     c->ts_base_ns = now;
 }
 
-static void twai_ts_timer(void *opaque)
+static void twai_ts_run(void *opaque)
 {
     ESP32P4TwaiCtrl *c = opaque;
 
     twai_raise(c, INT_TSI);
     twai_ts_schedule(c);
+}
+
+static void twai_ts_timer(void *opaque)
+{
+    ESP32P4TwaiCtrl *c = opaque;
+
+    twai_run_event(c->s, c->ts_due, twai_ts_run, c);
 }
 
 /* The receive FIFO */
@@ -1167,7 +1213,8 @@ static void twai_recov_schedule(ESP32P4TwaiCtrl *c)
         return;
     }
     runs = c->ewl && c->tec >= c->ewl ? c->tec - c->ewl + 1 : c->tec + 1;
-    timer_mod(c->recov_timer, c->recov_mark + (runs * occ + 999) / 1000);
+    twai_arm(c->recov_timer, &c->recov_due,
+             c->recov_mark + (runs * occ + 999) / 1000);
 }
 
 static void twai_recov_check(ESP32P4TwaiCtrl *c)
@@ -1193,9 +1240,16 @@ static void twai_recov_check(ESP32P4TwaiCtrl *c)
     twai_recov_schedule(c);
 }
 
-static void twai_recov_timer(void *opaque)
+static void twai_recov_run(void *opaque)
 {
     twai_recov_check(opaque);
+}
+
+static void twai_recov_timer(void *opaque)
+{
+    ESP32P4TwaiCtrl *c = opaque;
+
+    twai_run_event(c->s, c->recov_due, twai_recov_run, c);
 }
 
 static void twai_recov_pause(ESP32P4TwaiCtrl *c, int64_t t)
@@ -1523,7 +1577,7 @@ static void twai_ep_schedule(ESP32P4TwaiEpisode *ep)
 {
     for (uint32_t i = 0; i < ep->nact; i++) {
         if (act_key(&ep->act[i]) > ep->done_key) {
-            timer_mod(ep->timer, ep_time(ep, ep->act[i].boundary));
+            twai_arm(ep->timer, &ep->due, ep_time(ep, ep->act[i].boundary));
             return;
         }
     }
@@ -1640,7 +1694,8 @@ static void twai_ep_act(ESP32P4TwaiState *s, int seg, ESP32P4TwaiAction *a)
 
 static void twai_ep_start(ESP32P4TwaiState *s, int seg);
 
-static void twai_ep_timer(void *opaque)
+/* The episode's next action, or its start, at its time, twai_now(). */
+static void twai_ep_run(void *opaque)
 {
     ESP32P4TwaiEpisode *ep = opaque;
     ESP32P4TwaiState *s = ep->s;
@@ -1672,6 +1727,13 @@ static void twai_ep_timer(void *opaque)
         ep->done_key = act_key(&a);
         twai_ep_act(s, ep->seg, &a);
     }
+}
+
+static void twai_ep_timer(void *opaque)
+{
+    ESP32P4TwaiEpisode *ep = opaque;
+
+    twai_run_event(ep->s, ep->due, twai_ep_run, ep);
 }
 
 /* Whether the controller has a transmission it may start. */
@@ -1737,7 +1799,7 @@ static void twai_kick(ESP32P4TwaiState *s, int seg)
     n = ((earliest - origin) * 1000 + bit - 1) / bit;
     ep->start_pending = true;
     ep->start_at = origin + bits_ns(bit, n);
-    timer_mod(ep->timer, ep->start_at);
+    twai_arm(ep->timer, &ep->due, ep->start_at);
 }
 
 /*
@@ -1910,8 +1972,11 @@ static void twai_local_try(ESP32P4TwaiCtrl *c)
     twai_local_start(c, MAX(MAX(twai_now(), c->sync_at), c->ready_at));
 }
 
-/* [spec:nuos:req:emu.esp32p4.twai] */
-static void twai_local_timer(void *opaque)
+/*
+ * [spec:nuos:req:emu.esp32p4.twai]
+ * The failing transmission's next event, at its time, local_t0.
+ */
+static void twai_local_run(void *opaque)
 {
     ESP32P4TwaiCtrl *c = opaque;
     int seg;
@@ -1949,6 +2014,63 @@ static void twai_local_timer(void *opaque)
         }
         twai_local_try(c);
         return;
+    }
+}
+
+static void twai_local_timer(void *opaque)
+{
+    ESP32P4TwaiCtrl *c = opaque;
+
+    twai_run_event(c->s, c->local_t0, twai_local_run, c);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.twai]
+ * Take the timed events that fell due by @now, in time order, each at its
+ * own time, before a change at @now: a register access, a clock change, a
+ * reset, a pad or routing change or a frame from the QEMU CAN bus. A
+ * change an event makes is part of it and catches up nothing.
+ */
+static void twai_catch_up(ESP32P4TwaiState *s, int64_t now)
+{
+    if (s->in_event) {
+        return;
+    }
+    for (;;) {
+        QEMUTimer *timer = NULL;
+        void (*run)(void *opaque) = NULL;
+        void *opaque = NULL;
+        int64_t due = INT64_MAX;
+
+#define TWAI_EARLIEST(t, when, fn, arg) \
+        do { \
+            if (timer_pending(t) && (when) < due) { \
+                timer = (t); \
+                due = (when); \
+                run = (fn); \
+                opaque = (arg); \
+            } \
+        } while (0)
+
+        for (int i = 0; i < ESP32P4_TWAI_SEGS; i++) {
+            TWAI_EARLIEST(s->ep[i].timer, s->ep[i].due, twai_ep_run,
+                          &s->ep[i]);
+        }
+        for (int i = 0; i < ESP32P4_TWAI_NUM; i++) {
+            ESP32P4TwaiCtrl *c = &s->ctrl[i];
+
+            TWAI_EARLIEST(c->local_timer, c->local_t0, twai_local_run, c);
+            TWAI_EARLIEST(c->recov_timer, c->recov_due, twai_recov_run, c);
+            TWAI_EARLIEST(c->ts_timer, c->ts_due, twai_ts_run, c);
+            TWAI_EARLIEST(c->standby_timer, c->standby_due,
+                          twai_standby_run, c);
+        }
+#undef TWAI_EARLIEST
+        if (!timer || due > now) {
+            return;
+        }
+        timer_del(timer);
+        twai_run_event(s, due, run, opaque);
     }
 }
 
@@ -2317,8 +2439,10 @@ static void twai_write(ESP32P4TwaiCtrl *c, hwaddr addr, uint32_t v)
 static uint64_t esp32p4_twai_mmio_read(void *opaque, hwaddr addr,
                                        unsigned size)
 {
-    return extract32(twai_read(opaque, addr & ~3), (addr & 3) * 8,
-                     size * 8);
+    ESP32P4TwaiCtrl *c = opaque;
+
+    twai_catch_up(c->s, twai_now());
+    return extract32(twai_read(c, addr & ~3), (addr & 3) * 8, size * 8);
 }
 
 static void esp32p4_twai_mmio_write(void *opaque, hwaddr addr,
@@ -2329,6 +2453,7 @@ static void esp32p4_twai_mmio_write(void *opaque, hwaddr addr,
     uint32_t mask = MAKE_64BIT_MASK(shift, size * 8);
     uint32_t cur = 0;
 
+    twai_catch_up(c->s, twai_now());
     /* A narrow write merges with what the register holds. */
     switch (addr & ~3) {
     case A_MODE:
@@ -2403,6 +2528,7 @@ static ssize_t esp32p4_twai_receive(CanBusClientState *client,
         (q->can_id & QEMU_CAN_ERR_FLAG)) {
         return 0;
     }
+    twai_catch_up(s, now);
     twai_bus_activity(c, false, now + twai_bits_ns(c, 3));
     if (c->standby) {
         twai_set_standby(c, false);
@@ -2500,6 +2626,7 @@ static void esp32p4_twai_route_changed(Notifier *n, void *data)
 {
     ESP32P4TwaiState *s = container_of(n, ESP32P4TwaiState, route_notifier);
 
+    twai_catch_up(s, twai_now());
     for (int i = 0; i < ESP32P4_TWAI_NUM; i++) {
         ESP32P4TwaiCtrl *c = &s->ctrl[i];
         uint8_t view;
@@ -2522,6 +2649,7 @@ static void esp32p4_twai_rx_in(void *opaque, int n, int level)
     if (c->rx_level == !!level) {
         return;
     }
+    twai_catch_up(c->s, twai_now());
     c->rx_level = level;
     if (c->view == VIEW_CONST) {
         twai_rejoin(c);
@@ -2543,6 +2671,7 @@ static void esp32p4_twai_clk_update(void *opaque, ClockEvent event)
     ESP32P4TwaiCtrl *c = opaque;
 
     if (event == ClockPreUpdate) {
+        twai_catch_up(c->s, twai_now());
         twai_ts_rebase(c);
         twai_recov_fold(c, twai_now());
         return;
@@ -2620,6 +2749,7 @@ static void esp32p4_twai_reset_in(void *opaque, int n, int level)
 {
     ESP32P4TwaiCtrl *c = &((ESP32P4TwaiState *)opaque)->ctrl[n];
 
+    twai_catch_up(c->s, twai_now());
     c->in_reset = level;
     twai_ctrl_reset(c);
     twai_update_irq(c);
@@ -2642,6 +2772,7 @@ static void esp32p4_twai_reset_hold(Object *obj, ResetType type)
         twai_ctrl_reset(&s->ctrl[i]);
     }
     s->sending = false;
+    s->in_event = false;
 }
 
 static void esp32p4_twai_reset_exit(Object *obj, ResetType type)
@@ -2775,8 +2906,8 @@ static const VMStateDescription vmstate_esp32p4_twai_action = {
 
 static const VMStateDescription vmstate_esp32p4_twai_episode = {
     .name = "esp32p4-twai-episode",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(active, ESP32P4TwaiEpisode),
         VMSTATE_BOOL(start_pending, ESP32P4TwaiEpisode),
@@ -2805,14 +2936,15 @@ static const VMStateDescription vmstate_esp32p4_twai_episode = {
                              ESP32P4TwaiAction),
         VMSTATE_INT64(idle_at, ESP32P4TwaiEpisode),
         VMSTATE_TIMER_PTR(timer, ESP32P4TwaiEpisode),
+        VMSTATE_INT64(due, ESP32P4TwaiEpisode),
         VMSTATE_END_OF_LIST()
     },
 };
 
 static const VMStateDescription vmstate_esp32p4_twai_ctrl = {
     .name = "esp32p4-twai-ctrl",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(mode, ESP32P4TwaiCtrl),
         VMSTATE_UINT32(status, ESP32P4TwaiCtrl),
@@ -2860,6 +2992,7 @@ static const VMStateDescription vmstate_esp32p4_twai_ctrl = {
         VMSTATE_BOOL(recov_paused, ESP32P4TwaiCtrl),
         VMSTATE_INT64(recov_mark, ESP32P4TwaiCtrl),
         VMSTATE_TIMER_PTR(recov_timer, ESP32P4TwaiCtrl),
+        VMSTATE_INT64(recov_due, ESP32P4TwaiCtrl),
         VMSTATE_BOOL(local_active, ESP32P4TwaiCtrl),
         VMSTATE_UINT8(local_phase, ESP32P4TwaiCtrl),
         VMSTATE_UINT32(local_bit, ESP32P4TwaiCtrl),
@@ -2872,9 +3005,11 @@ static const VMStateDescription vmstate_esp32p4_twai_ctrl = {
         VMSTATE_UINT64(ts_count_base, ESP32P4TwaiCtrl),
         VMSTATE_INT64(ts_base_ns, ESP32P4TwaiCtrl),
         VMSTATE_TIMER_PTR(ts_timer, ESP32P4TwaiCtrl),
+        VMSTATE_INT64(ts_due, ESP32P4TwaiCtrl),
         VMSTATE_BOOL(standby, ESP32P4TwaiCtrl),
         VMSTATE_INT64(idle_since, ESP32P4TwaiCtrl),
         VMSTATE_TIMER_PTR(standby_timer, ESP32P4TwaiCtrl),
+        VMSTATE_INT64(standby_due, ESP32P4TwaiCtrl),
         VMSTATE_BOOL(clkout_level, ESP32P4TwaiCtrl),
         VMSTATE_CLOCK(clk, ESP32P4TwaiCtrl),
         VMSTATE_END_OF_LIST()
@@ -2883,8 +3018,8 @@ static const VMStateDescription vmstate_esp32p4_twai_ctrl = {
 
 static const VMStateDescription vmstate_esp32p4_twai = {
     .name = TYPE_ESP32P4_TWAI,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = esp32p4_twai_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(ctrl, ESP32P4TwaiState, ESP32P4_TWAI_NUM, 1,
