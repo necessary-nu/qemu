@@ -1112,7 +1112,11 @@ static EspReply esp_command(int fd, uint8_t cmd, const uint8_t *data,
  * the commands that work on the flash and the security information
  * (SPI_ATTACH, FLASH_BEGIN, FLASH_DATA, GET_SECURITY_INFO) and refuses
  * those on memory and registers (MEM_BEGIN, READ_REG: status 1, error
- * 5). It refuses the SPI download boot mode outright.
+ * 5, the response keeping the last command taken's opcode). It refuses
+ * the SPI download boot mode outright. The flash is powered by the board,
+ * whose power the model does not switch: on v3.1 silicon with its flash
+ * on the chip's switchable supply the ROM's refusal of register writes
+ * keeps the flash commands from working (Espressif's erratum ROM-770).
  */
 /* [spec:nuos:req:emu.esp32p4.boot/test] */
 static void test_secure_download(void)
