@@ -10,6 +10,7 @@
 #define HW_RISCV_ESP32P4_H
 
 #include "qemu/units.h"
+#include "hw/audio/esp32p4_i2s.h"
 #include "hw/core/boards.h"
 #include "hw/cpu/cluster.h"
 #include "hw/core/or-irq.h"
@@ -44,8 +45,10 @@
 #include "hw/misc/esp32p4_lp_mailbox.h"
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/misc/esp32p4_parlio.h"
+#include "hw/misc/esp32p4_pcnt.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "hw/misc/esp32p4_pmu.h"
+#include "hw/misc/esp32p4_rmt.h"
 #include "hw/misc/esp32p4_rsa.h"
 #include "hw/misc/esp32p4_sha.h"
 #include "hw/misc/esp32p4_trace.h"
@@ -177,6 +180,8 @@ struct ESP32P4MachineState {
     ESP32P4TwaiState twai;
     /* The QEMU CAN buses on TWAI0 to TWAI2's pads, or NULL. */
     CanBusState *canbus[ESP32P4_TWAI_NUM];
+    ESP32P4RmtState rmt;
+    ESP32P4PcntState pcnt;
 
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];
@@ -225,6 +230,9 @@ struct ESP32P4MachineState {
     ESP32P4TraceState trace[ESP32P4_HP_CORES];
     /* GPIO16 to GPIO54's holds: LP_SYSTEM's OR HP_SYSTEM's. */
     OrIRQState pad_hold_or[ESP32P4_GPIO_PADS - ESP32P4_HP_SYS_HOLD_FIRST];
+
+    /* I2S0 to I2S2, then the LP I2S */
+    ESP32P4I2sState i2s[ESP32P4_I2S_COUNT];
 
     /* The cryptography blocks. */
     ESP32P4AesState aes;
