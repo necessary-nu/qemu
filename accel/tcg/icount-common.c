@@ -86,17 +86,28 @@ static int64_t icount_get_executed(CPUState *cpu)
  * Add the virtual time @executed instructions of @cpu's current run take:
  * each its run's instruction time, or 2^shift ns. Fractions of a ns carry
  * over, so a clock whose period is not a whole number of ns keeps its
- * rate over any number of instructions.
+ * rate over any number of instructions; so do the fractions of a unit of
+ * a period that is not a whole number of units, in the CPU's own
+ * remainder.
  */
 static void icount_account_time(CPUState *cpu, int64_t executed)
 {
     uint64_t insn_time = cpu->icount_insn_time;
-    uint64_t lo, hi, frac;
+    uint64_t lo, hi, frac, carry = 0;
 
     if (!insn_time) {
         insn_time = (uint64_t)1 << (32 + timers_state.icount_time_shift);
     }
+    if (cpu->icount_insn_frac && executed > 0) {
+        mulu64(&lo, &hi, executed, cpu->icount_insn_frac);
+        lo += cpu->icount_time_rem;
+        hi += lo < cpu->icount_time_rem;
+        cpu->icount_time_rem = divu128(&lo, &hi, cpu->icount_insn_den);
+        carry = lo;
+    }
     mulu64(&lo, &hi, executed, insn_time);
+    lo += carry;
+    hi += lo < carry;
     frac = (uint64_t)timers_state.qemu_icount_time_frac + (uint32_t)lo;
     qatomic_set(&timers_state.qemu_icount_time,
                 timers_state.qemu_icount_time +
@@ -576,6 +587,14 @@ static void icount_cpu_clock_update(void *opaque, ClockEvent event)
     }
 }
 
+void icount_set_cpu_period_frac(CPUState *cpu, uint64_t frac, uint64_t den)
+{
+    assert(den && frac < den);
+    qatomic_set(&cpu->icount_period_den, den);
+    qatomic_set(&cpu->icount_period_frac, frac);
+    cpu->icount_time_rem = 0;
+}
+
 void icount_set_cpu_clock(CPUState *cpu, Clock *clk)
 {
     assert(!cpu->icount_clock);
@@ -584,6 +603,7 @@ void icount_set_cpu_clock(CPUState *cpu, Clock *clk)
                        ClockUpdate);
     clock_set_source(cpu->icount_clock, clk);
     qatomic_set(&cpu->icount_period, clock_get(cpu->icount_clock));
+    cpu->icount_period_den = 1;
 }
 
 void icount_notify_exit(void)

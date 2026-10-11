@@ -446,9 +446,20 @@ struct qemu_work_item;
  *   per cycle of, or NULL to execute one every 2^shift ns. Set with
  *   icount_set_cpu_clock().
  * @icount_period: The period of @icount_clock, in Clock units (2^-32 ns).
+ * @icount_period_frac: The fraction of a Clock unit by which the clock's
+ *   exact period exceeds @icount_period, @icount_period_frac /
+ *   @icount_period_den; 0 for a whole number of units. Set with
+ *   icount_set_cpu_period_frac().
+ * @icount_period_den: The denominator of @icount_period_frac.
+ * @icount_time_rem: The CPU's instructions' time beyond what they have
+ *   added to the virtual time, in 1/@icount_period_den of a Clock unit.
  * @icount_insn_time: Virtual time one instruction of the current run
  *   accounts for, in Clock units, or 0 for 2^shift ns. Written only by
  *   the vCPU thread when it prepares a run.
+ * @icount_insn_frac: The fraction of a unit each instruction of the
+ *   current run accounts for beyond @icount_insn_time, in
+ *   1/@icount_insn_den.
+ * @icount_insn_den: The denominator of @icount_insn_frac.
  * @cpu_ases: Pointer to array of CPUAddressSpaces (which define the
  *            AddressSpaces this CPU has)
  * @as: Pointer to the first AddressSpace, for the convenience of targets which
@@ -515,7 +526,12 @@ struct CPUState {
     int64_t icount_extra;
     Clock *icount_clock;
     uint64_t icount_period;
+    uint64_t icount_period_frac;
+    uint64_t icount_period_den;
+    uint64_t icount_time_rem;
     uint64_t icount_insn_time;
+    uint64_t icount_insn_frac;
+    uint64_t icount_insn_den;
     uint64_t random_seed;
     sigjmp_buf jmp_env;
 

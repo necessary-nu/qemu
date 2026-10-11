@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 #include "system/replay.h"
 #include "exec/icount.h"
+#include "qemu/host-utils.h"
 #include "qemu/main-loop.h"
 #include "qemu/guest-random.h"
 #include "hw/core/cpu.h"
@@ -155,6 +156,29 @@ int64_t icount_percpu_budget(int cpu_count)
     return timeslice;
 }
 
+/*
+ * The instructions @cpu executes in @own units of its own time, rounded
+ * up: of @period units each, plus the run's fraction of a unit.
+ */
+static int64_t icount_insns_in(CPUState *cpu, uint64_t own, uint64_t period)
+{
+    uint64_t n = (own + period - 1) / period;
+    uint64_t frac = cpu->icount_insn_frac, den = cpu->icount_insn_den;
+
+    /* The longer exact period may need fewer: n - 1 of them may do. */
+    while (frac && n > 1) {
+        uint64_t m = n - 1, flo, fhi, dlo, dhi;
+
+        mulu64(&flo, &fhi, m, frac);
+        mulu64(&dlo, &dhi, own - m * period, den);
+        if (fhi < dhi || (fhi == dhi && flo < dlo)) {
+            break;
+        }
+        n = m;
+    }
+    return n;
+}
+
 void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
 {
     int insns_left;
@@ -182,9 +206,16 @@ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
                           icount_get_deadline() * icount_round_cpus);
 
         cpu->icount_insn_time = period / icount_round_cpus;
-        cpu->icount_budget = (((uint64_t)own << 32) + period - 1) / period;
+        cpu->icount_insn_frac = 0;
+        if (icount_round_cpus == 1) {
+            cpu->icount_insn_den = qatomic_read(&cpu->icount_period_den);
+            cpu->icount_insn_frac = qatomic_read(&cpu->icount_period_frac);
+        }
+        cpu->icount_budget = icount_insns_in(cpu, (uint64_t)own << 32,
+                                             period);
     } else {
         cpu->icount_insn_time = 0;
+        cpu->icount_insn_frac = 0;
         cpu->icount_budget = MIN(icount_get_limit(), cpu_budget);
     }
     insns_left = MIN(0xffff, cpu->icount_budget);

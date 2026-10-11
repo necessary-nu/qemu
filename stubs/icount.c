@@ -33,3 +33,6 @@ void icount_notify_exit(void)
 void icount_set_cpu_clock(CPUState *cpu, Clock *clk)
 {
 }
+void icount_set_cpu_period_frac(CPUState *cpu, uint64_t frac, uint64_t den)
+{
+}
