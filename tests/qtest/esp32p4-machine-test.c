@@ -18,6 +18,10 @@
 #define L2MEM_BASE          0x4ff00000
 #define L2MEM_DIRECT_BASE   0x8ff00000
 #define L2MEM_SIZE          (768 * 1024)
+/* The L2 cache's part of L2MEM from reset: its start, 128 KiB. */
+#define L2_CACHE_SIZE       (128 * 1024)
+#define L2MEM_RAM           (L2MEM_BASE + L2_CACHE_SIZE)
+#define L2MEM_RAM_DIRECT    (L2MEM_DIRECT_BASE + L2_CACHE_SIZE)
 #define LP_SRAM_BASE        0x50108000
 
 #define ROM_CHIP_ID         0x4fc00010
@@ -189,19 +193,26 @@ static void test_memory_map(void)
                           "(prio 0, rom): esp32p4.hp-rom");
     assert_mtree_has(qts, "000000008fc00000-000000008fc1ffff "
                           "(prio 0, rom): esp32p4.hp-rom");
-    assert_mtree_has(qts, "000000004ff00000-000000004ffbffff "
-                          "(prio 0, ram): esp32p4.l2mem");
-    assert_mtree_has(qts, "000000008ff00000-000000008ffbffff "
-                          "(prio 0, ram): esp32p4.l2mem");
+    assert_mtree_has(qts, "000000004ff20000-000000004ffbffff "
+                          "(prio 0, ram): esp32p4.l2mem @0000000000020000");
+    assert_mtree_has(qts, "000000008ff20000-000000008ffbffff "
+                          "(prio 0, ram): esp32p4.l2mem @0000000000020000");
     assert_mtree_has(qts, "0000000050100000-0000000050103fff "
                           "(prio 0, i/o): esp32p4.lp-rom");
     assert_mtree_has(qts, "0000000050108000-000000005010ffff "
                           "(prio 0, ram): esp32p4.lp-sram");
 
-    /* The two addresses of L2MEM are one memory. */
-    qtest_writel(qts, L2MEM_BASE + 0x40, 0x12345678);
-    g_assert_cmphex(qtest_readl(qts, L2MEM_DIRECT_BASE + 0x40), ==,
-                    0x12345678);
+    /*
+     * The two addresses of L2MEM are one memory, after the 128 KiB the L2
+     * cache takes from reset. qtest's accesses are no core's, so they do
+     * not go through the caches.
+     */
+    assert_mtree_has(qts, "000000004ff00000-000000004ff1ffff "
+                          "(prio 1, i/o): esp32p4.l2mem-l2-cache");
+    assert_mtree_has(qts, "000000008ff00000-000000008ff1ffff "
+                          "(prio 1, i/o): esp32p4.l2mem-direct-l2-cache");
+    qtest_writel(qts, L2MEM_RAM_DIRECT + 0x40, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, L2MEM_RAM + 0x40), ==, 0x12345678);
     qtest_writel(qts, L2MEM_DIRECT_BASE + L2MEM_SIZE - 4, 0x9abcdef0);
     g_assert_cmphex(qtest_readl(qts, L2MEM_BASE + L2MEM_SIZE - 4), ==,
                     0x9abcdef0);
@@ -217,15 +228,18 @@ static void test_memory_map(void)
                     ESP32P4_CHIP_ID);
     g_assert_cmphex(qtest_readl(qts, ROM_LAYOUT_PTR), ==, ROM_LAYOUT);
 
-    /* The external memory windows, which the MMU maps. */
+    /*
+     * The external memory windows, which the MMUs map, at their direct
+     * addresses and, for the bus's masters, their cached ones.
+     */
+    assert_mtree_has(qts, "0000000080000000-0000000083ffffff "
+                          "(prio 0, i/o): esp32p4.flash-window");
+    assert_mtree_has(qts, "0000000088000000-000000008bffffff "
+                          "(prio 0, i/o): esp32p4.psram-window");
     assert_mtree_has(qts, "0000000040000000-0000000043ffffff "
                           "(prio 0, i/o): esp32p4.flash-window");
     assert_mtree_has(qts, "0000000048000000-000000004bffffff "
                           "(prio 0, i/o): esp32p4.psram-window");
-    assert_mtree_has(qts, "0000000080000000-0000000083ffffff "
-                          "(prio 0, i/o): esp32p4.flash-window-direct");
-    assert_mtree_has(qts, "0000000088000000-000000008bffffff "
-                          "(prio 0, i/o): esp32p4.psram-window-direct");
 
     /* The in-package PSRAM behind them, and the flash chip. */
     g_assert_cmpuint(qom_get_uint(qts, "/machine/unattached/esp32p4.psram[0]",
@@ -259,6 +273,12 @@ static void test_unimplemented(void)
                           "(prio 0, i/o): esp32p4.uart0");
     assert_mtree_has(qts, "000000005008c000-000000005008cfff "
                           "(prio 0, i/o): esp32p4.flash-spi0");
+    assert_mtree_has(qts, "000000005008d000-000000005008dfff "
+                          "(prio 0, i/o): esp32p4.flash-spi1");
+    assert_mtree_has(qts, "000000005008e000-000000005008efff "
+                          "(prio 0, i/o): esp32p4.psram-mspi0");
+    assert_mtree_has(qts, "000000005008f000-000000005008ffff "
+                          "(prio 0, i/o): esp32p4.psram-mspi1");
     assert_mtree_has(qts, "000000003ff10000-000000003ff10fff "
                           "(prio 0, i/o): esp32p4.cache");
     assert_mtree_has(qts, "0000000050093000-0000000050093fff "
@@ -365,11 +385,12 @@ static void test_no_flash(void)
     {
         g_autofree char *qtree = qtest_hmp(qts, "info qtree");
 
-        g_assert(strstr(qtree, "bus: flash-spi"));
+        g_assert(strstr(qtree, "dev: esp32p4-mspi"));
+        g_assert(strstr(qtree, "bus: ssi"));
         g_assert(!strstr(qtree, "dev: w25q"));
     }
     /* The rest of the machine is all there. */
-    assert_mtree_has(qts, "0000000040000000-0000000043ffffff "
+    assert_mtree_has(qts, "0000000080000000-0000000083ffffff "
                           "(prio 0, i/o): esp32p4.flash-window");
     g_assert_cmphex(qtest_readl(qts, ROM_CHIP_ID), ==, ESP32P4_CHIP_ID);
     qtest_quit(qts);
@@ -472,7 +493,7 @@ static void test_kernel(void)
     g_assert_cmphex(qtest_readl(qts, ROM_CHIP_ID), ==, ESP32P4_CHIP_ID);
     qtest_quit(qts);
 
-    /* Nothing maps the flash window, so -kernel cannot load into it. */
+    /* Only the MMU, which software sets up, maps the flash window. */
     g_free(args);
     args = g_strdup_printf("-M esp32p4,flash-size=16M -kernel %s", bad);
     assert_refused(args, "outside L2MEM, the TCM and LP SRAM");
