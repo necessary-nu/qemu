@@ -291,10 +291,18 @@ void qemu_system_vmstop_request_prepare(void)
     qemu_mutex_lock(&vmstop_lock);
 }
 
+/*
+ * Made from a vCPU thread, a request stops every vCPU at once, as a reset
+ * request does: the VM stops at the virtual time of the request, which the
+ * main loop then keeps (see qemu_system_request_pending()).
+ */
 void qemu_system_vmstop_request(RunState state)
 {
     vmstop_requested = state;
     qemu_mutex_unlock(&vmstop_lock);
+    if (qemu_in_vcpu_thread()) {
+        cpu_stop_all();
+    }
     qemu_notify_event();
 }
 struct VMChangeStateEntry {
@@ -466,13 +474,13 @@ int vm_shutdown(void)
 int vm_stop(RunState state)
 {
     if (qemu_in_vcpu_thread()) {
-        qemu_system_vmstop_request_prepare();
-        qemu_system_vmstop_request(state);
         /*
+         * The request stops every vCPU.
          * FIXME: should not return to device code in case
          * vm_stop() has been requested.
          */
-        cpu_stop_current();
+        qemu_system_vmstop_request_prepare();
+        qemu_system_vmstop_request(state);
         return 0;
     }
 
@@ -595,6 +603,23 @@ bool qemu_force_shutdown_requested(void)
 ShutdownCause qemu_reset_requested_get(void)
 {
     return reset_requested;
+}
+
+/*
+ * Whether a reset, shutdown, suspend, debug stop or vmstop request waits
+ * for the main loop to act on it. The vCPUs that stopped for one are idle
+ * only until it does, so icount_start_warp_timer() does not move virtual
+ * time on to the next timer meanwhile.
+ */
+bool qemu_system_request_pending(void)
+{
+    bool vmstop;
+
+    qemu_mutex_lock(&vmstop_lock);
+    vmstop = vmstop_requested != RUN_STATE__MAX;
+    qemu_mutex_unlock(&vmstop_lock);
+    return reset_requested || shutdown_requested || suspend_requested ||
+           debug_requested || vmstop;
 }
 
 static int qemu_shutdown_requested(void)
@@ -927,7 +952,7 @@ void qemu_system_suspend_request(void)
         return;
     }
     suspend_requested = 1;
-    cpu_stop_current();
+    cpu_stop_all();
     qemu_notify_event();
 }
 
