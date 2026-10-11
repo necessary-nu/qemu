@@ -219,12 +219,15 @@ static void esp32_efuse_op_timer_start(Esp32EfuseState *s)
 {
     uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     /*
-     * The TRM gives no duration for a read or a program command. 10 ms
-     * keeps the boot ROM's three reads well inside what silicon shows:
-     * ESP-IDF's bootloader logs its first line about 30 ms after reset,
-     * and the RTC watchdog's flash-boot stage gives the ROM 853 ms.
+     * The TRM gives no duration for a read or a program command; silicon
+     * takes microseconds. The boot ROM checks that EFUSE_CMD still reads
+     * busy at the instruction after it issues a read, and software-resets
+     * the chip if not: without icount the host can hold the CPU up
+     * between the two for tens of milliseconds under load, so a command
+     * takes 50 ms. Longer would eat into the 853 ms the RTC watchdog's
+     * flash-boot stage gives the ROM, which reads three times as it boots.
      */
-    uint64_t interval_ns = 10 * SCALE_MS;
+    uint64_t interval_ns = 50 * SCALE_MS;
     /*
      * Each command runs for the full interval from when it is issued. A
      * command left running by the reset that powers the digital domain
