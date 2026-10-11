@@ -90,6 +90,21 @@
  *
  *       -M esp32p4,strap-mode=0x08
  *
+ *   - The SD/MMC host controller (TRM chapter 57) at 0x50083000, behind
+ *     SDMMC_SYS_CLK and its reset, its card interface clocked by the
+ *     SDIO_LS clocks, its internal DMA through the permission managers as
+ *     DMA master SDMMC, its interrupt SDIO_HOST_INTR (source 23), and its
+ *     card detect, write protect and SDIO interrupt inputs and card reset
+ *     outputs matrix signals 126 to 131 and 146 to 148. A card on slot N
+ *     is -drive if=sd,index=N: the board's microSD socket is slot 0, on
+ *     the IO MUX pads GPIO39 to GPIO44; slot 1 is where the board's
+ *     ESP32-C6 sits, as an SDIO slave, and has no card unless given one:
+ *
+ *       -drive if=sd,index=0,format=raw,file=sd.img
+ *
+ *     A card is on the board, not the chip: no reset of the chip or the
+ *     controller reaches it, only a power cycle (QEMU's system reset).
+ *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
  * a file longer than 512 bytes. A blank, all-zero, file starts as a
@@ -159,7 +174,6 @@ static const struct {
     { "usb-wrap",         0x50080000, 4 * KiB },
     { "vdma",             0x50081000, 4 * KiB },
     { "pau",              0x50082000, 4 * KiB },
-    { "sdmmc",            0x50083000, 4 * KiB },
     { "h264",             0x50084000, 4 * KiB },
     { "ahb-dma",          0x50085000, 4 * KiB },
     { "jpeg",             0x50086000, 4 * KiB },
@@ -993,6 +1007,77 @@ static void esp32p4_init_pms(ESP32P4MachineState *s)
                                     ESP32P4_PMS_LP_RESET, 0));
 }
 
+/*
+ * The SD/MMC host controller and the cards on its slots. Its registers
+ * are behind SDMMC_SYS_CLK and LP_CLKRST's SDMMC reset, BUFFIFO, whose
+ * read pops the FIFO, reading 0 while gated; its CIU takes
+ * SDIO_LS_SLF_CLK, and needs
+ * SDIO_LS_DRV_CLK and SDIO_LS_SAM_CLK to reach a card. Its card-side
+ * inputs and outputs are GPIO matrix signals: SD_CARD_DETECT_N_1 and _2,
+ * SD_CARD_INT_N_1 and _2, SD_CARD_WRITE_PRT_1 and _2 in, SD_RST_N_1 and _2
+ * and SD_CCMD_OD_PULLUP_EN_N out (slot 0 is the matrix's card 1).
+ */
+/* [spec:nuos:req:emu.esp32p4.sdmmc] */
+static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
+    DeviceState *dev;
+    ESP32P4ClkRstGate *g;
+    int slot;
+
+    object_initialize_child(OBJECT(s), "sdmmc", &s->sdmmc,
+                            TYPE_ESP32P4_SDMMC);
+    dev = DEVICE(&s->sdmmc);
+    object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "hclk",
+                          qdev_get_clock_out(clkrst, "sdmmc-sys"));
+    qdev_connect_clock_in(dev, "cclk-in",
+                          qdev_get_clock_out(clkrst, "sdio-slf"));
+    qdev_connect_clock_in(dev, "drv", qdev_get_clock_out(clkrst, "sdio-drv"));
+    qdev_connect_clock_in(dev, "sam", qdev_get_clock_out(clkrst, "sdio-sam"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                 ESP32P4_SDMMC_BASE, ESP32P4_CLK_SDMMC_SYS,
+                                 ESP32P4_RST_SDMMC, 0);
+    esp32p4_clkrst_gate_volatile(g, 0x200, 4);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_SDIO_HOST));
+
+    for (slot = 0; slot < DWC_SDMMC_MAX_SLOTS; slot++) {
+        BusState *bus = qdev_get_child_bus(dev, slot ? "sd-bus1" : "sd-bus0");
+        DriveInfo *dinfo = drive_get(IF_SD, 0, slot);
+
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+            ESP32P4_SIG_SD_CARD_DETECT_N_1_PAD_IN + slot,
+            qdev_get_gpio_in_named(dev, DWC_SDMMC_CARD_DETECT_N, slot));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+            ESP32P4_SIG_SD_CARD_WRITE_PRT_1_PAD_IN + slot,
+            qdev_get_gpio_in_named(dev, DWC_SDMMC_CARD_WRITE_PRT, slot));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+            ESP32P4_SIG_SD_CARD_INT_N_1_PAD_IN + slot,
+            qdev_get_gpio_in_named(dev, DWC_SDMMC_CARD_INT_N, slot));
+        qdev_connect_gpio_out_named(dev, DWC_SDMMC_CARD_RST_N, slot,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                                   ESP32P4_SIG_SD_RST_N_1_PAD_OUT + slot));
+
+        /* The card resets at power-on only, not with the controller. */
+        qbus_set_reset_domain(bus);
+        qemu_register_resettable(OBJECT(bus));
+        if (dinfo) {
+            DeviceState *card = qdev_new(TYPE_SD_CARD);
+
+            qdev_prop_set_drive_err(card, "drive",
+                                    blk_by_legacy_dinfo(dinfo),
+                                    &error_fatal);
+            qdev_realize_and_unref(card, bus, &error_fatal);
+        }
+    }
+    qdev_connect_gpio_out_named(dev, DWC_SDMMC_CCMD_OD_PULLUP_EN_N, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                               ESP32P4_SIG_SD_CCMD_OD_PULLUP_EN_N_PAD_OUT));
+}
+
 /* The memories -kernel can load into: those the cores address directly. */
 static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
 {
@@ -1129,6 +1214,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_gpio(s);
     esp32p4_init_pms(s);
     esp32p4_init_ext_memory(s);
+    esp32p4_init_sdmmc(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
                         esp32p4_unimplemented[i].name,
