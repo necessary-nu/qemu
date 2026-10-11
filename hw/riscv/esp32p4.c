@@ -70,9 +70,9 @@
  *     detector, its interrupt source 8; and the LP mailbox (0x50118000),
  *     its interrupts sources 4 and 5.
  *   - The event task matrix (TRM chapter 14) at 0x500D5000, mapping the
- *     events of the GPIO matrix, the timers, the RTC timer and GDMA to
- *     the tasks of the GPIO matrix, the timer groups, GDMA and the LP
- *     core.
+ *     events of the GPIO matrix, the timers, the RTC timer, GDMA, the LED
+ *     PWM controller and MCPWM to the tasks of the GPIO matrix, the timer
+ *     groups, GDMA, the LED PWM controller, MCPWM and the LP core.
  *   - Permission control (TRM chapter 20): the HP, LP and DMA access
  *     permission managers, through which every core (and DMA master)
  *     reaches the bus, each access carrying its master and privilege mode,
@@ -266,6 +266,30 @@
  *     (source 111), its four units' signal, control and clear inputs
  *     matrix signals 141 to 156 and 63 to 66.
  *
+ *   - The cryptography blocks (TRM chapters 27 to 36): the AES, SHA, RSA,
+ *     ECC and HMAC accelerators, the RSA_DS and ECDSA_DS signature
+ *     peripherals and the Key Manager (0x50089000 to 0x50096FFF), each on
+ *     its CRYPTO_*_CLK, its registers behind CRYPTO_SYS_CLK
+ *     (KEY_MANAGER_SYS_CLK for the Key Manager) and held by its resets and
+ *     those of the blocks that reuse it; AES and SHA as GDMA-AXI's AES and
+ *     SHA peripherals; their keys from the eFuses or the Key Manager, which
+ *     also gives the MSPI controllers their encryption keys. In the LP
+ *     system, the HUK Generator (0x50114000), whose SRAM PUF is the
+ *     chip's, and the random number generator (0x50126000), which gives
+ *     the host's random numbers. A chip's PUF follows its eFuses and the
+ *     HUK Generator's puf-seed property:
+ *
+ *       -global esp32p4-huk.puf-seed=0x1234
+ *
+ *   - The LED PWM controller (TRM chapter 58) at 0x500D3000, behind
+ *     LEDC_APB_CLK and its reset, its timers on LEDC_CLK, its interrupt
+ *     LEDC_INTR (source 52) and its eight outputs matrix signals 126 to
+ *     133; and MCPWM0 and MCPWM1 (TRM chapter 59) at 0x500C0000 and
+ *     0x500C1000, each behind MCPWMn_APB_CLK and its reset, on MCPWMn_CLK,
+ *     its interrupt PWMn_INTR (sources 38 and 39), its six outputs, sync,
+ *     fault and capture inputs matrix signals 89 to 106. Their ETM events
+ *     and tasks are the ETM's.
+ *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
  * a file longer than 512 bytes. A blank, all-zero, file starts as a
@@ -356,14 +380,6 @@ static const struct {
     { "jpeg",             0x50086000, 4 * KiB },
     { "ppa",              0x50087000, 4 * KiB },
     { "dma2d",            0x50088000, 4 * KiB },
-    { "keymng",           0x50089000, 4 * KiB },
-    { "aes",              0x50090000, 4 * KiB },
-    { "sha",              0x50091000, 4 * KiB },
-    { "rsa",              0x50092000, 4 * KiB },
-    { "ecc",              0x50093000, 4 * KiB },
-    { "ds",               0x50094000, 4 * KiB },
-    { "hmac",             0x50095000, 4 * KiB },
-    { "ecdsa",            0x50096000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
     { "pvt",              0x5009e000, 4 * KiB },
     { "csi-host",         0x5009f000, 2 * KiB },
@@ -376,9 +392,6 @@ static const struct {
     { "h264-dma",         0x500a7000, 4 * KiB },
 
     /* HP peripherals 1. */
-    { "mcpwm0",           0x500c0000, 4 * KiB },
-    { "mcpwm1",           0x500c1000, 4 * KiB },
-    { "ledc",             0x500d3000, 4 * KiB },
     { "lcd-cam",          0x500dc000, 4 * KiB },
     { "adc",              0x500de000, 4 * KiB },
     { "iomux-mspi-pin",   0x500e1200, 4 * KiB - 0x200 },
@@ -393,12 +406,10 @@ static const struct {
     { "mipi-dsi-mem",     0x50105000, 4 * KiB },
 
     /* LP always-on peripherals. */
-    { "lp-huk",           0x50114000, 4 * KiB },
     { "rtc-cali",         0x50119000, 4 * KiB },
 
     /* LP peripherals. */
     { "lp-spi",           0x50123000, 4 * KiB },
-    { "lp-trng",          0x50126000, 4 * KiB },
     { "lp-adc",           0x50127000, 4 * KiB },
     { "lp-touch",         0x50128000, 4 * KiB },
     { "lp-intr",          0x5012c000, 4 * KiB },
@@ -1099,6 +1110,8 @@ static void esp32p4_init_mspi(ESP32P4MachineState *s, ESP32P4MSPIState *m,
     sbd = SYS_BUS_DEVICE(m);
     qdev_prop_set_bit(dev, "psram", psram);
     object_property_set_link(OBJECT(m), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    object_property_set_link(OBJECT(m), "keymng", OBJECT(&s->keymng),
                              &error_abort);
     if (psram) {
         object_property_set_link(OBJECT(m), "psram-mr", OBJECT(&s->psram),
@@ -2421,6 +2434,83 @@ static void esp32p4_init_twai(ESP32P4MachineState *s)
 }
 
 /*
+ * The LED PWM controller and MCPWM0 and MCPWM1: each behind its bus clock
+ * and reset (RST_EN_LEDC, RST_EN_PWMn), timed by its function clock, its
+ * interrupt a source of the interrupt matrix, its pad signals through the
+ * GPIO matrix.
+ */
+/* [spec:nuos:req:emu.esp32p4.pwm] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+static void esp32p4_init_pwm(ESP32P4MachineState *s)
+{
+    DeviceState *dev, *gpio = DEVICE(&s->gpio);
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    int i, n;
+
+    object_initialize_child(OBJECT(s), "ledc", &s->ledc, TYPE_ESP32P4_LEDC);
+    dev = DEVICE(&s->ledc);
+    qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, "ledc"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_LEDC_BASE, ESP32P4_CLK_LEDC_APB,
+                             ESP32P4_RST_LEDC, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LEDC));
+    for (n = 0; n < ESP32P4_LEDC_CHANNELS; n++) {
+        qdev_connect_gpio_out_named(dev, ESP32P4_LEDC_OUT, n,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                ESP32P4_SIG_LEDC_LS_SIG_OUT_PAD_OUT0 + n));
+    }
+
+    for (i = 0; i < ESP32P4_MCPWM_NUM; i++) {
+        static const struct {
+            int out, sync, fault, cap;
+        } sig[ESP32P4_MCPWM_NUM] = {
+            { ESP32P4_SIG_PWM0_CH0_A_PAD_OUT, ESP32P4_SIG_PWM0_SYNC0_PAD_IN,
+              ESP32P4_SIG_PWM0_F0_PAD_IN, ESP32P4_SIG_PWM0_CAP0_PAD_IN },
+            { ESP32P4_SIG_PWM1_CH0_A_PAD_OUT, ESP32P4_SIG_PWM1_SYNC0_PAD_IN,
+              ESP32P4_SIG_PWM1_F0_PAD_IN, ESP32P4_SIG_PWM1_CAP0_PAD_IN },
+        };
+        g_autofree char *name = g_strdup_printf("mcpwm%d", i);
+
+        object_initialize_child(OBJECT(s), name, &s->mcpwm[i],
+                                TYPE_ESP32P4_MCPWM);
+        dev = DEVICE(&s->mcpwm[i]);
+        qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, name));
+        sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+        esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                 ESP32P4_MCPWM0_BASE +
+                                 i * ESP32P4_MCPWM_STRIDE,
+                                 ESP32P4_CLK_MCPWM0_APB + i,
+                                 ESP32P4_RST_PWM0 + i, 0);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           esp32p4_intr_source(s, ESP32P4_INTR_PWM0 + i));
+        for (n = 0; n < ESP32_MCPWM_OUTS; n++) {
+            qdev_connect_gpio_out_named(dev, ESP32_MCPWM_OUT, n,
+                qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                                       sig[i].out + n));
+        }
+        for (n = 0; n < ESP32_MCPWM_SYNCS; n++) {
+            qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                sig[i].sync + n,
+                qdev_get_gpio_in_named(dev, ESP32_MCPWM_SYNC_IN, n));
+        }
+        for (n = 0; n < ESP32_MCPWM_FAULTS; n++) {
+            qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                sig[i].fault + n,
+                qdev_get_gpio_in_named(dev, ESP32_MCPWM_FAULT_IN, n));
+        }
+        for (n = 0; n < ESP32_MCPWM_CAPS; n++) {
+            qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                sig[i].cap + n,
+                qdev_get_gpio_in_named(dev, ESP32_MCPWM_CAP_IN, n));
+        }
+    }
+}
+
+/*
  * The BitScrambler, between GDMA and the peripherals HP_SYSTEM attaches it
  * to; and the parallel IO controller, served by GDMA-AXI, its pads through
  * the GPIO matrix.
@@ -2695,8 +2785,8 @@ static void esp32p4_init_rmt_pcnt(ESP32P4MachineState *s)
  *
  * The RMT and the PCNT have no events or tasks on the P4.
  *
- * Not connected, as their blocks are not modelled: the LED PWM, MCPWM,
- * ADC, REGDMA, temperature sensor and 2D-DMA events and tasks;
+ * Not connected, as their blocks are not modelled: the ADC, REGDMA,
+ * temperature sensor and 2D-DMA events and tasks;
  * the LP core's events (ULP_EVT_*) and ULP_TASK_WAKEUP_CPU, the PMU's LP
  * core wakeup, whose LP_CORE_ETM_WAKEUP_FLAG in LP_SYS is not modelled;
  * and the RTC timer's tasks (RTC_TASK_*), which the TRM says it does not
@@ -2808,6 +2898,41 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
         for (k = 0; k < ESP32P4_GDMA_ETM_TASKS; k++) {
             esp32p4_etm_connect_task(etm, task[g] + k, dev,
                                      ESP32P4_GDMA_ETM_TASK, k);
+        }
+    }
+
+    /* The LED PWM controller's channels and timers. */
+    dev = DEVICE(&s->ledc);
+    for (k = 0; k < ESP32P4_LEDC_ETM_EVENTS; k++) {
+        esp32p4_etm_connect_event(etm,
+                                  ESP32P4_ETM_LEDC_EVT_DUTY_CHNG_END_CH0 + k,
+                                  dev, ESP32P4_LEDC_ETM_EVENT, k);
+    }
+    for (k = 0; k < ESP32P4_LEDC_ETM_TASKS; k++) {
+        esp32p4_etm_connect_task(etm,
+                                 ESP32P4_ETM_LEDC_TASK_TIMER0_RES_UPDATE + k,
+                                 dev, ESP32P4_LEDC_ETM_TASK, k);
+    }
+
+    /* MCPWM0 and MCPWM1. */
+    for (g = 0; g < ESP32P4_MCPWM_NUM; g++) {
+        static const int evt[] = {
+            ESP32P4_ETM_MCPWM0_EVT_TIMER0_STOP,
+            ESP32P4_ETM_MCPWM1_EVT_TIMER0_STOP,
+        };
+        static const int task[] = {
+            ESP32P4_ETM_MCPWM0_TASK_CMPR0_A_UP,
+            ESP32P4_ETM_MCPWM1_TASK_CMPR0_A_UP,
+        };
+
+        dev = DEVICE(&s->mcpwm[g]);
+        for (k = 0; k < ESP32P4_MCPWM_ETM_EVENTS; k++) {
+            esp32p4_etm_connect_event(etm, evt[g] + k, dev,
+                                      ESP32_MCPWM_ETM_EVENT, k);
+        }
+        for (k = 0; k < ESP32P4_MCPWM_ETM_TASKS; k++) {
+            esp32p4_etm_connect_task(etm, task[g] + k, dev,
+                                     ESP32_MCPWM_ETM_TASK, k);
         }
     }
 
@@ -3251,6 +3376,208 @@ static void esp32p4_init_usb_serial_jtag(ESP32P4MachineState *s)
                                     ESP32P4_GPIO_PAD_PULL_UP, 25));
 }
 
+/*
+ * A cryptography block: its clock, its registers behind @bus_clock, and
+ * its interrupt (or none for -1).
+ */
+static void esp32p4_crypto_block(ESP32P4MachineState *s, DeviceState *dev,
+                                 const char *clock, hwaddr base,
+                                 unsigned bus_clock, int intr)
+{
+    qdev_connect_clock_in(dev, "clk",
+                          qdev_get_clock_out(DEVICE(&s->clkrst), clock));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0, base,
+                             bus_clock, ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    if (intr >= 0) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           esp32p4_intr_source(s, intr));
+    }
+}
+
+/*
+ * The cryptography blocks. A block's reset also holds the blocks it reuses
+ * (TRM 27.3, 28.5, 30.3, 31.3): RST_EN_DS the AES, SHA and RSA
+ * accelerators, RST_EN_ECDSA the SHA, RSA and ECC accelerators, RST_EN_KM
+ * the AES accelerator and RST_EN_HMAC the SHA accelerator; RST_EN_CRYPTO
+ * holds them all (esp32p4_clkrst.c).
+ */
+/* [spec:nuos:req:emu.esp32p4.crypto] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_crypto(ESP32P4MachineState *s)
+{
+    static const struct {
+        unsigned reset;
+        int lines;
+    } shared[ESP32P4_CRYPTO_RST_SPLITS] = {
+        { ESP32P4_RST_DS, 4 },
+        { ESP32P4_RST_ECDSA, 4 },
+        { ESP32P4_RST_KM, 2 },
+        { ESP32P4_RST_HMAC, 2 },
+    };
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    DeviceState *aes, *sha, *rsa, *ecc, *hmac, *ds, *ecdsa, *km, *huk, *trng;
+    DeviceState *split[ESP32P4_CRYPTO_RST_SPLITS];
+    ESP32P4ClkRstGate *gate;
+    Object *gdma_axi = OBJECT(&s->gdma[1]);
+    int i;
+
+    object_initialize_child(OBJECT(s), "trng", &s->trng, TYPE_ESP32P4_TRNG);
+    object_initialize_child(OBJECT(s), "huk", &s->huk, TYPE_ESP32P4_HUK);
+    object_initialize_child(OBJECT(s), "keymng", &s->keymng,
+                            TYPE_ESP32P4_KEYMNG);
+    object_initialize_child(OBJECT(s), "aes", &s->aes, TYPE_ESP32P4_AES);
+    object_initialize_child(OBJECT(s), "sha", &s->sha, TYPE_ESP32P4_SHA);
+    object_initialize_child(OBJECT(s), "rsa", &s->rsa, TYPE_ESP32P4_RSA);
+    object_initialize_child(OBJECT(s), "ecc", &s->ecc, TYPE_ESP32P4_ECC);
+    object_initialize_child(OBJECT(s), "hmac", &s->hmac, TYPE_ESP32P4_HMAC);
+    object_initialize_child(OBJECT(s), "ds", &s->ds, TYPE_ESP32P4_DS);
+    object_initialize_child(OBJECT(s), "ecdsa", &s->ecdsa,
+                            TYPE_ESP32P4_ECDSA);
+    trng = DEVICE(&s->trng);
+    huk = DEVICE(&s->huk);
+    km = DEVICE(&s->keymng);
+    aes = DEVICE(&s->aes);
+    sha = DEVICE(&s->sha);
+    rsa = DEVICE(&s->rsa);
+    ecc = DEVICE(&s->ecc);
+    hmac = DEVICE(&s->hmac);
+    ds = DEVICE(&s->ds);
+    ecdsa = DEVICE(&s->ecdsa);
+
+    /* The LP blocks, in the always-on domain and LPPERI's. */
+    qdev_connect_clock_in(trng, "clk", qdev_get_clock_out(clkrst, "lp-rng"));
+    sysbus_realize(SYS_BUS_DEVICE(trng), &error_fatal);
+    gate = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(trng), 0,
+                                    ESP32P4_TRNG_BASE, ESP32P4_CLK_LP_RNG,
+                                    ESP32P4_RST_LP_RNG, 0);
+    esp32p4_clkrst_gate_volatile(gate, ESP32P4_TRNG_DATA, 4);
+
+    object_property_set_link(OBJECT(huk), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    qdev_connect_clock_in(huk, "clk",
+                          qdev_get_clock_out(clkrst, "lp-dyn-fast"));
+    sysbus_realize(SYS_BUS_DEVICE(huk), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(huk), 0,
+                             ESP32P4_HUK_BASE, ESP32P4_CLK_LP_DYN_FAST,
+                             ESP32P4_RST_LP_HUK, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(huk), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_HUK));
+
+    object_property_set_link(OBJECT(km), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    object_property_set_link(OBJECT(km), "huk", OBJECT(huk), &error_abort);
+    esp32p4_crypto_block(s, km, "crypto-km", ESP32P4_KEYMNG_BASE,
+                         ESP32P4_CLK_KEY_MANAGER_SYS, ESP32P4_INTR_KM);
+
+    object_property_set_link(OBJECT(aes), "gdma", gdma_axi, &error_abort);
+    esp32p4_crypto_block(s, aes, "crypto-aes", ESP32P4_AES_BASE,
+                         ESP32P4_CLK_CRYPTO_SYS, ESP32P4_INTR_AES);
+    object_property_set_link(OBJECT(sha), "gdma", gdma_axi, &error_abort);
+    esp32p4_crypto_block(s, sha, "crypto-sha", ESP32P4_SHA_BASE,
+                         ESP32P4_CLK_CRYPTO_SYS, ESP32P4_INTR_SHA);
+    esp32p4_crypto_block(s, rsa, "crypto-rsa", ESP32P4_RSA_BASE,
+                         ESP32P4_CLK_CRYPTO_SYS, ESP32P4_INTR_RSA);
+    object_property_set_link(OBJECT(ecc), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    esp32p4_crypto_block(s, ecc, "crypto-ecc", ESP32P4_ECC_BASE,
+                         ESP32P4_CLK_CRYPTO_SYS, ESP32P4_INTR_ECC);
+
+    object_property_set_link(OBJECT(hmac), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    object_property_set_link(OBJECT(hmac), "keymng", OBJECT(km),
+                             &error_abort);
+    object_property_set_link(OBJECT(hmac), "sha", OBJECT(sha), &error_abort);
+    esp32p4_crypto_block(s, hmac, "crypto-hmac", ESP32P4_HMAC_BASE,
+                         ESP32P4_CLK_CRYPTO_SYS, -1);
+
+    object_property_set_link(OBJECT(ds), "hmac", OBJECT(hmac), &error_abort);
+    object_property_set_link(OBJECT(ds), "keymng", OBJECT(km), &error_abort);
+    object_property_set_link(OBJECT(ds), "aes", OBJECT(aes), &error_abort);
+    object_property_set_link(OBJECT(ds), "sha", OBJECT(sha), &error_abort);
+    object_property_set_link(OBJECT(ds), "rsa", OBJECT(rsa), &error_abort);
+    esp32p4_crypto_block(s, ds, "crypto-ds", ESP32P4_DS_BASE,
+                         ESP32P4_CLK_CRYPTO_SYS, -1);
+    qdev_connect_gpio_out_named(hmac, ESP32P4_HMAC_DS_KEY, 0,
+                                qdev_get_gpio_in_named(ds,
+                                    ESP32P4_DS_HMAC_KEY, 0));
+
+    object_property_set_link(OBJECT(ecdsa), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    object_property_set_link(OBJECT(ecdsa), "keymng", OBJECT(km),
+                             &error_abort);
+    object_property_set_link(OBJECT(ecdsa), "ecc", OBJECT(ecc),
+                             &error_abort);
+    object_property_set_link(OBJECT(ecdsa), "sha", OBJECT(sha),
+                             &error_abort);
+    esp32p4_crypto_block(s, ecdsa, "crypto-ecdsa", ESP32P4_ECDSA_BASE,
+                         ESP32P4_CLK_CRYPTO_SYS, ESP32P4_INTR_ECDSA);
+
+    /* The resets. */
+    for (i = 0; i < ESP32P4_CRYPTO_RST_SPLITS; i++) {
+        object_initialize_child(OBJECT(s), "crypto-reset-split[*]",
+                                &s->crypto_rst_split[i], TYPE_SPLIT_IRQ);
+        split[i] = DEVICE(&s->crypto_rst_split[i]);
+        qdev_prop_set_uint16(split[i], "num-lines", shared[i].lines);
+        qdev_realize(split[i], NULL, &error_fatal);
+        qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                    shared[i].reset,
+                                    qdev_get_gpio_in(split[i], 0));
+    }
+    /* RST_EN_DS: RSA_DS, AES, SHA, RSA. */
+    qdev_connect_gpio_out(split[0], 0,
+                          qdev_get_gpio_in_named(ds, ESP32P4_DS_RESET, 0));
+    qdev_connect_gpio_out(split[0], 1,
+                          qdev_get_gpio_in_named(aes, ESP32P4_AES_RESET, 1));
+    qdev_connect_gpio_out(split[0], 2,
+                          qdev_get_gpio_in_named(sha, ESP32P4_SHA_RESET, 1));
+    qdev_connect_gpio_out(split[0], 3,
+                          qdev_get_gpio_in_named(rsa, ESP32P4_RSA_RESET, 1));
+    /* RST_EN_ECDSA: ECDSA_DS, SHA, RSA, ECC. */
+    qdev_connect_gpio_out(split[1], 0,
+                          qdev_get_gpio_in_named(ecdsa, ESP32P4_ECDSA_RESET,
+                                                 0));
+    qdev_connect_gpio_out(split[1], 1,
+                          qdev_get_gpio_in_named(sha, ESP32P4_SHA_RESET, 3));
+    qdev_connect_gpio_out(split[1], 2,
+                          qdev_get_gpio_in_named(rsa, ESP32P4_RSA_RESET, 2));
+    qdev_connect_gpio_out(split[1], 3,
+                          qdev_get_gpio_in_named(ecc, ESP32P4_ECC_RESET, 1));
+    /* RST_EN_KM: the Key Manager, AES. */
+    qdev_connect_gpio_out(split[2], 0,
+                          qdev_get_gpio_in_named(km, ESP32P4_KEYMNG_RESET,
+                                                 0));
+    qdev_connect_gpio_out(split[2], 1,
+                          qdev_get_gpio_in_named(aes, ESP32P4_AES_RESET, 2));
+    /* RST_EN_HMAC: HMAC, SHA. */
+    qdev_connect_gpio_out(split[3], 0,
+                          qdev_get_gpio_in_named(hmac, ESP32P4_HMAC_RESET,
+                                                 0));
+    qdev_connect_gpio_out(split[3], 1,
+                          qdev_get_gpio_in_named(sha, ESP32P4_SHA_RESET, 2));
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET, ESP32P4_RST_AES,
+                                qdev_get_gpio_in_named(aes,
+                                    ESP32P4_AES_RESET, 0));
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET, ESP32P4_RST_SHA,
+                                qdev_get_gpio_in_named(sha,
+                                    ESP32P4_SHA_RESET, 0));
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET, ESP32P4_RST_RSA,
+                                qdev_get_gpio_in_named(rsa,
+                                    ESP32P4_RSA_RESET, 0));
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET, ESP32P4_RST_ECC,
+                                qdev_get_gpio_in_named(ecc,
+                                    ESP32P4_ECC_RESET, 0));
+
+    /* HP_SYSTEM's power-down of the RSA and ECC memories. */
+    qdev_connect_gpio_out_named(DEVICE(&s->hp_sys), ESP32P4_HP_SYS_MEM_PD, 0,
+                                qdev_get_gpio_in_named(rsa,
+                                    ESP32P4_RSA_MEM_PD, 0));
+    qdev_connect_gpio_out_named(DEVICE(&s->hp_sys), ESP32P4_HP_SYS_MEM_PD, 1,
+                                qdev_get_gpio_in_named(ecc,
+                                    ESP32P4_ECC_MEM_PD, 0));
+}
+
 /* The memories -kernel can load into: those the cores address directly. */
 static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
 {
@@ -3452,10 +3779,11 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_gpio(s);
     esp32p4_init_i2c(s);
     esp32p4_init_pms(s);
+    esp32p4_init_dma(s);
+    esp32p4_init_crypto(s);
     esp32p4_init_ext_memory(s);
     esp32p4_init_sdmmc(s);
     esp32p4_init_emac(s);
-    esp32p4_init_dma(s);
     esp32p4_init_spi(s);
     esp32p4_init_parlio(s);
     esp32p4_init_low_power(s);
@@ -3464,6 +3792,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_i2s(s);
     esp32p4_init_i3c(s);
     esp32p4_init_twai(s);
+    esp32p4_init_pwm(s);
     esp32p4_init_rmt_pcnt(s);
     esp32p4_init_etm(s);
     esp32p4_init_usb(s);
