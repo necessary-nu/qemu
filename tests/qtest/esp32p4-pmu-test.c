@@ -124,6 +124,7 @@
 #define WAKE_EXT                12
 #define WAKE_RTC_TIMER0         13
 #define WAKE_LP_CPU             22
+#define WAKE_HP_CPU             23
 
 #define STATE_ACTIVE            0x01
 #define STATE_HP_SLEEP          0x04
@@ -138,6 +139,13 @@
 #define TAR_EN                  (1u << 31)
 #define TIMER_UPDATE            (1u << 28)
 #define INT_TARGET              (1u << 31)
+
+#define HP_SYS                  0x500e5000
+#define CPU_INT_FROM_CPU_0      (HP_SYS + 0x010)
+#define HP2LP_WAKEUP_GROUP_EN(n) (HP_SYS + 0x210 + 4 * (n))
+#define SRC_FROM_CPU_INTR0      79
+#define HP2LP_FIRST             21
+#define LP_SYS_EXT_WAKEUP1_STATUS 0x50110020
 
 #define LP_CLKRST_RESET_CAUSE   0x50111010
 #define LPCORE_CAUSE_MASK_PMU   (1u << 25)
@@ -331,7 +339,7 @@ static void test_reset(void)
 /*
  * A source that PMU_SLEEP_REJECT_ENA enables rejects the sleep, recording
  * it in PMU_REJECT_CAUSE and raising PMU_SOC_SLEEP_REJECT_INT; the chip
- * stays in HP_ACTIVE.
+ * stays in HP_ACTIVE. The GPIO wakeup, then HP_SYSTEM's interrupt wakeup.
  */
 /* [spec:nuos:req:emu.esp32p4.low-power/test] */
 static void test_reject(void)
@@ -352,6 +360,22 @@ static void test_reject(void)
     g_assert_cmphex(rd(qts, SLP_WAKEUP_STATUS1), ==, 0);
     wr(qts, HP_INT_CLR, HP_INT_REJECT);
     g_assert(!source(qts, SRC_PMU_0));
+
+    /*
+     * HP_SYSTEM's interrupt wakeup, the "HP CPU" source: CPU_INTR_FROM_CPU_0
+     * (source 79) in HP2LP_WAKEUP_GROUP1.
+     */
+    qtest_writel(qts, HP2LP_WAKEUP_GROUP_EN((SRC_FROM_CPU_INTR0 -
+                                             HP2LP_FIRST) / 32),
+                 1u << ((SRC_FROM_CPU_INTR0 - HP2LP_FIRST) % 32));
+    qtest_writel(qts, CPU_INT_FROM_CPU_0, 1);
+    wr(qts, SLP_WAKEUP_CNTL1, SLP_REJECT_EN | (1u << WAKE_HP_CPU));
+    wr(qts, SLP_WAKEUP_CNTL0, SLEEP_REQ);
+    g_assert_cmphex(rd(qts, SLP_WAKEUP_STATUS1), ==, 1u << WAKE_HP_CPU);
+    g_assert_cmphex(current_state(qts), ==, STATE_ACTIVE);
+    wr(qts, SLP_WAKEUP_CNTL4, SLP_REJECT_CAUSE_CLR);
+    wr(qts, HP_INT_CLR, HP_INT_REJECT);
+    qtest_writel(qts, CPU_INT_FROM_CPU_0, 0);
 
     /* A source only wake-enabled does not reject: the chip falls asleep. */
     wr(qts, SLP_WAKEUP_CNTL1, 0);
@@ -501,7 +525,7 @@ static void test_min_sleep(void)
 /*
  * The EXT wakeup: a pad of GPIO0 to GPIO15 that PMU_EXT_WAKEUP_SEL selects
  * at its PMU_EXT_WAKEUP_LV level, recorded in PMU_EXT_WAKEUP_ST until
- * PMU_EXT_WAKEUP_STATUS_CLR.
+ * PMU_EXT_WAKEUP_STATUS_CLR, and in LP_SYSTEM's EXT_WAKEUP1_STATUS.
  */
 /* [spec:nuos:req:emu.esp32p4.low-power/test] */
 static void test_ext_wakeup(void)
@@ -521,6 +545,8 @@ static void test_ext_wakeup(void)
     g_assert_cmphex(current_state(qts), ==, STATE_ACTIVE);
     g_assert_cmphex(rd(qts, SLP_WAKEUP_STATUS0), ==, 1u << WAKE_EXT);
     g_assert_cmphex(rd(qts, EXT_WAKEUP_ST), ==, 1u << 5);
+    /* LP_SYSTEM's record of the pad, which ESP-IDF reads. */
+    g_assert_cmphex(qtest_readl(qts, LP_SYS_EXT_WAKEUP1_STATUS), ==, 1u << 5);
     wr(qts, EXT_WAKEUP_CNTL, EXT_STATUS_CLR);
     g_assert_cmphex(rd(qts, EXT_WAKEUP_ST), ==, 0);
     wr(qts, EXT_WAKEUP_CNTL, 0);
