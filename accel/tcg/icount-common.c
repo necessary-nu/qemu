@@ -82,26 +82,205 @@ static int64_t icount_get_executed(CPUState *cpu)
             (cpu->neg.icount_decr.u16.low + cpu->icount_extra));
 }
 
+/* @ns + @frac 2^-32 ns, plus @units 2^-32 ns (below 2^96). */
+static void icount_time_add(int64_t *ns, uint32_t *frac, uint64_t lo,
+                            uint64_t hi)
+{
+    uint64_t f = (uint64_t)*frac + (uint32_t)lo;
+
+    *ns += (int64_t)((hi << 32) | (lo >> 32)) + (int64_t)(f >> 32);
+    *frac = (uint32_t)f;
+}
+
 /*
- * Add the virtual time @executed instructions of @cpu's current run take:
- * each its run's instruction time, or 2^shift ns. Fractions of a ns carry
- * over, so a clock whose period is not a whole number of ns keeps its
- * rate over any number of instructions.
+ * The window of the CPUs with an icount clock (see icount_set_cpu_clock()
+ * and tcg-accel-ops-icount.c). Each CPU taking part has run through its
+ * own time, icount_own past the window's start: a period of its clock an
+ * instruction. One gone idle stays where it stopped until virtual time
+ * passes it, and then follows virtual time, as an idle core's does. Over
+ * the window, virtual time is the mean of their own times, so that each
+ * instruction of a CPU running alongside n - 1 others moves it on by 1/n
+ * of the CPU's period, as they take turns, by the whole period while the
+ * others are idle, and by nothing while all are idle (which the warp to
+ * the next deadline then covers): the least x, past the window's start,
+ * with
+ *
+ *     x = (sum of running own times + sum of idle max(own, x)) / n
+ *
+ * which is found by trying, in turn, the idle CPUs whose own time x has
+ * passed (fewest first): each gives x as the mean of the others' own
+ * times over the rest, and the right one is consistent with that.
+ */
+static int64_t icount_window_x(void)
+{
+    int64_t running = 0, rest = 0, *idle;
+    int n = 0, k = 0;
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        n++;
+    }
+    idle = g_newa(int64_t, n);
+    n = 0;
+    CPU_FOREACH(cpu) {
+        if (!cpu->icount_in_window) {
+            continue;
+        }
+        n++;
+        if (cpu->icount_window_idle) {
+            int i = k++;
+
+            while (i > 0 && idle[i - 1] > cpu->icount_own) {
+                idle[i] = idle[i - 1];
+                i--;
+            }
+            idle[i] = cpu->icount_own;
+            rest += cpu->icount_own;
+        } else {
+            running += cpu->icount_own;
+        }
+    }
+    if (n == 0) {
+        return INT64_MIN;
+    }
+    for (int m = 0; m <= k; m++) {
+        int64_t x;
+
+        if (m > 0) {
+            rest -= idle[m - 1];
+        }
+        if (m == n) {
+            return idle[k - 1];
+        }
+        x = (running + rest) / (n - m);
+        if ((m == 0 || idle[m - 1] <= x) && (m == k || x <= idle[m])) {
+            return x;
+        }
+    }
+    return INT64_MIN;
+}
+
+/* Virtual time past the window's start, in 2^-32 ns. */
+static int64_t icount_window_elapsed(void)
+{
+    int64_t ns = timers_state.qemu_icount_time - timers_state.window_ns;
+
+    if (ns >= INT32_MAX) {
+        return INT64_MAX;
+    }
+    return (int64_t)((uint64_t)ns << 32) +
+           (int64_t)timers_state.qemu_icount_time_frac -
+           (int64_t)timers_state.window_frac;
+}
+
+/* Bring virtual time up to the window's CPUs' (icount_window_x()). */
+static void icount_window_sync(void)
+{
+    int64_t x;
+
+    if (!timers_state.window_cpus) {
+        return;
+    }
+    x = icount_window_x();
+
+    if (x > icount_window_elapsed()) {
+        int64_t ns = timers_state.window_ns;
+        uint32_t frac = timers_state.window_frac;
+
+        icount_time_add(&ns, &frac, x, 0);
+        qatomic_set(&timers_state.qemu_icount_time, ns);
+        timers_state.qemu_icount_time_frac = frac;
+    }
+}
+
+/*
+ * Add the virtual time @executed instructions of @cpu's current run take.
+ * A CPU running in the window of those with an icount clock adds its run's
+ * instruction time, a period of its clock, to its own time, which moves
+ * virtual time on as icount_window_x() says. Any other adds its run's
+ * instruction time, or 2^shift ns, to virtual time, and moves the window
+ * on as much. Fractions of a ns carry over, so a clock whose period is not
+ * a whole number of ns keeps its rate over any number of instructions.
  */
 static void icount_account_time(CPUState *cpu, int64_t executed)
 {
     uint64_t insn_time = cpu->icount_insn_time;
-    uint64_t lo, hi, frac;
+    uint64_t lo, hi;
 
+    if (insn_time && cpu->icount_in_window && !cpu->icount_window_idle &&
+        timers_state.window_cpus) {
+        cpu->icount_own += executed * insn_time;
+        icount_window_sync();
+        return;
+    }
     if (!insn_time) {
         insn_time = (uint64_t)1 << (32 + timers_state.icount_time_shift);
     }
     mulu64(&lo, &hi, executed, insn_time);
-    frac = (uint64_t)timers_state.qemu_icount_time_frac + (uint32_t)lo;
-    qatomic_set(&timers_state.qemu_icount_time,
-                timers_state.qemu_icount_time +
-                (int64_t)((hi << 32) | (lo >> 32)) + (int64_t)(frac >> 32));
-    timers_state.qemu_icount_time_frac = (uint32_t)frac;
+    icount_time_add(&timers_state.qemu_icount_time,
+                    &timers_state.qemu_icount_time_frac, lo, hi);
+    if (timers_state.window_cpus) {
+        icount_time_add(&timers_state.window_ns, &timers_state.window_frac,
+                        lo, hi);
+    }
+}
+
+uint64_t icount_window_start(uint64_t units, int cpus)
+{
+    uint64_t moved = UINT64_MAX;
+    int64_t elapsed;
+
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    elapsed = icount_window_elapsed();
+    if (timers_state.window_cpus && elapsed >= 0 && elapsed != INT64_MAX) {
+        moved = elapsed;
+    }
+    timers_state.window_ns = timers_state.qemu_icount_time;
+    timers_state.window_frac = timers_state.qemu_icount_time_frac;
+    timers_state.window_units = units;
+    timers_state.window_cpus = cpus;
+    timers_state.window_running = cpus;
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+    return moved;
+}
+
+void icount_window_set_idle(CPUState *cpu, bool idle)
+{
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    if (idle) {
+        cpu->icount_window_idle = true;
+        timers_state.window_running--;
+        icount_window_sync();
+    } else {
+        cpu->icount_own = MAX(cpu->icount_own, icount_window_elapsed());
+        cpu->icount_window_idle = false;
+        timers_state.window_running++;
+    }
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
+void icount_window_join(CPUState *cpu, uint64_t units)
+{
+    int64_t elapsed;
+
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    elapsed = icount_window_elapsed();
+    cpu->icount_own = elapsed;
+    cpu->icount_in_window = true;
+    cpu->icount_window_idle = false;
+    timers_state.window_cpus++;
+    timers_state.window_running++;
+    if (elapsed >= 0 && (uint64_t)elapsed < timers_state.window_units &&
+        units < timers_state.window_units - elapsed) {
+        timers_state.window_units = elapsed + units;
+    }
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
 }
 
 /*
