@@ -48,18 +48,36 @@
  *
  * - SYS_CTRL's SYS_SW_RST (write-only) makes the software system reset,
  *   which the machine carries out ("sys-sw-reset"); LP_CORE_DISABLE and
- *   SYSTIMER_STALL_SEL go to the LP core and the RTC timer; the FIB
- *   bits give the super watchdog's and the brownout detector's resets
- *   ("swd-reset-en", "bod-reset-en"; FIB bits 2 and 1). The TRM does not
- *   describe the FIB: as the field names have it, LP_FIB_SEL's bit set
- *   selects the software's DIG_FIB bit and clear the analog state's
- *   ANA_FIB (which reads its reset value, the analog FIB not being
- *   modelled), and, as ESP32-C6's LP_ANA_FIB_ENABLE has it, a FIB bit set
- *   bypasses the reset: from reset neither reset is enabled, and
- *   software enables one by clearing its DIG_FIB bit;
+ *   SYSTIMER_STALL_SEL go to the LP core and the RTC timer;
  *   LP_CORE_ETM_WAKEUP_FLAG sets on its ETM input and clears on a write of
  *   1 to it or to LP_CORE_ETM_WAKEUP_FLAG_CLR, and is the PMU's ETM wakeup
  *   source (bit 17), which wakes the LP core.
+ *
+ * - The FIB control (TRM 21.2.2.2) enables the brownout detector (FIB
+ *   bit 1) and the super watchdog's reset (bit 2): LP_FIB_SEL's bit picks
+ *   the source, the analog state ANA_FIB's bit when set and the
+ *   software's DIG_FIB bit when clear, and the picked bit set enables
+ *   ("bod-reset-en", "swd-reset-en"). From reset LP_FIB_SEL (0xFF) picks
+ *   the analog state for both; DIG_FIB, 0xFF from reset, enables both
+ *   once picked until software clears its bit. ESP-IDF's start-up writes
+ *   LP_FIB_SEL with 0xEF, giving bit 4, the DCDC switch, to DIG_FIB and
+ *   leaving the detector and the watchdog to the analog state. FIB bits 4
+ *   and 5 (the DCDC switch and its VSET enable) are kept as written, the
+ *   DCDC converter not being modelled.
+ *
+ *   ANA_FIB, read-only, reports the analog state, which the model takes
+ *   as 0x7B: the detector enabled (bit 1) and the super watchdog's reset
+ *   not (bit 2). The v3 header gives ANA_FIB a reset value of 0x7F, which
+ *   would enable that reset from power-on, but silicon evidently does not:
+ *   the boot ROM never feeds the super watchdog nor sets its auto-feed
+ *   (its only access is main()'s SWD_RST_FLAG_CLR, and it never writes
+ *   the FIB), yet flashing over UART, which keeps the chip in download
+ *   mode for well over the watchdog's second, works without feeding it:
+ *   esptool's ESP32-P4 disable_watchdogs() and esp-flasher-stub's
+ *   transport set SWD_AUTO_FEED_EN only over USB-Serial-JTAG, whose reset
+ *   into download mode leaves an application's settings in place. ANA_FIB
+ *   bit 2 clear is to be confirmed on a board, by reading SYS_CTRL's
+ *   ANA_FIB and by sitting in download mode for some seconds.
  *
  * - LP_CORE_BOOT_ADDR (0x50100000 from reset), the LP core's boot address,
  *   and BOOT_ADDR_HP_LP, the application's, at which the LP ROM starts it,
@@ -185,7 +203,7 @@
 #define SYS_CTRL_ETM_WAKEUP_FLAG_CLR BIT(29)
 #define SYS_CTRL_ETM_WAKEUP_FLAG BIT(30)
 #define SYS_CTRL_SYSTIMER_STALL_SEL BIT(31)
-/* The FIB bits of the brownout detector and the super watchdog. */
+/* The FIB bits of the brownout detector and the super watchdog's reset. */
 #define FIB_BOD                 1
 #define FIB_SWD                 2
 
@@ -218,7 +236,8 @@ typedef struct {
 static const ESP32P4LPSysReg esp32p4_lp_sys_regs[ESP32P4_LP_SYS_NREGS] = {
     REG(A_VER_DATE, 0x20250214, 0xffffffff),
     REG(A_CLK_SEL_CTRL, 0, 0x00030000),
-    REG(A_SYS_CTRL, 0x1fffc7f8, 0x9fe00ffd),
+    /* ANA_FIB (bits 20:14) reads 0x7B, not the header's 0x7F: see above. */
+    REG(A_SYS_CTRL, 0x1ffec7f8, 0x9fe00ffd),
     REG(A_LP_CLK_CTRL, 0x4001, 0x4001),
     REG(A_LP_RST_CTRL, 0x3, 0x7),
     REG(A_LP_CORE_BOOT_ADDR, 0x50100000, 0xffffffff),
@@ -339,17 +358,18 @@ uint32_t esp32p4_lp_sys_lp_core_app_addr(ESP32P4LPSysState *s)
 }
 
 /*
- * A FIB-controlled reset's enable: the FIB bit, the software's when
- * LP_FIB_SEL's bit is set, else the analog state's, clear.
+ * [spec:nuos:req:emu.esp32p4.debug]
+ * A FIB-controlled enable (TRM 21.2.2.2): the FIB bit, the analog state's
+ * when LP_FIB_SEL's bit is set, else the software's, set.
  */
 static bool esp32p4_lp_sys_fib_enable(ESP32P4LPSysState *s, int bit)
 {
     uint32_t ctrl = s->regs[R(A_SYS_CTRL)];
 
     if (extract32(ctrl, SYS_CTRL_LP_FIB_SEL_SHIFT + bit, 1)) {
-        return !extract32(ctrl, SYS_CTRL_DIG_FIB_SHIFT + bit, 1);
+        return extract32(ctrl, SYS_CTRL_ANA_FIB_SHIFT + bit, 1);
     }
-    return !extract32(ctrl, SYS_CTRL_ANA_FIB_SHIFT + bit, 1);
+    return extract32(ctrl, SYS_CTRL_DIG_FIB_SHIFT + bit, 1);
 }
 
 /* [spec:nuos:req:emu.esp32p4.debug] */

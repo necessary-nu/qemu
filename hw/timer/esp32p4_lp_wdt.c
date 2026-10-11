@@ -45,15 +45,18 @@
  * (cause 0x12) and sets SWD_RESET_FLAG, which that reset keeps and
  * SWD_RST_FLAG_CLR or a chip reset clears, if LP_SYSTEM's FIB control lets
  * it (the "swd-reset-en" input); otherwise it starts its timeout again.
- * Out of reset the FIB leaves the reset to the analog state, which the
- * model takes not to reset: the boot ROM never feeds the SWD, yet its
- * download mode does not reset every second, and ESP-IDF's P4 bootloader,
- * unlike the C3's and C6's, does not enable the reset
- * (bootloader_ana_super_wdt_reset_config is empty), though the header
- * gives ANA_FIB a reset value of 127. SWD_SIGNAL_WIDTH, the width of the
- * feed signal to the analog circuit, is held as written. SWD_CONFIG takes
- * writes only while SWD_WKEY holds 0x50D83AA1, except SWD_RST_FLAG_CLR,
- * which the boot ROM's main() writes without the key.
+ * Out of reset the FIB leaves the reset to the analog state, which on
+ * silicon evidently does not enable it (see esp32p4_lp_sys.c): the boot
+ * ROM neither feeds the SWD nor sets SWD_AUTO_FEED_EN (its one access is
+ * the keyless SWD_RST_FLAG_CLR in main()), and its download mode does not
+ * reset every second. Software enables the reset through LP_SYSTEM's
+ * DIG_FIB; ESP-IDF's P4 bootloader sets SWD_AUTO_FEED_EN at the start of
+ * bootloader_init() whatever the FIB says. SWD_SIGNAL_WIDTH,
+ * the width of the feed signal to the analog circuit, is held as written.
+ * SWD_CONFIG takes writes only while SWD_WKEY holds 0x50D83AA1, except
+ * SWD_RST_FLAG_CLR, which the boot ROM's main() writes without the key
+ * (esp32p4_lp_wdt_swd_rst_flag_clr() for a program -kernel starts in the
+ * ROM's place).
  *
  * Both interrupts drive LP_WDT_INTR. The block resets with a system reset
  * and its LP_CLKRST reset, not with an HP core reset. LP_WDT_DATE's
@@ -425,6 +428,12 @@ static void lp_wdt_set_spi_boot(void *opaque, int n, int level)
 static void lp_wdt_set_swd_reset_en(void *opaque, int n, int level)
 {
     ESP32P4_LP_WDT(opaque)->swd_reset_en = level;
+}
+
+/* [spec:nuos:req:emu.esp32p4.timers] */
+void esp32p4_lp_wdt_swd_rst_flag_clr(ESP32P4LPWdtState *s)
+{
+    s->swd_reset_flag = false;
 }
 
 /* [spec:nuos:req:emu.esp32p4.timers] */
