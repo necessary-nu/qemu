@@ -17,4 +17,5 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files('esp32_uhci.c'))
 system_ss.add(when: 'CONFIG_RP2350_DMA', if_true: files('rp2350_dma.c'))
 system_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_gdma.c',
                                                    'esp32p4_dw_gdma.c',
-                                                   'esp32p4_uhci.c'))
+                                                   'esp32p4_uhci.c',
+                                                   'esp32p4_bitscrambler.c'))
