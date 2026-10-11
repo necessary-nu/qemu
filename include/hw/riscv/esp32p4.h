@@ -19,6 +19,7 @@
 #include "hw/intc/esp32p4_intmatrix.h"
 #include "hw/ssi/ssi.h"
 #include "hw/misc/esp32p4_ana.h"
+#include "hw/misc/esp32p4_cache.h"
 #include "hw/misc/esp32p4_clkrst.h"
 #include "hw/misc/esp32p4_hp_sys.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
@@ -26,6 +27,7 @@
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "hw/nvram/esp32p4_efuse.h"
+#include "hw/ssi/esp32p4_mspi.h"
 #include "system/memory.h"
 #include "target/riscv/esp32p4_cpu.h"
 
@@ -62,6 +64,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 #define ESP32P4_FLASH_MIN_SIZE      (1 * MiB)
 #define ESP32P4_FLASH_MAX_SIZE      (128 * MiB)
 
+#define ESP32P4_CACHE_BASE          0x3ff10000
+#define ESP32P4_FLASH_MSPI_BASE     0x5008c000
+#define ESP32P4_PSRAM_MSPI_BASE     0x5008e000
 #define ESP32P4_HP_SYS_CLKRST_BASE  0x500e6000
 #define ESP32P4_LP_SYS_BASE         0x50110000
 #define ESP32P4_LP_CLKRST_BASE      0x50111000
@@ -90,6 +95,9 @@ struct ESP32P4MachineState {
     MemoryRegion l2mem_direct;
     MemoryRegion lp_sram;
     MemoryRegion psram;
+    /* The HP cores' address space, and the bus in it. */
+    MemoryRegion hp_mem;
+    MemoryRegion hp_bus;
 
     /* The HP cores' resets, to each core and its CLIC. */
     SplitIRQ core_reset_split[ESP32P4_HP_CORES];
@@ -114,6 +122,13 @@ struct ESP32P4MachineState {
     ESP32P4PmsState pms;
     ESP32P4IcmState icm;
 
+    ESP32P4MSPIState flash_mspi;
+    ESP32P4MSPIState psram_mspi;
+    /* HP_SYSTEM_CRYPTO_CTRL's enables, to the flash's and PSRAM's MSPI. */
+    SplitIRQ crypto_split[ESP32P4_HP_SYS_CRYPTO_CTRL_LINES];
+    MemoryRegion flash_window_alias;
+    MemoryRegion psram_window_alias;
+    ESP32P4CacheState cache;
     SSIBus *flash_bus;
     uint64_t flash_size;
 };

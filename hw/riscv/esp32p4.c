@@ -29,16 +29,21 @@
  *   - The HP ROM (128 KiB) at 0x4FC00000, and at 0x8FC00000 for direct
  *     access; HP L2MEM (768 KiB) at 0x4FF00000, and at 0x8FF00000 for
  *     direct access; the HP TCM (8 KiB) at 0x30100000; the LP ROM (16 KiB)
- *     at 0x50100000; LP SRAM (32 KiB) at 0x50108000. L2MEM is all RAM:
- *     none of it is given to the L2 cache.
+ *     at 0x50100000; LP SRAM (32 KiB) at 0x50108000. The L2 cache occupies
+ *     the start of L2MEM, 128 KiB from reset (TRM 9.3.2's configurations;
+ *     esp32p4_cache.c), which no master can then reach.
  *   - The external memory windows, 64 MiB each: flash at 0x40000000 and
- *     PSRAM at 0x48000000, both again at 0x8xxxxxxx for direct access.
- *     The cache's MMU maps them onto the flash and PSRAM in 64 KiB pages,
- *     and is not modelled, so the windows are unimplemented devices. Behind
- *     them, the 32 MiB of in-package PSRAM is a RAM region of its own, and
- *     the flash a W25Q part on the bus of the flash MSPI controllers; as
- *     nothing maps them, and the controllers are not modelled either, the
- *     cores cannot reach them.
+ *     PSRAM at 0x48000000, both again at 0x8xxxxxxx for direct access,
+ *     which the MMUs of the flash and PSRAM MSPI controllers
+ *     (esp32p4_mspi.c, at 0x5008C000 to 0x5008FFFF) map onto the flash and
+ *     the 32 MiB of in-package PSRAM, a RAM region of its own, in 64 KiB
+ *     pages. The flash is a W25Q part on the flash controller's SSI bus.
+ *   - The caches (esp32p4_cache.c, registers at 0x3FF10000): the HP cores
+ *     reach the external memory through their L1 and the L2 cache, and
+ *     L2MEM through their L1, at the 0x4xxxxxxx addresses; the cores'
+ *     address space, of their own, has the caches' views there over the
+ *     system's. Every other master, the LP core and DMA among them, and
+ *     the cores at 0x8xxxxxxx, reach the memories directly.
  *   - The reset and clock control, HP_SYS_CLKRST, LP_AON_CLKRST and
  *     LPPERI, with the clock tree from the crystal, the RC oscillators and
  *     the PLLs to every block's clocks, and the analog I2C controller
@@ -71,8 +76,10 @@
  *     external interrupts 16 to 47 of either HP core, remapped as each
  *     core's mode and its CLIC's user-mode interrupts decide. Of HP_SYSTEM
  *     (0x500E5000), the cores' software interrupts CPU_INTR_FROM_CPU_0 to
- *     _3, sources of the matrix; the rest of its registers are logged as
- *     unimplemented. A source no modelled block drives stays low.
+ *     _3, sources of the matrix, the L1 caches' resets, the external
+ *     memory encryption enables and the L2MEM error response and
+ *     interrupt; the rest of its registers are logged as unimplemented. A
+ *     source no modelled block drives stays low.
  *   - The GPIO matrix and IO MUX (TRM chapter 10), HP and LP, with
  *     GPIO_EXT's sigma-delta modulators, glitch filters and ETM, behind
  *     IOMUX_APB_CLK and the LP IO MUX's clock and their resets, timed by
@@ -103,8 +110,9 @@
  *
  * The HP ROM image is the esp32p4-rev3-rom.bin firmware file, or the raw
  * image -bios names. With -kernel, an ELF's segments are loaded into
- * L2MEM, the TCM or LP SRAM, and core 0 starts at the ELF's entry point
- * rather than in the ROM; core 1 is still held for software to release.
+ * L2MEM (past the L2 cache), the TCM or LP SRAM, and core 0 starts at the
+ * ELF's entry point rather than in the ROM, with the caches empty; core 1
+ * is still held for software to release.
  */
 
 #include "qemu/osdep.h"
@@ -144,17 +152,6 @@ static const struct {
     { "bus-monitor",      0x3ff06000, 4 * KiB },
     { "l2mem-monitor",    0x3ff0e000, 4 * KiB },
     { "tcm-monitor",      0x3ff0f000, 4 * KiB },
-    { "cache",            0x3ff10000, 4 * KiB },
-
-    /* The external memory windows. */
-    { "flash-window",        ESP32P4_FLASH_WINDOW_BASE,
-                             ESP32P4_EXT_WINDOW_SIZE },
-    { "psram-window",        ESP32P4_PSRAM_WINDOW_BASE,
-                             ESP32P4_EXT_WINDOW_SIZE },
-    { "flash-window-direct", ESP32P4_FLASH_WINDOW_DIRECT_BASE,
-                             ESP32P4_EXT_WINDOW_SIZE },
-    { "psram-window-direct", ESP32P4_PSRAM_WINDOW_DIRECT_BASE,
-                             ESP32P4_EXT_WINDOW_SIZE },
 
     /* HP peripherals 0. */
     { "usb-otg-hs",       0x50000000, 256 * KiB },
@@ -170,10 +167,6 @@ static const struct {
     { "dma2d",            0x50088000, 4 * KiB },
     { "keymng",           0x50089000, 4 * KiB },
     { "axi-dma",          0x5008a000, 8 * KiB },
-    { "flash-spi0",       0x5008c000, 4 * KiB },
-    /* flash-spi1 at 0x5008d000 carries the flash's bus. */
-    { "psram-mspi0",      0x5008e000, 4 * KiB },
-    { "psram-mspi1",      0x5008f000, 4 * KiB },
     { "aes",              0x50090000, 4 * KiB },
     { "sha",              0x50091000, 4 * KiB },
     { "rsa",              0x50092000, 4 * KiB },
@@ -259,8 +252,6 @@ static const struct {
     { "lp-tsens",         0x5012f000, 4 * KiB },
 };
 
-#define ESP32P4_FLASH_SPI1_BASE 0x5008d000
-
 static DeviceState *esp32p4_unimplemented_device(const char *name,
                                                  hwaddr size)
 {
@@ -339,10 +330,9 @@ static const char *esp32p4_flash_part(uint64_t size)
 }
 
 /*
- * The flash chip on the bus the flash MSPI controllers drive, SPI1 for
- * software's commands and SPI0 for the cache's reads, neither of which is
- * modelled: the bus hangs off SPI1's unimplemented device, and nothing
- * selects the chip. It is erased unless backed by the first -drive if=mtd.
+ * The flash chip on the flash MSPI controller's bus, chip select 0, which
+ * SPI1 drives with software's commands and SPI0 with the cache's reads. It
+ * is erased unless backed by the first -drive if=mtd.
  *
  * A board with no flash has nothing on the bus. Nothing then drives the
  * controllers' data inputs, which out of reset have no pull-up or
@@ -352,13 +342,11 @@ static const char *esp32p4_flash_part(uint64_t size)
 /* [spec:nuos:req:emu.esp32p4.machine] */
 static void esp32p4_init_flash(ESP32P4MachineState *s)
 {
-    DeviceState *spi1 = esp32p4_unimplemented_device("flash-spi1", 4 * KiB);
     DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
     DeviceState *flash;
 
-    s->flash_bus = ssi_create_bus(spi1, "flash-spi");
-    esp32p4_map(spi1, ESP32P4_FLASH_SPI1_BASE);
-
+    s->flash_bus = (SSIBus *)qdev_get_child_bus(DEVICE(&s->flash_mspi),
+                                                "ssi");
     if (!s->flash_size) {
         qemu_log("esp32p4: no flash is configured (-M esp32p4,flash-size="
                  "SIZE); the flash bus has no chip on it\n");
@@ -379,17 +367,28 @@ static void esp32p4_init_flash(ESP32P4MachineState *s)
         qdev_prop_set_drive_err(flash, "drive", blk, &error_fatal);
     }
     ssi_realize_and_unref(flash, s->flash_bus, &error_fatal);
+    qdev_connect_gpio_out_named(DEVICE(&s->flash_mspi), SSI_GPIO_CS, 0,
+                                qdev_get_gpio_in_named(flash, SSI_GPIO_CS,
+                                                       0));
 }
 
 /*
  * The bus as every master sees it, through the access permission managers
  * (hw/misc/esp32p4_pms.c): the cores take it as their memory as they are
- * realized, before the blocks the APMs record refusals in exist.
+ * realized, before the blocks the APMs record refusals in exist. The HP
+ * cores take it with the caches' views over it at 0x4xxxxxxx
+ * (esp32p4_init_ext_memory()): their cached accesses are for their PMP
+ * alone.
  */
 /* [spec:nuos:req:emu.esp32p4.pms] */
+/* [spec:nuos:req:emu.esp32p4.memory] */
 static void esp32p4_init_bus(ESP32P4MachineState *s)
 {
     object_initialize_child(OBJECT(s), "pms", &s->pms, TYPE_ESP32P4_PMS);
+    memory_region_init(&s->hp_mem, OBJECT(s), "esp32p4.hp-mem", UINT64_MAX);
+    memory_region_init_alias(&s->hp_bus, OBJECT(s), "esp32p4.hp-bus",
+                             esp32p4_pms_bus(&s->pms), 0, UINT64_MAX);
+    memory_region_add_subregion_overlap(&s->hp_mem, 0, &s->hp_bus, 0);
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */
@@ -406,8 +405,7 @@ static void esp32p4_init_cpus(ESP32P4MachineState *s)
         qdev_prop_set_uint64(DEVICE(&s->hp_cpu[i]), "resetvec",
                              ESP32P4_HP_RESET_VECTOR);
         object_property_set_link(OBJECT(&s->hp_cpu[i]), "memory",
-                                 OBJECT(esp32p4_pms_bus(&s->pms)),
-                                 &error_abort);
+                                 OBJECT(&s->hp_mem), &error_abort);
         s->hp_cpu[i].parent_obj.env.mhartid = i;
         qdev_realize(DEVICE(&s->hp_cpu[i]), NULL, &error_fatal);
         qemu_register_resettable(OBJECT(&s->hp_cpu[i]));
@@ -621,8 +619,9 @@ static qemu_irq esp32p4_intr_source(ESP32P4MachineState *s, int source)
  * The interrupt matrix, its registers behind INTRMTX_APB_CLK and its
  * reset, between the sources and the CLIC external interrupts of both HP
  * cores; for its remapping, each core's machine mode and which of its
- * CLIC's interrupts are user-mode ones. And HP_SYSTEM's software
- * interrupts, behind SYSREG_APB_CLK, which are among its sources.
+ * CLIC's interrupts are user-mode ones. And HP_SYSTEM, behind
+ * SYSREG_APB_CLK, whose software interrupts and HP_SYSREG interrupt are
+ * among its sources.
  */
 /* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
 static void esp32p4_init_intmatrix(ESP32P4MachineState *s)
@@ -671,6 +670,8 @@ static void esp32p4_init_intmatrix(ESP32P4MachineState *s)
                                     esp32p4_intr_source(s,
                                         ESP32P4_INTR_FROM_CPU_INTR0 + n));
     }
+    sysbus_connect_irq(SYS_BUS_DEVICE(hp_sys), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_HP_SYSREG));
 }
 
 /*
@@ -699,6 +700,170 @@ static void esp32p4_init_efuse(ESP32P4MachineState *s)
                              ESP32P4_CLKRST_GATE_NO_RESET, 0);
     sysbus_connect_irq(SYS_BUS_DEVICE(efuse), 0,
                        esp32p4_intr_source(s, ESP32P4_INTR_LP_EFUSE));
+}
+
+/*
+ * One of the MSPI controllers: its SPI0 and SPI1 registers behind its bus
+ * clock, its 64 MiB window at its direct address and, for the bus's other
+ * masters, at its cached one, its clocks, resets and interrupt, and the
+ * encryption enables from HP_SYSTEM (through `crypto_split` output
+ * `psram`).
+ */
+/* [spec:nuos:req:emu.esp32p4.memory] */
+static void esp32p4_init_mspi(ESP32P4MachineState *s, ESP32P4MSPIState *m,
+                              bool psram)
+{
+    DeviceState *dev, *clkrst = DEVICE(&s->clkrst);
+    SysBusDevice *sbd;
+    MemoryRegion *window, *alias = psram ? &s->psram_window_alias
+                                         : &s->flash_window_alias;
+    hwaddr regs = psram ? ESP32P4_PSRAM_MSPI_BASE : ESP32P4_FLASH_MSPI_BASE;
+    int n;
+
+    object_initialize_child(OBJECT(s), psram ? "psram-mspi" : "flash-mspi",
+                            m, TYPE_ESP32P4_MSPI);
+    dev = DEVICE(m);
+    sbd = SYS_BUS_DEVICE(m);
+    qdev_prop_set_bit(dev, "psram", psram);
+    object_property_set_link(OBJECT(m), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    if (psram) {
+        object_property_set_link(OBJECT(m), "psram-mr", OBJECT(&s->psram),
+                                 &error_abort);
+    }
+    qdev_connect_clock_in(dev, "sys", qdev_get_clock_out(clkrst,
+                          psram ? "psram-sys" : "flash-sys"));
+    qdev_connect_clock_in(dev, "core", qdev_get_clock_out(clkrst,
+                          psram ? "psram-core" : "flash-core"));
+    sysbus_realize(sbd, &error_fatal);
+
+    esp32p4_clkrst_map_gated(&s->clkrst, sbd, ESP32P4_MSPI_MMIO_SPI0, regs,
+                             psram ? ESP32P4_CLK_PSRAM_SYS
+                                   : ESP32P4_CLK_FLASH_SYS,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    esp32p4_clkrst_map_gated(&s->clkrst, sbd, ESP32P4_MSPI_MMIO_SPI1,
+                             regs + ESP32P4_MSPI_REGS_SIZE,
+                             psram ? ESP32P4_CLK_PSRAM_SYS
+                                   : ESP32P4_CLK_FLASH_SYS,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    window = sysbus_mmio_get_region(sbd, ESP32P4_MSPI_MMIO_WINDOW);
+    memory_region_add_subregion(get_system_memory(),
+                                psram ? ESP32P4_PSRAM_WINDOW_DIRECT_BASE
+                                      : ESP32P4_FLASH_WINDOW_DIRECT_BASE,
+                                window);
+    memory_region_init_alias(alias, OBJECT(s),
+                             psram ? "esp32p4.psram-window-bus"
+                                   : "esp32p4.flash-window-bus",
+                             window, 0, ESP32P4_EXT_WINDOW_SIZE);
+    memory_region_add_subregion(get_system_memory(),
+                                psram ? ESP32P4_PSRAM_WINDOW_BASE
+                                      : ESP32P4_FLASH_WINDOW_BASE, alias);
+
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                psram ? ESP32P4_RST_DUAL_MSPI_APB
+                                      : ESP32P4_RST_MSPI_APB,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_MSPI_APB_RESET, 0));
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                psram ? ESP32P4_RST_DUAL_MSPI_AXI
+                                      : ESP32P4_RST_MSPI_AXI,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_MSPI_AXI_RESET, 0));
+    for (n = 0; n < ESP32P4_HP_SYS_CRYPTO_CTRL_LINES; n++) {
+        qdev_connect_gpio_out(DEVICE(&s->crypto_split[n]), psram,
+                              qdev_get_gpio_in_named(dev,
+                                  ESP32P4_MSPI_CRYPTO_CTRL, n));
+    }
+    sysbus_connect_irq(sbd, 0, esp32p4_intr_source(s,
+                       psram ? ESP32P4_INTR_PSRAM_MSPI : ESP32P4_INTR_MSPI));
+}
+
+/*
+ * The flash and PSRAM MSPI controllers and the flash, and the caches:
+ * their registers behind L1CACHE_CPU_CLK and RST_EN_HP_CACHE, the part of
+ * L2MEM the L2 cache occupies over L2MEM at both its addresses, and their
+ * views in the HP cores' address space.
+ */
+/* [spec:nuos:req:emu.esp32p4.memory] */
+static void esp32p4_init_ext_memory(ESP32P4MachineState *s)
+{
+    DeviceState *cache, *clkrst = DEVICE(&s->clkrst);
+    SysBusDevice *sbd;
+    static const struct {
+        hwaddr base;
+        int region;
+    } views[] = {
+        { ESP32P4_FLASH_WINDOW_BASE,
+          ESP32P4_CACHE_MMIO_VIEW0 + ESP32P4_CACHE_VIEW_FLASH },
+        { ESP32P4_PSRAM_WINDOW_BASE,
+          ESP32P4_CACHE_MMIO_VIEW0 + ESP32P4_CACHE_VIEW_PSRAM },
+        { ESP32P4_L2MEM_BASE,
+          ESP32P4_CACHE_MMIO_VIEW0 + ESP32P4_CACHE_VIEW_L2MEM },
+    };
+    static const int cache_resets[ESP32P4_CACHE_NRESETS] = {
+        [ESP32P4_CACHE_RESET_L1_I0] = ESP32P4_RST_L1_I0_CACHE,
+        [ESP32P4_CACHE_RESET_L1_I1] = ESP32P4_RST_L1_I1_CACHE,
+        [ESP32P4_CACHE_RESET_L1_D] = ESP32P4_RST_L1_D_CACHE,
+        [ESP32P4_CACHE_RESET_L2] = ESP32P4_RST_L2_CACHE,
+    };
+    int i;
+
+    /* HP_SYSTEM_CRYPTO_CTRL's enables go to both controllers. */
+    for (i = 0; i < ESP32P4_HP_SYS_CRYPTO_CTRL_LINES; i++) {
+        object_initialize_child(OBJECT(s), "crypto-ctrl-split[*]",
+                                &s->crypto_split[i], TYPE_SPLIT_IRQ);
+        qdev_prop_set_uint16(DEVICE(&s->crypto_split[i]), "num-lines", 2);
+        qdev_realize(DEVICE(&s->crypto_split[i]), NULL, &error_fatal);
+        qdev_connect_gpio_out_named(DEVICE(&s->hp_sys),
+                                    ESP32P4_HP_SYS_CRYPTO_CTRL, i,
+                                    qdev_get_gpio_in(
+                                        DEVICE(&s->crypto_split[i]), 0));
+    }
+    esp32p4_init_mspi(s, &s->flash_mspi, false);
+    esp32p4_init_mspi(s, &s->psram_mspi, true);
+    esp32p4_init_flash(s);
+
+    object_initialize_child(OBJECT(s), "cache", &s->cache,
+                            TYPE_ESP32P4_CACHE);
+    cache = DEVICE(&s->cache);
+    sbd = SYS_BUS_DEVICE(cache);
+    object_property_set_link(OBJECT(cache), "flash-mspi",
+                             OBJECT(&s->flash_mspi), &error_abort);
+    object_property_set_link(OBJECT(cache), "psram-mspi",
+                             OBJECT(&s->psram_mspi), &error_abort);
+    object_property_set_link(OBJECT(cache), "l2mem", OBJECT(&s->l2mem),
+                             &error_abort);
+    object_property_set_link(OBJECT(cache), "hp-sys", OBJECT(&s->hp_sys),
+                             &error_abort);
+    sysbus_realize(sbd, &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, sbd, ESP32P4_CACHE_MMIO_REGS,
+                             ESP32P4_CACHE_BASE, ESP32P4_CLK_L1CACHE_CPU,
+                             ESP32P4_RST_HP_CACHE, 0);
+    sysbus_mmio_map_overlap(sbd, ESP32P4_CACHE_MMIO_L2MEM_CACHED,
+                            ESP32P4_L2MEM_BASE, 1);
+    sysbus_mmio_map_overlap(sbd, ESP32P4_CACHE_MMIO_L2MEM_DIRECT,
+                            ESP32P4_L2MEM_DIRECT_BASE, 1);
+    for (i = 0; i < ARRAY_SIZE(views); i++) {
+        memory_region_add_subregion_overlap(&s->hp_mem, views[i].base,
+            sysbus_mmio_get_region(sbd, views[i].region), 1);
+    }
+    for (i = 0; i < ESP32P4_CACHE_NRESETS; i++) {
+        qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                    cache_resets[i],
+                                    qdev_get_gpio_in_named(cache,
+                                        ESP32P4_CACHE_CACHE_RESET, i));
+    }
+    for (i = 0; i < ESP32P4_HP_SYS_CACHE_RESET_LINES; i++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->hp_sys),
+                                    ESP32P4_HP_SYS_CACHE_RESET, i,
+                                    qdev_get_gpio_in_named(cache,
+                                        ESP32P4_CACHE_SYS_CACHE_RESET, i));
+    }
+    qdev_connect_gpio_out_named(DEVICE(&s->hp_sys),
+                                ESP32P4_HP_SYS_L2MEM_ERR_RESP, 0,
+                                qdev_get_gpio_in_named(cache,
+                                    ESP32P4_CACHE_L2MEM_ERR_RESP, 0));
+    sysbus_connect_irq(sbd, 0, esp32p4_intr_source(s, ESP32P4_INTR_CACHE));
 }
 
 /*
@@ -895,8 +1060,9 @@ static void esp32p4_check_kernel(const char *filename)
             error_report("esp32p4: '%s' has a segment at 0x%08" PRIx32
                          ", 0x%" PRIx32 " bytes, outside L2MEM, the TCM and "
                          "LP SRAM; -kernel loads only into those, as the "
-                         "flash and PSRAM need the MMU, which is not "
-                         "modelled", filename, paddr, memsz);
+                         "flash and PSRAM windows reach the memories only "
+                         "through the MMU software sets up", filename,
+                         paddr, memsz);
             exit(1);
         }
     }
@@ -962,7 +1128,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_efuse(s);
     esp32p4_init_gpio(s);
     esp32p4_init_pms(s);
-    esp32p4_init_flash(s);
+    esp32p4_init_ext_memory(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
                         esp32p4_unimplemented[i].name,
