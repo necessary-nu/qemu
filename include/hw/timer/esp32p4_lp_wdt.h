@@ -41,8 +41,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPWdtState, ESP32P4_LP_WDT)
  *   - Named GPIO input "swd-reset-en": high while LP_SYSTEM's FIB control
  *     lets the super watchdog reset the system (LP_FIB_SEL bit 2 clear and
  *     DIG_FIB bit 2 set, or LP_FIB_SEL bit 2 set and the analog state
- *     ANA_FIB bit 2 set, as from reset); for LP_SYS. High, as the analog
- *     state has it, until LP_SYS drives it.
+ *     ANA_FIB bit 2 set); for LP_SYS. Low, as the analog state has it from
+ *     reset, until LP_SYS drives it.
  *   - Named GPIO output "cpu-reset": per HP core, a pulse of the RTC
  *     watchdog's CPU reset of it, to the reset and clock control's
  *     "rwdt-core-reset".

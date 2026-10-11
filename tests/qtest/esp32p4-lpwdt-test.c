@@ -8,10 +8,10 @@
  * The RTC watchdog counts LP_DYN_SLOW_CLK, RC_SLOW_CLK's 150 kHz out of
  * reset, so 150 cycles are 1 ms; its stage 0 hold is doubled, as
  * EFUSE_WDT_DELAY_SEL is 0. The super watchdog requests a feed after
- * 860 ms and resets the system at 960 ms, as LP_SYSTEM's FIB control lets
- * it from reset; a test running longer has it feed itself or disables it.
- * System resets are awaited as QMP RESET events; interrupts are seen in
- * the interrupt matrix's status of source 1.
+ * 860 ms and resets the system at 960 ms once LP_SYSTEM's FIB control
+ * lets it, which from reset it does not. System resets are awaited as QMP
+ * RESET events; interrupts are seen in the interrupt matrix's status of
+ * source 1.
  */
 
 #include "qemu/osdep.h"
@@ -56,8 +56,7 @@
 
 #define LP_WDT_PATH         "/machine/lp-wdt"
 #define LP_SYS_CTRL         0x50110008
-#define SYS_CTRL_RESET      0x1fffc7f8u
-#define DIG_FIB_SWD         (1u << 5)
+#define SYS_CTRL_RESET      0x1ffec7f8u
 #define LP_FIB_SEL_SWD      (1u << 23)
 #define HP_CPU0             "/machine/hp-cluster/cpu[0]"
 #define HP_CPU1             "/machine/hp-cluster/cpu[1]"
@@ -300,12 +299,13 @@ static void test_system_reset(void)
 
 /*
  * The super watchdog. From reset LP_SYSTEM's FIB control leaves its reset
- * to the analog state, which enables it: unfed, it requests a feed at
- * 860 ms and resets the system at 960 ms (cause 0x12), setting
- * SWD_RESET_FLAG, which that reset keeps and SWD_RST_FLAG_CLR clears
- * without the key. With the FIB's software bit picked and clear, the
- * timeout starts it again instead. Fed, it does not reset; feeding
- * itself, it requests and never resets; disabled, it does neither.
+ * to the analog state, which does not enable it: unfed, it requests a feed
+ * at 860 ms and at 960 ms starts again. With the FIB's software bit picked
+ * (DIG_FIB bit 2 set from reset), unfed, it resets the system at 960 ms
+ * (cause 0x12), setting SWD_RESET_FLAG, which that reset keeps and
+ * SWD_RST_FLAG_CLR clears without the key; the reset returns the FIB to
+ * the analog state. Fed, it does not reset; feeding itself, it requests
+ * and never resets; disabled, it does neither.
  */
 /* [spec:nuos:req:emu.esp32p4.timers/test] */
 static void test_swd(void)
@@ -318,6 +318,18 @@ static void test_swd(void)
     step(qts, 1);
     g_assert_cmphex(rd(qts, INT_RAW), ==, INT_SWD);
     g_assert(wdt_irq(qts));
+    wr(qts, INT_CLR, INT_SWD);
+    step(qts, 100 * MS);
+    g_assert_cmphex(LP_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0x01);
+    step(qts, 860 * MS);
+    g_assert_cmphex(rd(qts, INT_RAW), ==, INT_SWD);
+    wr(qts, INT_CLR, INT_SWD);
+
+    /* Its reset enabled by software: fed, it starts again; unfed, resets. */
+    qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET & ~LP_FIB_SEL_SWD);
+    swd_write(qts, SWD_RESET | SWD_FEED);
+    step(qts, 860 * MS);
+    g_assert_cmphex(rd(qts, INT_RAW), ==, INT_SWD);
     step(qts, 100 * MS - 1);
     g_assert_cmphex(LP_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0x01);
     await_reset(qts, 1);
@@ -325,23 +337,13 @@ static void test_swd(void)
     g_assert_cmphex(CORE0_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0x12);
     g_assert_cmphex(rd(qts, SWD_CONFIG), ==, SWD_RESET | SWD_RESET_FLAG);
     g_assert_cmphex(rd(qts, INT_RAW), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, LP_SYS_CTRL), ==, SYS_CTRL_RESET);
     wr(qts, SWD_CONFIG, SWD_RESET | SWD_RST_FLAG_CLR);
     g_assert_cmphex(rd(qts, SWD_CONFIG), ==, SWD_RESET);
 
-    /* Its reset disabled, the timeout starts it again. */
+    /* Enabled again, feeding keeps it off. */
     qtest_writel(qts, RESET_CAUSE, CAUSE_CLEAR_ALL);
-    qtest_writel(qts, LP_SYS_CTRL,
-                 SYS_CTRL_RESET & ~(DIG_FIB_SWD | LP_FIB_SEL_SWD));
-    step(qts, 960 * MS);
-    g_assert_cmphex(LP_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0);
-    g_assert_cmphex(rd(qts, INT_RAW), ==, INT_SWD);
-    wr(qts, INT_CLR, INT_SWD);
-    step(qts, 860 * MS);
-    g_assert_cmphex(rd(qts, INT_RAW), ==, INT_SWD);
-    wr(qts, INT_CLR, INT_SWD);
-
-    /* Its reset enabled again, feeding keeps it off. */
-    qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET);
+    qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET & ~LP_FIB_SEL_SWD);
     swd_write(qts, SWD_RESET | SWD_FEED);
     step(qts, 959 * MS);
     swd_write(qts, SWD_RESET | SWD_FEED);
@@ -393,8 +395,7 @@ static void test_flashboot(void)
 /*
  * Strapped for SPI boot, as by default, and booting through the ROM (no
  * -kernel), MWDT0's flash boot protection resets the HP core every
- * 650 ms and the RTC watchdog's resets the system after 2.67 s. The super
- * watchdog feeds itself, as ESP-IDF's bootloader has it.
+ * 650 ms and the RTC watchdog's resets the system after 2.67 s.
  */
 /* [spec:nuos:req:emu.esp32p4.timers/test] */
 static void test_spi_boot_strap(void)
@@ -402,7 +403,6 @@ static void test_spi_boot_strap(void)
     QTestState *qts = qtest_init("-M esp32p4");
 
     now = 0;
-    swd_write(qts, SWD_RESET | SWD_AUTO_FEED);
     step(qts, 650 * MS - 1);
     g_assert_cmphex(CORE0_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0x01);
     step(qts, 1);

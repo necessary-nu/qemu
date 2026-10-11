@@ -291,9 +291,8 @@
  * is still held for software to release. The program finds the super
  * watchdog as the ROM leaves the program it boots: running since the
  * reset, unfed, its SWD_RESET_FLAG cleared (the ROM's main() clears it on
- * core 0 at every boot). The program must feed it, or have it feed itself
- * (SWD_AUTO_FEED_EN, which ESP-IDF's bootloader sets first thing), within
- * 960 ms of the reset, or it resets the system.
+ * core 0 at every boot), and its reset not enabled by LP_SYSTEM's FIB
+ * control until software enables it.
  *
  * The ELF stands for the program the ROM boots from flash, and takes the
  * ROM's place whenever the HP system starts: after an HP core reset that
@@ -3378,7 +3377,8 @@ static void esp32p4_reload_kernel(ESP32P4MachineState *s)
  * place finds done, as a system reset completes. Of the super watchdog,
  * the ROM's main() only clears SWD_RESET_FLAG on core 0
  * (clear_super_wdt_reset_flag()); it neither feeds the watchdog nor sets
- * SWD_AUTO_FEED_EN, so the watchdog runs on, unfed, as it does here.
+ * SWD_AUTO_FEED_EN, nor writes LP_SYSTEM's FIB control, so the watchdog
+ * runs on, unfed, as it does here.
  */
 static void esp32p4_rom_boot_state(void *opaque)
 {

@@ -56,14 +56,27 @@
  *   bit 1) and the super watchdog's reset (bit 2): LP_FIB_SEL's bit picks
  *   the source, the analog state ANA_FIB's bit when set and the
  *   software's DIG_FIB bit when clear, and the picked bit set enables
- *   ("bod-reset-en", "swd-reset-en"). ANA_FIB reads the analog state, its
- *   reset value 0x7F: from reset LP_FIB_SEL picks it, and both are
- *   enabled; DIG_FIB, 0xFF from reset, enables both once picked until
- *   software clears its bit. ESP-IDF's start-up writes LP_FIB_SEL with
- *   0xEF, giving bit 4, the DCDC switch, to DIG_FIB and leaving the
- *   detector and the watchdog to the analog state. FIB bits 4 and 5 (the
- *   DCDC switch and its VSET enable) are kept as written, the DCDC
- *   converter not being modelled.
+ *   ("bod-reset-en", "swd-reset-en"). From reset LP_FIB_SEL (0xFF) picks
+ *   the analog state for both; DIG_FIB, 0xFF from reset, enables both
+ *   once picked until software clears its bit. ESP-IDF's start-up writes
+ *   LP_FIB_SEL with 0xEF, giving bit 4, the DCDC switch, to DIG_FIB and
+ *   leaving the detector and the watchdog to the analog state. FIB bits 4
+ *   and 5 (the DCDC switch and its VSET enable) are kept as written, the
+ *   DCDC converter not being modelled.
+ *
+ *   ANA_FIB, read-only, reports the analog state, which the model takes
+ *   as 0x7B: the detector enabled (bit 1) and the super watchdog's reset
+ *   not (bit 2). The v3 header gives ANA_FIB a reset value of 0x7F, which
+ *   would enable that reset from power-on, but silicon evidently does not:
+ *   the boot ROM never feeds the super watchdog nor sets its auto-feed
+ *   (its only access is main()'s SWD_RST_FLAG_CLR, and it never writes
+ *   the FIB), yet flashing over UART, which keeps the chip in download
+ *   mode for well over the watchdog's second, works without feeding it:
+ *   esptool's ESP32-P4 disable_watchdogs() and esp-flasher-stub's
+ *   transport set SWD_AUTO_FEED_EN only over USB-Serial-JTAG, whose reset
+ *   into download mode leaves an application's settings in place. ANA_FIB
+ *   bit 2 clear is to be confirmed on a board, by reading SYS_CTRL's
+ *   ANA_FIB and by sitting in download mode for some seconds.
  *
  * - LP_CORE_BOOT_ADDR (0x50100000 from reset), the LP core's boot address,
  *   for the LP core (esp32p4_lp_sys_lp_core_boot_addr()).
@@ -221,7 +234,8 @@ typedef struct {
 static const ESP32P4LPSysReg esp32p4_lp_sys_regs[ESP32P4_LP_SYS_NREGS] = {
     REG(A_VER_DATE, 0x20250214, 0xffffffff),
     REG(A_CLK_SEL_CTRL, 0, 0x00030000),
-    REG(A_SYS_CTRL, 0x1fffc7f8, 0x9fe00ffd),
+    /* ANA_FIB (bits 20:14) reads 0x7B, not the header's 0x7F: see above. */
+    REG(A_SYS_CTRL, 0x1ffec7f8, 0x9fe00ffd),
     REG(A_LP_CLK_CTRL, 0x4001, 0x4001),
     REG(A_LP_RST_CTRL, 0x3, 0x7),
     REG(A_LP_CORE_BOOT_ADDR, 0x50100000, 0xffffffff),

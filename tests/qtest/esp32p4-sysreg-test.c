@@ -81,7 +81,8 @@
 
 #define LP_ANA_PATH         "/machine/lp-ana"
 
-#define SYS_CTRL_RESET      0x1fffc7f8u
+/* ANA_FIB reads 0x7B: the analog state enables the BOD, not the SWD. */
+#define SYS_CTRL_RESET      0x1ffec7f8u
 #define SYS_SW_RST          (1u << 1)
 #define DIG_FIB(b)          (1u << (3 + (b)))
 #define LP_FIB_SEL(b)       (1u << (21 + (b)))
@@ -415,7 +416,7 @@ static void test_lp_reset_values(void)
     qtest_writel(qts, LP_CORE_BOOT_ADDR, 0x50108000);
     g_assert_cmphex(qtest_readl(qts, LP_CORE_BOOT_ADDR), ==, 0x50108000);
     qtest_writel(qts, LP_SYS_CTRL, 0);
-    g_assert_cmphex(qtest_readl(qts, LP_SYS_CTRL), ==, 0x7f << 14);
+    g_assert_cmphex(qtest_readl(qts, LP_SYS_CTRL), ==, 0x7b << 14);
     qtest_writel(qts, LP_CORE_ERR_RESP_DIS, 0xffffffff);
     g_assert_cmphex(qtest_readl(qts, LP_CORE_ERR_RESP_DIS), ==, 0x7);
     qtest_quit(qts);
@@ -447,38 +448,38 @@ static void test_lp_rng(void)
 
 /*
  * The FIB control (TRM 21.2.2.2) of FIB bit @bit's enable, seen on output
- * @out: from reset LP_FIB_SEL picks the analog state ANA_FIB, whose bit,
- * set, enables; picked instead, DIG_FIB's bit enables while set; the
- * other FIB bit's choice changes nothing.
+ * @out: from reset LP_FIB_SEL picks the analog state ANA_FIB, whose bit
+ * enables when set (@analog); picked instead, DIG_FIB's bit enables while
+ * set; the other FIB bit's choice changes nothing.
  */
-static void lp_fib_out(const char *out, int bit, int other)
+static void lp_fib_out(const char *out, int bit, int other, bool analog)
 {
     QTestState *qts = start();
 
     qtest_irq_intercept_out_named(qts, LP_SYS_PATH, out);
     qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET);
-    g_assert_true(qtest_get_irq(qts, 0));
+    g_assert_cmpint(qtest_get_irq(qts, 0), ==, analog);
     qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET & ~LP_FIB_SEL(bit));
     g_assert_true(qtest_get_irq(qts, 0));
     qtest_writel(qts, LP_SYS_CTRL,
                  SYS_CTRL_RESET & ~(LP_FIB_SEL(bit) | DIG_FIB(bit)));
     g_assert_false(qtest_get_irq(qts, 0));
     qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET & ~DIG_FIB(bit));
-    g_assert_true(qtest_get_irq(qts, 0));
+    g_assert_cmpint(qtest_get_irq(qts, 0), ==, analog);
     qtest_writel(qts, LP_SYS_CTRL,
                  SYS_CTRL_RESET & ~(LP_FIB_SEL(other) | DIG_FIB(other)));
-    g_assert_true(qtest_get_irq(qts, 0));
+    g_assert_cmpint(qtest_get_irq(qts, 0), ==, analog);
     /* ESP-IDF's start-up LP_FIB_SEL, 0xEF, leaves both to the analog. */
     qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET & ~LP_FIB_SEL(4));
-    g_assert_true(qtest_get_irq(qts, 0));
+    g_assert_cmpint(qtest_get_irq(qts, 0), ==, analog);
     qtest_quit(qts);
 }
 
 /* [spec:nuos:req:emu.esp32p4.debug/test] */
 static void test_lp_fib(void)
 {
-    lp_fib_out("swd-reset-en", FIB_SWD, FIB_BOD);
-    lp_fib_out("bod-reset-en", FIB_BOD, FIB_SWD);
+    lp_fib_out("swd-reset-en", FIB_SWD, FIB_BOD, false);
+    lp_fib_out("bod-reset-en", FIB_BOD, FIB_SWD, true);
 }
 
 /*

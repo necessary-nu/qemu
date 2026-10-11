@@ -40,10 +40,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
  *   follows HP core 1's stall rather than core 0's.
  * ESP32P4_LP_SYS_SWD_RESET_EN: high while the super watchdog may reset
  *   the system: FIB bit 2 set, the analog state ANA_FIB's if LP_FIB_SEL
- *   bit 2 is set, else DIG_FIB's. High from reset; to the RTC watchdog
- *   block's "swd-reset-en".
+ *   bit 2 is set, else DIG_FIB's. Low from reset, the analog state not
+ *   enabling it; to the RTC watchdog block's "swd-reset-en".
  * ESP32P4_LP_SYS_BOD_RESET_EN: the same for the brownout detector, FIB
- *   bit 1, which enables it; to LP_ANALOG_PERI's "bod-en".
+ *   bit 1, which enables it. High from reset; to LP_ANALOG_PERI's
+ *   "bod-en".
  * ESP32P4_LP_SYS_HP_ROOT_CLK: HP_ROOT_CLK_CTRL's CPU_CLK_EN and
  *   SYS_CLK_EN, the gates of the HP system's 400 MHz CPU and 480 MHz
  *   system root clocks, for the reset and clock control.

@@ -45,12 +45,13 @@
  * (cause 0x12) and sets SWD_RESET_FLAG, which that reset keeps and
  * SWD_RST_FLAG_CLR or a chip reset clears, if LP_SYSTEM's FIB control lets
  * it (the "swd-reset-en" input); otherwise it starts its timeout again.
- * Out of reset the FIB leaves the reset to the analog state, which
- * enables it (TRM 21.2.2.2; ANA_FIB reads 0x7F), so the SWD resets the
- * system 960 ms after each system reset unless software feeds it or sets
- * SWD_AUTO_FEED_EN: the boot ROM does neither (its one access is the
- * keyless SWD_RST_FLAG_CLR in main()), and ESP-IDF's P4 bootloader sets
- * SWD_AUTO_FEED_EN at the start of bootloader_init(). SWD_SIGNAL_WIDTH,
+ * Out of reset the FIB leaves the reset to the analog state, which on
+ * silicon evidently does not enable it (see esp32p4_lp_sys.c): the boot
+ * ROM neither feeds the SWD nor sets SWD_AUTO_FEED_EN (its one access is
+ * the keyless SWD_RST_FLAG_CLR in main()), and its download mode does not
+ * reset every second. Software enables the reset through LP_SYSTEM's
+ * DIG_FIB; ESP-IDF's P4 bootloader sets SWD_AUTO_FEED_EN at the start of
+ * bootloader_init() whatever the FIB says. SWD_SIGNAL_WIDTH,
  * the width of the feed signal to the analog circuit, is held as written.
  * SWD_CONFIG takes writes only while SWD_WKEY holds 0x50D83AA1, except
  * SWD_RST_FLAG_CLR, which the boot ROM's main() writes without the key
@@ -712,8 +713,6 @@ static void esp32p4_lp_wdt_init(Object *obj)
     qdev_init_gpio_in_named(dev, lp_wdt_set_sleep, ESP32P4_LP_WDT_SLEEP, 1);
     qdev_init_gpio_in_named(dev, lp_wdt_set_swd_reset_en,
                             ESP32P4_LP_WDT_SWD_RESET_EN, 1);
-    /* The analog FIB state enables the super watchdog's reset. */
-    s->swd_reset_en = true;
     qdev_init_gpio_out_named(dev, s->cpu_reset, ESP32P4_LP_WDT_CPU_RESET,
                              ESP32P4_CLKRST_HP_CORES);
 }
