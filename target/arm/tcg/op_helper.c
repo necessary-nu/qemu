@@ -470,12 +470,27 @@ void HELPER(wfit)(CPUARMState *env, uint32_t rd)
 
 void HELPER(sev)(CPUARMState *env)
 {
-    CPUState *cs = env_cpu(env);
+    CPUState *self = env_cpu(env);
+    CPUState *cs;
+
     CPU_FOREACH(cs) {
         ARMCPU *target_cpu = ARM_CPU(cs);
-        target_cpu->env.event_register = true;
+
+        qatomic_set(&target_cpu->env.event_register, true);
+        if (cs == self) {
+            continue;
+        }
         if (!qemu_cpu_is_self(cs)) {
             qemu_cpu_kick(cs);
+        } else if (qatomic_read(&cs->halted)) {
+            /*
+             * A CPU that may be waiting for the event shares this thread,
+             * as every CPU does in round-robin TCG: end this CPU's turn
+             * after the SEV, which ends its translation block, so that the
+             * thread wakes the other now, at the SEV's virtual time, rather
+             * than when its turn comes round, up to a timer deadline later.
+             */
+            cpu_exit(self);
         }
     }
 }
