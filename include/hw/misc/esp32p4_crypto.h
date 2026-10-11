@@ -10,6 +10,7 @@
 #define HW_MISC_ESP32P4_CRYPTO_H
 
 #include "hw/core/clock.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "migration/vmstate.h"
 #include "qemu/timer.h"
 
@@ -30,11 +31,10 @@ typedef struct ESP32P4CryptoTimer {
     /* The cycles left when the current stretch of constant clock began. */
     uint64_t left;
     /*
-     * When that stretch began, and the clock's period through it (0 while
-     * the clock is stopped).
+     * The clock's cycles counted from when that stretch began, at its
+     * period through it (stopped while the clock is).
      */
-    int64_t stretch_ns;
-    uint64_t stretch_period;
+    ESP32P4ClkCount stretch;
 } ESP32P4CryptoTimer;
 
 void esp32p4_crypto_timer_init(ESP32P4CryptoTimer *t, Clock *clk,

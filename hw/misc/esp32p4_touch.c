@@ -492,10 +492,7 @@ static bool touch_counting(ESP32P4TouchState *s)
 /* The cycles of LP_DYN_FAST_CLK counted up to @t. */
 static uint64_t touch_count_at(ESP32P4TouchState *s, int64_t t)
 {
-    if (!clock_is_enabled(s->fast) || t <= s->meas_base_ns) {
-        return s->meas_count;
-    }
-    return s->meas_count + clock_ns_to_ticks(s->fast, t - s->meas_base_ns);
+    return s->meas_count + esp32p4_clk_count_at(&s->meas_edges, t);
 }
 
 
@@ -507,10 +504,11 @@ static void touch_meas_arm(ESP32P4TouchState *s)
 
     if ((c2 & SCAN2_TIMEOUT_EN) && clock_is_enabled(s->fast)) {
         uint64_t limit = SCAN2_TIMEOUT_NUM(c2);
-        int64_t t = s->meas_base_ns;
+        int64_t t = s->meas_edges.origin_ns;
 
         if (s->meas_count < limit) {
-            t += clock_ticks_to_ns(s->fast, limit - s->meas_count);
+            t = esp32p4_clk_count_time(&s->meas_edges,
+                                       limit - s->meas_count);
         }
         due = MIN(due, t);
     }
@@ -584,7 +582,7 @@ static void touch_meas_begin(ESP32P4TouchState *s, int64_t when)
 
     s->cur_para = para;
     s->fsm_phase = ESP32P4_TOUCH_FSM_MEAS;
-    s->meas_base_ns = when;
+    esp32p4_clk_count_start(&s->meas_edges, s->fast, when);
     s->meas_count = 0;
     if (!(work & WORK_OUT_GATE)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: TOUCH_OUT_GATE stops the touch "
@@ -1098,11 +1096,12 @@ static void touch_fast_update(void *opaque, ClockEvent event)
         esp32p4_clkwait_fold(&s->xpd_wait, now);
         if (touch_counting(s)) {
             s->meas_count = touch_count_at(s, now);
-            s->meas_base_ns = MAX(now, s->meas_base_ns);
+            s->meas_edges.origin_ns = MAX(now, s->meas_edges.origin_ns);
         }
         return;
     }
     esp32p4_clkwait_resched(&s->xpd_wait);
+    s->meas_edges.period = esp32p4_clk_exact(s->fast);
     if (touch_counting(s)) {
         touch_meas_arm(s);
     }
@@ -1231,8 +1230,8 @@ static const VMStateDescription vmstate_esp32p4_touch_chan = {
 
 static const VMStateDescription vmstate_esp32p4_touch = {
     .name = TYPE_ESP32P4_TOUCH,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(int_raw, ESP32P4TouchState),
         VMSTATE_UINT32(int_ena, ESP32P4TouchState),
@@ -1256,7 +1255,7 @@ static const VMStateDescription vmstate_esp32p4_touch = {
         VMSTATE_UINT8(scan_last, ESP32P4TouchState),
         VMSTATE_ESP32P4_CLKWAIT(xpd_wait, ESP32P4TouchState),
         VMSTATE_TIMER(meas_timer, ESP32P4TouchState),
-        VMSTATE_INT64(meas_base_ns, ESP32P4TouchState),
+        VMSTATE_ESP32P4_CLK_COUNT(meas_edges, ESP32P4TouchState),
         VMSTATE_UINT64(meas_count, ESP32P4TouchState),
         VMSTATE_INT64(meas_end_ns, ESP32P4TouchState),
         VMSTATE_INT64(meas_due_ns, ESP32P4TouchState),

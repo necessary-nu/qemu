@@ -794,13 +794,10 @@ static void esp32p4_efuse_update_irq(ESP32P4EfuseState *s)
 /* Cycles the running operation has run, up to now. */
 static uint64_t esp32p4_efuse_cycles_run(ESP32P4EfuseState *s)
 {
-    uint64_t run = s->op_cycles_done;
+    uint64_t run = s->op_cycles_done +
+                   esp32p4_clk_count_at(&s->op_edges,
+                                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
-    if (clock_is_enabled(s->clk)) {
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-
-        run += clock_ns_to_ticks(s->clk, now - s->op_stretch_ns);
-    }
     return MIN(run, s->op_cycles);
 }
 
@@ -809,13 +806,14 @@ static void esp32p4_efuse_op_schedule(ESP32P4EfuseState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    s->op_stretch_ns = now;
-    if (!clock_is_enabled(s->clk)) {
+    esp32p4_clk_count_start(&s->op_edges, s->clk, now);
+    if (!esp32p4_clk_count_running(&s->op_edges)) {
         timer_del(&s->op_timer);
         return;
     }
-    timer_mod_ns(&s->op_timer, now + clock_ticks_to_ns(s->clk,
-                                       s->op_cycles - s->op_cycles_done));
+    timer_mod_ns(&s->op_timer,
+                 esp32p4_clk_count_time(&s->op_edges,
+                                        s->op_cycles - s->op_cycles_done));
 }
 
 /* The cycles each word of the array takes to read. */
@@ -1492,8 +1490,8 @@ int esp32p4_efuse_find_purpose(ESP32P4EfuseState *s, uint32_t purpose)
 
 static const VMStateDescription vmstate_esp32p4_efuse = {
     .name = TYPE_ESP32P4_EFUSE,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(wr_dis, ESP32P4EfuseState),
         VMSTATE_UINT32_2DARRAY(blk0, ESP32P4EfuseState,
@@ -1533,7 +1531,7 @@ static const VMStateDescription vmstate_esp32p4_efuse = {
         VMSTATE_UINT32(op, ESP32P4EfuseState),
         VMSTATE_UINT64(op_cycles, ESP32P4EfuseState),
         VMSTATE_UINT64(op_cycles_done, ESP32P4EfuseState),
-        VMSTATE_INT64(op_stretch_ns, ESP32P4EfuseState),
+        VMSTATE_ESP32P4_CLK_COUNT(op_edges, ESP32P4EfuseState),
         VMSTATE_UINT32_ARRAY(op_pgm, ESP32P4EfuseState,
                              ESP32P4_EFUSE_RS_WORDS +
                              ESP32P4_EFUSE_RS_CHECK_WORDS),

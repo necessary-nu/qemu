@@ -462,8 +462,8 @@ static const VMStateDescription vmstate_esp32p4_sha_state = {
 
 static const VMStateDescription vmstate_esp32p4_sha = {
     .name = TYPE_ESP32P4_SHA,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_ESP32P4_CRYPTO_TIMER(op, ESP32P4ShaDevState),
         VMSTATE_BOOL_ARRAY(reset_in, ESP32P4ShaDevState, ESP32P4_SHA_RESETS),
