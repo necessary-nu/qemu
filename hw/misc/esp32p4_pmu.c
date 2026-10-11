@@ -795,6 +795,12 @@ static void pmu_drive_outputs(ESP32P4PMUState *s, bool force)
     };
     int i, pd;
 
+    pmu_drive(s->hold_all[ESP32P4_PMU_HOLD_HP],
+              &o->hold_all[ESP32P4_PMU_HOLD_HP],
+              c->hp_pad_hold || c->hp_pad_hold_auto, force);
+    pmu_drive(s->hold_all[ESP32P4_PMU_HOLD_LP],
+              &o->hold_all[ESP32P4_PMU_HOLD_LP],
+              c->lp_pad_hold || c->lp_pad_hold_auto, force);
     for (i = 0; i < ESP32P4_PMU_NUM_PD; i++) {
         pd = pd_order[i];
         pmu_drive(s->power[pd], &s->power_level[pd], pmu_domain_on(s, pd),
@@ -859,12 +865,6 @@ static void pmu_drive_outputs(ESP32P4PMUState *s, bool force)
               s->lp_cpu_stalled ||
               (s->regs[R(A_LP_CPU_PWR0)] & LP_CPU_FORCE_STALL), force);
 
-    pmu_drive(s->hold_all[ESP32P4_PMU_HOLD_HP],
-              &o->hold_all[ESP32P4_PMU_HOLD_HP],
-              c->hp_pad_hold || c->hp_pad_hold_auto, force);
-    pmu_drive(s->hold_all[ESP32P4_PMU_HOLD_LP],
-              &o->hold_all[ESP32P4_PMU_HOLD_LP],
-              c->lp_pad_hold || c->lp_pad_hold_auto, force);
     pmu_drive(s->pad_sleep, &o->pad_sleep, c->pad_slp_sel, force);
     pmu_drive(s->pause_wdt, &o->pause_wdt, c->pause_wdt, force);
     pmu_drive(s->bod_vbat_sel, &o->bod_vbat_sel, lp_dig & LP_BOD_SOURCE_SEL,
@@ -877,8 +877,10 @@ static void pmu_drive_outputs(ESP32P4PMUState *s, bool force)
 /*
  * [spec:nuos:req:emu.esp32p4.low-power]
  * Drive what the controls, the domains and the LP CPU's state say. The
- * memory goes before PD_TOP, so that the machine knows the memories were
- * lost as the HP system comes back.
+ * pads' holds go before the domains, so that a pad latches its
+ * configuration before a power-down resets it; the memory goes before
+ * PD_TOP, so that the machine knows the memories were lost as the HP
+ * system comes back.
  */
 static void pmu_update_outputs(ESP32P4PMUState *s)
 {
