@@ -58,6 +58,10 @@
  *     watchdogs reset the HP cores, the HP core (the HP blocks and both
  *     cores, the LP system running on) or the whole system, each with its
  *     reset cause in LP_CLKRST.
+ *   - The event task matrix (TRM chapter 14) at 0x500D5000, mapping the
+ *     events of the GPIO matrix, the timers, the RTC timer and GDMA to
+ *     the tasks of the GPIO matrix, the timer groups, GDMA and the LP
+ *     core.
  *   - Permission control (TRM chapter 20): the HP, LP and DMA access
  *     permission managers, through which every core (and DMA master)
  *     reaches the bus, each access carrying its master and privilege mode,
@@ -248,7 +252,6 @@ static const struct {
     { "spi3",             0x500d1000, 4 * KiB },
     { "usb-serial-jtag",  0x500d2000, 4 * KiB },
     { "ledc",             0x500d3000, 4 * KiB },
-    { "etm",              0x500d5000, 4 * KiB },
     { "twai0",            0x500d7000, 4 * KiB },
     { "twai1",            0x500d8000, 4 * KiB },
     { "twai2",            0x500d9000, 4 * KiB },
@@ -774,10 +777,11 @@ static void esp32p4_hp_core_reset(void *opaque, int n, int level)
  * no bus clock gate: their registers are behind LP_DYN_FAST_CLK and their
  * LP_CLKRST resets.
  *
- * Their interrupts are sources of the interrupt matrix. Their ETM events
- * and tasks, the RTC timer's wakeups and the LP core's timer interrupt
- * are named GPIO lines (see the devices' headers) that nothing drives or
- * takes until the ETM, the PMU and the LP core's interrupts are modelled.
+ * Their interrupts are sources of the interrupt matrix, and their ETM
+ * events and tasks the ETM's (esp32p4_init_etm()). The RTC timer's wakeups
+ * and the LP core's timer interrupt are named GPIO lines (see the devices'
+ * headers) that nothing takes until the PMU and the LP core's interrupts
+ * are modelled.
  * MWDT0 and the RTC watchdog run their flash boot protection when the
  * chip boots from flash through the boot ROM in SPI boot mode: when the
  * board's strapping (the strap-mode property) has GPIO35 high and there
@@ -1704,6 +1708,135 @@ static void esp32p4_init_dma(ESP32P4MachineState *s)
                        esp32p4_intr_source(s, ESP32P4_INTR_DW_GDMA));
 }
 
+/*
+ * The event task matrix (TRM chapter 14), its registers behind
+ * ETM_APB_CLK, running on ETM_SYS_CLK, held by RST_EN_ETM; and every
+ * modelled block's events and tasks, by their IDs, as its header
+ * (hw/misc/esp32p4_etm.h) describes: a block that generates events or
+ * takes tasks adds a line here for each.
+ *
+ * Not connected, as their blocks are not modelled: the LED PWM, MCPWM,
+ * ADC, REGDMA, temperature sensor, I2S, 2D-DMA and PMU events and tasks;
+ * the LP core's events (ULP_EVT_*) and ULP_TASK_WAKEUP_CPU, the PMU's LP
+ * core wakeup, whose LP_CORE_ETM_WAKEUP_FLAG in LP_SYS is not modelled;
+ * and the RTC timer's tasks (RTC_TASK_*), which the TRM says it does not
+ * take.
+ */
+/* [spec:nuos:req:emu.esp32p4.etm] */
+static void esp32p4_init_etm(ESP32P4MachineState *s)
+{
+    ESP32P4EtmState *etm = &s->etm;
+    DeviceState *dev, *clkrst = DEVICE(&s->clkrst);
+    int ch, g, x, k;
+
+    object_initialize_child(OBJECT(s), "etm", etm, TYPE_ESP32P4_ETM);
+    dev = DEVICE(etm);
+    qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, "etm-sys"));
+    qdev_connect_clock_in(dev, "rtc-evt-tick",
+                          qdev_get_clock_out(DEVICE(&s->lp_timer),
+                                             "etm-tick"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_ETM_BASE, ESP32P4_CLK_ETM_APB,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET, ESP32P4_RST_ETM,
+                                qdev_get_gpio_in_named(dev,
+                                                       ESP32P4_ETM_RESET, 0));
+
+    /* GPIO_EXT's eight channels and the analog comparators. */
+    dev = DEVICE(&s->gpio);
+    for (ch = 0; ch < ESP32P4_GPIO_ETM_CHANNELS; ch++) {
+        esp32p4_etm_connect_event(etm, ESP32P4_ETM_GPIO_EVT_CH0_RISE_EDGE + ch,
+                                  dev, ESP32P4_GPIO_ETM_EVENT,
+                                  ESP32P4_GPIO_ETM_LINE(ch,
+                                      ESP32P4_GPIO_ETM_RISE));
+        esp32p4_etm_connect_event(etm, ESP32P4_ETM_GPIO_EVT_CH0_FALL_EDGE + ch,
+                                  dev, ESP32P4_GPIO_ETM_EVENT,
+                                  ESP32P4_GPIO_ETM_LINE(ch,
+                                      ESP32P4_GPIO_ETM_FALL));
+        esp32p4_etm_connect_event(etm, ESP32P4_ETM_GPIO_EVT_CH0_ANY_EDGE + ch,
+                                  dev, ESP32P4_GPIO_ETM_EVENT,
+                                  ESP32P4_GPIO_ETM_LINE(ch,
+                                      ESP32P4_GPIO_ETM_ANY));
+        esp32p4_etm_connect_task(etm, ESP32P4_ETM_GPIO_TASK_CH0_SET + ch,
+                                 dev, ESP32P4_GPIO_ETM_TASK,
+                                 ESP32P4_GPIO_ETM_LINE(ch,
+                                     ESP32P4_GPIO_ETM_SET));
+        esp32p4_etm_connect_task(etm, ESP32P4_ETM_GPIO_TASK_CH0_CLEAR + ch,
+                                 dev, ESP32P4_GPIO_ETM_TASK,
+                                 ESP32P4_GPIO_ETM_LINE(ch,
+                                     ESP32P4_GPIO_ETM_CLEAR));
+        esp32p4_etm_connect_task(etm, ESP32P4_ETM_GPIO_TASK_CH0_TOGGLE + ch,
+                                 dev, ESP32P4_GPIO_ETM_TASK,
+                                 ESP32P4_GPIO_ETM_LINE(ch,
+                                     ESP32P4_GPIO_ETM_TOGGLE));
+    }
+    for (k = 0; k < ESP32P4_GPIO_ETM_ZERO_DET_LINES; k++) {
+        esp32p4_etm_connect_event(etm, ESP32P4_ETM_GPIO_EVT_ZERO_DET_POS0 + k,
+                                  dev, ESP32P4_GPIO_ETM_ZERO_DET, k);
+    }
+
+    /* The timer groups' timers, each its alarm and five tasks. */
+    for (g = 0; g < 2; g++) {
+        dev = DEVICE(&s->timg[g]);
+        for (x = 0; x < ESP32P4_TIMG_TIMERS; x++) {
+            esp32p4_etm_connect_event(etm, ESP32P4_ETM_TG0_EVT_CNT_CMP_TIMER0 +
+                                      g * ESP32P4_TIMG_TIMERS + x,
+                                      dev, ESP32P4_TIMG_ETM_EVENT, x);
+            for (k = 0; k < ESP32P4_TIMG_TASKS; k++) {
+                int line = x * ESP32P4_TIMG_TASKS + k;
+
+                esp32p4_etm_connect_task(etm,
+                    ESP32P4_ETM_TG0_TASK_CNT_START_TIMER0 +
+                    g * ESP32P4_TIMG_TIMERS * ESP32P4_TIMG_TASKS + line,
+                    dev, ESP32P4_TIMG_ETM_TASK, line);
+            }
+        }
+    }
+
+    /* The system timer's comparators. */
+    for (x = 0; x < ESP32P4_SYSTIMER_COMPS; x++) {
+        esp32p4_etm_connect_event(etm, ESP32P4_ETM_SYSTIMER_EVT_CNT_CMP0 + x,
+                                  DEVICE(&s->systimer),
+                                  ESP32P4_SYSTIMER_ETM_EVENT, x);
+    }
+
+    /* The RTC timer; RTC_EVT_TICK is its counting clock, above. */
+    esp32p4_etm_connect_event(etm, ESP32P4_ETM_RTC_EVT_CMP,
+                              DEVICE(&s->lp_timer), ESP32P4_LP_TIMER_ETM_EVENT,
+                              ESP32P4_LP_TIMER_EVT_CMP);
+    esp32p4_etm_connect_event(etm, ESP32P4_ETM_RTC_EVT_OVF,
+                              DEVICE(&s->lp_timer), ESP32P4_LP_TIMER_ETM_EVENT,
+                              ESP32P4_LP_TIMER_EVT_OVF);
+
+    /* GDMA-AHB's and GDMA-AXI's channels. */
+    for (g = 0; g < 2; g++) {
+        static const int evt[] = {
+            ESP32P4_ETM_PDMA_AHB_EVT_IN_DONE_CH0,
+            ESP32P4_ETM_PDMA_AXI_EVT_IN_DONE_CH0,
+        };
+        static const int task[] = {
+            ESP32P4_ETM_PDMA_AHB_TASK_IN_START_CH0,
+            ESP32P4_ETM_PDMA_AXI_TASK_IN_START_CH0,
+        };
+
+        dev = DEVICE(&s->gdma[g]);
+        for (k = 0; k < ESP32P4_GDMA_ETM_EVENTS; k++) {
+            esp32p4_etm_connect_event(etm, evt[g] + k, dev,
+                                      ESP32P4_GDMA_ETM_EVENT, k);
+        }
+        for (k = 0; k < ESP32P4_GDMA_ETM_TASKS; k++) {
+            esp32p4_etm_connect_task(etm, task[g] + k, dev,
+                                     ESP32P4_GDMA_ETM_TASK, k);
+        }
+    }
+
+    /* The LP core's interrupt, through LP_SYS's ETM_TASK_ULP_INT. */
+    esp32p4_etm_connect_task(etm, ESP32P4_ETM_ULP_TASK_INT_CPU,
+                             DEVICE(&s->lp_sys),
+                             ESP32P4_LP_SYS_ETM_TASK_ULP_INT, 0);
+}
+
 /* The memories -kernel can load into: those the cores address directly. */
 static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
 {
@@ -1846,6 +1979,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_emac(s);
     esp32p4_init_dma(s);
     esp32p4_init_i3c(s);
+    esp32p4_init_etm(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
                         esp32p4_unimplemented[i].name,
