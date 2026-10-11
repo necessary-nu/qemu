@@ -669,7 +669,9 @@ static void rx_end_frame(ESP32P4ParlioState *s, bool err)
 static int64_t rx_timeout_at(ESP32P4ParlioState *s)
 {
     return s->rx_timeout_from +
-           clock_ticks_to_ns(s->sys_clk, RX_TIMEOUT_THRES(s->rx_genrl_act));
+           MIN(esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->sys_clk),
+                                     RX_TIMEOUT_THRES(s->rx_genrl_act)),
+               INT64_MAX / 2);
 }
 
 static void rx_arm_timeout(ESP32P4ParlioState *s)
@@ -810,32 +812,24 @@ static bool uclk_pad(ESP32P4ParlioClk *u, ESP32P4ClkDiv *div)
                                      div);
 }
 
-/* The time of internal edge @n, a rising edge for even @n. */
+/*
+ * The time of internal edge @n, a rising edge for even @n: n + 1 half
+ * periods of the unit's clock after edge 0, at the first nanosecond that
+ * has come, at the clock's exact period.
+ */
 static int64_t uclk_edge_ns(ESP32P4ParlioClk *u, uint64_t n)
 {
-    uint64_t lo, hi;
-
-    mulu64(&lo, &hi, u->period, n + 1);
-    return u->base_ns + (int64_t)((hi << 31) | (lo >> 33));
+    return u->base_ns + MIN(esp32p4_clk_cycles_ns(u->half, n + 1),
+                            INT64_MAX / 2);
 }
 
 /* The number of the first internal edge after @t. */
 static uint64_t uclk_edge_after(ESP32P4ParlioClk *u, int64_t t)
 {
-    uint64_t d, lo, hi, n;
-
     if (t < u->base_ns) {
         return 0;
     }
-    d = t - u->base_ns;
-    lo = d << 33;
-    hi = d >> 31;
-    divu128(&lo, &hi, u->period);
-    n = lo ? lo - 1 : 0;
-    while (uclk_edge_ns(u, n) <= t) {
-        n++;
-    }
-    return n;
+    return esp32p4_clk_ns_cycles(u->half, t - u->base_ns);
 }
 
 /*
@@ -921,7 +915,8 @@ static void uclk_schedule(ESP32P4ParlioClk *u)
 {
     uint64_t n;
 
-    if (!u->period || (!uclk_needed(u) && !u->in_level)) {
+    if (!esp32p4_clk_period_running(u->half) ||
+        (!uclk_needed(u) && !u->in_level)) {
         timer_del(u->timer);
         u->running = false;
         return;
@@ -1001,7 +996,8 @@ static void parlio_slip(ESP32P4ParlioState *s, int64_t now)
     }
     for (int i = 0; i < 2; i++) {
         ESP32P4ParlioClk *u = &s->uclk[i];
-        int64_t delta = now + clock_ticks_to_ns(u->clk, 1) / 2 - uclk_due(u);
+        int64_t delta = now + esp32p4_clk_cycles_ns(u->half, 1) -
+                        uclk_due(u);
 
         if (timer_pending(u->timer) && delta > 0) {
             u->base_ns += delta;
@@ -1101,10 +1097,10 @@ static void uclk_update(void *opaque, ClockEvent event)
     }
     timer_del(u->timer);
     u->running = false;
-    u->period = clock_get(u->clk);
+    u->half = esp32p4_clk_period_scale(esp32p4_clk_exact(u->clk), 1, 2);
     u->base_ns = esp32_line_time();
     u->next = 0;
-    if (u->period) {
+    if (esp32p4_clk_period_running(u->half)) {
         /* A started clock starts low. */
         u->in_level = false;
         unit_redrive_clk(u->s, u->unit, u->base_ns);
@@ -1566,13 +1562,13 @@ static const VMStateDescription vmstate_parlio_fifo = {
 
 static const VMStateDescription vmstate_parlio_clk = {
     .name = "esp32p4-parlio-clk",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4ParlioClk),
         VMSTATE_TIMER_PTR(timer, ESP32P4ParlioClk),
         VMSTATE_INT64(base_ns, ESP32P4ParlioClk),
-        VMSTATE_UINT64(period, ESP32P4ParlioClk),
+        VMSTATE_ESP32P4_CLK_PERIOD(half, ESP32P4ParlioClk),
         VMSTATE_UINT64(next, ESP32P4ParlioClk),
         VMSTATE_BOOL(running, ESP32P4ParlioClk),
         VMSTATE_BOOL(in_level, ESP32P4ParlioClk),
@@ -1586,8 +1582,8 @@ static const VMStateDescription vmstate_parlio_clk = {
 
 static const VMStateDescription vmstate_parlio = {
     .name = TYPE_ESP32P4_PARLIO,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(sys_clk, ESP32P4ParlioState),
         VMSTATE_TIMER_PTR(rx_timeout_timer, ESP32P4ParlioState),

@@ -739,8 +739,8 @@ static const VMStateDescription vmstate_esp32p4_ecdsa_sha = {
 
 static const VMStateDescription vmstate_esp32p4_ecdsa = {
     .name = TYPE_ESP32P4_ECDSA,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_ESP32P4_CRYPTO_TIMER(op, ESP32P4EcdsaState),
         VMSTATE_ESP32P4_CRYPTO_TIMER(sha_op, ESP32P4EcdsaState),

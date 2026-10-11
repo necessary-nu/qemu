@@ -283,6 +283,12 @@ struct ESP32P4CPU {
      * when the clock restarts; a core waiting in WFI goes on waiting.
      */
     bool clock_halted;
+    /*
+     * Stops (a reset asserted, a clock stopped) queued on the core's own
+     * thread and not yet acted on; not migrated, as a migration happens
+     * with every queue empty.
+     */
+    int stops_pending;
 
     /*
      * The HP core's Espressif-specific state; the LP core has none of it.

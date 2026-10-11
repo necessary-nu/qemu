@@ -1569,13 +1569,40 @@ static uint32_t clk_div(Esp32McpwmState *s)
     return (s->clk_cfg & 0xff) + 1;
 }
 
+/*
+ * @clk's whole cycles in @ns, and the first nanosecond by which @ticks of
+ * them have elapsed: the ESP32-P4's at MCPWMn_CLK's exact period
+ * (esp32p4_clk_period.h), the ESP32's at its Clock's.
+ */
+static uint64_t mcpwm_clk_cycles(Esp32McpwmState *s, Clock *clk, int64_t ns)
+{
+    if (s->p4) {
+        return esp32p4_clk_ns_cycles(s->p4_period, ns);
+    }
+    return clock_ns_to_ticks(clk, ns);
+}
+
+static uint64_t mcpwm_clk_ns(Esp32McpwmState *s, Clock *clk, uint64_t ticks)
+{
+    uint64_t ns;
+
+    if (s->p4) {
+        return esp32p4_clk_cycles_ns(s->p4_period, ticks);
+    }
+    ns = clock_ticks_to_ns(clk, ticks);
+    while (clock_ns_to_ticks(clk, ns) < ticks) {
+        ns++;
+    }
+    return ns;
+}
+
 static uint64_t mcpwm_cycle_at(Esp32McpwmState *s, int64_t ns)
 {
     if (ns <= s->base_ns) {
         return s->base_cycle;
     }
     return s->base_cycle +
-           clock_ns_to_ticks(s->core_clk, ns - s->base_ns) / clk_div(s);
+           mcpwm_clk_cycles(s, s->core_clk, ns - s->base_ns) / clk_div(s);
 }
 
 /* The first virtual time at which PWM_clk has reached `cycle`. */
@@ -1590,10 +1617,7 @@ static int64_t mcpwm_ns_at(Esp32McpwmState *s, uint64_t cycle)
         return INT64_MAX / 2;
     }
     ticks = (cycle - s->base_cycle) * clk_div(s);
-    ns = clock_ticks_to_ns(s->core_clk, ticks);
-    while (clock_ns_to_ticks(s->core_clk, ns) < ticks) {
-        ns++;
-    }
+    ns = mcpwm_clk_ns(s, s->core_clk, ticks);
     return s->base_ns + MIN(ns, (uint64_t)INT64_MAX / 2);
 }
 
@@ -1633,8 +1657,8 @@ static uint32_t cap_timer_at(Esp32McpwmState *s, int64_t t)
     if (!(s->core.cap_timer_cfg & CAP_TIMER_EN) || t <= s->cap_anchor_ns) {
         return s->cap_anchor;
     }
-    return s->cap_anchor + (uint32_t)clock_ns_to_ticks(s->cap_clk,
-                                                       t - s->cap_anchor_ns);
+    return s->cap_anchor + (uint32_t)mcpwm_clk_cycles(s, s->cap_clk,
+                                                      t - s->cap_anchor_ns);
 }
 
 static uint32_t cap_timer_now(Esp32McpwmState *s)
@@ -2561,9 +2585,17 @@ static void esp32_mcpwm_cap_clk_update(void *opaque, ClockEvent event)
     }
 }
 
-/* The ESP32-P4's MCPWMn_CLK, PWM_clk's source and the capture timer's. */
+/*
+ * The ESP32-P4's MCPWMn_CLK, PWM_clk's source and the capture timer's:
+ * counted at its exact period from the change on.
+ */
 static void esp32p4_mcpwm_clk_update(void *opaque, ClockEvent event)
 {
+    Esp32McpwmState *s = opaque;
+
+    if (event == ClockUpdate) {
+        s->p4_period = esp32p4_clk_exact(s->core_clk);
+    }
     esp32_mcpwm_cap_clk_update(opaque, event);
     esp32_mcpwm_core_clk_update(opaque, event);
 }
@@ -2575,6 +2607,9 @@ static void esp32_mcpwm_reset_hold(Object *obj, ResetType type)
     bool fault_in[ESP32_MCPWM_FAULTS];
 
     timer_del(s->timer);
+    if (s->p4) {
+        s->p4_period = esp32p4_clk_exact(s->core_clk);
+    }
     /* Input levels come from outside the block and survive its reset. */
     memcpy(fault_in, c->fault_in, sizeof(fault_in));
     memset(c, 0, sizeof(*c));
@@ -2769,6 +2804,24 @@ static const VMStateDescription vmstate_esp32_mcpwm_core = {
     },
 };
 
+static bool esp32p4_mcpwm_period_needed(void *opaque)
+{
+    return ((Esp32McpwmState *)opaque)->p4;
+}
+
+static const VMStateDescription vmstate_esp32p4_mcpwm_period = {
+    .name = TYPE_ESP32_MCPWM "/p4-period",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = esp32p4_mcpwm_period_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(p4_period.num_hi, Esp32McpwmState),
+        VMSTATE_UINT64(p4_period.num_lo, Esp32McpwmState),
+        VMSTATE_UINT64(p4_period.den, Esp32McpwmState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_esp32_mcpwm = {
     .name = TYPE_ESP32_MCPWM,
     .version_id = 2,
@@ -2801,6 +2854,10 @@ static const VMStateDescription vmstate_esp32_mcpwm = {
         VMSTATE_INT64(due_ns, Esp32McpwmState),
         VMSTATE_INT64(seen_ns, Esp32McpwmState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_esp32p4_mcpwm_period,
+        NULL
     },
 };
 

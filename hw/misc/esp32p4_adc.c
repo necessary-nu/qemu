@@ -1668,8 +1668,8 @@ static const VMStateDescription vmstate_esp32p4_adc_unit = {
 
 static const VMStateDescription vmstate_esp32p4_adc = {
     .name = TYPE_ESP32P4_ADC,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(hp_regs, ESP32P4AdcState, ESP32P4_ADC_HP_NREGS),
         VMSTATE_UINT32_ARRAY(lp_regs, ESP32P4AdcState, ESP32P4_ADC_LP_NREGS),

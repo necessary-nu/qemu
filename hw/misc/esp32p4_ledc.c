@@ -89,8 +89,10 @@
  * ------
  *
  * Nothing is ticked. The timers' positions are computed from when they
- * last changed; the duty of any cycle, fade or not, in closed form from
- * the fade's last anchor; the outputs as functions of both. Each output
+ * last changed, a count every LEDC_CLK's exact period times the divider
+ * (esp32p4_clk_period.h), reached at the first nanosecond its exact time
+ * has come; the duty of any cycle, fade or not, in closed form from the
+ * fade's last anchor; the outputs as functions of both. Each output
  * changes at its edges' exact times, stamped on the line
  * (hw/gpio/esp32_line.h), but no sooner than min-edge-ns after its
  * previous change: closer edges are coalesced into the level at the end
@@ -263,31 +265,6 @@ enum {
 
 /* Timer arithmetic */
 
-/* a * b / 2^32, saturating */
-static uint64_t mul_shr32(uint64_t a, uint64_t b)
-{
-    uint64_t lo, hi;
-
-    mulu64(&lo, &hi, a, b);
-    if (hi >> 32) {
-        return UINT64_MAX;
-    }
-    return (lo >> 32) | (hi << 32);
-}
-
-/* Counts done d ns after the anchor: the largest m with m q / 2^32 <= d */
-static uint64_t ledc_ticks(uint64_t d, uint64_t q)
-{
-    uint64_t hi = (d + 1) >> 32, lo = (d + 1) << 32;
-
-    if (lo == 0) {
-        hi--;
-    }
-    lo--;
-    divu128(&lo, &hi, q);
-    return hi ? UINT64_MAX : lo;
-}
-
 static uint64_t timer_period(const ESP32P4LedcTimer *t)
 {
     return 1ull << t->res;
@@ -298,30 +275,41 @@ static uint32_t timer_top(const ESP32P4LedcTimer *t)
     return timer_period(t) - 1;
 }
 
-/* The count's period in 2^-32 ns; 0 while the counter stands still. */
-static uint64_t timer_q(ESP32P4LedcState *s, int x)
+/*
+ * The count's period: LEDC_CLK's exact period times the divider, 8
+ * fraction bits; stopped while the counter stands still.
+ */
+static ESP32P4ClkPeriod timer_q(ESP32P4LedcState *s, int x)
 {
     ESP32P4LedcTimer *t = &s->t[x];
 
     if ((t->conf & (TCONF_RST | TCONF_PAUSE)) || t->etm_paused ||
         !clock_is_enabled(s->clk) || t->div < MIN_DIV) {
-        return 0;
+        return esp32p4_clk_period_stopped();
     }
-    return mul_shr32(clock_get(s->clk), (uint64_t)t->div << 24);
+    return esp32p4_clk_period_scale(esp32p4_clk_exact(s->clk), t->div, 256);
 }
 
-/* Where the counter stands at time x: the cycle and the count. */
+static bool timer_runs(const ESP32P4LedcTimer *t)
+{
+    return esp32p4_clk_period_running(t->q);
+}
+
+/*
+ * Where the counter stands at time x: the cycle and the count, a count
+ * reached at the first nanosecond its exact time has come.
+ */
 static void timer_pos(const ESP32P4LedcTimer *t, int64_t x, uint64_t *k,
                       uint64_t *v)
 {
     uint64_t total;
 
-    if (!t->q || x <= t->anchor_ns) {
+    if (!timer_runs(t) || x <= t->anchor_ns) {
         *k = t->anchor_cycle;
         *v = t->anchor_cnt;
         return;
     }
-    total = t->anchor_cnt + ledc_ticks(x - t->anchor_ns, t->q);
+    total = t->anchor_cnt + esp32p4_clk_ns_cycles(t->q, x - t->anchor_ns);
     *k = t->anchor_cycle + (total >> t->res);
     *v = total & (timer_period(t) - 1);
 }
@@ -332,7 +320,8 @@ static void timer_pos(const ESP32P4LedcTimer *t, int64_t x, uint64_t *k,
  */
 static int64_t timer_time(const ESP32P4LedcTimer *t, uint64_t k, uint64_t v)
 {
-    uint64_t m, ns;
+    uint64_t m;
+    int64_t ns;
 
     if (k < t->anchor_cycle || (k == t->anchor_cycle && v < t->anchor_cnt)) {
         return INT64_MIN;
@@ -341,11 +330,11 @@ static int64_t timer_time(const ESP32P4LedcTimer *t, uint64_t k, uint64_t v)
     if (m == 0) {
         return t->anchor_ns;
     }
-    if (!t->q) {
+    if (!timer_runs(t)) {
         return INT64_MAX;
     }
-    ns = mul_shr32(m, t->q);
-    if (ns >= (uint64_t)(INT64_MAX - t->anchor_ns)) {
+    ns = esp32p4_clk_cycles_ns(t->q, m);
+    if (ns >= INT64_MAX - t->anchor_ns) {
         return INT64_MAX;
     }
     return t->anchor_ns + ns;
@@ -640,7 +629,7 @@ static int64_t chan_next_edge(ESP32P4LedcState *s, int n, int64_t x)
     uint64_t k, v, stop = UINT64_MAX, look;
     bool fading;
 
-    if (!ch->active || !t->q || hp >= period) {
+    if (!ch->active || !timer_runs(t) || hp >= period) {
         return INT64_MAX;
     }
     timer_pos(t, x, &k, &v);
@@ -977,7 +966,7 @@ static void chan_request_load(ESP32P4LedcState *s, int n, bool fade,
     timer_pos(t, now, &k, &v);
     ch->load_fade = fade;
     ch->conf0 |= CONF0_PARA_UP;
-    if (t->q) {
+    if (timer_runs(t)) {
         ch->load_pending = true;
         ch->load_cycle = k + 1;
     } else {
@@ -1052,7 +1041,7 @@ static void chan_request_ops(ESP32P4LedcState *s, int n, uint32_t ops,
         ch->gamma_conf &= ~GAMMA_PAUSE;
     }
     timer_pos(t, now, &k, &v);
-    if (!t->q) {
+    if (!timer_runs(t)) {
         fade_ops(s, n, ops, k, true);
         return;
     }
@@ -1151,7 +1140,7 @@ static int64_t ledc_next_event(ESP32P4LedcState *s, int *kind, int *idx)
     for (int x = 0; x < ESP32P4_LEDC_TIMERS; x++) {
         ESP32P4LedcTimer *t = &s->t[x];
 
-        if ((t->pend_div || t->pend_res) && t->q) {
+        if ((t->pend_div || t->pend_res) && timer_runs(t)) {
             int64_t tm = due_time(t, timer_time(t, t->pend_cycle, 0));
 
             if (tm < best) {
@@ -1261,7 +1250,7 @@ static int64_t ledc_next_wake(ESP32P4LedcState *s)
     for (int x = 0; x < ESP32P4_LEDC_TIMERS; x++) {
         ESP32P4LedcTimer *t = &s->t[x];
 
-        if (!t->q) {
+        if (!timer_runs(t)) {
             continue;
         }
         if (timer_ovf_watched(s, x)) {
@@ -1278,7 +1267,7 @@ static int64_t ledc_next_wake(ESP32P4LedcState *s)
         ESP32P4LedcTimer *t = chan_timer(s, n);
         int64_t e;
 
-        if (t->q && chan_ovf_watched(s, n)) {
+        if (timer_runs(t) && chan_ovf_watched(s, n)) {
             uint64_t k = t->ovf_next + chan_ovf_left(s, n) - 1;
 
             next = MIN(next, due_time(t, timer_time(t, k, timer_top(t))));
@@ -1392,7 +1381,7 @@ static void ledc_timer_write(ESP32P4LedcState *s, int x, uint32_t v,
         }
         t->pend_div = true;
         t->pend_res = true;
-        t->q = 0;
+        t->q = esp32p4_clk_period_stopped();
         timer_take_update(s, x, now, t->anchor_cycle);
         /* Held at count 0 of its cycle, which has had no overflow. */
         t->ovf_next = t->anchor_cycle;
@@ -1825,7 +1814,7 @@ static const VMStateDescription vmstate_esp32p4_ledc_timer = {
         VMSTATE_INT64(anchor_ns, ESP32P4LedcTimer),
         VMSTATE_UINT64(anchor_cycle, ESP32P4LedcTimer),
         VMSTATE_UINT32(anchor_cnt, ESP32P4LedcTimer),
-        VMSTATE_UINT64(q, ESP32P4LedcTimer),
+        VMSTATE_ESP32P4_CLK_PERIOD(q, ESP32P4LedcTimer),
         VMSTATE_UINT64(ovf_next, ESP32P4LedcTimer),
         VMSTATE_UINT64(cmp_next, ESP32P4LedcTimer),
         VMSTATE_END_OF_LIST()
@@ -1876,8 +1865,8 @@ static const VMStateDescription vmstate_esp32p4_ledc_channel = {
 
 static const VMStateDescription vmstate_esp32p4_ledc = {
     .name = TYPE_ESP32P4_LEDC,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4LedcState),
         VMSTATE_TIMER(timer, ESP32P4LedcState),

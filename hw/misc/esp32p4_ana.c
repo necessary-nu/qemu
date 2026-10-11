@@ -212,13 +212,12 @@ int esp32p4_ana_slave(uint8_t addr)
 /*
  * [spec:nuos:req:emu.esp32p4.clocks]
  * The period the PLL's registers configure, from XTAL_CLK's, exactly; or
- * stopped. XTAL_CLK's 25 ns is a whole number of Clock units, so its
- * Clock's period is exact.
+ * stopped.
  */
 static ESP32P4ClkPeriod esp32p4_ana_target(ESP32P4AnaState *s, int pll)
 {
     const uint8_t *r = s->regs[esp32p4_ana_pll_slave[pll]];
-    ESP32P4ClkPeriod xtal = esp32p4_clk_period_exact(clock_get(s->xtal));
+    ESP32P4ClkPeriod xtal = esp32p4_clk_exact(s->xtal);
     uint32_t div, ref, odiv, num;
 
     switch (pll) {
@@ -261,9 +260,19 @@ static void esp32p4_ana_update_out(ESP32P4AnaState *s, int pll)
 }
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */
-ESP32P4ClkPeriod esp32p4_ana_pll_period(ESP32P4AnaState *s, int pll)
+static bool esp32p4_ana_exact_period(Object *obj, Clock *out,
+                                     ESP32P4ClkPeriod *p)
 {
-    return s->out_period[pll];
+    ESP32P4AnaState *s = ESP32P4_ANA(obj);
+    int pll;
+
+    for (pll = 0; pll < ESP32P4_ANA_NUM_PLLS; pll++) {
+        if (s->out[pll] == out) {
+            *p = s->out_period[pll];
+            return true;
+        }
+    }
+    return false;
 }
 
 static void esp32p4_ana_set_cal_end(ESP32P4AnaState *s, int pll, bool end)
@@ -596,9 +605,11 @@ static void esp32p4_ana_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
+    ESP32P4ClkSourceClass *csc = ESP32P4_CLK_SOURCE_CLASS(klass);
 
     rc->phases.hold = esp32p4_ana_reset_hold;
     dc->vmsd = &vmstate_esp32p4_ana;
+    csc->exact_period = esp32p4_ana_exact_period;
 }
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */
@@ -608,6 +619,10 @@ static const TypeInfo esp32p4_ana_info = {
     .instance_size = sizeof(ESP32P4AnaState),
     .instance_init = esp32p4_ana_init,
     .class_init    = esp32p4_ana_class_init,
+    .interfaces    = (const InterfaceInfo[]) {
+        { TYPE_ESP32P4_CLK_SOURCE },
+        { }
+    },
 };
 
 static void esp32p4_ana_register_types(void)

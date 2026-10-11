@@ -22,26 +22,15 @@
 #include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_crypto.h"
 
-static uint64_t ns_to_cycles(uint64_t ns, uint64_t period)
-{
-    uint64_t lo, hi;
-
-    /* The period is in 2^-32 ns units, so cycles = (ns << 32) / period. */
-    mulu64(&lo, &hi, ns, 1ULL << 32);
-    divu128(&lo, &hi, period);
-    return hi ? UINT64_MAX : lo;
-}
-
 /* Run the cycles left from @now at the clock's present rate. */
 static void crypto_timer_arm(ESP32P4CryptoTimer *t, int64_t now)
 {
-    t->stretch_ns = now;
-    t->stretch_period = clock_get(t->clk);
-    if (!t->stretch_period) {
+    esp32p4_clk_count_start(&t->stretch, t->clk, now);
+    if (!esp32p4_clk_count_running(&t->stretch)) {
         timer_del(&t->timer);
         return;
     }
-    t->due_ns = now + clock_ticks_to_ns(t->clk, t->left);
+    t->due_ns = esp32p4_clk_count_time(&t->stretch, t->left);
     timer_mod(&t->timer, t->due_ns);
 }
 
@@ -106,13 +95,13 @@ void esp32p4_crypto_timer_cancel(ESP32P4CryptoTimer *t)
 void esp32p4_crypto_timer_clock_update(ESP32P4CryptoTimer *t)
 {
     int64_t now = esp32_line_time();
+    uint64_t done;
 
     if (!t->active) {
         return;
     }
-    if (t->stretch_period) {
-        uint64_t done = ns_to_cycles(now - t->stretch_ns, t->stretch_period);
-
+    if (esp32p4_clk_count_running(&t->stretch)) {
+        done = esp32p4_clk_count_at(&t->stretch, now);
         t->left = done >= t->left ? 1 : t->left - done;
     }
     crypto_timer_arm(t, now);
@@ -120,14 +109,13 @@ void esp32p4_crypto_timer_clock_update(ESP32P4CryptoTimer *t)
 
 const VMStateDescription vmstate_esp32p4_crypto_timer = {
     .name = "esp32p4-crypto-timer",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER(timer, ESP32P4CryptoTimer),
         VMSTATE_BOOL(active, ESP32P4CryptoTimer),
         VMSTATE_UINT64(left, ESP32P4CryptoTimer),
-        VMSTATE_INT64(stretch_ns, ESP32P4CryptoTimer),
-        VMSTATE_UINT64(stretch_period, ESP32P4CryptoTimer),
+        VMSTATE_ESP32P4_CLK_COUNT(stretch, ESP32P4CryptoTimer),
         VMSTATE_INT64(due_ns, ESP32P4CryptoTimer),
         VMSTATE_END_OF_LIST()
     },

@@ -12,6 +12,7 @@
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
 #include "hw/i2c/i2c.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -83,14 +84,25 @@ struct ESP32P4I2CClass {
 };
 
 /* An input line and its filter (I2C_SCL_FILTER_*, I2C_SDA_FILTER_*). */
+/*
+ * An instant of the master's: exactly @cyc cycles of I2C_SCLK, at the
+ * period the controller took as the clock last changed, after @origin.
+ */
+typedef struct ESP32P4I2CTp {
+    int64_t origin;
+    uint64_t cyc;
+} ESP32P4I2CTp;
+
 typedef struct ESP32P4I2CLine {
     /* The level at the input and the level past the filter. */
     bool raw;
     bool filt;
-    /* When the filtered level last changed. */
+    /* When the filtered level last changed, and that instant exactly. */
     int64_t edge_ns;
+    ESP32P4I2CTp edge_tp;
     /* A change waiting to pass the filter: when it does. */
     int64_t pend_ns;
+    ESP32P4I2CTp pend_tp;
 } ESP32P4I2CLine;
 
 struct ESP32P4I2CState {
@@ -152,17 +164,23 @@ struct ESP32P4I2CState {
     bool bus_active;
 
     /*
-     * The master's next step: due at step_mark, timed at step_period,
-     * the I2C_SCLK period when it was scheduled, or with the clock
-     * stopped (step_period 0) step_left cycles after it restarts; a clock
-     * change rescales what is left. step_ns is the time of the step
-     * being run.
+     * The master's next step: due at step_mark, the instant step_tp, or
+     * with the clock stopped step_left cycles after it restarts; a clock
+     * change rescales what is left. step_ns is the time of the step being
+     * run, the instant cur_tp. The instants count I2C_SCLK's cycles at
+     * tp_period, its exact period as the clock last changed (stopped
+     * while it is). drv_ns and drv_tp are when the controller last
+     * changed each line it drives (LINE_SCL, LINE_SDA), and that instant.
      */
     uint32_t step;
     uint64_t step_left;
     int64_t step_mark;
-    uint64_t step_period;
+    ESP32P4ClkPeriod tp_period;
+    ESP32P4I2CTp step_tp;
     int64_t step_ns;
+    ESP32P4I2CTp cur_tp;
+    int64_t drv_ns[2];
+    ESP32P4I2CTp drv_tp[2];
 
     /* Master. */
     bool mst_busy;
@@ -189,6 +207,7 @@ struct ESP32P4I2CState {
     uint8_t dev_byte;
     int64_t t_rel;
     int64_t t_fall_due;
+    ESP32P4I2CTp fall_tp;
     uint8_t rst_pulses;
     bool start_pending;
 

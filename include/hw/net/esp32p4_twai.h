@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "net/can_emu.h"
 #include "qemu/notify.h"
@@ -86,7 +87,11 @@ typedef struct ESP32P4TwaiEpisode {
     bool start_pending;
     int64_t start_at;
     int64_t t_sof;
-    /* The bit time of the winning transmitter, in picoseconds. */
+    /*
+     * The bit time of the winning transmitter, exactly, and in
+     * picoseconds, rounded down, for receivers at other bit times.
+     */
+    ESP32P4ClkPeriod bit;
     int64_t bit_ps;
     /* The controllers that took part from SOF, and those since gone. */
     uint8_t members;
@@ -200,18 +205,27 @@ typedef struct ESP32P4TwaiCtrl {
     int64_t sync_at;
     /* When it may next start a frame (Suspend Transmission). */
     int64_t ready_at;
-    /* Bus-off recovery: counting runs of 11 recessive bits from mark. */
+    /*
+     * Bus-off recovery: counting runs of 11 recessive bits from mark,
+     * recov_runs of them counted so far.
+     */
     bool recovering;
     bool recov_paused;
     int64_t recov_mark;
+    uint64_t recov_runs;
     QEMUTimer *recov_timer;
     int64_t recov_due;
 
-    /* A transmission that cannot reach any bus, failing bit by bit. */
+    /*
+     * A transmission that cannot reach any bus, failing bit by bit: its
+     * next step at local_t0, local_bits bit times after local_origin.
+     */
     bool local_active;
     uint8_t local_phase;
     uint32_t local_bit;
     int64_t local_t0;
+    int64_t local_origin;
+    uint64_t local_bits;
     QEMUTimer *local_timer;
 
     /* What twai_rx hears and whether twai_tx reaches a pad. */
@@ -219,6 +233,9 @@ typedef struct ESP32P4TwaiCtrl {
     bool drives;
     bool rx_level;
     bool in_reset;
+
+    /* TWAIn_CLK's exact period, as it last changed. */
+    ESP32P4ClkPeriod clk_period;
 
     /* The timestamp counter: its count at ts_base_ns. */
     uint64_t ts_count_base;

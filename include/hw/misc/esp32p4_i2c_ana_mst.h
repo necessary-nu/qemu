@@ -47,11 +47,13 @@ struct ESP32P4I2CAnaMstState {
     /* Each master's transaction in progress. */
     bool busy[ESP32P4_I2C_ANA_MST_MASTERS];
     QEMUTimer *timer[ESP32P4_I2C_ANA_MST_MASTERS];
-    /* Cycles of the timing clock still to go, counted at xfer_mark. */
+    /*
+     * Cycles of the timing clock still to go as of the origin of xfer,
+     * the clock's cycles counted from its last change (stopped while it
+     * is).
+     */
     uint64_t xfer_left[ESP32P4_I2C_ANA_MST_MASTERS];
-    int64_t xfer_mark[ESP32P4_I2C_ANA_MST_MASTERS];
-    /* The timing clock's period since xfer_mark; 0 while it is stopped. */
-    uint64_t xfer_period[ESP32P4_I2C_ANA_MST_MASTERS];
+    ESP32P4ClkCount xfer[ESP32P4_I2C_ANA_MST_MASTERS];
     ESP32P4I2CAnaMstTimer timer_ctx[ESP32P4_I2C_ANA_MST_MASTERS];
 };
 

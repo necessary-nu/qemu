@@ -79,10 +79,11 @@ static const uint32_t key_check[3] = { 0x0d474ca0, 0x03b2fc3f, 0x13f4e9da };
 
 /* The default BLOCK1, BLOCK2 and BLOCK10, and their parity. */
 static const uint32_t default_blk1[6] = {
-    0xc4000001, 0x0000240a, 0x88044931, 0x64a0c664, 0x00980a0c, 0x00000100,
+    0xc4000001, 0x0000240a, 0x88044930, 0x64a0c664, 0x00980a0c, 0x00000100,
 };
+/* Its Reed-Solomon parity, as espefuse computes it. */
 static const uint32_t default_blk1_check[3] = {
-    0xc4525b6b, 0xfa776e7d, 0xaedaef45,
+    0x39e3fbc8, 0xbad1df9f, 0x39a0b20e,
 };
 static const uint32_t default_blk2[8] = {
     0, 0, 0, 0, 0x1a466990, 0xf641866e, 0x641e6b99, 0x0003c140,
@@ -290,11 +291,14 @@ static void test_defaults(void)
     uint32_t sys2, major, minor;
     unsigned b, w;
 
-    /* As ESP-IDF's efuse_ll reads the wafer version: v3.1. */
+    /*
+     * As ESP-IDF's efuse_ll reads the wafer version: v3.0, the revision of
+     * the HP ROM the machine ships (ECO5).
+     */
     sys2 = rd(qts, RD_MAC_SYS(2));
     major = ((sys2 >> 23) & 1) << 2 | ((sys2 >> 4) & 3);
     minor = sys2 & 0xf;
-    g_assert_cmpuint(major * 100 + minor, ==, 301);
+    g_assert_cmpuint(major * 100 + minor, ==, 300);
     g_assert_cmpuint((sys2 >> 6) & 3, ==, 0);         /* DISABLE_*_MAJOR */
     g_assert_cmpuint((sys2 >> 11) & 3, ==, 1);        /* BLK_VERSION_MAJOR */
     g_assert_cmpuint((sys2 >> 8) & 7, ==, 1);         /* BLK_VERSION_MINOR */
@@ -834,12 +838,56 @@ static void test_file_empty(void)
     unlink(path);
 }
 
+/* The chip revision ESP-IDF's efuse_ll reads from the eFuses. */
+static uint32_t chip_revision(QTestState *qts)
+{
+    uint32_t sys2 = rd(qts, RD_MAC_SYS(2));
+
+    return (((sys2 >> 23) & 1) << 2 | ((sys2 >> 4) & 3)) * 100 +
+           (sys2 & 0xf);
+}
+
+/*
+ * The factory-fresh eFuses present the revision of the HP ROM image that
+ * runs, by the ECO version at its offset 0x14: a ROM image (-bios) of
+ * ECO6, v3.1's, gives v3.1, ECO7 v3.2, and an ECO the machine does not
+ * know v3.0.
+ */
+/* [spec:nuos:req:emu.esp32p4.efuse/test] */
+static void test_rom_revision(void)
+{
+    static const struct {
+        uint32_t eco;
+        uint32_t revision;
+    } roms[] = { { 5, 300 }, { 6, 301 }, { 7, 302 }, { 9, 300 } };
+
+    for (int i = 0; i < ARRAY_SIZE(roms); i++) {
+        g_autofree uint8_t *rom = g_malloc0(128 * 1024);
+        g_autofree char *path = NULL;
+        GError *err = NULL;
+        QTestState *qts;
+        int fd = g_file_open_tmp("esp32p4-rom-XXXXXX.bin", &path, &err);
+
+        g_assert_no_error(err);
+        stl_le_p(rom + 0x10, 18);       /* the ESP32-P4's chip ID */
+        stl_le_p(rom + 0x14, roms[i].eco);
+        g_assert_cmpint(write(fd, rom, 128 * 1024), ==, 128 * 1024);
+        close(fd);
+        qts = qtest_initf("-M esp32p4,strap-mode=0 -bios %s", path);
+        g_assert_cmpuint(chip_revision(qts), ==, roms[i].revision);
+        g_assert_cmphex(qtest_readl(qts, 0x4fc00014), ==, roms[i].eco);
+        qtest_quit(qts);
+        unlink(path);
+    }
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
 
     qtest_add_func("/esp32p4/efuse/registers", test_registers);
     qtest_add_func("/esp32p4/efuse/defaults", test_defaults);
+    qtest_add_func("/esp32p4/efuse/rom-revision", test_rom_revision);
     qtest_add_func("/esp32p4/efuse/read-timing", test_read_timing);
     qtest_add_func("/esp32p4/efuse/program", test_program);
     qtest_add_func("/esp32p4/efuse/reed-solomon", test_rs);

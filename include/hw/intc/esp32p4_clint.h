@@ -12,6 +12,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "target/riscv/esp32p4_cpu.h"
@@ -75,9 +76,14 @@ struct ESP32P4ClintState {
     Clock *mtime_clk;
     ESP32P4ClintCore core[ESP32P4_CLINT_CORES];
 
-    /* The count at sync_ns, and whether it is counting. */
+    /*
+     * The count as of cycle @synced of the "mtime" clock, counted from when
+     * the counter last started or the clock changed (@edges), and whether
+     * it is counting.
+     */
     uint64_t count;
-    int64_t sync_ns;
+    ESP32P4ClkCount edges;
+    uint64_t synced;
     bool running;
 };
 

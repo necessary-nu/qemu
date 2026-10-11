@@ -938,16 +938,37 @@ static uint64_t dwmac_ptp_rollover(Esp32DwmacState *s)
                                         : TS_BINARY_ROLLOVER;
 }
 
-/* The PTP reference clock's rising edges from time 0 to @ns */
-static uint64_t dwmac_ptp_edges(uint32_t hz, int64_t ns)
+static uint64_t dwmac_default_clock_edges(Esp32DwmacState *s, Clock *clk,
+                                          int64_t ns)
 {
-    return muldiv64(ns, hz, NANOSECONDS_PER_SECOND);
+    return muldiv64(MAX(ns, 0), clock_get_hz(clk), NANOSECONDS_PER_SECOND);
+}
+
+static int64_t dwmac_default_clock_edge_ns(Esp32DwmacState *s, Clock *clk,
+                                           uint64_t edge)
+{
+    uint32_t hz = clock_get_hz(clk);
+
+    return hz ? muldiv64_round_up(edge, NANOSECONDS_PER_SECOND, hz)
+              : INT64_MAX;
+}
+
+/* The PTP reference clock's rising edges from time 0 to @ns */
+static uint64_t dwmac_ptp_edges(Esp32DwmacState *s, int64_t ns)
+{
+    return dwmac_class(s)->clock_edges(s, s->ptp_clk, ns);
 }
 
 /* The time of the @edge'th rising edge */
-static int64_t dwmac_ptp_edge_ns(uint32_t hz, uint64_t edge)
+static int64_t dwmac_ptp_edge_ns(Esp32DwmacState *s, uint64_t edge)
 {
-    return muldiv64_round_up(edge, NANOSECONDS_PER_SECOND, hz);
+    return dwmac_class(s)->clock_edge_ns(s, s->ptp_clk, edge);
+}
+
+/* @cycles of the bus clock in ns, from an edge of it */
+static int64_t dwmac_bus_cycles_ns(Esp32DwmacState *s, uint64_t cycles)
+{
+    return dwmac_class(s)->clock_edge_ns(s, s->bus_clk, cycles);
 }
 
 /* The sub-second increments @cycles cycles of the PTP clock make */
@@ -1003,14 +1024,13 @@ static void dwmac_ptp_put(Esp32DwmacState *s, const DwmacPtpTime *t)
 static void dwmac_ptp_time_at(Esp32DwmacState *s, int64_t ns,
                               DwmacPtpTime *t)
 {
-    uint32_t hz = dwmac_ptp_hz(s);
     uint64_t cycles;
 
     dwmac_ptp_get(s, t);
     if (!dwmac_ptp_running(s) || ns <= s->ptp_anchor_ns) {
         return;
     }
-    cycles = dwmac_ptp_edges(hz, ns) - dwmac_ptp_edges(hz, s->ptp_anchor_ns);
+    cycles = dwmac_ptp_edges(s, ns) - dwmac_ptp_edges(s, s->ptp_anchor_ns);
     dwmac_ptp_add_units(s, t, dwmac_ptp_incs(s, t, cycles) *
                               (s->ts_ssinc & TS_SSINC_MASK));
 }
@@ -1114,7 +1134,6 @@ static uint64_t dwmac_ptp_units_to(Esp32DwmacState *s, const DwmacPtpTime *t,
  */
 static void dwmac_ptp_schedule(Esp32DwmacState *s)
 {
-    uint32_t hz = dwmac_ptp_hz(s);
     uint64_t ssinc = s->ts_ssinc & TS_SSINC_MASK;
     uint64_t units = UINT64_MAX;
     uint64_t incs, cycles, next_pps;
@@ -1143,7 +1162,7 @@ static void dwmac_ptp_schedule(Esp32DwmacState *s)
         cycles = incs;
     }
     timer_mod(&s->ptp_timer,
-              dwmac_ptp_edge_ns(hz, dwmac_ptp_edges(hz, s->ptp_anchor_ns) +
+              dwmac_ptp_edge_ns(s, dwmac_ptp_edges(s, s->ptp_anchor_ns) +
                                 cycles));
 }
 
@@ -2130,12 +2149,11 @@ static bool dwmac_rx_dma_frame(Esp32DwmacState *s, const uint8_t *frame,
         s->rx_desc = next;
         if (d[1] & RDES1_DIC) {
             uint32_t riwt = s->rx_wdt & 0xff;
-            uint64_t hz = clock_get_hz(s->bus_clk);
 
-            if (riwt && hz) {
+            if (riwt && clock_get_hz(s->bus_clk)) {
                 timer_mod(&s->rx_wdt_timer,
                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                          muldiv64(riwt * 256, NANOSECONDS_PER_SECOND, hz));
+                          dwmac_bus_cycles_ns(s, riwt * 256));
             }
         } else {
             timer_del(&s->rx_wdt_timer);
@@ -2487,22 +2505,22 @@ static void dwmac_mdio_start(Esp32DwmacState *s)
     };
     Esp32DwmacClass *k = dwmac_class(s);
     unsigned cr = (s->mii_addr >> MII_CR_SHIFT) & 0xf;
-    uint64_t hz = clock_get_hz(s->bus_clk);
     uint32_t d = div[cr];
+    int64_t ns;
 
     if (!d) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: reserved MIICSRCLK value %u\n", dwmac_name(s), cr);
         d = 42;
     }
-    if (!hz) {
-        hz = 80000000;
-    }
+    /* Without its clock the frame takes the time it would at 80 MHz. */
+    ns = clock_get_hz(s->bus_clk) ? dwmac_bus_cycles_ns(s, 64 * d)
+                                  : muldiv64(64 * d, NANOSECONDS_PER_SECOND,
+                                             80000000);
     if (k->mdio_drive) {
         k->mdio_drive(s, true);
     }
-    timer_mod(&s->mdio_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              muldiv64(64 * d, NANOSECONDS_PER_SECOND, hz));
+    timer_mod(&s->mdio_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
 }
 
 /*
@@ -3390,9 +3408,13 @@ static void esp32_dwmac_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
+    Esp32DwmacClass *k = ESP32_DWMAC_CLASS(klass);
+
     rc->phases.hold = esp32_dwmac_reset_hold;
     dc->realize = esp32_dwmac_realize;
     dc->unrealize = esp32_dwmac_unrealize;
+    k->clock_edges = dwmac_default_clock_edges;
+    k->clock_edge_ns = dwmac_default_clock_edge_ns;
     device_class_set_props(dc, esp32_dwmac_properties);
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
 }

@@ -278,6 +278,13 @@ struct DWC2OTGState {
     QEMUTimer *bus_timer;
     int64_t frame_start_ns;
     int64_t frame_ns;
+    /*
+     * The frames counted from frame_origin_ns at the PHY clock frame_hz,
+     * the current one ending frame_ticks PHY clocks after it.
+     */
+    int64_t frame_origin_ns;
+    uint64_t frame_ticks;
+    uint64_t frame_hz;
     uint16_t frnum;
     /* The transaction in flight while a QEMU device completes it. */
     bool xact_async;

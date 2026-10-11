@@ -77,14 +77,20 @@
  * reads as zero past its end, and grows to 336 bytes when written. An
  * empty file is refused. Programming writes the file when it ends.
  *
- * The defaults are those of a factory-fresh ESP32-P4NRW32X of revision
- * v3.1, everything else zero:
+ * The defaults are those of a factory-fresh ESP32-P4NRW32X of the
+ * revision the "chip-revision" property gives, v3.0 unless set,
+ * everything else zero:
  *
- *   - Wafer version 3.1 (EFUSE_WAFER_VERSION_MAJOR_LO 3, _MINOR 1).
- *     ESP-IDF's default minimum revision for v3.x silicon is v3.1
- *     (CONFIG_ESP32P4_REV_MIN_301), and the v3.0 ROM (ECO5) is the one
- *     esp-rom-elfs gives for all of v3.x; Espressif's esp-emu also seeds
- *     v3.1.
+ *   - The wafer version: chip-revision's major number in
+ *     EFUSE_WAFER_VERSION_MAJOR_LO and _HI, its minor number in _MINOR.
+ *     Each v3.x revision has its own boot ROM, which prints its ECO:
+ *     esp32p4-eco5-20250430 on v3.0 (the boot log of ESP-IDF's flash
+ *     encryption guide for the P4), eco6-20251011 on v3.1 and
+ *     eco7-20260109 on v3.2 (as users' logs from those revisions show), so
+ *     the machine sets the property from the ECO of the HP ROM image it
+ *     runs: v3.0 for the ROM it ships, whose ECO is 5. ESP-IDF's default
+ *     minimum revision is v3.1 (CONFIG_ESP32P4_REV_MIN_301), so its
+ *     default builds refuse to run on v3.0, as they do on the chip.
  *   - Block version 1.1: ESP-IDF's bootloader accepts up to v1.99, takes
  *     ADC and LDO calibration from v0.1, and the PMU's from v0.2 except
  *     v1.0, which the v3.x silicon's code singles out.
@@ -629,7 +635,7 @@ static void set_field(uint32_t *words, unsigned bit, unsigned width,
     }
 }
 
-/* The array of a factory-fresh ESP32-P4NRW32X v3.1, as described above. */
+/* The array of a factory-fresh ESP32-P4NRW32X, as described above. */
 /* [spec:nuos:req:emu.esp32p4.efuse] */
 static void esp32p4_efuse_defaults(ESP32P4EfuseState *s)
 {
@@ -641,6 +647,8 @@ static void esp32p4_efuse_defaults(ESP32P4EfuseState *s)
     static const uint16_t adc2_hi_dout[4] = { 28, 22, 18, 12 };
     static const uint8_t adc1_ch_diff[8] = { 1, 0, 2, 1, 0, 1, 2, 0 };
     static const uint8_t adc2_ch_diff[6] = { 1, 1, 0, 2, 1, 0 };
+    uint32_t major = s->chip_revision / 100;
+    uint32_t minor = s->chip_revision % 100;
     uint32_t *blk1 = s->rs_data[1];
     uint32_t *blk2 = s->rs_data[2];
     uint32_t *blk10 = s->rs_data[10];
@@ -653,15 +661,15 @@ static void esp32p4_efuse_defaults(ESP32P4EfuseState *s)
     /* BLOCK1: MAC, versions, package, PSRAM, LDO and PMU trims. */
     blk1[0] = ldl_be_p(mac + 2);
     blk1[1] = lduw_be_p(mac);
-    set_field(blk1, 64, 4, 1);          /* WAFER_VERSION_MINOR */
-    set_field(blk1, 68, 2, 3);          /* WAFER_VERSION_MAJOR_LO */
+    set_field(blk1, 64, 4, minor);      /* WAFER_VERSION_MINOR */
+    set_field(blk1, 68, 2, major);      /* WAFER_VERSION_MAJOR_LO */
     set_field(blk1, 72, 3, 1);          /* BLK_VERSION_MINOR */
     set_field(blk1, 75, 2, 1);          /* BLK_VERSION_MAJOR */
     set_field(blk1, 77, 3, 2);          /* PSRAM_CAP */
     set_field(blk1, 80, 2, 0);          /* TEMP */
     set_field(blk1, 82, 2, 1);          /* PSRAM_VENDOR */
     set_field(blk1, 84, 3, 0);          /* PKG_VERSION */
-    set_field(blk1, 87, 1, 0);          /* WAFER_VERSION_MAJOR_HI */
+    set_field(blk1, 87, 1, major >> 2); /* WAFER_VERSION_MAJOR_HI */
     set_field(blk1, 88, 4, 8);          /* LDO_VO1_DREF */
     set_field(blk1, 92, 4, 8);          /* LDO_VO2_DREF */
     set_field(blk1, 96, 3, 4);          /* LDO_VO1_MUL */
@@ -794,13 +802,10 @@ static void esp32p4_efuse_update_irq(ESP32P4EfuseState *s)
 /* Cycles the running operation has run, up to now. */
 static uint64_t esp32p4_efuse_cycles_run(ESP32P4EfuseState *s)
 {
-    uint64_t run = s->op_cycles_done;
+    uint64_t run = s->op_cycles_done +
+                   esp32p4_clk_count_at(&s->op_edges,
+                                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
-    if (clock_is_enabled(s->clk)) {
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-
-        run += clock_ns_to_ticks(s->clk, now - s->op_stretch_ns);
-    }
     return MIN(run, s->op_cycles);
 }
 
@@ -809,13 +814,14 @@ static void esp32p4_efuse_op_schedule(ESP32P4EfuseState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    s->op_stretch_ns = now;
-    if (!clock_is_enabled(s->clk)) {
+    esp32p4_clk_count_start(&s->op_edges, s->clk, now);
+    if (!esp32p4_clk_count_running(&s->op_edges)) {
         timer_del(&s->op_timer);
         return;
     }
-    timer_mod_ns(&s->op_timer, now + clock_ticks_to_ns(s->clk,
-                                       s->op_cycles - s->op_cycles_done));
+    timer_mod_ns(&s->op_timer,
+                 esp32p4_clk_count_time(&s->op_edges,
+                                        s->op_cycles - s->op_cycles_done));
 }
 
 /* The cycles each word of the array takes to read. */
@@ -1372,6 +1378,12 @@ static void esp32p4_efuse_realize(DeviceState *dev, Error **errp)
     if (!clock_has_source(s->clk)) {
         clock_set_hz(s->clk, EFUSE_CLK_HZ);
     }
+    if (s->chip_revision / 100 > 7 || s->chip_revision % 100 > 15) {
+        error_setg(errp, "%s: chip-revision %u is not a wafer version the "
+                   "eFuses can hold (major 0 to 7, minor 0 to 15, as major "
+                   "* 100 + minor)", TYPE_ESP32P4_EFUSE, s->chip_revision);
+        return;
+    }
 
     if (!s->blk) {
         esp32p4_efuse_defaults(s);
@@ -1492,8 +1504,8 @@ int esp32p4_efuse_find_purpose(ESP32P4EfuseState *s, uint32_t purpose)
 
 static const VMStateDescription vmstate_esp32p4_efuse = {
     .name = TYPE_ESP32P4_EFUSE,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(wr_dis, ESP32P4EfuseState),
         VMSTATE_UINT32_2DARRAY(blk0, ESP32P4EfuseState,
@@ -1533,7 +1545,7 @@ static const VMStateDescription vmstate_esp32p4_efuse = {
         VMSTATE_UINT32(op, ESP32P4EfuseState),
         VMSTATE_UINT64(op_cycles, ESP32P4EfuseState),
         VMSTATE_UINT64(op_cycles_done, ESP32P4EfuseState),
-        VMSTATE_INT64(op_stretch_ns, ESP32P4EfuseState),
+        VMSTATE_ESP32P4_CLK_COUNT(op_edges, ESP32P4EfuseState),
         VMSTATE_UINT32_ARRAY(op_pgm, ESP32P4EfuseState,
                              ESP32P4_EFUSE_RS_WORDS +
                              ESP32P4_EFUSE_RS_CHECK_WORDS),
@@ -1547,6 +1559,8 @@ static const VMStateDescription vmstate_esp32p4_efuse = {
 
 static const Property esp32p4_efuse_properties[] = {
     DEFINE_PROP_DRIVE("drive", ESP32P4EfuseState, blk),
+    DEFINE_PROP_UINT32("chip-revision", ESP32P4EfuseState, chip_revision,
+                       300),
 };
 
 static void esp32p4_efuse_class_init(ObjectClass *klass, const void *data)

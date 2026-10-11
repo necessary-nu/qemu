@@ -201,17 +201,6 @@ static const uint16_t wdt_reset_length_ns[8] = {
     100, 200, 300, 400, 500, 800, 1600, 3200,
 };
 
-/* The least time in which @clk makes @n cycles, capped for timer_mod(). */
-static int64_t timg_cycles_ns(Clock *clk, uint64_t n)
-{
-    uint64_t ns = clock_ticks_to_ns(clk, n);
-
-    while (ns < INT64_MAX / 4 && clock_ns_to_ticks(clk, ns) < n) {
-        ns++;
-    }
-    return MIN(ns, INT64_MAX / 4);
-}
-
 static void timg_update_irqs(ESP32P4TimgState *s)
 {
     uint32_t st = s->int_raw & s->int_ena;
@@ -234,10 +223,13 @@ static uint32_t timg_divisor(uint32_t config)
 /* Function clock cycles timer @t has counted since its sync point. */
 static uint64_t timg_timer_cycles(ESP32P4TimgTimer *t, int64_t now)
 {
-    if (!t->running || now <= t->sync_ns) {
+    uint64_t cycles;
+
+    if (!t->running) {
         return 0;
     }
-    return clock_ns_to_ticks(t->clk, now - t->sync_ns);
+    cycles = esp32p4_clk_count_at(&t->edges, now);
+    return cycles > t->synced ? cycles - t->synced : 0;
 }
 
 static uint64_t timg_timer_count(ESP32P4TimgTimer *t, int64_t now)
@@ -252,10 +244,10 @@ static uint64_t timg_timer_count(ESP32P4TimgTimer *t, int64_t now)
 }
 
 /*
- * Fold the cycles counted up to @now into the count and the prescaler,
- * keeping the sync point on a function clock edge so that the time
- * towards the next is not lost. A sync at a time before the last, for a
- * task whose event came earlier, changes nothing.
+ * Fold the cycles counted up to @now into the count and the prescaler. A
+ * sync at a time before the last, for a task whose event came earlier,
+ * changes nothing; while the timer is stopped, it notes the time, from
+ * which a start counts.
  */
 static void timg_timer_sync(ESP32P4TimgTimer *t, int64_t now)
 {
@@ -263,11 +255,11 @@ static void timg_timer_sync(ESP32P4TimgTimer *t, int64_t now)
 
     t->count = timg_timer_count(t, now);
     if (!t->running) {
-        t->sync_ns = MAX(now, t->sync_ns);
+        t->edges.origin_ns = MAX(now, t->edges.origin_ns);
         return;
     }
     t->pre = (t->pre + cycles) % timg_divisor(t->config);
-    t->sync_ns += timg_cycles_ns(t->clk, cycles);
+    t->synced += cycles;
 }
 
 /*
@@ -318,12 +310,14 @@ static void timg_timer_check(ESP32P4TimgState *s, int x, int64_t now)
     if (!t->running) {
         return;
     }
-    if (ahead > UINT64_MAX / div) {
-        cycles = UINT64_MAX;
+    if (ahead > (UINT64_MAX - t->synced) / div) {
+        t->due_ns = INT64_MAX / 4;
     } else {
         cycles = ahead * div - t->pre;
+        t->due_ns = MIN(esp32p4_clk_count_time(&t->edges,
+                                               t->synced + cycles),
+                        INT64_MAX / 4);
     }
-    t->due_ns = t->sync_ns + timg_cycles_ns(t->clk, cycles);
     timer_mod(&t->timer, t->due_ns);
 }
 
@@ -339,7 +333,9 @@ static void timg_timer_update(ESP32P4TimgState *s, int x, int64_t now)
     bool running = (t->config & TCONF_EN) && clock_is_enabled(t->clk);
 
     if (running && !t->running) {
-        t->sync_ns = MAX(now, t->sync_ns);
+        esp32p4_clk_count_start(&t->edges, t->clk,
+                                MAX(now, t->edges.origin_ns));
+        t->synced = 0;
     }
     t->running = running;
     timg_timer_check(s, x, now);
@@ -408,7 +404,8 @@ static void timg_timer_clk_update(ESP32P4TimgState *s, int x,
         timg_timer_sync(t, now);
         return;
     }
-    t->sync_ns = now;
+    esp32p4_clk_count_start(&t->edges, t->clk, now);
+    t->synced = 0;
     timg_timer_update(s, x, now);
 }
 
@@ -443,10 +440,13 @@ static bool timg_wdt_enabled(ESP32P4TimgState *s)
 
 static uint64_t timg_wdt_cycles(ESP32P4TimgWdt *w, int64_t now)
 {
-    if (!w->running || now <= w->sync_ns) {
+    uint64_t cycles;
+
+    if (!w->running) {
         return 0;
     }
-    return clock_ns_to_ticks(w->clk, now - w->sync_ns);
+    cycles = esp32p4_clk_count_at(&w->edges, now);
+    return cycles > w->synced ? cycles - w->synced : 0;
 }
 
 static void timg_wdt_sync(ESP32P4TimgWdt *w, int64_t now)
@@ -454,13 +454,9 @@ static void timg_wdt_sync(ESP32P4TimgWdt *w, int64_t now)
     uint64_t cycles = timg_wdt_cycles(w, now);
     uint32_t ps = timg_wdt_prescale(w);
 
-    if (!w->running) {
-        w->sync_ns = now;
-        return;
-    }
     w->count += (w->pre + cycles) / ps;
     w->pre = (w->pre + cycles) % ps;
-    w->sync_ns += timg_cycles_ns(w->clk, cycles);
+    w->synced += cycles;
 }
 
 /* Schedule the current stage's timeout, after a sync. */
@@ -477,8 +473,10 @@ static void timg_wdt_schedule(ESP32P4TimgState *s)
     if (!ahead) {
         ahead = 1ull << 32;
     }
-    w->due_ns = w->sync_ns +
-                timg_cycles_ns(w->clk, ahead * timg_wdt_prescale(w) - w->pre);
+    w->due_ns = MIN(esp32p4_clk_count_time(&w->edges, w->synced +
+                                           ahead * timg_wdt_prescale(w) -
+                                           w->pre),
+                    INT64_MAX / 4);
     timer_mod(&w->timer, w->due_ns);
 }
 
@@ -495,7 +493,8 @@ static void timg_wdt_update(ESP32P4TimgState *s, int64_t now)
         w->pre = 0;
     }
     if (running && !w->running) {
-        w->sync_ns = now;
+        esp32p4_clk_count_start(&w->edges, w->clk, now);
+        w->synced = 0;
     }
     w->running = running;
     timg_wdt_schedule(s);
@@ -578,7 +577,8 @@ static void timg_wdt_clk_update(void *opaque, ClockEvent event)
         timg_wdt_sync(&s->wdt, now);
         return;
     }
-    s->wdt.sync_ns = now;
+    esp32p4_clk_count_start(&s->wdt.edges, s->wdt.clk, now);
+    s->wdt.synced = 0;
     timg_wdt_update(s, now);
 }
 
@@ -602,31 +602,42 @@ static bool timg_cal_counting_clocks(ESP32P4TimgState *s)
 }
 
 /*
+ * XTAL_CLK's cycles in @n cycles of the measured clock, from an XTAL_CLK
+ * edge at the first of them: exact while XTAL_CLK's period is a whole
+ * number of ns, as the crystal's 25 ns is; with another, the whole ns
+ * before the end of cycle @n.
+ */
+static uint64_t timg_cal_xtal_in(ESP32P4TimgState *s, uint64_t n)
+{
+    return esp32p4_clk_ns_cycles(s->xtal_edges.period,
+        esp32p4_clk_cycles_ns_floor(s->cal_edges.period, n));
+}
+
+/*
  * Count the measurement up to @now at the clocks' current rates, ahead of
  * a change of rate: once counting, whole cycles of the measured clock, with
- * XTAL_CLK's up to the last of them, so that the value stays XTAL_CLK's
- * count over whole cycles; and XTAL_CLK's cycles since the start, for the
- * timeout.
+ * XTAL_CLK's in them, so that the value stays XTAL_CLK's count over whole
+ * cycles; and XTAL_CLK's cycles since the start, for the timeout.
  */
 static void timg_cal_fold(ESP32P4TimgState *s, int64_t now)
 {
     ESP32P4TimgCal *c = &s->cal;
+    uint64_t at = esp32p4_clk_count_at(&s->cal_edges, now);
+    uint64_t xtal_at = esp32p4_clk_count_at(&s->xtal_edges, now);
 
     if (c->active && c->counting && timg_cal_counting_clocks(s) &&
-        now > c->seg_ns) {
+        at > c->first) {
         /* The end has not come: the count is short of the target. */
-        uint64_t cycles = MIN(clock_ns_to_ticks(s->cal_clk, now - c->seg_ns),
-                              c->target - c->cycles - 1);
+        uint64_t cycles = MIN(at - c->first, c->target - c->cycles - 1);
 
         c->cycles += cycles;
-        c->xtal += clock_ns_to_ticks(s->xtal,
-                                     clock_ticks_to_ns(s->cal_clk, cycles));
+        c->xtal += timg_cal_xtal_in(s, cycles);
     }
-    c->seg_ns = now;
-    if (c->active && clock_is_enabled(s->xtal) && now > c->to_seg_ns) {
-        c->since_start += clock_ns_to_ticks(s->xtal, now - c->to_seg_ns);
+    c->first = at;
+    if (c->active && xtal_at > c->xtal_first) {
+        c->since_start += xtal_at - c->xtal_first;
     }
-    c->to_seg_ns = now;
+    c->xtal_first = xtal_at;
 }
 
 /* Schedule the measurement's next event, its first edge or its end. */
@@ -638,16 +649,14 @@ static void timg_cal_arm(ESP32P4TimgState *s, int64_t now)
     if (!c->active || !timg_cal_counting_clocks(s)) {
         return;
     }
-    c->seg_ns = now;
     if (!c->counting) {
-        uint64_t edge = clock_ns_to_ticks(s->cal_clk, now) + 1;
-
-        c->event_ns = MAX(timg_cycles_ns(s->cal_clk, edge), now);
+        c->first = esp32p4_clk_count_at(&s->cal_edges, now) + 1;
+        c->event_ns = esp32p4_clk_count_time(&s->cal_edges, c->first);
     } else {
-        c->event_ns = now + timg_cycles_ns(s->cal_clk,
-                                           c->target - c->cycles);
+        c->event_ns = esp32p4_clk_count_time(&s->cal_edges, c->first +
+                                             c->target - c->cycles);
     }
-    timer_mod(&c->timer, c->event_ns);
+    timer_mod(&c->timer, MIN(c->event_ns, INT64_MAX / 4));
 }
 
 /* Schedule the timeout: when XTAL_CLK's count exceeds the threshold. */
@@ -664,8 +673,10 @@ static void timg_cal_arm_timeout(ESP32P4TimgState *s, int64_t now)
         timer_mod(&c->timeout_timer, now);
         return;
     }
-    timer_mod(&c->timeout_timer, c->to_seg_ns +
-              timg_cycles_ns(s->xtal, need - c->since_start));
+    timer_mod(&c->timeout_timer,
+              MIN(esp32p4_clk_count_time(&s->xtal_edges, c->xtal_first +
+                                         need - c->since_start),
+                  INT64_MAX / 4));
 }
 
 static void timg_cal_stop(ESP32P4TimgState *s)
@@ -693,14 +704,13 @@ static void timg_cal_begin(ESP32P4TimgState *s, bool oneshot,
     c->cycles = 0;
     c->xtal = 0;
     c->since_start = 0;
-    c->to_seg_ns = now;
+    c->xtal_first = esp32p4_clk_count_at(&s->xtal_edges, now);
     if (by_software) {
         c->timeout = false;
     }
     if (oneshot) {
         c->rdy = false;
     }
-    c->seg_ns = now;
     timg_cal_arm(s, now);
     timg_cal_arm_timeout(s, now);
 }
@@ -722,13 +732,12 @@ static void timg_cal_event(ESP32P4TimgState *s, int64_t when)
     }
     if (!c->counting) {
         c->counting = true;
-        c->seg_ns = when;
         if (c->target) {
             timg_cal_arm(s, when);
             return;
         }
     } else {
-        c->xtal += clock_ns_to_ticks(s->xtal, when - c->seg_ns);
+        c->xtal += timg_cal_xtal_in(s, c->target - c->cycles);
     }
     c->value = extract64(c->xtal, 0, CAL_VALUE_BITS);
     if (c->oneshot) {
@@ -752,9 +761,10 @@ static void timg_cal_timeout(ESP32P4TimgState *s, int64_t when)
     c->timeout = true;
     if (cycling && (c->cfg & CAL_START_CYCLING)) {
         c->restart_pending = true;
-        timer_mod(&c->timer, when + timg_cycles_ns(s->xtal,
-                                                   CAL2_RST_CNT(c->cfg2)));
-        c->event_ns = timer_expire_time_ns(&c->timer);
+        c->event_ns = MAX(esp32p4_clk_count_time(&s->xtal_edges,
+                              esp32p4_clk_count_at(&s->xtal_edges, when) +
+                              CAL2_RST_CNT(c->cfg2)), when);
+        timer_mod(&c->timer, MIN(c->event_ns, INT64_MAX / 4));
     }
 }
 
@@ -819,10 +829,13 @@ static void timg_cal_write(ESP32P4TimgState *s, uint32_t value, int64_t now)
     }
 }
 
-/* A clock of the calibration is about to change rate, or has. */
-static void timg_cal_clk_update(void *opaque, ClockEvent event)
+/*
+ * A clock of the calibration is about to change rate, or has: its cycles
+ * begin afresh from the change.
+ */
+static void timg_cal_clock_update(ESP32P4TimgState *s, ClockEvent event,
+                                  bool xtal)
 {
-    ESP32P4TimgState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (event == ClockPreUpdate) {
@@ -830,10 +843,27 @@ static void timg_cal_clk_update(void *opaque, ClockEvent event)
         timg_cal_fold(s, now);
         return;
     }
+    if (xtal) {
+        esp32p4_clk_count_start(&s->xtal_edges, s->xtal, now);
+        s->cal.xtal_first = 0;
+    } else {
+        esp32p4_clk_count_start(&s->cal_edges, s->cal_clk, now);
+        s->cal.first = 0;
+    }
     if (s->cal.active) {
         timg_cal_arm(s, now);
         timg_cal_arm_timeout(s, now);
     }
+}
+
+static void timg_xtal_update(void *opaque, ClockEvent event)
+{
+    timg_cal_clock_update(opaque, event, true);
+}
+
+static void timg_cal_clk_update(void *opaque, ClockEvent event)
+{
+    timg_cal_clock_update(opaque, event, false);
 }
 
 /* Registers ----------------------------------------------------------- */
@@ -1173,7 +1203,8 @@ static void esp32p4_timg_reset_hold(Object *obj, ResetType type)
         t->latched = 0;
         t->count = 0;
         t->pre = 0;
-        t->sync_ns = now;
+        esp32p4_clk_count_start(&t->edges, t->clk, now);
+        t->synced = 0;
         t->running = false;
     }
     timer_del(&w->timer);
@@ -1189,10 +1220,13 @@ static void esp32p4_timg_reset_hold(Object *obj, ResetType type)
     w->stage = 0;
     w->count = 0;
     w->pre = 0;
-    w->sync_ns = now;
+    esp32p4_clk_count_start(&w->edges, w->clk, now);
+    w->synced = 0;
     w->running = false;
 
     timg_cal_stop(s);
+    esp32p4_clk_count_start(&s->xtal_edges, s->xtal, now);
+    esp32p4_clk_count_start(&s->cal_edges, s->cal_clk, now);
     s->cal.cfg = CAL_RESET;
     s->cal.cfg2 = CAL2_RESET;
     s->cal.rdy = false;
@@ -1240,7 +1274,7 @@ static void esp32p4_timg_init(Object *obj)
                                      ClockPreUpdate | ClockUpdate);
     s->wdt.clk = qdev_init_clock_in(dev, "wdt", timg_wdt_clk_update, s,
                                     ClockPreUpdate | ClockUpdate);
-    s->xtal = qdev_init_clock_in(dev, "xtal", timg_cal_clk_update, s,
+    s->xtal = qdev_init_clock_in(dev, "xtal", timg_xtal_update, s,
                                  ClockPreUpdate | ClockUpdate);
     s->cal_clk = qdev_init_clock_in(dev, "cal", timg_cal_clk_update, s,
                                     ClockPreUpdate | ClockUpdate);
@@ -1281,8 +1315,8 @@ static void esp32p4_timg_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_esp32p4_timg_timer = {
     .name = TYPE_ESP32P4_TIMG "/timer",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4TimgTimer),
         VMSTATE_TIMER(timer, ESP32P4TimgTimer),
@@ -1292,7 +1326,8 @@ static const VMStateDescription vmstate_esp32p4_timg_timer = {
         VMSTATE_UINT64(latched, ESP32P4TimgTimer),
         VMSTATE_UINT64(count, ESP32P4TimgTimer),
         VMSTATE_UINT32(pre, ESP32P4TimgTimer),
-        VMSTATE_INT64(sync_ns, ESP32P4TimgTimer),
+        VMSTATE_ESP32P4_CLK_COUNT(edges, ESP32P4TimgTimer),
+        VMSTATE_UINT64(synced, ESP32P4TimgTimer),
         VMSTATE_BOOL(running, ESP32P4TimgTimer),
         VMSTATE_INT64(due_ns, ESP32P4TimgTimer),
         VMSTATE_END_OF_LIST()
@@ -1301,8 +1336,8 @@ static const VMStateDescription vmstate_esp32p4_timg_timer = {
 
 static const VMStateDescription vmstate_esp32p4_timg_wdt = {
     .name = TYPE_ESP32P4_TIMG "/wdt",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4TimgWdt),
         VMSTATE_TIMER(timer, ESP32P4TimgWdt),
@@ -1317,7 +1352,8 @@ static const VMStateDescription vmstate_esp32p4_timg_wdt = {
         VMSTATE_UINT32(stage, ESP32P4TimgWdt),
         VMSTATE_UINT32(count, ESP32P4TimgWdt),
         VMSTATE_UINT32(pre, ESP32P4TimgWdt),
-        VMSTATE_INT64(sync_ns, ESP32P4TimgWdt),
+        VMSTATE_ESP32P4_CLK_COUNT(edges, ESP32P4TimgWdt),
+        VMSTATE_UINT64(synced, ESP32P4TimgWdt),
         VMSTATE_BOOL(running, ESP32P4TimgWdt),
         VMSTATE_INT64(due_ns, ESP32P4TimgWdt),
         VMSTATE_END_OF_LIST()
@@ -1326,8 +1362,8 @@ static const VMStateDescription vmstate_esp32p4_timg_wdt = {
 
 static const VMStateDescription vmstate_esp32p4_timg_cal = {
     .name = TYPE_ESP32P4_TIMG "/cal",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER(timer, ESP32P4TimgCal),
         VMSTATE_TIMER(timeout_timer, ESP32P4TimgCal),
@@ -1343,10 +1379,10 @@ static const VMStateDescription vmstate_esp32p4_timg_cal = {
         VMSTATE_UINT32(target, ESP32P4TimgCal),
         VMSTATE_UINT64(cycles, ESP32P4TimgCal),
         VMSTATE_UINT64(xtal, ESP32P4TimgCal),
-        VMSTATE_INT64(seg_ns, ESP32P4TimgCal),
+        VMSTATE_UINT64(first, ESP32P4TimgCal),
         VMSTATE_INT64(event_ns, ESP32P4TimgCal),
         VMSTATE_UINT64(since_start, ESP32P4TimgCal),
-        VMSTATE_INT64(to_seg_ns, ESP32P4TimgCal),
+        VMSTATE_UINT64(xtal_first, ESP32P4TimgCal),
         VMSTATE_BOOL(restart_pending, ESP32P4TimgCal),
         VMSTATE_END_OF_LIST()
     },
@@ -1354,17 +1390,19 @@ static const VMStateDescription vmstate_esp32p4_timg_cal = {
 
 static const VMStateDescription vmstate_esp32p4_timg = {
     .name = TYPE_ESP32P4_TIMG,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
-        VMSTATE_STRUCT_ARRAY(t, ESP32P4TimgState, ESP32P4_TIMG_TIMERS, 1,
+        VMSTATE_STRUCT_ARRAY(t, ESP32P4TimgState, ESP32P4_TIMG_TIMERS, 2,
                              vmstate_esp32p4_timg_timer, ESP32P4TimgTimer),
-        VMSTATE_STRUCT(wdt, ESP32P4TimgState, 1, vmstate_esp32p4_timg_wdt,
+        VMSTATE_STRUCT(wdt, ESP32P4TimgState, 2, vmstate_esp32p4_timg_wdt,
                        ESP32P4TimgWdt),
-        VMSTATE_STRUCT(cal, ESP32P4TimgState, 1, vmstate_esp32p4_timg_cal,
+        VMSTATE_STRUCT(cal, ESP32P4TimgState, 2, vmstate_esp32p4_timg_cal,
                        ESP32P4TimgCal),
         VMSTATE_CLOCK(xtal, ESP32P4TimgState),
         VMSTATE_CLOCK(cal_clk, ESP32P4TimgState),
+        VMSTATE_ESP32P4_CLK_COUNT(xtal_edges, ESP32P4TimgState),
+        VMSTATE_ESP32P4_CLK_COUNT(cal_edges, ESP32P4TimgState),
         VMSTATE_UINT32(int_ena, ESP32P4TimgState),
         VMSTATE_UINT32(int_raw, ESP32P4TimgState),
         VMSTATE_UINT32(date, ESP32P4TimgState),

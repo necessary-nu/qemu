@@ -63,6 +63,20 @@ typedef struct TimersState {
     int64_t qemu_icount_time;
     uint32_t qemu_icount_time_frac;
 
+    /*
+     * The window of virtual time the CPUs with an icount clock run through
+     * together (tcg-accel-ops-icount.c), from window_ns + window_frac
+     * 2^-32 ns of qemu_icount_time on, window_units 2^-32 ns long, which
+     * window_cpus CPUs take part in, window_running of them not idle. No
+     * window while window_cpus is 0. Written only by the vCPU thread; not
+     * migrated: a window starts afresh.
+     */
+    int64_t window_ns;
+    uint32_t window_frac;
+    uint64_t window_units;
+    int window_cpus;
+    int window_running;
+
     /* for adjusting icount */
     QEMUTimer *icount_rt_timer;
     QEMUTimer *icount_vm_timer;
