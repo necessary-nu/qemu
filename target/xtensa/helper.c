@@ -362,6 +362,12 @@ void xtensa_runstall(CPUXtensaState *env, bool runstall)
     if (runstall) {
         cpu_interrupt(cpu, CPU_INTERRUPT_HALT);
     } else {
+        /*
+         * A stall the CPU has not yet acted on (it was not running, as
+         * when another CPU stalls and releases it in the round-robin
+         * thread) must not halt it once released.
+         */
+        cpu_reset_interrupt(cpu, CPU_INTERRUPT_HALT);
         qemu_cpu_kick(cpu);
     }
 }
