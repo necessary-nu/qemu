@@ -34,6 +34,7 @@
 #include "hw/timer/esp32p4_systimer.h"
 #include "hw/timer/esp32p4_timg.h"
 #include "hw/ssi/esp32p4_mspi.h"
+#include "hw/ssi/esp32p4_spi.h"
 #include "system/memory.h"
 #include "target/riscv/esp32p4_cpu.h"
 
@@ -130,6 +131,8 @@ struct ESP32P4MachineState {
     /* GDMA-AHB, GDMA-AXI. */
     ESP32P4GdmaState gdma[2];
     ESP32P4DwGdmaState vdma;
+    /* GP-SPI2, GP-SPI3. */
+    ESP32P4SpiState spi[2];
 
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];

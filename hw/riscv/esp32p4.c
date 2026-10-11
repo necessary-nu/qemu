@@ -106,6 +106,15 @@
  *     peripheral served by GDMA attaches to its controller as
  *     include/hw/dma/esp32p4_gdma.h describes; VDMA's handshaking
  *     interfaces, for MIPI DSI and the ISP, are its named GPIOs.
+ *   - GP-SPI2 and GP-SPI3 (TRM chapter 46) at 0x500D0000 and 0x500D1000,
+ *     masters or slaves, through GDMA-AXI, their bus signals through the
+ *     GPIO matrix and (GP-SPI2's) the IO MUX, their interrupts sources 25
+ *     and 26. The board's SPI devices are QEMU SSI devices on their buses,
+ *     "spi2" and "spi3", wired to whichever pads carry the controller's
+ *     chip select and data lines (include/hw/ssi/esp32p4_spi.h):
+ *
+ *       -device w25q32,bus=spi2,cs=0
+ *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
  * a file longer than 512 bytes. A blank, all-zero, file starts as a
@@ -217,8 +226,6 @@ static const struct {
     { "uart3",            0x500cd000, 4 * KiB },
     { "uart4",            0x500ce000, 4 * KiB },
     { "parl-io",          0x500cf000, 4 * KiB },
-    { "spi2",             0x500d0000, 4 * KiB },
-    { "spi3",             0x500d1000, 4 * KiB },
     { "usb-serial-jtag",  0x500d2000, 4 * KiB },
     { "ledc",             0x500d3000, 4 * KiB },
     { "etm",              0x500d5000, 4 * KiB },
@@ -1257,6 +1264,78 @@ static void esp32p4_init_dma(ESP32P4MachineState *s)
                        esp32p4_intr_source(s, ESP32P4_INTR_DW_GDMA));
 }
 
+/*
+ * GP-SPI2 and GP-SPI3, their registers behind GPSPI2_APB_CLK and
+ * GPSPI3_APB_CLK and their resets, their data paths on GPSPI*_SYS_CLK and
+ * their masters on clk_spi_mst (GPSPI*_MST_CLK); their DMA through
+ * GDMA-AXI, their interrupts sources 25 and 26, their bus signals through
+ * the GPIO matrix (and, for GP-SPI2, the IO MUX), and each the other's
+ * peer on the pads. Their buses are "spi2" and "spi3".
+ */
+/* [spec:nuos:req:emu.esp32p4.spi] */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_spi(ESP32P4MachineState *s)
+{
+    static const struct {
+        hwaddr base;
+        unsigned bus_clock;
+        unsigned reset;
+        int intr;
+        const char *mst;
+        const char *sys;
+    } spi[2] = {
+        { ESP32P4_SPI2_BASE, ESP32P4_CLK_GPSPI2_APB, ESP32P4_RST_SPI2,
+          ESP32P4_INTR_SPI2, "gpspi2-mst", "gpspi2-sys" },
+        { ESP32P4_SPI3_BASE, ESP32P4_CLK_GPSPI3_APB, ESP32P4_RST_SPI3,
+          ESP32P4_INTR_SPI3, "gpspi3-mst", "gpspi3-sys" },
+    };
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    DeviceState *gpio = DEVICE(&s->gpio);
+    int i, line;
+
+    for (i = 0; i < 2; i++) {
+        object_initialize_child(OBJECT(s), i ? "spi3" : "spi2", &s->spi[i],
+                                TYPE_ESP32P4_SPI);
+    }
+    for (i = 0; i < 2; i++) {
+        DeviceState *dev = DEVICE(&s->spi[i]);
+        SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+        unsigned host = 2 + i;
+
+        qdev_prop_set_uint8(dev, "host", host);
+        object_property_set_link(OBJECT(dev), "gdma", OBJECT(&s->gdma[1]),
+                                 &error_abort);
+        object_property_set_link(OBJECT(dev), "gpio", OBJECT(gpio),
+                                 &error_abort);
+        object_property_set_link(OBJECT(dev), "peer", OBJECT(&s->spi[!i]),
+                                 &error_abort);
+        qdev_connect_clock_in(dev, "mst",
+                              qdev_get_clock_out(clkrst, spi[i].mst));
+        qdev_connect_clock_in(dev, "sys",
+                              qdev_get_clock_out(clkrst, spi[i].sys));
+        sysbus_realize(sbd, &error_fatal);
+        esp32p4_clkrst_map_gated(&s->clkrst, sbd, 0, spi[i].base,
+                                 spi[i].bus_clock, spi[i].reset, 0);
+        sysbus_connect_irq(sbd, 0, esp32p4_intr_source(s, spi[i].intr));
+        for (line = 0; line < ESP32P4_SPI_LINES; line++) {
+            int sig = esp32p4_spi_line_signal(host, line);
+
+            if (sig < 0) {
+                continue;
+            }
+            qdev_connect_gpio_out_named(dev, ESP32P4_SPI_SIG_OUT, line,
+                qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT, sig));
+            qdev_connect_gpio_out_named(dev, ESP32P4_SPI_SIG_OE, line,
+                qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OE, sig));
+            if (esp32p4_spi_line_has_input(host, line)) {
+                qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN, sig,
+                    qdev_get_gpio_in_named(dev, ESP32P4_SPI_SIG_IN, line));
+            }
+        }
+    }
+}
+
 /* The memories -kernel can load into: those the cores address directly. */
 static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
 {
@@ -1395,6 +1474,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_pms(s);
     esp32p4_init_ext_memory(s);
     esp32p4_init_dma(s);
+    esp32p4_init_spi(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
                         esp32p4_unimplemented[i].name,

@@ -367,7 +367,8 @@ qtests_riscv32 = \
      'esp32p4-clic-test', 'esp32p4-intmatrix-test', 'esp32p4-pms-test',
      'esp32p4-gpio-test', 'esp32p4-mmu-test', 'esp32p4-spimem-test',
      'esp32p4-systimer-test', 'esp32p4-timg-test', 'esp32p4-lpwdt-test',
-     'esp32p4-lp-timer-test', 'esp32p4-gdma-test', 'esp32p4-dwgdma-test'] :
+     'esp32p4-lp-timer-test', 'esp32p4-gdma-test', 'esp32p4-dwgdma-test',
+     'esp32p4-spi-test'] :
     [])
 
 qtests_riscv64 = ['riscv-csr-test'] + \
