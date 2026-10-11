@@ -10,6 +10,7 @@
 #define HW_NET_ESP32P4_EMAC_H
 
 #include "hw/net/esp32_dwmac.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "hw/misc/esp32p4_pms.h"
 
@@ -85,6 +86,8 @@ struct ESP32P4EmacState {
     Clock *tx_clk;
     Clock *phy_ref_clk;
     Clock *pad_txrx_clk;
+    /* The exact period of the clock on "pad-txrx". */
+    ESP32P4ClkPeriod pad_txrx_period;
 
     /* PHY_INTF_SEL as HP_SYSTEM drives it, and as the last reset took it */
     uint8_t phy_intf_sel;
