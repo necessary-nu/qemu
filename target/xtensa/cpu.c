@@ -153,6 +153,19 @@ static bool xtensa_cpu_has_work(CPUState *cs)
 
     return !env->runstall && env->pending_irq_level;
 }
+
+/*
+ * A halted CPU, stalled or in WAITI, runs again once released with an
+ * interrupt to take, which ends its WAITI.
+ */
+static bool xtensa_cpu_exec_halt(CPUState *cs)
+{
+    if (!xtensa_cpu_has_work(cs)) {
+        return false;
+    }
+    cpu_env(cs)->waiti = false;
+    return true;
+}
 #endif /* !CONFIG_USER_ONLY */
 
 static int xtensa_cpu_mmu_index(CPUState *cs, bool ifetch)
@@ -212,6 +225,7 @@ static void xtensa_cpu_reset_hold(Object *obj, ResetType type)
 
 #ifndef CONFIG_USER_ONLY
     reset_mmu(env);
+    env->waiti = false;
     cs->halted = env->runstall;
     for (unsigned i = 0; i < XTENSA_EXT_COUNTDOWNS; ++i) {
         env->ext_countdown[i] = -1;
@@ -354,7 +368,7 @@ static const TCGCPUOps xtensa_tcg_ops = {
     .tlb_fill = xtensa_cpu_tlb_fill,
     .pointer_wrap = cpu_pointer_wrap_uint32,
     .cpu_exec_interrupt = xtensa_cpu_exec_interrupt,
-    .cpu_exec_halt = xtensa_cpu_has_work,
+    .cpu_exec_halt = xtensa_cpu_exec_halt,
     .cpu_exec_reset = cpu_reset,
     .do_interrupt = xtensa_cpu_do_interrupt,
     .do_transaction_failed = xtensa_cpu_do_transaction_failed,
