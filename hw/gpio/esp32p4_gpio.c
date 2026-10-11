@@ -2661,8 +2661,10 @@ static void esp32p4_gpio_set_light_sleep(void *opaque, int n, int level)
 
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
+ * [spec:nuos:req:emu.esp32p4.etm]
  * An analog comparator's output: its edges latch COMP<n>_POS_INT_RAW
- * (rising), _NEG_INT_RAW (falling) and _ALL_INT_RAW, but not within
+ * (rising), _NEG_INT_RAW (falling) and _ALL_INT_RAW, and pulse the ETM
+ * event GPIO_EVT_ZERO_DET_POS<n> or _NEG<n>, but not within
  * GPIO_ZERO_DET<n>_FILTER_CNT IO MUX operating clock cycles of the
  * comparator's last interrupt.
  */
@@ -2671,6 +2673,7 @@ static void esp32p4_gpio_set_ana_comp(void *opaque, int n, int level)
     ESP32P4GpioState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t quiet;
+    qemu_irq etm = NULL;
 
     if (s->ana_comp[n] == (level != 0)) {
         return;
@@ -2681,8 +2684,10 @@ static void esp32p4_gpio_set_ana_comp(void *opaque, int n, int level)
         now - s->ana_comp_int_ns[n] >= quiet) {
         s->int_raw |= BIT(3 * n + (level ? 1 : 0)) | BIT(3 * n + 2);
         s->ana_comp_int_ns[n] = now;
+        etm = s->etm_zero_det[2 * n + (level ? 0 : 1)];
     }
     esp32p4_gpio_update(s);
+    qemu_irq_pulse(etm);
 }
 
 /*
@@ -3028,6 +3033,8 @@ static void esp32p4_gpio_init(Object *obj)
                              ESP32P4_GPIO_ETM_LINES);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_etm_task, ESP32P4_GPIO_ETM_TASK,
                             ESP32P4_GPIO_ETM_LINES);
+    qdev_init_gpio_out_named(dev, s->etm_zero_det, ESP32P4_GPIO_ETM_ZERO_DET,
+                             ESP32P4_GPIO_ETM_ZERO_DET_LINES);
 
     /*
      * The signals peripherals drive are theirs, not reset with this block:
