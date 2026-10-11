@@ -1025,6 +1025,14 @@ void qemu_system_shutdown_request_with_code(ShutdownCause reason,
     qemu_system_shutdown_request(reason);
 }
 
+/*
+ * Made from a vCPU thread (a guest's power-off register, PSCI's
+ * SYSTEM_OFF), the request stops every vCPU at once, as a reset request
+ * does: none runs on past it while the main loop exits, or, with
+ * -action shutdown=pause, stops the VM at the virtual time of the request.
+ * From another thread the main loop acts on it before any vCPU could
+ * matter.
+ */
 void qemu_system_shutdown_request(ShutdownCause reason)
 {
     trace_qemu_system_shutdown_request(reason);
@@ -1032,6 +1040,9 @@ void qemu_system_shutdown_request(ShutdownCause reason)
     shutdown_requested = reason;
     if (reason == SHUTDOWN_CAUSE_HOST_QMP_QUIT) {
         force_shutdown = true;
+    }
+    if (qemu_in_vcpu_thread()) {
+        cpu_stop_all();
     }
     qemu_notify_event();
 }
