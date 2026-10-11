@@ -115,6 +115,7 @@ void HELPER(waiti)(CPUXtensaState *env, uint32_t pc, uint32_t intlevel)
         return;
     }
 
+    env->waiti = true;
     cpu->halted = 1;
     HELPER(exception)(env, EXCP_HLT);
 }
