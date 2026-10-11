@@ -2732,6 +2732,18 @@ static void esp32p4_gpio_do_write(void *opaque)
 }
 
 /*
+ * Bring the line sources up to the present, before a write: a source
+ * whose edges due before the write are not yet driven (its timer running
+ * late) would otherwise drive them on reacting to the write's change, from
+ * inside the resolution of that change, which would propagate them at the
+ * write's time rather than their own.
+ */
+static void esp32p4_gpio_sync_sources(void *opaque)
+{
+    esp32_line_sync();
+}
+
+/*
  * [spec:nuos:req:emu.esp32p4.gpio]
  * The other offsets of each block have no register: they read as zero and
  * ignore writes. Byte and halfword accesses read and write their bytes of
@@ -2739,7 +2751,10 @@ static void esp32p4_gpio_do_write(void *opaque)
  * makes (GPIO_OUT, GPIO_ENABLE, the IO MUX, the routing) and the samples
  * of the line sources it takes all carry that time (see esp32_line.h), so
  * that every block an edge reaches sees it at the same moment however its
- * handlers are ordered, and without icount however long they take.
+ * handlers are ordered, and without icount however long they take. A
+ * write first brings the line sources up to that moment, so that the
+ * edges they made before it reach their receivers, each at its own time,
+ * before the write's own changes do.
  */
 static uint64_t esp32p4_gpio_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -2761,6 +2776,7 @@ static void esp32p4_gpio_write(void *opaque, hwaddr addr, uint64_t value,
     };
     int64_t t = esp32_line_time();
 
+    esp32_line_run_at(t, esp32p4_gpio_sync_sources, NULL);
     filters_catch_up(a.r->s, t);
     if (a.r->s->in_reset[blocks[a.r->block].reset]) {
         qemu_log_mask(LOG_GUEST_ERROR,
