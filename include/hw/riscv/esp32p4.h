@@ -30,6 +30,7 @@
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "hw/net/esp32p4_emac.h"
+#include "hw/net/esp32p4_twai.h"
 #include "hw/net/ip101_phy.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/sd/esp32p4_sdmmc.h"
@@ -138,6 +139,9 @@ struct ESP32P4MachineState {
     /* GDMA-AHB, GDMA-AXI. */
     ESP32P4GdmaState gdma[2];
     ESP32P4DwGdmaState vdma;
+    ESP32P4TwaiState twai;
+    /* The QEMU CAN buses on TWAI0 to TWAI2's pads, or NULL. */
+    CanBusState *canbus[ESP32P4_TWAI_NUM];
 
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];
