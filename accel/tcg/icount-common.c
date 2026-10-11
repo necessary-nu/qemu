@@ -183,6 +183,20 @@ int64_t icount_get(void)
     return icount;
 }
 
+int64_t icount_get_precise(uint32_t *frac)
+{
+    int64_t icount;
+    unsigned start;
+
+    do {
+        start = seqlock_read_begin(&timers_state.vm_clock_seqlock);
+        icount = icount_get_locked();
+        *frac = timers_state.qemu_icount_time_frac;
+    } while (seqlock_read_retry(&timers_state.vm_clock_seqlock, start));
+
+    return icount;
+}
+
 int64_t icount_to_ns(int64_t icount)
 {
     return icount << qatomic_read(&timers_state.icount_time_shift);
