@@ -249,7 +249,8 @@ static void esp32_soc_board_buses(Esp32SocState *s, void (*fn)(BusState *))
     for (int i = 0; i < ESP32_SPI_COUNT; i++) {
         fn(qdev_get_child_bus(DEVICE(&s->spi[i]), "spi"));
     }
-    fn(qdev_get_child_bus(DEVICE(&s->sdmmc), "sd-bus"));
+    fn(qdev_get_child_bus(DEVICE(&s->sdmmc), "sd-bus0"));
+    fn(qdev_get_child_bus(DEVICE(&s->sdmmc), "sd-bus1"));
 }
 
 static void esp32_soc_reset(DeviceState *dev)
@@ -1599,11 +1600,26 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_FLASH_DEC_EN_GPIO, 0,
                                 qdev_get_gpio_in_named(DEVICE(&s->flash_enc), ESP32_FLASH_ENCRYPTION_DEC_EN_GPIO, 0));
 
+    /*
+     * The SD/MMC host: its bus interface on APB_CLK, its card interface on
+     * PLL_F160M_CLK divided by CLK_EDGE_SEL's N + 1.
+     */
+    qdev_prop_set_uint32(DEVICE(&s->sdmmc), "ctrl-reset", 0x01000000);
+    qdev_prop_set_uint32(DEVICE(&s->sdmmc), "clk-edge-mask", 0x001fffff);
+    qdev_prop_set_uint32(DEVICE(&s->sdmmc), "clk-edge-reset", 0x00020200);
+    qdev_prop_set_bit(DEVICE(&s->sdmmc), "clk-edge-div", true);
     qdev_realize(DEVICE(&s->sdmmc), &s->periph_bus, &error_abort);
-    esp32_soc_add_gated_device(s, &s->sdmmc, DR_REG_SDMMC_BASE,
-                               ESP32_GATE_WIFI,
-                               R_DPORT_WIFI_CLK_EN_SDIO_HOST_MASK,
-                               R_DPORT_CORE_RST_EN_SDIO_HOST_MASK);
+    {
+        Esp32PeriphGate *g = esp32_soc_add_gated_device(
+            s, &s->sdmmc, DR_REG_SDMMC_BASE, ESP32_GATE_WIFI,
+            R_DPORT_WIFI_CLK_EN_SDIO_HOST_MASK,
+            R_DPORT_CORE_RST_EN_SDIO_HOST_MASK);
+
+        g->apb_clk = s->sdmmc_apb_clk;
+        g->f160m_clk = s->sdmmc_f160m_clk;
+        g->volatile_reg = 0x200;
+        g->has_volatile_reg = true;
+    }
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdmmc), 0,
                        qdev_get_gpio_in(intmatrix_dev, ETS_SDIO_HOST_INTR_SOURCE));
 
@@ -2018,6 +2034,10 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "flash_enc", &s->flash_enc, TYPE_ESP32_FLASH_ENCRYPTION);
 
     object_initialize_child(obj, "sdmmc", &s->sdmmc, TYPE_DWC_SDMMC);
+    s->sdmmc_apb_clk = clock_new(obj, "sdmmc-apb");
+    qdev_connect_clock_in(DEVICE(&s->sdmmc), "hclk", s->sdmmc_apb_clk);
+    s->sdmmc_f160m_clk = clock_new(obj, "sdmmc-f160m");
+    qdev_connect_clock_in(DEVICE(&s->sdmmc), "cclk-in", s->sdmmc_f160m_clk);
 
     object_initialize_child(obj, "emac", &s->emac, TYPE_ESP32_EMAC);
     s->emac_apb_clk = clock_new(obj, "emac-apb");
@@ -2159,6 +2179,11 @@ static void esp32_machine_init_i2c(Esp32SocState *s)
                             &error_fatal);
 }
 
+/*
+ * The board's SD card, -drive if=sd, in the SD/MMC host's slot 1: slot
+ * 0's pads (GPIO6 to GPIO11) carry the flash on a module, so a board's
+ * card socket is on slot 1, where ESP-IDF looks for it by default.
+ */
 static void esp32_machine_init_sd(Esp32SocState *ss)
 {
     DriveInfo *dinfo = drive_get(IF_SD, 0, 0);
@@ -2170,7 +2195,7 @@ static void esp32_machine_init_sd(Esp32SocState *ss)
                                 &error_fatal);
         /* See the comment on not using sysbus-default in esp32_machine_init_i2c */
         DeviceState *sdmmc = DEVICE(&ss->sdmmc);
-        SDBus* sd_bus = SD_BUS(qdev_get_child_bus(sdmmc, "sd-bus"));
+        SDBus* sd_bus = SD_BUS(qdev_get_child_bus(sdmmc, "sd-bus1"));
         qdev_realize_and_unref(card, BUS(sd_bus), &error_fatal);
     }
 }

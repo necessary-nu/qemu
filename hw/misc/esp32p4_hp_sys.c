@@ -37,6 +37,14 @@
  *     else answers L2MEM accesses with an error. Their interrupt is the
  *     HP_SYSREG source (sysbus IRQ 0).
  *
+ *   - HP_SYSTEM_GMAC_CTRL0_REG (0x14C) to _CTRL2_REG (0x154): the EMAC's
+ *     PHY interface (PHY_INTF_SEL) and sideband flow control request
+ *     (SBD_FLOWCTRL), to the EMAC ("gmac-phy-intf-sel",
+ *     "gmac-sbd-flowctrl" outputs); its PPS output and its resets in its
+ *     transmit and receive clock domains as the EMAC drives them
+ *     ("gmac-status" inputs); and its system time, read from the EMAC.
+ *     GMAC_MEM_CLK_FORCE_ON is held: the EMAC's FIFO memories always run.
+ *
  * The rest of the block's registers are logged as unimplemented and read
  * as zero.
  */
@@ -66,6 +74,16 @@
 #define A_L2_MEM_INT_RECORD0    0xb0
 #define RECORD0_ADDR_MASK       0x1fffff
 #define RECORD0_WE              BIT(21)
+#define A_GMAC_CTRL0            0x14c
+#define GMAC_CTRL0_PTP_PPS      BIT(0)
+#define GMAC_CTRL0_SBD_FLOWCTRL BIT(1)
+#define GMAC_CTRL0_PHY_INTF_SHIFT 2
+#define GMAC_CTRL0_PHY_INTF     (7u << GMAC_CTRL0_PHY_INTF_SHIFT)
+#define GMAC_CTRL0_RST_CLK_TX_N BIT(6)
+#define GMAC_CTRL0_RST_CLK_RX_N BIT(7)
+#define GMAC_CTRL0_RW           0x3e
+#define A_GMAC_CTRL1            0x150
+#define A_GMAC_CTRL2            0x154
 #define A_L2_MEM_ERR_RESP_CTRL  0x198
 #define L2_MEM_ERR_RESP_EN      BIT(0)
 
@@ -90,6 +108,20 @@ void esp32p4_hp_sys_l2mem_exceed(ESP32P4HPSysState *s, uint32_t offset,
     }
     s->l2_mem_int_raw |= L2_MEM_EXCEED_ADDR_INT;
     esp32p4_hp_sys_update_irq(s);
+}
+
+void esp32p4_hp_sys_set_gmac_ptp(ESP32P4HPSysState *s,
+                                 uint64_t (*time)(void *opaque),
+                                 void *opaque)
+{
+    s->gmac_ptp_time = time;
+    s->gmac_ptp_opaque = opaque;
+}
+
+/* [spec:nuos:req:emu.esp32p4.emac] */
+static uint64_t esp32p4_hp_sys_gmac_time(ESP32P4HPSysState *s)
+{
+    return s->gmac_ptp_time ? s->gmac_ptp_time(s->gmac_ptp_opaque) : 0;
 }
 
 static uint32_t esp32p4_hp_sys_reg(ESP32P4HPSysState *s, hwaddr addr,
@@ -118,6 +150,12 @@ static uint32_t esp32p4_hp_sys_reg(ESP32P4HPSysState *s, hwaddr addr,
         return s->l2_mem_int_record0;
     case A_L2_MEM_ERR_RESP_CTRL:
         return s->l2_mem_err_resp_ctrl;
+    case A_GMAC_CTRL0:
+        return s->gmac_ctrl0 | s->gmac_status;
+    case A_GMAC_CTRL1:
+        return esp32p4_hp_sys_gmac_time(s);
+    case A_GMAC_CTRL2:
+        return esp32p4_hp_sys_gmac_time(s) >> 32;
     default:
         *known = false;
         return 0;
@@ -136,6 +174,34 @@ static uint64_t esp32p4_hp_sys_read(void *opaque, hwaddr addr, unsigned size)
         return 0;
     }
     return extract32(v, (addr & 3) * 8, size * 8);
+}
+
+/* [spec:nuos:req:emu.esp32p4.emac] */
+static void esp32p4_hp_sys_update_gmac(ESP32P4HPSysState *s)
+{
+    for (int i = 0; i < ESP32P4_HP_SYS_GMAC_PHY_INTF_LINES; i++) {
+        qemu_set_irq(s->gmac_phy_intf[i],
+                     extract32(s->gmac_ctrl0,
+                               GMAC_CTRL0_PHY_INTF_SHIFT + i, 1));
+    }
+    qemu_set_irq(s->gmac_sbd_flowctrl,
+                 !!(s->gmac_ctrl0 & GMAC_CTRL0_SBD_FLOWCTRL));
+}
+
+static void esp32p4_hp_sys_set_gmac_status(void *opaque, int n, int level)
+{
+    static const uint32_t bit[ESP32P4_HP_SYS_GMAC_STATUS_LINES] = {
+        [ESP32P4_HP_SYS_GMAC_PTP_PPS] = GMAC_CTRL0_PTP_PPS,
+        [ESP32P4_HP_SYS_GMAC_RST_CLK_TX_N] = GMAC_CTRL0_RST_CLK_TX_N,
+        [ESP32P4_HP_SYS_GMAC_RST_CLK_RX_N] = GMAC_CTRL0_RST_CLK_RX_N,
+    };
+    ESP32P4HPSysState *s = opaque;
+
+    if (level) {
+        s->gmac_status |= bit[n];
+    } else {
+        s->gmac_status &= ~bit[n];
+    }
 }
 
 static void esp32p4_hp_sys_update_crypto(ESP32P4HPSysState *s)
@@ -213,6 +279,24 @@ static void esp32p4_hp_sys_write(void *opaque, hwaddr addr, uint64_t value,
                                    (v & mask)) & L2_MEM_ERR_RESP_EN;
         qemu_set_irq(s->l2mem_err_resp, s->l2_mem_err_resp_ctrl);
         break;
+    case A_GMAC_CTRL0: {
+        unsigned intf;
+
+        s->gmac_ctrl0 = ((s->gmac_ctrl0 & ~mask) | (v & mask)) &
+                        GMAC_CTRL0_RW;
+        intf = (s->gmac_ctrl0 & GMAC_CTRL0_PHY_INTF) >>
+               GMAC_CTRL0_PHY_INTF_SHIFT;
+        if (intf != 0 && intf != 4) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: PHY_INTF_SEL %u is neither "
+                          "MII (0) nor RMII (4)\n", TYPE_ESP32P4_HP_SYS,
+                          intf);
+        }
+        esp32p4_hp_sys_update_gmac(s);
+        break;
+    }
+    case A_GMAC_CTRL1:
+    case A_GMAC_CTRL2:
+        break;
     default:
         qemu_log_mask(LOG_UNIMP, "%s: unimplemented write of %u bytes at "
                       "0x%" HWADDR_PRIx " (value 0x%" PRIx64 ")\n",
@@ -244,6 +328,7 @@ static void esp32p4_hp_sys_reset_hold(Object *obj, ResetType type)
     s->l2_mem_int_ena = 0;
     s->l2_mem_int_record0 = 0;
     s->l2_mem_err_resp_ctrl = 0;
+    s->gmac_ctrl0 = 0;
 }
 
 static void esp32p4_hp_sys_reset_exit(Object *obj, ResetType type)
@@ -256,6 +341,7 @@ static void esp32p4_hp_sys_reset_exit(Object *obj, ResetType type)
     esp32p4_hp_sys_update_cache_reset(s);
     esp32p4_hp_sys_update_crypto(s);
     qemu_set_irq(s->l2mem_err_resp, s->l2_mem_err_resp_ctrl);
+    esp32p4_hp_sys_update_gmac(s);
     esp32p4_hp_sys_update_irq(s);
 }
 
@@ -278,12 +364,20 @@ static void esp32p4_hp_sys_init(Object *obj)
                              ESP32P4_HP_SYS_CRYPTO_CTRL_LINES);
     qdev_init_gpio_out_named(DEVICE(obj), &s->l2mem_err_resp,
                              ESP32P4_HP_SYS_L2MEM_ERR_RESP, 1);
+    qdev_init_gpio_out_named(DEVICE(obj), s->gmac_phy_intf,
+                             ESP32P4_HP_SYS_GMAC_PHY_INTF,
+                             ESP32P4_HP_SYS_GMAC_PHY_INTF_LINES);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->gmac_sbd_flowctrl,
+                             ESP32P4_HP_SYS_GMAC_SBD_FLOWCTRL, 1);
+    qdev_init_gpio_in_named(DEVICE(obj), esp32p4_hp_sys_set_gmac_status,
+                            ESP32P4_HP_SYS_GMAC_STATUS,
+                            ESP32P4_HP_SYS_GMAC_STATUS_LINES);
 }
 
 static const VMStateDescription vmstate_esp32p4_hp_sys = {
     .name = TYPE_ESP32P4_HP_SYS,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(cpu_int_from_cpu, ESP32P4HPSysState,
                              ESP32P4_HP_SYS_CPU_INTRS),
@@ -294,6 +388,8 @@ static const VMStateDescription vmstate_esp32p4_hp_sys = {
         VMSTATE_UINT32(l2_mem_int_ena, ESP32P4HPSysState),
         VMSTATE_UINT32(l2_mem_int_record0, ESP32P4HPSysState),
         VMSTATE_UINT32(l2_mem_err_resp_ctrl, ESP32P4HPSysState),
+        VMSTATE_UINT32(gmac_ctrl0, ESP32P4HPSysState),
+        VMSTATE_UINT32(gmac_status, ESP32P4HPSysState),
         VMSTATE_END_OF_LIST()
     },
 };

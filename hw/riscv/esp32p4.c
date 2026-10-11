@@ -67,6 +67,10 @@
  *     VDD_ANA and VDD_BAT, with the glitch detectors and the power supply
  *     detector, its interrupt source 8; and the LP mailbox (0x50118000),
  *     its interrupts sources 4 and 5.
+ *   - The event task matrix (TRM chapter 14) at 0x500D5000, mapping the
+ *     events of the GPIO matrix, the timers, the RTC timer and GDMA to
+ *     the tasks of the GPIO matrix, the timer groups, GDMA and the LP
+ *     core.
  *   - Permission control (TRM chapter 20): the HP, LP and DMA access
  *     permission managers, through which every core (and DMA master)
  *     reaches the bus, each access carrying its master and privilege mode,
@@ -105,6 +109,21 @@
  *
  *       -M esp32p4,strap-mode=0x08
  *
+ *   - The SD/MMC host controller (TRM chapter 57) at 0x50083000, behind
+ *     SDMMC_SYS_CLK and its reset, its card interface clocked by the
+ *     SDIO_LS clocks, its internal DMA through the permission managers as
+ *     DMA master SDMMC, its interrupt SDIO_HOST_INTR (source 23), and its
+ *     card detect, write protect and SDIO interrupt inputs and card reset
+ *     outputs matrix signals 126 to 131 and 146 to 148. A card on slot N
+ *     is -drive if=sd,index=N: the board's microSD socket is slot 0, on
+ *     the IO MUX pads GPIO39 to GPIO44; slot 1 is where the board's
+ *     ESP32-C6 sits, as an SDIO slave, and has no card unless given one:
+ *
+ *       -drive if=sd,index=0,format=raw,file=sd.img
+ *
+ *     A card is on the board, not the chip: no reset of the chip or the
+ *     controller reaches it, only a power cycle (QEMU's system reset).
+ *
  *   - The DMA controllers (TRM chapters 6 and 7): GDMA-AHB at 0x50085000
  *     and GDMA-AXI at 0x5008A000, three RX and three TX channels each,
  *     behind AHB_PDMA_SYS_CLK and AXI_PDMA_SYS_CLK and their resets, their
@@ -115,6 +134,18 @@
  *     peripheral served by GDMA attaches to its controller as
  *     include/hw/dma/esp32p4_gdma.h describes; VDMA's handshaking
  *     interfaces, for MIPI DSI and the ISP, are its named GPIOs.
+ *
+ *   - The TWAI controllers TWAI0 to TWAI2 (TRM chapter 56) at 0x500D7000,
+ *     0x500D8000 and 0x500D9000, each behind its bus clock, on its function
+ *     clock and reset, its interrupt TWAIn_INTR (sources 40 to 42), its
+ *     twai_tx, twai_rx, twai_bus_off_on, twai_clkout and twai_standby
+ *     signals through the GPIO matrix. Each controller's pads can lead to a
+ *     QEMU CAN bus, the machine's canbus0 to canbus2; controllers on one
+ *     bus arbitrate and acknowledge each other, and can-host-socketcan on
+ *     the bus connects it to the host's (on Linux):
+ *
+ *       -object can-bus,id=can0 -M esp32p4,canbus0=can0,canbus1=can0
+ *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
  * a file longer than 512 bytes. A blank, all-zero, file starts as a
@@ -201,7 +232,6 @@ static const struct {
     { "usb-otg-fs",       0x50040000, 256 * KiB },
     { "usb-wrap",         0x50080000, 4 * KiB },
     { "pau",              0x50082000, 4 * KiB },
-    { "sdmmc",            0x50083000, 4 * KiB },
     { "h264",             0x50084000, 4 * KiB },
     { "jpeg",             0x50086000, 4 * KiB },
     { "ppa",              0x50087000, 4 * KiB },
@@ -214,7 +244,6 @@ static const struct {
     { "ds",               0x50094000, 4 * KiB },
     { "hmac",             0x50095000, 4 * KiB },
     { "ecdsa",            0x50096000, 4 * KiB },
-    { "emac",             0x50098000, 16 * KiB },
     { "usb-phy",          0x5009c000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
     { "pvt",              0x5009e000, 4 * KiB },
@@ -248,10 +277,6 @@ static const struct {
     { "spi3",             0x500d1000, 4 * KiB },
     { "usb-serial-jtag",  0x500d2000, 4 * KiB },
     { "ledc",             0x500d3000, 4 * KiB },
-    { "etm",              0x500d5000, 4 * KiB },
-    { "twai0",            0x500d7000, 4 * KiB },
-    { "twai1",            0x500d8000, 4 * KiB },
-    { "twai2",            0x500d9000, 4 * KiB },
     { "i3c-mst",          0x500da000, 4 * KiB },
     { "i3c-slv",          0x500db000, 4 * KiB },
     { "lcd-cam",          0x500dc000, 4 * KiB },
@@ -509,6 +534,12 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
                               qdev_get_clock_out(ana,
                                                  esp32p4_ana_pll_names[i]));
     }
+    /*
+     * The board's RMII reference clock reaches PAD_EMAC_TXRX_CLK through
+     * the EMAC's IO MUX function on its pad (esp32p4_init_emac()).
+     */
+    qdev_connect_clock_in(clkrst, "pad-emac-txrx-in",
+                          qdev_get_clock_out(DEVICE(&s->emac), "pad-txrx"));
     sysbus_realize(SYS_BUS_DEVICE(ana), &error_fatal);
     sysbus_realize(SYS_BUS_DEVICE(clkrst), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(clkrst), ESP32P4_CLKRST_MMIO_HP,
@@ -768,11 +799,11 @@ static void esp32p4_hp_core_reset(void *opaque, int n, int level)
  * no bus clock gate: their registers are behind LP_DYN_FAST_CLK and their
  * LP_CLKRST resets.
  *
- * Their interrupts are sources of the interrupt matrix. Their ETM events
- * and tasks and the LP core's timer interrupt are named GPIO lines (see
- * the devices' headers) that nothing drives or takes until the ETM and the
- * LP core's interrupts are modelled; the RTC timer's wakeups go to the PMU
- * (esp32p4_init_low_power()).
+ * Their interrupts are sources of the interrupt matrix, and their ETM
+ * events and tasks the ETM's (esp32p4_init_etm()). The RTC timer's wakeups
+ * go to the PMU (esp32p4_init_low_power()); the LP core's timer interrupt
+ * is a named GPIO line (see the device's header) that nothing takes until
+ * the LP core's interrupts are modelled.
  * MWDT0 and the RTC watchdog run their flash boot protection when the
  * chip boots from flash through the boot ROM in SPI boot mode: when the
  * board's strapping (the strap-mode property) has GPIO35 high and there
@@ -1222,6 +1253,212 @@ static void esp32p4_init_pms(ESP32P4MachineState *s)
                                     ESP32P4_PMS_LP_RESET, 0));
 }
 
+/* The EMAC's system time, for HP_SYSTEM_GMAC_CTRL1 and _CTRL2 */
+static uint64_t esp32p4_emac_ptp_time(void *opaque)
+{
+    return esp32_dwmac_ptp_time(ESP32_DWMAC(opaque));
+}
+
+/*
+ * The board's Ethernet: the EMAC, its registers behind EMAC_SYS_CLK, held
+ * in reset by LP_CLKRST_RST_EN_EMAC, its clocks from HP_SYS_CLKRST, its
+ * DMA through the APMs, its interrupts ETH_MAC_INTR, PMT_INTR and
+ * LPI_INTR (sources 92, 91 and 90), HP_SYSTEM_GMAC_CTRL0, and its MII and
+ * PPS signals in the GPIO matrix; and the Waveshare ESP32-P4-WIFI6-POE-
+ * ETH's IP101GRI PHY, whose medium is the first -nic. The PHY's MDIO
+ * address is 1 (PHYAD0 pulled up, PHYAD3 down); MDIO has a pull-up
+ * (R59), and RESET_N, on GPIO51, is taken to be pulled up inside the PHY,
+ * as the board fits neither of its own resistors there.
+ */
+/* [spec:nuos:req:emu.esp32p4.emac] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_emac(ESP32P4MachineState *s)
+{
+    static const struct {
+        const char *in;
+        const char *out;
+    } clocks[] = {
+        { "sys", "emac-sys" },
+        { "rmii", "emac-rmii" },
+        { "rx", "emac-rx" },
+        { "tx", "emac-tx" },
+        { "ptp-ref", "emac-ptp-ref" },
+    };
+    DeviceState *emac = DEVICE(&s->emac), *phy = DEVICE(&s->phy);
+    DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
+    DeviceState *hp_sys = DEVICE(&s->hp_sys), *pps;
+    SysBusDevice *sbd = SYS_BUS_DEVICE(emac);
+    int i;
+
+    qdev_prop_set_uint8(phy, "addr", 1);
+    qdev_realize(phy, NULL, &error_fatal);
+    qemu_register_resettable(OBJECT(phy));
+
+    object_property_set_link(OBJECT(emac), "pms", OBJECT(&s->pms),
+                             &error_abort);
+    object_property_set_link(OBJECT(emac), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
+    object_property_set_link(OBJECT(emac), "phy", OBJECT(phy), &error_abort);
+    for (i = 0; i < ARRAY_SIZE(clocks); i++) {
+        qdev_connect_clock_in(emac, clocks[i].in,
+                              qdev_get_clock_out(clkrst, clocks[i].out));
+    }
+    qdev_connect_clock_in(emac, "phy-ref",
+                          qdev_get_clock_out(phy, "rmii-ref"));
+    qemu_configure_nic_device(emac, true, NULL);
+    sysbus_realize(sbd, &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, sbd, 0, ESP32P4_EMAC_BASE,
+                             ESP32P4_CLK_EMAC_SYS,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_EMAC,
+                                qdev_get_gpio_in_named(emac,
+                                    ESP32P4_EMAC_RESET, 0));
+    sysbus_connect_irq(sbd, ESP32_DWMAC_IRQ_SBD,
+                       esp32p4_intr_source(s, ESP32P4_INTR_ETH_MAC));
+    sysbus_connect_irq(sbd, ESP32_DWMAC_IRQ_PMT,
+                       esp32p4_intr_source(s, ESP32P4_INTR_PMT));
+    sysbus_connect_irq(sbd, ESP32_DWMAC_IRQ_LPI,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LPI));
+
+    for (i = 0; i < ESP32P4_HP_SYS_GMAC_PHY_INTF_LINES; i++) {
+        qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_GMAC_PHY_INTF, i,
+                                    qdev_get_gpio_in_named(emac,
+                                        ESP32P4_EMAC_PHY_INTF, i));
+    }
+    qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_GMAC_SBD_FLOWCTRL, 0,
+                                qdev_get_gpio_in_named(emac,
+                                    ESP32_DWMAC_SBD_FLOWCTRL, 0));
+    qdev_connect_gpio_out_named(emac, ESP32P4_EMAC_RST_N, 0,
+                                qdev_get_gpio_in_named(hp_sys,
+                                    ESP32P4_HP_SYS_GMAC_STATUS,
+                                    ESP32P4_HP_SYS_GMAC_RST_CLK_TX_N));
+    qdev_connect_gpio_out_named(emac, ESP32P4_EMAC_RST_N, 1,
+                                qdev_get_gpio_in_named(hp_sys,
+                                    ESP32P4_HP_SYS_GMAC_STATUS,
+                                    ESP32P4_HP_SYS_GMAC_RST_CLK_RX_N));
+    esp32p4_hp_sys_set_gmac_ptp(&s->hp_sys, esp32p4_emac_ptp_time,
+                                &s->emac);
+
+    object_initialize_child(OBJECT(s), "pps-split", &s->pps_split,
+                            TYPE_SPLIT_IRQ);
+    pps = DEVICE(&s->pps_split);
+    qdev_prop_set_uint16(pps, "num-lines", 2);
+    qdev_realize(pps, NULL, &error_fatal);
+    qdev_connect_gpio_out_named(emac, ESP32_DWMAC_PTP_PPS, 0,
+                                qdev_get_gpio_in(pps, 0));
+    qdev_connect_gpio_out(pps, 0,
+                          qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                              ESP32P4_SIG_EMAC_PTP_PPS_PAD_OUT));
+    qdev_connect_gpio_out(pps, 1,
+                          qdev_get_gpio_in_named(hp_sys,
+                              ESP32P4_HP_SYS_GMAC_STATUS,
+                              ESP32P4_HP_SYS_GMAC_PTP_PPS));
+
+    qdev_connect_gpio_out_named(emac, ESP32P4_EMAC_MDC, 0,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_SIG_OUT,
+                                    ESP32P4_SIG_MII_MDC_PAD_OUT));
+    qdev_connect_gpio_out_named(emac, ESP32P4_EMAC_MDO, 0,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_SIG_OUT,
+                                    ESP32P4_SIG_MII_MDO_PAD_OUT));
+    qdev_connect_gpio_out_named(emac, ESP32P4_EMAC_MDO_OE, 0,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_SIG_OE,
+                                    ESP32P4_SIG_MII_MDO_PAD_OUT));
+    qdev_connect_gpio_out_named(emac, ESP32P4_EMAC_TX_EN, 0,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_SIG_OUT,
+                                    ESP32P4_SIG_EMAC_PHY_TXEN_PAD_OUT));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                                ESP32P4_SIG_MII_MDI_PAD_IN,
+                                qdev_get_gpio_in_named(emac,
+                                    ESP32P4_EMAC_MDI, 0));
+
+    /* The board's pull-ups, and RESET_N following its pad. */
+    qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_PAD_PULL_UP,
+                                        s->emac.pad_mdio), 1);
+    qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_PAD_PULL_UP,
+                                        ESP32P4_BOARD_PHY_RESET_PAD), 1);
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_OUT,
+                                ESP32P4_BOARD_PHY_RESET_PAD,
+                                qemu_irq_invert(qdev_get_gpio_in_named(phy,
+                                    IP101_PHY_RESET, 0)));
+}
+
+/*
+ * The SD/MMC host controller and the cards on its slots. Its registers
+ * are behind SDMMC_SYS_CLK and LP_CLKRST's SDMMC reset, BUFFIFO, whose
+ * read pops the FIFO, reading 0 while gated; its CIU takes
+ * SDIO_LS_SLF_CLK, and needs
+ * SDIO_LS_DRV_CLK and SDIO_LS_SAM_CLK to reach a card. Its card-side
+ * inputs and outputs are GPIO matrix signals: SD_CARD_DETECT_N_1 and _2,
+ * SD_CARD_INT_N_1 and _2, SD_CARD_WRITE_PRT_1 and _2 in, SD_RST_N_1 and _2
+ * and SD_CCMD_OD_PULLUP_EN_N out (slot 0 is the matrix's card 1).
+ */
+/* [spec:nuos:req:emu.esp32p4.sdmmc] */
+static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
+    DeviceState *dev;
+    ESP32P4ClkRstGate *g;
+    int slot;
+
+    object_initialize_child(OBJECT(s), "sdmmc", &s->sdmmc,
+                            TYPE_ESP32P4_SDMMC);
+    dev = DEVICE(&s->sdmmc);
+    object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "hclk",
+                          qdev_get_clock_out(clkrst, "sdmmc-sys"));
+    qdev_connect_clock_in(dev, "cclk-in",
+                          qdev_get_clock_out(clkrst, "sdio-slf"));
+    qdev_connect_clock_in(dev, "drv", qdev_get_clock_out(clkrst, "sdio-drv"));
+    qdev_connect_clock_in(dev, "sam", qdev_get_clock_out(clkrst, "sdio-sam"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                 ESP32P4_SDMMC_BASE, ESP32P4_CLK_SDMMC_SYS,
+                                 ESP32P4_RST_SDMMC, 0);
+    esp32p4_clkrst_gate_volatile(g, 0x200, 4);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_SDIO_HOST));
+
+    for (slot = 0; slot < DWC_SDMMC_MAX_SLOTS; slot++) {
+        BusState *bus = qdev_get_child_bus(dev, slot ? "sd-bus1" : "sd-bus0");
+        DriveInfo *dinfo = drive_get(IF_SD, 0, slot);
+
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+            ESP32P4_SIG_SD_CARD_DETECT_N_1_PAD_IN + slot,
+            qdev_get_gpio_in_named(dev, DWC_SDMMC_CARD_DETECT_N, slot));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+            ESP32P4_SIG_SD_CARD_WRITE_PRT_1_PAD_IN + slot,
+            qdev_get_gpio_in_named(dev, DWC_SDMMC_CARD_WRITE_PRT, slot));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+            ESP32P4_SIG_SD_CARD_INT_N_1_PAD_IN + slot,
+            qdev_get_gpio_in_named(dev, DWC_SDMMC_CARD_INT_N, slot));
+        qdev_connect_gpio_out_named(dev, DWC_SDMMC_CARD_RST_N, slot,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                                   ESP32P4_SIG_SD_RST_N_1_PAD_OUT + slot));
+
+        /* The card resets at power-on only, not with the controller. */
+        qbus_set_reset_domain(bus);
+        qemu_register_resettable(OBJECT(bus));
+        if (dinfo) {
+            DeviceState *card = qdev_new(TYPE_SD_CARD);
+
+            qdev_prop_set_drive_err(card, "drive",
+                                    blk_by_legacy_dinfo(dinfo),
+                                    &error_fatal);
+            qdev_realize_and_unref(card, bus, &error_fatal);
+        }
+    }
+    qdev_connect_gpio_out_named(dev, DWC_SDMMC_CCMD_OD_PULLUP_EN_N, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                               ESP32P4_SIG_SD_CCMD_OD_PULLUP_EN_N_PAD_OUT));
+}
+
 /*
  * The DMA controllers, on the bus through the APMs: GDMA-AHB and GDMA-AXI,
  * each behind its bus clock and reset, which also clock its transfers,
@@ -1348,10 +1585,11 @@ static void esp32p4_hp_top_power(void *opaque, int n, int level)
  *     pauses the RTC watchdog and lets the brown-out detector see VDD_BAT.
  *     Its wakeup sources: the GPIO and LP GPIO wakeups, the RTC timer's
  *     targets, the brown-out detector and VDD_BAT's under-voltage, and the
- *     EXT wakeup on pads GPIO0 to GPIO15. The other sources' "wakeup" lines,
- *     PMU_TASK_SLEEP_REQ, PMU_EVT_SLEEP_WAKEUP, UART_WAKEUP_EN and the LP
+ *     EXT wakeup on pads GPIO0 to GPIO15. Its ETM task, PMU_TASK_SLEEP_REQ,
+ *     and event, PMU_EVT_SLEEP_WAKEUP, are the ETM's (esp32p4_init_etm()).
+ *     The other sources' "wakeup" lines, UART_WAKEUP_EN and the LP
  *     interrupt wait for the blocks that take them (UARTs, USB, SDIO, touch,
- *     LP I2S, EMAC, ETM, the LP core's interrupts, HP_SYSTEM's interrupt
+ *     LP I2S, EMAC, the LP core's interrupts, HP_SYSTEM's interrupt
  *     wakeup).
  *   - LP_ANALOG_PERI, behind its LP_CLKRST reset, its interrupt source 8:
  *     the brown-out detector, on BIAS's thresholds, and the glitch and
@@ -1533,6 +1771,208 @@ static void esp32p4_init_low_power(ESP32P4MachineState *s)
                        esp32p4_intr_source(s, ESP32P4_INTR_MB_HP));
     sysbus_connect_irq(SYS_BUS_DEVICE(mb), ESP32P4_LP_MAILBOX_IRQ_LP,
                        esp32p4_intr_source(s, ESP32P4_INTR_MB_LP));
+}
+
+/*
+ * The TWAI controllers, each behind TWAIn_APB_CLK, timed by TWAIn_CLK and
+ * reset by HP_SYS_CLKRST_RST_EN_CANn, which the device takes itself as it
+ * resets one controller of three; their interrupts TWAI0_INTR to
+ * TWAI2_INTR (sources 40 to 42) and their pad signals; and the QEMU CAN
+ * bus on each one's pads. Reading the interrupt register clears it, and
+ * reading the capture registers re-arms them.
+ */
+/* [spec:nuos:req:emu.esp32p4.twai] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_twai(ESP32P4MachineState *s)
+{
+    DeviceState *twai, *gpio = DEVICE(&s->gpio);
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    int i;
+
+    object_initialize_child(OBJECT(s), "twai", &s->twai, TYPE_ESP32P4_TWAI);
+    twai = DEVICE(&s->twai);
+    object_property_set_link(OBJECT(twai), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
+    for (i = 0; i < ESP32P4_TWAI_NUM; i++) {
+        g_autofree char *link = g_strdup_printf("canbus%d", i);
+        g_autofree char *clk = g_strdup_printf("twai%d", i);
+
+        if (s->canbus[i]) {
+            object_property_set_link(OBJECT(twai), link,
+                                     OBJECT(s->canbus[i]), &error_abort);
+        }
+        qdev_connect_clock_in(twai, clk, qdev_get_clock_out(clkrst, clk));
+    }
+    sysbus_realize(SYS_BUS_DEVICE(twai), &error_fatal);
+    for (i = 0; i < ESP32P4_TWAI_NUM; i++) {
+        ESP32P4ClkRstGate *g;
+
+        g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(twai), i,
+                                     ESP32P4_TWAI0_BASE +
+                                     i * ESP32P4_TWAI_STRIDE,
+                                     ESP32P4_CLK_TWAI0_APB + i,
+                                     ESP32P4_CLKRST_GATE_NO_RESET, 0);
+        esp32p4_clkrst_gate_volatile(g, 0x0c, 4);
+        esp32p4_clkrst_gate_volatile(g, 0x2c, 4);
+        esp32p4_clkrst_gate_volatile(g, 0x30, 4);
+        qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                    ESP32P4_RST_CAN0 + i,
+                                    qdev_get_gpio_in_named(twai,
+                                        ESP32P4_TWAI_RESET, i));
+        sysbus_connect_irq(SYS_BUS_DEVICE(twai), i,
+                           esp32p4_intr_source(s, ESP32P4_INTR_TWAI0 + i));
+        qdev_connect_gpio_out_named(twai, ESP32P4_TWAI_TX, i,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                ESP32P4_SIG_TWAI0_TX_PAD_OUT + 3 * i));
+        qdev_connect_gpio_out_named(twai, ESP32P4_TWAI_BUS_OFF, i,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                ESP32P4_SIG_TWAI0_BUS_OFF_ON_PAD_OUT + 3 * i));
+        qdev_connect_gpio_out_named(twai, ESP32P4_TWAI_CLKOUT, i,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                ESP32P4_SIG_TWAI0_CLKOUT_PAD_OUT + 3 * i));
+        qdev_connect_gpio_out_named(twai, ESP32P4_TWAI_STANDBY, i,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                ESP32P4_SIG_TWAI0_STANDBY_PAD_OUT + i));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+            ESP32P4_SIG_TWAI0_RX_PAD_IN + 3 * i,
+            qdev_get_gpio_in_named(twai, ESP32P4_TWAI_RX, i));
+    }
+}
+
+/*
+ * The event task matrix (TRM chapter 14), its registers behind
+ * ETM_APB_CLK, running on ETM_SYS_CLK, held by RST_EN_ETM; and every
+ * modelled block's events and tasks, by their IDs, as its header
+ * (hw/misc/esp32p4_etm.h) describes: a block that generates events or
+ * takes tasks adds a line here for each.
+ *
+ * Not connected, as their blocks are not modelled: the LED PWM, MCPWM,
+ * ADC, REGDMA, temperature sensor, I2S and 2D-DMA events and tasks;
+ * the LP core's events (ULP_EVT_*) and ULP_TASK_WAKEUP_CPU, the PMU's LP
+ * core wakeup, whose LP_CORE_ETM_WAKEUP_FLAG in LP_SYS is not modelled;
+ * and the RTC timer's tasks (RTC_TASK_*), which the TRM says it does not
+ * take.
+ */
+/* [spec:nuos:req:emu.esp32p4.etm] */
+static void esp32p4_init_etm(ESP32P4MachineState *s)
+{
+    ESP32P4EtmState *etm = &s->etm;
+    DeviceState *dev, *clkrst = DEVICE(&s->clkrst);
+    int ch, g, x, k;
+
+    object_initialize_child(OBJECT(s), "etm", etm, TYPE_ESP32P4_ETM);
+    dev = DEVICE(etm);
+    qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, "etm-sys"));
+    qdev_connect_clock_in(dev, "rtc-evt-tick",
+                          qdev_get_clock_out(DEVICE(&s->lp_timer),
+                                             "etm-tick"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_ETM_BASE, ESP32P4_CLK_ETM_APB,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET, ESP32P4_RST_ETM,
+                                qdev_get_gpio_in_named(dev,
+                                                       ESP32P4_ETM_RESET, 0));
+
+    /* GPIO_EXT's eight channels and the analog comparators. */
+    dev = DEVICE(&s->gpio);
+    for (ch = 0; ch < ESP32P4_GPIO_ETM_CHANNELS; ch++) {
+        esp32p4_etm_connect_event(etm, ESP32P4_ETM_GPIO_EVT_CH0_RISE_EDGE + ch,
+                                  dev, ESP32P4_GPIO_ETM_EVENT,
+                                  ESP32P4_GPIO_ETM_LINE(ch,
+                                      ESP32P4_GPIO_ETM_RISE));
+        esp32p4_etm_connect_event(etm, ESP32P4_ETM_GPIO_EVT_CH0_FALL_EDGE + ch,
+                                  dev, ESP32P4_GPIO_ETM_EVENT,
+                                  ESP32P4_GPIO_ETM_LINE(ch,
+                                      ESP32P4_GPIO_ETM_FALL));
+        esp32p4_etm_connect_event(etm, ESP32P4_ETM_GPIO_EVT_CH0_ANY_EDGE + ch,
+                                  dev, ESP32P4_GPIO_ETM_EVENT,
+                                  ESP32P4_GPIO_ETM_LINE(ch,
+                                      ESP32P4_GPIO_ETM_ANY));
+        esp32p4_etm_connect_task(etm, ESP32P4_ETM_GPIO_TASK_CH0_SET + ch,
+                                 dev, ESP32P4_GPIO_ETM_TASK,
+                                 ESP32P4_GPIO_ETM_LINE(ch,
+                                     ESP32P4_GPIO_ETM_SET));
+        esp32p4_etm_connect_task(etm, ESP32P4_ETM_GPIO_TASK_CH0_CLEAR + ch,
+                                 dev, ESP32P4_GPIO_ETM_TASK,
+                                 ESP32P4_GPIO_ETM_LINE(ch,
+                                     ESP32P4_GPIO_ETM_CLEAR));
+        esp32p4_etm_connect_task(etm, ESP32P4_ETM_GPIO_TASK_CH0_TOGGLE + ch,
+                                 dev, ESP32P4_GPIO_ETM_TASK,
+                                 ESP32P4_GPIO_ETM_LINE(ch,
+                                     ESP32P4_GPIO_ETM_TOGGLE));
+    }
+    for (k = 0; k < ESP32P4_GPIO_ETM_ZERO_DET_LINES; k++) {
+        esp32p4_etm_connect_event(etm, ESP32P4_ETM_GPIO_EVT_ZERO_DET_POS0 + k,
+                                  dev, ESP32P4_GPIO_ETM_ZERO_DET, k);
+    }
+
+    /* The timer groups' timers, each its alarm and five tasks. */
+    for (g = 0; g < 2; g++) {
+        dev = DEVICE(&s->timg[g]);
+        for (x = 0; x < ESP32P4_TIMG_TIMERS; x++) {
+            esp32p4_etm_connect_event(etm, ESP32P4_ETM_TG0_EVT_CNT_CMP_TIMER0 +
+                                      g * ESP32P4_TIMG_TIMERS + x,
+                                      dev, ESP32P4_TIMG_ETM_EVENT, x);
+            for (k = 0; k < ESP32P4_TIMG_TASKS; k++) {
+                int line = x * ESP32P4_TIMG_TASKS + k;
+
+                esp32p4_etm_connect_task(etm,
+                    ESP32P4_ETM_TG0_TASK_CNT_START_TIMER0 +
+                    g * ESP32P4_TIMG_TIMERS * ESP32P4_TIMG_TASKS + line,
+                    dev, ESP32P4_TIMG_ETM_TASK, line);
+            }
+        }
+    }
+
+    /* The system timer's comparators. */
+    for (x = 0; x < ESP32P4_SYSTIMER_COMPS; x++) {
+        esp32p4_etm_connect_event(etm, ESP32P4_ETM_SYSTIMER_EVT_CNT_CMP0 + x,
+                                  DEVICE(&s->systimer),
+                                  ESP32P4_SYSTIMER_ETM_EVENT, x);
+    }
+
+    /* The RTC timer; RTC_EVT_TICK is its counting clock, above. */
+    esp32p4_etm_connect_event(etm, ESP32P4_ETM_RTC_EVT_CMP,
+                              DEVICE(&s->lp_timer), ESP32P4_LP_TIMER_ETM_EVENT,
+                              ESP32P4_LP_TIMER_EVT_CMP);
+    esp32p4_etm_connect_event(etm, ESP32P4_ETM_RTC_EVT_OVF,
+                              DEVICE(&s->lp_timer), ESP32P4_LP_TIMER_ETM_EVENT,
+                              ESP32P4_LP_TIMER_EVT_OVF);
+
+    /* GDMA-AHB's and GDMA-AXI's channels. */
+    for (g = 0; g < 2; g++) {
+        static const int evt[] = {
+            ESP32P4_ETM_PDMA_AHB_EVT_IN_DONE_CH0,
+            ESP32P4_ETM_PDMA_AXI_EVT_IN_DONE_CH0,
+        };
+        static const int task[] = {
+            ESP32P4_ETM_PDMA_AHB_TASK_IN_START_CH0,
+            ESP32P4_ETM_PDMA_AXI_TASK_IN_START_CH0,
+        };
+
+        dev = DEVICE(&s->gdma[g]);
+        for (k = 0; k < ESP32P4_GDMA_ETM_EVENTS; k++) {
+            esp32p4_etm_connect_event(etm, evt[g] + k, dev,
+                                      ESP32P4_GDMA_ETM_EVENT, k);
+        }
+        for (k = 0; k < ESP32P4_GDMA_ETM_TASKS; k++) {
+            esp32p4_etm_connect_task(etm, task[g] + k, dev,
+                                     ESP32P4_GDMA_ETM_TASK, k);
+        }
+    }
+
+    /* The PMU's sleep request and its wakeup to HP_ACTIVE. */
+    esp32p4_etm_connect_event(etm, ESP32P4_ETM_PMU_EVT_SLEEP_WEEKUP,
+                              DEVICE(&s->pmu), ESP32P4_PMU_ETM_EVENT, 0);
+    esp32p4_etm_connect_task(etm, ESP32P4_ETM_PMU_TASK_SLEEP_REQ,
+                             DEVICE(&s->pmu), ESP32P4_PMU_ETM_TASK, 0);
+
+    /* The LP core's interrupt, through LP_SYS's ETM_TASK_ULP_INT. */
+    esp32p4_etm_connect_task(etm, ESP32P4_ETM_ULP_TASK_INT_CPU,
+                             DEVICE(&s->lp_sys),
+                             ESP32P4_LP_SYS_ETM_TASK_ULP_INT, 0);
 }
 
 /* The memories -kernel can load into: those the cores address directly. */
@@ -1719,8 +2159,12 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_gpio(s);
     esp32p4_init_pms(s);
     esp32p4_init_ext_memory(s);
+    esp32p4_init_sdmmc(s);
+    esp32p4_init_emac(s);
     esp32p4_init_dma(s);
     esp32p4_init_low_power(s);
+    esp32p4_init_twai(s);
+    esp32p4_init_etm(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
                         esp32p4_unimplemented[i].name,
@@ -1784,9 +2228,26 @@ static void esp32p4_set_strap_mode(Object *obj, Visitor *v,
     ESP32P4_MACHINE(obj)->strap_mode = value;
 }
 
+/* [spec:nuos:req:emu.esp32p4.twai] */
 static void esp32p4_machine_instance_init(Object *obj)
 {
-    ESP32P4_MACHINE(obj)->strap_mode = ESP32P4_GPIO_STRAP_SPI_BOOT;
+    ESP32P4MachineState *s = ESP32P4_MACHINE(obj);
+
+    s->strap_mode = ESP32P4_GPIO_STRAP_SPI_BOOT;
+    /* Early, for the clock tree to take the EMAC's pad clock. */
+    object_initialize_child(obj, "emac", &s->emac, TYPE_ESP32P4_EMAC);
+    object_initialize_child(obj, "phy", &s->phy, TYPE_IP101_PHY);
+    for (int i = 0; i < ESP32P4_TWAI_NUM; i++) {
+        g_autofree char *name = g_strdup_printf("canbus%d", i);
+        g_autofree char *desc = g_strdup_printf("The QEMU CAN bus (-object "
+                                                "can-bus) on TWAI%d's pads",
+                                                i);
+
+        object_property_add_link(obj, name, TYPE_CAN_BUS,
+                                 (Object **)&s->canbus[i],
+                                 object_property_allow_set_link, 0);
+        object_property_set_description(obj, name, desc);
+    }
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */
