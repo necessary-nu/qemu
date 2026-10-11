@@ -446,9 +446,16 @@ struct qemu_work_item;
  *   per cycle of, or NULL to execute one every 2^shift ns. Set with
  *   icount_set_cpu_clock().
  * @icount_period: The period of @icount_clock, in Clock units (2^-32 ns).
- * @icount_insn_time: Virtual time one instruction of the current run
- *   accounts for, in Clock units, or 0 for 2^shift ns. Written only by
- *   the vCPU thread when it prepares a run.
+ * @icount_insn_time: The time one instruction of the current run takes,
+ *   in Clock units: of the CPU's own time if it has an icount clock (and
+ *   of virtual time as its icount window says), or 0 for 2^shift ns of
+ *   virtual time. Written only by the vCPU thread when it prepares a run.
+ * @icount_in_window: Under icount, the CPU takes part in the window of
+ *   virtual time the CPUs with an icount clock run through together.
+ * @icount_window_idle: It went idle in that window, which counts it as
+ *   having run to the window's end.
+ * @icount_own: Its own time past the window's start, in Clock units: the
+ *   periods of its clock its instructions have taken.
  * @cpu_ases: Pointer to array of CPUAddressSpaces (which define the
  *            AddressSpaces this CPU has)
  * @as: Pointer to the first AddressSpace, for the convenience of targets which
@@ -516,6 +523,9 @@ struct CPUState {
     Clock *icount_clock;
     uint64_t icount_period;
     uint64_t icount_insn_time;
+    bool icount_in_window;
+    bool icount_window_idle;
+    int64_t icount_own;
     uint64_t random_seed;
     sigjmp_buf jmp_env;
 
