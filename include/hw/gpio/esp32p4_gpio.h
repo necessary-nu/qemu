@@ -172,6 +172,11 @@ enum {
  *     PMU's hold-all (TRM 10.9), ORed by whoever drives it. A held pad
  *     keeps the drive, pulls and input enable it had as the hold began.
  *     LP_IOMUX_LP_PAD_HOLD holds LP pads from inside this block.
+ *   ESP32P4_GPIO_HOLD_ALL, "hold-all" (input, ESP32P4_GPIO_HOLD_ALLS
+ *     lines): the PMU's global holds (TRM 10.9), line
+ *     ESP32P4_GPIO_HOLD_ALL_HP of the HP pads, GPIO16 to GPIO54, and line
+ *     ESP32P4_GPIO_HOLD_ALL_LP of the LP pads, GPIO0 to GPIO15, ORed with
+ *     each pad's own hold.
  *   ESP32P4_GPIO_LIGHT_SLEEP, "light-sleep" (input): high while the PMU
  *     has the chip in light sleep, when pads with SLP_SEL set take their
  *     sleep configuration (TRM table 10.8-1).
@@ -219,6 +224,7 @@ enum {
 #define ESP32P4_GPIO_RESET          "reset"
 #define ESP32P4_GPIO_PAD_PULL_UP    "pad-pull-up"
 #define ESP32P4_GPIO_PAD_HOLD       "pad-hold"
+#define ESP32P4_GPIO_HOLD_ALL      "hold-all"
 #define ESP32P4_GPIO_LIGHT_SLEEP    "light-sleep"
 #define ESP32P4_GPIO_ANA_COMP       "ana-comp"
 #define ESP32P4_GPIO_WAKEUP         "wakeup"
@@ -236,6 +242,12 @@ enum {
     ESP32P4_GPIO_RESET_HP,
     ESP32P4_GPIO_RESET_LP,
     ESP32P4_GPIO_RESETS,
+};
+
+enum {
+    ESP32P4_GPIO_HOLD_ALL_HP,
+    ESP32P4_GPIO_HOLD_ALL_LP,
+    ESP32P4_GPIO_HOLD_ALLS,
 };
 
 /* An ETM channel's events and tasks. */
@@ -392,6 +404,7 @@ struct ESP32P4GpioState {
     uint64_t ext_level;
     uint64_t ext_pull_up;
     uint64_t ext_hold;
+    bool hold_all[ESP32P4_GPIO_HOLD_ALLS];
     /* The board's wire each pad is on, numbered from 1; 0 for none. */
     uint8_t pad_wire[ESP32P4_GPIO_PADS];
     bool light_sleep;
