@@ -349,6 +349,14 @@ static void esp32_rtc_wdt_cb(void *opaque)
         return;
     }
     action = esp32_rtc_wdt_action(s);
+    /*
+     * The next stage counts from when this one ended, not from when the
+     * callback, which the host can run late without icount, got to it.
+     */
+    if (s->wdt_running && s->rtc_slowclk_freq && hold > s->wdt_count_base) {
+        now = MIN(now, esp32_rtc_ticks_to_ns(s, s->wdt_base_ns,
+                                             hold - s->wdt_count_base));
+    }
     s->wdt_stage = (s->wdt_stage + 1) % ESP32_RTC_WDT_STAGES;
     s->wdt_count_base = 0;
     s->wdt_base_ns = now;
@@ -882,12 +890,37 @@ static void esp32_rtc_mem_crc(Esp32RtcCntlState *s, uint32_t old)
     REG(s, RTC_MEM_CONF) |= R_RTC_MEM_CONF_CRC_FINISH_MASK;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.rtc]
+ * A register access first makes the alarm and TIME_VALID, if due by its
+ * moment, take effect, so that what software reads and writes does not
+ * depend on how promptly the host runs their timers: an INT_RAW read
+ * after the RTC timer has passed the alarm shows it, and an INT_CLR
+ * after it clears it.
+ */
+static void esp32_rtc_catch_up(Esp32RtcCntlState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (timer_pending(&s->valid_timer) &&
+        timer_expire_time_ns(&s->valid_timer) <= now) {
+        timer_del(&s->valid_timer);
+        esp32_rtc_valid_cb(s);
+    }
+    if (timer_pending(&s->alarm_timer) &&
+        timer_expire_time_ns(&s->alarm_timer) <= now) {
+        timer_del(&s->alarm_timer);
+        esp32_rtc_alarm_cb(s);
+    }
+}
+
 static uint64_t esp32_rtc_cntl_read(void *opaque, hwaddr addr,
                                     unsigned int size)
 {
     Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
     uint32_t r;
 
+    esp32_rtc_catch_up(s);
     switch (addr) {
     case A_RTC_CNTL_TIME0:
         return s->time_latched & UINT32_MAX;
@@ -941,9 +974,11 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
     Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
     uint32_t *r = &s->regs[addr / 4];
     uint32_t v = value;
-    uint32_t old = *r;
+    uint32_t old;
     uint32_t writable = reg_info[addr / 4].writable;
 
+    esp32_rtc_catch_up(s);
+    old = *r;
     switch (addr) {
     case A_RTC_CNTL_OPTIONS0:
         *r = v & writable;
