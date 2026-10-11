@@ -12,26 +12,36 @@
 #include "qemu/units.h"
 #include "hw/core/boards.h"
 #include "hw/cpu/cluster.h"
+#include "hw/core/or-irq.h"
+#include "hw/core/split-irq.h"
 #include "hw/dma/esp32p4_bitscrambler.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/dma/esp32p4_gdma.h"
-#include "hw/core/split-irq.h"
 #include "hw/gpio/esp32p4_gpio.h"
+#include "hw/i2c/esp32p4_i2c.h"
+#include "hw/i3c/esp32p4_i3c.h"
 #include "hw/intc/esp32p4_clic.h"
 #include "hw/intc/esp32p4_clint.h"
 #include "hw/intc/esp32p4_intmatrix.h"
 #include "hw/ssi/ssi.h"
 #include "hw/misc/esp32p4_ana.h"
+#include "hw/misc/esp32p4_assist_debug.h"
+#include "hw/misc/esp32p4_axi_perf_mon.h"
 #include "hw/misc/esp32p4_cache.h"
 #include "hw/misc/esp32p4_clkrst.h"
 #include "hw/misc/esp32p4_etm.h"
 #include "hw/misc/esp32p4_hp_sys.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_icm.h"
+#include "hw/misc/esp32p4_lp_ana.h"
+#include "hw/misc/esp32p4_lp_mailbox.h"
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/misc/esp32p4_parlio.h"
 #include "hw/misc/esp32p4_pms.h"
+#include "hw/misc/esp32p4_pmu.h"
+#include "hw/misc/esp32p4_trace.h"
 #include "hw/net/esp32p4_emac.h"
+#include "hw/net/esp32p4_twai.h"
 #include "hw/net/ip101_phy.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/sd/esp32p4_sdmmc.h"
@@ -40,6 +50,8 @@
 #include "hw/timer/esp32p4_systimer.h"
 #include "hw/timer/esp32p4_timg.h"
 #include "hw/ssi/esp32p4_mspi.h"
+#include "hw/usb/dwc2-otg.h"
+#include "hw/usb/esp32p4_usb.h"
 #include "system/memory.h"
 #include "target/riscv/esp32p4_cpu.h"
 
@@ -136,12 +148,19 @@ struct ESP32P4MachineState {
     /* The access permission managers, every master's way onto the bus. */
     ESP32P4PmsState pms;
     ESP32P4IcmState icm;
+    ESP32P4I2CState i2c[2];
+    ESP32P4I2CState lp_i2c;
+    ESP32P4I3CMstState i3c_mst;
+    ESP32P4I3CSlvState i3c_slv;
     ESP32P4SdmmcState sdmmc;
     /* GDMA-AHB, GDMA-AXI. */
     ESP32P4GdmaState gdma[2];
     ESP32P4DwGdmaState vdma;
     ESP32P4BitScramblerState bitscrambler;
     ESP32P4ParlioState parlio;
+    ESP32P4TwaiState twai;
+    /* The QEMU CAN buses on TWAI0 to TWAI2's pads, or NULL. */
+    CanBusState *canbus[ESP32P4_TWAI_NUM];
 
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];
@@ -153,6 +172,18 @@ struct ESP32P4MachineState {
     SplitIRQ hp_core_reset_split;
     ESP32P4EtmState etm;
 
+    /* Low-power management: the PMU, LP_ANALOG_PERI and the LP mailbox. */
+    ESP32P4PMUState pmu;
+    ESP32P4LPAnaState lp_ana;
+    ESP32P4LPMailboxState lp_mailbox;
+    /* The PMU's power of PD_TOP and of the HP memory, to the machine. */
+    qemu_irq hp_top_power;
+    qemu_irq hp_mem_power;
+    /* Whether the HP memories have lost their contents since PD_TOP rose. */
+    bool hp_mem_lost;
+    /* The -kernel ELF's segments outside LP SRAM, for its reload. */
+    GArray *kernel_segments;
+
     ESP32P4MSPIState flash_mspi;
     ESP32P4MSPIState psram_mspi;
     /* HP_SYSTEM_CRYPTO_CTRL's enables, to the flash's and PSRAM's MSPI. */
@@ -160,6 +191,11 @@ struct ESP32P4MachineState {
     MemoryRegion flash_window_alias;
     MemoryRegion psram_window_alias;
     ESP32P4CacheState cache;
+    /* The USB 2.0 OTG controllers, high and full speed, and their PHYs. */
+    DWC2OTGState usb_hs;
+    DWC2OTGState usb_fs;
+    ESP32P4UsbUtmiState usb_utmi;
+    ESP32P4UsbWrapState usb_wrap;
     SSIBus *flash_bus;
     uint64_t flash_size;
 
@@ -167,6 +203,18 @@ struct ESP32P4MachineState {
     ESP32P4EmacState emac;
     IP101PhyState phy;
     SplitIRQ pps_split;
+
+    ESP32P4AssistDebugState assist_debug;
+    ESP32P4AxiPerfMonState axi_perf_mon;
+    ESP32P4TraceState trace[ESP32P4_HP_CORES];
+    /* GPIO16 to GPIO54's holds: LP_SYSTEM's OR HP_SYSTEM's. */
+    OrIRQState pad_hold_or[ESP32P4_GPIO_PADS - ESP32P4_HP_SYS_HOLD_FIRST];
 };
+
+/*
+ * How long LP_SYSTEM_SYS_SW_RST holds the HP core in reset; the TRM gives
+ * no length, and this is the shortest of the RTC watchdog's.
+ */
+#define ESP32P4_SW_SYS_RESET_NS 100
 
 #endif
