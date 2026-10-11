@@ -81,6 +81,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "qemu/bitops.h"
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
@@ -828,16 +829,26 @@ static bool pad_driven_by_chip(ESP32P4GpioState *s, unsigned n, bool *level)
  * [spec:nuos:req:emu.esp32p4.gpio]
  * Resolve every pad's level and input buffer. A pad that has just been
  * held latches what it has; a held pad keeps that whatever its registers
- * and signals do (TRM 10.9).
+ * and signals do (TRM 10.9). Pads the board wires together ("pad-wires")
+ * share one level: low while any of them is driven low, from outside or
+ * by its own driver; else high while any is driven high or pulled up.
  */
 static void resolve(ESP32P4GpioState *s, uint64_t *pad_out,
                     uint64_t *raw_out)
 {
-    uint64_t pad = 0, raw = 0;
+    uint64_t pad = 0, raw = 0, ie_mask = 0;
+    uint64_t drv_low = 0, drv_high = 0, pulled = 0;
     uint64_t held = (s->ext_hold | s->lp_pad_hold) & PAD_MASK;
 
+    if (s->hold_all[ESP32P4_GPIO_HOLD_ALL_HP]) {
+        held |= PAD_MASK & ~LP_PAD_MASK;
+    }
+    if (s->hold_all[ESP32P4_GPIO_HOLD_ALL_LP]) {
+        held |= LP_PAD_MASK;
+    }
+
     for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
-        bool drive, val, pu, ie, level;
+        bool drive, val, pu, ie;
 
         if (bit64(held, n) && !bit64(s->held, n)) {
             PadCtl c;
@@ -865,18 +876,49 @@ static void resolve(ESP32P4GpioState *s, uint64_t *pad_out,
         }
 
         if (bit64(s->ext_driven, n)) {
-            level = bit64(s->ext_level, n);
-        } else if (drive) {
-            level = val;
-        } else {
-            /* Pulled up, or pulled down or floating, which reads low */
-            level = pu;
+            drive = true;
+            val = bit64(s->ext_level, n);
         }
-        pad |= (uint64_t)level << n;
+        if (drive) {
+            if (val) {
+                drv_high |= 1ULL << n;
+            } else {
+                drv_low |= 1ULL << n;
+            }
+        } else if (pu) {
+            pulled |= 1ULL << n;
+        }
         if (ie) {
-            raw |= (uint64_t)level << n;
+            ie_mask |= 1ULL << n;
         }
     }
+    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
+        uint64_t net = 1ULL << n;
+        bool level;
+
+        if (s->pad_wire[n]) {
+            net = 0;
+            for (unsigned m = 0; m < ESP32P4_GPIO_PADS; m++) {
+                if (s->pad_wire[m] == s->pad_wire[n]) {
+                    net |= 1ULL << m;
+                }
+            }
+        }
+        /*
+         * An outside driver wins over the pad's own; on a wire, a low
+         * driver wins. Undriven, a pull-up holds the pad high; pulled
+         * down or floating, it reads low.
+         */
+        if (!s->pad_wire[n] && bit64(s->ext_driven, n)) {
+            level = bit64(s->ext_level, n);
+        } else if (drv_low & net) {
+            level = false;
+        } else {
+            level = (drv_high | pulled) & net;
+        }
+        pad |= (uint64_t)level << n;
+    }
+    raw = pad & ie_mask;
     s->held = held;
     *pad_out = pad;
     *raw_out = raw;
@@ -1780,7 +1822,7 @@ bool esp32p4_gpio_sig_in_source(ESP32P4GpioState *s, unsigned sig,
         pad = iomux_in_pad(s, sig);
     }
     if (pad < 0 || lp_owned(s, pad) || bit64(s->ext_driven, pad) ||
-        bit64(s->held, pad)) {
+        bit64(s->held, pad) || s->pad_wire[pad]) {
         return false;
     }
     pad_ctl(s, pad, &c);
@@ -2669,6 +2711,15 @@ static void esp32p4_gpio_set_hold(void *opaque, int n, int level)
     esp32p4_gpio_update(s);
 }
 
+/* [spec:nuos:req:emu.esp32p4.low-power] */
+static void esp32p4_gpio_set_hold_all(void *opaque, int n, int level)
+{
+    ESP32P4GpioState *s = opaque;
+
+    s->hold_all[n] = level != 0;
+    esp32p4_gpio_update(s);
+}
+
 static void esp32p4_gpio_set_light_sleep(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
@@ -2976,6 +3027,76 @@ static void esp32p4_gpio_set_mask(Object *obj, Visitor *v, const char *name,
     }
 }
 
+static char *esp32p4_gpio_get_wires(Object *obj, Error **errp)
+{
+    ESP32P4GpioState *s = ESP32P4_GPIO(obj);
+    GString *str = g_string_new(NULL);
+
+    for (unsigned w = 1; w <= ESP32P4_GPIO_PADS; w++) {
+        bool first = true;
+
+        for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
+            if (s->pad_wire[n] != w) {
+                continue;
+            }
+            if (first && str->len) {
+                g_string_append_c(str, ',');
+            }
+            g_string_append_printf(str, first ? "%u" : ":%u", n);
+            first = false;
+        }
+    }
+    return g_string_free(str, false);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * The board's wires between pads: comma-separated groups of pads joined
+ * by colons, each group one wire, e.g. "7:9,8:10".
+ */
+static void esp32p4_gpio_set_wires(Object *obj, const char *value,
+                                   Error **errp)
+{
+    ESP32P4GpioState *s = ESP32P4_GPIO(obj);
+    uint8_t wire[ESP32P4_GPIO_PADS] = { 0 };
+    g_auto(GStrv) groups = g_strsplit(value, ",", -1);
+    unsigned w = 0;
+
+    for (unsigned g = 0; groups[g]; g++) {
+        g_auto(GStrv) pads = g_strsplit(groups[g], ":", -1);
+        unsigned count = 0;
+
+        if (!*groups[g]) {
+            continue;
+        }
+        w++;
+        for (unsigned i = 0; pads[i]; i++) {
+            uint64_t n;
+
+            if (qemu_strtou64(pads[i], NULL, 10, &n) ||
+                n >= ESP32P4_GPIO_PADS) {
+                error_setg(errp, "pad-wires: '%s' is not a pad", pads[i]);
+                return;
+            }
+            if (wire[n]) {
+                error_setg(errp, "pad-wires: GPIO%" PRIu64 " is on two "
+                           "wires", n);
+                return;
+            }
+            wire[n] = w;
+            count++;
+        }
+        if (count < 2) {
+            error_setg(errp, "pad-wires: a wire joins two pads or more");
+            return;
+        }
+    }
+    memcpy(s->pad_wire, wire, sizeof(wire));
+    if (DEVICE(obj)->realized) {
+        esp32p4_gpio_update(s);
+    }
+}
+
 static void esp32p4_gpio_init(Object *obj)
 {
     ESP32P4GpioState *s = ESP32P4_GPIO(obj);
@@ -3042,6 +3163,8 @@ static void esp32p4_gpio_init(Object *obj)
                             ESP32P4_GPIO_PADS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_light_sleep,
                             ESP32P4_GPIO_LIGHT_SLEEP, 1);
+    qdev_init_gpio_in_named(dev, esp32p4_gpio_set_hold_all,
+                            ESP32P4_GPIO_HOLD_ALL, ESP32P4_GPIO_HOLD_ALLS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_ana_comp,
                             ESP32P4_GPIO_ANA_COMP, ESP32P4_GPIO_ANA_COMPS);
     qdev_init_gpio_out_named(dev, &s->wakeup_out, ESP32P4_GPIO_WAKEUP, 1);
@@ -3110,8 +3233,8 @@ static const VMStateDescription vmstate_esp32p4_gpio_filter = {
 
 static const VMStateDescription vmstate_esp32p4_gpio = {
     .name = TYPE_ESP32P4_GPIO,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(iomux_clk, ESP32P4GpioState),
         VMSTATE_CLOCK(lp_clk, ESP32P4GpioState),
@@ -3185,7 +3308,10 @@ static const VMStateDescription vmstate_esp32p4_gpio = {
         VMSTATE_UINT64(ext_driven, ESP32P4GpioState),
         VMSTATE_UINT64(ext_level, ESP32P4GpioState),
         VMSTATE_UINT64(ext_pull_up, ESP32P4GpioState),
+        VMSTATE_UINT8_ARRAY(pad_wire, ESP32P4GpioState, ESP32P4_GPIO_PADS),
         VMSTATE_UINT64(ext_hold, ESP32P4GpioState),
+        VMSTATE_BOOL_ARRAY(hold_all, ESP32P4GpioState,
+                           ESP32P4_GPIO_HOLD_ALLS),
         VMSTATE_BOOL(light_sleep, ESP32P4GpioState),
         VMSTATE_UINT8_ARRAY(sig_out, ESP32P4GpioState, ESP32P4_GPIO_SIGS),
         VMSTATE_UINT8_ARRAY(sig_oe, ESP32P4GpioState, ESP32P4_GPIO_SIGS),
@@ -3241,6 +3367,12 @@ static void esp32p4_gpio_class_init(ObjectClass *klass, const void *data)
                               NULL, NULL);
     object_class_property_set_description(klass, "pad-ext-level",
         "The levels outside drivers hold the pads at, bit n for GPIOn");
+    object_class_property_add_str(klass, "pad-wires",
+                                  esp32p4_gpio_get_wires,
+                                  esp32p4_gpio_set_wires);
+    object_class_property_set_description(klass, "pad-wires",
+        "Pads the board wires together: groups of GPIO numbers joined by "
+        "':', separated by ',' (e.g. \"7:9,8:10\")");
 }
 
 /* [spec:nuos:req:emu.esp32p4.gpio] */

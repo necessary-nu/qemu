@@ -22,8 +22,8 @@
  *     ESP-IDF and the ROM's own entry point contradict), or at LP SRAM
  *     once software clears it; core 1 is held in reset with its clock
  *     gated until software releases it through HP_SYS_CLKRST. The LP core,
- *     which starts at the LP ROM, is held in reset: the PMU, which starts
- *     it, is not modelled. Each core executes at the clock that drives it,
+ *     which starts at the LP ROM, is held in reset until the PMU starts
+ *     it. Each core executes at the clock that drives it,
  *     the HP cores at CPU_CLK and the LP core at LP_DYN_FAST_CLK, and
  *     under icount an instruction takes a cycle of it.
  *   - The HP ROM (128 KiB) at 0x4FC00000, and at 0x8FC00000 for direct
@@ -47,9 +47,11 @@
  *   - The reset and clock control, HP_SYS_CLKRST, LP_AON_CLKRST and
  *     LPPERI, with the clock tree from the crystal, the RC oscillators and
  *     the PLLs to every block's clocks, and the analog I2C controller
- *     through which software configures the PLLs; and LP_SYS's
- *     BOOT_ADDR_HP_CORE1 and its record of refused accesses, the rest of
- *     whose registers are logged as unimplemented.
+ *     through which software configures the PLLs.
+ *   - The system registers (TRM chapter 21), HP_SYSTEM at 0x500E5000 and
+ *     LP_SYSTEM at 0x50110000, every register of each (esp32p4_hp_sys.c,
+ *     esp32p4_lp_sys.c), driving what the machine models of the blocks
+ *     they configure (esp32p4_init_debug()).
  *   - The eFuse controller and its array, on its clock and reset from
  *     LPPERI, its interrupt a source of the interrupt matrix.
  *   - The system timer, the two timer groups (each two timers, an MWDT
@@ -58,6 +60,15 @@
  *     watchdogs reset the HP cores, the HP core (the HP blocks and both
  *     cores, the LP system running on) or the whole system, each with its
  *     reset cause in LP_CLKRST.
+ *   - Low-power management (TRM chapters 15, 24 to 26): the PMU
+ *     (0x50115000), its state machine taking the chip between HP_ACTIVE,
+ *     HP_SLEEP and LP_SLEEP, powering the domains, the oscillators and the
+ *     PLLs, gating the HP system's clocks, stalling the HP cores and
+ *     starting and stopping the LP core, its interrupts sources 6 and 7;
+ *     LP_ANALOG_PERI (0x50113000), the brown-out detector on the board's
+ *     VDD_ANA and VDD_BAT, with the glitch detectors and the power supply
+ *     detector, its interrupt source 8; and the LP mailbox (0x50118000),
+ *     its interrupts sources 4 and 5.
  *   - The event task matrix (TRM chapter 14) at 0x500D5000, mapping the
  *     events of the GPIO matrix, the timers, the RTC timer and GDMA to
  *     the tasks of the GPIO matrix, the timer groups, GDMA and the LP
@@ -84,12 +95,9 @@
  *     core 1's 2 KiB above, behind its bus clock and reset: every
  *     peripheral interrupt source, as its source input, to the CLIC
  *     external interrupts 16 to 47 of either HP core, remapped as each
- *     core's mode and its CLIC's user-mode interrupts decide. Of HP_SYSTEM
- *     (0x500E5000), the cores' software interrupts CPU_INTR_FROM_CPU_0 to
- *     _3, sources of the matrix, the L1 caches' resets, the external
- *     memory encryption enables and the L2MEM error response and
- *     interrupt; the rest of its registers are logged as unimplemented. A
- *     source no modelled block drives stays low.
+ *     core's mode and its CLIC's user-mode interrupts decide. HP_SYSTEM's
+ *     software interrupts CPU_INTR_FROM_CPU_0 to _3 are sources of the
+ *     matrix. A source no modelled block drives stays low.
  *   - The GPIO matrix and IO MUX (TRM chapter 10), HP and LP, with
  *     GPIO_EXT's sigma-delta modulators, glitch filters and ETM, behind
  *     IOMUX_APB_CLK and the LP IO MUX's clock and their resets, timed by
@@ -125,6 +133,30 @@
  *     peripheral served by GDMA attaches to its controller as
  *     include/hw/dma/esp32p4_gdma.h describes; VDMA's handshaking
  *     interfaces, for MIPI DSI and the ISP, are its named GPIOs.
+ *   - The debug blocks (TRM chapters 3, 22 and 23): the debug assistant at
+ *     0x3FF06000, watching the HP cores' SP, their accesses to four
+ *     regions and their PCs; each HP core's RISC-V trace encoder, at
+ *     0x3FF04000 and 0x3FF05000, writing Efficient Trace packets to
+ *     memory; and the AXI performance monitor at 0x500A8000.
+ *
+ *   - The USB 2.0 OTG controllers (TRM chapters 52 and 53,
+ *     hw/usb/esp32p4_usb.c): OTG_HS (0x50000000) on its UTMI+ PHY
+ *     (0x5009C000) and OTG_FS (0x50040000) on a full-speed PHY that
+ *     USB_WRAP (0x50080000) controls, behind their bus clocks and resets,
+ *     their DMA through the DMA access permission manager, their
+ *     interrupts sources 93, 94 and 103, OTG_FS's OTG signals through the
+ *     GPIO matrix. In host mode QEMU's USB devices plug into a
+ *     controller's port, the bus named after it: usb-otg-hs.0 and
+ *     usb-otg-fs.0,
+ *
+ *       -device usb-kbd,bus=usb-otg-hs.0,port=1
+ *
+ *     and in device mode one of the built-in hosts of hw/usb/usb-devport.h
+ *     is at the other end of the cable, the token port or the CDC-ACM
+ *     bridge on a chardev:
+ *
+ *       -chardev socket,id=tok,path=tok.sock,server=on,wait=off
+ *       -global esp32p4-usb-otg-fs.token-chardev=tok
  *
  *   - The TWAI controllers TWAI0 to TWAI2 (TRM chapter 56) at 0x500D7000,
  *     0x500D8000 and 0x500D9000, each behind its bus clock, on its function
@@ -136,6 +168,21 @@
  *     the bus connects it to the host's (on Linux):
  *
  *       -object can-bus,id=can0 -M esp32p4,canbus0=can0,canbus1=can0
+ *
+ *   - I2C0, I2C1 and the LP I2C (TRM chapter 47), and the I3C master and
+ *     slave, at the level of their lines through the GPIO matrices, timed
+ *     by their function clocks, their interrupts through the interrupt
+ *     matrix. Each master's QEMU bus, "i2c0", "i2c1", "lp-i2c" and "i3c"
+ *     (with "i3c-legacy-i2c" for I2C devices on the I3C bus), stands for
+ *     the board's wires on the pads it is routed to; the board has no
+ *     devices on them, and -device puts devices there:
+ *
+ *       -device tmp105,bus=i2c0,address=0x48
+ *
+ *     Pads the board wires to each other, so that two of the chip's
+ *     controllers share a bus, are the GPIO block's "pad-wires":
+ *
+ *       -global esp32p4-gpio.pad-wires=7:9,8:10
  *
  *   - The RMT (TRM chapter 60) at 0x500A2000, behind RMT_SYS_CLK and its
  *     reset, timed by RMT_CLK, its interrupt RMT_INTR (source 43), its four
@@ -169,6 +216,22 @@
  * L2MEM (past the L2 cache), the TCM or LP SRAM, and core 0 starts at the
  * ELF's entry point rather than in the ROM, with the caches empty; core 1
  * is still held for software to release.
+ *
+ * The ELF stands for the program the ROM boots from flash, and takes the
+ * ROM's place whenever the HP system starts: after an HP core reset that
+ * selects the ROM (LP_CLKRST_HPCORE0_STAT_VECTOR_SEL), and so after a
+ * deep sleep, core 0 starts at the entry point. The ROM on such a wakeup
+ * (PMU HP power down reset, 0x05) takes LP_SYSTEM_LP_STORE8 bit 0 to tell
+ * a deep sleep, after which it boots from flash as from power-on, from a
+ * light sleep, after which it jumps to the address in the rest of the
+ * word; it runs no deep-sleep wake stub itself, ESP-IDF's bootloader and
+ * application doing that. As the deep sleep powered the HP memories down,
+ * losing L2MEM and the TCM, the machine first loads the ELF's segments
+ * there again, as the boot from flash would (leaving LP SRAM, which keeps
+ * its contents, as ESP-IDF's bootloader leaves the LP memory on a deep
+ * sleep wakeup); the HP pads stay held until the program releases them,
+ * as the ROM does at boot (PMU_TIE_LOW_HP_PAD_HOLD_ALL). Without -kernel
+ * the ROM runs again, as on the chip.
  */
 
 #include "qemu/osdep.h"
@@ -191,6 +254,8 @@
 #include "system/block-backend.h"
 #include "system/blockdev.h"
 #include "system/reset.h"
+#include "system/tcg.h"
+#include "exec/translation-block.h"
 
 /*
  * The blocks of the address map that are not modelled, each an
@@ -203,16 +268,10 @@ static const struct {
     hwaddr size;
 } esp32p4_unimplemented[] = {
     /* HP CPU peripherals. */
-    { "trace0",           0x3ff04000, 4 * KiB },
-    { "trace1",           0x3ff05000, 4 * KiB },
-    { "bus-monitor",      0x3ff06000, 4 * KiB },
     { "l2mem-monitor",    0x3ff0e000, 4 * KiB },
     { "tcm-monitor",      0x3ff0f000, 4 * KiB },
 
     /* HP peripherals 0. */
-    { "usb-otg-hs",       0x50000000, 256 * KiB },
-    { "usb-otg-fs",       0x50040000, 256 * KiB },
-    { "usb-wrap",         0x50080000, 4 * KiB },
     { "pau",              0x50082000, 4 * KiB },
     { "h264",             0x50084000, 4 * KiB },
     { "jpeg",             0x50086000, 4 * KiB },
@@ -226,7 +285,6 @@ static const struct {
     { "ds",               0x50094000, 4 * KiB },
     { "hmac",             0x50095000, 4 * KiB },
     { "ecdsa",            0x50096000, 4 * KiB },
-    { "usb-phy",          0x5009c000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
     { "pvt",              0x5009e000, 4 * KiB },
     { "csi-host",         0x5009f000, 2 * KiB },
@@ -242,8 +300,6 @@ static const struct {
     /* HP peripherals 1. */
     { "mcpwm0",           0x500c0000, 4 * KiB },
     { "mcpwm1",           0x500c1000, 4 * KiB },
-    { "i2c0",             0x500c4000, 4 * KiB },
-    { "i2c1",             0x500c5000, 4 * KiB },
     { "i2s0",             0x500c6000, 4 * KiB },
     { "i2s1",             0x500c7000, 4 * KiB },
     { "i2s2",             0x500c8000, 4 * KiB },
@@ -257,8 +313,6 @@ static const struct {
     { "spi3",             0x500d1000, 4 * KiB },
     { "usb-serial-jtag",  0x500d2000, 4 * KiB },
     { "ledc",             0x500d3000, 4 * KiB },
-    { "i3c-mst",          0x500da000, 4 * KiB },
-    { "i3c-slv",          0x500db000, 4 * KiB },
     { "lcd-cam",          0x500dc000, 4 * KiB },
     { "adc",              0x500de000, 4 * KiB },
     { "uhci",             0x500df000, 4 * KiB },
@@ -274,15 +328,11 @@ static const struct {
     { "mipi-dsi-mem",     0x50105000, 4 * KiB },
 
     /* LP always-on peripherals. */
-    { "lp-analog-peri",   0x50113000, 4 * KiB },
     { "lp-huk",           0x50114000, 4 * KiB },
-    { "pmu",              0x50115000, 4 * KiB },
-    { "lp-mailbox",       0x50118000, 4 * KiB },
     { "rtc-cali",         0x50119000, 4 * KiB },
 
     /* LP peripherals. */
     { "lp-uart",          0x50121000, 4 * KiB },
-    { "lp-i2c",           0x50122000, 4 * KiB },
     { "lp-spi",           0x50123000, 4 * KiB },
     { "lp-i2s",           0x50125000, 4 * KiB },
     { "lp-trng",          0x50126000, 4 * KiB },
@@ -558,11 +608,14 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
         DeviceState *cpu = DEVICE(&s->hp_cpu[i]);
         g_autofree char *clk = g_strdup_printf("core%d-cpu", i);
 
-        /* A core's reset also resets its CLIC. */
+        /*
+         * A core's reset also resets its CLIC, stops its PC record in the
+         * debug assistant and is its trace encoder's reset sideband.
+         */
         object_initialize_child(OBJECT(s), "core-reset-split[*]",
                                 &s->core_reset_split[i], TYPE_SPLIT_IRQ);
         qdev_prop_set_uint16(DEVICE(&s->core_reset_split[i]), "num-lines",
-                             2);
+                             4);
         qdev_realize(DEVICE(&s->core_reset_split[i]), NULL, &error_fatal);
         qdev_connect_gpio_out(DEVICE(&s->core_reset_split[i]), 0,
                               qdev_get_gpio_in_named(cpu, ESP32P4_CPU_RESET,
@@ -592,6 +645,8 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
 
     object_initialize_child(OBJECT(s), "lp-sys", &s->lp_sys,
                             TYPE_ESP32P4_LP_SYS);
+    object_property_set_link(OBJECT(&s->lp_sys), "lp-cpu",
+                             OBJECT(&s->lp_cpu), &error_abort);
     sysbus_realize(SYS_BUS_DEVICE(&s->lp_sys), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->lp_sys), 0, ESP32P4_LP_SYS_BASE);
 }
@@ -750,7 +805,8 @@ static void esp32p4_init_efuse(ESP32P4MachineState *s)
 
 /*
  * The HP core reset of the HP blocks with no reset line of their own,
- * HP_SYSTEM's registers, the CLINT and the AXI ICM; the rest take theirs
+ * HP_SYSTEM's registers, the CLINT, the AXI ICM and the debug assistant
+ * (whose PC records survive it); the rest take theirs
  * from the reset and clock control, which holds every HP block reset line
  * and the HP cores through it. (The HP and DMA access permission managers
  * have no reset of their own in the PMS model, which resets them only with
@@ -765,6 +821,7 @@ static void esp32p4_hp_core_reset(void *opaque, int n, int level)
         device_cold_reset(DEVICE(&s->hp_sys));
         device_cold_reset(DEVICE(&s->clint));
         device_cold_reset(DEVICE(&s->icm));
+        device_cold_reset(DEVICE(&s->assist_debug));
     }
 }
 
@@ -784,18 +841,17 @@ static void esp32p4_hp_core_reset(void *opaque, int n, int level)
  *
  * Their interrupts are sources of the interrupt matrix, and their ETM
  * events and tasks the ETM's (esp32p4_init_etm()). The RTC timer's wakeups
- * and the LP core's timer interrupt are named GPIO lines (see the devices'
- * headers) that nothing takes until the PMU and the LP core's interrupts
- * are modelled.
+ * go to the PMU (esp32p4_init_low_power()); the LP core's timer interrupt
+ * is a named GPIO line (see the device's header) that nothing takes until
+ * the LP core's interrupts are modelled.
  * MWDT0 and the RTC watchdog run their flash boot protection when the
  * chip boots from flash through the boot ROM in SPI boot mode: when the
  * board's strapping (the strap-mode property) has GPIO35 high and there
  * is no -kernel, which loads the program in the ROM's place, with no flash
  * boot to protect. Pads driven from outside at reset, which GPIO_STRAP
  * latches in place of the strapping, and LP_SYSTEM_FORCE_DOWNLOAD_BOOT do
- * not change it. LP_SYSTEM's FIB control of the super watchdog's reset is
- * not modelled: the "swd-reset-en" input stays low, as the FIB's analog
- * default leaves it.
+ * not change it. LP_SYSTEM's FIB control enables the super watchdog's
+ * reset (see esp32p4_init_debug()).
  */
 /* [spec:nuos:req:emu.esp32p4.timers] */
 static void esp32p4_init_timers(ESP32P4MachineState *s)
@@ -810,7 +866,7 @@ static void esp32p4_init_timers(ESP32P4MachineState *s)
         object_initialize_child(OBJECT(s), "core-stall-split[*]",
                                 &s->core_stall_split[n], TYPE_SPLIT_IRQ);
         qdev_prop_set_uint16(DEVICE(&s->core_stall_split[n]), "num-lines",
-                             2);
+                             3);
         qdev_realize(DEVICE(&s->core_stall_split[n]), NULL, &error_fatal);
         qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_CORE_STALL, n,
                                     qdev_get_gpio_in(
@@ -1191,6 +1247,217 @@ static void esp32p4_init_gpio(ESP32P4MachineState *s)
 }
 
 /*
+ * I2C0 and I2C1 (0x500C4000, 0x500C5000), their registers behind
+ * I2Cn_APB_CLK and HP_SYS_CLKRST's I2Cn reset, timed by I2Cn_CLK, their
+ * interrupts sources 44 and 45 and their lines the GPIO matrix's signals
+ * 68 to 71; and the LP I2C (0x50122000), behind LPPERI's LP_I2C clock
+ * gate and reset, timed by LP_I2C_SCLK, its interrupt source 11 and its
+ * lines the LP GPIO matrix's signals 0 and 1. Their QEMU I2C buses,
+ * "i2c0", "i2c1" and "lp-i2c", stand for the board's wires on the pads
+ * each controller is routed to; the board has nothing on them, and
+ * -device puts i2c-slave devices there:
+ *
+ *   -device tmp105,bus=i2c0,address=0x48
+ */
+/* [spec:nuos:req:emu.esp32p4.i2c] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_i2c(ESP32P4MachineState *s)
+{
+    static const struct {
+        const char *bus;
+        hwaddr base;
+        unsigned bus_clock;
+        unsigned reset;
+        const char *sclk;
+        int intr;
+        unsigned scl;
+        unsigned sda;
+    } hp[] = {
+        { "i2c0", 0x500c4000, ESP32P4_CLK_I2C0_APB, ESP32P4_RST_I2C0, "i2c0",
+          ESP32P4_INTR_I2C0, ESP32P4_SIG_I2C0_SCL_PAD_OUT,
+          ESP32P4_SIG_I2C0_SDA_PAD_OUT },
+        { "i2c1", 0x500c5000, ESP32P4_CLK_I2C1_APB, ESP32P4_RST_I2C1, "i2c1",
+          ESP32P4_INTR_I2C1, ESP32P4_SIG_I2C1_SCL_PAD_OUT,
+          ESP32P4_SIG_I2C1_SDA_PAD_OUT },
+    };
+    DeviceState *gpio = DEVICE(&s->gpio), *clkrst = DEVICE(&s->clkrst);
+    ESP32P4ClkRstGate *g;
+    DeviceState *dev;
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(hp); i++) {
+        object_initialize_child(OBJECT(s), hp[i].bus, &s->i2c[i],
+                                TYPE_ESP32P4_I2C);
+        dev = DEVICE(&s->i2c[i]);
+        qdev_prop_set_string(dev, "bus-name", hp[i].bus);
+        qdev_connect_clock_in(dev, "sclk",
+                              qdev_get_clock_out(clkrst, hp[i].sclk));
+        sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+        g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                     hp[i].base, hp[i].bus_clock,
+                                     hp[i].reset, 0);
+        esp32p4_clkrst_gate_volatile(g, 0x1c, 4);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           esp32p4_intr_source(s, hp[i].intr));
+        qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SCL_OUT, 0,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT, hp[i].scl));
+        qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SCL_OE, 0,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OE, hp[i].scl));
+        qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SDA_OUT, 0,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT, hp[i].sda));
+        qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SDA_OE, 0,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OE, hp[i].sda));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN, hp[i].scl,
+            qdev_get_gpio_in_named(dev, ESP32P4_I2C_SCL_IN, 0));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN, hp[i].sda,
+            qdev_get_gpio_in_named(dev, ESP32P4_I2C_SDA_IN, 0));
+    }
+
+    object_initialize_child(OBJECT(s), "lp-i2c", &s->lp_i2c,
+                            TYPE_ESP32P4_LP_I2C);
+    dev = DEVICE(&s->lp_i2c);
+    qdev_prop_set_string(dev, "bus-name", "lp-i2c");
+    qdev_connect_clock_in(dev, "sclk",
+                          qdev_get_clock_out(clkrst, "lp-i2c-sclk"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                 0x50122000, ESP32P4_CLK_LP_I2C,
+                                 ESP32P4_RST_LP_I2C, 0);
+    esp32p4_clkrst_gate_volatile(g, 0x1c, 4);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_I2C));
+    qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SCL_OUT, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_LP_SIG_OUT,
+                               ESP32P4_LP_SIG_I2C_SCL_PAD_OUT));
+    qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SCL_OE, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_LP_SIG_OE,
+                               ESP32P4_LP_SIG_I2C_SCL_PAD_OUT));
+    qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SDA_OUT, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_LP_SIG_OUT,
+                               ESP32P4_LP_SIG_I2C_SDA_PAD_OUT));
+    qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SDA_OE, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_LP_SIG_OE,
+                               ESP32P4_LP_SIG_I2C_SDA_PAD_OUT));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_LP_SIG_IN,
+                                ESP32P4_LP_SIG_I2C_SCL_PAD_IN,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_I2C_SCL_IN, 0));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_LP_SIG_IN,
+                                ESP32P4_LP_SIG_I2C_SDA_PAD_IN,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_I2C_SDA_IN, 0));
+}
+
+/*
+ * The I3C master (0x500DA000) and slave (0x500DB000), behind
+ * I3C_MST_APB_CLK and I3C_SLV_APB_CLK and their resets, the master timed
+ * by I3C_MST_CLK and served by GDMA-AHB as its peripheral 0; their
+ * interrupts sources 101 and 102; their lines the
+ * GPIO matrix's signals 134 to 137, and the master's pull-up enables 138
+ * and 139. The master's QEMU I3C bus, "i3c", stands for the board's
+ * wires on the pads it is routed to, i2c-slave devices going on its
+ * legacy I2C bus, "i3c-legacy-i2c"; the board has nothing on them:
+ *
+ *   -device mock-i3c-target,bus=i3c,static-address=0x30,pid=...
+ *
+ * The slave's target logic sits on that bus, and takes part in the
+ * master's transfers when the board wires the two controllers' pads
+ * together.
+ */
+/* [spec:nuos:req:emu.esp32p4.i2c] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_i3c(ESP32P4MachineState *s)
+{
+    DeviceState *gpio = DEVICE(&s->gpio), *clkrst = DEVICE(&s->clkrst);
+    DeviceState *mst, *slv;
+    ESP32P4ClkRstGate *g;
+    static const struct {
+        const char *name;
+        unsigned sig;
+    } mst_lines[] = {
+        { ESP32P4_I3C_SCL_OUT, ESP32P4_SIG_I3C_MST_SCL_PAD_OUT },
+        { ESP32P4_I3C_SDA_OUT, ESP32P4_SIG_I3C_MST_SDA_PAD_OUT },
+        { ESP32P4_I3C_SCL_PULLUP, ESP32P4_SIG_I3C_MST_SCL_PULLUP_EN_PAD_OUT },
+        { ESP32P4_I3C_SDA_PULLUP, ESP32P4_SIG_I3C_MST_SDA_PULLUP_EN_PAD_OUT },
+    };
+    int i;
+
+    object_initialize_child(OBJECT(s), "i3c-mst", &s->i3c_mst,
+                            TYPE_ESP32P4_I3C_MST);
+    mst = DEVICE(&s->i3c_mst);
+    qdev_prop_set_string(mst, "bus-name", "i3c");
+    object_property_set_link(OBJECT(mst), "gdma", OBJECT(&s->gdma[0]),
+                             &error_abort);
+    qdev_connect_clock_in(mst, "clk", qdev_get_clock_out(clkrst, "i3c-mst"));
+    sysbus_realize(SYS_BUS_DEVICE(mst), &error_fatal);
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(mst), 0,
+                                 0x500da000, ESP32P4_CLK_I3C_MST_APB,
+                                 ESP32P4_RST_I3CMST, 0);
+    esp32p4_clkrst_gate_volatile(g, 0x0c, 8);
+    esp32p4_clkrst_gate_volatile(g, 0x18, 4);
+    esp32p4_clkrst_gate_volatile(g, 0x40, 4);
+    sysbus_connect_irq(SYS_BUS_DEVICE(mst), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_I3C_MST));
+    for (i = 0; i < ARRAY_SIZE(mst_lines); i++) {
+        qdev_connect_gpio_out_named(mst, mst_lines[i].name, 0,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                                   mst_lines[i].sig));
+    }
+    qdev_connect_gpio_out_named(mst, ESP32P4_I3C_SCL_OE, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OE,
+                               ESP32P4_SIG_I3C_MST_SCL_PAD_OUT));
+    qdev_connect_gpio_out_named(mst, ESP32P4_I3C_SDA_OE, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OE,
+                               ESP32P4_SIG_I3C_MST_SDA_PAD_OUT));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                                ESP32P4_SIG_I3C_MST_SCL_PAD_IN,
+                                qdev_get_gpio_in_named(mst,
+                                    ESP32P4_I3C_SCL_IN, 0));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                                ESP32P4_SIG_I3C_MST_SDA_PAD_IN,
+                                qdev_get_gpio_in_named(mst,
+                                    ESP32P4_I3C_SDA_IN, 0));
+
+    object_initialize_child(OBJECT(s), "i3c-slv", &s->i3c_slv,
+                            TYPE_ESP32P4_I3C_SLV);
+    slv = DEVICE(&s->i3c_slv);
+    object_property_set_link(OBJECT(slv), "i3c-bus", OBJECT(s->i3c_mst.bus),
+                             &error_abort);
+    qdev_connect_clock_in(slv, "clk", qdev_get_clock_out(clkrst,
+                                                         "i3c-slv-apb"));
+    sysbus_realize(SYS_BUS_DEVICE(slv), &error_fatal);
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(slv), 0,
+                                 0x500db000, ESP32P4_CLK_I3C_SLV_APB,
+                                 ESP32P4_RST_I3CSLV, 0);
+    esp32p4_clkrst_gate_volatile(g, 0x40, 4);
+    esp32p4_clkrst_gate_volatile(g, 0x48, 4);
+    sysbus_connect_irq(SYS_BUS_DEVICE(slv), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_I3C_SLV));
+    qdev_connect_gpio_out_named(slv, ESP32P4_I3C_SCL_OUT, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                               ESP32P4_SIG_I3C_SLV_SCL_PAD_OUT));
+    qdev_connect_gpio_out_named(slv, ESP32P4_I3C_SCL_OE, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OE,
+                               ESP32P4_SIG_I3C_SLV_SCL_PAD_OUT));
+    qdev_connect_gpio_out_named(slv, ESP32P4_I3C_SDA_OUT, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                               ESP32P4_SIG_I3C_SLV_SDA_PAD_OUT));
+    qdev_connect_gpio_out_named(slv, ESP32P4_I3C_SDA_OE, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OE,
+                               ESP32P4_SIG_I3C_SLV_SDA_PAD_OUT));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                                ESP32P4_SIG_I3C_SLV_SCL_PAD_IN,
+                                qdev_get_gpio_in_named(slv,
+                                    ESP32P4_I3C_SCL_IN, 0));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                                ESP32P4_SIG_I3C_SLV_SDA_PAD_IN,
+                                qdev_get_gpio_in_named(slv,
+                                    ESP32P4_I3C_SDA_IN, 0));
+}
+
+/*
  * The access permission managers and the blocks that record what they
  * refuse: the AXI ICM, its registers behind ICM_APB_CLK, whose interrupt
  * is SYS_ICM_INTR (source 21), and LP_SYS, whose interrupt is
@@ -1502,6 +1769,443 @@ static void esp32p4_init_dma(ESP32P4MachineState *s)
                        esp32p4_intr_source(s, ESP32P4_INTR_DW_GDMA));
 }
 
+/* What the HP memories hold as they come back from a power-down. */
+#define ESP32P4_LOST_MEM_PATTERN 0xa5
+
+/* Fill RAM region @mr as a powered-down memory comes back. */
+static void esp32p4_lose_memory(MemoryRegion *mr)
+{
+    uint64_t size = memory_region_size(mr);
+    ram_addr_t ra = memory_region_get_ram_addr(mr);
+
+    memset(memory_region_get_ram_ptr(mr), ESP32P4_LOST_MEM_PATTERN, size);
+    memory_region_set_dirty(mr, 0, size);
+    if (tcg_enabled()) {
+        tb_invalidate_phys_range(NULL, ra, ra + size - 1);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
+ * The PMU powers the HP memories down: L2MEM and the TCM lose their
+ * contents (TRM 15.4.1.2; LP SRAM, in the LP system, keeps its own).
+ */
+static void esp32p4_hp_mem_power(void *opaque, int n, int level)
+{
+    ESP32P4MachineState *s = opaque;
+
+    if (!level) {
+        esp32p4_lose_memory(&s->l2mem);
+        esp32p4_lose_memory(&s->tcm);
+        s->hp_mem_lost = true;
+    }
+}
+
+static void esp32p4_reload_kernel(ESP32P4MachineState *s);
+
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
+ * The PMU powers PD_TOP, the HP system, down or up. As it comes back after
+ * the HP memories were lost, -kernel's ELF is loaded again in place of the
+ * ROM's boot from flash, before the HP cores start.
+ */
+static void esp32p4_hp_top_power(void *opaque, int n, int level)
+{
+    ESP32P4MachineState *s = opaque;
+
+    if (level && s->hp_mem_lost) {
+        esp32p4_reload_kernel(s);
+        s->hp_mem_lost = false;
+    }
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->clkrst),
+                                        ESP32P4_CLKRST_PMU_POWER,
+                                        ESP32P4_CLKRST_PD_TOP), level);
+}
+
+/*
+ * Low-power management (TRM chapters 15, 24 to 26), in the LP always-on
+ * domain, its registers behind LP_DYN_FAST_CLK:
+ *
+ *   - The PMU, timed by LP_DYN_FAST_CLK and LP_DYN_SLOW_CLK, its PMU_INTR
+ *     and LP interrupts sources 6 and 7: it powers the domains (PD_TOP and
+ *     the HP memories through the machine, which keeps the memories' loss),
+ *     the oscillators, the crystal and the PLLs, gates the HP system's
+ *     clocks and ROOT_CLK, stalls the HP cores, starts and stops the LP
+ *     core, holds the pads and switches them to their sleep configuration,
+ *     pauses the RTC watchdog and lets the brown-out detector see VDD_BAT.
+ *     Its wakeup sources: the GPIO and LP GPIO wakeups, the RTC timer's
+ *     targets, the brown-out detector and VDD_BAT's under-voltage,
+ *     HP_SYSTEM's interrupt wakeup (the TRM's "HP CPU" source) and the EXT
+ *     wakeup on pads GPIO0 to GPIO15, which LP_SYSTEM records too. Its ETM
+ *     task, PMU_TASK_SLEEP_REQ, and event, PMU_EVT_SLEEP_WAKEUP, are the
+ *     ETM's (esp32p4_init_etm()). The other sources' "wakeup" lines,
+ *     UART_WAKEUP_EN and the LP interrupt wait for the blocks that take
+ *     them (UARTs, USB, SDIO, touch, LP I2S, EMAC, the LP core's
+ *     interrupts).
+ *   - LP_ANALOG_PERI, behind its LP_CLKRST reset, its interrupt source 8:
+ *     the brown-out detector, on BIAS's thresholds, and the glitch and
+ *     power supply detectors. The detector's "bod-en" is left at the
+ *     analog default, enabled, rather than taken from LP_SYSTEM's
+ *     "bod-reset-en", which reads a set FIB bit as disabling the detector
+ *     and so, from its reset value, would disable it, where TRM 21.2.2.2
+ *     has a set bit enable it.
+ *   - The LP mailbox, behind its LP_CLKRST reset, MB_HP_INTR and MB_LP_INTR
+ *     sources 4 and 5.
+ */
+/* [spec:nuos:req:emu.esp32p4.low-power] */
+static void esp32p4_init_low_power(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    DeviceState *gpio = DEVICE(&s->gpio);
+    DeviceState *pmu, *ana, *mb;
+    int i;
+
+    object_initialize_child(OBJECT(s), "pmu", &s->pmu, TYPE_ESP32P4_PMU);
+    pmu = DEVICE(&s->pmu);
+    object_property_set_link(OBJECT(pmu), "clkrst", OBJECT(&s->clkrst),
+                             &error_abort);
+    object_property_set_link(OBJECT(pmu), "lp-cpu", OBJECT(&s->lp_cpu),
+                             &error_abort);
+    object_property_set_link(OBJECT(pmu), "lp-sys", OBJECT(&s->lp_sys),
+                             &error_abort);
+    qdev_connect_clock_in(pmu, "fast", qdev_get_clock_out(clkrst,
+                                                          "lp-dyn-fast"));
+    qdev_connect_clock_in(pmu, "slow", qdev_get_clock_out(clkrst,
+                                                          "lp-dyn-slow"));
+    sysbus_realize(SYS_BUS_DEVICE(pmu), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(pmu), 0,
+                             ESP32P4_PMU_BASE, ESP32P4_CLK_LP_DYN_FAST,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(pmu), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_PMU_0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(pmu), 1,
+                       esp32p4_intr_source(s, ESP32P4_INTR_PMU_1));
+
+    s->hp_top_power = qemu_allocate_irq(esp32p4_hp_top_power, s, 0);
+    s->hp_mem_power = qemu_allocate_irq(esp32p4_hp_mem_power, s, 0);
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_POWER, ESP32P4_PMU_PD_TOP,
+                                s->hp_top_power);
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_POWER,
+                                ESP32P4_PMU_PD_HP_MEM, s->hp_mem_power);
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_POWER,
+                                ESP32P4_PMU_PD_HP_CPU,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_POWER,
+                                    ESP32P4_CLKRST_PD_HP_CPU));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_POWER,
+                                ESP32P4_PMU_PD_HP_CNNT,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_POWER,
+                                    ESP32P4_CLKRST_PD_HP_CNNT));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_POWER,
+                                ESP32P4_PMU_PD_LP_PERI,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_POWER,
+                                    ESP32P4_CLKRST_PD_LP_PERI));
+    for (i = 0; i < ESP32P4_CLKRST_NUM_XPD; i++) {
+        qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_XPD, i,
+                                    qdev_get_gpio_in_named(clkrst,
+                                        ESP32P4_CLKRST_PMU_XPD, i));
+    }
+    for (i = 0; i < ESP32P4_ANA_NUM_PLLS; i++) {
+        qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_PLL_XPD, i,
+                                    qdev_get_gpio_in_named(DEVICE(&s->ana),
+                                        ESP32P4_ANA_XPD, i));
+    }
+    for (i = 0; i < ESP32P4_HP_CORES; i++) {
+        qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_CORE_STALL, i,
+                                    qdev_get_gpio_in_named(clkrst,
+                                        ESP32P4_CLKRST_PMU_CORE_STALL, i));
+    }
+    for (i = 0; i < ESP32P4_CLKRST_NUM_PMU_ICG; i++) {
+        qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_ICG, i,
+                                    qdev_get_gpio_in_named(clkrst,
+                                        ESP32P4_CLKRST_PMU_ICG, i));
+    }
+    for (i = 0; i < ESP32P4_CLKRST_NUM_SYSCLK; i++) {
+        qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_SYSCLK, i,
+                                    qdev_get_gpio_in_named(clkrst,
+                                        ESP32P4_CLKRST_PMU_SYSCLK, i));
+    }
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LP_SLEEP, 0,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_LP_SLEEP, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LP_CORE_RESET, 0,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_LP_CORE_RESET, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LP_CORE_CLOCK, 0,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_LP_CORE_CLOCK, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LP_CORE_STALL, 0,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_LP_CORE_STALL, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_HOLD_ALL,
+                                ESP32P4_PMU_HOLD_HP,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_HOLD_ALL,
+                                    ESP32P4_GPIO_HOLD_ALL_HP));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_HOLD_ALL,
+                                ESP32P4_PMU_HOLD_LP,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_HOLD_ALL,
+                                    ESP32P4_GPIO_HOLD_ALL_LP));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_PAD_SLEEP, 0,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_LIGHT_SLEEP, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_PAUSE_WDT, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->lp_wdt),
+                                    ESP32P4_LP_WDT_SLEEP, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_XTAL_OFF, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->lp_timer),
+                                    ESP32P4_LP_TIMER_XTAL_OFF, 0));
+
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_WAKEUP, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_GPIO));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_LP_WAKEUP, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_LP_GPIO));
+    qdev_connect_gpio_out_named(DEVICE(&s->hp_sys), ESP32P4_HP_SYS_HP_WAKEUP,
+                                0, qdev_get_gpio_in_named(pmu,
+                                       ESP32P4_PMU_WAKEUP,
+                                       ESP32P4_PMU_WAKE_HP_CPU));
+    qdev_connect_gpio_out_named(DEVICE(&s->lp_timer),
+                                ESP32P4_LP_TIMER_SOC_WAKEUP, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_RTC_TIMER0));
+    qdev_connect_gpio_out_named(DEVICE(&s->lp_timer),
+                                ESP32P4_LP_TIMER_LP_WAKEUP, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_RTC_TIMER1));
+    for (i = 0; i < ESP32P4_PMU_EXT_PADS; i++) {
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_OUT, i,
+                                    qdev_get_gpio_in_named(pmu,
+                                        ESP32P4_PMU_EXT_PAD, i));
+    }
+
+    object_initialize_child(OBJECT(s), "lp-ana", &s->lp_ana,
+                            TYPE_ESP32P4_LP_ANA);
+    ana = DEVICE(&s->lp_ana);
+    object_property_set_link(OBJECT(ana), "clkrst", OBJECT(&s->clkrst),
+                             &error_abort);
+    object_property_set_link(OBJECT(ana), "ana", OBJECT(&s->ana),
+                             &error_abort);
+    object_property_set_link(OBJECT(ana), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    qdev_connect_clock_in(ana, "fast", qdev_get_clock_out(clkrst,
+                                                          "lp-dyn-fast"));
+    sysbus_realize(SYS_BUS_DEVICE(ana), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(ana), 0,
+                             ESP32P4_LP_ANA_BASE, ESP32P4_CLK_LP_DYN_FAST,
+                             ESP32P4_RST_LP_ANAPERI, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(ana), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_ANAPERI));
+    qdev_connect_gpio_out_named(DEVICE(&s->ana), ESP32P4_ANA_BIAS_UPDATE, 0,
+                                qdev_get_gpio_in_named(ana,
+                                    ESP32P4_LP_ANA_BIAS_UPDATE, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_BOD_VBAT_SEL, 0,
+                                qdev_get_gpio_in_named(ana,
+                                    ESP32P4_LP_ANA_VBAT_SEL, 0));
+    qdev_connect_gpio_out_named(ana, ESP32P4_LP_ANA_BROWNOUT, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_BROWNOUT));
+    qdev_connect_gpio_out_named(ana, ESP32P4_LP_ANA_VBAT_UNDERVOLTAGE, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_VBAT));
+
+    object_initialize_child(OBJECT(s), "lp-mailbox", &s->lp_mailbox,
+                            TYPE_ESP32P4_LP_MAILBOX);
+    mb = DEVICE(&s->lp_mailbox);
+    sysbus_realize(SYS_BUS_DEVICE(mb), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(mb), 0,
+                             ESP32P4_LP_MAILBOX_BASE, ESP32P4_CLK_LP_DYN_FAST,
+                             ESP32P4_RST_LP_MAILBOX, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(mb), ESP32P4_LP_MAILBOX_IRQ_HP,
+                       esp32p4_intr_source(s, ESP32P4_INTR_MB_HP));
+    sysbus_connect_irq(SYS_BUS_DEVICE(mb), ESP32P4_LP_MAILBOX_IRQ_LP,
+                       esp32p4_intr_source(s, ESP32P4_INTR_MB_LP));
+}
+
+/* LP_SYSTEM_SYS_SW_RST: the software system reset, an HP core reset. */
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static void esp32p4_sw_sys_reset(void *opaque, int n, int level)
+{
+    ESP32P4MachineState *s = opaque;
+
+    if (level) {
+        esp32p4_clkrst_hp_core_reset(&s->clkrst, ESP32P4_HP_CORE_RESET_SW,
+                                     ESP32P4_SW_SYS_RESET_NS);
+    }
+}
+
+/*
+ * The system registers' connections and the debug blocks (TRM chapters 21
+ * to 23 and 3):
+ *
+ *   - HP_SYSTEM's and LP_SYSTEM's bus error response disables to the HP
+ *     cores and the LP core; HP_SYSTEM's WFI wakeup events to the HP cores;
+ *     its HP2LP interrupt groups over sources 21 to 130 of the interrupt
+ *     matrix, whose HP_INTR waits for the LP core's interrupt controller
+ *     and whose HP wakeup is the PMU's (esp32p4_init_low_power()); and the
+ *     HP cores' stalls for CPU_CORESTALLED_ST.
+ *   - The pads' holds: each pad's GPIO block "pad-hold" input is the OR of
+ *     LP_SYSTEM_PAD_RTC_HOLD_CTRL's bit for it and, for GPIO16 to GPIO54,
+ *     HP_SYSTEM_GPIO_O_HOLD_CTRL's (the PMU's holds of all the HP or LP
+ *     pads are the GPIO block's "hold-all", esp32p4_init_low_power()).
+ *   - LP_SYSTEM's software system reset, an HP core reset with cause 0x03
+ *     (TRM table 11.1-1), its choice of the core whose stall the RTC
+ *     timer follows, and its FIB control of the super watchdog's reset,
+ *     to the RTC watchdog. Its LP core disable is not connected, as the
+ *     PMU does not act on it, nor its brownout reset enable (see
+ *     esp32p4_init_low_power()).
+ *   - The debug assistant (0x3FF06000), not gated by BUSMON_CPU_CLK_EN, its
+ *     interrupt ASSIST_DEBUG_INTR (source 127), watching the HP cores and
+ *     taking their resets for its PC records.
+ *   - The AXI performance monitor (0x500A8000), behind AXI_PERF_MON_SYS_CLK
+ *     and its reset, counting SYS_CLK, the AXI matrix's clock, its
+ *     interrupt AXI_PERF_MON_INTR (source 130).
+ *   - Each HP core's trace encoder (0x3FF04000, 0x3FF05000), behind
+ *     TRACE_CPU_CLK and its RST_EN_CORETRACE<n> reset, its AHB master on
+ *     TRACE_SYS_CLK writing the trace memory through the access permission
+ *     managers, its interrupt CORE<n>_TRACE_INTR (sources 97, 98), taking
+ *     its core's reset as its reset sideband.
+ */
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static void esp32p4_init_debug(ESP32P4MachineState *s)
+{
+    DeviceState *hp_sys = DEVICE(&s->hp_sys);
+    DeviceState *lp_sys = DEVICE(&s->lp_sys);
+    DeviceState *gpio = DEVICE(&s->gpio);
+    DeviceState *dev;
+    int core, n;
+
+    for (core = 0; core < ESP32P4_HP_CORES; core++) {
+        DeviceState *cpu = DEVICE(&s->hp_cpu[core]);
+
+        for (n = 0; n < ESP32P4_BUSES; n++) {
+            qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_ERR_RESP_DIS,
+                                        core * ESP32P4_BUSES + n,
+                                        qdev_get_gpio_in_named(cpu,
+                                            ESP32P4_CPU_ERR_RESP_DIS, n));
+        }
+        qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_CPU_WAKEUP, core,
+                                    qdev_get_gpio_in_named(cpu,
+                                        ESP32P4_CPU_WAKEUP, 0));
+        qdev_connect_gpio_out(DEVICE(&s->core_stall_split[core]), 2,
+                              qdev_get_gpio_in_named(hp_sys,
+                                  ESP32P4_HP_SYS_CORE_STALLED, core));
+    }
+    for (n = 0; n < ESP32P4_HP_SYS_HP2LP_SOURCES; n++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->intmatrix),
+                                    ESP32P4_INTMATRIX_SOURCE_OUT,
+                                    ESP32P4_HP_SYS_HP2LP_FIRST + n,
+                                    qdev_get_gpio_in_named(hp_sys,
+                                        ESP32P4_HP_SYS_HP_SOURCE, n));
+    }
+    for (n = 0; n < ESP32P4_BUSES; n++) {
+        qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_ERR_RESP_DIS, n,
+                                    qdev_get_gpio_in_named(DEVICE(&s->lp_cpu),
+                                        ESP32P4_CPU_ERR_RESP_DIS, n));
+    }
+
+    for (n = 0; n < ESP32P4_GPIO_PADS; n++) {
+        qemu_irq hold = qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_PAD_HOLD, n);
+        int h = n - ESP32P4_HP_SYS_HOLD_FIRST;
+
+        if (h < 0) {
+            qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_PAD_HOLD, n,
+                                        hold);
+            continue;
+        }
+        object_initialize_child(OBJECT(s), "pad-hold-or[*]",
+                                &s->pad_hold_or[h], TYPE_OR_IRQ);
+        dev = DEVICE(&s->pad_hold_or[h]);
+        qdev_prop_set_uint16(dev, "num-lines", 2);
+        qdev_realize(dev, NULL, &error_fatal);
+        qdev_connect_gpio_out(dev, 0, hold);
+        qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_PAD_HOLD, n,
+                                    qdev_get_gpio_in(dev, 0));
+        qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_PAD_HOLD, h,
+                                    qdev_get_gpio_in(dev, 1));
+    }
+
+    qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_SW_RESET, 0,
+                                qemu_allocate_irq(esp32p4_sw_sys_reset, s, 0));
+    qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_STALL_SEL, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->lp_timer),
+                                    ESP32P4_LP_TIMER_STALL_SEL, 0));
+    qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_SWD_RESET_EN, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->lp_wdt),
+                                    ESP32P4_LP_WDT_SWD_RESET_EN, 0));
+
+    object_initialize_child(OBJECT(s), "assist-debug", &s->assist_debug,
+                            TYPE_ESP32P4_ASSIST_DEBUG);
+    dev = DEVICE(&s->assist_debug);
+    for (core = 0; core < ESP32P4_HP_CORES; core++) {
+        g_autofree char *link = g_strdup_printf("cpu%d", core);
+
+        object_property_set_link(OBJECT(dev), link,
+                                 OBJECT(&s->hp_cpu[core]), &error_abort);
+    }
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, ESP32P4_ASSIST_DEBUG_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_ASSIST_DEBUG));
+    for (core = 0; core < ESP32P4_HP_CORES; core++) {
+        qdev_connect_gpio_out(DEVICE(&s->core_reset_split[core]), 2,
+                              qdev_get_gpio_in_named(dev,
+                                  ESP32P4_ASSIST_DEBUG_CORE_RESET, core));
+    }
+
+    object_initialize_child(OBJECT(s), "axi-perf-mon", &s->axi_perf_mon,
+                            TYPE_ESP32P4_AXI_PERF_MON);
+    dev = DEVICE(&s->axi_perf_mon);
+    qdev_connect_clock_in(dev, "axi", qdev_get_clock_out(DEVICE(&s->clkrst),
+                                                         "sys"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_AXI_PERF_MON_BASE,
+                             ESP32P4_CLK_AXI_PERF_MON_SYS,
+                             ESP32P4_RST_AXI_PERF_MON, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_AXI_PERF_MON));
+
+    for (core = 0; core < ESP32P4_HP_CORES; core++) {
+        static const hwaddr base[] = { ESP32P4_TRACE0_BASE,
+                                       ESP32P4_TRACE1_BASE };
+
+        object_initialize_child(OBJECT(s), "trace[*]", &s->trace[core],
+                                TYPE_ESP32P4_TRACE);
+        dev = DEVICE(&s->trace[core]);
+        qdev_prop_set_uint8(dev, "core", core);
+        object_property_set_link(OBJECT(dev), "cpu",
+                                 OBJECT(&s->hp_cpu[core]), &error_abort);
+        object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
+                                 &error_abort);
+        qdev_connect_clock_in(dev, "sys-clk",
+                              qdev_get_clock_out(DEVICE(&s->clkrst),
+                                                 "trace-sys"));
+        sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+        esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                 base[core], ESP32P4_CLK_TRACE_CPU,
+                                 core ? ESP32P4_RST_CORETRACE1
+                                      : ESP32P4_RST_CORETRACE0, 0);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           esp32p4_intr_source(s, core ?
+                                               ESP32P4_INTR_CORE1_TRACE :
+                                               ESP32P4_INTR_CORE0_TRACE));
+        qdev_connect_gpio_out(DEVICE(&s->core_reset_split[core]), 3,
+                              qdev_get_gpio_in_named(dev,
+                                  ESP32P4_TRACE_CORE_RESET, 0));
+    }
+}
+
 /*
  * The TWAI controllers, each behind TWAIn_APB_CLK, timed by TWAIn_CLK and
  * reset by HP_SYS_CLKRST_RST_EN_CANn, which the device takes itself as it
@@ -1644,7 +2348,7 @@ static void esp32p4_init_rmt_pcnt(ESP32P4MachineState *s)
  * The RMT and the PCNT have no events or tasks on the P4.
  *
  * Not connected, as their blocks are not modelled: the LED PWM, MCPWM,
- * ADC, REGDMA, temperature sensor, I2S, 2D-DMA and PMU events and tasks;
+ * ADC, REGDMA, temperature sensor, I2S and 2D-DMA events and tasks;
  * the LP core's events (ULP_EVT_*) and ULP_TASK_WAKEUP_CPU, the PMU's LP
  * core wakeup, whose LP_CORE_ETM_WAKEUP_FLAG in LP_SYS is not modelled;
  * and the RTC timer's tasks (RTC_TASK_*), which the TRM says it does not
@@ -1759,10 +2463,205 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
         }
     }
 
-    /* The LP core's interrupt, through LP_SYS's ETM_TASK_ULP_INT. */
+    /* The PMU's sleep request and its wakeup to HP_ACTIVE. */
+    esp32p4_etm_connect_event(etm, ESP32P4_ETM_PMU_EVT_SLEEP_WEEKUP,
+                              DEVICE(&s->pmu), ESP32P4_PMU_ETM_EVENT, 0);
+    esp32p4_etm_connect_task(etm, ESP32P4_ETM_PMU_TASK_SLEEP_REQ,
+                             DEVICE(&s->pmu), ESP32P4_PMU_ETM_TASK, 0);
+
+    /*
+     * The LP core's interrupt, through LP_SYS's ETM_TASK_ULP_INT, and its
+     * wakeup, which LP_SYS's LP_CORE_ETM_WAKEUP_FLAG records.
+     */
     esp32p4_etm_connect_task(etm, ESP32P4_ETM_ULP_TASK_INT_CPU,
                              DEVICE(&s->lp_sys),
                              ESP32P4_LP_SYS_ETM_TASK_ULP_INT, 0);
+    esp32p4_etm_connect_task(etm, ESP32P4_ETM_ULP_TASK_WAKEUP_CPU,
+                             DEVICE(&s->lp_sys),
+                             ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP, 0);
+}
+
+/*
+ * The full-speed OTG's UTMI+ OTG signals through the GPIO matrix (TRM
+ * table 10.12-1, signals 110 to 115), as ESP-IDF's usb_phy.c routes them:
+ * the session end through USB_WRAP, which can override it.
+ */
+static const struct {
+    int sig;
+    int line;
+} esp32p4_usb_fs_sense[] = {
+    { ESP32P4_SIG_USB_OTG11_IDDIG_PAD_IN, DWC2_OTG_SENSE_IDDIG },
+    { ESP32P4_SIG_USB_OTG11_AVALID_PAD_IN, DWC2_OTG_SENSE_AVALID },
+    { ESP32P4_SIG_USB_SRP_BVALID_PAD_IN, DWC2_OTG_SENSE_BVALID },
+    { ESP32P4_SIG_USB_OTG11_VBUSVALID_PAD_IN, DWC2_OTG_SENSE_VBUSVALID },
+}, esp32p4_usb_fs_ctl[] = {
+    { ESP32P4_SIG_USB_OTG11_IDPULLUP_PAD_OUT, DWC2_OTG_CTL_IDPULLUP },
+    { ESP32P4_SIG_USB_OTG11_DPPULLDOWN_PAD_OUT, DWC2_OTG_CTL_DPPULLDOWN },
+    { ESP32P4_SIG_USB_OTG11_DMPULLDOWN_PAD_OUT, DWC2_OTG_CTL_DMPULLDOWN },
+    { ESP32P4_SIG_USB_OTG11_DRVVBUS_PAD_OUT, DWC2_OTG_CTL_DRVVBUS },
+    { ESP32P4_SIG_USB_SRP_CHRGVBUS_PAD_OUT, DWC2_OTG_CTL_CHRGVBUS },
+    { ESP32P4_SIG_USB_SRP_DISCHRGVBUS_PAD_OUT, DWC2_OTG_CTL_DISCHRGVBUS },
+};
+
+/* Map a DWC2 core's registers and FIFOs behind its bus clock and reset. */
+static void esp32p4_map_usb_core(ESP32P4MachineState *s, DWC2OTGState *core,
+                                 hwaddr base, unsigned clock, unsigned reset)
+{
+    ESP32P4ClkRstGate *g;
+
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(core),
+                                 DWC2_OTG_MMIO_CSR, base, clock, reset, 0);
+    /* GRXSTSP pops the receive FIFO. */
+    esp32p4_clkrst_gate_volatile(g, DWC2_OTG_GRXSTSP, 4);
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(core),
+                                 DWC2_OTG_MMIO_FIFO,
+                                 base + DWC2_OTG_FIFO_BASE, clock, reset, 0);
+    /* Reading a push/pop window pops the receive FIFO. */
+    esp32p4_clkrst_gate_volatile(g, 0, DWC2_OTG_MAX_EPS * 0x1000);
+}
+
+/*
+ * The USB 2.0 OTG controllers. OTG_HS: its registers and the UTMI+ PHY's
+ * behind USB_OTG20_SYS_CLK, the core reset by RST_EN_USB_OTG20 and the
+ * PHY by RST_EN_USB_OTG20_PHY, the PHY's PLL on USB_OTG20_PHYREF_CLK; its
+ * PHY controls in HP_SYSTEM; its interrupts USB_OTG_INTR (93) and
+ * USB_OTG_ENDP_MULTI_PROC_INTR (94). OTG_FS: its registers and USB_WRAP's
+ * behind USB_OTG11_SYS_CLK, both reset by RST_EN_USB_OTG11, its PHY on
+ * USB_OTG11_48M_CLK; its PHY selection in LP_SYS and the eFuses; its
+ * interrupt USB_OTG11_INTR (103). Both DMA through the DMA APM.
+ */
+/* [spec:nuos:req:emu.esp32p4.usb] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+static void esp32p4_init_usb(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    DeviceState *gpio = DEVICE(&s->gpio);
+    DeviceState *hs, *fs, *utmi, *wrap;
+    int i;
+
+    object_initialize_child(OBJECT(s), "usb-utmi", &s->usb_utmi,
+                            TYPE_ESP32P4_USB_UTMI);
+    utmi = DEVICE(&s->usb_utmi);
+    qdev_connect_clock_in(utmi, "refclk",
+                          qdev_get_clock_out(clkrst, "usb-otg20-phyref"));
+    sysbus_realize(SYS_BUS_DEVICE(utmi), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(utmi), 0,
+                             ESP32P4_USB_UTMI_BASE, ESP32P4_CLK_USB_OTG20_SYS,
+                             ESP32P4_RST_USB_OTG20_PHY, 0);
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_USB_OTG20_PHY,
+                                qdev_get_gpio_in_named(utmi,
+                                    ESP32P4_USB_UTMI_PHY_RESET, 0));
+    for (i = 0; i < ESP32P4_HP_SYS_USBOTG20_CTRL_LINES; i++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->hp_sys),
+                                    ESP32P4_HP_SYS_USBOTG20_CTRL, i,
+                                    qdev_get_gpio_in_named(utmi,
+                                        ESP32P4_USB_UTMI_SYS_CTRL, i));
+    }
+    for (i = 0; i < 4; i++) {
+        qdev_connect_gpio_out_named(utmi, ESP32P4_USB_UTMI_PHY_ST, i,
+                                    qdev_get_gpio_in_named(
+                                        DEVICE(&s->hp_sys),
+                                        ESP32P4_HP_SYS_USB_OTGHS_PHY_ST, i));
+    }
+
+    object_initialize_child(OBJECT(s), "usb-otg-hs", &s->usb_hs,
+                            TYPE_ESP32P4_USB_OTG_HS);
+    hs = DEVICE(&s->usb_hs);
+    dwc2_otg_set_dma(&s->usb_hs, esp32p4_pms_bus_as(&s->pms),
+                     esp32p4_dma_attrs(ESP32P4_DMA_MASTER_USB_OTG_HS,
+                                       ESP32P4_ICM_ID_USB_OTG_HS));
+    qdev_connect_clock_in(hs, "utmi", qdev_get_clock_out(utmi, "utmi"));
+    sysbus_realize(SYS_BUS_DEVICE(hs), &error_fatal);
+    esp32p4_map_usb_core(s, &s->usb_hs, ESP32P4_USB_OTG_HS_BASE,
+                         ESP32P4_CLK_USB_OTG20_SYS, ESP32P4_RST_USB_OTG20);
+    sysbus_connect_irq(SYS_BUS_DEVICE(hs), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_USB_OTG));
+    sysbus_connect_irq(SYS_BUS_DEVICE(hs), 1,
+                       esp32p4_intr_source(s,
+                           ESP32P4_INTR_USB_OTG_ENDP_MULTI_PROC));
+    for (i = 0; i < DWC2_OTG_SENSE_NUM; i++) {
+        qdev_connect_gpio_out_named(utmi, DWC2_OTG_SENSE, i,
+                                    qdev_get_gpio_in_named(hs,
+                                        DWC2_OTG_SENSE, i));
+    }
+    qdev_connect_gpio_out_named(hs, DWC2_OTG_CTL, DWC2_OTG_CTL_DRVVBUS,
+                                qdev_get_gpio_in_named(utmi,
+                                    ESP32P4_USB_UTMI_DRVVBUS, 0));
+    qdev_connect_gpio_out_named(hs, DWC2_OTG_HOST_ATTACHED, 0,
+                                qdev_get_gpio_in_named(utmi,
+                                    ESP32P4_USB_UTMI_HOST_ATTACHED, 0));
+
+    object_initialize_child(OBJECT(s), "usb-wrap", &s->usb_wrap,
+                            TYPE_ESP32P4_USB_WRAP);
+    wrap = DEVICE(&s->usb_wrap);
+    object_property_set_link(OBJECT(wrap), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    sysbus_realize(SYS_BUS_DEVICE(wrap), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(wrap), 0,
+                             ESP32P4_USB_WRAP_BASE, ESP32P4_CLK_USB_OTG11_SYS,
+                             ESP32P4_RST_USB_OTG11, 0);
+    for (i = 0; i < 2; i++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->lp_sys),
+                                    ESP32P4_LP_SYS_USB_PHY_SEL, i,
+                                    qdev_get_gpio_in_named(wrap,
+                                        ESP32P4_USB_WRAP_PHY_SEL, i));
+    }
+
+    object_initialize_child(OBJECT(s), "usb-otg-fs", &s->usb_fs,
+                            TYPE_ESP32P4_USB_OTG_FS);
+    fs = DEVICE(&s->usb_fs);
+    dwc2_otg_set_dma(&s->usb_fs, esp32p4_pms_bus_as(&s->pms),
+                     esp32p4_dma_attrs(ESP32P4_DMA_MASTER_USB_OTG_FS,
+                                       ESP32P4_ICM_ID_USB_OTG_FS));
+    qdev_connect_clock_in(fs, "fsphy",
+                          qdev_get_clock_out(clkrst, "usb-otg11-48m"));
+    sysbus_realize(SYS_BUS_DEVICE(fs), &error_fatal);
+    esp32p4_map_usb_core(s, &s->usb_fs, ESP32P4_USB_OTG_FS_BASE,
+                         ESP32P4_CLK_USB_OTG11_SYS, ESP32P4_RST_USB_OTG11);
+    sysbus_connect_irq(SYS_BUS_DEVICE(fs), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_USB_OTG11_CH0));
+    qdev_connect_gpio_out_named(wrap, DWC2_OTG_PHY_CONNECTED, 0,
+                                qdev_get_gpio_in_named(fs,
+                                    DWC2_OTG_PHY_CONNECTED, 0));
+    for (i = 0; i < 2; i++) {
+        qdev_connect_gpio_out_named(wrap, DWC2_OTG_PULL_OVERRIDE, i,
+                                    qdev_get_gpio_in_named(fs,
+                                        DWC2_OTG_PULL_OVERRIDE, i));
+    }
+    for (i = 0; i < ARRAY_SIZE(esp32p4_usb_fs_sense); i++) {
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                                    esp32p4_usb_fs_sense[i].sig,
+                                    qdev_get_gpio_in_named(fs,
+                                        DWC2_OTG_SENSE,
+                                        esp32p4_usb_fs_sense[i].line));
+    }
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                                ESP32P4_SIG_USB_SRP_SESSEND_PAD_IN,
+                                qdev_get_gpio_in_named(wrap,
+                                    ESP32P4_USB_WRAP_SESSEND_IN, 0));
+    qdev_connect_gpio_out_named(wrap, ESP32P4_USB_WRAP_SESSEND, 0,
+                                qdev_get_gpio_in_named(fs, DWC2_OTG_SENSE,
+                                    DWC2_OTG_SENSE_SESSEND));
+    /*
+     * The D+ pull-up OTG_FS's PHY puts on its pad: GPIO27, of the PHY the
+     * OTG has by default. GPIO25's pull-up is USB Serial/JTAG's line.
+     */
+    qdev_connect_gpio_out_named(fs, DWC2_OTG_DP_PULLUP, 0,
+                                qdev_get_gpio_in_named(wrap,
+                                    ESP32P4_USB_WRAP_CORE_DP_PULLUP, 0));
+    qdev_connect_gpio_out_named(wrap, ESP32P4_USB_WRAP_PHY_DP_PULLUP, 1,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_PAD_PULL_UP, 27));
+    for (i = 0; i < ARRAY_SIZE(esp32p4_usb_fs_ctl); i++) {
+        qdev_connect_gpio_out_named(fs, DWC2_OTG_CTL,
+                                    esp32p4_usb_fs_ctl[i].line,
+                                    qdev_get_gpio_in_named(gpio,
+                                        ESP32P4_GPIO_SIG_OUT,
+                                        esp32p4_usb_fs_ctl[i].sig));
+    }
 }
 
 /* The memories -kernel can load into: those the cores address directly. */
@@ -1788,13 +2687,22 @@ static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
     return false;
 }
 
+/* An ELF segment -kernel loaded outside LP SRAM, for its reload. */
+typedef struct ESP32P4KernelSegment {
+    uint32_t paddr;
+    uint32_t memsz;
+    GBytes *data;
+} ESP32P4KernelSegment;
+
 /*
  * Refuse an ELF with a segment outside those memories: the loader would
  * drop one in the flash or PSRAM windows without a word, as nothing maps
  * them, and one in the ROM would replace the ROM. Files that are not
- * 32-bit little-endian ELFs are left for the loader to reject.
+ * 32-bit little-endian ELFs are left for the loader to reject. Keep the
+ * segments outside LP SRAM, which a deep sleep loses.
  */
-static void esp32p4_check_kernel(const char *filename)
+static void esp32p4_check_kernel(ESP32P4MachineState *s,
+                                 const char *filename)
 {
     g_autofree char *data = NULL;
     gsize len;
@@ -1817,7 +2725,8 @@ static void esp32p4_check_kernel(const char *filename)
     }
     for (i = 0; i < phnum; i++) {
         Elf32_Phdr ph;
-        uint32_t paddr, memsz;
+        ESP32P4KernelSegment seg;
+        uint32_t paddr, memsz, offset, filesz;
 
         if (phoff + (uint64_t)(i + 1) * phentsize > len) {
             return;
@@ -1825,6 +2734,8 @@ static void esp32p4_check_kernel(const char *filename)
         memcpy(&ph, data + phoff + i * phentsize, sizeof(ph));
         paddr = le32_to_cpu(ph.p_paddr);
         memsz = le32_to_cpu(ph.p_memsz);
+        offset = le32_to_cpu(ph.p_offset);
+        filesz = MIN(le32_to_cpu(ph.p_filesz), memsz);
         if (le32_to_cpu(ph.p_type) != PT_LOAD || !memsz) {
             continue;
         }
@@ -1837,6 +2748,39 @@ static void esp32p4_check_kernel(const char *filename)
                          paddr, memsz);
             exit(1);
         }
+        if ((paddr >= ESP32P4_LP_SRAM_BASE &&
+             paddr - ESP32P4_LP_SRAM_BASE < ESP32P4_LP_SRAM_SIZE) ||
+            (uint64_t)offset + filesz > len) {
+            continue;
+        }
+        seg.paddr = paddr;
+        seg.memsz = memsz;
+        seg.data = g_bytes_new(data + offset, filesz);
+        g_array_append_val(s->kernel_segments, seg);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
+ * Load the -kernel ELF's segments outside LP SRAM again, as the ROM's boot
+ * from flash would once the HP memories have lost their contents.
+ */
+static void esp32p4_reload_kernel(ESP32P4MachineState *s)
+{
+    guint i;
+
+    for (i = 0; s->kernel_segments && i < s->kernel_segments->len; i++) {
+        ESP32P4KernelSegment *seg = &g_array_index(s->kernel_segments,
+                                                   ESP32P4KernelSegment, i);
+        gsize filesz;
+        const void *bytes = g_bytes_get_data(seg->data, &filesz);
+        g_autofree uint8_t *zeros = g_malloc0(seg->memsz - filesz);
+
+        address_space_write(&address_space_memory, seg->paddr,
+                            MEMTXATTRS_UNSPECIFIED, bytes, filesz);
+        address_space_write(&address_space_memory, seg->paddr + filesz,
+                            MEMTXATTRS_UNSPECIFIED, zeros,
+                            seg->memsz - filesz);
     }
 }
 
@@ -1863,7 +2807,9 @@ static void esp32p4_load(ESP32P4MachineState *s)
     if (!machine->kernel_filename) {
         return;
     }
-    esp32p4_check_kernel(machine->kernel_filename);
+    s->kernel_segments = g_array_new(false, false,
+                                     sizeof(ESP32P4KernelSegment));
+    esp32p4_check_kernel(s, machine->kernel_filename);
     if (load_elf(machine->kernel_filename, NULL, NULL, NULL, &entry, NULL,
                  NULL, NULL, ELFDATA2LSB, EM_RISCV, 1, 0) < 0) {
         error_report("esp32p4: cannot load the ELF file '%s'",
@@ -1900,14 +2846,19 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_efuse(s);
     esp32p4_init_timers(s);
     esp32p4_init_gpio(s);
+    esp32p4_init_i2c(s);
     esp32p4_init_pms(s);
     esp32p4_init_ext_memory(s);
     esp32p4_init_sdmmc(s);
     esp32p4_init_emac(s);
     esp32p4_init_dma(s);
+    esp32p4_init_low_power(s);
+    esp32p4_init_i3c(s);
     esp32p4_init_twai(s);
     esp32p4_init_rmt_pcnt(s);
     esp32p4_init_etm(s);
+    esp32p4_init_usb(s);
+    esp32p4_init_debug(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
                         esp32p4_unimplemented[i].name,

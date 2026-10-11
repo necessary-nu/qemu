@@ -76,6 +76,118 @@ static void gen_esp32p4_hwlp_check(DisasContext *ctx)
 }
 
 /*
+ * The debug assistant's SP monitor (hw/misc/esp32p4_assist_debug.c), after
+ * an instruction writes SP while it is enabled: compare SP with the
+ * monitored bounds, and call the helper only when SP has crossed one since
+ * the last report, so that code keeping its stack in bounds pays two
+ * compares per SP write. The helper takes the instruction's address, for
+ * the PC the monitor records. Its report may raise this core's interrupt,
+ * which is taken after the instruction: the instruction ends its block
+ * (as under icount it must, to raise it).
+ */
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static void gen_esp32p4_sp_check(DisasContext *ctx)
+{
+    TCGLabel *done = gen_new_label();
+    TCGv sp = tcg_temp_new();
+    TCGv bound = tcg_temp_new();
+    TCGv out = tcg_temp_new();
+    TCGv above = tcg_temp_new();
+
+    translator_io_start(&ctx->base);
+    tcg_gen_ext32u_tl(sp, cpu_gpr[xSP]);
+    tcg_gen_ld32u_tl(bound, tcg_env, ESP32P4_ENV_OFFSET(spmon_min));
+    tcg_gen_setcond_tl(TCG_COND_LTU, out, sp, bound);
+    tcg_gen_ld32u_tl(bound, tcg_env, ESP32P4_ENV_OFFSET(spmon_max));
+    tcg_gen_setcond_tl(TCG_COND_GTU, above, sp, bound);
+    tcg_gen_or_tl(out, out, above);
+    tcg_gen_ld32u_tl(bound, tcg_env, ESP32P4_ENV_OFFSET(spmon_out));
+    tcg_gen_brcond_tl(TCG_COND_EQ, out, bound, done);
+    gen_pc_plus_diff(sp, ctx, 0);
+    gen_helper_esp32p4_sp_check(tcg_env, sp);
+    gen_set_label(done);
+}
+
+/*
+ * The kind of the instruction at pc_next, for the trace encoder: a
+ * conditional branch, a jump whose target the program gives (JAL, C.J,
+ * C.JAL), one whose target it does not (JALR, C.JR, C.JALR, Zcmp's
+ * cm.popret and cm.popretz, Zcmt's table jumps), a trap return, or none
+ * of these; and its length.
+ */
+static uint32_t esp32p4_trace_kind(DisasContext *ctx, CPURISCVState *env)
+{
+    uint16_t lo = translator_lduw_end(env, &ctx->base, ctx->base.pc_next,
+                                      MO_LE);
+    uint32_t insn;
+
+    if ((lo & 3) != 3) {
+        unsigned funct3 = lo >> 13;
+
+        switch (lo & 3) {
+        case 1:
+            if (funct3 == 1 || funct3 == 5) {
+                return ESP32P4_TRACE_KIND_JAL;
+            }
+            if (funct3 == 6 || funct3 == 7) {
+                return ESP32P4_TRACE_KIND_BRANCH;
+            }
+            break;
+        case 2:
+            if (funct3 == 4 && !extract32(lo, 2, 5) && extract32(lo, 7, 5)) {
+                return ESP32P4_TRACE_KIND_JALR;
+            }
+            if ((lo & 0xfc03) == 0xa002 || (lo & 0xff03) == 0xbe02 ||
+                (lo & 0xff03) == 0xbc02) {
+                return ESP32P4_TRACE_KIND_JALR;
+            }
+            break;
+        default:
+            break;
+        }
+        return ESP32P4_TRACE_KIND_PLAIN;
+    }
+    insn = lo | ((uint32_t)translator_lduw_end(env, &ctx->base,
+                                               ctx->base.pc_next + 2,
+                                               MO_LE) << 16);
+    switch (insn & 0x7f) {
+    case 0x63:
+        return ESP32P4_TRACE_KIND_BRANCH | ESP32P4_TRACE_LEN_4;
+    case 0x6f:
+        return ESP32P4_TRACE_KIND_JAL | ESP32P4_TRACE_LEN_4;
+    case 0x67:
+        return ESP32P4_TRACE_KIND_JALR | ESP32P4_TRACE_LEN_4;
+    case 0x73:
+        /* MRET, SRET, URET and DRET. */
+        if (insn == 0x30200073 || insn == 0x10200073 ||
+            insn == 0x00200073 || insn == 0x7b200073) {
+            return ESP32P4_TRACE_KIND_XRET | ESP32P4_TRACE_LEN_4;
+        }
+        break;
+    default:
+        break;
+    }
+    return ESP32P4_TRACE_KIND_PLAIN | ESP32P4_TRACE_LEN_4;
+}
+
+/*
+ * While the trace encoder traces the core, each instruction reports its
+ * start, and with it the retirement of the one before; the encoder learns
+ * from the address each starts at whether a branch was taken and where a
+ * jump went.
+ */
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static void gen_esp32p4_trace_insn(DisasContext *ctx, CPURISCVState *env)
+{
+    TCGv pc = tcg_temp_new();
+
+    gen_pc_plus_diff(pc, ctx, 0);
+    gen_helper_esp32p4_trace_insn(tcg_env, pc,
+                                  tcg_constant_i32(esp32p4_trace_kind(ctx,
+                                                                      env)));
+}
+
+/*
  * Set the given registers of a loop, ending the TB since the loop may
  * start counting. A disabled extension, or user mode without
  * mhwloop_state_reg.URW, makes the instruction illegal.

@@ -56,6 +56,7 @@
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
 #include "qemu/main-loop.h"
+#include "exec/icount.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev.h"
 #include "hw/core/sysemu-cpu-ops.h"
@@ -95,6 +96,9 @@ static bool esp32p4_cpu_has_work(CPUState *cs)
 
     if (esp32p4_cpu_held(cpu)) {
         return false;
+    }
+    if (qatomic_read(&cpu->wakeup)) {
+        return true;
     }
 #ifdef CONFIG_TCG
     if (esp32p4_env_is_hp(&cpu->parent_obj.env) && esp32p4_clic_wakes(cpu)) {
@@ -142,6 +146,11 @@ void esp32p4_cpu_set_mintthresh(ESP32P4CPU *cpu, uint8_t th)
 {
     qatomic_set(&cpu->mintthresh, th);
     esp32p4_cpu_clic_present(cpu, qatomic_read(&cpu->clic_sel));
+}
+
+bool esp32p4_cpu_mid_block(void)
+{
+    return icount_enabled() && current_cpu && !current_cpu->neg.can_do_io;
 }
 
 /* Run on the core when its reset input rises. */
@@ -224,6 +233,31 @@ static void esp32p4_cpu_set_clock(void *opaque, int n, int level)
     async_run_on_cpu(CPU(cpu), stopped ? esp32p4_cpu_clock_stop
                                        : esp32p4_cpu_clock_start,
                      RUN_ON_CPU_NULL);
+}
+
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static void esp32p4_cpu_set_err_resp_dis(void *opaque, int n, int level)
+{
+    ESP32P4CPU *cpu = opaque;
+
+    qatomic_set(&cpu->err_resp_dis,
+                deposit32(qatomic_read(&cpu->err_resp_dis), n, 1,
+                          level != 0));
+}
+
+/*
+ * The HP core's dedicated wakeup input: while it is high the core does
+ * not wait in WFI, and as it rises a core waiting there wakes.
+ */
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static void esp32p4_cpu_set_wakeup(void *opaque, int n, int level)
+{
+    ESP32P4CPU *cpu = opaque;
+
+    qatomic_set(&cpu->wakeup, level != 0);
+    if (level) {
+        qemu_cpu_kick(CPU(cpu));
+    }
 }
 
 #ifdef CONFIG_TCG
@@ -322,16 +356,20 @@ static uint32_t esp32p4_illegal_reason(ESP32P4CPU *cpu, uint32_t insn)
 
 /*
  * Entering a trap, which on the HP core is always taken in machine mode:
- * mexstatus records it (EXPT_VLD) and, for an access fault, whether a bus
- * error or the PMP or PMA raised it, saves PBEXE in PPBEXE and clears it;
- * tcontrol saves MTE in MPTE and clears it, disabling the triggers; and
- * mext_ill records why an illegal instruction was illegal.
+ * the debug assistant's LASTPC_BEFORE_EXCEPTION takes the PC the trap is
+ * taken at, the excepting instruction's or, for an interrupt, the one it
+ * comes before (the core does not say which instruction it last
+ * completed); mexstatus records it (EXPT_VLD) and, for an access fault,
+ * whether a bus error or the PMP or PMA raised it, saves PBEXE in PPBEXE
+ * and clears it; tcontrol saves MTE in MPTE and clears it, disabling the
+ * triggers; and mext_ill records why an illegal instruction was illegal.
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
 static void esp32p4_hp_trap_entry(ESP32P4CPU *cpu, int32_t excp)
 {
     CPURISCVState *env = &cpu->parent_obj.env;
 
+    cpu->exc_pc = env->pc;
     if (!(excp & RISCV_EXCP_INT_FLAG)) {
         switch (excp) {
         case RISCV_EXCP_ILLEGAL_INST:
@@ -389,7 +427,7 @@ void esp32p4_hp_priv_update(ESP32P4CPU *cpu)
  * HP core: the CLIC's own interrupts are taken by esp32p4_clic_take().
  * The PIE illegal instruction exception (cause 0x1f) leaves the
  * instruction in mtval, which QEMU's trap code only does for its own
- * illegal instruction cause.
+ * illegal instruction cause. The trace encoder learns of the trap.
  */
 /* [spec:nuos:req:emu.esp32p4.pie] */
 void esp32p4_hp_do_interrupt(CPUState *cs)
@@ -413,6 +451,9 @@ void esp32p4_hp_do_interrupt(CPUState *cs)
         esp32p4_clic_exception_taken(cpu, prev_priv, prev_mil);
     }
     esp32p4_hp_priv_update(cpu);
+    esp32p4_trace_trap(cpu, env->mepc, excp & RISCV_EXCP_INT_MASK, false,
+                       env->mtval, prev_priv, cpu->trap_after_retire);
+    cpu->trap_after_retire = false;
 }
 
 /*
@@ -441,6 +482,7 @@ static bool esp32p4_hp_cpu_exec_interrupt(CPUState *cs, int request)
             }
             env->excp_uw2 = 0;
             cpu->bus_error = true;
+            cpu->trap_after_retire = true;
             esp32p4_hp_do_interrupt(cs);
             return true;
         }
@@ -462,12 +504,15 @@ static bool esp32p4_hp_cpu_exec_interrupt(CPUState *cs, int request)
 }
 
 /*
- * A bus error, which the core takes as an access fault, is recorded with
- * the faulting instruction's address and valid bit in ldpc or stpc and
- * the access address in ldtval or sttval, the newest entry first. The
- * core reports load and store bus errors asynchronously unless mhint.SBE
- * is set, so on hardware the fault may be taken a few instructions after
- * the access; here it is always taken at the access.
+ * A bus error, which the core takes as an access fault unless
+ * HP_SYSTEM_CORE_ERR_RESP_DIS disables the error response of the bus the
+ * access is on (esp32p4_cpu_bus()), when the access completes as if the
+ * slave had answered it, a read giving the 0 the bus returns. It is
+ * recorded with the faulting instruction's address and valid bit in ldpc
+ * or stpc and the access address in ldtval or sttval, the newest entry
+ * first. The core reports load and store bus errors asynchronously unless
+ * mhint.SBE is set, so on hardware the fault may be taken a few
+ * instructions after the access; here it is always taken at the access.
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
 static void esp32p4_hp_do_transaction_failed(CPUState *cs, hwaddr physaddr,
@@ -479,7 +524,11 @@ static void esp32p4_hp_do_transaction_failed(CPUState *cs, hwaddr physaddr,
 {
     ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
     uint32_t pc;
+    int bus = esp32p4_cpu_bus(addr, access_type == MMU_INST_FETCH);
 
+    if (qatomic_read(&cpu->err_resp_dis) & BIT(bus)) {
+        return;
+    }
     if (retaddr) {
         cpu_restore_state(cs, retaddr);
     }
@@ -527,10 +576,12 @@ static G_NORETURN void esp32p4_hp_do_unaligned_access(CPUState *cs,
  * The hardware loop and PIE state the translation of a block depends on:
  * whether the loop instructions may be used, and whether a loop counts;
  * whether the PIE instructions may be used, and whether the PIE state is
- * already dirty.
+ * already dirty; whether the debug assistant monitors SP; and whether the
+ * trace encoder traces the core.
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
 /* [spec:nuos:req:emu.esp32p4.pie] */
+/* [spec:nuos:req:emu.esp32p4.debug] */
 static TCGTBCPUState esp32p4_hp_get_tb_cpu_state(CPUState *cs)
 {
     ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
@@ -552,6 +603,12 @@ static TCGTBCPUState esp32p4_hp_get_tb_cpu_state(CPUState *cs)
     default:
         s.cs_base = FIELD_DP64(s.cs_base, EXT_TB_FLAGS, ESP32P4_PIE_EN, 1);
         break;
+    }
+    if (qatomic_read(&cpu->spmon_en)) {
+        s.cs_base = FIELD_DP64(s.cs_base, EXT_TB_FLAGS, ESP32P4_SPMON, 1);
+    }
+    if (qatomic_read(&cpu->trace_en)) {
+        s.cs_base = FIELD_DP64(s.cs_base, EXT_TB_FLAGS, ESP32P4_TRACE, 1);
     }
     return s;
 }
@@ -632,6 +689,8 @@ static void esp32p4_cpu_init(Object *obj)
                             ESP32P4_CPU_RESET, 1);
     qdev_init_gpio_in_named(DEVICE(obj), esp32p4_cpu_set_clock,
                             ESP32P4_CPU_CLOCK, 1);
+    qdev_init_gpio_in_named(DEVICE(obj), esp32p4_cpu_set_err_resp_dis,
+                            ESP32P4_CPU_ERR_RESP_DIS, 3);
 }
 
 static bool esp32p4_cpu_get_in_reset(Object *obj, Error **errp)
@@ -747,6 +806,26 @@ static const VMStateDescription vmstate_esp32p4_hp_clic = {
 };
 #endif
 
+/* The inputs from the system registers and the debug assistant's state. */
+static const VMStateDescription vmstate_esp32p4_debug = {
+    .name = "esp32p4-cpu/debug",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(err_resp_dis, ESP32P4CPU),
+        VMSTATE_BOOL(wakeup, ESP32P4CPU),
+        VMSTATE_UINT32(exc_pc, ESP32P4CPU),
+        VMSTATE_UINT32(assist_watch, ESP32P4CPU),
+        VMSTATE_UINT32_ARRAY(assist_lo, ESP32P4CPU, ESP32P4_ASSIST_REGIONS),
+        VMSTATE_UINT32_ARRAY(assist_hi, ESP32P4CPU, ESP32P4_ASSIST_REGIONS),
+        VMSTATE_BOOL(spmon_en, ESP32P4CPU),
+        VMSTATE_UINT32(spmon_min, ESP32P4CPU),
+        VMSTATE_UINT32(spmon_max, ESP32P4CPU),
+        VMSTATE_UINT32(spmon_out, ESP32P4CPU),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_esp32p4_cpu = {
     .name = "esp32p4-cpu",
     .version_id = 1,
@@ -759,14 +838,15 @@ static const VMStateDescription vmstate_esp32p4_cpu = {
         VMSTATE_BOOL(clock_halted, ESP32P4CPU),
         VMSTATE_END_OF_LIST()
     },
-#ifdef CONFIG_TCG
     .subsections = (const VMStateDescription * const []) {
+        &vmstate_esp32p4_debug,
+#ifdef CONFIG_TCG
         &vmstate_esp32p4_hp_state,
         &vmstate_esp32p4_pie,
         &vmstate_esp32p4_hp_clic,
+#endif
         NULL
     },
-#endif
 };
 
 /*
@@ -838,6 +918,8 @@ static void esp32p4_hp_cpu_init(Object *obj)
                             ESP32P4_CPU_GPIO_IN, ESP32P4_CPU_GPIOS);
     qdev_init_gpio_out_named(dev, &cpu->m_mode_irq, ESP32P4_CPU_M_MODE, 1);
 #endif
+    qdev_init_gpio_in_named(DEVICE(obj), esp32p4_cpu_set_wakeup,
+                            ESP32P4_CPU_WAKEUP, 1);
 }
 
 /* [spec:nuos:req:emu.esp32p4.cpu] */
@@ -864,6 +946,47 @@ static void esp32p4_hp_cpu_class_init(ObjectClass *oc, const void *data)
 #endif
 }
 
+#ifdef CONFIG_TCG
+/*
+ * A bus error on the LP core: an access fault, unless
+ * LP_SYSTEM_LP_CORE_ERR_RESP_DIS disables the error response of the bus
+ * the access is on: its IBUS and DBUS for LP ROM and LP SRAM
+ * (0x50100000 to 0x5010FFFF), its AHB bus for the rest.
+ */
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static void esp32p4_lp_do_transaction_failed(CPUState *cs, hwaddr physaddr,
+                                             vaddr addr, unsigned size,
+                                             MMUAccessType access_type,
+                                             int mmu_idx, MemTxAttrs attrs,
+                                             MemTxResult response,
+                                             uintptr_t retaddr)
+{
+    ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
+    int bus = ESP32P4_CPU_BUS_AHB;
+
+    if (addr >= 0x50100000 && addr < 0x50110000) {
+        bus = access_type == MMU_INST_FETCH ? ESP32P4_CPU_BUS_IBUS
+                                            : ESP32P4_CPU_BUS_DBUS;
+    }
+    if (qatomic_read(&cpu->err_resp_dis) & BIT(bus)) {
+        return;
+    }
+    esp32p4_tcg_ops.do_transaction_failed(cs, physaddr, addr, size,
+                                          access_type, mmu_idx, attrs,
+                                          response, retaddr);
+}
+
+/* A trap on the LP core: LP_SYSTEM_LP_CPU_EXC_PC takes the PC. */
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static void esp32p4_lp_do_interrupt(CPUState *cs)
+{
+    ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
+
+    cpu->exc_pc = cpu->parent_obj.env.pc;
+    esp32p4_tcg_ops.do_interrupt(cs);
+}
+#endif
+
 /*
  * The LP core's TCG table: its accesses carry its identity to the access
  * permission managers.
@@ -876,6 +999,9 @@ static void esp32p4_lp_cpu_class_init(ObjectClass *oc, const void *data)
 
     esp32p4_lp_tcg_ops = esp32p4_tcg_ops;
     esp32p4_lp_tcg_ops.tlb_fill = esp32p4_lp_tlb_fill;
+    esp32p4_lp_tcg_ops.do_transaction_failed =
+        esp32p4_lp_do_transaction_failed;
+    esp32p4_lp_tcg_ops.do_interrupt = esp32p4_lp_do_interrupt;
     cc->tcg_ops = &esp32p4_lp_tcg_ops;
 #endif
 }
