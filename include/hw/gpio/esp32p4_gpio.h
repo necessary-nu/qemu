@@ -452,4 +452,12 @@ bool esp32p4_gpio_pad_driven(ESP32P4GpioState *s, unsigned n, bool *level);
 bool esp32p4_gpio_sig_in_source(ESP32P4GpioState *s, unsigned sig,
                                 unsigned *src, bool *inverted);
 
+/*
+ * Whether HP pad n's IO MUX selects function func, with its input
+ * enabled: for a block whose IO MUX function takes a clock from the pad,
+ * which no line carries.
+ */
+bool esp32p4_gpio_iomux_in_selected(ESP32P4GpioState *s, unsigned n,
+                                    unsigned func);
+
 #endif
