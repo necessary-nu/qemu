@@ -42,6 +42,7 @@
 #include "net/net.h"
 #include "elf.h"
 #include "exec/cputlb.h"
+#include "system/tcg.h"
 
 #define TYPE_ESP32_SOC "xtensa.esp32"
 #define ESP32_SOC(obj) OBJECT_CHECK(Esp32SocState, (obj), TYPE_ESP32_SOC)
@@ -411,15 +412,44 @@ static unsigned esp32_get_pid(void *opaque, int cpu)
     return esp32_pid_current(&s->pid[cpu]);
 }
 
-/* DPORT's protection configuration changed: drop every CPU's mappings. */
+/* On a CPU's own thread: the flush esp32_mpu_update() queued for it. */
+static void esp32_mpu_flush_work(CPUState *cs, run_on_cpu_data data)
+{
+    Esp32SocState *s = data.host_ptr;
+
+    s->mpu_flush_pending[cs->cpu_index] = false;
+    tlb_flush(cs);
+}
+
+/*
+ * DPORT's protection or cache configuration changed: drop every CPU's
+ * mappings. A CPU's TLB is its own thread's: another thread flushing it
+ * while the CPU runs rewrites (and on a resize frees) the tables its
+ * translated code is reading, so a change made from elsewhere, by the
+ * other CPU's store to DPORT or by the main loop, is queued as work the
+ * CPU does before it executes again; a flush already queued covers later
+ * changes too. On the CPU's own thread (under icount, the one thread the
+ * CPUs take turns on), and for a CPU that is stopped (and stays so while
+ * the BQL, held here, is), the flush is made at once. Without TCG (under
+ * qtest) there is no TLB.
+ */
 static void esp32_mpu_update(void *opaque, int n, int level)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
     Esp32SocState *s = ESP32_SOC(opaque);
 
-    if (level) {
-        for (int i = 0; i < ms->smp.cpus; ++i) {
-            tlb_flush(CPU(&s->cpu[i]));
+    if (!level || !tcg_enabled()) {
+        return;
+    }
+    for (int i = 0; i < ms->smp.cpus; ++i) {
+        CPUState *cs = CPU(&s->cpu[i]);
+
+        if (!cs->created || qemu_cpu_is_self(cs) || cs->stopped) {
+            tlb_flush(cs);
+        } else if (!s->mpu_flush_pending[i]) {
+            s->mpu_flush_pending[i] = true;
+            async_run_on_cpu(cs, esp32_mpu_flush_work,
+                             RUN_ON_CPU_HOST_PTR(s));
         }
     }
 }
