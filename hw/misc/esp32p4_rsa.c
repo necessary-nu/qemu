@@ -30,7 +30,12 @@
  * as the TRM warns. The CONSTANT_TIME option (RSA_CONSTANT_TIME_REG, set
  * from reset) does a multiplication for every bit of Y; cleared, the
  * accelerator skips Y's leading zeros and multiplies only for its set
- * bits. Neither changes a correct result, only the time.
+ * bits. Neither changes a correct result, only the time. An operation
+ * takes the options as it starts: written while it computes, they are
+ * kept for the next. ESP-IDF's esp_mpi_exp_mpi_mod_hw_op() clears
+ * RSA_SEARCH_ENABLE_REG straight after it starts every exponentiation,
+ * with the search it set for that one at Y's top bit, where the search
+ * starts the operation.
  *
  * Timing: a Montgomery multiplication of n-word numbers takes 3n^2 + 8n
  * cycles of CRYPTO_RSA_CLK, which with the two conversions reproduces the
@@ -43,7 +48,8 @@
  * After its reset the accelerator clears its memories, which takes 128
  * cycles during which RSA_QUERY_CLEAN_REG and RSA_QUERY_IDLE_REG read 0.
  * Its memories cannot be reached while it computes or initializes (reads
- * give 0, writes are dropped and logged); powered down by
+ * give 0, writes are dropped and logged), nor its other registers but the
+ * options and the interrupt's be written; powered down by
  * HP_SYSTEM_RSA_PD_CTRL_REG they lose their contents and read as zero.
  * Writes while its clock is stopped or it is held in reset are dropped and
  * logged, and while the RSA_DS peripheral occupies it its registers read
@@ -180,8 +186,8 @@ static void rsa_op_done(void *opaque)
         s->op_kind = RSA_OP_NONE;
         return;
     case RSA_OP_MODEXP:
-        esp32p4_rsa_modexp(t, x, y, m, z, s->m_prime, n, rsa_top(s, n),
-                           s->constant_time & 1, x);
+        esp32p4_rsa_modexp(t, x, y, m, z, s->m_prime, n, s->op_top,
+                           s->op_constant_time, x);
         memcpy(z, t, n * sizeof(uint32_t));
         break;
     case RSA_OP_MODMULT:
@@ -223,13 +229,15 @@ static void rsa_start(ESP32P4RsaState *s, uint32_t op)
                       "has no operands; it is ignored\n", TYPE_ESP32P4_RSA);
         return;
     }
+    s->op_top = rsa_top(s, n);
+    s->op_constant_time = s->constant_time & 1;
     switch (op) {
     case RSA_OP_MODEXP: {
         const uint32_t *y = s->mem[ESP32P4_RSA_MEM_Y];
-        unsigned top = rsa_top(s, n);
+        unsigned top = s->op_top;
         uint64_t mults = 2;
 
-        if (s->constant_time & 1) {
+        if (s->op_constant_time) {
             mults += 2ULL * (top + 1);
         } else {
             int bit;
@@ -363,7 +371,9 @@ static void rsa_write(void *opaque, hwaddr addr, uint64_t value,
         *w = deposit32(*w, shift, size * 8, value);
         return;
     }
-    if (!s->idle && reg != A_INT_CLR && reg != A_INT_ENA) {
+    if (!s->idle && reg != A_INT_CLR && reg != A_INT_ENA &&
+        reg != A_CONSTANT_TIME && reg != A_SEARCH_ENABLE &&
+        reg != A_SEARCH_POS) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write at 0x%" HWADDR_PRIx
                       " while the accelerator is busy is dropped\n",
                       TYPE_ESP32P4_RSA, addr);
@@ -537,8 +547,8 @@ static void rsa_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_esp32p4_rsa = {
     .name = TYPE_ESP32P4_RSA,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_ESP32P4_CRYPTO_TIMER(op, ESP32P4RsaState),
         VMSTATE_BOOL_ARRAY(reset_in, ESP32P4RsaState, ESP32P4_RSA_RESETS),
@@ -557,6 +567,8 @@ static const VMStateDescription vmstate_esp32p4_rsa = {
         VMSTATE_BOOL(idle, ESP32P4RsaState),
         VMSTATE_BOOL(done_int, ESP32P4RsaState),
         VMSTATE_UINT32(op_kind, ESP32P4RsaState),
+        VMSTATE_UINT32(op_top, ESP32P4RsaState),
+        VMSTATE_BOOL(op_constant_time, ESP32P4RsaState),
         VMSTATE_END_OF_LIST()
     },
 };
