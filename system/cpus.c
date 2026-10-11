@@ -296,9 +296,15 @@ void cpu_handle_guest_debug(CPUState *cpu)
             cpu_single_step(cpu, 0);
         }
     } else {
+        /*
+         * Every vCPU stops with this one, as gdb's all-stop mode has them
+         * do, at the virtual time of the stop: the main loop keeps it
+         * while it acts on the request (see qemu_system_request_pending()).
+         */
         gdb_set_stop_cpu(cpu);
         qemu_system_debug_request();
         cpu->stopped = true;
+        cpu_stop_all();
     }
 }
 

@@ -525,11 +525,12 @@ void icount_start_warp_timer(void)
     }
 
     /*
-     * Nor while a reset or shutdown waits for the main loop to act on it:
-     * the vCPUs stopped for it, not to wait for a timer, and it takes
-     * effect at the virtual time of its request.
+     * Nor while a reset, shutdown, suspend, debug stop or vmstop request
+     * waits for the main loop to act on it: the vCPUs stopped for it, not
+     * to wait for a timer, and it takes effect at the virtual time of its
+     * request.
      */
-    if (qemu_reset_requested_get() || qemu_shutdown_requested_get()) {
+    if (qemu_system_request_pending()) {
         return;
     }
 
