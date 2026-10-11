@@ -13,6 +13,7 @@ config ESP32P4
     bool
     default y
     depends on RISCV32 && TCG
+    select CAN_BUS
     select CPU_CLUSTER
     select ESP32_LINE
     select SSI

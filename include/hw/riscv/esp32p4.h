@@ -25,6 +25,7 @@
 #include "hw/misc/esp32p4_icm.h"
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/misc/esp32p4_pms.h"
+#include "hw/net/esp32p4_twai.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "system/memory.h"
 #include "target/riscv/esp32p4_cpu.h"
@@ -113,6 +114,9 @@ struct ESP32P4MachineState {
     /* The access permission managers, every master's way onto the bus. */
     ESP32P4PmsState pms;
     ESP32P4IcmState icm;
+    ESP32P4TwaiState twai;
+    /* The QEMU CAN buses on TWAI0 to TWAI2's pads, or NULL. */
+    CanBusState *canbus[ESP32P4_TWAI_NUM];
 
     SSIBus *flash_bus;
     uint64_t flash_size;
