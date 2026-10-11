@@ -291,6 +291,14 @@ REG32(LP_PAD, 0)
 #define ETM_EVENT_WRITABLE  0xbf
 #define ETM_TASK_WRITABLE   0x0f0f0f0f
 #define INT_BITS            0xff
+/*
+ * GPIO_INT_RAW's bits for comparator n's rising, falling and either edge
+ * of COMP_OUT; esp32p4_gpio_set_ana_comp() has why the rising edge's is
+ * bit 3n, which the TRM names COMP<n>_NEG_INT.
+ */
+#define INT_COMP_RISE(n)    BIT(3 * (n))
+#define INT_COMP_FALL(n)    BIT(3 * (n) + 1)
+#define INT_COMP_ANY(n)     BIT(3 * (n) + 2)
 #define BISTIN_SEL_WRITABLE 0xf
 #define BISTIN_SEL_RESET    0xf
 #define BIST_PAD_OE         BIT(0)
@@ -2874,12 +2882,45 @@ static void esp32p4_gpio_set_light_sleep(void *opaque, int n, int level)
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
  * [spec:nuos:req:emu.esp32p4.etm]
- * An analog comparator's output: its edges latch COMP<n>_POS_INT_RAW
- * (rising), _NEG_INT_RAW (falling) and _ALL_INT_RAW, and pulse the ETM
- * event GPIO_EVT_ZERO_DET_POS<n> or _NEG<n>, but not within
- * GPIO_ZERO_DET<n>_FILTER_CNT IO MUX operating clock cycles of the
- * comparator's last interrupt. An edge is at its line's time, which the
- * event carries.
+ * An analog comparator's output COMP_OUT, high while its source is above
+ * its reference. A rising edge, the source crossing above the reference,
+ * latches GPIO_INT_RAW bit 3n and pulses the ETM event
+ * GPIO_EVT_ZERO_DET_POS<n>; a falling edge latches bit 3n + 1 and pulses
+ * GPIO_EVT_ZERO_DET_NEG<n>; either latches bit 3n + 2, COMP<n>_ALL_INT_RAW.
+ * None of this happens within GPIO_ZERO_DET<n>_FILTER_CNT IO MUX operating
+ * clock cycles of the comparator's last interrupt. An edge is at its
+ * line's time, which the event carries.
+ *
+ * The sources disagree on which of bits 3n and 3n + 1 is the rising edge.
+ * The TRM's GPIO_INT_RAW_REG (Register 10.39) and the field names in
+ * ESP-IDF's v3 gpio_reg.h and gpio_struct.h make bit 3n COMP<n>_NEG_INT,
+ * which the TRM's Table 66.6-1 raises on a falling COMP_OUT, and bit
+ * 3n + 1 COMP<n>_POS_INT, on a rising one. The descriptions of those same
+ * fields say the reverse (bit 3n: "analog comparator pos edge interrupt
+ * raw"), and so does ESP-IDF's driver, the software that runs on silicon:
+ * the ESP32-P4's hal/ana_cmpr_ll.h has ANALOG_CMPR_LL_POS_CROSS_INTR_MASK
+ * at bit 3n and _NEG_ at 3n + 1. ESP-IDF changed the masks to that in
+ * commit cb7b9850c8 ("Fix swapped POS/NEG cross interrupt masks on
+ * ESP32-C5/P4/C61"), which says its test case, which arms one direction,
+ * drives the source pad across a 0.5 VDD_IO_6 internal reference and
+ * expects the callback for that direction only, failed on ESP32-P4
+ * hardware with the bits the names give. The model follows the field
+ * descriptions and ESP-IDF's driver. The ETM events raise no such
+ * conflict: the TRM's 66.5 and ESP-IDF (ANA_CMPR_EVENT_POS_CROSS, the
+ * source becoming higher than the reference, is ZERO_DET_POS<n>) agree,
+ * and ESP-IDF's ETM test, which starts a timer on ZERO_DET_NEG<n> and
+ * stops it on ZERO_DET_POS<n> around a low pulse of the source, passes on
+ * ESP32-P4 hardware (commit 529b6bf97c enabled it there). Neither commit
+ * says which chip revision its test ran on, hence the check below.
+ *
+ * To be confirmed on the ESP32-P4-WIFI6-POE-ETH board: power comparator 1
+ * against its internal reference at 0.5 VDD_IO_6 (LP_SYSTEM_REG_PAD_COMP1
+ * = 0x15), set GPIO_ZERO_DET1_FILTER_CNT to a few cycles, drive its source
+ * pad GPIO54 low, clear GPIO_INT_RAW, drive the pad high and read
+ * GPIO_INT_RAW, clear it, drive the pad low and read it again. The model
+ * reads 0x28 and then 0x30; the field names would have 0x30 and then
+ * 0x28. The chip's own GPIO output can drive the pad, as in ESP-IDF's
+ * test, or a supply on the header.
  */
 static void esp32p4_gpio_set_ana_comp(void *opaque, int n, int level)
 {
@@ -2896,7 +2937,8 @@ static void esp32p4_gpio_set_ana_comp(void *opaque, int n, int level)
     quiet = clock_ticks_to_ns(s->iomux_clk, s->zero_det[n]);
     if (s->ana_comp_int_ns[n] == INT64_MIN ||
         now - s->ana_comp_int_ns[n] >= quiet) {
-        s->int_raw |= BIT(3 * n + (level ? 1 : 0)) | BIT(3 * n + 2);
+        s->int_raw |= (level ? INT_COMP_RISE(n) : INT_COMP_FALL(n)) |
+                      INT_COMP_ANY(n);
         s->ana_comp_int_ns[n] = now;
         etm = s->etm_zero_det[2 * n + (level ? 0 : 1)];
     }

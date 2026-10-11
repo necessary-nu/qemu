@@ -15,9 +15,14 @@
  * internal reference, DREF_COMPn tenths of VDD_IO_6 (0 to 0.7 VDD_IO_6).
  * COMP_OUT is high while the source is above the reference (TRM 66.3),
  * low while the comparator is powered down (XPD_COMPn clear). GPIO_EXT
- * takes its edges as the interrupts GPIO_COMPn_POS_INT, _NEG_INT and
- * _ALL_INT and the ETM events GPIO_EVT_ZERO_DET_POSn and _NEGn (TRM
- * 66.5, 66.6), through its ZERO_DET filter (hw/gpio/esp32p4_gpio.c).
+ * takes its edges, through its ZERO_DET filter, as interrupts and as the
+ * ETM events GPIO_EVT_ZERO_DET_POSn (rising) and _NEGn (falling) (TRM
+ * 66.5, 66.6): a rising edge, the source crossing above the reference,
+ * latches GPIO_INT_RAW bit 3n, a falling edge bit 3n + 1, either one bit
+ * 3n + 2. These are the bits ESP-IDF's driver reads as a positive and a
+ * negative crossing, as its tests on ESP32-P4 hardware bear out, though
+ * the TRM names bit 3n GPIO_COMPn_NEG_INT; hw/gpio/esp32p4_gpio.c has the
+ * evidence and the board check still to make.
  *
  * The pads' voltages are the ADC's properties for ADC2's channels 2 to 5
  * (adc2-ch2-mv to adc2-ch5-mv, GPIO51 to GPIO54), or the supply or ground

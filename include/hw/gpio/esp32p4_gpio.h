@@ -187,7 +187,11 @@ enum {
  *     sleep configuration (TRM table 10.8-1).
  *   ESP32P4_GPIO_ANA_COMP, "ana-comp" (input, 2 lines): the analog
  *     voltage comparators' outputs, matrix output signals 244 and 245,
- *     whose edges GPIO_INT_RAW's COMP<n>_POS, _NEG and _ALL latch.
+ *     high while the source is above the reference; GPIO_INT_RAW latches
+ *     comparator n's rising edges in bit 3n, its falling edges in bit
+ *     3n + 1 and both in bit 3n + 2, as ESP-IDF's driver reads them
+ *     (the TRM's names for bits 3n and 3n + 1 are the other way round;
+ *     see esp32p4_gpio_set_ana_comp()).
  *   ESP32P4_GPIO_WAKEUP, "wakeup" (output): the HP GPIO wakeup from light
  *     sleep (TRM 10.4.6.1): a pad with GPIO_PINn_WAKEUP_ENABLE is at the
  *     level its INT_TYPE, 4 or 5, names.
@@ -207,7 +211,7 @@ enum {
  *   ESP32P4_GPIO_ETM_ZERO_DET, "etm-zero-det" (output, 4 lines): the
  *     analog comparators' ETM events GPIO_EVT_ZERO_DET_POS<n> (line 2n)
  *     and _NEG<n> (line 2n + 1), pulsed on the rising and falling edges
- *     that set COMP<n>_POS_INT_RAW and _NEG_INT_RAW, through the same
+ *     that latch GPIO_INT_RAW bits 3n and 3n + 1, through the same
  *     GPIO_ZERO_DET<n>_FILTER_CNT filter.
  *
  * The interrupts are the sysbus IRQs, in the order of ESP32P4GpioIrq,
