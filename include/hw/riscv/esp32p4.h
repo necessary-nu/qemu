@@ -10,6 +10,7 @@
 #define HW_RISCV_ESP32P4_H
 
 #include "qemu/units.h"
+#include "hw/audio/esp32p4_i2s.h"
 #include "hw/core/boards.h"
 #include "hw/char/esp32_uart_terminal.h"
 #include "hw/char/esp32p4_uart.h"
@@ -227,6 +228,9 @@ struct ESP32P4MachineState {
     ESP32P4TraceState trace[ESP32P4_HP_CORES];
     /* GPIO16 to GPIO54's holds: LP_SYSTEM's OR HP_SYSTEM's. */
     OrIRQState pad_hold_or[ESP32P4_GPIO_PADS - ESP32P4_HP_SYS_HOLD_FIRST];
+
+    /* I2S0 to I2S2, then the LP I2S */
+    ESP32P4I2sState i2s[ESP32P4_I2S_COUNT];
 };
 
 /*

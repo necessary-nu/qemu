@@ -374,7 +374,7 @@ qtests_riscv32 = \
      'esp32p4-assist-debug-test', 'esp32p4-axi-perf-mon-test',
      'esp32p4-trace-test', 'esp32p4-pmu-test', 'esp32p4-lp-mailbox-test',
      'esp32p4-uart-test', 'esp32p4-spi-test', 'esp32p4-parlio-test',
-     'esp32p4-bitscrambler-test'] :
+     'esp32p4-bitscrambler-test', 'esp32p4-i2s-test'] :
     [])
 
 qtests_riscv64 = ['riscv-csr-test'] + \
