@@ -122,8 +122,11 @@ static const uint32_t hp_peri_bits[4] = {
 #define ROM_DIRECT          0x8fc00000
 #define LP_SRAM             0x50108000
 #define TCM                 0x30100000
-/* Words of L2MEM for the tests to write, 64 KiB in. */
-#define SCRATCH             0x4ff10000
+/*
+ * Words of L2MEM for the tests to write, 256 KiB in: past the 128 KiB the
+ * L2 cache takes from reset.
+ */
+#define SCRATCH             0x4ff40000
 
 #define MEMTX_OK            0
 
