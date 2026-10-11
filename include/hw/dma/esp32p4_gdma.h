@@ -284,6 +284,8 @@ struct ESP32P4GdmaState {
     qemu_irq etm_event[ESP32P4_GDMA_ETM_EVENTS];
     Clock *clk;
     QEMUTimer *timer;
+    /* When the round @timer runs falls due. */
+    int64_t due_ns;
     /* The bus as the channels reach it, through the APMs. */
     MemoryRegion *bus;
     AddressSpace *as;

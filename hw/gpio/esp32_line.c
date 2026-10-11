@@ -44,6 +44,18 @@ void esp32_line_set_at(qemu_irq line, int level, int64_t when_ns)
 
 /* [spec:nuos:req:emu.esp32.gpio] */
 /* [spec:nuos:req:emu.esp32p4.gpio] */
+void esp32_line_run_at(int64_t when_ns, void (*fn)(void *opaque),
+                       void *opaque)
+{
+    int64_t saved = line_stamp;
+
+    line_stamp = when_ns;
+    fn(opaque);
+    line_stamp = saved;
+}
+
+/* [spec:nuos:req:emu.esp32.gpio] */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
 void esp32_line_add_source(Notifier *n)
 {
     notifier_list_add(&line_sources, n);
