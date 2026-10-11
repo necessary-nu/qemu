@@ -42,9 +42,10 @@ enum {
  *     LP_INT_* registers), sources of the interrupt matrix.
  *   - Named GPIO output "lp-core-int": LP_TIMER_REG_1_INTR again, the LP
  *     core's timer interrupt, for the LP core's interrupt controller.
- *   - Named GPIO outputs "soc-wakeup" and "lp-wakeup": a pulse as the
- *     counter reaches target 0 and target 1, the PMU's wakeup of the chip
- *     and of the LP core.
+ *   - Named GPIO outputs "soc-wakeup" and "lp-wakeup": high from the
+ *     counter reaching target 0 and target 1 until software clears
+ *     SOC_WAKEUP_INT_RAW and MAIN_TIMER_LP_INT_RAW, the PMU's wakeup
+ *     sources RTC_TIMER_TAR0 and RTC_TIMER_TAR1.
  *   - Named GPIO output "etm-event": per ESP32P4_LP_TIMER_EVT_*, a pulse of
  *     RTC_EVT_CMP (target 0 reached) and RTC_EVT_OVF (the counter
  *     overflowing).

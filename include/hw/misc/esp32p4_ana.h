@@ -52,11 +52,23 @@ enum {
  *
  * Named GPIO inputs, per PLL: "xpd", its power-up by the PMU, and
  * "cal-stop", HP_SYS_CLKRST_ANA_PLL_CTRL0's *_CAL_STOP. Named GPIO output,
- * per PLL: "cal-end", its calibration done.
+ * per PLL: "cal-end", its calibration done; and "bias-update", a pulse as
+ * a BIAS register is written, for the brown-out detector, whose thresholds
+ * BIAS holds.
  */
-#define ESP32P4_ANA_XPD      "xpd"
-#define ESP32P4_ANA_CAL_STOP "cal-stop"
-#define ESP32P4_ANA_CAL_END  "cal-end"
+#define ESP32P4_ANA_XPD         "xpd"
+#define ESP32P4_ANA_CAL_STOP    "cal-stop"
+#define ESP32P4_ANA_CAL_END     "cal-end"
+#define ESP32P4_ANA_BIAS_UPDATE "bias-update"
+
+/*
+ * BIAS's brown-out thresholds (TRM 25.4): VDD_BAT's, VDD_ANA's and the
+ * battery charger's, each its under-voltage threshold in bits 4:2 and the
+ * threshold that releases it in bits 7:5.
+ */
+#define ESP32P4_ANA_BIAS_DREF_VBAT          8
+#define ESP32P4_ANA_BIAS_DREF_VDDA          9
+#define ESP32P4_ANA_BIAS_DREF_VBAT_CHARGER  10
 
 extern const char *const esp32p4_ana_pll_names[ESP32P4_ANA_NUM_PLLS];
 
@@ -71,6 +83,7 @@ struct ESP32P4AnaState {
     Clock *xtal;
     Clock *out[ESP32P4_ANA_NUM_PLLS];
     qemu_irq cal_end_out[ESP32P4_ANA_NUM_PLLS];
+    qemu_irq bias_update;
 
     uint8_t regs[ESP32P4_ANA_NUM_SLAVES][ESP32P4_ANA_SLAVE_REGS];
 
