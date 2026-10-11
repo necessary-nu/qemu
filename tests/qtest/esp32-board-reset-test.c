@@ -89,6 +89,9 @@
 
 #define SDMMC_BASE              0x3ff68000
 #define SDMMC_CTRL              (SDMMC_BASE + 0x00)
+#define SDMMC_CLKDIV            (SDMMC_BASE + 0x08)
+#define SDMMC_CLKSRC            (SDMMC_BASE + 0x0c)
+#define SDMMC_CLKENA            (SDMMC_BASE + 0x10)
 #define SDMMC_BLKSIZ            (SDMMC_BASE + 0x1c)
 #define SDMMC_CMDARG            (SDMMC_BASE + 0x28)
 #define SDMMC_CMD               (SDMMC_BASE + 0x2c)
@@ -96,6 +99,9 @@
 #define SDMMC_RINTSTS           (SDMMC_BASE + 0x44)
 #define SDMMC_CMD_START         (1u << 31)
 #define SDMMC_CMD_USE_HOLD_REG  (1u << 29)
+#define SDMMC_CMD_UPDATE_CLK    (1u << 21)
+/* The board's card is in slot 1. */
+#define SDMMC_CMD_CARD1         (1u << 16)
 #define SDMMC_CMD_RESP_EXPECT   (1u << 6)
 #define SDMMC_CMD_RESP_LONG     (1u << 7)
 #define SDMMC_INT_RTO           (1u << 8)
@@ -332,12 +338,23 @@ static void test_flash(void)
     qtest_quit(qts);
 }
 
+/*
+ * Clock the SD/MMC host and give card 1 its clock: the CIU's 80 MHz
+ * divided by 2 * 2, handed to the CIU by a clock update.
+ */
 static void sdmmc_setup(QTestState *qts)
 {
     qtest_writel(qts, DPORT_WIFI_CLK_EN,
                  qtest_readl(qts, DPORT_WIFI_CLK_EN) | WIFI_CLK_SDIO_HOST);
     qtest_writel(qts, DPORT_CORE_RST_EN,
                  qtest_readl(qts, DPORT_CORE_RST_EN) & ~CORE_RST_SDIO_HOST);
+    qtest_writel(qts, SDMMC_CLKDIV, 2 << 8);
+    qtest_writel(qts, SDMMC_CLKSRC, 1 << 2);
+    qtest_writel(qts, SDMMC_CLKENA, 1 << 1);
+    qtest_writel(qts, SDMMC_CMD, SDMMC_CMD_START | SDMMC_CMD_UPDATE_CLK |
+                 SDMMC_CMD_CARD1);
+    qtest_clock_step(qts, 1000);
+    g_assert_cmphex(qtest_readl(qts, SDMMC_CMD) & SDMMC_CMD_START, ==, 0);
 }
 
 /*
@@ -351,8 +368,10 @@ static bool sd_cmd(QTestState *qts, uint32_t index, uint32_t arg,
 
     qtest_writel(qts, SDMMC_RINTSTS, 0xffffffff);
     qtest_writel(qts, SDMMC_CMDARG, arg);
-    qtest_writel(qts, SDMMC_CMD,
-                 SDMMC_CMD_START | SDMMC_CMD_USE_HOLD_REG | flags | index);
+    qtest_writel(qts, SDMMC_CMD, SDMMC_CMD_START | SDMMC_CMD_USE_HOLD_REG |
+                 SDMMC_CMD_CARD1 | flags | index);
+    /* At 20 MHz, a command and its response, or its timeout, take 10 us. */
+    qtest_clock_step(qts, 100 * 1000);
     rintsts = qtest_readl(qts, SDMMC_RINTSTS);
     g_assert_true(rintsts & SDMMC_INT_CMD_DONE);
     if (resp) {

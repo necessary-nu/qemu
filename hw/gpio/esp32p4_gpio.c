@@ -1737,6 +1737,24 @@ bool esp32p4_gpio_pad_driven(ESP32P4GpioState *s, unsigned n, bool *level)
 }
 
 /* [spec:nuos:req:emu.esp32p4.gpio] */
+bool esp32p4_gpio_iomux_in_selected(ESP32P4GpioState *s, unsigned n,
+                                    unsigned func)
+{
+    unsigned f;
+    PadCtl c;
+
+    if (n >= ESP32P4_GPIO_PADS || lp_owned(s, n)) {
+        return false;
+    }
+    hp_func(s, n, &f);
+    if (f != func) {
+        return false;
+    }
+    pad_ctl(s, n, &c);
+    return c.ie;
+}
+
+/* [spec:nuos:req:emu.esp32p4.gpio] */
 bool esp32p4_gpio_sig_in_source(ESP32P4GpioState *s, unsigned sig,
                                 unsigned *src, bool *inverted)
 {

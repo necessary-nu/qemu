@@ -14,6 +14,8 @@ config ESP32P4
     default y
     depends on RISCV32 && TCG
     select CPU_CLUSTER
+    select DWC_SDMMC
+    select ESP32_DWMAC
     select ESP32_LINE
     select SSI
     select SPLIT_IRQ
