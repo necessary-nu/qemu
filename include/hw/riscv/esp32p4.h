@@ -10,6 +10,7 @@
 #define HW_RISCV_ESP32P4_H
 
 #include "qemu/units.h"
+#include "hw/audio/esp32p4_i2s.h"
 #include "hw/core/boards.h"
 #include "hw/cpu/cluster.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
@@ -163,6 +164,9 @@ struct ESP32P4MachineState {
     ESP32P4EmacState emac;
     IP101PhyState phy;
     SplitIRQ pps_split;
+
+    /* I2S0 to I2S2, then the LP I2S */
+    ESP32P4I2sState i2s[ESP32P4_I2S_COUNT];
 };
 
 #endif
