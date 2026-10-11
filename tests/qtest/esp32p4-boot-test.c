@@ -996,12 +996,15 @@ static void test_image_digest(void)
  * Secure Boot (EFUSE_SECURE_BOOT_EN, a public key digest in BLOCK_KEY0 for
  * SECURE_BOOT_DIGEST0): the ROM passes its anti-glitch checks of the
  * random number generator, which reset the chip when they fail with
- * Secure Boot on, lists the key digest, and refuses the image. This ROM
- * (v3.0's, ECO5) copies the image to verify it into its buffer at
+ * Secure Boot on, lists the key digest, and refuses an unsigned image.
+ * This ROM image (ESP-ROM esp32p4-eco5-20250430, the one Espressif
+ * publishes for v3.x) stages the image it verifies in its buffer at
  * 0x4FF00000, inside the 128 KiB of L2MEM the L2 cache takes from reset,
- * which the CPU cannot write (Espressif's erratum ROM-764, fixed in chip
- * revision v3.1), so it refuses every image there, signed or not: the
- * image's own digest, taken from the buffer, does not match.
+ * which the CPU cannot write (Espressif's erratum ROM-764, listed as
+ * fixed in chip revision v3.1 without saying how), so the image's digest
+ * taken from the buffer does not match, and it would refuse a signed
+ * image too. Its signature verification itself, run on images in RAM, is
+ * sb-signature-test's (emu/tests/esp32p4-guest).
  */
 /* [spec:nuos:req:emu.esp32p4.boot/test] */
 static void test_secure_boot(void)
