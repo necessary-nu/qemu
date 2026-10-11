@@ -169,6 +169,8 @@ struct Esp32SocState {
     Clock *rmt_ref_tick_clk;
     Clock *emac_apb_clk;
     Clock *sdio_apb_clk;
+    Clock *sdmmc_apb_clk;
+    Clock *sdmmc_f160m_clk;
     Clock *mcpwm_apb_clk[ESP32_MCPWM_COUNT];
     Clock *mcpwm_f160m_clk[ESP32_MCPWM_COUNT];
     Clock *i2s_apb_clk[ESP32_I2S_COUNT];
