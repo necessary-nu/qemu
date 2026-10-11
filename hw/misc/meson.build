@@ -226,6 +226,7 @@ system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_axi_perf_mon.c',
   'esp32p4_cache.c',
   'esp32p4_clkrst.c',
+  'esp32p4_etm.c',
   'esp32p4_hp_sys.c',
   'esp32p4_i2c_ana_mst.c',
   'esp32p4_icm.c',

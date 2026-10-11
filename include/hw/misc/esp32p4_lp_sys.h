@@ -49,9 +49,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
  * Named GPIO inputs
  * =================
  *
- * ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP: a pulse of the ETM task that wakes
- *   the LP core, which sets LP_CORE_ETM_WAKEUP_FLAG.
- * ESP32P4_LP_SYS_ETM_TASK_ULP: a pulse of the ETM's ULP_TASK_INT_CPU,
+ * ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP: a pulse of the ETM's task
+ *   ULP_TASK_WAKEUP_CPU, the LP core's wakeup, which sets
+ *   LP_CORE_ETM_WAKEUP_FLAG.
+ * ESP32P4_LP_SYS_ETM_TASK_ULP_INT: a pulse of the ETM's ULP_TASK_INT_CPU,
  *   which raises ETM_TASK_ULP_INT.
  * ESP32P4_LP_SYS_SLOW_CLK_TICK: a pulse of the slow clock tick, which
  *   raises SLOW_CLK_TICK_INT.
@@ -67,7 +68,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
 #define ESP32P4_LP_SYS_BOD_RESET_EN     "bod-reset-en"
 #define ESP32P4_LP_SYS_HP_ROOT_CLK      "hp-root-clk"
 #define ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP "lp-core-etm-wakeup"
-#define ESP32P4_LP_SYS_ETM_TASK_ULP     "etm-task-ulp"
+#define ESP32P4_LP_SYS_ETM_TASK_ULP_INT "etm-task-ulp-int"
 #define ESP32P4_LP_SYS_SLOW_CLK_TICK    "slow-clk-tick"
 
 struct ESP32P4LPSysState {

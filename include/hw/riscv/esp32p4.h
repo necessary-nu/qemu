@@ -26,6 +26,7 @@
 #include "hw/misc/esp32p4_axi_perf_mon.h"
 #include "hw/misc/esp32p4_cache.h"
 #include "hw/misc/esp32p4_clkrst.h"
+#include "hw/misc/esp32p4_etm.h"
 #include "hw/misc/esp32p4_hp_sys.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_icm.h"
@@ -33,6 +34,7 @@
 #include "hw/misc/esp32p4_pms.h"
 #include "hw/misc/esp32p4_trace.h"
 #include "hw/net/esp32p4_emac.h"
+#include "hw/net/esp32p4_twai.h"
 #include "hw/net/ip101_phy.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/sd/esp32p4_sdmmc.h"
@@ -141,6 +143,9 @@ struct ESP32P4MachineState {
     /* GDMA-AHB, GDMA-AXI. */
     ESP32P4GdmaState gdma[2];
     ESP32P4DwGdmaState vdma;
+    ESP32P4TwaiState twai;
+    /* The QEMU CAN buses on TWAI0 to TWAI2's pads, or NULL. */
+    CanBusState *canbus[ESP32P4_TWAI_NUM];
 
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];
@@ -150,6 +155,7 @@ struct ESP32P4MachineState {
     SplitIRQ core_stall_split[ESP32P4_HP_CORES];
     /* The HP core reset, to the machine and the RTC timer. */
     SplitIRQ hp_core_reset_split;
+    ESP32P4EtmState etm;
 
     ESP32P4MSPIState flash_mspi;
     ESP32P4MSPIState psram_mspi;

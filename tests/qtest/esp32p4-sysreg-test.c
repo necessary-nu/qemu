@@ -482,7 +482,7 @@ static void test_lp_interrupts(void)
     g_assert_cmphex(qtest_readl(qts, LP_INT_ST), ==, LP_INT_SLOW_CLK_TICK);
     g_assert_cmphex(qtest_readl(qts, INTMTX_STATUS(0)) & (1u << SRC_LP_SYSREG),
                     ==, 1u << SRC_LP_SYSREG);
-    qtest_set_irq_in(qts, LP_SYS_PATH, "etm-task-ulp", 0, 1);
+    qtest_set_irq_in(qts, LP_SYS_PATH, "etm-task-ulp-int", 0, 1);
     g_assert_cmphex(qtest_readl(qts, LP_INT_ST), ==,
                     LP_INT_SLOW_CLK_TICK | LP_INT_ETM_TASK_ULP);
     qtest_writel(qts, LP_INT_CLR, LP_INT_SLOW_CLK_TICK);

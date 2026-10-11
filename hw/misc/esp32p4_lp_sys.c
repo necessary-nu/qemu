@@ -559,7 +559,7 @@ static void esp32p4_lp_sys_init(Object *obj)
     qdev_init_gpio_in_named(dev, esp32p4_lp_sys_set_etm_wakeup,
                             ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP, 1);
     qdev_init_gpio_in_named(dev, esp32p4_lp_sys_set_etm_task_ulp,
-                            ESP32P4_LP_SYS_ETM_TASK_ULP, 1);
+                            ESP32P4_LP_SYS_ETM_TASK_ULP_INT, 1);
     qdev_init_gpio_in_named(dev, esp32p4_lp_sys_set_slow_clk_tick,
                             ESP32P4_LP_SYS_SLOW_CLK_TICK, 1);
 }
