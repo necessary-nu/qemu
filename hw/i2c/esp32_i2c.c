@@ -4,6 +4,7 @@
 #include "qemu/error-report.h"
 #include "hw/i2c/esp32_i2c.h"
 #include "hw/core/irq.h"
+#include "hw/gpio/esp32_line.h"
 #include "migration/vmstate.h"
 
 static void esp32_i2c_do_transaction(Esp32I2CState *s);
@@ -106,10 +107,8 @@ static uint64_t esp32_i2c_read(void * opaque, hwaddr addr, unsigned int size)
     }
 }
 
-static void esp32_i2c_write(void * opaque, hwaddr addr, uint64_t value, unsigned int size)
+static void esp32_i2c_reg_write(Esp32I2CState *s, hwaddr addr, uint64_t value)
 {
-    Esp32I2CState * s = Esp32_I2C(opaque);
-
     switch(addr) {
     case A_I2C_CTR:
         if (FIELD_EX32(value, I2C_CTR, MS_MODE) != 1) {
@@ -352,6 +351,33 @@ static void esp32_i2c_scl_in(void *opaque, int n, int level)
 static void esp32_i2c_sda_in(void *opaque, int n, int level)
 {
     Esp32_I2C(opaque)->sda_in = level != 0;
+}
+
+typedef struct I2cAccess {
+    Esp32I2CState *s;
+    hwaddr addr;
+    uint64_t value;
+} I2cAccess;
+
+static void esp32_i2c_access_write(void *opaque)
+{
+    I2cAccess *a = opaque;
+
+    esp32_i2c_reg_write(a->s, a->addr, a->value);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * A register write acts at the moment it began (see esp32_line.h): the
+ * START, the STOP and the lines' levels between the bytes of a command
+ * list it runs all reach the matrix at that one time, as under icount.
+ */
+static void esp32_i2c_write(void *opaque, hwaddr addr, uint64_t value,
+                            unsigned int size)
+{
+    I2cAccess a = { .s = Esp32_I2C(opaque), .addr = addr, .value = value };
+
+    esp32_line_run_at(esp32_line_time(), esp32_i2c_access_write, &a);
 }
 
 static const MemoryRegionOps esp32_i2c_ops = {
