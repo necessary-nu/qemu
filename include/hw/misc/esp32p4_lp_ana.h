@@ -81,9 +81,14 @@ enum {
 typedef struct ESP32P4LPAnaFilter {
     struct ESP32P4LPAnaState *s;
     QEMUTimer timer;
-    /* The count at sync_ns, and whether it counts up (1) or down (-1). */
+    /*
+     * The count as of LP_DYN_FAST_CLK's cycle @synced, counted from when
+     * the filter started counting or the clock changed (@edges), and
+     * whether it counts up (1) or down (-1).
+     */
     uint32_t count;
-    int64_t sync_ns;
+    ESP32P4ClkCount edges;
+    uint64_t synced;
     int32_t dir;
     bool flag;
 } ESP32P4LPAnaFilter;
@@ -117,12 +122,13 @@ struct ESP32P4LPAnaState {
 
     /*
      * The mode-0 brown-out counter, while bod_counting: bod_base counts and
-     * those since bod_start_ns; the levels of its interrupt and reset
+     * LP_DYN_FAST_CLK's cycles since, counted from when it started or the
+     * clock changed (bod_edges); the levels of its interrupt and reset
      * comparators.
      */
     bool bod_counting;
     uint64_t bod_base;
-    int64_t bod_start_ns;
+    ESP32P4ClkCount bod_edges;
     QEMUTimer bod_timer;
     bool bod_int;
     bool bod_reset;

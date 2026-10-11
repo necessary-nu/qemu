@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/bitmap.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -586,19 +587,19 @@ struct ESP32P4EtmState {
     uint32_t date;
 
     /*
-     * The time SYS_CLK last changed, from which its cycles are counted,
-     * and the time each event was last received and each task last
-     * generated, INT64_MIN for never: once in a cycle each.
+     * SYS_CLK's cycles, counted from when it last changed, and the time
+     * each event was last received and each task last generated, INT64_MIN
+     * for never: once in a cycle each.
      */
-    int64_t clk_ns;
+    ESP32P4ClkCount clk_count;
     int64_t evt_ns[ESP32P4_ETM_EVENTS];
     int64_t task_ns[ESP32P4_ETM_TASKS];
 
     /*
-     * RTC_EVT_TICK: the edges of "rtc-evt-tick" since it last changed, at
-     * @tick_ns, accounted for up to @tick_seen.
+     * RTC_EVT_TICK: the edges of "rtc-evt-tick" since it last changed
+     * (@tick_count), accounted for up to @tick_seen.
      */
-    int64_t tick_ns;
+    ESP32P4ClkCount tick_count;
     uint64_t tick_seen;
 
     /* Which events and tasks the machine has connected. */

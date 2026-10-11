@@ -270,7 +270,7 @@ static void esp32p4_apm_total(ESP32P4AxiPerfMonState *s, int n,
 
 static uint64_t esp32p4_apm_cycles(ESP32P4AxiPerfMonState *s, int64_t ns)
 {
-    return clock_ns_to_ticks(s->axi_clk, MAX(ns, 0));
+    return esp32p4_clk_ns_cycles(esp32p4_clk_exact(s->axi_clk), ns);
 }
 
 /* VALID_STROBE_NUM's time (bits 7:0) or data (15:8) divisor, less one. */
@@ -296,15 +296,12 @@ static void esp32p4_apm_avg_update(ESP32P4AxiPerfMonState *s, int n, int dir)
                                       : METRIC_WR_AVG_TIME, time);
 }
 
-static int64_t esp32p4_apm_window_ns(ESP32P4AxiPerfMonState *s, int n,
-                                     int dir)
+/* A window's length in AXI clock cycles; 0 while the clock is stopped. */
+static uint32_t esp32p4_apm_window(ESP32P4AxiPerfMonState *s, int n, int dir)
 {
     uint32_t thr = extract32(s->regs[R(A_INS_TIME_THR(n))], dir * 16, 16);
 
-    if (!thr || !clock_get(s->axi_clk)) {
-        return 0;
-    }
-    return clock_ticks_to_ns(s->axi_clk, thr);
+    return clock_is_enabled(s->axi_clk) ? thr : 0;
 }
 
 static bool esp32p4_apm_ins_enabled(ESP32P4AxiPerfMonState *s, int n,
@@ -314,18 +311,26 @@ static bool esp32p4_apm_ins_enabled(ESP32P4AxiPerfMonState *s, int n,
            !s->record_stopped[n];
 }
 
-/* Start the next window, if the test runs and the clock does. */
+/*
+ * Start the next window, if the test runs and the clock does: from @now,
+ * or, @chained, from the end of the one before, on the clock's edges.
+ */
 static void esp32p4_apm_ins_start(ESP32P4AxiPerfMonState *s, int n, int dir,
-                                  int64_t now)
+                                  int64_t now, bool chained)
 {
     ESP32P4AxiPerfMonMeasure *m = &s->measure[n][dir];
-    int64_t len = esp32p4_apm_window_ns(s, n, dir);
+    uint32_t len = esp32p4_apm_window(s, n, dir);
 
     m->ins_beats = 0;
-    m->ins_start_ns = now;
+    if (!chained) {
+        esp32p4_clk_count_start(&m->ins_edges, s->axi_clk, now);
+        m->ins_end = 0;
+    }
+    m->ins_end += len;
     m->ins_running = esp32p4_apm_ins_enabled(s, n, dir) && len;
     if (m->ins_running) {
-        timer_mod(m->ins_timer, now + len);
+        timer_mod(m->ins_timer, esp32p4_clk_count_time(&m->ins_edges,
+                                                       m->ins_end));
     } else {
         timer_del(m->ins_timer);
     }
@@ -393,7 +398,7 @@ static void esp32p4_apm_ins_timer(ESP32P4AxiPerfMonState *s, int n, int dir)
         }
         return;
     }
-    esp32p4_apm_ins_start(s, n, dir, now);
+    esp32p4_apm_ins_start(s, n, dir, now, true);
 }
 
 static void esp32p4_apm_timer_u0_rd(void *opaque)
@@ -519,10 +524,10 @@ static void esp32p4_apm_update_ins(ESP32P4AxiPerfMonState *s)
         int n = b / 2, dir = b % 2;
         ESP32P4AxiPerfMonMeasure *m = &s->measure[n][dir];
         bool want = esp32p4_apm_ins_enabled(s, n, dir) &&
-                    esp32p4_apm_window_ns(s, n, dir);
+                    esp32p4_apm_window(s, n, dir);
 
         if (want && !m->ins_running) {
-            esp32p4_apm_ins_start(s, n, dir, now);
+            esp32p4_apm_ins_start(s, n, dir, now, false);
         } else if (!want && m->ins_running) {
             m->ins_running = false;
             timer_del(m->ins_timer);
@@ -717,7 +722,7 @@ static void esp32p4_axi_perf_mon_reset_hold(Object *obj, ResetType type)
             m->avg_last_ns = 0;
             m->ins_running = false;
             m->ins_beats = 0;
-            m->ins_start_ns = 0;
+            m->ins_end = 0;
             timer_del(m->ins_timer);
         }
     }
@@ -761,7 +766,8 @@ static const VMStateDescription vmstate_esp32p4_apm_measure = {
         VMSTATE_UINT64(avg_beats, ESP32P4AxiPerfMonMeasure),
         VMSTATE_INT64(avg_last_ns, ESP32P4AxiPerfMonMeasure),
         VMSTATE_BOOL(ins_running, ESP32P4AxiPerfMonMeasure),
-        VMSTATE_INT64(ins_start_ns, ESP32P4AxiPerfMonMeasure),
+        VMSTATE_ESP32P4_CLK_COUNT(ins_edges, ESP32P4AxiPerfMonMeasure),
+        VMSTATE_UINT64(ins_end, ESP32P4AxiPerfMonMeasure),
         VMSTATE_UINT64(ins_beats, ESP32P4AxiPerfMonMeasure),
         VMSTATE_TIMER_PTR(ins_timer, ESP32P4AxiPerfMonMeasure),
         VMSTATE_END_OF_LIST()
@@ -770,8 +776,8 @@ static const VMStateDescription vmstate_esp32p4_apm_measure = {
 
 static const VMStateDescription vmstate_esp32p4_axi_perf_mon = {
     .name = TYPE_ESP32P4_AXI_PERF_MON,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(axi_clk, ESP32P4AxiPerfMonState),
         VMSTATE_UINT32_ARRAY(regs, ESP32P4AxiPerfMonState,

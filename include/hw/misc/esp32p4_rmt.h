@@ -10,6 +10,7 @@
 #define HW_MISC_ESP32P4_RMT_H
 
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "hw/core/clock.h"
 #include "hw/dma/esp32p4_gdma.h"
 #include "qemu/notify.h"
@@ -161,6 +162,8 @@ struct ESP32P4RmtState {
     qemu_irq irq;
     qemu_irq sig_out[ESP32P4_RMT_TX_CHANNELS];
     Clock *sclk;
+    /* rmt_sclk's exact period, as it last changed. */
+    ESP32P4ClkPeriod sclk_period;
     QEMUTimer timer;
     Notifier line_source;
     ESP32P4GdmaState *gdma;

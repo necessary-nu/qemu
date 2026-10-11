@@ -954,10 +954,10 @@ static void pmu_seq_arm(ESP32P4PMUState *s, uint64_t fast, uint64_t slow)
     }
     s->seq_waiting = false;
     if (fast) {
-        ns += clock_ticks_to_ns(s->fast, fast);
+        ns += esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->fast), fast);
     }
     if (slow) {
-        ns += clock_ticks_to_ns(s->slow, slow);
+        ns += esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->slow), slow);
     }
     pmu_seq_at(s, esp32_line_time() + MAX(ns, 1));
 }
@@ -1089,7 +1089,8 @@ static void pmu_check(ESP32P4PMUState *s)
     case ESP32P4_PMU_ST_HP_SLEEP:
         earliest = s->sleep_start_ns;
         if (clock_is_enabled(s->slow)) {
-            earliest += clock_ticks_to_ns(s->slow, HP_MIN_SLP_VAL(cntl3));
+            earliest += esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->slow),
+                                              HP_MIN_SLP_VAL(cntl3));
         }
         if (wake && now >= earliest) {
             pmu_start_wake(s, wake);
@@ -1103,9 +1104,9 @@ static void pmu_check(ESP32P4PMUState *s)
         if (wake || (!s->lp_cpu_on && lp_wake)) {
             earliest = s->sleep_start_ns;
             if (clock_is_enabled(s->slow)) {
-                earliest += clock_ticks_to_ns(s->slow,
-                                              MAX(HP_MIN_SLP_VAL(cntl3),
-                                                  LP_MIN_SLP_VAL(cntl3)));
+                earliest += esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->slow),
+                                                  MAX(HP_MIN_SLP_VAL(cntl3),
+                                                      LP_MIN_SLP_VAL(cntl3)));
             }
             if (now < earliest) {
                 pmu_seq_at(s, earliest);
@@ -1275,7 +1276,7 @@ static void pmu_lp_sleep_arm(ESP32P4PMUState *s)
         return;
     }
     s->lp_sleep_due_ns = esp32_line_time() +
-                         MAX(clock_ticks_to_ns(s->fast, cycles), 1);
+        MAX(esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->fast), cycles), 1);
     timer_mod(&s->lp_sleep_timer, s->lp_sleep_due_ns);
 }
 
@@ -1449,6 +1450,7 @@ static void pmu_ldo_schedule(ESP32P4PMUState *s, int n)
 {
     ESP32P4PMULdo *l = &s->ldo[n];
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    ESP32P4ClkPeriod slow = esp32p4_clk_exact(s->slow);
     uint64_t cycles, due = UINT64_MAX;
     int k;
 
@@ -1456,7 +1458,7 @@ static void pmu_ldo_schedule(ESP32P4PMUState *s, int n)
     if (!l->running || !clock_is_enabled(s->slow)) {
         return;
     }
-    cycles = clock_ns_to_ticks(s->slow, MAX(now - l->start_ns, 0));
+    cycles = esp32p4_clk_ns_cycles(slow, now - l->start_ns);
     for (k = 0; k < 2; k++) {
         uint64_t at = (uint64_t)pmu_ldo_target(s, n, k) * LDO_CYCLES_PER_COUNT;
 
@@ -1472,8 +1474,7 @@ static void pmu_ldo_schedule(ESP32P4PMUState *s, int n)
         due = MIN(due, at);
     }
     if (due != UINT64_MAX) {
-        timer_mod(&l->timer, l->start_ns +
-                  clock_ticks_to_ns(s->slow, due) + 1);
+        timer_mod(&l->timer, l->start_ns + esp32p4_clk_cycles_ns(slow, due));
     }
     pmu_update_irqs(s);
 }

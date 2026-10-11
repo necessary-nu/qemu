@@ -140,6 +140,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
                                      ESP32P4_LP_BOOT_OFFSET)
 
 #define ESP32P4_ROM_FILE            "esp32p4-rev3-rom.bin"
+/* Where in the HP ROM its ECO version is (_rom_eco_version). */
+#define ESP32P4_ROM_ECO_VERSION     0x14
 
 /* The board pad the IP101GRI's RESET_N is on */
 #define ESP32P4_BOARD_PHY_RESET_PAD 51

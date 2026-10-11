@@ -11,6 +11,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -184,6 +185,8 @@ struct Esp32McpwmState {
     /* PWM_clk cycle core.now corresponds to virtual time base_ns at base */
     int64_t base_ns;
     uint64_t base_cycle;
+    /* The ESP32-P4's MCPWMn_CLK at its exact period, as it last changed */
+    ESP32P4ClkPeriod p4_period;
 
     /* GPIO SYNCn levels as received, before inversion */
     bool sync_in[ESP32_MCPWM_SYNCS];

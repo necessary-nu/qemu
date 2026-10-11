@@ -41,6 +41,7 @@
 #include "qapi/error.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "hw/sd/esp32p4_sdmmc.h"
 #include "hw/misc/esp32p4_icm.h"
 #include "migration/vmstate.h"
@@ -110,6 +111,13 @@ static uint64_t esp32p4_sdmmc_cclk_period(DWCSDMMCState *d)
         return 0;
     }
     return clock_get(d->cclk);
+}
+
+/* [spec:nuos:req:emu.esp32p4.sdmmc] */
+static int64_t esp32p4_sdmmc_clock_ns(DWCSDMMCState *d, Clock *clk,
+                                      uint64_t cycles)
+{
+    return MAX(esp32p4_clk_cycles_ns(esp32p4_clk_exact(clk), cycles), 1);
 }
 
 static void esp32p4_sdmmc_clock_update(void *opaque, ClockEvent event)
@@ -206,6 +214,7 @@ static void esp32p4_sdmmc_class_init(ObjectClass *klass, const void *data)
     sc->vendor_read = esp32p4_sdmmc_vendor_read;
     sc->vendor_write = esp32p4_sdmmc_vendor_write;
     sc->cclk_period = esp32p4_sdmmc_cclk_period;
+    sc->clock_ns = esp32p4_sdmmc_clock_ns;
 }
 
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */
