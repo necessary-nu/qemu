@@ -940,8 +940,10 @@ static void test_core_resets(void)
 
     /* An MWDT CPU reset of the core HPCORE_WDT_RESET_SOURCE_SEL picks. */
     qtest_writel(qts, HPWDT_CORE1_RST_CTRL0, 4 << 9);
-    qtest_set_irq_in(qts, CLKRST, ESP32P4_CLKRST_MWDT_CORE_RESET, 1, 1);
-    qtest_set_irq_in(qts, CLKRST, ESP32P4_CLKRST_MWDT_CORE_RESET, 1, 0);
+    qtest_set_irq_in(qts, CLKRST, ESP32P4_CLKRST_MWDT_CORE_RESET,
+                     ESP32P4_CLKRST_MWDT_LINE(1, 1), 1);
+    qtest_set_irq_in(qts, CLKRST, ESP32P4_CLKRST_MWDT_CORE_RESET,
+                     ESP32P4_CLKRST_MWDT_LINE(1, 1), 0);
     g_assert(qtest_qom_get_bool(qts, HP_CPU1, "in-reset"));
     g_assert(!qtest_qom_get_bool(qts, HP_CPU0, "in-reset"));
     qtest_clock_step(qts, 100);
