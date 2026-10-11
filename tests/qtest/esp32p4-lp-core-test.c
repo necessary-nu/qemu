@@ -9,10 +9,12 @@
 
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
+#include "qobject/qdict.h"
 #include "libqtest.h"
 
 #define LP_CPU                  "/machine/lp-cluster/cpu"
-/* The LP core is the third in "info registers -a". */
+/* The CPUs' indices: HP core 0, HP core 1, the LP core. */
+#define HP_CPU0_INDEX           0
 #define LP_CPU_INDEX            2
 
 #define LP_ROM                  0x50100000u
@@ -174,7 +176,38 @@ static void test_boot(void)
     qtest_quit(qts);
 }
 
-/* The LP ROM reads zero and logs every access as unavailable. */
+/*
+ * The word at @addr as CPU @cpu reads it (HMP's xp with it the monitor's
+ * CPU), in *@value; false if the CPU cannot reach the address.
+ */
+static bool cpu_read(QTestState *qts, int cpu, uint32_t addr, uint32_t *value)
+{
+    g_autofree char *cmd = g_strdup_printf("xp /1wx 0x%x", addr);
+    QDict *rsp = qtest_qmp(qts, "{'execute': 'human-monitor-command', "
+                           "'arguments': {'command-line': %s, "
+                           "'cpu-index': %d}}", cmd, cpu);
+    const char *text, *colon, *end;
+    unsigned long v;
+    bool ok;
+
+    g_assert(qdict_haskey(rsp, "return"));
+    text = qdict_get_str(rsp, "return");
+    ok = !strstr(text, "Cannot access memory");
+    if (ok) {
+        colon = strchr(text, ':');
+        g_assert(colon);
+        g_assert_cmpint(qemu_strtoul(colon + 1, &end, 16, &v), ==, 0);
+        *value = v;
+    }
+    qobject_unref(rsp);
+    return ok;
+}
+
+/*
+ * The absent LP ROM: the LP core reads zero there, each access logged as
+ * unavailable; HP core 0, which cannot reach it, gets a bus error, and its
+ * write changes nothing.
+ */
 /* [spec:nuos:req:emu.esp32p4.lp-rom/test] */
 static void test_lp_rom(void)
 {
@@ -182,22 +215,30 @@ static void test_lp_rom(void)
     g_autofree char *text = NULL;
     GError *err = NULL;
     QTestState *qts;
+    uint32_t v = 0x5a5a5a5a;
     int fd = g_file_open_tmp("esp32p4-lp-rom-XXXXXX.log", &log, &err);
 
     g_assert_no_error(err);
     close(fd);
-    qts = qtest_initf("-M esp32p4 -d unimp -D %s", log);
-    g_assert_cmphex(qtest_readl(qts, LP_ROM), ==, 0);
-    g_assert_cmphex(qtest_readl(qts, LP_ROM + 0x3ffc), ==, 0);
+    qts = qtest_initf("-M esp32p4 -d unimp,guest_errors -D %s", log);
+    g_assert(cpu_read(qts, LP_CPU_INDEX, LP_ROM, &v));
+    g_assert_cmphex(v, ==, 0);
+    g_assert(cpu_read(qts, LP_CPU_INDEX, LP_ROM + 0x3ffc, &v));
+    g_assert_cmphex(v, ==, 0);
+    g_assert(!cpu_read(qts, HP_CPU0_INDEX, LP_ROM, &v));
+    g_assert(!cpu_read(qts, HP_CPU0_INDEX, LP_ROM + 0x3ffc, &v));
     qtest_writel(qts, LP_ROM + 0x100, 0x12345678);
-    g_assert_cmphex(qtest_readl(qts, LP_ROM + 0x100), ==, 0);
+    g_assert(cpu_read(qts, LP_CPU_INDEX, LP_ROM + 0x100, &v));
+    g_assert_cmphex(v, ==, 0);
     qtest_quit(qts);
 
     g_assert(g_file_get_contents(log, &text, NULL, NULL));
     g_assert(strstr(text, "esp32p4.lp-rom: read of 4 bytes at 0x3ffc: the "
                     "LP ROM is unavailable"));
-    g_assert(strstr(text, "esp32p4.lp-rom: write of 4 bytes at 0x100: the "
-                    "LP ROM is unavailable"));
+    g_assert(strstr(text, "esp32p4.lp-rom: read of 4 bytes at 0x3ffc: only "
+                    "the LP core reaches the LP ROM"));
+    g_assert(strstr(text, "esp32p4.lp-rom: write of 4 bytes at 0x100: only "
+                    "the LP core reaches the LP ROM"));
     unlink(log);
 }
 

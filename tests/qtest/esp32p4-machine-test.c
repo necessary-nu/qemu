@@ -481,6 +481,8 @@ static void test_kernel(void)
 {
     g_autofree char *elf = write_elf(0x4ff80000);
     g_autofree char *bad = write_elf(0x40000000);
+    g_autofree char *in_cache = write_elf(L2MEM_BASE + 0x100);
+    g_autofree char *rom_data = write_elf(0x4ffbf000);
     g_autofree char *args = NULL;
     g_autofree char *regs = NULL;
     QTestState *qts;
@@ -488,21 +490,43 @@ static void test_kernel(void)
     args = g_strdup_printf("-M esp32p4,flash-size=16M -kernel %s", elf);
     qts = qtest_init(args);
     regs = qtest_hmp(qts, "info registers -a");
-    /* Core 0 starts at the entry point; core 1 still at the ROM. */
+    /*
+     * Core 0 starts at the entry point, with the registers the boot ROM
+     * leaves as it jumps there (hw/riscv/esp32p4_boot.c; the guest tests
+     * check its CSRs, which take the core's own behaviour only with TCG);
+     * core 1 still at the ROM.
+     */
     g_assert_cmphex(dump_reg(regs, 0, "pc"), ==, 0x4ff80000);
+    g_assert_cmphex(dump_reg(regs, 0, "x1/ra"), ==, 0x4fc05542);
+    g_assert_cmphex(dump_reg(regs, 0, "x2/sp"), ==, 0x4ffbcdf0);
+    g_assert_cmphex(dump_reg(regs, 0, "x15/a5"), ==, 0x4ff80000);
     g_assert_cmphex(dump_reg(regs, 1, "pc"), ==, HP_ROM_BASE);
     g_assert_cmphex(qtest_readl(qts, 0x4ff80000), ==, 0x0000006f);
     /* The ROM is still there. */
     g_assert_cmphex(qtest_readl(qts, ROM_CHIP_ID), ==, ESP32P4_CHIP_ID);
     qtest_quit(qts);
 
-    /* Only the MMU, which software sets up, maps the flash window. */
+    /*
+     * Only the MMU, which software sets up, maps the flash window; nothing
+     * reaches the L2 cache's part of L2MEM; the boot ROM does not load a
+     * segment over its own stack and data.
+     */
     g_free(args);
     args = g_strdup_printf("-M esp32p4,flash-size=16M -kernel %s", bad);
-    assert_refused(args, "outside L2MEM, the TCM and LP SRAM");
+    assert_refused(args, "outside L2MEM past the L2 cache, the TCM and LP "
+                   "SRAM");
+    g_free(args);
+    args = g_strdup_printf("-M esp32p4,flash-size=16M -kernel %s", in_cache);
+    assert_refused(args, "outside L2MEM past the L2 cache, the TCM and LP "
+                   "SRAM");
+    g_free(args);
+    args = g_strdup_printf("-M esp32p4,flash-size=16M -kernel %s", rom_data);
+    assert_refused(args, "over the boot ROM's stack and data");
 
     unlink(elf);
     unlink(bad);
+    unlink(in_cache);
+    unlink(rom_data);
 }
 
 int main(int argc, char **argv)

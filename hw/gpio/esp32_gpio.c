@@ -19,7 +19,11 @@
  * peripheral input signals. Everything is recomputed whenever a register, a
  * peripheral signal or an outside driver changes, and whenever software
  * samples the pads, so that the sigma-delta modulators' bitstreams are read
- * at the virtual time of the access.
+ * at the virtual time of the access. A recomputation drives every line it
+ * changes at one time (see esp32_line.h): that of the change it
+ * propagates, and for a register access the moment the access began, so
+ * that every block an edge reaches, through the matrix or the IO_MUX, sees
+ * it at the same moment.
  */
 
 #include "qemu/osdep.h"
@@ -695,9 +699,15 @@ bool esp32_gpio_sig_in_source(Esp32GpioState *s, unsigned sig,
     return true;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * One resolution, at the time of the change being propagated: the
+ * modulators up to then, the pads, the interrupts they latch, and every
+ * output that changed.
+ */
 static void esp32_gpio_propagate(Esp32GpioState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
     int8_t iomux_src[ESP32_GPIO_SIG_COUNT];
     uint64_t pad, in, changed;
     bool resync = s->resync;
@@ -791,15 +801,11 @@ static void esp32_gpio_propagate(Esp32GpioState *s)
  */
 #define GPIO_SETTLE_LIMIT 16
 
-static void esp32_gpio_update(Esp32GpioState *s)
+static void esp32_gpio_settle(void *opaque)
 {
+    Esp32GpioState *s = opaque;
     unsigned rounds = 0;
 
-    if (s->updating) {
-        s->update_pending = true;
-        return;
-    }
-    s->updating = true;
     do {
         s->update_pending = false;
         esp32_gpio_propagate(s);
@@ -810,6 +816,25 @@ static void esp32_gpio_update(Esp32GpioState *s)
             break;
         }
     } while (s->update_pending);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * Resolve the pads until the routing settles. Every line this drives
+ * carries one time, the change's (esp32_line_time()): a stamped change's
+ * own, and for one that carries none, such as an outside driver, a clock
+ * or a peripheral's untimed output, the moment the resolution began. Every
+ * receiver of an edge, and every block the edge reaches through others,
+ * times it alike, rather than each reading the clock as it happens to run.
+ */
+static void esp32_gpio_update(Esp32GpioState *s)
+{
+    if (s->updating) {
+        s->update_pending = true;
+        return;
+    }
+    s->updating = true;
+    esp32_line_run_at(esp32_line_time(), esp32_gpio_settle, s);
     s->update_pending = false;
     s->updating = false;
 }
@@ -898,10 +923,8 @@ static void esp32_gpio_sample(Esp32GpioState *s)
     esp32_gpio_update(s);
 }
 
-static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+static uint64_t gpio_reg_read(Esp32GpioState *s, hwaddr addr)
 {
-    Esp32GpioState *s = ESP32_GPIO(opaque);
-
     switch (addr) {
     case A_GPIO_BT_SELECT:
         return s->bt_select;
@@ -1008,11 +1031,9 @@ static void esp32_gpio_check_in_sel(unsigned sig, uint32_t cfg)
  * [spec:nuos:req:emu.esp32.gpio]
  * GPIO matrix and sigma-delta register writes.
  */
-static void esp32_gpio_write(void *opaque, hwaddr addr,
-                             uint64_t value, unsigned int size)
+static void gpio_reg_write(Esp32GpioState *s, hwaddr addr, uint64_t value)
 {
-    Esp32GpioState *s = ESP32_GPIO(opaque);
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
     uint32_t v = value;
     bool route = false;
     unsigned i;
@@ -1163,6 +1184,69 @@ static void esp32_gpio_write(void *opaque, hwaddr addr,
     }
 }
 
+/* A register access under way, which acts at one moment throughout. */
+typedef struct GpioAccess {
+    Esp32GpioState *s;
+    hwaddr addr;
+    uint64_t value;
+    uint64_t (*read)(Esp32GpioState *s, hwaddr addr);
+    void (*write)(Esp32GpioState *s, hwaddr addr, uint64_t value);
+} GpioAccess;
+
+static void gpio_access_read(void *opaque)
+{
+    GpioAccess *a = opaque;
+
+    a->value = a->read(a->s, a->addr);
+}
+
+static void gpio_access_write(void *opaque)
+{
+    GpioAccess *a = opaque;
+
+    a->write(a->s, a->addr, a->value);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * An access to the GPIO matrix or the IO_MUX acts at the moment it began:
+ * the pad changes it makes (GPIO_OUT, GPIO_ENABLE, the routing, the
+ * IO_MUX), the samples of the line sources it takes and the modulators'
+ * bitstreams all carry that time (see esp32_line.h), so that every block
+ * an edge reaches sees it at the same moment however its handlers are
+ * ordered, and without icount however long they take.
+ */
+static uint64_t gpio_read_at_start(Esp32GpioState *s, hwaddr addr,
+                                   uint64_t (*read)(Esp32GpioState *,
+                                                    hwaddr))
+{
+    GpioAccess a = { .s = s, .addr = addr, .read = read };
+
+    esp32_line_run_at(esp32_line_time(), gpio_access_read, &a);
+    return a.value;
+}
+
+static void gpio_write_at_start(Esp32GpioState *s, hwaddr addr,
+                                uint64_t value,
+                                void (*write)(Esp32GpioState *, hwaddr,
+                                              uint64_t))
+{
+    GpioAccess a = { .s = s, .addr = addr, .value = value, .write = write };
+
+    esp32_line_run_at(esp32_line_time(), gpio_access_write, &a);
+}
+
+static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    return gpio_read_at_start(ESP32_GPIO(opaque), addr, gpio_reg_read);
+}
+
+static void esp32_gpio_write(void *opaque, hwaddr addr,
+                             uint64_t value, unsigned int size)
+{
+    gpio_write_at_start(ESP32_GPIO(opaque), addr, value, gpio_reg_write);
+}
+
 static const MemoryRegionOps esp32_gpio_ops = {
     .read = esp32_gpio_read,
     .write = esp32_gpio_write,
@@ -1180,10 +1264,8 @@ static uint32_t iomux_writable(unsigned gpio)
     return IO_MUX_PIN_WRITABLE;
 }
 
-static uint64_t esp32_iomux_read(void *opaque, hwaddr addr, unsigned int size)
+static uint64_t iomux_reg_read(Esp32GpioState *s, hwaddr addr)
 {
-    Esp32GpioState *s = ESP32_GPIO(opaque);
-
     if (addr < 4) {
         return s->pin_ctrl;
     }
@@ -1203,10 +1285,8 @@ static uint64_t esp32_iomux_read(void *opaque, hwaddr addr, unsigned int size)
  * model does not resolve, and the MCU_* (SLP_SEL) settings apply only in
  * light sleep.
  */
-static void esp32_iomux_write(void *opaque, hwaddr addr,
-                              uint64_t value, unsigned int size)
+static void iomux_reg_write(Esp32GpioState *s, hwaddr addr, uint64_t value)
 {
-    Esp32GpioState *s = ESP32_GPIO(opaque);
     unsigned gpio;
 
     if (addr < 4) {
@@ -1231,6 +1311,17 @@ static void esp32_iomux_write(void *opaque, hwaddr addr,
     }
     esp32_gpio_update(s);
     notifier_list_notify(&s->route_notifiers, s);
+}
+
+static uint64_t esp32_iomux_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    return gpio_read_at_start(ESP32_GPIO(opaque), addr, iomux_reg_read);
+}
+
+static void esp32_iomux_write(void *opaque, hwaddr addr,
+                              uint64_t value, unsigned int size)
+{
+    gpio_write_at_start(ESP32_GPIO(opaque), addr, value, iomux_reg_write);
 }
 
 static const MemoryRegionOps esp32_iomux_ops = {

@@ -162,11 +162,21 @@ struct ESP32P4MachineState {
     MemoryRegion l2mem_direct;
     MemoryRegion lp_sram;
     /*
-     * The LP ROM, and whether it holds an image: the machine ships none,
-     * so it is absent and the LP core starts past it.
+     * The LP ROM, and whether it holds an image. The machine ships none:
+     * without the lp-rom property's image, dumped by the user from their
+     * own chip, the LP ROM is absent and the LP core starts past it.
      */
+    char *lp_rom_file;
     MemoryRegion lp_rom;
     bool lp_rom_loaded;
+    /*
+     * The LP ROM is on the LP core's own buses: the LP core's address
+     * space is the bus with the LP ROM over it, and the bus itself answers
+     * the LP ROM's addresses with an error.
+     */
+    MemoryRegion lp_mem;
+    MemoryRegion lp_bus;
+    MemoryRegion lp_rom_hole;
     MemoryRegion psram;
     /* The HP cores' address space, and the bus in it. */
     MemoryRegion hp_mem;
@@ -187,10 +197,17 @@ struct ESP32P4MachineState {
     ESP32P4LPSysState lp_sys;
     /* The HP cores' reset vector inputs from LP_CLKRST_*_STAT_VECTOR_SEL. */
     qemu_irq *core_vector;
-    /* The entry point of the -kernel ELF, which core 0 starts at; or 0. */
+    /* Whether core 0's reset vector is the ROM's. */
+    bool core0_rom_vector;
+    /* Core 0's reset, and its start as the reset ends, still to run. */
+    bool core0_in_reset;
+    bool core0_boot_pending;
+    /* The entry point of the -kernel ELF, which takes the ROM's place; or 0. */
     uint64_t kernel_entry;
     ESP32P4EfuseState efuse;
     ESP32P4GpioState gpio;
+    /* The boot mode's SPI boot, to MWDT0 and the RTC watchdog. */
+    SplitIRQ spi_boot_split;
     /* The board's strapping of GPIO34 to GPIO38, in GPIO_STRAP's layout */
     uint32_t strap_mode;
     /* The access permission managers, every master's way onto the bus. */
@@ -233,9 +250,7 @@ struct ESP32P4MachineState {
     /* The PMU's power of PD_TOP and of the HP memory, to the machine. */
     qemu_irq hp_top_power;
     qemu_irq hp_mem_power;
-    /* Whether the HP memories have lost their contents since PD_TOP rose. */
-    bool hp_mem_lost;
-    /* The -kernel ELF's segments outside LP SRAM, for its reload. */
+    /* The -kernel ELF's segments (ESP32P4KernelSegment). */
     GArray *kernel_segments;
 
     ESP32P4MSPIState flash_mspi;
@@ -303,5 +318,27 @@ struct ESP32P4MachineState {
  * no length, and this is the shortest of the RTC watchdog's.
  */
 #define ESP32P4_SW_SYS_RESET_NS 100
+
+/* The part of L2MEM the L2 cache takes from reset, which the ROM keeps. */
+#define ESP32P4_L2_CACHE_RESET_SIZE (128 * KiB)
+
+/* A loadable segment of the -kernel ELF. */
+typedef struct ESP32P4KernelSegment {
+    uint32_t paddr;
+    uint32_t memsz;
+    GBytes *data;
+} ESP32P4KernelSegment;
+
+/*
+ * The boot ROM hand-off (hw/riscv/esp32p4_boot.c). esp32p4_boot_core0() is
+ * HP core 0's start from a reset: with -kernel, when the ROM there would
+ * boot the image in flash, the ELF stands for it and
+ * esp32p4_present_rom_handoff() presents the state the ROM leaves as it
+ * jumps to the image. esp32p4_rom_refuses_segment() tells whether the
+ * ROM's loader refuses a segment at @addr of @size bytes.
+ */
+void esp32p4_boot_core0(ESP32P4MachineState *s);
+void esp32p4_present_rom_handoff(ESP32P4MachineState *s);
+bool esp32p4_rom_refuses_segment(uint32_t addr, uint32_t size);
 
 #endif
