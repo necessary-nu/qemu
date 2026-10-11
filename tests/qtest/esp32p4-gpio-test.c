@@ -1147,6 +1147,9 @@ static void test_etm(void)
  * The analog comparators' edges latch GPIO_INT_RAW and raise
  * GPIO_PAD_COMP_INTR (source 78) while enabled; GPIO_ZERO_DETn_FILTER_CNT
  * hides edges for that many IO MUX clock cycles after an interrupt.
+ * Comparator n's rising edge is bit 3n and its falling edge bit 3n + 1,
+ * as ESP-IDF's driver reads them (the TRM names them the other way
+ * round), and either is bit 3n + 2.
  */
 /* [spec:nuos:req:emu.esp32p4.gpio/test] */
 static void test_pad_comp(void)
@@ -1155,14 +1158,14 @@ static void test_pad_comp(void)
 
     qtest_writel(qts, GPIO_ZERO_DET0, 0);
     qtest_set_irq_in(qts, GPIO_PATH, "ana-comp", 0, 1);
-    g_assert_cmphex(qtest_readl(qts, GPIO_INT_RAW), ==, 0x6);
-    g_assert_cmphex(qtest_readl(qts, GPIO_INT_ST), ==, 0x6);
+    g_assert_cmphex(qtest_readl(qts, GPIO_INT_RAW), ==, 0x5);
+    g_assert_cmphex(qtest_readl(qts, GPIO_INT_ST), ==, 0x5);
     g_assert_cmphex(src_status(qts, 2), ==, SRC_GPIO_BIT(4));
-    qtest_writel(qts, GPIO_INT_CLR, 0x6);
+    qtest_writel(qts, GPIO_INT_CLR, 0x5);
     g_assert_cmphex(src_status(qts, 2), ==, 0);
     qtest_set_irq_in(qts, GPIO_PATH, "ana-comp", 0, 0);
-    g_assert_cmphex(qtest_readl(qts, GPIO_INT_RAW), ==, 0x5);
-    qtest_writel(qts, GPIO_INT_ENA, 0xfe);
+    g_assert_cmphex(qtest_readl(qts, GPIO_INT_RAW), ==, 0x6);
+    qtest_writel(qts, GPIO_INT_ENA, 0xfd);
     g_assert_cmphex(qtest_readl(qts, GPIO_INT_ST), ==, 0x4);
     qtest_writel(qts, GPIO_INT_ENA, 0);
     g_assert_cmphex(src_status(qts, 2), ==, 0);
@@ -1172,14 +1175,17 @@ static void test_pad_comp(void)
     /* Comparator 1, filtered for 100 cycles after each interrupt */
     qtest_writel(qts, GPIO_ZERO_DET1, 100);
     qtest_set_irq_in(qts, GPIO_PATH, "ana-comp", 1, 1);
-    g_assert_cmphex(qtest_readl(qts, GPIO_INT_RAW), ==, 0x30);
-    qtest_writel(qts, GPIO_INT_CLR, 0x30);
+    g_assert_cmphex(qtest_readl(qts, GPIO_INT_RAW), ==, 0x28);
+    qtest_writel(qts, GPIO_INT_CLR, 0x28);
     qtest_clock_step(qts, 50 * CYCLE_NS);
     qtest_set_irq_in(qts, GPIO_PATH, "ana-comp", 1, 0);
     g_assert_cmphex(qtest_readl(qts, GPIO_INT_RAW), ==, 0);
     qtest_clock_step(qts, 60 * CYCLE_NS);
     qtest_set_irq_in(qts, GPIO_PATH, "ana-comp", 1, 1);
-    g_assert_cmphex(qtest_readl(qts, GPIO_INT_RAW), ==, 0x30);
+    g_assert_cmphex(qtest_readl(qts, GPIO_INT_RAW), ==, 0x28);
+    qtest_clock_step(qts, 110 * CYCLE_NS);
+    qtest_set_irq_in(qts, GPIO_PATH, "ana-comp", 1, 0);
+    g_assert_cmphex(qtest_readl(qts, GPIO_INT_RAW), ==, 0x38);
     qtest_quit(qts);
 }
 
