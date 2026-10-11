@@ -102,6 +102,20 @@ enum {
  * the DMA master of the peripheral it serves. A qtest can play any
  * peripheral through the controller's "periph" property
  * (hw/dma/esp32p4_gdma.c).
+ *
+ * Time. The controller's bus rounds happen at the times they fall due,
+ * however late the QEMU timer that runs them: each runs as of its own
+ * time (esp32_line_run_at(), include/hw/gpio/esp32_line.h), and a pull,
+ * push or event a round causes carries that time. A peripheral that takes
+ * its own events late in the same way, and moves data at them, keeps the
+ * two in step: before an event of its own at time t it calls
+ * esp32p4_gdma_sync(s, t), which runs what an interposer on the
+ * controller's paths has due by t and the rounds that fell due by then,
+ * so the event sees the path as it was at t. A register access or a bus
+ * clock change at the controller first runs, for each attached peripheral
+ * with ops->sync, ops->sync(opaque, now), which takes the peripheral's
+ * events due by then (syncing the controller before each), and then the
+ * interposers' events and the controller's own rounds due by then.
  */
 #define ESP32P4_GDMA_EOF        (1u << 0)
 #define ESP32P4_GDMA_ERR_EOF    (1u << 1)
@@ -109,10 +123,12 @@ enum {
 typedef struct ESP32P4GdmaPeriphOps {
     void (*tx_ready)(void *opaque);
     void (*rx_ready)(void *opaque);
+    void (*sync)(void *opaque, int64_t when);
 } ESP32P4GdmaPeriphOps;
 
 void esp32p4_gdma_attach(ESP32P4GdmaState *s, unsigned periph,
                          const ESP32P4GdmaPeriphOps *ops, void *opaque);
+void esp32p4_gdma_sync(ESP32P4GdmaState *s, int64_t when);
 size_t esp32p4_gdma_pull(ESP32P4GdmaState *s, unsigned periph,
                          uint8_t *buf, size_t len, bool *eof);
 size_t esp32p4_gdma_push(ESP32P4GdmaState *s, unsigned periph,
@@ -155,7 +171,11 @@ bool esp32p4_gdma_rx_flowing(ESP32P4GdmaState *s, unsigned periph);
  *     the channel exactly as the peripheral's calls do on a direct path,
  *     and tells the peripheral of bytes it has for it, or room it has
  *     made, with esp32p4_gdma_periph_ready(), which calls the
- *     peripheral's tx_ready or rx_ready.
+ *     peripheral's tx_ready or rx_ready;
+ *   - esp32p4_gdma_sync(s, t) calls ops->sync(opaque, t), with which an
+ *     interposer that takes its own steps late takes those due by t,
+ *     each at its own time, running the channel's rounds due before each
+ *     with esp32p4_gdma_chan_sync().
  *
  * The interposition is wiring, not controller state: a reset of the
  * controller keeps it.
@@ -167,6 +187,7 @@ typedef struct ESP32P4GdmaInterposerOps {
                    unsigned flags);
     size_t (*rx_room)(void *opaque);
     void (*chan_ready)(void *opaque, int dir);
+    void (*sync)(void *opaque, int64_t when);
 } ESP32P4GdmaInterposerOps;
 
 void esp32p4_gdma_interpose(ESP32P4GdmaState *s, int dir, unsigned periph,
@@ -179,6 +200,7 @@ size_t esp32p4_gdma_chan_push(ESP32P4GdmaState *s, unsigned periph,
                               unsigned flags);
 size_t esp32p4_gdma_chan_tx_pending(ESP32P4GdmaState *s, unsigned periph);
 size_t esp32p4_gdma_chan_rx_room(ESP32P4GdmaState *s, unsigned periph);
+void esp32p4_gdma_chan_sync(ESP32P4GdmaState *s, int64_t when);
 void esp32p4_gdma_periph_ready(ESP32P4GdmaState *s, unsigned periph,
                                int dir);
 
