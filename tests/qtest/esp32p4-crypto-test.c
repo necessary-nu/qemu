@@ -884,6 +884,55 @@ static void test_rsa(void)
     qtest_quit(qts);
 }
 
+static void rsa_modexp_1024(QTestState *qts, bool clear_search)
+{
+    wr_words(qts, RSA_X_MEM, rsa_x, 32);
+    wr_words(qts, RSA_Z_MEM, rsa_r, 32);
+    qtest_writel(qts, RSA_START_MODEXP, 1);
+    if (clear_search) {
+        g_assert_cmphex(qtest_readl(qts, RSA_QUERY_IDLE), ==, 0);
+        qtest_writel(qts, RSA_SEARCH_ENABLE, 0);
+        g_assert_cmphex(qtest_readl(qts, RSA_SEARCH_ENABLE), ==, 0);
+    }
+    wait_for(qts, RSA_QUERY_IDLE, 1, 1, 200 * 1000 * 1000);
+}
+
+/*
+ * The acceleration options written while the accelerator computes, as
+ * ESP-IDF's esp_mpi_exp_mpi_mod_hw_op() clears RSA_SEARCH_ENABLE_REG
+ * straight after it starts each exponentiation: the operation keeps the
+ * options it started with, and the next takes the new ones.
+ */
+/* [spec:nuos:req:emu.esp32p4.crypto/test] */
+static void test_rsa_options_busy(void)
+{
+    QTestState *qts = start();
+
+    wait_for(qts, RSA_QUERY_CLEAN, 1, 1, 100000);
+    qtest_writel(qts, RSA_MODE, 31);
+    qtest_writel(qts, RSA_M_PRIME, RSA_MPRIME);
+    wr_words(qts, RSA_M_MEM, rsa_m, 32);
+    wr_words(qts, RSA_Y_MEM, rsa_y, 32);
+
+    /* ESP-IDF's sequence, the search at Y's top bit. */
+    qtest_writel(qts, RSA_CONSTANT_TIME, 0);
+    qtest_writel(qts, RSA_SEARCH_ENABLE, 1);
+    qtest_writel(qts, RSA_SEARCH_POS, 1023);
+    rsa_modexp_1024(qts, true);
+    check_words(qts, RSA_Z_MEM, rsa_z, 32);
+
+    /* The search below Y's top bit holds for the operation it started. */
+    qtest_writel(qts, RSA_SEARCH_ENABLE, 1);
+    qtest_writel(qts, RSA_SEARCH_POS, 1000);
+    rsa_modexp_1024(qts, true);
+    g_assert_cmphex(qtest_readl(qts, RSA_Z_MEM), !=, rsa_z[0]);
+
+    /* The next operation searches no more. */
+    rsa_modexp_1024(qts, false);
+    check_words(qts, RSA_Z_MEM, rsa_z, 32);
+    qtest_quit(qts);
+}
+
 /* ECC */
 
 static void ecc_run(QTestState *qts, uint32_t conf)
@@ -1250,6 +1299,8 @@ int main(int argc, char **argv)
                    test_sha_next_block_busy);
     qtest_add_func("/esp32p4-crypto/sha-dma", test_sha_dma);
     qtest_add_func("/esp32p4-crypto/rsa", test_rsa);
+    qtest_add_func("/esp32p4-crypto/rsa-options-busy",
+                   test_rsa_options_busy);
     qtest_add_func("/esp32p4-crypto/ecc", test_ecc);
     qtest_add_func("/esp32p4-crypto/rng", test_rng);
     qtest_add_func("/esp32p4-crypto/rng-source", test_rng_source);
