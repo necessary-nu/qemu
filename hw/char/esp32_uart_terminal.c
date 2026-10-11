@@ -244,10 +244,14 @@ static bool term_get_break(Object *obj, Error **errp)
 static void term_set_break(Object *obj, bool value, Error **errp)
 {
     Esp32UartTerminalState *s = ESP32_UART_TERMINAL(obj);
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
 
     if (s->brk == value) {
         return;
+    }
+    if (DEVICE(obj)->realized) {
+        /* The bits due before the break, which a late timer has not sent */
+        term_tx_advance(s);
     }
     s->brk = value;
     if (!DEVICE(obj)->realized || !qemu_chr_fe_backend_connected(&s->chr)) {
