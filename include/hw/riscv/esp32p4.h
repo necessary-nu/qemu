@@ -13,6 +13,7 @@
 #include "hw/core/boards.h"
 #include "hw/char/esp32_uart_terminal.h"
 #include "hw/char/esp32p4_uart.h"
+#include "hw/char/esp32p4_usb_serial_jtag.h"
 #include "hw/cpu/cluster.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/dma/esp32p4_gdma.h"
@@ -174,6 +175,7 @@ struct ESP32P4MachineState {
     ESP32P4UartState lp_uart;
     Esp32UartTerminalState terminal[ESP32P4_SERIAL_PORTS];
     ESP32P4UhciState uhci;
+    ESP32P4UsjState usj;
 };
 
 #endif

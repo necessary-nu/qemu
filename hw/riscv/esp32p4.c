@@ -142,6 +142,16 @@
  *     interrupt source 30, moves the data of the UART CONF0.UART_SEL
  *     names through GDMA-AHB as peripheral UHCI0.
  *
+ *   - The USB Serial/JTAG controller (TRM chapter 54) at 0x500D2000,
+ *     behind USB_DEVICE_APB_CLK and LP_CLKRST's USB_DEVICE reset, its USB
+ *     side on USB_DEVICE_48M_CLK, its interrupt source 22, its PHY's
+ *     pull-ups on GPIO24 and GPIO25. Its CDC-ACM serial port reaches a
+ *     chardev, a computer at the other end of the board's USB cable,
+ *     which enumerates the device as the boot ROM starts and reads and
+ *     writes the port while the chardev is open; with none, no cable:
+ *
+ *       -chardev stdio,id=usj -global esp32p4-usb-serial-jtag.chardev=usj
+ *
  *   - The DMA controllers (TRM chapters 6 and 7): GDMA-AHB at 0x50085000
  *     and GDMA-AXI at 0x5008A000, three RX and three TX channels each,
  *     behind AHB_PDMA_SYS_CLK and AXI_PDMA_SYS_CLK and their resets, their
@@ -261,7 +271,6 @@ static const struct {
     { "parl-io",          0x500cf000, 4 * KiB },
     { "spi2",             0x500d0000, 4 * KiB },
     { "spi3",             0x500d1000, 4 * KiB },
-    { "usb-serial-jtag",  0x500d2000, 4 * KiB },
     { "ledc",             0x500d3000, 4 * KiB },
     { "twai0",            0x500d7000, 4 * KiB },
     { "twai1",            0x500d8000, 4 * KiB },
@@ -1797,6 +1806,36 @@ static void esp32p4_init_uart(ESP32P4MachineState *s)
                        esp32p4_intr_source(s, ESP32P4_INTR_UHCI0));
 }
 
+/*
+ * The USB Serial/JTAG controller: its registers behind
+ * USB_DEVICE_APB_CLK and its reset, its USB side on USB_DEVICE_48M_CLK,
+ * its D- and D+ pull-ups on GPIO24 and GPIO25.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart] */
+static void esp32p4_init_usb_serial_jtag(ESP32P4MachineState *s)
+{
+    DeviceState *dev, *gpio = DEVICE(&s->gpio);
+
+    object_initialize_child(OBJECT(s), "usb-serial-jtag", &s->usj,
+                            TYPE_ESP32P4_USB_SERIAL_JTAG);
+    dev = DEVICE(&s->usj);
+    qdev_connect_clock_in(dev, "usb48",
+                          qdev_get_clock_out(DEVICE(&s->clkrst),
+                                             "usb-device-48m"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_USJ_BASE, ESP32P4_CLK_USB_DEVICE_APB,
+                             ESP32P4_RST_USB_DEVICE, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_USB_SERIAL_JTAG));
+    qdev_connect_gpio_out_named(dev, ESP32P4_USJ_PAD_PULL_UP, 0,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_PAD_PULL_UP, 24));
+    qdev_connect_gpio_out_named(dev, ESP32P4_USJ_PAD_PULL_UP, 1,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_PAD_PULL_UP, 25));
+}
+
 /* The memories -kernel can load into: those the cores address directly. */
 static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
 {
@@ -1938,6 +1977,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_emac(s);
     esp32p4_init_dma(s);
     esp32p4_init_uart(s);
+    esp32p4_init_usb_serial_jtag(s);
     esp32p4_init_etm(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(

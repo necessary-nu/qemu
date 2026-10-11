@@ -1181,6 +1181,178 @@ static void test_uhci_rx(void)
     qtest_quit(qts);
 }
 
+/* The USB Serial/JTAG controller */
+#define USJ                 0x500d2000
+#define USJ_EP1             (USJ + 0x00)
+#define USJ_EP1_CONF        (USJ + 0x04)
+#define USJ_INT_RAW         (USJ + 0x08)
+#define USJ_INT_CLR         (USJ + 0x14)
+#define USJ_CONF0           (USJ + 0x18)
+#define USJ_TEST            (USJ + 0x1c)
+#define USJ_JFIFO_ST        (USJ + 0x20)
+#define USJ_FRAM_NUM        (USJ + 0x24)
+#define USJ_IN_EP1_ST       (USJ + 0x2c)
+#define USJ_OUT_EP1_ST      (USJ + 0x3c)
+#define USJ_MEM_CONF        (USJ + 0x48)
+#define USJ_CHIP_RST        (USJ + 0x4c)
+#define USJ_SET_LINE_W0     (USJ + 0x50)
+#define USJ_SET_LINE_W1     (USJ + 0x54)
+#define USJ_SER_AFIFO       (USJ + 0x64)
+#define USJ_BUS_RESET_ST    (USJ + 0x68)
+#define USJ_ECO_HIGH_48     (USJ + 0x70)
+#define USJ_SRAM_CTRL       (USJ + 0x84)
+#define USJ_DATE            (USJ + 0x88)
+#define USJ_WR_DONE         (1u << 0)
+#define USJ_IN_FREE         (1u << 1)
+#define USJ_OUT_AVAIL       (1u << 2)
+#define USJ_INT_SOF         (1u << 1)
+#define USJ_INT_RECV_PKT    (1u << 2)
+#define USJ_INT_IN_EMPTY    (1u << 3)
+#define USJ_INT_BUS_RESET   (1u << 9)
+#define USJ_INT_RTS_CHG     (1u << 12)
+#define USJ_INT_DTR_CHG     (1u << 13)
+#define USJ_INT_GET_LINE    (1u << 14)
+#define USJ_INT_SET_LINE    (1u << 15)
+#define USJ_PAD_ENABLE      (1u << 14)
+#define GPIO_IN             (GPIO + 0x03c)
+#define MS                  1000000
+
+/*
+ * The controller's registers out of reset, and its IN buffer with no
+ * host: the 64th byte flushes it, and it stays full; USB_PAD_ENABLE's
+ * D+ pull-up on GPIO25.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+static void test_usj_registers(void)
+{
+    QTestState *qts = start();
+    int i;
+
+    g_assert_cmphex(qtest_readl(qts, USJ_EP1_CONF), ==, USJ_IN_FREE);
+    g_assert_cmphex(qtest_readl(qts, USJ_INT_RAW), ==, USJ_INT_IN_EMPTY);
+    g_assert_cmphex(qtest_readl(qts, USJ_CONF0), ==, 0x4200);
+    g_assert_cmphex(qtest_readl(qts, USJ_TEST), ==, 0x30);
+    g_assert_cmphex(qtest_readl(qts, USJ_JFIFO_ST), ==, 0x44);
+    g_assert_cmphex(qtest_readl(qts, USJ_IN_EP1_ST), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, USJ_MEM_CONF), ==, 2);
+    g_assert_cmphex(qtest_readl(qts, USJ_SER_AFIFO), ==, 0x10);
+    g_assert_cmphex(qtest_readl(qts, USJ_BUS_RESET_ST), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, USJ_ECO_HIGH_48), ==, 0xffffffff);
+    g_assert_cmphex(qtest_readl(qts, USJ_SRAM_CTRL), ==, 0x1320);
+    g_assert_cmphex(qtest_readl(qts, USJ_DATE), ==, 0x02112010);
+
+    for (i = 0; i < 63; i++) {
+        qtest_writel(qts, USJ_EP1, i);
+    }
+    g_assert_cmphex(qtest_readl(qts, USJ_EP1_CONF), ==, USJ_IN_FREE);
+    qtest_writel(qts, USJ_EP1, 63);
+    g_assert_cmphex(qtest_readl(qts, USJ_EP1_CONF), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, USJ_IN_EP1_ST), ==, 1 | (64 << 2));
+    qtest_clock_step(qts, 500 * MS);
+    g_assert_cmphex(qtest_readl(qts, USJ_EP1_CONF), ==, 0);
+    g_assert_false(qtest_readl(qts, USJ_INT_RAW) & USJ_INT_SOF);
+
+    /* The PHY's D+ pull-up holds GPIO25 high, until the pads go. */
+    qtest_writel(qts, IO_MUX_GPIO(25), MCU_SEL_GPIO | FUN_IE | FUN_DRV(2));
+    g_assert_true(qtest_readl(qts, GPIO_IN) & (1u << 25));
+    qtest_writel(qts, USJ_CONF0, 0x4200 & ~USJ_PAD_ENABLE);
+    g_assert_false(qtest_readl(qts, GPIO_IN) & (1u << 25));
+    qtest_quit(qts);
+}
+
+static QTestState *start_usj(int *fd)
+{
+    g_autofree char *dir = g_dir_make_tmp("esp32p4-usj-XXXXXX", NULL);
+    g_autofree char *path = g_strdup_printf("%s/sock", dir);
+    int srv = qtest_socket_server(path);
+    QTestState *qts;
+
+    qts = qtest_initf("-M esp32p4,flash-size=16M -serial none "
+                      "-chardev socket,id=usj,path=%s "
+                      "-global esp32p4-usb-serial-jtag.chardev=usj", path);
+    *fd = accept(srv, NULL, NULL);
+    g_assert_cmpint(*fd, >=, 0);
+    close(srv);
+    unlink(path);
+    rmdir(dir);
+    return qts;
+}
+
+/*
+ * The host on the chardev: it attaches after 100 ms, resets the bus for
+ * 10 ms, sends SOFs a millisecond apart, enumerates and opens the port
+ * (SET_LINE_CODING, GET_LINE_CODING, DTR and RTS); then a flushed IN
+ * buffer reaches the chardev and the chardev's bytes arrive as an OUT
+ * packet; closing the chardev drops DTR and RTS.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+static void test_usj_host(void)
+{
+    int fd;
+    QTestState *qts = start_usj(&fd);
+    uint32_t frame;
+    char buf[8];
+    int i;
+
+    g_assert_false(qtest_readl(qts, USJ_INT_RAW) & USJ_INT_BUS_RESET);
+    qtest_clock_step(qts, 100 * MS + 1000);
+    g_assert_true(qtest_readl(qts, USJ_INT_RAW) & USJ_INT_BUS_RESET);
+    g_assert_cmphex(qtest_readl(qts, USJ_BUS_RESET_ST), ==, 0);
+    qtest_clock_step(qts, 10 * MS);
+    g_assert_cmphex(qtest_readl(qts, USJ_BUS_RESET_ST), ==, 1);
+    frame = qtest_readl(qts, USJ_FRAM_NUM);
+    qtest_clock_step(qts, 3 * MS);
+    g_assert_cmpuint(qtest_readl(qts, USJ_FRAM_NUM), ==, frame + 3);
+    g_assert_true(qtest_readl(qts, USJ_INT_RAW) & USJ_INT_SOF);
+    qtest_clock_step(qts, 20 * MS);
+    g_assert_true(qtest_readl(qts, USJ_INT_RAW) & USJ_INT_SET_LINE);
+    g_assert_true(qtest_readl(qts, USJ_INT_RAW) & USJ_INT_GET_LINE);
+    g_assert_cmpuint(qtest_readl(qts, USJ_SET_LINE_W0), ==, 115200);
+    g_assert_cmphex(qtest_readl(qts, USJ_SET_LINE_W1), ==, 8u << 16);
+    g_assert_true(qtest_readl(qts, USJ_INT_RAW) & USJ_INT_DTR_CHG);
+    g_assert_true(qtest_readl(qts, USJ_INT_RAW) & USJ_INT_RTS_CHG);
+    g_assert_cmphex(qtest_readl(qts, USJ_CHIP_RST), ==, 3);
+
+    /* IN: two bytes and WR_DONE */
+    qtest_writel(qts, USJ_INT_CLR, USJ_INT_IN_EMPTY);
+    qtest_writel(qts, USJ_EP1, 'h');
+    qtest_writel(qts, USJ_EP1, 'i');
+    qtest_writel(qts, USJ_EP1_CONF, USJ_WR_DONE);
+    g_assert_cmphex(qtest_readl(qts, USJ_EP1_CONF), ==, 0);
+    qtest_clock_step(qts, 20000);
+    g_assert_cmphex(qtest_readl(qts, USJ_EP1_CONF), ==, USJ_IN_FREE);
+    g_assert_true(qtest_readl(qts, USJ_INT_RAW) & USJ_INT_IN_EMPTY);
+    g_assert_cmpint(recv(fd, buf, 2, MSG_WAITALL), ==, 2);
+    g_assert_cmpmem(buf, 2, "hi", 2);
+
+    /* OUT: three bytes from the chardev */
+    g_assert_cmpint(send(fd, "abc", 3, 0), ==, 3);
+    for (i = 0; i < 100 && !(qtest_readl(qts, USJ_EP1_CONF) &
+                             USJ_OUT_AVAIL); i++) {
+        g_usleep(10000);
+        qtest_clock_step(qts, 100000);
+    }
+    g_assert_true(qtest_readl(qts, USJ_INT_RAW) & USJ_INT_RECV_PKT);
+    g_assert_cmphex(qtest_readl(qts, USJ_OUT_EP1_ST), ==,
+                    (5 << 2) | (3 << 16));
+    g_assert_cmphex(qtest_readl(qts, USJ_EP1), ==, 'a');
+    g_assert_cmphex(qtest_readl(qts, USJ_EP1), ==, 'b');
+    g_assert_cmphex(qtest_readl(qts, USJ_EP1), ==, 'c');
+    g_assert_cmphex(qtest_readl(qts, USJ_EP1_CONF), ==, USJ_IN_FREE);
+
+    /* The terminal closes the port: DTR and RTS drop. */
+    qtest_writel(qts, USJ_INT_CLR, USJ_INT_DTR_CHG | USJ_INT_RTS_CHG);
+    close(fd);
+    for (i = 0; i < 100 && !(qtest_readl(qts, USJ_INT_RAW) &
+                             USJ_INT_DTR_CHG); i++) {
+        g_usleep(10000);
+        qtest_clock_step(qts, MS);
+    }
+    g_assert_true(qtest_readl(qts, USJ_INT_RAW) & USJ_INT_DTR_CHG);
+    g_assert_cmphex(qtest_readl(qts, USJ_CHIP_RST), ==, 0);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1202,6 +1374,8 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/uart/serial_port", test_serial_port);
     qtest_add_func("esp32p4/uart/uhci_tx", test_uhci_tx);
     qtest_add_func("esp32p4/uart/uhci_rx", test_uhci_rx);
+    qtest_add_func("esp32p4/uart/usj_registers", test_usj_registers);
+    qtest_add_func("esp32p4/uart/usj_host", test_usj_host);
     qtest_add_func("esp32p4/uart/rom_banner", test_rom_banner);
 
     return g_test_run();
