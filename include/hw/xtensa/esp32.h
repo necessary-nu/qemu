@@ -148,6 +148,12 @@ struct Esp32SocState {
     MemoryRegion cpu_sysmem_view[ESP32_CPU_COUNT];
 
     uint32_t requested_reset;
+    /*
+     * A TLB flush queued for each CPU's own thread (esp32_mpu_update())
+     * and not yet made; transient, as a CPU does what is queued for it
+     * before it stops.
+     */
+    bool mpu_flush_pending[ESP32_CPU_COUNT];
 
     /* CPU_CLK, APB_CLK and REF_TICK as the clock tree selects them */
     Clock *cpu_clk;

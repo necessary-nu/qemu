@@ -1105,10 +1105,7 @@ static const VMStateDescription vmstate_esp32p4_counters = {
         VMSTATE_UINT64_ARRAY(ctr_ref, ESP32P4CPU, 2),
         VMSTATE_UINT64_ARRAY(hpm, ESP32P4CPU, ESP32P4_LP_HPM_COUNTERS),
         VMSTATE_UINT32(mcountinhibit, ESP32P4CPU),
-        VMSTATE_BOOL(waiti_force_on, ESP32P4CPU),
-        VMSTATE_UINT8(waiti_delay, ESP32P4CPU),
         VMSTATE_BOOL(ctr_wfi, ESP32P4CPU),
-        VMSTATE_UINT32(wfi_left, ESP32P4CPU),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1236,22 +1233,6 @@ static void esp32p4_hp_cpu_set_gpio_in(void *opaque, int n, int level)
                                          level != 0));
 }
 
-/* HP_SYSTEM_CPU_WAITI_CONF: whether, and when, the clock stops in WFI. */
-/* [spec:nuos:req:emu.esp32p4.cpu] */
-static void esp32p4_hp_cpu_set_waiti_conf(void *opaque, int n, int level)
-{
-    ESP32P4CPU *cpu = opaque;
-    bool force_on = cpu->waiti_force_on;
-    uint8_t delay = cpu->waiti_delay;
-
-    if (n == 0) {
-        force_on = level != 0;
-    } else {
-        delay = deposit32(delay, n - 1, 1, level != 0);
-    }
-    esp32p4_counters_set_waiti(cpu, force_on, delay);
-}
-
 /*
  * The core has left the code it was executing: if it now waits in WFI,
  * its counters learn when it started to.
@@ -1305,10 +1286,6 @@ static void esp32p4_hp_cpu_init(Object *obj)
     qdev_init_gpio_in_named(dev, esp32p4_hp_cpu_set_gpio_in,
                             ESP32P4_CPU_GPIO_IN, ESP32P4_CPU_GPIOS);
     qdev_init_gpio_out_named(dev, &cpu->m_mode_irq, ESP32P4_CPU_M_MODE, 1);
-    qdev_init_gpio_in_named(dev, esp32p4_hp_cpu_set_waiti_conf,
-                            ESP32P4_CPU_WAITI_CONF,
-                            ESP32P4_CPU_WAITI_CONF_LINES);
-    cpu->waiti_force_on = true;
 #endif
     qdev_init_gpio_in_named(DEVICE(obj), esp32p4_cpu_set_wakeup,
                             ESP32P4_CPU_WAKEUP, 1);
