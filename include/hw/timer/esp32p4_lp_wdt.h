@@ -40,7 +40,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPWdtState, ESP32P4_LP_WDT)
  *     RTC watchdog pauses if RTC_WDT_PAUSE_IN_SLP is set; for the PMU.
  *   - Named GPIO input "swd-reset-en": high while LP_SYSTEM's FIB control
  *     lets the super watchdog reset the system (LP_FIB_SEL bit 2 clear and
- *     DIG_FIB bit 2 set, or the analog state ANA_FIB bit 2); for LP_SYS.
+ *     DIG_FIB bit 2 set, or LP_FIB_SEL bit 2 set and the analog state
+ *     ANA_FIB bit 2 set, as from reset); for LP_SYS. High, as the analog
+ *     state has it, until LP_SYS drives it.
  *   - Named GPIO output "cpu-reset": per HP core, a pulse of the RTC
  *     watchdog's CPU reset of it, to the reset and clock control's
  *     "rwdt-core-reset".
@@ -91,5 +93,13 @@ struct ESP32P4LPWdtState {
     bool sleep;
     bool swd_reset_en;
 };
+
+/*
+ * A write of SWD_RST_FLAG_CLR, which needs no key: the boot ROM's main()
+ * makes it on HP core 0 as it boots after any reset (all but a light
+ * sleep's wakeup), and the machine makes it for a program -kernel starts
+ * in the ROM's place.
+ */
+void esp32p4_lp_wdt_swd_rst_flag_clr(ESP32P4LPWdtState *s);
 
 #endif

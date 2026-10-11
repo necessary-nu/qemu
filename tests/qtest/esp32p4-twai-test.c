@@ -16,6 +16,10 @@
 #include "libqtest.h"
 
 #define TWAI(n)             (0x500d7000u + 0x1000u * (n))
+#define LP_WDT_SWD_CONFIG   0x5011601cu
+#define LP_WDT_SWD_WPROTECT 0x50116020u
+#define LP_WDT_SWD_DISABLE  (1u << 30)
+#define LP_WDT_WKEY         0x50d83aa1u
 #define MODE                0x00
 #define CMD                 0x04
 #define STATUS              0x08
@@ -1182,9 +1186,13 @@ static void test_timestamp(void)
 
     /*
      * Strapped for download boot: the flash boot watchdogs, which would
-     * reset the chip within seconds, do not run.
+     * reset the chip within seconds, do not run. The super watchdog,
+     * which would reset it within a second, is disabled.
      */
     two_nodes_with(",strap-mode=0");
+    qtest_writel(qts, LP_WDT_SWD_WPROTECT, LP_WDT_WKEY);
+    qtest_writel(qts, LP_WDT_SWD_CONFIG,
+                 qtest_readl(qts, LP_WDT_SWD_CONFIG) | LP_WDT_SWD_DISABLE);
     wr(1, TS_PRESCALER, 39);
     t_en = now;
     wr(1, TS_CFG, 1);

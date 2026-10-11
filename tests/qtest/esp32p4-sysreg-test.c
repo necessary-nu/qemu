@@ -9,7 +9,8 @@
  * and what they drive: the HP2LP interrupt groups (seen in their status
  * registers and on the "hp-intr" and "hp-wakeup" outputs), the pads'
  * holds (seen on the GPIO block's "pad" outputs), the memories'
- * initialisation, the FIB control of the super watchdog's reset, the LP
+ * initialisation, the FIB control of the brownout detector and the super
+ * watchdog's reset, the LP
  * interrupts (in the interrupt matrix's status of source 19) and the
  * software system reset, an HP core reset with cause 0x03 that LP_SYSTEM
  * itself lives through.
@@ -17,6 +18,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qobject/qdict.h"
 
 #define HP_SYS              0x500e5000
 #define HP_SYS_PATH         "/machine/hp-sys"
@@ -77,10 +79,14 @@
 #define LP_PAD_RTC_HOLD_CTRL0 (LP_SYS + 0x1c4)
 #define LP_DISCHARGE        (LP_SYS + 0x200)
 
+#define LP_ANA_PATH         "/machine/lp-ana"
+
 #define SYS_CTRL_RESET      0x1fffc7f8u
 #define SYS_SW_RST          (1u << 1)
-#define DIG_FIB_SWD         (1u << 5)
-#define LP_FIB_SEL_SWD      (1u << 23)
+#define DIG_FIB(b)          (1u << (3 + (b)))
+#define LP_FIB_SEL(b)       (1u << (21 + (b)))
+#define FIB_BOD             1
+#define FIB_SWD             2
 #define ETM_WAKEUP_FLAG_CLR (1u << 29)
 #define ETM_WAKEUP_FLAG     (1u << 30)
 #define LP_INT_ETM_TASK_ULP (1u << 5)
@@ -440,24 +446,65 @@ static void test_lp_rng(void)
 }
 
 /*
- * The FIB control of the super watchdog's reset: off from reset, the
- * selected FIB bit being set; on with DIG_FIB's bit clear and selected;
- * the analog state's again once LP_FIB_SEL's bit clears.
+ * The FIB control (TRM 21.2.2.2) of FIB bit @bit's enable, seen on output
+ * @out: from reset LP_FIB_SEL picks the analog state ANA_FIB, whose bit,
+ * set, enables; picked instead, DIG_FIB's bit enables while set; the
+ * other FIB bit's choice changes nothing.
  */
-/* [spec:nuos:req:emu.esp32p4.debug/test] */
-static void test_lp_fib(void)
+static void lp_fib_out(const char *out, int bit, int other)
 {
     QTestState *qts = start();
 
-    qtest_irq_intercept_out_named(qts, LP_SYS_PATH, "swd-reset-en");
-    g_assert_false(qtest_get_irq(qts, 0));
-    qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET & ~DIG_FIB_SWD);
+    qtest_irq_intercept_out_named(qts, LP_SYS_PATH, out);
+    qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET);
+    g_assert_true(qtest_get_irq(qts, 0));
+    qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET & ~LP_FIB_SEL(bit));
     g_assert_true(qtest_get_irq(qts, 0));
     qtest_writel(qts, LP_SYS_CTRL,
-                 SYS_CTRL_RESET & ~(DIG_FIB_SWD | LP_FIB_SEL_SWD));
+                 SYS_CTRL_RESET & ~(LP_FIB_SEL(bit) | DIG_FIB(bit)));
     g_assert_false(qtest_get_irq(qts, 0));
-    qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET);
-    g_assert_false(qtest_get_irq(qts, 0));
+    qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET & ~DIG_FIB(bit));
+    g_assert_true(qtest_get_irq(qts, 0));
+    qtest_writel(qts, LP_SYS_CTRL,
+                 SYS_CTRL_RESET & ~(LP_FIB_SEL(other) | DIG_FIB(other)));
+    g_assert_true(qtest_get_irq(qts, 0));
+    /* ESP-IDF's start-up LP_FIB_SEL, 0xEF, leaves both to the analog. */
+    qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET & ~LP_FIB_SEL(4));
+    g_assert_true(qtest_get_irq(qts, 0));
+    qtest_quit(qts);
+}
+
+/* [spec:nuos:req:emu.esp32p4.debug/test] */
+static void test_lp_fib(void)
+{
+    lp_fib_out("swd-reset-en", FIB_SWD, FIB_BOD);
+    lp_fib_out("bod-reset-en", FIB_BOD, FIB_SWD);
+}
+
+/*
+ * The FIB control's brownout detector enable reaches the detector: with
+ * DIG_FIB's bit picked and clear, VDD_ANA below its 2.4 V threshold makes
+ * no brown-out; set again, it makes one, whose mode 1 reset (enabled by
+ * the analog default) resets the system with cause 0x0F.
+ */
+/* [spec:nuos:req:emu.esp32p4.debug/test] */
+static void test_lp_fib_bod(void)
+{
+    QTestState *qts = start();
+    QDict *r;
+
+    qtest_writel(qts, LP_SYS_CTRL,
+                 SYS_CTRL_RESET & ~(LP_FIB_SEL(FIB_BOD) | DIG_FIB(FIB_BOD)));
+    qtest_writel(qts, RESET_CAUSE, CAUSE_CLEAR_ALL);
+    r = qtest_qmp(qts, "{ 'execute': 'qom-set', 'arguments': { 'path': %s, "
+                  "'property': 'vdda-mv', 'value': 2300 } }", LP_ANA_PATH);
+    g_assert(qdict_haskey(r, "return"));
+    qobject_unref(r);
+    qtest_clock_step(qts, 10000);
+    g_assert_cmphex(LP_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0);
+    qtest_writel(qts, LP_SYS_CTRL, SYS_CTRL_RESET & ~LP_FIB_SEL(FIB_BOD));
+    qtest_clock_step(qts, 1000);
+    g_assert_cmphex(LP_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0x0f);
     qtest_quit(qts);
 }
 
@@ -547,6 +594,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/sysreg/lp/reset-values", test_lp_reset_values);
     qtest_add_func("esp32p4/sysreg/lp/rng", test_lp_rng);
     qtest_add_func("esp32p4/sysreg/lp/fib", test_lp_fib);
+    qtest_add_func("esp32p4/sysreg/lp/fib-bod", test_lp_fib_bod);
     qtest_add_func("esp32p4/sysreg/lp/interrupts", test_lp_interrupts);
     qtest_add_func("esp32p4/sysreg/lp/sw-reset", test_sw_reset);
 
