@@ -50,9 +50,9 @@ static uint64_t esp32_timg_wdt_get_count(Esp32TimgWdtState *ws,
 #define TIMG_DEBUG_LOG(...) // qemu_log(__VA_ARGS__)
 
 /*
- * A timer callback that runs this far after its deadline, as the host
- * can make it without icount, restarts what it times from the present
- * rather than replaying every period it missed.
+ * A watchdog stage callback that runs this far after its deadline, as the
+ * host can make it without icount, starts the next stage from the present
+ * rather than replaying every stage it missed.
  */
 #define TIMG_CATCHUP_NS (10 * SCALE_MS)
 
@@ -591,8 +591,9 @@ static void esp32_timg_cal_clk_update(void *opaque, ClockEvent event)
 /*
  * [spec:nuos:req:emu.esp32.clock-gating]
  * When the alarm of timer @ts fell due: the time the counter reached
- * ALARM, which the QEMU timer's callback, running late, may be past.
- * ns_base is when the alarm was armed from.
+ * ALARM, which the QEMU timer's callback, running late, may be past
+ * however far. An alarm fires once (ALARM_EN clears), so there are no
+ * periods to replay. ns_base is when the alarm was armed from.
  */
 static uint64_t esp32_timg_timer_alarm_ns(Esp32TimgTimerState *ts,
                                           uint64_t ns_now)
@@ -606,10 +607,7 @@ static uint64_t esp32_timg_timer_alarm_ns(Esp32TimgTimerState *ts,
         return ns_now;
     }
     due = ts->ns_base + esp32_timg_timer_count_to_ns(ts, count_to_alarm);
-    if (due > ns_now || ns_now - due > TIMG_CATCHUP_NS) {
-        return ns_now;
-    }
-    return due;
+    return MIN(due, ns_now);
 }
 
 static void esp32_timg_timer_cb(void *opaque)
