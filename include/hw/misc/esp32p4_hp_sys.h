@@ -95,6 +95,9 @@ enum {
  *   PHY_SUSPEND_FORCE_EN, PHY_RSTN, PHY_RESET_FORCE_EN, PHY_PLL_FORCE_EN,
  *   PHY_PLL_EN and OTG_SUSPENDM (bits 15 to 21), to the USB OTG HS UTMI+
  *   PHY's "sys-ctrl" inputs.
+ * ESP32P4_HP_SYS_MEM_PD: RSA_PD_CTRL's and ECC_PD_CTRL's power-down of
+ *   the RSA and ECC accelerators' memories, in that order, high while
+ *   down, to their "mem-pd" inputs.
  *
  * Named GPIO inputs
  * =================
@@ -132,6 +135,8 @@ enum {
 #define ESP32P4_HP_SYS_GMAC_SBD_FLOWCTRL "gmac-sbd-flowctrl"
 #define ESP32P4_HP_SYS_USBOTG20_CTRL    "usbotg20-ctrl"
 #define ESP32P4_HP_SYS_USBOTG20_CTRL_LINES 7
+#define ESP32P4_HP_SYS_MEM_PD           "mem-pd"
+#define ESP32P4_HP_SYS_MEM_PD_LINES     2
 #define ESP32P4_HP_SYS_HP_SOURCE        "hp-source"
 #define ESP32P4_HP_SYS_CORE_STALLED     "core-stalled"
 #define ESP32P4_HP_SYS_DMACTIVE_LPCORE  "dmactive-lpcore"
@@ -185,6 +190,7 @@ struct ESP32P4HPSysState {
     qemu_irq gmac_sbd_flowctrl;
     qemu_irq usbotg20_ctrl_out[ESP32P4_HP_SYS_USBOTG20_CTRL_LINES];
     qemu_irq bs_peri_sel[ESP32P4_HP_SYS_BS_PERI_SEL_LINES];
+    qemu_irq mem_pd[ESP32P4_HP_SYS_MEM_PD_LINES];
     /* HP_SYSREG_INTR, sysbus IRQ 0. */
     qemu_irq sysreg_irq;
 };

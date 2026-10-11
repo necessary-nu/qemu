@@ -401,8 +401,11 @@ static void test_lp_reset_values(void)
         g_assert_cmphex(qtest_readl(qts, regs[i].addr), ==, regs[i].reset);
     }
 
-    /* The LP core sits at its reset vector, having taken no trap. */
-    g_assert_cmphex(qtest_readl(qts, LP_CPU_DBG_PC), ==, LP_ROM_BASE);
+    /*
+     * The LP core sits at its reset vector, 0x80 into the vector table at
+     * its boot address, having taken no trap.
+     */
+    g_assert_cmphex(qtest_readl(qts, LP_CPU_DBG_PC), ==, LP_ROM_BASE + 0x80);
     g_assert_cmphex(qtest_readl(qts, LP_CPU_EXC_PC), ==, 0);
 
     /* LP_CORE_BOOT_ADDR is read-write; ANA_FIB is read-only. */

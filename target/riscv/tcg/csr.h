@@ -88,7 +88,7 @@ extern const RISCVCSR th_csr_list[];
 extern const RISCVCSR mips_csr_list[];
 
 /* Implemented in esp32p4_csr.c */
-extern const RISCVCSR esp32p4_hp_csr_list[];
+extern const RISCVCSR esp32p4_csr_list[];
 
 /* PMP CSRs, defined in pmp.c */
 void pmpcfg_csr_write(CPURISCVState *env, uint32_t reg_index,

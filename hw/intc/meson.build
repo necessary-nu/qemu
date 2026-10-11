@@ -66,7 +66,8 @@ specific_ss.add(when: 'CONFIG_SH_INTC', if_true: files('sh_intc.c'))
 specific_ss.add(when: 'CONFIG_RISCV_ACLINT', if_true: files('riscv_aclint.c'))
 specific_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_clic.c',
                                                     'esp32p4_clint.c'))
-system_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_intmatrix.c'))
+system_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_intmatrix.c',
+                                                  'esp32p4_lp_intr.c'))
 specific_ss.add(when: 'CONFIG_RISCV_APLIC', if_true: files('riscv_aplic.c'))
 specific_ss.add(when: 'CONFIG_RISCV_IMSIC', if_true: files('riscv_imsic.c'))
 specific_ss.add(when: 'CONFIG_SIFIVE_PLIC', if_true: files('sifive_plic.c'))

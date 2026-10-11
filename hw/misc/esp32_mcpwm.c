@@ -1,12 +1,14 @@
 /*
- * ESP32 motor control PWM (MCPWM)
+ * ESP32 and ESP32-P4 motor control PWM (MCPWM)
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * Reference: ESP32 TRM, "Motor Control PWM (MCPWM)", and ESP-IDF's
- * soc/mcpwm_reg.h, soc/mcpwm_struct.h and hal/mcpwm_ll.h.
+ * soc/mcpwm_reg.h, soc/mcpwm_struct.h and hal/mcpwm_ll.h; for the
+ * ESP32-P4, its TRM (v3.x silicon) chapter 59 and ESP-IDF's v3
+ * mcpwm_reg.h and mcpwm_struct.h, and hal/mcpwm_ll.h.
  *
  * PWM_clk is PLL_F160M_CLK divided by CLK_PRESCALE + 1; each PWM timer
  * counts on PT_clk, PWM_clk divided by its own prescale. The three timers
@@ -37,13 +39,50 @@
  * changes. The input synchronisers in the GPIO matrix and the fault and
  * capture sampling are not modelled: an input takes effect in the PWM_clk
  * or APB_CLK cycle in which it changes.
+ *
+ * Times are those of the signal lines (hw/gpio/esp32_line.h): an output
+ * edge is stamped with the moment it is due, though the timer's callback
+ * may run after it (the callback does all that has fallen due, each at
+ * its time, and skips to shortly before the present if more than 10 ms
+ * behind), and an input acts at the time its change is stamped with, so
+ * that a capture of an edge another block drives through the GPIO matrix
+ * reads the capture timer at that edge. Whenever software samples the
+ * pads the outputs are brought to their exact levels; a register access
+ * first brings every other source of line changes up to the present, and
+ * acts at the moment it began.
+ *
+ * The ESP32-P4's block (TRM chapter 59) is this one with:
+ *   - Its clock, MCPWMn_CLK, from HP_SYS_CLKRST's source mux and divider:
+ *     CLK_PRESCALE divides it into PWM_clk (TRM 59.5, "PWM_clk = 6.25 ns
+ *     * (PWM_CLK_PRESCALE + 1)" for the 160 MHz PLL_F160M_CLK), and the
+ *     capture timer counts it ("the same as MCPWM's core clock", as
+ *     ESP-IDF's SOC_MCPWM_CAPTURE_CLK_FROM_GROUP has it), not APB_CLK.
+ *   - Event comparators: OPn_TSTMP_E1 and E2, without shadows, give the
+ *     ETM events OPn_TEE1 and OPn_TEE2 as the count of operator n's timer
+ *     equals them, as TSTMP_A gives TEA; they act on nothing else.
+ *   - ETM events (EVT_EN, EVT_EN2): each of the 30 interrupt conditions,
+ *     as an event of its own each time it happens, and TEE1/TEE2, pulsed
+ *     at the time they happen. A timer fires for each enabled event, as
+ *     for an interrupt.
+ *   - ETM tasks (TASK_EN), as TRM table 59.3-8 gives them: CMPRn_A_UP and
+ *     _B_UP transfer operator n's A or B shadow, if one is pending, as a
+ *     forced update does; GEN_STOP stops every running timer where it
+ *     stands, each raising its stop interrupt and event, the outputs
+ *     holding their levels, until software starts it again; TIMERn_SYNC
+ *     is timer n's software sync; TIMERn_PERIOD_UP transfers its period
+ *     shadow; TZn_OST trips operator n's one-shot fault handling and
+ *     CLRn_OST clears it, with no TZ_SW_OST enable needed; CAPn is
+ *     capture channel n's software capture.
+ *   - CLK and VERSION at 0x144 and 0x148, VERSION resetting to 0x2212290.
  */
 
 #include "qemu/osdep.h"
+#include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32_mcpwm.h"
 #include "migration/vmstate.h"
 
@@ -85,6 +124,14 @@
 #define A_INT_CLR               0x11c
 #define A_CLK                   0x120
 #define A_VERSION               0x124
+/* The ESP32-P4's: the ETM's enables and event comparators, CLK, VERSION */
+#define A_P4_EVT_EN             0x120
+#define A_P4_TASK_EN            0x124
+#define A_P4_EVT_EN2            0x128
+#define A_P4_OP_TSTMP_E         0x12c
+#define A_P4_OP_TSTMP_E_END     0x144
+#define A_P4_CLK                0x144
+#define A_P4_VERSION            0x148
 
 #define ESP32_MCPWM_REGION_SIZE 0x1000
 
@@ -209,6 +256,37 @@ enum {
 #define INT_CAP(n)              (1u << (27 + (n)))
 #define VERSION_MASK            0x0fffffffu
 #define VERSION_RESET           0x02107230u
+#define P4_VERSION_RESET        0x02212290u
+#define EVT_EN_MASK             0x3fffffffu
+#define EVT_EN2_MASK            0x3fu
+#define TASK_EN_MASK            0x3fffffu
+#define TSTMP_E_MASK            0xffffu
+
+/*
+ * The ESP32-P4's ETM events, as the lines of "etm-event": EVT_EN's bits,
+ * then EVT_EN2's.
+ */
+#define ETM_TIMER_STOP(i)       (i)
+#define ETM_TIMER_TEZ(i)        (3 + (i))
+#define ETM_TIMER_TEP(i)        (6 + (i))
+#define ETM_OP_TEA(k)           (9 + (k))
+#define ETM_OP_TEB(k)           (12 + (k))
+#define ETM_FAULT(n)            (15 + (n))
+#define ETM_FAULT_CLR(n)        (18 + (n))
+#define ETM_FH_CBC(k)           (21 + (k))
+#define ETM_FH_OST(k)           (24 + (k))
+#define ETM_CAP(n)              (27 + (n))
+#define ETM_OP_TEE(k, e)        (30 + 3 * (e) + (k))
+
+/* Its ETM tasks, as the lines of "etm-task" and TASK_EN's bits. */
+#define TASK_CMPR_A_UP(k)       (k)
+#define TASK_CMPR_B_UP(k)       (3 + (k))
+#define TASK_GEN_STOP           6
+#define TASK_TIMER_SYNC(i)      (7 + (i))
+#define TASK_TIMER_PERIOD_UP(i) (10 + (i))
+#define TASK_TZ_OST(k)          (13 + (k))
+#define TASK_CLR_OST(k)         (16 + (k))
+#define TASK_CAP(n)             (19 + (n))
 
 /* Timing events seen by an operator */
 #define EV_TEZ                  (1u << 0)
@@ -249,6 +327,8 @@ enum {
 #define SNAP_WINDOW_MAX         (1u << 20)
 /* The most overdue timer callbacks an access runs before its own work */
 #define MAX_LATE_CALLBACKS      64
+/* How far behind its due time the timer's callback catches up edge by edge */
+#define CATCHUP_NS              (10 * 1000 * 1000)
 /* The most events a look-ahead run takes before giving up for now. */
 #define WATCH_MAX_EVENTS        65536
 
@@ -256,6 +336,7 @@ enum {
 typedef struct McpwmWatch {
     const uint8_t *driven;      /* output levels as driven */
     bool irq;                   /* whether a rising interrupt counts */
+    uint64_t etm;               /* the ETM events that count */
     uint64_t floor;             /* output changes count from this cycle */
 } McpwmWatch;
 
@@ -263,8 +344,34 @@ typedef enum McpwmSeen {
     SEEN_NOTHING,               /* nothing visible will ever happen */
     SEEN_HORIZON,               /* nothing visible yet; look again later */
     SEEN_OUTPUT,
-    SEEN_IRQ,
+    SEEN_IRQ,                   /* a rising interrupt or an ETM event */
 } McpwmSeen;
+
+/*
+ * The ESP32-P4's ETM event etm_line has happened at the current cycle.
+ * The groups of a run each run from its start, so the latest event of
+ * any group is the one whose cycle is kept.
+ */
+static void core_etm_fire(Esp32McpwmCore *c, int etm_line)
+{
+    c->etm_fired |= 1ull << etm_line;
+    c->etm_cycle = MAX(c->etm_cycle, c->now);
+}
+
+/*
+ * Interrupt condition int_bit, which is also the ESP32-P4's ETM event
+ * etm_line, has happened at the current cycle.
+ */
+static void core_raise(Esp32McpwmCore *c, uint32_t int_bit, int etm_line)
+{
+    c->int_raw |= int_bit;
+    core_etm_fire(c, etm_line);
+}
+
+static uint64_t core_etm_enabled(const Esp32McpwmCore *c)
+{
+    return c->evt_en | ((uint64_t)c->evt_en2 << ETM_OP_TEE(0, 0));
+}
 
 /* Timers */
 
@@ -419,6 +526,17 @@ static bool op_timer_down(const Esp32McpwmCore *c, int k)
 static bool op_cmp_live(const Esp32McpwmCore *c, int i, uint32_t v)
 {
     return v <= c->timer[i].period;
+}
+
+/*
+ * Whether operator k's event comparator e (E1, E2), on timer i, produces
+ * its ETM event, TEE1 or TEE2. It acts on nothing else, so while the
+ * event is disabled it is not looked for.
+ */
+static bool op_tee_live(const Esp32McpwmCore *c, int k, int i, int e)
+{
+    return (c->evt_en2 & (1u << (ETM_OP_TEE(k, e) - ETM_OP_TEE(0, 0)))) &&
+           op_cmp_live(c, i, c->op[k].tstmp_e[e]);
 }
 
 static bool op_update_enabled(const Esp32McpwmCore *c, int k)
@@ -612,11 +730,11 @@ static void fh_trip(Esp32McpwmCore *c, int k, bool sw_ost, bool sw_cbc)
     cbc |= sw_cbc && (o->fh_cfg0 & FH_SW_CBC);
     if (ost && !o->ost_on) {
         o->ost_on = true;
-        c->int_raw |= INT_FH_OST(k);
+        core_raise(c, INT_FH_OST(k), ETM_FH_OST(k));
     }
     if (cbc && !o->cbc_on) {
         o->cbc_on = true;
-        c->int_raw |= INT_FH_CBC(k);
+        core_raise(c, INT_FH_CBC(k), ETM_FH_CBC(k));
     }
 }
 
@@ -629,11 +747,16 @@ static void op_timer_events(Esp32McpwmCore *c, int k, int i, uint32_t ev)
 
     if (t->value == o->cmp[0] && op_cmp_live(c, i, o->cmp[0])) {
         ev |= EV_TEA;
-        c->int_raw |= INT_OP_TEA(k);
+        core_raise(c, INT_OP_TEA(k), ETM_OP_TEA(k));
     }
     if (t->value == o->cmp[1] && op_cmp_live(c, i, o->cmp[1])) {
         ev |= EV_TEB;
-        c->int_raw |= INT_OP_TEB(k);
+        core_raise(c, INT_OP_TEB(k), ETM_OP_TEB(k));
+    }
+    for (int e = 0; e < 2; e++) {
+        if (op_tee_live(c, k, i, e) && t->value == o->tstmp_e[e]) {
+            core_etm_fire(c, ETM_OP_TEE(k, e));
+        }
     }
     if (ev & (EV_TEZ | EV_TEP | EV_TEA | EV_TEB)) {
         op_generate(o, ev, t->down);
@@ -758,11 +881,11 @@ static void timer_events(Esp32McpwmCore *c, int i)
 
     if (t->value == 0) {
         ev |= EV_TEZ;
-        c->int_raw |= INT_TIMER_TEZ(i);
+        core_raise(c, INT_TIMER_TEZ(i), ETM_TIMER_TEZ(i));
     }
     if (t->value == t->period) {
         ev |= EV_TEP;
-        c->int_raw |= INT_TIMER_TEP(i);
+        core_raise(c, INT_TIMER_TEP(i), ETM_TIMER_TEP(i));
     }
     for (int k = 0; k < ESP32_MCPWM_OPS; k++) {
         if (op_timer(c, k) == i) {
@@ -778,7 +901,7 @@ static void timer_events(Esp32McpwmCore *c, int i)
          (ev & EV_TEP))) {
         /* The one-shot starts read back as the stopped state they reach. */
         t->running = false;
-        c->int_raw |= INT_TIMER_STOP(i);
+        core_raise(c, INT_TIMER_STOP(i), ETM_TIMER_STOP(i));
         if (start == START_ONCE_TEZ) {
             t->cfg1 = (t->cfg1 & ~7u) | START_STOP_TEZ;
         } else if (start == START_ONCE_TEP) {
@@ -1082,6 +1205,9 @@ static uint64_t timer_next(const Esp32McpwmCore *c, int i)
             if (op_cmp_live(c, i, o->cmp[cmp])) {
                 k = MIN(k, timer_ticks_to(t, o->cmp[cmp]));
             }
+            if (op_tee_live(c, n, i, cmp)) {
+                k = MIN(k, timer_ticks_to(t, o->tstmp_e[cmp]));
+            }
         }
     }
     if (k == NO_EVENT) {
@@ -1181,6 +1307,8 @@ static void core_normalise(Esp32McpwmCore *n, const Esp32McpwmCore *c,
     n->now = 0;
     n->cap_sync_hit = false;
     n->cap_sync = 0;
+    n->etm_fired = 0;
+    n->etm_cycle = 0;
     for (int i = 0; i < ESP32_MCPWM_TIMERS; i++) {
         if (!(group & (1u << i))) {
             memset(&n->timer[i], 0, sizeof(n->timer[i]));
@@ -1292,7 +1420,8 @@ static McpwmSeen core_run_group(Esp32McpwmCore *c, uint64_t target,
         events++;
 
         if (w) {
-            if (w->irq && (c->int_raw & c->int_ena & ~raw0)) {
+            if ((w->irq && (c->int_raw & c->int_ena & ~raw0)) ||
+                (c->etm_fired & w->etm)) {
                 return SEEN_IRQ;
             }
             if (c->now >= w->floor &&
@@ -1382,6 +1511,7 @@ static McpwmSeen core_look_ahead(const Esp32McpwmCore *c, const McpwmWatch *w,
         McpwmSeen seen;
 
         memcpy(ahead, c, sizeof(*ahead));
+        ahead->etm_fired = 0;
         seen = core_run_group(ahead, NO_EVENT - 1, w, groups[g]);
         if (seen == SEEN_NOTHING) {
             continue;
@@ -1406,10 +1536,10 @@ static void core_faults(Esp32McpwmCore *c)
         }
         c->fault_ev[n] = ev;
         if (!ev) {
-            c->int_raw |= INT_FAULT_CLR(n);
+            core_raise(c, INT_FAULT_CLR(n), ETM_FAULT_CLR(n));
             continue;
         }
-        c->int_raw |= INT_FAULT(n);
+        core_raise(c, INT_FAULT(n), ETM_FAULT(n));
         /* The generators' T0/T1 events selected from this fault */
         for (int k = 0; k < ESP32_MCPWM_OPS; k++) {
             Esp32McpwmOp *o = &c->op[k];
@@ -1445,7 +1575,7 @@ static uint64_t mcpwm_cycle_at(Esp32McpwmState *s, int64_t ns)
         return s->base_cycle;
     }
     return s->base_cycle +
-           clock_ns_to_ticks(s->f160m, ns - s->base_ns) / clk_div(s);
+           clock_ns_to_ticks(s->core_clk, ns - s->base_ns) / clk_div(s);
 }
 
 /* The first virtual time at which PWM_clk has reached `cycle`. */
@@ -1460,23 +1590,35 @@ static int64_t mcpwm_ns_at(Esp32McpwmState *s, uint64_t cycle)
         return INT64_MAX / 2;
     }
     ticks = (cycle - s->base_cycle) * clk_div(s);
-    ns = clock_ticks_to_ns(s->f160m, ticks);
-    while (clock_ns_to_ticks(s->f160m, ns) < ticks) {
+    ns = clock_ticks_to_ns(s->core_clk, ticks);
+    while (clock_ns_to_ticks(s->core_clk, ns) < ticks) {
         ns++;
     }
     return s->base_ns + MIN(ns, (uint64_t)INT64_MAX / 2);
 }
 
 /*
- * The present. While the timer's callback runs it is the moment the timer
- * was due: the callback itself can run a little late, and the edges it
- * drives, and anything they cause in this block (a capture of its own
- * output through the GPIO matrix), belong to the due time. Time never
- * goes back from a moment the block has already acted at.
+ * The present: the time of the line change being propagated, if this
+ * block acts on one, so that an input acts at the moment its edge is
+ * stamped with; or that of the register access under way.
+ */
+static int64_t mcpwm_present(Esp32McpwmState *s)
+{
+    return s->accessing ? s->access_ns : esp32_line_time();
+}
+
+/*
+ * The moment the block acts at: the present, but while the timer's
+ * callback runs the moment the timer was due: the callback itself can run
+ * a little late, and the edges it drives, and anything they cause in this
+ * block (a capture of its own output through the GPIO matrix), belong to
+ * the due time. Time never goes back from a moment the block has already
+ * acted at.
  */
 static int64_t mcpwm_now(Esp32McpwmState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = mcpwm_present(s);
+
 
     if (s->in_timer_cb) {
         now = MIN(s->due_ns, now);
@@ -1485,13 +1627,19 @@ static int64_t mcpwm_now(Esp32McpwmState *s)
     return s->seen_ns;
 }
 
-static uint32_t cap_timer_now(Esp32McpwmState *s)
+/* The capture timer at time t, no earlier than its anchor. */
+static uint32_t cap_timer_at(Esp32McpwmState *s, int64_t t)
 {
-    if (!(s->core.cap_timer_cfg & CAP_TIMER_EN)) {
+    if (!(s->core.cap_timer_cfg & CAP_TIMER_EN) || t <= s->cap_anchor_ns) {
         return s->cap_anchor;
     }
-    return s->cap_anchor + (uint32_t)clock_ns_to_ticks(s->apb, mcpwm_now(s) -
-                                                       s->cap_anchor_ns);
+    return s->cap_anchor + (uint32_t)clock_ns_to_ticks(s->cap_clk,
+                                                       t - s->cap_anchor_ns);
+}
+
+static uint32_t cap_timer_now(Esp32McpwmState *s)
+{
+    return cap_timer_at(s, mcpwm_now(s));
 }
 
 static void cap_reanchor(Esp32McpwmState *s)
@@ -1518,12 +1666,40 @@ static void mcpwm_cap_sync_hit(Esp32McpwmState *s)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * [spec:nuos:req:emu.esp32p4.etm]
+ * Pulse the enabled ETM events that have happened, stamped with time
+ * when, in the order of their IDs. A task this answers in this block
+ * comes back before this returns, and finds them cleared.
+ */
+static void mcpwm_etm_emit(Esp32McpwmState *s, int64_t when)
+{
+    Esp32McpwmCore *c = &s->core;
+    uint64_t fired = c->etm_fired & core_etm_enabled(c);
+
+    c->etm_fired = 0;
+    c->etm_cycle = 0;
+    if (!s->p4) {
+        return;
+    }
+    while (fired) {
+        int n = ctz64(fired);
+
+        fired &= fired - 1;
+        esp32_line_set_at(s->etm_event[n], 1, when);
+        esp32_line_set_at(s->etm_event[n], 0, when);
+    }
+}
+
 static void mcpwm_timer_cb(void *opaque);
 
 /*
  * Run the core to the present. The timer's work that is already due is
  * done first, at its due time, so that an access racing a late callback
- * sees the edges driven when they happened.
+ * sees the edges driven when they happened. The run's ETM events go out
+ * at the time they happened: the timer fires for each, so that a run
+ * meets at most one cycle with any.
  */
 static void mcpwm_sync(Esp32McpwmState *s)
 {
@@ -1531,8 +1707,7 @@ static void mcpwm_sync(Esp32McpwmState *s)
     uint64_t target;
 
     for (int n = 0; n < MAX_LATE_CALLBACKS && !s->in_timer_cb &&
-         timer_pending(s->timer) &&
-         s->due_ns <= qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL); n++) {
+         timer_pending(s->timer) && s->due_ns <= mcpwm_present(s); n++) {
         timer_del(s->timer);
         mcpwm_timer_cb(s);
     }
@@ -1542,6 +1717,9 @@ static void mcpwm_sync(Esp32McpwmState *s)
         core_run(c, target);
     }
     mcpwm_cap_sync_hit(s);
+    if (c->etm_fired) {
+        mcpwm_etm_emit(s, mcpwm_ns_at(s, c->etm_cycle));
+    }
 }
 
 static void mcpwm_schedule(Esp32McpwmState *s)
@@ -1552,12 +1730,13 @@ static void mcpwm_schedule(Esp32McpwmState *s)
     uint64_t when;
     int64_t due;
 
-    if (!clock_is_enabled(s->f160m)) {
+    if (!clock_is_enabled(s->core_clk)) {
         timer_del(s->timer);
         return;
     }
     w.driven = s->out_level;
     w.irq = !s->irq_level;
+    w.etm = s->p4 ? core_etm_enabled(&s->core) : 0;
     w.floor = MAX(mcpwm_cycle_at(s, floor_ns), s->core.now);
     seen = core_look_ahead(&s->core, &w, &when);
     if (seen == SEEN_NOTHING) {
@@ -1572,7 +1751,10 @@ static void mcpwm_schedule(Esp32McpwmState *s)
     timer_mod(s->timer, due);
 }
 
-/* Drive the outputs and the interrupt from the core's state. */
+/*
+ * Drive the outputs and the interrupt from the core's state, and pulse
+ * the ETM events of what has just been done.
+ */
 static void mcpwm_update(Esp32McpwmState *s)
 {
     Esp32McpwmCore *c = &s->core;
@@ -1597,8 +1779,11 @@ static void mcpwm_update(Esp32McpwmState *s)
             if (level != s->out_level[n]) {
                 s->out_level[n] = level;
                 s->last_out_ns = mcpwm_now(s);
-                qemu_set_irq(s->out[n], level);
+                esp32_line_set_at(s->out[n], level, s->last_out_ns);
             }
+        }
+        if (c->etm_fired) {
+            mcpwm_etm_emit(s, mcpwm_now(s));
         }
         irq_level = !!(c->int_raw & c->int_ena);
         if (irq_level != s->irq_level) {
@@ -1610,23 +1795,90 @@ static void mcpwm_update(Esp32McpwmState *s)
     mcpwm_schedule(s);
 }
 
-static void mcpwm_timer_cb(void *opaque)
+static void mcpwm_timer_fire(Esp32McpwmState *s)
 {
-    Esp32McpwmState *s = opaque;
-
     s->in_timer_cb = true;
     mcpwm_sync(s);
     mcpwm_update(s);
     s->in_timer_cb = false;
 }
 
+/*
+ * The timer's callback does all the work due up to the moment it runs,
+ * each piece at its own due time, so that it leaves the timer set after
+ * that moment: callbacks each due before the moment they are run at would
+ * keep the main loop running timers. Far behind (the host slower than the
+ * edges it is to drive) it skips to shortly before that moment, the
+ * outputs taking their levels there.
+ */
+static void mcpwm_timer_cb(void *opaque)
+{
+    Esp32McpwmState *s = opaque;
+    int64_t limit = mcpwm_present(s);
+
+    if (s->due_ns < limit - CATCHUP_NS) {
+        s->due_ns = limit - CATCHUP_NS;
+    }
+    for (;;) {
+        mcpwm_timer_fire(s);
+        if (!timer_pending(s->timer) || s->due_ns > limit) {
+            break;
+        }
+        timer_del(s->timer);
+    }
+}
+
+/* Software sampling the pads: the outputs at their levels of the moment. */
+static void mcpwm_line_sync(Notifier *n, void *data)
+{
+    Esp32McpwmState *s = container_of(n, Esp32McpwmState, line_source);
+
+    if (s->syncing_others) {
+        return;
+    }
+    mcpwm_sync(s);
+    mcpwm_update(s);
+}
+
+/*
+ * A register access samples the block's inputs: first bring every other
+ * source of line changes up to the present, so that an edge whose timer
+ * has not yet fired (the host running behind virtual time) reaches a
+ * capture, fault or sync input stamped with its own time, before this
+ * block acts at the present. The access acts at the moment it began:
+ * without icount virtual time moves on while it runs, and an edge after
+ * the other sources were brought up to date is yet to come.
+ */
+static void mcpwm_access_begin(Esp32McpwmState *s)
+{
+    int64_t t = esp32_line_time();
+
+    s->syncing_others = true;
+    esp32_line_sync();
+    s->syncing_others = false;
+    s->access_ns = t;
+    s->accessing = true;
+    mcpwm_sync(s);
+}
+
+static void mcpwm_access_end(Esp32McpwmState *s)
+{
+    s->accessing = false;
+}
+
 /* Capture */
 
+/*
+ * A capture reads the capture timer at the time of the change that makes
+ * it, though the block may have acted at a later moment already: an edge
+ * another block drives late (the host running behind virtual time), which
+ * a line sync brings after this block's own, is still timed exactly.
+ */
 static void cap_capture(Esp32McpwmState *s, int n, bool neg)
 {
-    s->cap_val[n] = cap_timer_now(s);
+    s->cap_val[n] = cap_timer_at(s, mcpwm_present(s));
     s->cap_status = (s->cap_status & ~(1u << n)) | ((uint32_t)neg << n);
-    s->core.int_raw |= INT_CAP(n);
+    core_raise(&s->core, INT_CAP(n), ETM_CAP(n));
 }
 
 /*
@@ -1898,15 +2150,88 @@ static void update_cfg_write(Esp32McpwmCore *c, uint32_t v)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * The ESP32-P4's registers from 0x120: the ETM's enables, the event
+ * comparators, CLK and VERSION. Returns false for an offset not among
+ * them.
+ */
+static bool p4_read(Esp32McpwmState *s, hwaddr addr, uint64_t *v)
+{
+    Esp32McpwmCore *c = &s->core;
+
+    if (addr >= A_P4_OP_TSTMP_E && addr < A_P4_OP_TSTMP_E_END) {
+        unsigned n = (addr - A_P4_OP_TSTMP_E) / 4;
+
+        *v = c->op[n / 2].tstmp_e[n % 2];
+        return true;
+    }
+    switch (addr) {
+    case A_P4_EVT_EN:
+        *v = c->evt_en;
+        return true;
+    case A_P4_TASK_EN:
+        *v = c->task_en;
+        return true;
+    case A_P4_EVT_EN2:
+        *v = c->evt_en2;
+        return true;
+    case A_P4_CLK:
+        *v = s->clk_reg;
+        return true;
+    case A_P4_VERSION:
+        *v = s->version;
+        return true;
+    }
+    return false;
+}
+
+/* [spec:nuos:req:emu.esp32p4.pwm] */
+static bool p4_write(Esp32McpwmState *s, hwaddr addr, uint32_t v)
+{
+    Esp32McpwmCore *c = &s->core;
+
+    if (addr >= A_P4_OP_TSTMP_E && addr < A_P4_OP_TSTMP_E_END) {
+        unsigned n = (addr - A_P4_OP_TSTMP_E) / 4;
+
+        c->op[n / 2].tstmp_e[n % 2] = v & TSTMP_E_MASK;
+        return true;
+    }
+    switch (addr) {
+    case A_P4_EVT_EN:
+        c->evt_en = v & EVT_EN_MASK;
+        return true;
+    case A_P4_TASK_EN:
+        c->task_en = v & TASK_EN_MASK;
+        return true;
+    case A_P4_EVT_EN2:
+        c->evt_en2 = v & EVT_EN2_MASK;
+        return true;
+    case A_P4_CLK:
+        s->clk_reg = v & 1;
+        return true;
+    case A_P4_VERSION:
+        s->version = v & VERSION_MASK;
+        return true;
+    }
+    return false;
+}
+
 /* [spec:nuos:req:emu.esp32.mcpwm] */
+/* [spec:nuos:req:emu.esp32p4.pwm] */
 static uint64_t esp32_mcpwm_read(void *opaque, hwaddr addr, unsigned size)
 {
     Esp32McpwmState *s = opaque;
     Esp32McpwmCore *c = &s->core;
     uint64_t v = 0;
 
-    mcpwm_sync(s);
-    if (addr >= A_TIMER_BASE && addr < A_SYNCI_CFG) {
+    mcpwm_access_begin(s);
+    if (s->p4 && addr >= A_P4_EVT_EN) {
+        if (!p4_read(s, addr, &v)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "esp32-mcpwm: read of bad offset "
+                          "0x%" HWADDR_PRIx "\n", addr);
+        }
+    } else if (addr >= A_TIMER_BASE && addr < A_SYNCI_CFG) {
         Esp32McpwmTimer *t = &c->timer[(addr - A_TIMER_BASE) / TIMER_STRIDE];
 
         switch ((addr - A_TIMER_BASE) % TIMER_STRIDE) {
@@ -1983,10 +2308,12 @@ static uint64_t esp32_mcpwm_read(void *opaque, hwaddr addr, unsigned size)
         }
     }
     mcpwm_update(s);
+    mcpwm_access_end(s);
     return v;
 }
 
 /* [spec:nuos:req:emu.esp32.mcpwm] */
+/* [spec:nuos:req:emu.esp32p4.pwm] */
 static void esp32_mcpwm_write(void *opaque, hwaddr addr, uint64_t value,
                               unsigned size)
 {
@@ -1994,8 +2321,13 @@ static void esp32_mcpwm_write(void *opaque, hwaddr addr, uint64_t value,
     Esp32McpwmCore *c = &s->core;
     uint32_t v = value;
 
-    mcpwm_sync(s);
-    if (addr >= A_TIMER_BASE && addr < A_SYNCI_CFG) {
+    mcpwm_access_begin(s);
+    if (s->p4 && addr >= A_P4_EVT_EN) {
+        if (!p4_write(s, addr, v)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "esp32-mcpwm: write to bad offset "
+                          "0x%" HWADDR_PRIx "\n", addr);
+        }
+    } else if (addr >= A_TIMER_BASE && addr < A_SYNCI_CFG) {
         timer_write(s, (addr - A_TIMER_BASE) / TIMER_STRIDE,
                     (addr - A_TIMER_BASE) % TIMER_STRIDE, v);
     } else if (addr >= A_OP_BASE && addr < A_FAULT_DETECT) {
@@ -2090,6 +2422,7 @@ static void esp32_mcpwm_write(void *opaque, hwaddr addr, uint64_t value,
     }
     core_settle(c);
     mcpwm_update(s);
+    mcpwm_access_end(s);
 }
 
 static const MemoryRegionOps esp32_mcpwm_ops = {
@@ -2099,6 +2432,72 @@ static const MemoryRegionOps esp32_mcpwm_ops = {
     .valid.min_access_size = 4,
     .valid.max_access_size = 4,
 };
+
+/*
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * The ESP32-P4's GEN_STOP task: every running timer stops where it
+ * stands, raising its stop interrupt and event; the operators, with no
+ * more timing events, hold their outputs.
+ */
+static void core_gen_stop(Esp32McpwmCore *c)
+{
+    for (int i = 0; i < ESP32_MCPWM_TIMERS; i++) {
+        Esp32McpwmTimer *t = &c->timer[i];
+
+        if (t->running) {
+            t->running = false;
+            core_raise(c, INT_TIMER_STOP(i), ETM_TIMER_STOP(i));
+        }
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * [spec:nuos:req:emu.esp32p4.etm]
+ * An ETM task, acted on as its line rises while TASK_EN enables it, at
+ * the time of the event that generated it.
+ */
+static void esp32_mcpwm_etm_task(void *opaque, int n, int level)
+{
+    Esp32McpwmState *s = opaque;
+    Esp32McpwmCore *c = &s->core;
+
+    if (!level || !(c->task_en & (1u << n))) {
+        return;
+    }
+    mcpwm_sync(s);
+    if (n <= TASK_CMPR_B_UP(ESP32_MCPWM_OPS - 1)) {
+        op_transfer(&c->op[n % ESP32_MCPWM_OPS],
+                    n < TASK_CMPR_B_UP(0) ? OP_PEND_A : OP_PEND_B);
+    } else if (n == TASK_GEN_STOP) {
+        core_gen_stop(c);
+    } else if (n <= TASK_TIMER_SYNC(ESP32_MCPWM_TIMERS - 1)) {
+        int i = n - TASK_TIMER_SYNC(0);
+
+        if (c->timer[i].sync & SYNC_SYNCI_EN) {
+            timer_take_sync(c, i);
+        }
+        timer_sync_out(c, i, 1u << i);
+    } else if (n <= TASK_TIMER_PERIOD_UP(ESP32_MCPWM_TIMERS - 1)) {
+        timer_transfer(c, n - TASK_TIMER_PERIOD_UP(0), true);
+    } else if (n <= TASK_TZ_OST(ESP32_MCPWM_OPS - 1)) {
+        int k = n - TASK_TZ_OST(0);
+
+        if (!c->op[k].ost_on) {
+            c->op[k].ost_on = true;
+            core_raise(c, INT_FH_OST(k), ETM_FH_OST(k));
+        }
+    } else if (n <= TASK_CLR_OST(ESP32_MCPWM_OPS - 1)) {
+        c->op[n - TASK_CLR_OST(0)].ost_on = false;
+    } else {
+        int cap = n - TASK_CAP(0);
+
+        cap_capture(s, cap, s->cap_status & (1u << cap));
+    }
+    mcpwm_cap_sync_hit(s);
+    core_settle(c);
+    mcpwm_update(s);
+}
 
 /* Inputs from the GPIO matrix */
 
@@ -2140,7 +2539,7 @@ static void esp32_mcpwm_cap_in(void *opaque, int n, int level)
  * A change of PLL_F160M_CLK: run to the change at the old rate, then count
  * from there at the new one.
  */
-static void esp32_mcpwm_f160m_update(void *opaque, ClockEvent event)
+static void esp32_mcpwm_core_clk_update(void *opaque, ClockEvent event)
 {
     Esp32McpwmState *s = opaque;
 
@@ -2153,13 +2552,20 @@ static void esp32_mcpwm_f160m_update(void *opaque, ClockEvent event)
     }
 }
 
-static void esp32_mcpwm_apb_update(void *opaque, ClockEvent event)
+static void esp32_mcpwm_cap_clk_update(void *opaque, ClockEvent event)
 {
     Esp32McpwmState *s = opaque;
 
     if (event == ClockPreUpdate) {
         cap_reanchor(s);
     }
+}
+
+/* The ESP32-P4's MCPWMn_CLK, PWM_clk's source and the capture timer's. */
+static void esp32p4_mcpwm_clk_update(void *opaque, ClockEvent event)
+{
+    esp32_mcpwm_cap_clk_update(opaque, event);
+    esp32_mcpwm_core_clk_update(opaque, event);
 }
 
 static void esp32_mcpwm_reset_hold(Object *obj, ResetType type)
@@ -2191,7 +2597,7 @@ static void esp32_mcpwm_reset_hold(Object *obj, ResetType type)
 
     s->clk_cfg = 0;
     s->clk_reg = 0;
-    s->version = VERSION_RESET;
+    s->version = s->p4 ? P4_VERSION_RESET : VERSION_RESET;
     s->seen_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->base_ns = mcpwm_now(s);
     s->base_cycle = 0;
@@ -2224,8 +2630,9 @@ static void esp32_mcpwm_init(Object *obj)
     Esp32McpwmState *s = ESP32_MCPWM(obj);
     DeviceState *dev = DEVICE(obj);
 
+    s->p4 = ESP32_MCPWM_GET_CLASS(obj)->p4;
     memory_region_init_io(&s->iomem, obj, &esp32_mcpwm_ops, s,
-                          TYPE_ESP32_MCPWM, ESP32_MCPWM_REGION_SIZE);
+                          object_get_typename(obj), ESP32_MCPWM_REGION_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
     qdev_init_gpio_out_named(dev, s->out, ESP32_MCPWM_OUT, ESP32_MCPWM_OUTS);
@@ -2235,10 +2642,22 @@ static void esp32_mcpwm_init(Object *obj)
                             ESP32_MCPWM_FAULTS);
     qdev_init_gpio_in_named(dev, esp32_mcpwm_cap_in, ESP32_MCPWM_CAP_IN,
                             ESP32_MCPWM_CAPS);
-    s->f160m = qdev_init_clock_in(dev, "f160m", esp32_mcpwm_f160m_update, s,
-                                  ClockPreUpdate | ClockUpdate);
-    s->apb = qdev_init_clock_in(dev, "apb", esp32_mcpwm_apb_update, s,
-                                ClockPreUpdate);
+    if (s->p4) {
+        s->core_clk = qdev_init_clock_in(dev, "clk", esp32p4_mcpwm_clk_update,
+                                         s, ClockPreUpdate | ClockUpdate);
+        s->cap_clk = s->core_clk;
+        qdev_init_gpio_out_named(dev, s->etm_event, ESP32_MCPWM_ETM_EVENT,
+                                 ESP32P4_MCPWM_ETM_EVENTS);
+        qdev_init_gpio_in_named(dev, esp32_mcpwm_etm_task,
+                                ESP32_MCPWM_ETM_TASK, ESP32P4_MCPWM_ETM_TASKS);
+    } else {
+        s->core_clk = qdev_init_clock_in(dev, "f160m",
+                                         esp32_mcpwm_core_clk_update, s,
+                                         ClockPreUpdate | ClockUpdate);
+        s->cap_clk = qdev_init_clock_in(dev, "apb", esp32_mcpwm_cap_clk_update,
+                                        s, ClockPreUpdate);
+    }
+    s->line_source.notify = mcpwm_line_sync;
 }
 
 static void esp32_mcpwm_realize(DeviceState *dev, Error **errp)
@@ -2246,6 +2665,7 @@ static void esp32_mcpwm_realize(DeviceState *dev, Error **errp)
     Esp32McpwmState *s = ESP32_MCPWM(dev);
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mcpwm_timer_cb, s);
+    esp32_line_add_source(&s->line_source);
 }
 
 static const Property esp32_mcpwm_properties[] = {
@@ -2314,6 +2734,7 @@ static const VMStateDescription vmstate_esp32_mcpwm_op = {
         VMSTATE_UINT64_ARRAY(car_rise, Esp32McpwmOp, 2),
         VMSTATE_BOOL(cbc_on, Esp32McpwmOp),
         VMSTATE_BOOL(ost_on, Esp32McpwmOp),
+        VMSTATE_UINT32_ARRAY(tstmp_e, Esp32McpwmOp, 2),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -2339,17 +2760,22 @@ static const VMStateDescription vmstate_esp32_mcpwm_core = {
         VMSTATE_BOOL_ARRAY(fault_ev, Esp32McpwmCore, ESP32_MCPWM_FAULTS),
         VMSTATE_BOOL(cap_sync_hit, Esp32McpwmCore),
         VMSTATE_UINT64(cap_sync, Esp32McpwmCore),
+        VMSTATE_UINT32(evt_en, Esp32McpwmCore),
+        VMSTATE_UINT32(evt_en2, Esp32McpwmCore),
+        VMSTATE_UINT32(task_en, Esp32McpwmCore),
+        VMSTATE_UINT64(etm_fired, Esp32McpwmCore),
+        VMSTATE_UINT64(etm_cycle, Esp32McpwmCore),
         VMSTATE_END_OF_LIST()
     },
 };
 
 static const VMStateDescription vmstate_esp32_mcpwm = {
     .name = TYPE_ESP32_MCPWM,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
-        VMSTATE_CLOCK(f160m, Esp32McpwmState),
-        VMSTATE_CLOCK(apb, Esp32McpwmState),
+        VMSTATE_CLOCK(core_clk, Esp32McpwmState),
+        VMSTATE_CLOCK(cap_clk, Esp32McpwmState),
         VMSTATE_TIMER_PTR(timer, Esp32McpwmState),
         VMSTATE_STRUCT(core, Esp32McpwmState, 1, vmstate_esp32_mcpwm_core,
                        Esp32McpwmCore),
@@ -2390,18 +2816,32 @@ static void esp32_mcpwm_class_init(ObjectClass *klass, const void *data)
     device_class_set_props(dc, esp32_mcpwm_properties);
 }
 
+static void esp32p4_mcpwm_class_init(ObjectClass *klass, const void *data)
+{
+    ESP32_MCPWM_CLASS(klass)->p4 = true;
+}
+
 /* [spec:nuos:req:emu.esp32.mcpwm] */
 static const TypeInfo esp32_mcpwm_info = {
     .name          = TYPE_ESP32_MCPWM,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(Esp32McpwmState),
     .instance_init = esp32_mcpwm_init,
+    .class_size    = sizeof(Esp32McpwmClass),
     .class_init    = esp32_mcpwm_class_init,
+};
+
+/* [spec:nuos:req:emu.esp32p4.pwm] */
+static const TypeInfo esp32p4_mcpwm_info = {
+    .name          = TYPE_ESP32P4_MCPWM,
+    .parent        = TYPE_ESP32_MCPWM,
+    .class_init    = esp32p4_mcpwm_class_init,
 };
 
 static void esp32_mcpwm_register_types(void)
 {
     type_register_static(&esp32_mcpwm_info);
+    type_register_static(&esp32p4_mcpwm_info);
 }
 
 type_init(esp32_mcpwm_register_types)
