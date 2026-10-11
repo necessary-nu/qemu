@@ -12,6 +12,8 @@
 #include "qemu/units.h"
 #include "hw/core/boards.h"
 #include "hw/cpu/cluster.h"
+#include "hw/dma/esp32p4_dw_gdma.h"
+#include "hw/dma/esp32p4_gdma.h"
 #include "hw/core/split-irq.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "hw/intc/esp32p4_clic.h"
@@ -28,6 +30,10 @@
 #include "hw/misc/esp32p4_pms.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/sd/esp32p4_sdmmc.h"
+#include "hw/timer/esp32p4_lp_timer.h"
+#include "hw/timer/esp32p4_lp_wdt.h"
+#include "hw/timer/esp32p4_systimer.h"
+#include "hw/timer/esp32p4_timg.h"
 #include "hw/ssi/esp32p4_mspi.h"
 #include "system/memory.h"
 #include "target/riscv/esp32p4_cpu.h"
@@ -123,6 +129,18 @@ struct ESP32P4MachineState {
     ESP32P4PmsState pms;
     ESP32P4IcmState icm;
     ESP32P4SdmmcState sdmmc;
+    /* GDMA-AHB, GDMA-AXI. */
+    ESP32P4GdmaState gdma[2];
+    ESP32P4DwGdmaState vdma;
+
+    ESP32P4SysTimerState systimer;
+    ESP32P4TimgState timg[2];
+    ESP32P4LPWdtState lp_wdt;
+    ESP32P4LPTimerState lp_timer;
+    /* Each HP core's stall, to the system timer and the RTC timer. */
+    SplitIRQ core_stall_split[ESP32P4_HP_CORES];
+    /* The HP core reset, to the machine and the RTC timer. */
+    SplitIRQ hp_core_reset_split;
 
     ESP32P4MSPIState flash_mspi;
     ESP32P4MSPIState psram_mspi;
