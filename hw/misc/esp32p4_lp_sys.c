@@ -28,9 +28,9 @@
  *
  * - The interrupt registers INT_RAW, INT_ST, INT_ENA and INT_CLR, whose
  *   enabled raw bits drive LP_SYSREG_INTR, source 19 of the interrupt
- *   matrix. Of the raw bits only LP_ADDRHOLE_INT is ever set: the LP
- *   core's bus timeouts, the ETM's ULP task and the slow clock tick are
- *   not modelled.
+ *   matrix. Of the raw bits LP_ADDRHOLE_INT and ETM_TASK_ULP_INT, which
+ *   the ETM's task ULP_TASK_INT_CPU sets, are ever set: the LP core's bus
+ *   timeouts and the slow clock tick are not modelled.
  *
  * - LP_SYSTEM_REG_USB_CTRL_REG (0x100): SW_HW_USB_PHY_SEL and
  *   SW_USB_PHY_SEL, which choose the full-speed PHYs of USB Serial/JTAG
@@ -72,6 +72,7 @@
 
 /* LP_ADDRHOLE_INT, IDBUS_ADDRHOLE_INT, the three bus timeouts, ETM, tick. */
 #define INT_LP_ADDRHOLE         BIT(0)
+#define INT_ETM_TASK_ULP        BIT(5)
 #define INT_ALL                 0x7f
 
 /* LP_ADDRHOLE_INFO: the master's ID in bits 4:0, then WR and SECURE. */
@@ -103,6 +104,17 @@ void esp32p4_lp_sys_addrhole(ESP32P4LPSysState *s, uint32_t addr,
         s->int_raw |= INT_LP_ADDRHOLE;
     }
     esp32p4_lp_sys_update(s);
+}
+
+/* [spec:nuos:req:emu.esp32p4.etm] */
+static void esp32p4_lp_sys_etm_task_ulp_int(void *opaque, int n, int level)
+{
+    ESP32P4LPSysState *s = opaque;
+
+    if (level) {
+        s->int_raw |= INT_ETM_TASK_ULP;
+        esp32p4_lp_sys_update(s);
+    }
 }
 
 static bool esp32p4_lp_sys_reg(ESP32P4LPSysState *s, hwaddr addr,
@@ -246,6 +258,8 @@ static void esp32p4_lp_sys_init(Object *obj)
                           TYPE_ESP32P4_LP_SYS, ESP32P4_LP_SYS_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    qdev_init_gpio_in_named(DEVICE(obj), esp32p4_lp_sys_etm_task_ulp_int,
+                            ESP32P4_LP_SYS_ETM_TASK_ULP_INT, 1);
     qdev_init_gpio_out_named(DEVICE(obj), s->usb_phy_sel,
                              ESP32P4_LP_SYS_USB_PHY_SEL, 2);
 }

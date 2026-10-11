@@ -99,6 +99,10 @@
  * count waits. LPPERI_RST_EN_LP_CORE resets the LP core at once. Each
  * reset records its cause in LP_CLKRST_RESET_CAUSE, and a chip reset
  * records 0x01 for all three cores, which the ROM reads as a power-on.
+ * An HP core reset, which the watchdogs request, holds both HP cores and
+ * every HP block in reset for its length and returns HP_SYS_CLKRST's
+ * registers to their reset values, leaving the LP system as it is; a
+ * system reset is QEMU's, with the cause a block gives it.
  * LP_CLKRST_HPCORE<n>_STAT_VECTOR_SEL picks the core's reset vector.
  *
  * HP_SYS_CLKRST_ANA_PLL_CTRL0's calibration controls drive the analog
@@ -1479,12 +1483,19 @@ static void esp32p4_clkrst_update_cores(ESP32P4ClkRstState *s, bool force)
     int n;
 
     for (n = 0; n < ESP32P4_CLKRST_HP_CORES; n++) {
-        level = !(s->regs[R_HP_FORCE_NORST0] & FORCE_NORST_CORE(n)) &&
-                ((s->regs[R_HP_RST_EN0] & RST_EN_CORE_GLOBAL(n)) ||
-                 s->core_pulse[n] == ESP32P4_CORE_PULSE_RESET);
+        level = s->hp_core_reset ||
+                (!(s->regs[R_HP_FORCE_NORST0] & FORCE_NORST_CORE(n)) &&
+                 ((s->regs[R_HP_RST_EN0] & RST_EN_CORE_GLOBAL(n)) ||
+                  s->core_pulse[n] == ESP32P4_CORE_PULSE_RESET));
         if (force || level != s->core_reset_level[n]) {
             s->core_reset_level[n] = level;
             qemu_set_irq(s->core_reset[n], level);
+        }
+        level = s->core_pulse[n] == ESP32P4_CORE_PULSE_STALL ||
+                s->pmu_core_stall[n];
+        if (force || level != s->core_stall_level[n]) {
+            s->core_stall_level[n] = level;
+            qemu_set_irq(s->core_stall[n], level);
         }
         level = s->period[C(CORE0_CPU) + n] &&
                 s->core_pulse[n] != ESP32P4_CORE_PULSE_STALL &&
@@ -1512,10 +1523,25 @@ static void esp32p4_clkrst_update_cores(ESP32P4ClkRstState *s, bool force)
     }
 }
 
+/*
+ * Whether block reset @i is an HP block's, which an HP core reset holds:
+ * all but those of LP_CLKRST_LP_RST_EN and LPPERI_RESET_EN, the LP
+ * system's. (LP_CLKRST's USB, SD/MMC and EMAC resets are HP blocks'.)
+ */
+static bool esp32p4_clkrst_hp_block(int i)
+{
+    const RstDesc *d = &esp32p4_rst_desc[i];
+
+    return d->rst.reg != R_LP_RST_EN && d->rst.reg != R_LPPERI_RESET_EN;
+}
+
 static bool esp32p4_clkrst_reset_held(ESP32P4ClkRstState *s, int i)
 {
     const RstDesc *d = &esp32p4_rst_desc[i];
 
+    if (s->hp_core_reset && esp32p4_clkrst_hp_block(i)) {
+        return true;
+    }
     if (d->norst.width && fld(s, d->norst)) {
         return false;
     }
@@ -1633,6 +1659,12 @@ void esp32p4_clkrst_set_system_reset_cause(ESP32P4ClkRstState *s,
     s->system_reset_cause = cause;
 }
 
+/* [spec:nuos:req:emu.esp32p4.timers] */
+uint8_t esp32p4_clkrst_system_reset_cause(ESP32P4ClkRstState *s)
+{
+    return s->system_reset_cause;
+}
+
 /*
  * Time the current phase of core @n's CPU reset, in cycles of its clock;
  * while that clock is stopped the phase waits for it.
@@ -1701,6 +1733,65 @@ static void esp32p4_clkrst_aon_core_reset(ESP32P4ClkRstState *s, int n,
     esp32p4_clkrst_core_pulse(s, n, cause, ctrl & HPCORE_STALL_EN,
                               HPCORE_STALL_WAIT(ctrl),
                               HPCORE_RESET_LENGTH(ctrl), C(LP_DYN_FAST));
+}
+
+/* The SoC clock dividers in effect out of reset. */
+static void esp32p4_clkrst_reset_soc_div(ESP32P4ClkRstState *s)
+{
+    memset(s->soc_div, 0, sizeof(s->soc_div));
+    s->soc_div[1][0] = 1;
+    s->soc_div[3][0] = 1;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * An HP core reset: HP_SYS_CLKRST's registers and the dividers they set
+ * take their reset values, which hold core 1 again; CPU resets in progress
+ * end; and both HP cores and every HP block are held in reset until
+ * hp_core_timer runs. The LP system's registers, LP_CLKRST's and LPPERI's,
+ * keep their values, and the reset vector LP_CLKRST selects with them.
+ */
+void esp32p4_clkrst_hp_core_reset(ESP32P4ClkRstState *s, unsigned source,
+                                  int64_t length_ns)
+{
+    uint8_t cause = ESP32P4_RESET_CAUSE_RWDT_CORE;
+    int i;
+
+    if (source != ESP32P4_HP_CORE_RESET_RWDT) {
+        unsigned mwdt = source - ESP32P4_HP_CORE_RESET_MWDT0;
+        uint32_t sel = s->regs[R_HPCORE_WDT_RESET_SOURCE0];
+
+        if (extract32(sel, 0, 1) != mwdt && extract32(sel, 1, 1) != mwdt) {
+            return;
+        }
+        cause = ESP32P4_RESET_CAUSE_MWDT_CORE;
+    }
+    esp32p4_clkrst_record_reset(s, ESP32P4_CLKRST_CORE_HP0 |
+                                ESP32P4_CLKRST_CORE_HP1, cause);
+    for (i = 0; i < R_HP_END; i++) {
+        s->regs[i] = esp32p4_clkrst_regs[i].reset;
+    }
+    esp32p4_clkrst_reset_soc_div(s);
+    memset(s->sdio_edge, 0, sizeof(s->sdio_edge));
+    for (i = 0; i < ESP32P4_CLKRST_HP_CORES; i++) {
+        s->core_pulse[i] = ESP32P4_CORE_PULSE_IDLE;
+        s->core_pulse_waiting[i] = false;
+        timer_del(s->core_timer[i]);
+    }
+    s->hp_core_reset = true;
+    timer_mod(s->hp_core_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              MAX(length_ns, 1));
+    esp32p4_clkrst_update(s, false);
+    qemu_set_irq(s->hp_core_reset_out, 1);
+}
+
+static void esp32p4_clkrst_hp_core_timer(void *opaque)
+{
+    ESP32P4ClkRstState *s = opaque;
+
+    s->hp_core_reset = false;
+    esp32p4_clkrst_update(s, false);
+    qemu_set_irq(s->hp_core_reset_out, 0);
 }
 
 /* The value a read of register @idx returns. */
@@ -2049,48 +2140,45 @@ static void esp32p4_clkrst_set_pmu_lp_core_clock(void *opaque, int n,
 
 /*
  * [spec:nuos:req:emu.esp32p4.clocks]
- * MWDT @n asks for a CPU reset: of each core whose
- * HPCORE<n>_WDT_RESET_SOURCE_SEL picks it, as its HPWDT_CORE<n>_RST_CTRL0
- * configures it.
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * An MWDT asks for a CPU reset of core n (line ESP32P4_CLKRST_MWDT_LINE):
+ * it takes place if HPCORE<n>_WDT_RESET_SOURCE_SEL picks that MWDT, as the
+ * core's HPWDT_CORE<n>_RST_CTRL0 configures it.
  */
-static void esp32p4_clkrst_mwdt_reset(void *opaque, int mwdt, int level)
+static void esp32p4_clkrst_mwdt_reset(void *opaque, int line, int level)
 {
     ESP32P4ClkRstState *s = opaque;
+    int mwdt = line / ESP32P4_CLKRST_HP_CORES;
+    int n = line % ESP32P4_CLKRST_HP_CORES;
     uint32_t ctrl;
-    int n;
 
-    if (!level) {
+    if (!level ||
+        extract32(s->regs[R_HPCORE_WDT_RESET_SOURCE0], n, 1) != mwdt) {
         return;
     }
-    for (n = 0; n < ESP32P4_CLKRST_HP_CORES; n++) {
-        if (extract32(s->regs[R_HPCORE_WDT_RESET_SOURCE0], n, 1) != mwdt) {
-            continue;
-        }
-        ctrl = s->regs[R_HPWDT_CORE0_RST_CTRL0 + n];
-        esp32p4_clkrst_core_pulse(s, n, ESP32P4_RESET_CAUSE_MWDT_CPU,
-                                  ctrl & HPWDT_STALL_EN,
-                                  HPWDT_STALL_WAIT_NUM(ctrl),
-                                  HPWDT_RST_LEN(ctrl), C(XTAL));
-    }
+    ctrl = s->regs[R_HPWDT_CORE0_RST_CTRL0 + n];
+    esp32p4_clkrst_core_pulse(s, n, ESP32P4_RESET_CAUSE_MWDT_CPU,
+                              ctrl & HPWDT_STALL_EN,
+                              HPWDT_STALL_WAIT_NUM(ctrl),
+                              HPWDT_RST_LEN(ctrl), C(XTAL));
     esp32p4_clkrst_update(s, false);
 }
 
-/* [spec:nuos:req:emu.esp32p4.clocks] */
+/*
+ * [spec:nuos:req:emu.esp32p4.clocks]
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * The RTC watchdog asks for a CPU reset of core @n: it takes place if
+ * LP_WDT_HPCORE<n>_RESET_EN is set.
+ */
 static void esp32p4_clkrst_rwdt_reset(void *opaque, int n, int level)
 {
     ESP32P4ClkRstState *s = opaque;
-    int core;
 
-    if (!level) {
+    if (!level || !(s->regs[R_LP_HPCPU_RESET_CTRL0] &
+                    (HPCORE_LP_WDT_RESET_EN << HPCORE_SHIFT(n)))) {
         return;
     }
-    for (core = 0; core < ESP32P4_CLKRST_HP_CORES; core++) {
-        if (s->regs[R_LP_HPCPU_RESET_CTRL0] &
-            (HPCORE_LP_WDT_RESET_EN << HPCORE_SHIFT(core))) {
-            esp32p4_clkrst_aon_core_reset(s, core,
-                                         ESP32P4_RESET_CAUSE_RWDT_CPU);
-        }
-    }
+    esp32p4_clkrst_aon_core_reset(s, n, ESP32P4_RESET_CAUSE_RWDT_CPU);
     esp32p4_clkrst_update(s, false);
 }
 
@@ -2212,24 +2300,16 @@ static void esp32p4_clkrst_reset_hold(Object *obj, ResetType type)
     for (i = 0; i < ESP32P4_CLKRST_NREGS; i++) {
         s->regs[i] = esp32p4_clkrst_regs[i].reset;
     }
-    s->soc_div[0][0] = 0;
-    s->soc_div[0][1] = 0;
-    s->soc_div[0][2] = 0;
-    s->soc_div[1][0] = 1;
-    s->soc_div[1][1] = 0;
-    s->soc_div[1][2] = 0;
-    s->soc_div[2][0] = 0;
-    s->soc_div[2][1] = 0;
-    s->soc_div[2][2] = 0;
-    s->soc_div[3][0] = 1;
-    s->soc_div[3][1] = 0;
-    s->soc_div[3][2] = 0;
+    esp32p4_clkrst_reset_soc_div(s);
     memset(s->sdio_edge, 0, sizeof(s->sdio_edge));
     for (i = 0; i < ESP32P4_CLKRST_HP_CORES; i++) {
         s->core_pulse[i] = ESP32P4_CORE_PULSE_IDLE;
         s->core_pulse_waiting[i] = false;
         timer_del(s->core_timer[i]);
     }
+    s->hp_core_reset = false;
+    timer_del(s->hp_core_timer);
+    qemu_set_irq(s->hp_core_reset_out, 0);
     esp32p4_clkrst_record_reset(s, ESP32P4_CLKRST_CORE_HP0 |
                                 ESP32P4_CLKRST_CORE_HP1 |
                                 ESP32P4_CLKRST_CORE_LP,
@@ -2279,6 +2359,10 @@ static void esp32p4_clkrst_init(Object *obj)
     qdev_init_gpio_out_named(dev, s->pll_cal_stop,
                              ESP32P4_CLKRST_PLL_CAL_STOP,
                              ESP32P4_CLKRST_NUM_PLL_CAL);
+    qdev_init_gpio_out_named(dev, s->core_stall, ESP32P4_CLKRST_CORE_STALL,
+                             ESP32P4_CLKRST_HP_CORES);
+    qdev_init_gpio_out_named(dev, &s->hp_core_reset_out,
+                             ESP32P4_CLKRST_HP_CORE_RESET, 1);
 
     qdev_init_gpio_in_named(dev, esp32p4_clkrst_set_cal_end,
                             ESP32P4_CLKRST_PLL_CAL_END,
@@ -2293,9 +2377,11 @@ static void esp32p4_clkrst_init(Object *obj)
     qdev_init_gpio_in_named(dev, esp32p4_clkrst_set_pmu_lp_core_clock,
                             ESP32P4_CLKRST_PMU_LP_CORE_CLOCK, 1);
     qdev_init_gpio_in_named(dev, esp32p4_clkrst_mwdt_reset,
-                            ESP32P4_CLKRST_MWDT_CORE_RESET, 2);
+                            ESP32P4_CLKRST_MWDT_CORE_RESET,
+                            ESP32P4_CLKRST_MWDTS * ESP32P4_CLKRST_HP_CORES);
     qdev_init_gpio_in_named(dev, esp32p4_clkrst_rwdt_reset,
-                            ESP32P4_CLKRST_RWDT_CORE_RESET, 1);
+                            ESP32P4_CLKRST_RWDT_CORE_RESET,
+                            ESP32P4_CLKRST_HP_CORES);
     qdev_init_gpio_in_named(dev, esp32p4_clkrst_lp_uart_wakeup,
                             ESP32P4_CLKRST_LP_UART_WAKEUP, 1);
 
@@ -2306,6 +2392,8 @@ static void esp32p4_clkrst_init(Object *obj)
                                         esp32p4_clkrst_core_timer,
                                         &s->core_timer_ctx[i]);
     }
+    s->hp_core_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                    esp32p4_clkrst_hp_core_timer, s);
 
     /* The PMU's levels until it is modelled; see the header. */
     s->pmu_xpd[ESP32P4_CLKRST_XPD_RC_FAST] = true;
@@ -2386,6 +2474,10 @@ static const VMStateDescription vmstate_esp32p4_clkrst = {
                            ESP32P4_CLKRST_HP_CORES),
         VMSTATE_BOOL_ARRAY(core_vector_level, ESP32P4ClkRstState,
                            ESP32P4_CLKRST_HP_CORES),
+        VMSTATE_BOOL_ARRAY(core_stall_level, ESP32P4ClkRstState,
+                           ESP32P4_CLKRST_HP_CORES),
+        VMSTATE_BOOL(hp_core_reset, ESP32P4ClkRstState),
+        VMSTATE_TIMER_PTR(hp_core_timer, ESP32P4ClkRstState),
         VMSTATE_BOOL(lp_core_reset_level, ESP32P4ClkRstState),
         VMSTATE_BOOL(lp_core_clock_level, ESP32P4ClkRstState),
         VMSTATE_UINT64_ARRAY(checked_soc, ESP32P4ClkRstState, 4),

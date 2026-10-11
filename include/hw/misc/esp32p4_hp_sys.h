@@ -54,6 +54,28 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4HPSysState, ESP32P4_HP_SYS)
 #define ESP32P4_HP_SYS_CACHE_RESET_LINES 3
 
 /*
+ * Named GPIO outputs to the EMAC from HP_SYSTEM_GMAC_CTRL0:
+ * ESP32P4_HP_SYS_GMAC_PHY_INTF, three lines, PHY_INTF_SEL's bits, and
+ * ESP32P4_HP_SYS_GMAC_SBD_FLOWCTRL, SBD_FLOWCTRL.
+ */
+#define ESP32P4_HP_SYS_GMAC_PHY_INTF "gmac-phy-intf-sel"
+#define ESP32P4_HP_SYS_GMAC_PHY_INTF_LINES 3
+#define ESP32P4_HP_SYS_GMAC_SBD_FLOWCTRL "gmac-sbd-flowctrl"
+
+/*
+ * Named GPIO input ESP32P4_HP_SYS_GMAC_STATUS, the EMAC's outputs that
+ * HP_SYSTEM_GMAC_CTRL0 shows, by line ESP32P4_HP_SYS_GMAC_*: its PPS
+ * output and its resets in its transmit and receive clock domains.
+ */
+#define ESP32P4_HP_SYS_GMAC_STATUS "gmac-status"
+enum {
+    ESP32P4_HP_SYS_GMAC_PTP_PPS,
+    ESP32P4_HP_SYS_GMAC_RST_CLK_TX_N,
+    ESP32P4_HP_SYS_GMAC_RST_CLK_RX_N,
+    ESP32P4_HP_SYS_GMAC_STATUS_LINES,
+};
+
+/*
  * Named GPIO output ESP32P4_HP_SYS_USBOTG20_CTRL: HP_SYSTEM_SYS_USBOTG20_
  * CTRL's PHY_SUSPENDM, PHY_SUSPEND_FORCE_EN, PHY_RSTN, PHY_RESET_FORCE_EN,
  * PHY_PLL_FORCE_EN, PHY_PLL_EN and OTG_SUSPENDM (bits 15 to 21), to the
@@ -87,6 +109,14 @@ struct ESP32P4HPSysState {
     qemu_irq usbotg20_ctrl_out[ESP32P4_HP_SYS_USBOTG20_CTRL_LINES];
     /* HP_SYSREG_INTR, sysbus IRQ 0. */
     qemu_irq sysreg_irq;
+    /* HP_SYSTEM_GMAC_CTRL0's writable fields, and the EMAC's status */
+    uint32_t gmac_ctrl0;
+    uint32_t gmac_status;
+    qemu_irq gmac_phy_intf[ESP32P4_HP_SYS_GMAC_PHY_INTF_LINES];
+    qemu_irq gmac_sbd_flowctrl;
+    /* The EMAC's system time, which GMAC_CTRL1 and _CTRL2 read */
+    uint64_t (*gmac_ptp_time)(void *opaque);
+    void *gmac_ptp_opaque;
 };
 
 /*
@@ -95,5 +125,14 @@ struct ESP32P4HPSysState {
  */
 void esp32p4_hp_sys_l2mem_exceed(ESP32P4HPSysState *s, uint32_t offset,
                                  bool write);
+
+/*
+ * The EMAC's system time output (ptp_timestamp_o): @time returns its
+ * seconds in the high 32 bits and sub-seconds in the low, for
+ * HP_SYSTEM_GMAC_CTRL2 and _CTRL1.
+ */
+void esp32p4_hp_sys_set_gmac_ptp(ESP32P4HPSysState *s,
+                                 uint64_t (*time)(void *opaque),
+                                 void *opaque);
 
 #endif
