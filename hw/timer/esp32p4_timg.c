@@ -103,6 +103,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/timer/esp32p4_timg.h"
 #include "migration/vmstate.h"
 
@@ -253,7 +254,8 @@ static uint64_t timg_timer_count(ESP32P4TimgTimer *t, int64_t now)
 /*
  * Fold the cycles counted up to @now into the count and the prescaler,
  * keeping the sync point on a function clock edge so that the time
- * towards the next is not lost.
+ * towards the next is not lost. A sync at a time before the last, for a
+ * task whose event came earlier, changes nothing.
  */
 static void timg_timer_sync(ESP32P4TimgTimer *t, int64_t now)
 {
@@ -261,15 +263,19 @@ static void timg_timer_sync(ESP32P4TimgTimer *t, int64_t now)
 
     t->count = timg_timer_count(t, now);
     if (!t->running) {
-        t->sync_ns = now;
+        t->sync_ns = MAX(now, t->sync_ns);
         return;
     }
     t->pre = (t->pre + cycles) % timg_divisor(t->config);
     t->sync_ns += timg_cycles_ns(t->clk, cycles);
 }
 
-/* [spec:nuos:req:emu.esp32p4.timers] */
-static void timg_timer_fire(ESP32P4TimgState *s, int x)
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * Timer @x alarms at @when: its ETM event carries that time, which a
+ * QEMU timer running late, or a register access catching up, has passed.
+ */
+static void timg_timer_fire(ESP32P4TimgState *s, int x, int64_t when)
 {
     ESP32P4TimgTimer *t = &s->t[x];
 
@@ -280,7 +286,8 @@ static void timg_timer_fire(ESP32P4TimgState *s, int x)
     s->int_raw |= BIT(x);
     timg_update_irqs(s);
     if (s->regclk & REGCLK_ETM_EN) {
-        qemu_irq_pulse(s->etm_event[x]);
+        esp32_line_set_at(s->etm_event[x], 1, when);
+        esp32_line_set_at(s->etm_event[x], 0, when);
     }
 }
 
@@ -305,7 +312,7 @@ static void timg_timer_check(ESP32P4TimgState *s, int x, int64_t now)
         ahead = (t->count - t->alarm) & COUNT_MASK;
     }
     if (ahead == 0 || ahead > COUNT_HALF) {
-        timg_timer_fire(s, x);
+        timg_timer_fire(s, x, now);
         return;
     }
     if (!t->running) {
@@ -320,14 +327,19 @@ static void timg_timer_check(ESP32P4TimgState *s, int x, int64_t now)
     timer_mod(&t->timer, t->due_ns);
 }
 
-/* Re-evaluate whether timer @x counts, after a sync at @now. */
+/*
+ * Re-evaluate whether timer @x counts, after a sync at @now. A timer
+ * started by a task whose event came before the timer's last change, as
+ * one from a block whose QEMU timer ran late can without icount, counts
+ * from that change: a start never undoes what software saw since.
+ */
 static void timg_timer_update(ESP32P4TimgState *s, int x, int64_t now)
 {
     ESP32P4TimgTimer *t = &s->t[x];
     bool running = (t->config & TCONF_EN) && clock_is_enabled(t->clk);
 
     if (running && !t->running) {
-        t->sync_ns = now;
+        t->sync_ns = MAX(now, t->sync_ns);
     }
     t->running = running;
     timg_timer_check(s, x, now);
@@ -1106,11 +1118,15 @@ static const MemoryRegionOps timg_ops = {
     .impl.max_access_size = 4,
 };
 
-/* [spec:nuos:req:emu.esp32p4.timers] */
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * An ETM task acts at its event's time, which its pulse carries: two
+ * tasks of one event start, or capture, at the same count.
+ */
 static void timg_etm_task(void *opaque, int line, int level)
 {
     ESP32P4TimgState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
     int x = line / ESP32P4_TIMG_TASKS;
     ESP32P4TimgTimer *t = &s->t[x];
 

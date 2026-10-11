@@ -117,6 +117,12 @@
  * noise level learns again once SPEECH_COUNT exceeds
  * PARAM_MAX_SPEECH_COUNT. VAD_FLAG is LP_I2S_WAKEUP.
  *
+ * ETM (TRM 49.11). The events carry the time of what raises them (see
+ * esp32_line.h): a master's period runs as of its end's time, however
+ * late the QEMU timer that runs it. The tasks act at their events' time;
+ * those that come while a period runs wait for its end and are then
+ * taken in the order of their events' times, each at its own.
+ *
  * An audio backend (the machine's audiodev) stands for a codec on each
  * controller's bus: it plays the frames a master transmitter sends (the
  * first two TDM channels, or the PCM2PDM converter's input), and gives a
@@ -516,10 +522,18 @@ static void i2s_raise(ESP32P4I2sState *s, uint32_t mask)
     i2s_update_irq(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.i2s]
+ * Pulse ETM event @evt, carrying the time of what raises it
+ * (esp32_line_time()): the end of the period being run, or the access.
+ */
 static void i2s_event(ESP32P4I2sState *s, unsigned evt)
 {
     if (!i2s_is_lp(s)) {
-        qemu_irq_pulse(s->etm_event[evt]);
+        int64_t t = esp32_line_time();
+
+        esp32_line_set_at(s->etm_event[evt], 1, t);
+        esp32_line_set_at(s->etm_event[evt], 0, t);
     }
 }
 
@@ -2227,6 +2241,49 @@ static void unit_arm(ESP32P4I2sState *s, ESP32P4I2sUnit *u)
 
 static void i2s_etm_apply(ESP32P4I2sState *s, unsigned n);
 
+/* A master's period run, or an ETM task applied, at a time of its own. */
+typedef struct I2sAt {
+    ESP32P4I2sState *s;
+    unsigned n;
+} I2sAt;
+
+static void i2s_bus_run_at(void *opaque)
+{
+    I2sAt *a = opaque;
+
+    i2s_bus_run(a->s, a->n);
+}
+
+static void i2s_etm_apply_at(void *opaque)
+{
+    I2sAt *a = opaque;
+
+    i2s_etm_apply(a->s, a->n);
+}
+
+/*
+ * Apply the ETM tasks that came while a period ran, in the order of their
+ * events' times, each at its own.
+ */
+static void i2s_etm_deferred_apply(ESP32P4I2sState *c)
+{
+    while (c->etm_deferred) {
+        I2sAt a = { .s = c, .n = ctz32(c->etm_deferred) };
+        uint32_t rest = c->etm_deferred & ~BIT(a.n);
+
+        while (rest) {
+            unsigned m = ctz32(rest);
+
+            if (c->etm_deferred_ns[m] < c->etm_deferred_ns[a.n]) {
+                a.n = m;
+            }
+            rest &= ~BIT(m);
+        }
+        c->etm_deferred &= ~BIT(a.n);
+        esp32_line_run_at(c->etm_deferred_ns[a.n], i2s_etm_apply_at, &a);
+    }
+}
+
 /* Whether the transmit FIFO holds a whole frame's data. */
 static bool tx_frame_ready(ESP32P4I2sState *s)
 {
@@ -2262,7 +2319,8 @@ static void unit_timer_cb(ESP32P4I2sState *s, ESP32P4I2sUnit *u)
             break;
         }
         u->events++;
-        i2s_bus_run(s, tx);
+        esp32_line_run_at(unit_event_time(s, u, u->events), i2s_bus_run_at,
+                          &(I2sAt) { .s = s, .n = tx });
         if (++runs == MAX_CATCH_UP) {
             /* Too far behind to catch up: drop the backlog */
             u->anchor = now;
@@ -2279,12 +2337,7 @@ static void unit_timer_cb(ESP32P4I2sState *s, ESP32P4I2sUnit *u)
             continue;
         }
         c->in_run = false;
-        while (c->etm_deferred) {
-            unsigned n = ctz32(c->etm_deferred);
-
-            c->etm_deferred &= ~BIT(n);
-            i2s_etm_apply(c, n);
-        }
+        i2s_etm_deferred_apply(c);
     }
     i2s_update_irq(s);
 }
@@ -2840,7 +2893,10 @@ static void i2s_etm_task(void *opaque, int n, int level)
         return;
     }
     if (s->in_run) {
-        s->etm_deferred |= BIT(n);
+        if (!(s->etm_deferred & BIT(n))) {
+            s->etm_deferred |= BIT(n);
+            s->etm_deferred_ns[n] = esp32_line_time();
+        }
         return;
     }
     i2s_etm_apply(s, n);

@@ -49,7 +49,11 @@
  * LP GPIO matrix has only pin filters (LP_IOMUX_PADn_FILTER_EN), clocked
  * by the LP IO MUX's clock. A filter's clock stopped, it holds its
  * output. An IO MUX function that carries a peripheral signal directly
- * takes the pad's input unfiltered.
+ * takes the pad's input unfiltered. A filter's output changes at the
+ * clock edge that decides it: everything the change reaches, an ETM
+ * event among them, sees that time (see esp32_line.h), however late the
+ * QEMU timer that runs it, and every change from outside first runs the
+ * filter changes due before it, in order.
  *
  * Interrupts. GPIO_STATUS latches each pad's interrupt type
  * (GPIO_PINn_INT_TYPE) on its filtered input: edges as they happen, and
@@ -1115,8 +1119,8 @@ static void filter_next(int64_t *next, Clock *clk, int64_t anchor,
     }
 }
 
-/* Arm the timer for the earliest filter output change due. */
-static void filters_schedule(ESP32P4GpioState *s)
+/* When the earliest filter output change falls due, or INT64_MAX. */
+static int64_t filters_next(ESP32P4GpioState *s)
 {
     int64_t next = INT64_MAX;
 
@@ -1142,6 +1146,14 @@ static void filters_schedule(ESP32P4GpioState *s)
             }
         }
     }
+    return next;
+}
+
+/* Arm the timer for the earliest filter output change due. */
+static void filters_schedule(ESP32P4GpioState *s)
+{
+    int64_t next = filters_next(s);
+
     if (next == INT64_MAX) {
         timer_del(&s->filter_timer);
     } else {
@@ -1475,8 +1487,18 @@ static bool lp_sig_in_level(ESP32P4GpioState *s, unsigned sig, uint64_t raw,
     return v ^ FIELD_EX32(cfg, LP_FUNC_IN, IN_INV_SEL);
 }
 
-/* ETM events, on the edges of the pin-filtered inputs */
-static void etm_events(ESP32P4GpioState *s, uint64_t pf)
+/* Pulse ETM event line @line, of an edge at time @t. */
+static void etm_pulse(qemu_irq line, int64_t t)
+{
+    esp32_line_set_at(line, 1, t);
+    esp32_line_set_at(line, 0, t);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.etm]
+ * ETM events, on the edges of the pin-filtered inputs at time @t.
+ */
+static void etm_events(ESP32P4GpioState *s, uint64_t pf, int64_t t)
 {
     uint64_t edges = pf ^ s->pf_in;
 
@@ -1488,11 +1510,11 @@ static void etm_events(ESP32P4GpioState *s, uint64_t pf)
             !bit64(edges, n)) {
             continue;
         }
-        qemu_irq_pulse(s->etm_event[ESP32P4_GPIO_ETM_LINE(ch,
-                           bit64(pf, n) ? ESP32P4_GPIO_ETM_RISE
-                                        : ESP32P4_GPIO_ETM_FALL)]);
-        qemu_irq_pulse(s->etm_event[ESP32P4_GPIO_ETM_LINE(ch,
-                           ESP32P4_GPIO_ETM_ANY)]);
+        etm_pulse(s->etm_event[ESP32P4_GPIO_ETM_LINE(ch,
+                      bit64(pf, n) ? ESP32P4_GPIO_ETM_RISE
+                                   : ESP32P4_GPIO_ETM_FALL)], t);
+        etm_pulse(s->etm_event[ESP32P4_GPIO_ETM_LINE(ch,
+                      ESP32P4_GPIO_ETM_ANY)], t);
     }
 }
 
@@ -1519,7 +1541,7 @@ static void propagate(ESP32P4GpioState *s)
 
     resolve(s, &pad, &raw);
     run_chains(s, raw, t, &pf, &hp, &lp);
-    etm_events(s, pf);
+    etm_events(s, pf, t);
     latch_interrupts(s, hp, lp);
     changed = pad ^ s->pad_level;
     s->pad_level = pad;
@@ -1640,6 +1662,49 @@ static void notify_route(ESP32P4GpioState *s)
     notifier_list_notify(&s->route_notifiers, s);
 }
 
+/* A filter output change, at the time it falls due, esp32_line_time(). */
+static void filters_change(void *opaque)
+{
+    ESP32P4GpioState *s = opaque;
+
+    filters_advance(s, esp32_line_time());
+    esp32p4_gpio_update(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * Make the filter output changes due by t, each at its own time. Each
+ * moves the filters' next change past its own; should one not, the
+ * filters take their samples up to t at once.
+ */
+static void filters_run(ESP32P4GpioState *s, int64_t t)
+{
+    int64_t due, done = INT64_MIN;
+
+    while ((due = filters_next(s)) <= t) {
+        if (due <= done) {
+            filters_advance(s, t);
+            esp32p4_gpio_update(s);
+            return;
+        }
+        done = due;
+        esp32_line_run_at(due, filters_change, s);
+    }
+}
+
+/*
+ * A change from outside at time t: first the filter output changes due
+ * by then, which a QEMU timer running late has not yet made. Outside a
+ * resolution the filter timer is armed for the earliest change due.
+ */
+static void filters_catch_up(ESP32P4GpioState *s, int64_t t)
+{
+    if (!s->updating && timer_pending(&s->filter_timer) &&
+        timer_expire_time_ns(&s->filter_timer) <= t) {
+        filters_run(s, t);
+    }
+}
+
 /* Bring the line sources up to now, then resolve the pads. */
 static void esp32p4_gpio_sample(ESP32P4GpioState *s)
 {
@@ -1653,6 +1718,7 @@ static void esp32p4_gpio_line_sync(Notifier *n, void *data)
     ESP32P4GpioState *s = container_of(n, ESP32P4GpioState, line_source);
 
     if (sdm_clock_on(s)) {
+        filters_catch_up(s, esp32_line_time());
         esp32p4_gpio_update(s);
     }
 }
@@ -1661,8 +1727,8 @@ static void esp32p4_gpio_filter_timer(void *opaque)
 {
     ESP32P4GpioState *s = opaque;
 
-    filters_advance(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-    esp32p4_gpio_update(s);
+    filters_run(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    filters_schedule(s);
 }
 
 /* Routing queries */
@@ -2585,6 +2651,7 @@ static uint64_t esp32p4_gpio_read(void *opaque, hwaddr addr, unsigned size)
     ESP32P4GpioRegion *r = opaque;
     uint32_t v;
 
+    filters_catch_up(r->s, esp32_line_time());
     if (!blocks[r->block].read(r->s, addr & ~3, &v)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: %s read at 0x%" HWADDR_PRIx ", which has no "
@@ -2601,6 +2668,7 @@ static void esp32p4_gpio_write(void *opaque, hwaddr addr, uint64_t value,
     ESP32P4GpioRegion *r = opaque;
     unsigned shift = (addr & 3) * 8;
 
+    filters_catch_up(r->s, esp32_line_time());
     if (r->s->in_reset[blocks[r->block].reset]) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: write to the %s block at 0x%" HWADDR_PRIx
@@ -2628,6 +2696,7 @@ static void esp32p4_gpio_pad_in(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    filters_catch_up(s, esp32_line_time());
     s->ext_driven |= 1ULL << n;
     s->ext_level = deposit64(s->ext_level, n, 1, level != 0);
     esp32p4_gpio_update(s);
@@ -2638,6 +2707,7 @@ static void esp32p4_gpio_pad_release(void *opaque, int n, int level)
     ESP32P4GpioState *s = opaque;
 
     if (level) {
+        filters_catch_up(s, esp32_line_time());
         s->ext_driven &= ~(1ULL << n);
         esp32p4_gpio_update(s);
     }
@@ -2650,6 +2720,7 @@ static void esp32p4_gpio_set_sig_out(void *opaque, int n, int level)
     if (s->sig_out[n] == (level != 0)) {
         return;
     }
+    filters_catch_up(s, esp32_line_time());
     s->sig_out[n] = level != 0;
     esp32p4_gpio_update(s);
 }
@@ -2658,6 +2729,7 @@ static void esp32p4_gpio_set_sig_oe(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    filters_catch_up(s, esp32_line_time());
     s->sig_oe[n] = level != 0;
     esp32p4_gpio_update(s);
 }
@@ -2669,6 +2741,7 @@ static void esp32p4_gpio_set_lp_sig_out(void *opaque, int n, int level)
     if (s->lp_sig_out[n] == (level != 0)) {
         return;
     }
+    filters_catch_up(s, esp32_line_time());
     s->lp_sig_out[n] = level != 0;
     esp32p4_gpio_update(s);
 }
@@ -2677,6 +2750,7 @@ static void esp32p4_gpio_set_lp_sig_oe(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    filters_catch_up(s, esp32_line_time());
     s->lp_sig_oe[n] = level != 0;
     esp32p4_gpio_update(s);
 }
@@ -2685,6 +2759,7 @@ static void esp32p4_gpio_set_iomux_out(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    filters_catch_up(s, esp32_line_time());
     s->iomux_func_out[n] = level != 0;
     esp32p4_gpio_update(s);
 }
@@ -2693,6 +2768,7 @@ static void esp32p4_gpio_set_iomux_oe(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    filters_catch_up(s, esp32_line_time());
     s->iomux_func_oe[n] = level != 0;
     esp32p4_gpio_update(s);
 }
@@ -2701,6 +2777,7 @@ static void esp32p4_gpio_set_pull_up(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    filters_catch_up(s, esp32_line_time());
     s->ext_pull_up = deposit64(s->ext_pull_up, n, 1, level != 0);
     esp32p4_gpio_update(s);
 }
@@ -2709,6 +2786,7 @@ static void esp32p4_gpio_set_hold(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    filters_catch_up(s, esp32_line_time());
     s->ext_hold = deposit64(s->ext_hold, n, 1, level != 0);
     esp32p4_gpio_update(s);
 }
@@ -2726,6 +2804,7 @@ static void esp32p4_gpio_set_light_sleep(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    filters_catch_up(s, esp32_line_time());
     s->light_sleep = level != 0;
     esp32p4_gpio_update(s);
 }
@@ -2737,18 +2816,20 @@ static void esp32p4_gpio_set_light_sleep(void *opaque, int n, int level)
  * (rising), _NEG_INT_RAW (falling) and _ALL_INT_RAW, and pulse the ETM
  * event GPIO_EVT_ZERO_DET_POS<n> or _NEG<n>, but not within
  * GPIO_ZERO_DET<n>_FILTER_CNT IO MUX operating clock cycles of the
- * comparator's last interrupt.
+ * comparator's last interrupt. An edge is at its line's time, which the
+ * event carries.
  */
 static void esp32p4_gpio_set_ana_comp(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
     int64_t quiet;
     qemu_irq etm = NULL;
 
     if (s->ana_comp[n] == (level != 0)) {
         return;
     }
+    filters_catch_up(s, now);
     s->ana_comp[n] = level != 0;
     quiet = clock_ticks_to_ns(s->iomux_clk, s->zero_det[n]);
     if (s->ana_comp_int_ns[n] == INT64_MIN ||
@@ -2758,13 +2839,16 @@ static void esp32p4_gpio_set_ana_comp(void *opaque, int n, int level)
         etm = s->etm_zero_det[2 * n + (level ? 0 : 1)];
     }
     esp32p4_gpio_update(s);
-    qemu_irq_pulse(etm);
+    if (etm) {
+        etm_pulse(etm, now);
+    }
 }
 
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
  * A GPIO ETM task: set, clear or toggle GPIO_OUT of every pad whose
- * GPIO_EXT_ETM_TASK_GPIOn_EN is set and whose _SEL names the channel.
+ * GPIO_EXT_ETM_TASK_GPIOn_EN is set and whose _SEL names the channel, at
+ * the event's time, which the task's pulse carries (esp32_line_time()).
  */
 static void esp32p4_gpio_etm_task(void *opaque, int line, int level)
 {
@@ -2785,6 +2869,7 @@ static void esp32p4_gpio_etm_task(void *opaque, int line, int level)
     if (!pads) {
         return;
     }
+    filters_catch_up(s, esp32_line_time());
     out = gpio_out_all(s);
     switch (kind) {
     case ESP32P4_GPIO_ETM_SET:
@@ -2963,6 +3048,7 @@ static void esp32p4_gpio_iomux_clk_update(void *opaque, ClockEvent event)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (event == ClockPreUpdate) {
+        filters_catch_up(s, now);
         filters_advance(s, now);
         sdm_reanchor_all(s, now);
         for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
@@ -2983,6 +3069,7 @@ static void esp32p4_gpio_lp_clk_update(void *opaque, ClockEvent event)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (event == ClockPreUpdate) {
+        filters_catch_up(s, now);
         filters_advance(s, now);
         for (unsigned n = 0; n < ESP32P4_GPIO_LP_PADS; n++) {
             s->lp_pin_filter[n].tick = 0;

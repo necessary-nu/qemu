@@ -46,7 +46,10 @@
  * TARGETx_INT_RAW, a level interrupt that TARGETx_INT_ENA lets out
  * (sources 53 to 55 of the interrupt matrix), and while SYSTIMER_ETM_EN is
  * set it pulses the comparator's ETM event. The comparators need CNT_CLK
- * to run.
+ * to run. An alarm happens at the time of the CNT_CLK edge that reaches
+ * its value, however late the QEMU timer that runs it: register accesses
+ * and clock and stall changes first run the alarms due before them, in
+ * order, and the ETM event carries the alarm's time.
  *
  * Writes to TARGETx_HI, TARGETx_LO, TARGETx_PERIOD, LOAD_HI and LOAD_LO
  * take effect at the next COMPx_LOAD or UNITn_LOAD, as the TRM's
@@ -61,6 +64,7 @@
 #include "qemu/log.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/timer/esp32p4_systimer.h"
 #include "migration/vmstate.h"
 
@@ -189,22 +193,24 @@ static int systimer_comp_unit(ESP32P4SysTimerComp *c)
 }
 
 /* [spec:nuos:req:emu.esp32p4.timers] */
-static void systimer_alarm(ESP32P4SysTimerState *s, int x)
+static void systimer_alarm(ESP32P4SysTimerState *s, int x, int64_t when)
 {
     s->int_raw |= BIT(x);
     systimer_update_irqs(s);
     if (s->conf & CONF_ETM_EN) {
-        qemu_irq_pulse(s->etm_event[x]);
+        esp32_line_set_at(s->etm_event[x], 1, when);
+        esp32_line_set_at(s->etm_event[x], 0, when);
     }
 }
 
 /*
  * [spec:nuos:req:emu.esp32p4.timers]
- * Compare comparator @x at CNT_CLK edge @edges: alarm if its value has
- * been reached or passed, and schedule its next alarm otherwise.
+ * Compare comparator @x at CNT_CLK edge @edges, at time @now: alarm if
+ * its value has been reached or passed, and schedule its next alarm
+ * otherwise.
  */
 static void systimer_comp_check(ESP32P4SysTimerState *s, int x,
-                                uint64_t edges)
+                                uint64_t edges, int64_t now)
 {
     ESP32P4SysTimerComp *c = &s->comp[x];
     int n = systimer_comp_unit(c);
@@ -217,7 +223,7 @@ static void systimer_comp_check(ESP32P4SysTimerState *s, int x,
     }
     v = systimer_unit_value(s, n, edges);
     if (((v - c->real) & COUNT_MASK) < PASSED_RANGE) {
-        systimer_alarm(s, x);
+        systimer_alarm(s, x, now);
         if (!(c->conf & TCONF_PERIOD_MODE)) {
             c->armed = false;
             return;
@@ -236,15 +242,17 @@ static void systimer_comp_check(ESP32P4SysTimerState *s, int x,
         return;
     }
     ahead = (c->real - v) & COUNT_MASK;
-    timer_mod(&c->timer, systimer_edge_ns(s, edges + ahead));
+    c->due_ns = systimer_edge_ns(s, edges + ahead);
+    timer_mod(&c->timer, c->due_ns);
 }
 
-static void systimer_check_all(ESP32P4SysTimerState *s, uint64_t edges)
+static void systimer_check_all(ESP32P4SysTimerState *s, uint64_t edges,
+                               int64_t now)
 {
     int x;
 
     for (x = 0; x < ESP32P4_SYSTIMER_COMPS; x++) {
-        systimer_comp_check(s, x, edges);
+        systimer_comp_check(s, x, edges, now);
     }
 }
 
@@ -263,9 +271,10 @@ static void systimer_comp_start(ESP32P4SysTimerState *s, int x,
 
 /*
  * Re-evaluate which counters run, after folding their counts at @edges,
- * and the comparators against them.
+ * and the comparators against them, at time @now.
  */
-static void systimer_update(ESP32P4SysTimerState *s, uint64_t edges)
+static void systimer_update(ESP32P4SysTimerState *s, uint64_t edges,
+                            int64_t now)
 {
     int n;
 
@@ -273,17 +282,48 @@ static void systimer_update(ESP32P4SysTimerState *s, uint64_t edges)
     for (n = 0; n < ESP32P4_SYSTIMER_UNITS; n++) {
         s->unit[n].running = systimer_unit_should_run(s, n);
     }
-    systimer_check_all(s, edges);
+    systimer_check_all(s, edges, now);
+}
+
+/*
+ * Comparator @x's alarm falls due: compare it at its due time, the edge
+ * that reaches its value, which a QEMU timer running late has passed.
+ */
+static void systimer_comp_due(ESP32P4SysTimerState *s, int x)
+{
+    ESP32P4SysTimerComp *c = &s->comp[x];
+
+    timer_del(&c->timer);
+    systimer_comp_check(s, x, systimer_edges(s, c->due_ns), c->due_ns);
+}
+
+/* Run the alarms that fell due by @now, in order. */
+static void systimer_catch_up(ESP32P4SysTimerState *s, int64_t now)
+{
+    for (;;) {
+        int next = -1;
+        int x;
+
+        for (x = 0; x < ESP32P4_SYSTIMER_COMPS; x++) {
+            ESP32P4SysTimerComp *c = &s->comp[x];
+
+            if (timer_pending(&c->timer) && c->due_ns <= now &&
+                (next < 0 || c->due_ns < s->comp[next].due_ns)) {
+                next = x;
+            }
+        }
+        if (next < 0) {
+            return;
+        }
+        systimer_comp_due(s, next);
+    }
 }
 
 static void systimer_comp_cb(void *opaque)
 {
     ESP32P4SysTimerComp *c = opaque;
-    ESP32P4SysTimerState *s = c->s;
 
-    systimer_comp_check(s, c - s->comp,
-                        systimer_edges(s, qemu_clock_get_ns(
-                                           QEMU_CLOCK_VIRTUAL)));
+    systimer_comp_due(c->s, c - c->s->comp);
 }
 
 /*
@@ -296,27 +336,32 @@ static void systimer_clk_update(void *opaque, ClockEvent event)
 {
     ESP32P4SysTimerState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint64_t edges = systimer_edges(s, now);
+    uint64_t edges;
 
     if (event == ClockPreUpdate) {
+        systimer_catch_up(s, now);
+        edges = systimer_edges(s, now);
         systimer_sync_units(s, edges);
         s->clk_edges = edges;
         s->clk_ns = now;
         return;
     }
     s->clk_ns = now;
-    systimer_update(s, s->clk_edges);
+    systimer_update(s, s->clk_edges, now);
 }
 
 /* [spec:nuos:req:emu.esp32p4.timers] */
 static void systimer_set_stall(void *opaque, int core, int level)
 {
     ESP32P4SysTimerState *s = opaque;
-    uint64_t edges = systimer_edges(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t edges;
 
+    systimer_catch_up(s, now);
+    edges = systimer_edges(s, now);
     systimer_sync_units(s, edges);
     s->stall[core] = level;
-    systimer_update(s, edges);
+    systimer_update(s, edges, now);
 }
 
 /* The register at word offset @addr; false for a reserved offset. */
@@ -403,6 +448,7 @@ static uint64_t systimer_read(void *opaque, hwaddr addr, unsigned size)
     ESP32P4SysTimerState *s = opaque;
     uint32_t v;
 
+    systimer_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     if (!systimer_read_reg(s, addr & ~3, &v)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of reserved offset 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_SYSTIMER, addr);
@@ -412,7 +458,7 @@ static uint64_t systimer_read(void *opaque, hwaddr addr, unsigned size)
 
 /* [spec:nuos:req:emu.esp32p4.timers] */
 static void systimer_write_conf(ESP32P4SysTimerState *s, uint32_t value,
-                                uint64_t edges)
+                                uint64_t edges, int64_t now)
 {
     uint32_t old = s->conf;
     int x;
@@ -424,7 +470,7 @@ static void systimer_write_conf(ESP32P4SysTimerState *s, uint32_t value,
             systimer_comp_start(s, x, edges);
         }
     }
-    systimer_update(s, edges);
+    systimer_update(s, edges, now);
 }
 
 /*
@@ -434,9 +480,9 @@ static void systimer_write_conf(ESP32P4SysTimerState *s, uint32_t value,
  * written as 1 for its write-trigger and write-1-to-clear ones.
  */
 static void systimer_write_reg(ESP32P4SysTimerState *s, hwaddr addr,
-                               uint32_t value, uint32_t ones)
+                               uint32_t value, uint32_t ones, int64_t now)
 {
-    uint64_t edges = systimer_edges(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    uint64_t edges = systimer_edges(s, now);
     ESP32P4SysTimerUnit *u;
     ESP32P4SysTimerComp *c;
     uint32_t old;
@@ -444,7 +490,7 @@ static void systimer_write_reg(ESP32P4SysTimerState *s, hwaddr addr,
 
     switch (addr) {
     case A_CONF:
-        systimer_write_conf(s, value, edges);
+        systimer_write_conf(s, value, edges, now);
         break;
     case A_UNIT_OP(0):
     case A_UNIT_OP(1):
@@ -489,7 +535,7 @@ static void systimer_write_reg(ESP32P4SysTimerState *s, hwaddr addr,
         if (c->conf & ~old & TCONF_PERIOD_MODE) {
             systimer_comp_start(s, i, edges);
         }
-        systimer_comp_check(s, i, edges);
+        systimer_comp_check(s, i, edges, now);
         break;
     case A_COMP_LOAD(0):
     case A_COMP_LOAD(1):
@@ -500,7 +546,7 @@ static void systimer_write_reg(ESP32P4SysTimerState *s, hwaddr addr,
             c->period = c->conf & TCONF_PERIOD_MASK;
             c->real = c->target;
             systimer_comp_start(s, i, edges);
-            systimer_comp_check(s, i, edges);
+            systimer_comp_check(s, i, edges, now);
         }
         break;
     case A_UNIT_LOAD(0):
@@ -509,7 +555,7 @@ static void systimer_write_reg(ESP32P4SysTimerState *s, hwaddr addr,
             u = &s->unit[(addr - A_UNIT_LOAD(0)) / 4];
             u->value = u->load;
             u->sync = edges;
-            systimer_check_all(s, edges);
+            systimer_check_all(s, edges, now);
         }
         break;
     case A_INT_ENA:
@@ -544,13 +590,15 @@ static void systimer_write(void *opaque, hwaddr addr, uint64_t data,
                            unsigned size)
 {
     ESP32P4SysTimerState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     unsigned shift = (addr & 3) * 8;
     uint32_t lanes = MAKE_64BIT_MASK(shift, size * 8);
     uint32_t ones = (data << shift) & lanes;
     uint32_t old;
 
+    systimer_catch_up(s, now);
     systimer_read_reg(s, addr & ~3, &old);
-    systimer_write_reg(s, addr & ~3, (old & ~lanes) | ones, ones);
+    systimer_write_reg(s, addr & ~3, (old & ~lanes) | ones, ones, now);
 }
 
 static const MemoryRegionOps systimer_ops = {
@@ -647,6 +695,7 @@ static const VMStateDescription vmstate_esp32p4_systimer_comp = {
         VMSTATE_UINT32(period, ESP32P4SysTimerComp),
         VMSTATE_UINT64(real, ESP32P4SysTimerComp),
         VMSTATE_BOOL(armed, ESP32P4SysTimerComp),
+        VMSTATE_INT64(due_ns, ESP32P4SysTimerComp),
         VMSTATE_TIMER(timer, ESP32P4SysTimerComp),
         VMSTATE_END_OF_LIST()
     },
@@ -654,8 +703,8 @@ static const VMStateDescription vmstate_esp32p4_systimer_comp = {
 
 static const VMStateDescription vmstate_esp32p4_systimer = {
     .name = TYPE_ESP32P4_SYSTIMER,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4SysTimerState),
         VMSTATE_UINT32(conf, ESP32P4SysTimerState),
