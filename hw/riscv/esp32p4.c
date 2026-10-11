@@ -90,6 +90,14 @@
  *
  *       -M esp32p4,strap-mode=0x08
  *
+ *   - The DMA controllers (TRM chapters 6 and 7): GDMA-AHB at 0x50085000
+ *     and GDMA-AXI at 0x5008A000, three RX and three TX channels each,
+ *     behind AHB_PDMA_SYS_CLK and AXI_PDMA_SYS_CLK and their resets, their
+ *     channels' interrupts sources 56 to 67; and VDMA, a DesignWare AXI DMA
+ *     controller, at 0x50081000, behind GDMA_SYS_CLK and the GDMA reset,
+ *     its interrupt source 24. Their accesses go through the DMA APM as
+ *     the DMA masters they are, to memory directly, past the caches. No
+ *     peripheral that uses them is modelled yet.
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
  * a file longer than 512 bytes. A blank, all-zero, file starts as a
@@ -157,16 +165,13 @@ static const struct {
     { "usb-otg-hs",       0x50000000, 256 * KiB },
     { "usb-otg-fs",       0x50040000, 256 * KiB },
     { "usb-wrap",         0x50080000, 4 * KiB },
-    { "vdma",             0x50081000, 4 * KiB },
     { "pau",              0x50082000, 4 * KiB },
     { "sdmmc",            0x50083000, 4 * KiB },
     { "h264",             0x50084000, 4 * KiB },
-    { "ahb-dma",          0x50085000, 4 * KiB },
     { "jpeg",             0x50086000, 4 * KiB },
     { "ppa",              0x50087000, 4 * KiB },
     { "dma2d",            0x50088000, 4 * KiB },
     { "keymng",           0x50089000, 4 * KiB },
-    { "axi-dma",          0x5008a000, 8 * KiB },
     { "aes",              0x50090000, 4 * KiB },
     { "sha",              0x50091000, 4 * KiB },
     { "rsa",              0x50092000, 4 * KiB },
@@ -993,6 +998,66 @@ static void esp32p4_init_pms(ESP32P4MachineState *s)
                                     ESP32P4_PMS_LP_RESET, 0));
 }
 
+/*
+ * The DMA controllers, on the bus through the APMs: GDMA-AHB and GDMA-AXI,
+ * each behind its bus clock and reset, which also clock its transfers,
+ * and VDMA behind GDMA_SYS_CLK and its reset.
+ */
+/* [spec:nuos:req:emu.esp32p4.dma] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_dma(ESP32P4MachineState *s)
+{
+    static const struct {
+        const char *type;
+        const char *clock;
+        hwaddr base;
+        unsigned bus_clock;
+        unsigned reset;
+        int intr;
+    } gdma[2] = {
+        { TYPE_ESP32P4_AHB_GDMA, "ahb-pdma-sys", ESP32P4_AHB_GDMA_BASE,
+          ESP32P4_CLK_AHB_PDMA_SYS, ESP32P4_RST_AHB_PDMA,
+          ESP32P4_INTR_AHB_PDMA_IN_CH0 },
+        { TYPE_ESP32P4_AXI_GDMA, "axi-pdma-sys", ESP32P4_AXI_GDMA_BASE,
+          ESP32P4_CLK_AXI_PDMA_SYS, ESP32P4_RST_AXI_PDMA,
+          ESP32P4_INTR_AXI_PDMA_IN_CH0 },
+    };
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    DeviceState *dev;
+    int i, n;
+
+    for (i = 0; i < 2; i++) {
+        object_initialize_child(OBJECT(s), i ? "axi-gdma" : "ahb-gdma",
+                                &s->gdma[i], gdma[i].type);
+        dev = DEVICE(&s->gdma[i]);
+        object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
+                                 &error_abort);
+        qdev_connect_clock_in(dev, "clk",
+                              qdev_get_clock_out(clkrst, gdma[i].clock));
+        sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+        esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                 gdma[i].base, gdma[i].bus_clock,
+                                 gdma[i].reset, 0);
+        for (n = 0; n < 2 * ESP32P4_GDMA_CHANNELS; n++) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(dev), n,
+                               esp32p4_intr_source(s, gdma[i].intr + n));
+        }
+    }
+
+    object_initialize_child(OBJECT(s), "vdma", &s->vdma,
+                            TYPE_ESP32P4_DW_GDMA);
+    dev = DEVICE(&s->vdma);
+    object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, "gdma-sys"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_DW_GDMA_BASE, ESP32P4_CLK_GDMA_SYS,
+                             ESP32P4_RST_GDMA, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_DW_GDMA));
+}
+
 /* The memories -kernel can load into: those the cores address directly. */
 static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
 {
@@ -1129,6 +1194,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_gpio(s);
     esp32p4_init_pms(s);
     esp32p4_init_ext_memory(s);
+    esp32p4_init_dma(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
                         esp32p4_unimplemented[i].name,
