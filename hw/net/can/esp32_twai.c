@@ -105,7 +105,7 @@ static void esp32_twai_update_lines(Esp32TWAIState *s)
 {
     uint8_t sr = (s->sja_state.clock & 0x80) ? s->sja_state.status_pel :
                                               s->sja_state.status_bas;
-    bool clkout = esp32_twai_clkout(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    bool clkout = esp32_twai_clkout(s, esp32_line_time());
 
     qemu_set_irq(s->tx_out, 1);
     qemu_set_irq(s->bus_off_out, (sr & TWAI_SR_BUS_OFF) != 0);
