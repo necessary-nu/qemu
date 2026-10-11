@@ -771,6 +771,30 @@ static void test_calibration(void)
 }
 
 /*
+ * The value counts XTAL_CLK's edges at their own times, at whatever phase
+ * they have to the measured clock's. RC_SLOW_CLK, 20000/3 ns a cycle,
+ * starts 1000 ns into XTAL_CLK's 25 ns cycles: its first edge comes at
+ * 7666 2/3 ns and its second at 14333 1/3 ns, and the XTAL_CLK edges in
+ * between, at 7675 to 14325 ns, are 267, though the cycle lasts 266 2/3
+ * XTAL_CLK cycles. The measurement ends at the first ns after.
+ */
+/* [spec:nuos:req:emu.esp32p4.timers/test] */
+static void test_calibration_phase(void)
+{
+    QTestState *qts = start();
+
+    step(qts, 1000);
+    cal_clock(qts, 8, 1);
+    cal_start(qts, 1);
+    step(qts, 14333 - now);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG) & CAL_RDY, ==, 0);
+    step(qts, 1);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG) & CAL_RDY, ==, CAL_RDY);
+    g_assert_cmpuint(CAL1_VALUE(rd(qts, 0, RTCCALICFG1)), ==, 267);
+    qtest_quit(qts);
+}
+
+/*
  * The block's reset line and bus clock; and byte accesses, which read and
  * write their bytes of a register.
  */
@@ -810,6 +834,8 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/timg/wdt-core-reset", test_wdt_core_reset);
     qtest_add_func("/esp32p4/timg/wdt-flashboot", test_wdt_flashboot);
     qtest_add_func("/esp32p4/timg/calibration", test_calibration);
+    qtest_add_func("/esp32p4/timg/calibration-phase",
+                   test_calibration_phase);
     qtest_add_func("/esp32p4/timg/gating", test_gating);
     return g_test_run();
 }

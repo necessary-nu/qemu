@@ -490,4 +490,63 @@ static inline int64_t esp32p4_clk_count_time(const ESP32P4ClkCount *c,
     return c->origin_ns + ns;
 }
 
+/*
+ * The cycles @x has completed by the exact time cycle @k of @c completes,
+ * which need not be a whole ns: 0 before @x's origin and while either is
+ * stopped; saturating at UINT64_MAX. Of two clocks on one count, as a
+ * calibration counts one clock's edges between two of another's.
+ */
+static inline uint64_t esp32p4_clk_count_at_cycle(const ESP32P4ClkCount *x,
+                                                  const ESP32P4ClkCount *c,
+                                                  uint64_t k)
+{
+    ESP32P4ClkPeriod pc = c->period, px = x->period;
+    uint64_t y[3], v[3], lo, hi, r, q_hi, q_lo, d_hi, d_lo, w_hi, w_lo;
+    int64_t d = c->origin_ns - x->origin_ns;
+    uint64_t ad = d < 0 ? -(uint64_t)d : (uint64_t)d;
+    bool rem;
+
+    if (!esp32p4_clk_period_running(pc) || !esp32p4_clk_period_running(px)) {
+        return 0;
+    }
+    /* k * pc = q + r / pc.den units: q, 128 bits, and r. */
+    esp32p4_mul_64_128(y, k, pc.num_hi, pc.num_lo);
+    if (y[2] >= pc.den) {
+        return UINT64_MAX;
+    }
+    lo = y[1];
+    hi = y[2];
+    r = divu128(&lo, &hi, pc.den);
+    q_hi = lo;
+    lo = y[0];
+    hi = r;
+    r = divu128(&lo, &hi, pc.den);
+    q_lo = lo;
+    /* The time from @x's origin, in whole units w and r / pc.den. */
+    d_hi = ad >> 32;
+    d_lo = ad << 32;
+    if (d >= 0) {
+        w_lo = q_lo + d_lo;
+        w_hi = q_hi + d_hi + (w_lo < q_lo);
+    } else if (q_hi > d_hi || (q_hi == d_hi && q_lo >= d_lo)) {
+        w_lo = q_lo - d_lo;
+        w_hi = q_hi - d_hi - (q_lo < d_lo);
+    } else {
+        return 0;
+    }
+    /*
+     * Over px: (w + r / pc.den) * px.den / px.num, rounded down; the
+     * fraction r * px.den / pc.den, below px.den, adds its whole part, as
+     * what is left of it is below 1 and cannot carry the division.
+     */
+    esp32p4_mul_64_128(v, px.den, w_hi, w_lo);
+    mulu64(&lo, &hi, r, px.den);
+    divu128(&lo, &hi, pc.den);
+    v[0] += lo;
+    if (v[0] < lo && !++v[1]) {
+        v[2]++;
+    }
+    return esp32p4_div_192_128(v, px.num_hi, px.num_lo, &rem);
+}
+
 #endif
