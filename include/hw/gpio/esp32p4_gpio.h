@@ -461,9 +461,10 @@ bool esp32p4_gpio_pad_driven(ESP32P4GpioState *s, unsigned n, bool *level);
  * the GPIO matrix or IO MUX connects to sig has its input enabled, is not
  * driven from outside or on a board wire, and is driven, push-pull, by
  * output signal *src through the matrix or its IO MUX function.
- * *inverted says whether the path inverts the level. Returns false if sig has no such source. For a
- * peripheral that models a serial link a frame at a time, to find which
- * of its own outputs one of its inputs listens to.
+ * *inverted says whether the path inverts the level. Returns false if sig
+ * has no such source. For a peripheral that models a serial link a frame
+ * at a time, to find which of its own outputs one of its inputs listens
+ * to.
  */
 bool esp32p4_gpio_sig_in_source(ESP32P4GpioState *s, unsigned sig,
                                 unsigned *src, bool *inverted);

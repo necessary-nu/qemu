@@ -365,8 +365,9 @@ static uint32_t esp32p4_i2c_ctr(ESP32P4I2CState *s)
 {
     uint32_t sync = esp32p4_i2c_is_lp(s) ? esp32p4_i2c_regs[R_CTR].sync_lp
                                          : esp32p4_i2c_regs[R_CTR].sync_hp;
+    uint32_t synced = s->act[R_CTR] & sync;
 
-    return (s->act[R_CTR] & sync) | (s->regs[R_CTR] & ~sync);
+    return synced | (s->regs[R_CTR] & ~sync);
 }
 
 static bool esp32p4_i2c_master(ESP32P4I2CState *s)
