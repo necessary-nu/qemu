@@ -892,15 +892,28 @@ static void esp32_rtc_mem_crc(Esp32RtcCntlState *s, uint32_t old)
 
 /*
  * [spec:nuos:req:emu.esp32.rtc]
- * A register access first makes the alarm and TIME_VALID, if due by its
- * moment, take effect, so that what software reads and writes does not
- * depend on how promptly the host runs their timers: an INT_RAW read
- * after the RTC timer has passed the alarm shows it, and an INT_CLR
- * after it clears it.
+ * A register access first makes the alarm, TIME_VALID and a watchdog
+ * stage ending in an interrupt, if due by its moment, take effect, so
+ * that what software reads and writes does not depend on how promptly
+ * the host runs their timers: an INT_RAW read after the RTC timer has
+ * passed the alarm shows it, and an INT_CLR after it clears it. A stage
+ * that resets is left to its timer: a reset is not made from within an
+ * access.
  */
 static void esp32_rtc_catch_up(Esp32RtcCntlState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    unsigned action;
+
+    while (timer_pending(&s->wdt_timer) &&
+           timer_expire_time_ns(&s->wdt_timer) <= now) {
+        action = esp32_rtc_wdt_action(s);
+        if (action != WDT_STG_INT && action != WDT_STG_OFF) {
+            break;
+        }
+        timer_del(&s->wdt_timer);
+        esp32_rtc_wdt_cb(s);
+    }
 
     if (timer_pending(&s->valid_timer) &&
         timer_expire_time_ns(&s->valid_timer) <= now) {

@@ -38,6 +38,7 @@ static void esp32_timg_cal_fold(Esp32TimgState *s, int64_t now);
 static void esp32_timg_cal_arm(Esp32TimgState *s, int64_t now);
 static void esp32_timg_int_update(Esp32TimgState *s);
 static void esp32_timg_timer_cb(void *opaque);
+static void esp32_timg_wdt_cb(void *opaque);
 static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_update_config(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_feed(Esp32TimgWdtState *ws);
@@ -77,15 +78,26 @@ static inline qemu_irq get_edge_irq(Esp32TimgState* s, Esp32TimgInterruptType it
 
 /*
  * [spec:nuos:req:emu.esp32.clock-gating]
- * A register access first makes the timers' alarms due by its moment take
- * effect, each at its own time, so that what software reads and writes
- * (INT_RAW, a reloaded count, an INT_CLR) does not depend on how promptly
- * the host runs their QEMU timers.
+ * A register access first makes the timers' alarms, and the watchdog's
+ * stages ending in an interrupt, due by its moment take effect, each at
+ * its own time, so that what software reads and writes (INT_RAW, a
+ * reloaded count, an INT_CLR) does not depend on how promptly the host
+ * runs their QEMU timers. A stage that resets is left to its timer: a
+ * reset is not made from within an access.
  */
 static void esp32_timg_catch_up(Esp32TimgState *s)
 {
     Esp32TimgTimerState *timers[] = { &s->t0, &s->t1, &s->lact };
+    Esp32TimgWdtState *ws = &s->wdt;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    while (timer_pending(&ws->stage_timer) &&
+           timer_expire_time_ns(&ws->stage_timer) <= now &&
+           (ws->mode[ws->cur_stage] == WDT_MODE_INT ||
+            ws->mode[ws->cur_stage] == WDT_MODE_OFF)) {
+        timer_del(&ws->stage_timer);
+        esp32_timg_wdt_cb(ws);
+    }
 
     for (int i = 0; i < ARRAY_SIZE(timers); i++) {
         Esp32TimgTimerState *ts = timers[i];
