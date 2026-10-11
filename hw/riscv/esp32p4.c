@@ -203,6 +203,30 @@
  *
  *       -global esp32p4-gpio.pad-wires=7:9,8:10
  *
+ *   - I2S0 to I2S2 (TRM chapter 49) at 0x500C6000, each behind its
+ *     I2Sn_APB_CLK and reset, its units on I2Sn_TX_CLK and I2Sn_RX_CLK,
+ *     moving data through GDMA-AHB, its interrupt I2Sn_INTR (sources 27 to
+ *     29), its signals matrix signals 25 to 45 and its ETM events and
+ *     tasks; and the LP I2S with its voice activity detection (chapters
+ *     50 and 44) at 0x50125000, behind LPPERI's LP_I2S gate and reset, on
+ *     LP_I2S_RX_CLK, its memory read at 0x50125C00, its interrupt
+ *     LP_I2S_INTR (source 12), its signals LP matrix signals 9 to 11. The
+ *     controllers clock and feed each other through whatever pads the
+ *     matrices route between them, and I2Sn_MCLK_out reaches another's
+ *     I2Sn_MCLK_in, a source of its unit clocks, the same way. The
+ *     machine's audiodev stands for a codec on every controller's bus:
+ *
+ *       -audiodev coreaudio,id=snd0 -M esp32p4,audiodev=snd0
+ *
+ *   - The RMT (TRM chapter 60) at 0x500A2000, behind RMT_SYS_CLK and its
+ *     reset, timed by RMT_CLK, its interrupt RMT_INTR (source 43), its four
+ *     TX outputs and four RX inputs matrix signals 246 to 249, and TX
+ *     channel 3 and RX channel 7 served by GDMA-AHB (PERI_SEL 10); and the
+ *     PCNT (TRM chapter 51) at 0x500C9000, behind PCNT_APB_CLK and its
+ *     reset, which also filters its inputs, its interrupt PCNT_INTR
+ *     (source 111), its four units' signal, control and clear inputs
+ *     matrix signals 141 to 156 and 63 to 66.
+ *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
  * a file longer than 512 bytes. A blank, all-zero, file starts as a
@@ -302,7 +326,6 @@ static const struct {
     { "dsi-host",         0x500a0000, 2 * KiB },
     { "dsi-bridge",       0x500a0800, 2 * KiB },
     { "isp",              0x500a1000, 4 * KiB },
-    { "rmt",              0x500a2000, 4 * KiB },
     /* The AXI ICM's QoS command interface, above its own registers. */
     { "axi-icm-qos",      0x500a4400, 3 * KiB },
     { "h264-dma",         0x500a7000, 4 * KiB },
@@ -310,10 +333,6 @@ static const struct {
     /* HP peripherals 1. */
     { "mcpwm0",           0x500c0000, 4 * KiB },
     { "mcpwm1",           0x500c1000, 4 * KiB },
-    { "i2s0",             0x500c6000, 4 * KiB },
-    { "i2s1",             0x500c7000, 4 * KiB },
-    { "i2s2",             0x500c8000, 4 * KiB },
-    { "pcnt",             0x500c9000, 4 * KiB },
     { "uart0",            0x500ca000, 4 * KiB },
     { "uart1",            0x500cb000, 4 * KiB },
     { "uart2",            0x500cc000, 4 * KiB },
@@ -342,7 +361,6 @@ static const struct {
     /* LP peripherals. */
     { "lp-uart",          0x50121000, 4 * KiB },
     { "lp-spi",           0x50123000, 4 * KiB },
-    { "lp-i2s",           0x50125000, 4 * KiB },
     { "lp-trng",          0x50126000, 4 * KiB },
     { "lp-adc",           0x50127000, 4 * KiB },
     { "lp-touch",         0x50128000, 4 * KiB },
@@ -581,6 +599,17 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
      */
     qdev_connect_clock_in(clkrst, "pad-emac-txrx-in",
                           qdev_get_clock_out(DEVICE(&s->emac), "pad-txrx"));
+    /*
+     * PAD_I2Sn_MCLK: I2Sn_MCLK_in, which the pads may connect to another
+     * controller's I2Sn_MCLK_out (esp32p4_init_i2s()).
+     */
+    for (i = 0; i < ESP32P4_I2S_HP_COUNT; i++) {
+        g_autofree char *in = g_strdup_printf("pad-i2s%d-mclk-in", i);
+
+        qdev_connect_clock_in(clkrst, in,
+                              qdev_get_clock_out(DEVICE(&s->i2s[i]),
+                                                 "pad-mclk"));
+    }
     sysbus_realize(SYS_BUS_DEVICE(ana), &error_fatal);
     sysbus_realize(SYS_BUS_DEVICE(clkrst), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(clkrst), ESP32P4_CLKRST_MMIO_HP,
@@ -1918,9 +1947,10 @@ static void esp32p4_hp_top_power(void *opaque, int n, int level)
  *     HP_SYSTEM's interrupt wakeup (the TRM's "HP CPU" source) and the EXT
  *     wakeup on pads GPIO0 to GPIO15, which LP_SYSTEM records too. Its ETM
  *     task, PMU_TASK_SLEEP_REQ, and event, PMU_EVT_SLEEP_WAKEUP, are the
- *     ETM's (esp32p4_init_etm()). The other sources' "wakeup" lines,
- *     UART_WAKEUP_EN and the LP interrupt wait for the blocks that take
- *     them (UARTs, USB, SDIO, touch, LP I2S, EMAC, the LP core's
+ *     ETM's (esp32p4_init_etm()), and the LP I2S's VAD wakeup is
+ *     connected with the LP I2S (esp32p4_init_i2s()). The other sources'
+ *     "wakeup" lines, UART_WAKEUP_EN and the LP interrupt wait for the
+ *     blocks that take them (UARTs, USB, SDIO, touch, EMAC, the LP core's
  *     interrupts).
  *   - LP_ANALOG_PERI, behind its LP_CLKRST reset, its interrupt source 8:
  *     the brown-out detector, on BIAS's thresholds, and the glitch and
@@ -2452,14 +2482,184 @@ static void esp32p4_init_parlio(ESP32P4MachineState *s)
 }
 
 /*
+ * I2S0 to I2S2 and the LP I2S (TRM chapters 49, 50 and 44). Each HP
+ * controller's registers are behind I2Sn_APB_CLK and its reset; its units
+ * run on I2Sn_TX_CLK and I2Sn_RX_CLK, and I2Sn_MCLK_out is
+ * I2Sn_MST_CLK; GDMA-AHB serves it; its interrupt is I2Sn_INTR (sources
+ * 27 to 29) and its signals are matrix signals 25 to 45. The LP I2S is
+ * behind LPPERI's LP_I2S clock gate and reset, receives on LP_I2S_RX_CLK,
+ * interrupts with LP_I2S_INTR (source 12) and has LP matrix signals 9 to
+ * 11; its VAD's LP_I2S_WAKEUP is the PMU's wakeup source 19. Every
+ * controller sees the others, so that one's master clock can drive
+ * another's slave units through the pads.
+ */
+/* [spec:nuos:req:emu.esp32p4.i2s] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_i2s(ESP32P4MachineState *s)
+{
+    static const char *const links[ESP32P4_I2S_COUNT] = {
+        "i2s0", "i2s1", "i2s2", "lp-i2s",
+    };
+    MachineState *ms = MACHINE(s);
+    DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
+    ESP32P4ClkRstGate *g;
+    int i, k, l;
+
+    for (i = 0; i < ESP32P4_I2S_COUNT; i++) {
+        DeviceState *dev = DEVICE(&s->i2s[i]);
+        bool lp = i == ESP32P4_I2S_LP_ID;
+
+        for (k = 0; k < ESP32P4_I2S_COUNT; k++) {
+            object_property_set_link(OBJECT(dev), links[k],
+                                     OBJECT(&s->i2s[k]), &error_abort);
+        }
+        object_property_set_link(OBJECT(dev), "gpio", OBJECT(&s->gpio),
+                                 &error_abort);
+        if (ms->audiodev) {
+            qdev_prop_set_string(dev, "audiodev", ms->audiodev);
+        }
+        if (lp) {
+            qdev_connect_clock_in(dev, "apb",
+                                  qdev_get_clock_out(clkrst, "lp-i2s"));
+            qdev_connect_clock_in(dev, "rx",
+                                  qdev_get_clock_out(clkrst, "lp-i2s-rx"));
+        } else {
+            static const char *const clk[] = { "apb", "tx", "rx", "mst" };
+
+            qdev_prop_set_uint8(dev, "id", i);
+            object_property_set_link(OBJECT(dev), "gdma",
+                                     OBJECT(&s->gdma[0]), &error_abort);
+            for (k = 0; k < ARRAY_SIZE(clk); k++) {
+                g_autofree char *out = g_strdup_printf("i2s%d-%s", i, clk[k]);
+
+                qdev_connect_clock_in(dev, clk[k],
+                                      qdev_get_clock_out(clkrst, out));
+            }
+        }
+        sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+        if (lp) {
+            g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                         ESP32P4_LP_I2S_BASE,
+                                         ESP32P4_CLK_LP_I2S,
+                                         ESP32P4_RST_LP_I2S, 0);
+            /* LP_I2S_RAM_BASE: reading pops the memory. */
+            esp32p4_clkrst_gate_volatile(g, 0xc00, 0x400);
+            sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                               esp32p4_intr_source(s, ESP32P4_INTR_LP_I2S));
+            qdev_connect_gpio_out_named(dev, ESP32P4_I2S_WAKEUP, 0,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->pmu),
+                                            ESP32P4_PMU_WAKEUP,
+                                            ESP32P4_PMU_WAKE_LP_I2S));
+        } else {
+            esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                     ESP32P4_I2S0_BASE + i * ESP32P4_I2S_SIZE,
+                                     ESP32P4_CLK_I2S0_APB + i,
+                                     ESP32P4_RST_I2S0_APB + i, 0);
+            sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                               esp32p4_intr_source(s, ESP32P4_INTR_I2S0 + i));
+        }
+        for (l = 0; l < ESP32P4_I2S_OUT_COUNT; l++) {
+            int sig = esp32p4_i2s_out_signal(i, l);
+
+            if (sig >= 0) {
+                qdev_connect_gpio_out_named(dev, ESP32P4_I2S_SIG_OUT, l,
+                    qdev_get_gpio_in_named(gpio, lp ? ESP32P4_GPIO_LP_SIG_OUT
+                                                    : ESP32P4_GPIO_SIG_OUT,
+                                           sig));
+            }
+        }
+        for (l = 0; l < ESP32P4_I2S_IN_COUNT; l++) {
+            int sig = esp32p4_i2s_in_signal(i, l);
+
+            if (sig >= 0) {
+                qdev_connect_gpio_out_named(gpio, lp ? ESP32P4_GPIO_LP_SIG_IN
+                                                     : ESP32P4_GPIO_SIG_IN,
+                                            sig,
+                                            qdev_get_gpio_in_named(dev,
+                                                ESP32P4_I2S_SIG_IN, l));
+            }
+        }
+    }
+}
+
+/*
+ * The RMT, its registers and RAM behind RMT_SYS_CLK and held by RST_EN_RMT,
+ * on RMT_CLK, its DMA channels on GDMA-AHB; and the PCNT, behind
+ * PCNT_APB_CLK, held by RST_EN_PCNT. Their pad signals go through the GPIO
+ * matrix. The RX channels' FIFO registers, whose reads move the RMT's
+ * pointers, are volatile while the block is gated.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt] */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+static void esp32p4_init_rmt_pcnt(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
+    DeviceState *dev;
+    ESP32P4ClkRstGate *g;
+    int n, u;
+
+    object_initialize_child(OBJECT(s), "rmt", &s->rmt, TYPE_ESP32P4_RMT);
+    dev = DEVICE(&s->rmt);
+    object_property_set_link(OBJECT(dev), "gdma", OBJECT(&s->gdma[0]),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "sclk", qdev_get_clock_out(clkrst, "rmt"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                 ESP32P4_RMT_BASE, ESP32P4_CLK_RMT_SYS,
+                                 ESP32P4_RST_RMT, 0);
+    esp32p4_clkrst_gate_volatile(g, 0x10, 4 * ESP32P4_RMT_RX_CHANNELS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_RMT));
+    for (n = 0; n < ESP32P4_RMT_TX_CHANNELS; n++) {
+        qdev_connect_gpio_out_named(dev, ESP32P4_RMT_SIG_OUT, n,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                                   ESP32P4_SIG_RMT_SIG_PAD_OUT0 + n));
+    }
+    for (n = 0; n < ESP32P4_RMT_RX_CHANNELS; n++) {
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+            ESP32P4_SIG_RMT_SIG_PAD_IN0 + n,
+            qdev_get_gpio_in_named(dev, ESP32P4_RMT_SIG_IN, n));
+    }
+
+    object_initialize_child(OBJECT(s), "pcnt", &s->pcnt, TYPE_ESP32P4_PCNT);
+    dev = DEVICE(&s->pcnt);
+    qdev_connect_clock_in(dev, "apb", qdev_get_clock_out(clkrst, "pcnt-apb"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_PCNT_BASE, ESP32P4_CLK_PCNT_APB,
+                             ESP32P4_RST_PCNT, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_PCNT));
+    for (u = 0; u < ESP32P4_PCNT_UNITS; u++) {
+        static const int sig[ESP32P4_PCNT_UNIT_INPUTS] = {
+            [ESP32P4_PCNT_SIG(0)] = ESP32P4_SIG_PCNT_SIG_CH0_PAD_IN0,
+            [ESP32P4_PCNT_SIG(1)] = ESP32P4_SIG_PCNT_SIG_CH1_PAD_IN0,
+            [ESP32P4_PCNT_CTRL(0)] = ESP32P4_SIG_PCNT_CTRL_CH0_PAD_IN0,
+            [ESP32P4_PCNT_CTRL(1)] = ESP32P4_SIG_PCNT_CTRL_CH1_PAD_IN0,
+            [ESP32P4_PCNT_RST] = ESP32P4_SIG_PCNT_RST_PAD_IN0,
+        };
+
+        for (n = 0; n < ESP32P4_PCNT_UNIT_INPUTS; n++) {
+            qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN, sig[n] + u,
+                qdev_get_gpio_in_named(dev, ESP32P4_PCNT_INPUT,
+                                       u * ESP32P4_PCNT_UNIT_INPUTS + n));
+        }
+    }
+}
+
+/*
  * The event task matrix (TRM chapter 14), its registers behind
  * ETM_APB_CLK, running on ETM_SYS_CLK, held by RST_EN_ETM; and every
  * modelled block's events and tasks, by their IDs, as its header
  * (hw/misc/esp32p4_etm.h) describes: a block that generates events or
  * takes tasks adds a line here for each.
  *
+ * The RMT and the PCNT have no events or tasks on the P4.
+ *
  * Not connected, as their blocks are not modelled: the LED PWM, MCPWM,
- * ADC, REGDMA, temperature sensor, I2S and 2D-DMA events and tasks;
+ * ADC, REGDMA, temperature sensor and 2D-DMA events and tasks;
  * the LP core's events (ULP_EVT_*) and ULP_TASK_WAKEUP_CPU, the PMU's LP
  * core wakeup, whose LP_CORE_ETM_WAKEUP_FLAG in LP_SYS is not modelled;
  * and the RTC timer's tasks (RTC_TASK_*), which the TRM says it does not
@@ -2579,6 +2779,24 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
                               DEVICE(&s->pmu), ESP32P4_PMU_ETM_EVENT, 0);
     esp32p4_etm_connect_task(etm, ESP32P4_ETM_PMU_TASK_SLEEP_REQ,
                              DEVICE(&s->pmu), ESP32P4_PMU_ETM_TASK, 0);
+
+    /*
+     * I2S0 to I2S2: RX_DONE, TX_DONE, X_WORDS_RECEIVED and X_WORDS_SENT,
+     * and START_RX, START_TX, STOP_RX and STOP_TX, each.
+     */
+    for (g = 0; g < ESP32P4_I2S_HP_COUNT; g++) {
+        dev = DEVICE(&s->i2s[g]);
+        for (k = 0; k < ESP32P4_I2S_ETM_EVENTS; k++) {
+            esp32p4_etm_connect_event(etm, ESP32P4_ETM_I2S0_EVT_RX_DONE +
+                                      g * ESP32P4_I2S_ETM_EVENTS + k,
+                                      dev, ESP32P4_I2S_ETM_EVENT, k);
+        }
+        for (k = 0; k < ESP32P4_I2S_ETM_TASKS; k++) {
+            esp32p4_etm_connect_task(etm, ESP32P4_ETM_I2S0_TASK_START_RX +
+                                     g * ESP32P4_I2S_ETM_TASKS + k,
+                                     dev, ESP32P4_I2S_ETM_TASK, k);
+        }
+    }
 
     /*
      * The LP core's interrupt, through LP_SYS's ETM_TASK_ULP_INT, and its
@@ -2966,8 +3184,10 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_spi(s);
     esp32p4_init_parlio(s);
     esp32p4_init_low_power(s);
+    esp32p4_init_i2s(s);
     esp32p4_init_i3c(s);
     esp32p4_init_twai(s);
+    esp32p4_init_rmt_pcnt(s);
     esp32p4_init_etm(s);
     esp32p4_init_usb(s);
     esp32p4_init_debug(s);
@@ -3040,9 +3260,16 @@ static void esp32p4_machine_instance_init(Object *obj)
     ESP32P4MachineState *s = ESP32P4_MACHINE(obj);
 
     s->strap_mode = ESP32P4_GPIO_STRAP_SPI_BOOT;
-    /* Early, for the clock tree to take the EMAC's pad clock. */
+    /* Early, for the clock tree to take the EMAC's and I2S's pad clocks. */
     object_initialize_child(obj, "emac", &s->emac, TYPE_ESP32P4_EMAC);
     object_initialize_child(obj, "phy", &s->phy, TYPE_IP101_PHY);
+    for (int i = 0; i < ESP32P4_I2S_HP_COUNT; i++) {
+        g_autofree char *name = g_strdup_printf("i2s%d", i);
+
+        object_initialize_child(obj, name, &s->i2s[i], TYPE_ESP32P4_I2S);
+    }
+    object_initialize_child(obj, "lp-i2s", &s->i2s[ESP32P4_I2S_LP_ID],
+                            TYPE_ESP32P4_LP_I2S);
     for (int i = 0; i < ESP32P4_TWAI_NUM; i++) {
         g_autofree char *name = g_strdup_printf("canbus%d", i);
         g_autofree char *desc = g_strdup_printf("The QEMU CAN bus (-object "
@@ -3079,6 +3306,7 @@ static void esp32p4_machine_class_init(ObjectClass *oc, const void *data)
     mc->min_cpus = ESP32P4_HP_CORES + 1;
     mc->max_cpus = ESP32P4_HP_CORES + 1;
     mc->default_cpus = ESP32P4_HP_CORES + 1;
+    machine_add_audiodev_property(mc);
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */

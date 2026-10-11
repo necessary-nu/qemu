@@ -1,0 +1,471 @@
+/*
+ * QTest testcase for the ESP32-P4 pulse count controller
+ *
+ * Copyright (c) 2026 Necessary Innovations AB
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * Pulses come from outside the chip on pads routed through the GPIO
+ * matrix to a unit's inputs, at exact virtual times, or from the RMT. The
+ * filter counts PCNT_APB_CLK, APB_CLK from reset: 10 MHz, 100 ns a cycle.
+ */
+
+#include "qemu/osdep.h"
+#include "libqtest.h"
+
+#define PCNT                0x500c9000u
+#define CONF0(u)            (PCNT + 0x00 + 0x0c * (u))
+#define CONF1(u)            (PCNT + 0x04 + 0x0c * (u))
+#define CONF2(u)            (PCNT + 0x08 + 0x0c * (u))
+#define CNT(u)              (PCNT + 0x30 + 4 * (u))
+#define INT_RAW             (PCNT + 0x40)
+#define INT_ST              (PCNT + 0x44)
+#define INT_ENA             (PCNT + 0x48)
+#define INT_CLR             (PCNT + 0x4c)
+#define STATUS(u)           (PCNT + 0x50 + 4 * (u))
+#define CTRL                (PCNT + 0x60)
+#define CHANGE_CONF(u)      (PCNT + 0x70 - 4 * (u))
+#define DATE                (PCNT + 0xfc)
+
+#define FILTER(t)           (t)
+#define FILTER_EN           (1u << 10)
+#define THR_ZERO_EN         (1u << 11)
+#define THR_H_LIM_EN        (1u << 12)
+#define THR_L_LIM_EN        (1u << 13)
+#define THR_THRES0_EN       (1u << 14)
+#define THR_THRES1_EN       (1u << 15)
+/* Channel ch's modes */
+#define NEG_MODE(ch, m)     ((m) << (16 + 8 * (ch)))
+#define POS_MODE(ch, m)     ((m) << (18 + 8 * (ch)))
+#define HCTRL_MODE(ch, m)   ((m) << (20 + 8 * (ch)))
+#define LCTRL_MODE(ch, m)   ((m) << (22 + 8 * (ch)))
+#define INC                 1
+#define DEC                 2
+#define KEEP                0
+#define INVERT              1
+#define HOLD                2
+
+#define ST_ZERO_MODE(v)     ((v) & 3)
+#define ST_THRES1           (1u << 2)
+#define ST_THRES0           (1u << 3)
+#define ST_L_LIM            (1u << 4)
+#define ST_H_LIM            (1u << 5)
+#define ST_ZERO             (1u << 6)
+
+#define CNT_RST(u)          (1u << (2 * (u)))
+#define CNT_PAUSE(u)        (1u << (2 * (u) + 1))
+#define DELTA_CHANGE_EN(u)  (1u << (8 + (u)))
+
+#define CLKRST              0x500e6000u
+#define SOC_CLK_CTRL2       (CLKRST + 0x1c)
+#define PERI_CLK_CTRL22     (CLKRST + 0x9c)
+#define HP_RST_EN1          (CLKRST + 0xc4)
+#define RMT_SYS_CLK_EN      (1u << 0)
+#define PCNT_APB_CLK_EN     (1u << 30)
+#define RMT_CLK_EN          (1u << 5)
+#define RST_EN_PCNT         (1u << 30)
+
+#define GPIO                0x500e0000u
+#define GPIO_FUNC_IN(s)     (GPIO + 0x158 + 4 * (s))
+#define GPIO_FUNC_OUT(n)    (GPIO + 0x558 + 4 * (n))
+#define IN_SIG_IN_SEL       (1u << 7)
+#define IO_MUX_GPIO(n)      (0x500e1004u + 4 * (n))
+#define MCU_SEL_GPIO        (1u << 12)
+#define FUN_IE              (1u << 9)
+#define FUN_DRV2            (2u << 10)
+#define GPIO_PATH           "/machine/gpio"
+
+#define SIG_CH0(u)          (141 + (u))
+#define SIG_CH1(u)          (145 + (u))
+#define CTRL_CH0(u)         (149 + (u))
+#define CTRL_CH1(u)         (153 + (u))
+#define RST_IN(u)           (63 + (u))
+
+#define INTMTX_STATUS3      0x500d620cu
+#define SRC_PCNT_BIT        (1u << 15)
+
+/* The RMT, for pulses from inside the chip */
+#define RMT                 0x500a2000u
+#define RMT_TX_CONF0(n)     (RMT + 0x20 + 4 * (n))
+#define RMT_TX_LIM(n)       (RMT + 0xa0 + 4 * (n))
+#define RMT_INT_RAW         (RMT + 0x70)
+#define RMT_SYS_CONF        (RMT + 0xc0)
+#define RMT_TX_SIM          (RMT + 0xc4)
+#define RMT_REF_CNT_RST     (RMT + 0xc8)
+#define RMT_RAM(w)          (RMT + 0x800 + 4 * (w))
+
+#define APB_NS              100
+
+static QTestState *qts;
+static int64_t now;
+
+static uint32_t rd(uint32_t a)
+{
+    return qtest_readl(qts, a);
+}
+
+static void wr(uint32_t a, uint32_t v)
+{
+    qtest_writel(qts, a, v);
+}
+
+static void clock_to(int64_t t)
+{
+    g_assert_cmpint(t, >=, now);
+    if (t > now) {
+        now = qtest_clock_set(qts, t);
+    }
+}
+
+static void step(int64_t ns)
+{
+    clock_to(now + ns);
+}
+
+static int16_t count(int u)
+{
+    return (int16_t)rd(CNT(u));
+}
+
+/* Pads 20 to 24 driven from outside and routed to signals. */
+static void pad_to(int pad, int sig)
+{
+    wr(IO_MUX_GPIO(pad), MCU_SEL_GPIO | FUN_IE | FUN_DRV2);
+    wr(GPIO_FUNC_IN(sig), IN_SIG_IN_SEL | pad);
+}
+
+static void drive(int pad, int level)
+{
+    qtest_set_irq_in(qts, GPIO_PATH, "pad-in", pad, level);
+}
+
+static void start(void)
+{
+    qts = qtest_init("-M esp32p4,strap-mode=0");
+    now = 0;
+    wr(SOC_CLK_CTRL2, rd(SOC_CLK_CTRL2) | PCNT_APB_CLK_EN);
+    for (int pad = 20; pad < 25; pad++) {
+        drive(pad, 0);
+    }
+}
+
+static void stop(void)
+{
+    qtest_quit(qts);
+    qts = NULL;
+}
+
+static void pulses(int pad, int n, int64_t hi, int64_t lo)
+{
+    for (int i = 0; i < n; i++) {
+        drive(pad, 1);
+        step(hi);
+        drive(pad, 0);
+        step(lo);
+    }
+}
+
+/* Configure unit u, latch its limits by clearing it, and let it count. */
+static void unit_setup(int u, uint32_t conf0, uint32_t conf1, uint32_t conf2)
+{
+    wr(CONF0(u), conf0);
+    wr(CONF1(u), conf1);
+    wr(CONF2(u), conf2);
+    wr(CTRL, rd(CTRL) | CNT_RST(u));
+    wr(CTRL, rd(CTRL) & ~CNT_RST(u));
+}
+
+static uint32_t lims(int16_t h, int16_t l)
+{
+    return (uint16_t)h | ((uint32_t)(uint16_t)l << 16);
+}
+
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_reset_values(void)
+{
+    start();
+    for (int u = 0; u < 4; u++) {
+        g_assert_cmphex(rd(CONF0(u)), ==, 0x3c10);
+        g_assert_cmphex(rd(CONF1(u)), ==, 0);
+        g_assert_cmphex(rd(CONF2(u)), ==, 0);
+        g_assert_cmphex(rd(CNT(u)), ==, 0);
+        g_assert_cmphex(rd(STATUS(u)), ==, 0);
+        g_assert_cmphex(rd(CHANGE_CONF(u)), ==, 0);
+    }
+    g_assert_cmphex(rd(CTRL), ==, 0x55);
+    g_assert_cmphex(rd(INT_RAW), ==, 0);
+    g_assert_cmphex(rd(INT_ENA), ==, 0);
+    g_assert_cmphex(rd(DATE), ==, 0x02211301);
+    wr(CTRL, 0xffffffff);
+    g_assert_cmphex(rd(CTRL), ==, 0x10fff);
+    /* The step registers are in reverse order: unit 3 first. */
+    wr(PCNT + 0x64, 0x1234);
+    g_assert_cmphex(rd(CHANGE_CONF(3)), ==, 0x1234);
+    stop();
+}
+
+/*
+ * Edge and level actions: rising edges counted up with the control input
+ * low, down with it high (inverted), not at all while held; falling edges
+ * of channel 1 counted down.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_counting(void)
+{
+    start();
+    pad_to(20, SIG_CH0(1));
+    pad_to(21, CTRL_CH0(1));
+    pad_to(22, SIG_CH1(1));
+    unit_setup(1, POS_MODE(0, INC) | LCTRL_MODE(0, KEEP) |
+               HCTRL_MODE(0, INVERT) | NEG_MODE(1, DEC), 0,
+               lims(1000, -1000));
+    pulses(20, 7, 500, 500);
+    g_assert_cmpint(count(1), ==, 7);
+    drive(21, 1);
+    step(500);
+    pulses(20, 3, 500, 500);
+    g_assert_cmpint(count(1), ==, 4);
+    wr(CONF0(1), POS_MODE(0, INC) | HCTRL_MODE(0, HOLD) | NEG_MODE(1, DEC));
+    pulses(20, 3, 500, 500);
+    g_assert_cmpint(count(1), ==, 4);
+    pulses(22, 6, 500, 500);
+    g_assert_cmpint(count(1), ==, -2);
+    g_assert_cmphex(ST_ZERO_MODE(rd(STATUS(1))), ==, 2);
+
+    /* Paused, the counter holds; PULSE_CNT_RST clears it. */
+    wr(CTRL, rd(CTRL) | CNT_PAUSE(1));
+    pulses(22, 3, 500, 500);
+    g_assert_cmpint(count(1), ==, -2);
+    wr(CTRL, rd(CTRL) & ~CNT_PAUSE(1));
+    pulses(22, 3, 500, 500);
+    g_assert_cmpint(count(1), ==, -5);
+    wr(CTRL, rd(CTRL) | CNT_RST(1));
+    g_assert_cmpint(count(1), ==, 0);
+    pulses(22, 3, 500, 500);
+    g_assert_cmpint(count(1), ==, 0);
+    stop();
+}
+
+/*
+ * The glitch filter: a change counts once it has held for FILTER_THRES
+ * APB cycles, so shorter pulses are lost and edges are counted that much
+ * later.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_filter(void)
+{
+    int64_t t0;
+
+    start();
+    pad_to(20, SIG_CH0(0));
+    unit_setup(0, POS_MODE(0, INC) | FILTER_EN | FILTER(5), 0,
+               lims(1000, -1000));
+    step(1000);
+    pulses(20, 4, 400, 1000);
+    g_assert_cmpint(count(0), ==, 0);
+    t0 = now;
+    drive(20, 1);
+    clock_to(t0 + 5 * APB_NS - 1);
+    g_assert_cmpint(count(0), ==, 0);
+    clock_to(t0 + 5 * APB_NS);
+    g_assert_cmpint(count(0), ==, 1);
+    drive(20, 0);
+    step(10 * APB_NS);
+    /* A low glitch within a high level is lost as well. */
+    drive(20, 1);
+    step(1000);
+    drive(20, 0);
+    step(300);
+    drive(20, 1);
+    step(1000);
+    g_assert_cmpint(count(0), ==, 2);
+    drive(20, 0);
+    step(1000);
+
+    /* Without FILTER_EN every pulse counts. */
+    wr(CONF0(0), POS_MODE(0, INC) | FILTER(5));
+    pulses(20, 4, 50, 50);
+    g_assert_cmpint(count(0), ==, 6);
+    stop();
+}
+
+/*
+ * The watch points: thresholds and zero on equality, limits clearing the
+ * counter, each match latched in STATUS with the unit's interrupt; the
+ * limits taking effect only when the counter is cleared or a watch point
+ * matches, thresholds at once.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_watch_points(void)
+{
+    start();
+    pad_to(20, SIG_CH0(2));
+    pad_to(21, SIG_CH1(2));
+    unit_setup(2, POS_MODE(0, INC) | POS_MODE(1, DEC) | THR_ZERO_EN |
+               THR_H_LIM_EN | THR_L_LIM_EN | THR_THRES0_EN | THR_THRES1_EN,
+               (uint16_t)3 | ((uint32_t)(uint16_t)-2 << 16), lims(5, -4));
+    wr(INT_ENA, 1u << 2);
+    pulses(20, 2, 500, 500);
+    g_assert_cmphex(rd(INT_RAW), ==, 0);
+    pulses(20, 1, 500, 500);
+    g_assert_cmpint(count(2), ==, 3);
+    g_assert_cmphex(rd(INT_RAW), ==, 1u << 2);
+    g_assert_cmphex(rd(INT_ST), ==, 1u << 2);
+    g_assert_cmphex(rd(INTMTX_STATUS3) & SRC_PCNT_BIT, ==, SRC_PCNT_BIT);
+    g_assert_cmphex(rd(STATUS(2)), ==, ST_THRES0 | 3);
+    wr(INT_CLR, 1u << 2);
+    g_assert_cmphex(rd(INTMTX_STATUS3) & SRC_PCNT_BIT, ==, 0);
+
+    /* The high limit at 5 clears the counter. */
+    pulses(20, 2, 500, 500);
+    g_assert_cmpint(count(2), ==, 0);
+    g_assert_cmphex(rd(STATUS(2)), ==, ST_H_LIM | 0);
+    wr(INT_CLR, 1u << 2);
+
+    /* Down to -2 (THRES1), through zero, to the low limit. */
+    pulses(21, 2, 500, 500);
+    g_assert_cmphex(rd(STATUS(2)), ==, ST_THRES1 | 2);
+    pulses(21, 1, 500, 500);
+    pulses(21, 1, 500, 500);
+    g_assert_cmphex(rd(STATUS(2)), ==, ST_L_LIM | 1);
+    g_assert_cmpint(count(2), ==, 0);
+    pulses(20, 1, 500, 500);
+    g_assert_cmpint(count(2), ==, 1);
+    pulses(21, 1, 500, 500);
+    g_assert_cmphex(rd(STATUS(2)), ==, ST_ZERO | 0);
+
+    /*
+     * A new THRES0 matches at once; a new high limit waits for that match,
+     * so 2 is passed and 3 clears.
+     */
+    wr(CONF2(2), lims(2, -4));
+    wr(CONF1(2), 2);
+    pulses(20, 2, 500, 500);
+    g_assert_cmpint(count(2), ==, 2);
+    g_assert_cmphex(rd(STATUS(2)), ==, ST_THRES0 | 3);
+    pulses(20, 1, 500, 500);
+    g_assert_cmpint(count(2), ==, 0);
+    g_assert_cmphex(rd(STATUS(2)), ==, ST_H_LIM | 0);
+    stop();
+}
+
+/* A unit's clear signal holds its counter at 0 while high. */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_clear_signal(void)
+{
+    start();
+    pad_to(20, SIG_CH0(3));
+    pad_to(23, RST_IN(3));
+    unit_setup(3, POS_MODE(0, INC), 0, lims(1000, -1000));
+    pulses(20, 10, 500, 500);
+    g_assert_cmpint(count(3), ==, 10);
+    drive(23, 1);
+    step(100);
+    g_assert_cmpint(count(3), ==, 0);
+    pulses(20, 2, 500, 500);
+    g_assert_cmpint(count(3), ==, 0);
+    drive(23, 0);
+    pulses(20, 2, 500, 500);
+    g_assert_cmpint(count(3), ==, 2);
+    stop();
+}
+
+/*
+ * The step comparator: every 25 counts down from the last step point
+ * raises the unit's interrupt, and the step limit clears the counter.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_step(void)
+{
+    int events = 0;
+
+    start();
+    pad_to(20, SIG_CH0(0));
+    unit_setup(0, POS_MODE(0, DEC), 0, lims(100, -1000));
+    wr(CHANGE_CONF(0), (uint16_t)-25 | ((uint32_t)(uint16_t)-100 << 16));
+    wr(CTRL, rd(CTRL) | DELTA_CHANGE_EN(0));
+    for (int i = 1; i <= 110; i++) {
+        pulses(20, 1, 200, 200);
+        if (rd(INT_RAW) & 1) {
+            wr(INT_CLR, 1);
+            events++;
+            g_assert_true(i % 25 == 0 || i == 100);
+        }
+    }
+    /* -25, -50, -75, -100 (the step limit, clearing), then -10 */
+    g_assert_cmpint(events, ==, 4);
+    g_assert_cmpint(count(0), ==, -10);
+    stop();
+}
+
+/*
+ * The RMT's pulses counted as they are sent: 25 pulses of 2 ticks a level
+ * at 40 MHz, each counted at the time of its edge whenever the counter is
+ * read.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_rmt_pulses(void)
+{
+    uint32_t conf = (1 << 8) | (1 << 16) | (1 << 6);
+    int64_t t0;
+
+    start();
+    wr(SOC_CLK_CTRL2, rd(SOC_CLK_CTRL2) | RMT_SYS_CLK_EN);
+    wr(PERI_CLK_CTRL22, RMT_CLK_EN);
+    wr(RMT_SYS_CONF, rd(RMT_SYS_CONF) | 1);
+    wr(IO_MUX_GPIO(24), MCU_SEL_GPIO | FUN_IE | FUN_DRV2);
+    qtest_set_irq_in(qts, GPIO_PATH, "pad-release", 24, 1);
+    wr(GPIO_FUNC_OUT(24), 246);
+    wr(GPIO_FUNC_IN(SIG_CH0(0)), IN_SIG_IN_SEL | 24);
+    unit_setup(0, POS_MODE(0, INC), 0, lims(1000, -1000));
+    for (int w = 0; w < 25; w++) {
+        wr(RMT_RAM(w), 0x8002 | (0x0002 << 16));
+    }
+    wr(RMT_RAM(25), 0);
+    wr(RMT_TX_CONF0(0), conf | (1 << 1) | (1 << 2));
+    wr(RMT_TX_CONF0(0), conf | (1 << 24));
+    step(1000);
+    t0 = now;
+    wr(RMT_REF_CNT_RST, 1);
+    wr(RMT_TX_CONF0(0), conf | 1);
+    /* Pulse k rises at t0 + 25 + 100 k ns. */
+    clock_to(t0 + 25 + 100 * 9);
+    g_assert_cmpint(count(0), ==, 10);
+    clock_to(t0 + 25 + 100 * 9 + 99);
+    g_assert_cmpint(count(0), ==, 10);
+    clock_to(t0 + 25 + 100 * 10);
+    g_assert_cmpint(count(0), ==, 11);
+    step(100000);
+    g_assert_cmpint(count(0), ==, 25);
+    g_assert_cmphex(rd(RMT_INT_RAW) & 1, ==, 1);
+    stop();
+}
+
+/* Held in reset, the block is back at its reset values. */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_block_reset(void)
+{
+    start();
+    wr(CONF0(0), 0x1234);
+    wr(CTRL, 0);
+    wr(HP_RST_EN1, RST_EN_PCNT);
+    wr(HP_RST_EN1, 0);
+    g_assert_cmphex(rd(CONF0(0)), ==, 0x3c10);
+    g_assert_cmphex(rd(CTRL), ==, 0x55);
+    stop();
+}
+
+int main(int argc, char **argv)
+{
+    g_test_init(&argc, &argv, NULL);
+
+    qtest_add_func("esp32p4/pcnt/reset_values", test_reset_values);
+    qtest_add_func("esp32p4/pcnt/counting", test_counting);
+    qtest_add_func("esp32p4/pcnt/filter", test_filter);
+    qtest_add_func("esp32p4/pcnt/watch_points", test_watch_points);
+    qtest_add_func("esp32p4/pcnt/clear_signal", test_clear_signal);
+    qtest_add_func("esp32p4/pcnt/step", test_step);
+    qtest_add_func("esp32p4/pcnt/rmt_pulses", test_rmt_pulses);
+    qtest_add_func("esp32p4/pcnt/block_reset", test_block_reset);
+    return g_test_run();
+}
