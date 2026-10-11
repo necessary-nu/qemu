@@ -46,8 +46,10 @@
  *     takes it, the 7-bit address itself; the DCT records it as on the
  *     wire, shifted up with its parity bit.
  *
- * Not modelled: HDR modes, DMA (DMA_TX_EN and DMA_RX_EN; the buffers stay
- * with the CPU), the RX bit and byte order bits, and the buffer
+ * With DMA_TX_EN and DMA_RX_EN the data buffers are GDMA-AHB's, as the
+ * header describes.
+ *
+ * Not modelled: HDR modes, the RX bit and byte order bits, and the buffer
  * timeouts of TIME_OUT_VALUE (logged).
  */
 
@@ -532,6 +534,99 @@ static void esp32p4_i3c_mst_end_dev(ESP32P4I3CMstState *s)
     }
 }
 
+/* Master: DMA */
+
+static bool esp32p4_i3c_mst_dma(ESP32P4I3CMstState *s, uint32_t en)
+{
+    return s->gdma && (s->regs[R_DEVICE_CTRL] & en);
+}
+
+static void esp32p4_i3c_mst_resume(ESP32P4I3CMstState *s);
+
+/*
+ * [spec:nuos:req:emu.esp32p4.i2c]
+ * GDMA fills the TX buffer a word at a time, the last word of a frame
+ * as far as the frame goes.
+ */
+static void esp32p4_i3c_mst_dma_tx(ESP32P4I3CMstState *s)
+{
+    uint8_t buf[4];
+    bool eof;
+    size_t n, i;
+
+    if (!esp32p4_i3c_mst_dma(s, CTRL_DMA_TX_EN)) {
+        return;
+    }
+    while (!fifo32_is_full(&s->tx)) {
+        n = esp32p4_gdma_pull(s->gdma, ESP32P4_GDMA_AHB_I3C, buf,
+                              4 - s->dma_tx_bytes, &eof);
+        for (i = 0; i < n; i++) {
+            s->dma_tx_word |= (uint32_t)buf[i] << (8 * s->dma_tx_bytes++);
+        }
+        if (s->dma_tx_bytes == 4 || (eof && s->dma_tx_bytes)) {
+            fifo32_push(&s->tx, s->dma_tx_word);
+            s->dma_tx_word = 0;
+            s->dma_tx_bytes = 0;
+        }
+        if (!n) {
+            break;
+        }
+    }
+    esp32p4_i3c_mst_update_irq(s);
+    esp32p4_i3c_mst_resume(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.i2c]
+ * GDMA empties the RX buffer a word at a time as its channel has room,
+ * and is told where a read ends.
+ */
+static void esp32p4_i3c_mst_dma_rx(ESP32P4I3CMstState *s)
+{
+    uint8_t buf[4];
+    bool last;
+
+    if (!esp32p4_i3c_mst_dma(s, CTRL_DMA_RX_EN)) {
+        return;
+    }
+    while (!fifo32_is_empty(&s->rx) &&
+           esp32p4_gdma_rx_room(s->gdma, ESP32P4_GDMA_AHB_I3C) >= 4) {
+        if (s->dma_rx_hold && fifo32_num_used(&s->rx) == 1) {
+            break;
+        }
+        last = s->dma_rx_eof && fifo32_num_used(&s->rx) == 1;
+        stl_le_p(buf, fifo32_pop(&s->rx));
+        esp32p4_gdma_push(s->gdma, ESP32P4_GDMA_AHB_I3C, buf, 4,
+                          last ? ESP32P4_GDMA_EOF : 0);
+        if (last) {
+            s->dma_rx_eof = false;
+        }
+    }
+    if (s->dma_rx_eof && fifo32_is_empty(&s->rx) &&
+        esp32p4_gdma_rx_room(s->gdma, ESP32P4_GDMA_AHB_I3C)) {
+        esp32p4_gdma_push(s->gdma, ESP32P4_GDMA_AHB_I3C, NULL, 0,
+                          ESP32P4_GDMA_EOF);
+        s->dma_rx_eof = false;
+    }
+    esp32p4_i3c_mst_update_irq(s);
+    esp32p4_i3c_mst_resume(s);
+}
+
+static void esp32p4_i3c_mst_dma_tx_ready(void *opaque)
+{
+    esp32p4_i3c_mst_dma_tx(opaque);
+}
+
+static void esp32p4_i3c_mst_dma_rx_ready(void *opaque)
+{
+    esp32p4_i3c_mst_dma_rx(opaque);
+}
+
+static const ESP32P4GdmaPeriphOps esp32p4_i3c_mst_dma_ops = {
+    .tx_ready = esp32p4_i3c_mst_dma_tx_ready,
+    .rx_ready = esp32p4_i3c_mst_dma_rx_ready,
+};
+
 /* Master: commands */
 
 static void esp32p4_i3c_mst_rx_byte(ESP32P4I3CMstState *s, uint8_t b)
@@ -541,6 +636,7 @@ static void esp32p4_i3c_mst_rx_byte(ESP32P4I3CMstState *s, uint8_t b)
         fifo32_push(&s->rx, s->rx_word);
         s->rx_word = 0;
         s->rx_bytes = 0;
+        esp32p4_i3c_mst_dma_rx(s);
     }
 }
 
@@ -564,6 +660,7 @@ static uint8_t esp32p4_i3c_mst_tx_byte(ESP32P4I3CMstState *s)
     if (!s->tx_bytes) {
         s->tx_word = fifo32_pop(&s->tx);
         s->tx_bytes = 4;
+        esp32p4_i3c_mst_dma_tx(s);
     }
     b = s->tx_word;
     s->tx_word >>= 8;
@@ -584,6 +681,11 @@ static void esp32p4_i3c_mst_cmd_end(ESP32P4I3CMstState *s)
     uint32_t dl;
 
     esp32p4_i3c_mst_rx_flush(s);
+    if (rnw) {
+        s->dma_rx_hold = false;
+        s->dma_rx_eof = true;
+    }
+    esp32p4_i3c_mst_dma_rx(s);
     /* An unfinished TX word is the command's; the next starts afresh. */
     s->tx_bytes = 0;
     if (CMD_ROC(s->cmd_l) || s->err) {
@@ -697,6 +799,7 @@ static void esp32p4_i3c_mst_next(ESP32P4I3CMstState *s)
     switch (attr) {
     case ATTR_REGULAR:
         s->left = CMD_DL(s->cmd_h);
+        s->dma_rx_hold = CMD_RNW(s->cmd_l);
         break;
     case ATTR_IMMEDIATE:
         s->left = MIN(CMD_BC(s->cmd_l), 4);
@@ -1126,10 +1229,12 @@ static void esp32p4_i3c_mst_trans_start(ESP32P4I3CMstState *s)
         return;
     }
     s->busy = true;
-    if (s->regs[R_DEVICE_CTRL] & (CTRL_DMA_TX_EN | CTRL_DMA_RX_EN)) {
-        qemu_log_mask(LOG_UNIMP, "%s: DMA is not modelled; the buffers stay "
-                      "with the CPU\n", TYPE_ESP32P4_I3C_MST);
+    if (!s->gdma &&
+        (s->regs[R_DEVICE_CTRL] & (CTRL_DMA_TX_EN | CTRL_DMA_RX_EN))) {
+        qemu_log_mask(LOG_UNIMP, "%s: no DMA controller is connected; the "
+                      "buffers stay with the CPU\n", TYPE_ESP32P4_I3C_MST);
     }
+    esp32p4_i3c_mst_dma_tx(s);
     if (s->regs[R_DEVICE_CTRL] &
         (CTRL_RX_BIT_ORDER | CTRL_RX_BYTE_ORDER | CTRL_MULTI_SLV_CCC)) {
         qemu_log_mask(LOG_UNIMP, "%s: RX_BIT_ORDER, RX_BYTE_ORDER and "
@@ -1163,11 +1268,15 @@ static void esp32p4_i3c_mst_reset_bufs(ESP32P4I3CMstState *s, uint32_t which)
     if (which & RST_TX_DATA_BUF) {
         fifo32_reset(&s->tx);
         s->tx_bytes = 0;
+        s->dma_tx_word = 0;
+        s->dma_tx_bytes = 0;
     }
     if (which & RST_RX_DATA_BUF) {
         fifo32_reset(&s->rx);
         s->rx_bytes = 0;
         s->rx_word = 0;
+        s->dma_rx_hold = false;
+        s->dma_rx_eof = false;
     }
     if (which & RST_IBI_DATA_BUF) {
         fifo32_reset(&s->ibi_data);
@@ -1457,6 +1566,10 @@ static void esp32p4_i3c_mst_realize(DeviceState *dev, Error **errp)
 
     s->bus = i3c_init_bus_type(TYPE_ESP32P4_I3C_BUS, dev,
                                s->bus_name ? s->bus_name : "i3c");
+    if (s->gdma) {
+        esp32p4_gdma_attach(s->gdma, ESP32P4_GDMA_AHB_I3C,
+                            &esp32p4_i3c_mst_dma_ops, s);
+    }
 }
 
 static const VMStateDescription vmstate_esp32p4_i3c_ibi = {
@@ -1501,6 +1614,10 @@ static const VMStateDescription vmstate_esp32p4_i3c_mst = {
         VMSTATE_UINT8(rx_bytes, ESP32P4I3CMstState),
         VMSTATE_UINT32(tx_word, ESP32P4I3CMstState),
         VMSTATE_UINT8(tx_bytes, ESP32P4I3CMstState),
+        VMSTATE_UINT32(dma_tx_word, ESP32P4I3CMstState),
+        VMSTATE_UINT8(dma_tx_bytes, ESP32P4I3CMstState),
+        VMSTATE_BOOL(dma_rx_hold, ESP32P4I3CMstState),
+        VMSTATE_BOOL(dma_rx_eof, ESP32P4I3CMstState),
         VMSTATE_BOOL(scl_in, ESP32P4I3CMstState),
         VMSTATE_BOOL(sda_in, ESP32P4I3CMstState),
         VMSTATE_BOOL(scl_drv, ESP32P4I3CMstState),
@@ -1534,6 +1651,8 @@ static const VMStateDescription vmstate_esp32p4_i3c_mst = {
 
 static const Property esp32p4_i3c_mst_properties[] = {
     DEFINE_PROP_STRING("bus-name", ESP32P4I3CMstState, bus_name),
+    DEFINE_PROP_LINK("gdma", ESP32P4I3CMstState, gdma, TYPE_ESP32P4_GDMA,
+                     ESP32P4GdmaState *),
 };
 
 static void esp32p4_i3c_mst_class_init(ObjectClass *klass, const void *data)

@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/dma/esp32p4_gdma.h"
 #include "hw/i3c/i3c.h"
 #include "qemu/fifo32.h"
 #include "qemu/fifo8.h"
@@ -64,6 +65,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4I3CSlvTarget, ESP32P4_I3C_SLV_TARGET)
  * inputs have seen the START, so only when its pads are wired to the
  * master's.
  *
+ * With DMA_TX_EN and DMA_RX_EN the master's TX and RX data buffers are
+ * GDMA-AHB's ("gdma" link): it fills the TX buffer from the channel that
+ * selects the I3C master, a word as the channel has four bytes for it or
+ * the frame ends, and empties the RX buffer into the channel that
+ * selects it, ending the frame (suc_eof) where a read command ends.
+ *
  * Clock inputs: the master's "clk", I3C_MST_CLK, which times the bus;
  * the slave's "clk", its APB clock. While a clock is stopped, its
  * controller does nothing.
@@ -105,6 +112,7 @@ struct ESP32P4I3CMstState {
     Clock *clk;
     I3CBus *bus;
     char *bus_name;
+    ESP32P4GdmaState *gdma;
     QEMUTimer timer;
 
     uint32_t regs[ESP32P4_I3C_MST_NREGS];
@@ -128,6 +136,15 @@ struct ESP32P4I3CMstState {
     /* What is left of the TX word being sent. */
     uint32_t tx_word;
     uint8_t tx_bytes;
+    /*
+     * DMA: the TX word GDMA is filling; a read in progress, which keeps
+     * its last word back for the frame's end to go with it; and a read
+     * whose end GDMA has still to be told of.
+     */
+    uint32_t dma_tx_word;
+    uint8_t dma_tx_bytes;
+    bool dma_rx_hold;
+    bool dma_rx_eof;
 
     /* The lines: the levels read back, and what the master drives. */
     bool scl_in;

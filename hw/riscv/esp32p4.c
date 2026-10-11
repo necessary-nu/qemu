@@ -1287,7 +1287,8 @@ static void esp32p4_init_i2c(ESP32P4MachineState *s)
 /*
  * The I3C master (0x500DA000) and slave (0x500DB000), behind
  * I3C_MST_APB_CLK and I3C_SLV_APB_CLK and their resets, the master timed
- * by I3C_MST_CLK; their interrupts sources 101 and 102; their lines the
+ * by I3C_MST_CLK and served by GDMA-AHB as its peripheral 0; their
+ * interrupts sources 101 and 102; their lines the
  * GPIO matrix's signals 134 to 137, and the master's pull-up enables 138
  * and 139. The master's QEMU I3C bus, "i3c", stands for the board's
  * wires on the pads it is routed to, i2c-slave devices going on its
@@ -1322,6 +1323,8 @@ static void esp32p4_init_i3c(ESP32P4MachineState *s)
                             TYPE_ESP32P4_I3C_MST);
     mst = DEVICE(&s->i3c_mst);
     qdev_prop_set_string(mst, "bus-name", "i3c");
+    object_property_set_link(OBJECT(mst), "gdma", OBJECT(&s->gdma[0]),
+                             &error_abort);
     qdev_connect_clock_in(mst, "clk", qdev_get_clock_out(clkrst, "i3c-mst"));
     sysbus_realize(SYS_BUS_DEVICE(mst), &error_fatal);
     g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(mst), 0,
@@ -1837,12 +1840,12 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_timers(s);
     esp32p4_init_gpio(s);
     esp32p4_init_i2c(s);
-    esp32p4_init_i3c(s);
     esp32p4_init_pms(s);
     esp32p4_init_ext_memory(s);
     esp32p4_init_sdmmc(s);
     esp32p4_init_emac(s);
     esp32p4_init_dma(s);
+    esp32p4_init_i3c(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
                         esp32p4_unimplemented[i].name,

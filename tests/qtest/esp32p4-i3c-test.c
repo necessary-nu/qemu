@@ -55,6 +55,8 @@
 #define DCT(n, w)           (0x100 + 16 * (n) + 4 * (w))
 
 #define CTRL_BA_INCLUDE     (1u << 1)
+#define CTRL_DMA_RX_EN      (1u << 6)
+#define CTRL_DMA_TX_EN      (1u << 7)
 #define CTRL_TRANS_START    (1u << 2)
 #define CTRL_AUTO_DIS_IBI   (1u << 5)
 #define CTRL_SCL_OE_FORCE   (1u << 12)
@@ -149,6 +151,31 @@
 /* I3C_MST_INTR 101 and I3C_SLV_INTR 102, word 3 */
 #define SRC_I3C_MST         (1u << 5)
 #define SRC_I3C_SLV         (1u << 6)
+
+/* GDMA-AHB channel 0, and descriptors in L2MEM past the L2 cache */
+#define AHB                 0x50085000
+#define AHB_IN_INT(ch)      (AHB + 0x10 * (ch))
+#define AHB_OUT_INT(ch)     (AHB + 0x30 + 0x10 * (ch))
+#define AHB_IN(ch)          (AHB + 0x70 + 0xc0 * (ch))
+#define AHB_OUT(ch)         (AHB + 0xd0 + 0xc0 * (ch))
+#define AHB_IN_LINK_ADDR(ch)  (AHB + 0x3ac + 4 * (ch))
+#define AHB_OUT_LINK_ADDR(ch) (AHB + 0x3b8 + 4 * (ch))
+#define DMA_CONF0           0x00
+#define DMA_LINK            0x10
+#define DMA_PERI_SEL        0x30
+#define DMA_RAW             0x0
+#define DMA_CLR             0xc
+#define IN_SUC_EOF          (1u << 1)
+#define OUT_EOF             (1u << 1)
+#define IN_LINK_START       (1u << 2)
+#define OUT_LINK_START      (1u << 1)
+#define OUT_AUTO_WRBACK     (1u << 2)
+#define OUT_EOF_MODE        (1u << 3)
+#define DW0(size, len)      ((size) | (len) << 12)
+#define SUC_EOF             (1u << 30)
+#define OWNER               (1u << 31)
+#define PERI_I3C            0
+#define MEM                 0x4ff40000
 
 #define MOCK_SA             0x30
 #define MOCK_DA             0x08
@@ -628,6 +655,66 @@ static void test_slave(void)
     qtest_quit(qts);
 }
 
+/*
+ * With DMA_TX_EN and DMA_RX_EN the data goes through GDMA-AHB: a write
+ * takes its bytes from a TX descriptor, a read leaves them in an RX
+ * descriptor, which the read's end closes with suc_eof.
+ */
+/* [spec:nuos:req:emu.esp32p4.i2c/test] */
+static void test_dma(void)
+{
+    QTestState *qts = start();
+    uint32_t wr_cmds[] = { CMDL(0, 0, 0, 0, 0, 0, 0, 1, 1), DL(8) };
+    uint32_t rd_cmds[] = { CMDL(0, 0, 0, 0, 0, 0, 1, 1, 1), DL(8) };
+    uint8_t data[8] = { 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
+    uint8_t got[8];
+    uint32_t r;
+
+    setup(qts);
+    setdasa(qts);
+    qtest_memwrite(qts, MEM + 0x1000, data, 8);
+    qtest_writel(qts, MEM, DW0(8, 8) | SUC_EOF | OWNER);
+    qtest_writel(qts, MEM + 4, MEM + 0x1000);
+    qtest_writel(qts, MEM + 8, 0);
+    qtest_writel(qts, MEM + 0x10, DW0(8, 0) | OWNER);
+    qtest_writel(qts, MEM + 0x14, MEM + 0x2000);
+    qtest_writel(qts, MEM + 0x18, 0);
+    qtest_writel(qts, AHB_OUT(0) + DMA_PERI_SEL, PERI_I3C);
+    qtest_writel(qts, AHB_IN(0) + DMA_PERI_SEL, PERI_I3C);
+    qtest_writel(qts, AHB_OUT(0) + DMA_CONF0, OUT_EOF_MODE |
+                 OUT_AUTO_WRBACK);
+    qtest_writel(qts, AHB_OUT_LINK_ADDR(0), MEM);
+    qtest_writel(qts, AHB_IN_LINK_ADDR(0), MEM + 0x10);
+    qtest_writel(qts, AHB_OUT(0) + DMA_LINK, OUT_LINK_START);
+    qtest_writel(qts, AHB_IN(0) + DMA_LINK, IN_LINK_START);
+    wr(qts, MST, DEVICE_CTRL, rd(qts, MST, DEVICE_CTRL) | CTRL_DMA_TX_EN |
+       CTRL_DMA_RX_EN);
+
+    run(qts, wr_cmds, 2);
+    wait_complete(qts);
+    r = rd(qts, MST, RESPONSE_BUF_PORT);
+    g_assert_cmphex(RESP_ERR(r), ==, 0);
+    g_assert_cmphex(RESP_DL(r), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, AHB_OUT_INT(0) + DMA_RAW) & OUT_EOF, ==,
+                    OUT_EOF);
+
+    run(qts, rd_cmds, 2);
+    wait_complete(qts);
+    qtest_clock_step(qts, 10000);
+    r = rd(qts, MST, RESPONSE_BUF_PORT);
+    g_assert_cmphex(RESP_ERR(r), ==, 0);
+    g_assert_cmphex(RESP_DL(r), ==, 8);
+    g_assert_cmphex(qtest_readl(qts, AHB_IN_INT(0) + DMA_RAW) & IN_SUC_EOF,
+                    ==, IN_SUC_EOF);
+    qtest_memread(qts, MEM + 0x2000, got, 8);
+    g_assert_cmpmem(got, 8, data, 8);
+    /* The RX descriptor came back with the length and suc_eof. */
+    g_assert_cmphex(qtest_readl(qts, MEM + 0x10), ==, DW0(8, 8) | SUC_EOF);
+    /* Nothing went through the CPU's ports. */
+    g_assert_cmphex(rd(qts, MST, DATA_BUFFER_STATUS_LEVEL), ==, 32);
+    qtest_quit(qts);
+}
+
 /* Not wired to the master's pads, the slave hears nothing. */
 /* [spec:nuos:req:emu.esp32p4.i2c/test] */
 static void test_slave_unwired(void)
@@ -661,5 +748,6 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/i3c/ibi", test_ibi);
     qtest_add_func("esp32p4/i3c/slave", test_slave);
     qtest_add_func("esp32p4/i3c/slave-unwired", test_slave_unwired);
+    qtest_add_func("esp32p4/i3c/dma", test_dma);
     return g_test_run();
 }
