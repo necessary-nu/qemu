@@ -82,12 +82,18 @@ int64_t icount_round(int64_t count);
  *
  * With a fixed "shift", each instruction @cpu executes takes one period
  * of @clk, as it is when the instruction executes, instead of 2^shift ns.
- * CPUs with a clock run as if in parallel: while N of them are not idle,
- * each executes at its clock's rate and an instruction moves virtual time
- * on by 1/N of its period, and they take turns at most a quantum of their
- * own time long (the "quantum" option, by default 1 us), so code on one
- * waiting for another sees it make progress as on real cores. In adaptive
- * mode and under record/replay the clock is ignored.
+ * CPUs with a clock run as if in parallel, each at its clock's rate
+ * whatever the others do: those not idle run through windows of virtual
+ * time together, in turns, and virtual time follows their own times, so
+ * that at each window's end it has moved on by exactly the periods each
+ * one's instructions took (and its idle time). A window is at most a
+ * quantum long while more than one runs (the "quantum" option, by default
+ * 1 us), so code on one waiting for another sees it make progress as on
+ * real cores; within a window, a CPU's view of virtual time may be ahead
+ * of, or behind, its own by up to that much. An interrupt one such CPU
+ * raises for another ends its turn, and a CPU leaving idle joins the
+ * window at once. In adaptive mode and under record/replay the clock is
+ * ignored.
  *
  * Stopping @clk does not stop @cpu: a machine whose clock stops its CPUs
  * halts them itself.
@@ -103,12 +109,10 @@ void icount_set_cpu_clock(CPUState *cpu, Clock *clk);
  *
  * A Clock holds its period as a whole number of 2^-32 ns units. For a
  * clock whose period is not one, the machine that knows it exactly gives
- * the fraction of a unit beyond, after each change of the clock: while
- * @cpu executes alone, its instructions then take the exact period each,
- * the fractions carried from one to the next, so that n of them take n
- * exact periods to within a unit however large n is. While other CPUs
- * with a clock take turns with it, an instruction takes 1/N of the
- * clock's period, rounded down to a unit.
+ * the fraction of a unit beyond, after each change of the clock: @cpu's
+ * instructions then take the exact period each of its own time, the
+ * fractions carried from one to the next, so that n of them take n exact
+ * periods to within a unit however large n is.
  */
 void icount_set_cpu_period_frac(CPUState *cpu, uint64_t frac, uint64_t den);
 

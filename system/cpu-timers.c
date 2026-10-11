@@ -228,6 +228,8 @@ static int icount_timers_post_load(void *opaque, int version_id)
         s->qemu_icount_time = s->qemu_icount << s->icount_time_shift;
         s->qemu_icount_time_frac = 0;
     }
+    /* The CPUs with an icount clock start a window afresh. */
+    s->window_cpus = 0;
     return 0;
 }
 

@@ -452,14 +452,20 @@ struct qemu_work_item;
  *   icount_set_cpu_period_frac().
  * @icount_period_den: The denominator of @icount_period_frac.
  * @icount_time_rem: The CPU's instructions' time beyond what they have
- *   added to the virtual time, in 1/@icount_period_den of a Clock unit.
- * @icount_insn_time: Virtual time one instruction of the current run
- *   accounts for, in Clock units, or 0 for 2^shift ns. Written only by
- *   the vCPU thread when it prepares a run.
+ *   accounted for, in 1/@icount_insn_den of a Clock unit.
+ * @icount_insn_time: The time one instruction of the current run takes,
+ *   in Clock units: of the CPU's own time if it has an icount clock (and
+ *   of virtual time as its icount window says), or 0 for 2^shift ns of
+ *   virtual time. Written only by the vCPU thread when it prepares a run.
  * @icount_insn_frac: The fraction of a unit each instruction of the
- *   current run accounts for beyond @icount_insn_time, in
- *   1/@icount_insn_den.
+ *   current run takes beyond @icount_insn_time, in 1/@icount_insn_den.
  * @icount_insn_den: The denominator of @icount_insn_frac.
+ * @icount_in_window: Under icount, the CPU takes part in the window of
+ *   virtual time the CPUs with an icount clock run through together.
+ * @icount_window_idle: It went idle in that window, which counts it as
+ *   having run to the window's end.
+ * @icount_own: Its own time past the window's start, in Clock units: the
+ *   periods of its clock its instructions have taken.
  * @cpu_ases: Pointer to array of CPUAddressSpaces (which define the
  *            AddressSpaces this CPU has)
  * @as: Pointer to the first AddressSpace, for the convenience of targets which
@@ -532,6 +538,9 @@ struct CPUState {
     uint64_t icount_insn_time;
     uint64_t icount_insn_frac;
     uint64_t icount_insn_den;
+    bool icount_in_window;
+    bool icount_window_idle;
+    int64_t icount_own;
     uint64_t random_seed;
     sigjmp_buf jmp_env;
 
