@@ -1027,9 +1027,9 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
 /*
  * The HP cores' CLINT and CLICs: the CLINT's software and timer interrupts
  * go to each core's CLIC interrupts 3 and 7, and its counter counts
- * CPU_CLK, which the TRM does not name; each core's CLIC and CLINT
- * registers are behind its CLIC bus clock, and its CLIC resets with the
- * core.
+ * CPU_CLK, the clock of the core complex it is part of (see
+ * esp32p4_clint.c); each core's CLIC and CLINT registers are behind its
+ * CLIC bus clock, and its CLIC resets with the core.
  */
 /* [spec:nuos:req:emu.esp32p4.clic] */
 static void esp32p4_init_core_local(ESP32P4MachineState *s)
@@ -2681,12 +2681,6 @@ static void esp32p4_init_debug(ESP32P4MachineState *s)
         qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_CPU_WAKEUP, core,
                                     qdev_get_gpio_in_named(cpu,
                                         ESP32P4_CPU_WAKEUP, 0));
-        for (n = 0; n < ESP32P4_HP_SYS_WAITI_LINES; n++) {
-            qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_CPU_WAITI_CONF,
-                                        core * ESP32P4_HP_SYS_WAITI_LINES + n,
-                                        qdev_get_gpio_in_named(cpu,
-                                            ESP32P4_CPU_WAITI_CONF, n));
-        }
         qdev_connect_gpio_out(DEVICE(&s->core_stall_split[core]), 2,
                               qdev_get_gpio_in_named(hp_sys,
                                   ESP32P4_HP_SYS_CORE_STALLED, core));

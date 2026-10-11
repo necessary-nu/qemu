@@ -36,10 +36,18 @@
  * other half to return: on reading mtimelo (1), mtimehi (2), or either
  * (3).
  *
- * The TRM does not say what clocks the counter; it counts the clock on
- * its "mtime" input, which the machine connects to CPU_CLK. Each core's
- * registers are behind its CLIC bus clock: while that is stopped they
- * drop writes. Each core's time CSR reads the count.
+ * The counter counts the clock on its "mtime" input, which the machine
+ * connects to CPU_CLK, ungated. The TRM names no clock of the counter's
+ * own: it puts the counter in the CPU core complex, shared by the two
+ * cores (2.1), which CPU_CLK drives (11.2.4.1). Neither ESP-IDF nor the
+ * boot ROM uses it, which leaves nothing to tell otherwise: ESP-IDF's
+ * timers are the system timer's, and its P4 light sleep does not keep the
+ * count, as it does the ESP32-C5's. Of CPU_CLK's gates, MISC_CPU_CLK_EN's
+ * "miscellaneous modules" may include it; stopping that is logged as
+ * unimplemented (esp32p4_clkrst.c). The WFI autoclock gating of the CPU
+ * subsystem does not reach it (esp32p4_clkrst.c). Each core's registers
+ * are behind its CLIC bus clock: while that is stopped they drop writes.
+ * Each core's time CSR reads the count.
  *
  * Under icount the counter is exact: a timer interrupt is raised at the
  * virtual time the count reaches mtimecmp.

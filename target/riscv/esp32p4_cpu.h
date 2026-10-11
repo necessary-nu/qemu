@@ -35,15 +35,6 @@ OBJECT_DECLARE_TYPE(ESP32P4CPU, ESP32P4CPUClass, ESP32P4_CPU)
 #define ESP32P4_CPU_CLK "clk"
 
 /*
- * Named GPIO input of the HP core, HP_SYSTEM_CPU_WAITI_CONF (TRM register
- * 21.43): line 0 high while WAIT_MODE_FORCE_ON keeps the core's clock
- * running in WFI, lines 1 to 4 WAITI_DELAY_NUM, the cycles the clock runs
- * on in WFI before it stops when it is not forced on.
- */
-#define ESP32P4_CPU_WAITI_CONF "waiti-conf"
-#define ESP32P4_CPU_WAITI_CONF_LINES 5
-
-/*
  * The HP core's fast GPIO (TRM 2.5, cpu_gpio_* CSRs): eight outputs each
  * with an output enable, driven by cpu_gpio_out and cpu_gpio_oen, and
  * eight inputs read through cpu_gpio_in. Named GPIO outputs carry each
@@ -464,16 +455,8 @@ struct ESP32P4CPU {
     uint64_t ctr_ref[2];
     uint64_t hpm[ESP32P4_LP_HPM_COUNTERS];
     uint32_t mcountinhibit;
-    /*
-     * The HP core's clock in WFI: HP_SYSTEM_CPU_WAITI_CONF's
-     * WAIT_MODE_FORCE_ON and WAITI_DELAY_NUM (ESP32P4_CPU_WAITI_CONF);
-     * whether the counters have seen the core enter WFI; and, while the
-     * clock is not forced on there, the cycles it runs on before it stops.
-     */
-    bool waiti_force_on;
-    uint8_t waiti_delay;
+    /* The counters have seen the HP core enter WFI, and not yet leave. */
     bool ctr_wfi;
-    uint32_t wfi_left;
 };
 
 struct ESP32P4CPUClass {
@@ -598,8 +581,8 @@ void esp32p4_trace_trap(ESP32P4CPU *cpu, uint32_t epc, uint32_t cause,
  * esp32p4_counters.c: both cores' counters. The counters' CSRs, which the
  * chip's CSR table hands over; the core's state changing, with the BQL
  * held: before its reset or clock enable changes or its clock changes
- * rate (esp32p4_counters_update()), as it enters WFI and as it leaves,
- * and as HP_SYSTEM_CPU_WAITI_CONF changes; and its reset.
+ * rate (esp32p4_counters_update()), and as an HP core enters WFI and
+ * as it leaves; and its reset.
  */
 RISCVException esp32p4_counters_read(CPURISCVState *env, int csrno,
                                      target_ulong *val);
@@ -607,8 +590,6 @@ RISCVException esp32p4_counters_write(CPURISCVState *env, int csrno,
                                       target_ulong val);
 void esp32p4_counters_update(ESP32P4CPU *cpu);
 void esp32p4_counters_wfi(ESP32P4CPU *cpu, bool wfi);
-void esp32p4_counters_set_waiti(ESP32P4CPU *cpu, bool force_on,
-                                uint8_t delay);
 void esp32p4_counters_reset(ESP32P4CPU *cpu);
 
 /* esp32p4_pie.c */
