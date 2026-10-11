@@ -339,6 +339,25 @@ static inline uint64_t esp32p4_clk_ns_cycles(ESP32P4ClkPeriod p, int64_t ns)
     return esp32p4_div_192_128(y, p.num_hi, p.num_lo, &rem);
 }
 
+/*
+ * The whole cycles of a clock of period @p that have elapsed
+ * @units_hi:@units_lo Clock units (2^-32 ns) after one of its edges: 0 for
+ * a stopped clock; saturating at UINT64_MAX.
+ */
+static inline uint64_t esp32p4_clk_units_cycles(ESP32P4ClkPeriod p,
+                                                uint64_t units_hi,
+                                                uint64_t units_lo)
+{
+    uint64_t y[3];
+    bool rem;
+
+    if (!esp32p4_clk_period_running(p)) {
+        return 0;
+    }
+    esp32p4_mul_64_128(y, p.den, units_hi, units_lo);
+    return esp32p4_div_192_128(y, p.num_hi, p.num_lo, &rem);
+}
+
 /* Whether a period @p is a whole number of ns, every edge on a whole ns. */
 static inline bool esp32p4_clk_period_whole_ns(ESP32P4ClkPeriod p)
 {

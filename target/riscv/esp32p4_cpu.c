@@ -822,10 +822,17 @@ static void esp32p4_cpu_reset_exit(Object *obj, ResetType type)
 }
 
 #ifdef CONFIG_TCG
-/* The core's clock is about to change rate: count at the old one first. */
+/*
+ * The core's clock is about to change rate: count at the old one first;
+ * then count, and execute, at the new one.
+ */
 static void esp32p4_cpu_clk_update(void *opaque, ClockEvent event)
 {
-    esp32p4_counters_update(opaque);
+    if (event == ClockPreUpdate) {
+        esp32p4_counters_update(opaque);
+    } else {
+        esp32p4_counters_clock_changed(opaque);
+    }
 }
 #endif
 
@@ -840,7 +847,7 @@ static void esp32p4_cpu_init(Object *obj)
 #ifdef CONFIG_TCG
     ESP32P4_CPU(obj)->clk = qdev_init_clock_in(DEVICE(obj), ESP32P4_CPU_CLK,
                                                esp32p4_cpu_clk_update, obj,
-                                               ClockPreUpdate);
+                                               ClockPreUpdate | ClockUpdate);
 #endif
 }
 
@@ -998,13 +1005,31 @@ static const VMStateDescription vmstate_esp32p4_lp_state = {
     },
 };
 
+/* The exact period the core executes at under icount, as it counts. */
+static int esp32p4_counters_post_load(void *opaque, int version_id)
+{
+    ESP32P4CPU *cpu = opaque;
+    ESP32P4ClkPeriod p = cpu->clk_period;
+    uint64_t lo = p.num_lo, hi = p.num_hi;
+
+    if (esp32p4_clk_period_running(p)) {
+        icount_set_cpu_period_frac(CPU(cpu), divu128(&lo, &hi, p.den), p.den);
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_esp32p4_counters = {
     .name = "esp32p4-cpu/counters",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .post_load = esp32p4_counters_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4CPU),
+        VMSTATE_UINT64(clk_period.num_hi, ESP32P4CPU),
+        VMSTATE_UINT64(clk_period.num_lo, ESP32P4CPU),
+        VMSTATE_UINT64(clk_period.den, ESP32P4CPU),
         VMSTATE_UINT64(cycles, ESP32P4CPU),
+        VMSTATE_UINT64(cycles_synced, ESP32P4CPU),
         VMSTATE_INT64(cycles_ns, ESP32P4CPU),
         VMSTATE_UINT32(cycles_frac, ESP32P4CPU),
         VMSTATE_UINT64(insns, ESP32P4CPU),
