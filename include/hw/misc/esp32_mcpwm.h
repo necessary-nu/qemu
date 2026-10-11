@@ -1,5 +1,5 @@
 /*
- * ESP32 motor control PWM (MCPWM)
+ * ESP32 and ESP32-P4 motor control PWM (MCPWM)
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -15,8 +15,8 @@
 #include "qom/object.h"
 
 #define TYPE_ESP32_MCPWM "esp32.mcpwm"
-typedef struct Esp32McpwmState Esp32McpwmState;
-DECLARE_INSTANCE_CHECKER(Esp32McpwmState, ESP32_MCPWM, TYPE_ESP32_MCPWM)
+#define TYPE_ESP32P4_MCPWM "esp32p4-mcpwm"
+OBJECT_DECLARE_TYPE(Esp32McpwmState, Esp32McpwmClass, ESP32_MCPWM)
 
 #define ESP32_MCPWM_TIMERS  3
 #define ESP32_MCPWM_OPS     3
@@ -43,6 +43,31 @@ DECLARE_INSTANCE_CHECKER(Esp32McpwmState, ESP32_MCPWM, TYPE_ESP32_MCPWM)
 #define ESP32_MCPWM_SYNC_IN     "sync-in"
 #define ESP32_MCPWM_FAULT_IN    "fault-in"
 #define ESP32_MCPWM_CAP_IN      "cap-in"
+
+/*
+ * The ESP32-P4's MCPWM0 and MCPWM1 (TYPE_ESP32P4_MCPWM) are the ESP32's
+ * block with an ETM interface, two event comparators per operator
+ * (OPn_TSTMP_E1/E2) and CLK and VERSION moved to 0x144 and 0x148. Their
+ * clock is "clk", MCPWMn_CLK from HP_SYS_CLKRST (its source and
+ * divider), which CLK_PRESCALE divides into PWM_clk and the capture
+ * timer counts; the machine maps the registers behind MCPWMn_APB_CLK and
+ * the block's reset.
+ *
+ *   "etm-event" (gpio-out, ESP32P4_MCPWM_ETM_EVENTS lines): the events in
+ *               the order of their ETM IDs from MCPWMn_EVT_TIMER0_STOP:
+ *               the timers' STOP, TEZ and TEP, the operators' TEA and
+ *               TEB, the faults' F and F_CLR, the trip zones' CBC and
+ *               OST, the captures' CAP, then the operators' TEE1 and
+ *               TEE2; each pulsed, stamped with its time, as it happens
+ *               while its EVT_EN or EVT_EN2 bit is set.
+ *   "etm-task"  (gpio-in, ESP32P4_MCPWM_ETM_TASKS lines): the tasks in the
+ *               order of their IDs from MCPWMn_TASK_CMPR0_A_UP, each
+ *               acting as it rises while its TASK_EN bit is set.
+ */
+#define ESP32_MCPWM_ETM_EVENT   "etm-event"
+#define ESP32_MCPWM_ETM_TASK    "etm-task"
+#define ESP32P4_MCPWM_ETM_EVENTS 36
+#define ESP32P4_MCPWM_ETM_TASKS 22
 
 typedef struct Esp32McpwmTimer {
     uint32_t cfg0;          /* TIMERn_CFG0: prescale, period shadow, method */
@@ -93,6 +118,7 @@ typedef struct Esp32McpwmOp {
     uint64_t car_rise[2];   /* when the carrier's input last rose */
     bool cbc_on;
     bool ost_on;
+    uint32_t tstmp_e[2];    /* the ESP32-P4's event comparators E1, E2 */
 } Esp32McpwmOp;
 
 /*
@@ -116,17 +142,39 @@ typedef struct Esp32McpwmCore {
     /* A PWM timer's sync_out reached the capture timer, last at cap_sync */
     bool cap_sync_hit;
     uint64_t cap_sync;
+    /*
+     * The ESP32-P4's ETM: the enables of the events, and those that have
+     * happened (one bit per "etm-event" line) since the device last
+     * pulsed them, the latest at cycle etm_cycle.
+     */
+    uint32_t evt_en;
+    uint32_t evt_en2;
+    uint32_t task_en;
+    uint64_t etm_fired;
+    uint64_t etm_cycle;
 } Esp32McpwmCore;
+
+struct Esp32McpwmClass {
+    SysBusDeviceClass parent_class;
+
+    /* The ESP32-P4's block: ETM, event comparators, its register map */
+    bool p4;
+};
 
 struct Esp32McpwmState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
-    Clock *f160m;
-    Clock *apb;
+    /* PWM_clk's source: PLL_F160M_CLK, or the ESP32-P4's MCPWMn_CLK */
+    Clock *core_clk;
+    /* The capture timer's: APB_CLK, or the ESP32-P4's MCPWMn_CLK */
+    Clock *cap_clk;
     QEMUTimer *timer;
     qemu_irq irq;
     qemu_irq out[ESP32_MCPWM_OUTS];
+    qemu_irq etm_event[ESP32P4_MCPWM_ETM_EVENTS];
+    Notifier line_source;
+    bool p4;
 
     Esp32McpwmCore core;
     uint32_t clk_cfg;
@@ -164,6 +212,13 @@ struct Esp32McpwmState {
     int64_t seen_ns;
     bool updating;
     bool update_pending;
+    /*
+     * A register access is bringing the other line sources up to date;
+     * an access is under way, acting at access_ns.
+     */
+    bool syncing_others;
+    bool accessing;
+    int64_t access_ns;
 };
 
 #endif
