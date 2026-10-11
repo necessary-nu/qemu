@@ -23,6 +23,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
 /* PAD_RTC_HOLD_CTRL0/1 hold GPIO0 to GPIO56. */
 #define ESP32P4_LP_SYS_HOLDS 57
 
+/* PAD_COMP0 and PAD_COMP1, the analog comparators'. */
+#define ESP32P4_LP_SYS_PAD_COMPS 2
+
 /*
  * Named GPIO outputs
  * ==================
@@ -39,14 +42,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
  * ESP32P4_LP_SYS_STALL_SEL: SYSTIMER_STALL_SEL, high when the RTC timer
  *   follows HP core 1's stall rather than core 0's.
  * ESP32P4_LP_SYS_SWD_RESET_EN: high while the super watchdog may reset
- *   the system: FIB bit 2 clear, DIG_FIB's if LP_FIB_SEL bit 2 is set,
- *   else the analog state ANA_FIB's. Low from reset.
- * ESP32P4_LP_SYS_BOD_RESET_EN: the same for the brownout detector, bit 1.
+ *   the system: FIB bit 2 set, the analog state ANA_FIB's if LP_FIB_SEL
+ *   bit 2 is set, else DIG_FIB's. Low from reset, the analog state not
+ *   enabling it; to the RTC watchdog block's "swd-reset-en".
+ * ESP32P4_LP_SYS_BOD_RESET_EN: the same for the brownout detector, FIB
+ *   bit 1, which enables it. High from reset; to LP_ANALOG_PERI's
+ *   "bod-en".
  * ESP32P4_LP_SYS_HP_ROOT_CLK: HP_ROOT_CLK_CTRL's CPU_CLK_EN and
  *   SYS_CLK_EN, the gates of the HP system's 400 MHz CPU and 480 MHz
  *   system root clocks, for the reset and clock control.
  * ESP32P4_LP_SYS_USB_PHY_SEL: USB_CTRL's SW_HW_USB_PHY_SEL and
  *   SW_USB_PHY_SEL, to USB_WRAP's "phy-sel" inputs.
+ * ESP32P4_LP_SYS_PAD_COMP: line n, a pulse as software writes PAD_COMPn,
+ *   for analog comparator n, which reads it with esp32p4_lp_sys_reg().
  * ESP32P4_LP_SYS_ETM_WAKEUP_FLAG: LP_CORE_ETM_WAKEUP_FLAG, the PMU's ETM
  *   wakeup source, high from the ETM's ULP_TASK_WAKEUP_CPU until software
  *   clears the flag.
@@ -73,6 +81,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
 #define ESP32P4_LP_SYS_BOD_RESET_EN     "bod-reset-en"
 #define ESP32P4_LP_SYS_HP_ROOT_CLK      "hp-root-clk"
 #define ESP32P4_LP_SYS_USB_PHY_SEL      "usb-phy-sel"
+#define ESP32P4_LP_SYS_PAD_COMP         "pad-comp"
 #define ESP32P4_LP_SYS_ETM_WAKEUP_FLAG  "lp-core-etm-wakeup-flag"
 #define ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP "lp-core-etm-wakeup"
 #define ESP32P4_LP_SYS_ETM_TASK_ULP_INT "etm-task-ulp-int"
@@ -98,6 +107,7 @@ struct ESP32P4LPSysState {
     qemu_irq bod_reset_en;
     qemu_irq hp_root_clk[2];
     qemu_irq usb_phy_sel[2];
+    qemu_irq pad_comp[ESP32P4_LP_SYS_PAD_COMPS];
     qemu_irq etm_wakeup_flag;
 };
 

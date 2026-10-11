@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -48,18 +49,22 @@ enum {
 /*
  * Clock input "xtal", the PLLs' reference; clock outputs "apll", "cpll",
  * "sdio-pll", "spll" and "mpll", each PLL's output, stopped while it is
- * powered down or not locked.
+ * powered down or not locked. A Clock holds its period only to its unit,
+ * so esp32p4_ana_pll_period() gives each output's period exactly, for
+ * the clock tree to divide (see esp32p4_clk_period.h).
  *
  * Named GPIO inputs, per PLL: "xpd", its power-up by the PMU, and
  * "cal-stop", HP_SYS_CLKRST_ANA_PLL_CTRL0's *_CAL_STOP. Named GPIO output,
- * per PLL: "cal-end", its calibration done; and "bias-update", a pulse as
- * a BIAS register is written, for the brown-out detector, whose thresholds
- * BIAS holds.
+ * per PLL: "cal-end", its calibration done; "bias-update", a pulse as a
+ * BIAS register is written, for the brown-out detector, whose thresholds
+ * BIAS holds; and "sar-update", a pulse as an analog sensors' (ANA_SENSOR)
+ * register is written, for the temperature sensor, whose range it holds.
  */
 #define ESP32P4_ANA_XPD         "xpd"
 #define ESP32P4_ANA_CAL_STOP    "cal-stop"
 #define ESP32P4_ANA_CAL_END     "cal-end"
 #define ESP32P4_ANA_BIAS_UPDATE "bias-update"
+#define ESP32P4_ANA_SAR_UPDATE  "sar-update"
 
 /*
  * BIAS's brown-out thresholds (TRM 25.4): VDD_BAT's, VDD_ANA's and the
@@ -84,6 +89,7 @@ struct ESP32P4AnaState {
     Clock *out[ESP32P4_ANA_NUM_PLLS];
     qemu_irq cal_end_out[ESP32P4_ANA_NUM_PLLS];
     qemu_irq bias_update;
+    qemu_irq sar_update;
 
     uint8_t regs[ESP32P4_ANA_NUM_SLAVES][ESP32P4_ANA_SLAVE_REGS];
 
@@ -91,6 +97,8 @@ struct ESP32P4AnaState {
     bool cal_stop[ESP32P4_ANA_NUM_PLLS];
     bool locked[ESP32P4_ANA_NUM_PLLS];
     bool cal_end[ESP32P4_ANA_NUM_PLLS];
+    /* The period each output last took, exactly. */
+    ESP32P4ClkPeriod out_period[ESP32P4_ANA_NUM_PLLS];
     QEMUTimer *lock_timer[ESP32P4_ANA_NUM_PLLS];
     QEMUTimer *cal_timer[ESP32P4_ANA_NUM_PLLS];
     ESP32P4AnaPllTimer timer_ctx[ESP32P4_ANA_NUM_PLLS];
@@ -108,5 +116,12 @@ bool esp32p4_ana_write(ESP32P4AnaState *s, int slave, uint8_t reg,
                        uint8_t data);
 bool esp32p4_ana_read(ESP32P4AnaState *s, int slave, uint8_t reg,
                       uint8_t *data);
+
+/*
+ * The period of PLL @pll's output (ESP32P4_ANA_PLL_*) as its Clock last
+ * took it, exactly: the Clock's period is this rounded down to a whole
+ * unit (esp32p4_clk_period_clock()).
+ */
+ESP32P4ClkPeriod esp32p4_ana_pll_period(ESP32P4AnaState *s, int pll);
 
 #endif

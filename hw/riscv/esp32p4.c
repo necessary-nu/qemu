@@ -270,6 +270,25 @@
  *     reset, which also filters its inputs, its interrupt PCNT_INTR
  *     (source 111), its four units' signal, control and clear inputs
  *     matrix signals 141 to 156 and 63 to 66.
+ *   - The analog blocks (TRM chapters 63 to 66): the SAR ADCs' HP
+ *     controller (0x500DE000, behind ADC_APB_CLK and RST_EN_ADC, timed by
+ *     HPADC_CLK, its DMA through GDMA-AHB as peripheral 8, its interrupt
+ *     ADC_INTR, source 37) and LP controller (0x50127000, behind LPPERI's
+ *     LP_ADC gate and reset, on LPADC_CLK and the LP SAR clocks, its
+ *     interrupt LP_ADC_INTR, source 9); the temperature sensor
+ *     (0x5012F000, on LPPERI's LP_TSENS clock and reset, its interrupt
+ *     source 15); the touch sensor (0x50128000, behind LPPERI's LP_TOUCH
+ *     gate and reset, configured through LP_ANALOG_PERI and the PMU, on
+ *     LP_DYN_FAST_CLK and LP_DYN_SLOW_CLK, its interrupt source 14 and its
+ *     wakeup the PMU's source 11); and the analog voltage comparators,
+ *     configured in LP_SYSTEM, their outputs to GPIO_EXT; with their ETM
+ *     events and tasks. The board's analog inputs are properties: the
+ *     ADC pads' voltages, which the comparators' pads GPIO51 to GPIO54
+ *     share, the touch pads' capacitances and the die temperature:
+ *
+ *       -global esp32p4-adc.adc1-ch3-mv=1200
+ *       -global esp32p4-touch.ch5-ff=14000
+ *       -global esp32p4-tsens.temp-mc=40000
  *
  *   - The cryptography blocks (TRM chapters 27 to 36): the AES, SHA, RSA,
  *     ECC and HMAC accelerators, the RSA_DS and ECDSA_DS signature
@@ -330,7 +349,11 @@
  * image -bios names. With -kernel, an ELF's segments are loaded into
  * L2MEM (past the L2 cache), the TCM or LP SRAM, and core 0 starts at the
  * ELF's entry point rather than in the ROM, with the caches empty; core 1
- * is still held for software to release.
+ * is still held for software to release. The program finds the super
+ * watchdog as the ROM leaves the program it boots: running since the
+ * reset, unfed, its SWD_RESET_FLAG cleared (the ROM's main() clears it on
+ * core 0 at every boot), and its reset not enabled by LP_SYSTEM's FIB
+ * control until software enables it.
  *
  * The ELF stands for the program the ROM boots from flash, and takes the
  * ROM's place whenever the HP system starts: after an HP core reset that
@@ -407,7 +430,6 @@ static const struct {
 
     /* HP peripherals 1. */
     { "lcd-cam",          0x500dc000, 4 * KiB },
-    { "adc",              0x500de000, 4 * KiB },
     { "iomux-mspi-pin",   0x500e1200, 4 * KiB - 0x200 },
     { "mem-monitor",      0x500e3000, 4 * KiB },
     { "audio-addc",       0x500e4000, 4 * KiB },
@@ -421,9 +443,6 @@ static const struct {
 
     /* LP peripherals. */
     { "lp-spi",           0x50123000, 4 * KiB },
-    { "lp-adc",           0x50127000, 4 * KiB },
-    { "lp-touch",         0x50128000, 4 * KiB },
-    { "lp-tsens",         0x5012f000, 4 * KiB },
 };
 
 static DeviceState *esp32p4_unimplemented_device(const char *name,
@@ -851,6 +870,8 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
 
     qdev_connect_clock_in(ana, "xtal", qdev_get_clock_out(clkrst,
                                                           "osc-xtal"));
+    object_property_set_link(OBJECT(clkrst), "ana", OBJECT(ana),
+                             &error_abort);
     for (i = 0; i < ESP32P4_ANA_NUM_PLLS; i++) {
         g_autofree char *in = g_strdup_printf("%s-in",
                                               esp32p4_ana_pll_names[i]);
@@ -2226,11 +2247,8 @@ static void esp32p4_hp_top_power(void *opaque, int n, int level)
  *     the LP core takes the PMU's interrupts as sources 6 and 7.
  *   - LP_ANALOG_PERI, behind its LP_CLKRST reset, its interrupt source 8:
  *     the brown-out detector, on BIAS's thresholds, and the glitch and
- *     power supply detectors. The detector's "bod-en" is left at the
- *     analog default, enabled, rather than taken from LP_SYSTEM's
- *     "bod-reset-en", which reads a set FIB bit as disabling the detector
- *     and so, from its reset value, would disable it, where TRM 21.2.2.2
- *     has a set bit enable it.
+ *     power supply detectors, the detector enabled by LP_SYSTEM's FIB
+ *     control (esp32p4_init_debug()).
  *   - The LP mailbox, behind its LP_CLKRST reset, MB_HP_INTR and MB_LP_INTR
  *     sources 4 and 5.
  */
@@ -2372,6 +2390,11 @@ static void esp32p4_init_low_power(ESP32P4MachineState *s)
     object_initialize_child(OBJECT(s), "lp-ana", &s->lp_ana,
                             TYPE_ESP32P4_LP_ANA);
     ana = DEVICE(&s->lp_ana);
+    /* The touch sensor, which LP_ANALOG_PERI configures. */
+    object_initialize_child(OBJECT(s), "touch", &s->touch,
+                            TYPE_ESP32P4_TOUCH);
+    object_property_set_link(OBJECT(ana), "touch", OBJECT(&s->touch),
+                             &error_abort);
     object_property_set_link(OBJECT(ana), "clkrst", OBJECT(&s->clkrst),
                              &error_abort);
     object_property_set_link(OBJECT(ana), "ana", OBJECT(&s->ana),
@@ -2509,10 +2532,10 @@ static void esp32p4_sw_sys_reset(void *opaque, int n, int level)
  *     pads are the GPIO block's "hold-all", esp32p4_init_low_power()).
  *   - LP_SYSTEM's software system reset, an HP core reset with cause 0x03
  *     (TRM table 11.1-1), its choice of the core whose stall the RTC
- *     timer follows, and its FIB control of the super watchdog's reset,
- *     to the RTC watchdog. Its LP core disable is the LP core's
- *     (esp32p4_init_lp_core()); its brownout reset enable is not
- *     connected (see esp32p4_init_low_power()).
+ *     timer follows, and its FIB control (TRM 21.2.2.2) of the super
+ *     watchdog's reset, to the RTC watchdog block, and of the brownout
+ *     detector, to LP_ANALOG_PERI. Its LP core disable is the LP core's
+ *     (esp32p4_init_lp_core()).
  *   - The debug assistant (0x3FF06000), not gated by BUSMON_CPU_CLK_EN, its
  *     interrupt ASSIST_DEBUG_INTR (source 127), watching the HP cores and
  *     taking their resets for its PC records.
@@ -2592,6 +2615,9 @@ static void esp32p4_init_debug(ESP32P4MachineState *s)
     qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_SWD_RESET_EN, 0,
                                 qdev_get_gpio_in_named(DEVICE(&s->lp_wdt),
                                     ESP32P4_LP_WDT_SWD_RESET_EN, 0));
+    qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_BOD_RESET_EN, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->lp_ana),
+                                    ESP32P4_LP_ANA_BOD_EN, 0));
 
     object_initialize_child(OBJECT(s), "assist-debug", &s->assist_debug,
                             TYPE_ESP32P4_ASSIST_DEBUG);
@@ -3066,6 +3092,172 @@ static void esp32p4_init_rmt_pcnt(ESP32P4MachineState *s)
 }
 
 /*
+ * The analog blocks (TRM chapters 63 to 66):
+ *
+ *   - The SAR ADCs: the HP controller's registers behind ADC_APB_CLK, its
+ *     FSMs and timer on HPADC_CLK ("adc"), held by RST_EN_ADC, its DMA
+ *     through GDMA-AHB as peripheral 8, its interrupt ADC_INTR (source
+ *     37); the LP controller's registers behind LPPERI's LP_ADC gate, on
+ *     LPADC_CLK and the LP SAR clocks, held by RST_EN_LP_ADC, its
+ *     interrupt LP_ADC_INTR (source 9). The SARs' initial codes and
+ *     calibration switches are the analog block's ANA_SENSOR registers,
+ *     the chip's calibration the eFuses'.
+ *   - The temperature sensor on LPPERI's LP_TSENS clock and reset, its
+ *     range in ANA_SENSOR, its calibration in the eFuses, its interrupt
+ *     LP_TSENS_INTR (source 15).
+ *   - The touch sensor: its status registers behind LPPERI's LP_TOUCH gate,
+ *     held by RST_EN_LP_TOUCH, its configuration LP_ANALOG_PERI's TOUCH_*
+ *     registers and its timer PMU_TOUCH_PWR_CNTL, on LP_DYN_FAST_CLK and
+ *     LP_DYN_SLOW_CLK, measuring only its sleep channel while the PMU has
+ *     the chip in LP_SLEEP, its interrupt LP_TOUCH_INTR (source 14), its
+ *     wakeup the PMU's source 11.
+ *   - The analog voltage comparators, configured by LP_SYSTEM's PAD_COMPn,
+ *     comparing the pads GPIO51 to GPIO54, whose digital drive they
+ *     watch, into GPIO_EXT's "ana-comp", which raises GPIO_PAD_COMP_INTR
+ *     (source 78) and the ZERO_DET ETM events.
+ *
+ * The ETM events and tasks are the ETM's (esp32p4_init_etm()).
+ */
+/* [spec:nuos:req:emu.esp32p4.analog] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_analog(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
+    DeviceState *pmu = DEVICE(&s->pmu);
+    DeviceState *dev, *cmpr;
+    int n;
+
+    object_initialize_child(OBJECT(s), "adc", &s->adc, TYPE_ESP32P4_ADC);
+    dev = DEVICE(&s->adc);
+    object_property_set_link(OBJECT(dev), "gdma", OBJECT(&s->gdma[0]),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "ana", OBJECT(&s->ana),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "adc", qdev_get_clock_out(clkrst, "adc"));
+    qdev_connect_clock_in(dev, "lp-adc",
+                          qdev_get_clock_out(clkrst, "lp-adc-func"));
+    qdev_connect_clock_in(dev, "lp-adc-sar1",
+                          qdev_get_clock_out(clkrst, "lp-adc-sar1"));
+    qdev_connect_clock_in(dev, "lp-adc-sar2",
+                          qdev_get_clock_out(clkrst, "lp-adc-sar2"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev),
+                             ESP32P4_ADC_MMIO_HP, ESP32P4_ADC_BASE,
+                             ESP32P4_CLK_ADC_APB, ESP32P4_CLKRST_GATE_NO_RESET,
+                             0);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev),
+                             ESP32P4_ADC_MMIO_LP, ESP32P4_LP_ADC_BASE,
+                             ESP32P4_CLK_LP_ADC, ESP32P4_CLKRST_GATE_NO_RESET,
+                             0);
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET, ESP32P4_RST_ADC,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_ADC_HP_RESET, 0));
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_LP_ADC,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_ADC_LP_RESET, 0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_ADC));
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_ADC));
+
+    object_initialize_child(OBJECT(s), "tsens", &s->tsens,
+                            TYPE_ESP32P4_TSENS);
+    dev = DEVICE(&s->tsens);
+    object_property_set_link(OBJECT(dev), "ana", OBJECT(&s->ana),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, "lp-tsens"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_TSENS_BASE, ESP32P4_CLK_LP_TSENS,
+                             ESP32P4_RST_LP_TSENS, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_TSENS));
+    qdev_connect_gpio_out_named(DEVICE(&s->ana), ESP32P4_ANA_SAR_UPDATE, 0,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_TSENS_DAC_UPDATE, 0));
+
+    dev = DEVICE(&s->touch);
+    object_property_set_link(OBJECT(dev), "lp-ana", OBJECT(&s->lp_ana),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "pmu", OBJECT(&s->pmu),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "fast",
+                          qdev_get_clock_out(clkrst, "lp-dyn-fast"));
+    qdev_connect_clock_in(dev, "slow",
+                          qdev_get_clock_out(clkrst, "lp-dyn-slow"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_TOUCH_BASE, ESP32P4_CLK_LP_TOUCH,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_LP_TOUCH,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_TOUCH_RESET, 0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_TOUCH));
+    qdev_connect_gpio_out_named(dev, ESP32P4_TOUCH_WAKEUP, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_TOUCH));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_TOUCH_PWR, 0,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_TOUCH_TIMER_UPDATE, 0));
+    /* LP_SLEEP, to the clock tree and the touch sensor. */
+    object_initialize_child(OBJECT(s), "lp-sleep-split", &s->lp_sleep_split,
+                            TYPE_SPLIT_IRQ);
+    qdev_prop_set_uint16(DEVICE(&s->lp_sleep_split), "num-lines", 2);
+    qdev_realize(DEVICE(&s->lp_sleep_split), NULL, &error_fatal);
+    qdev_connect_gpio_out(DEVICE(&s->lp_sleep_split), 0,
+                          qdev_get_gpio_out_connector(pmu,
+                                                      ESP32P4_PMU_LP_SLEEP,
+                                                      0));
+    qdev_connect_gpio_out(DEVICE(&s->lp_sleep_split), 1,
+                          qdev_get_gpio_in_named(dev, ESP32P4_TOUCH_SLEEP, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LP_SLEEP, 0,
+                                qdev_get_gpio_in(DEVICE(&s->lp_sleep_split),
+                                                 0));
+
+    object_initialize_child(OBJECT(s), "ana-cmpr", &s->ana_cmpr,
+                            TYPE_ESP32P4_ANA_CMPR);
+    cmpr = DEVICE(&s->ana_cmpr);
+    object_property_set_link(OBJECT(cmpr), "adc", OBJECT(&s->adc),
+                             &error_abort);
+    object_property_set_link(OBJECT(cmpr), "lp-sys", OBJECT(&s->lp_sys),
+                             &error_abort);
+    sysbus_realize(SYS_BUS_DEVICE(cmpr), &error_fatal);
+    for (n = 0; n < ESP32P4_ANA_CMPRS; n++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->lp_sys),
+                                    ESP32P4_LP_SYS_PAD_COMP, n,
+                                    qdev_get_gpio_in_named(cmpr,
+                                        ESP32P4_ANA_CMPR_CONFIG, n));
+        qdev_connect_gpio_out_named(cmpr, ESP32P4_ANA_CMPR_OUT, n,
+                                    qdev_get_gpio_in_named(gpio,
+                                        ESP32P4_GPIO_ANA_COMP, n));
+    }
+    qdev_connect_gpio_out_named(DEVICE(&s->adc), ESP32P4_ADC_PAD_CHANGE, 0,
+                                qdev_get_gpio_in_named(cmpr,
+                                    ESP32P4_ANA_CMPR_PAD_CHANGE, 0));
+    for (n = 0; n < ESP32P4_ANA_CMPR_PADS; n++) {
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_DRIVE_HIGH,
+                                    ESP32P4_ANA_CMPR_PAD0 + n,
+                                    qdev_get_gpio_in_named(cmpr,
+                                        ESP32P4_ANA_CMPR_PAD, 2 * n));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_DRIVE_LOW,
+                                    ESP32P4_ANA_CMPR_PAD0 + n,
+                                    qdev_get_gpio_in_named(cmpr,
+                                        ESP32P4_ANA_CMPR_PAD, 2 * n + 1));
+    }
+}
+
+/*
  * The event task matrix (TRM chapter 14), its registers behind
  * ETM_APB_CLK, running on ETM_SYS_CLK, held by RST_EN_ETM; and every
  * modelled block's events and tasks, by their IDs, as its header
@@ -3074,9 +3266,10 @@ static void esp32p4_init_rmt_pcnt(ESP32P4MachineState *s)
  *
  * The RMT and the PCNT have no events or tasks on the P4.
  *
- * Not connected, as their blocks are not modelled: the ADC, REGDMA,
- * temperature sensor and 2D-DMA events and tasks; and the RTC timer's
- * tasks (RTC_TASK_*), which the TRM says it does not take.
+ * Not connected, as their blocks are not modelled: the REGDMA and 2D-DMA
+ * events and tasks; ADC_EVT_RESULT_DONE0, which the TRM does not
+ * describe; and the RTC timer's tasks (RTC_TASK_*), which the TRM says it
+ * does not take.
  */
 /* [spec:nuos:req:emu.esp32p4.etm] */
 static void esp32p4_init_etm(ESP32P4MachineState *s)
@@ -3220,6 +3413,36 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
             esp32p4_etm_connect_task(etm, task[g] + k, dev,
                                      ESP32_MCPWM_ETM_TASK, k);
         }
+    }
+
+    /* The ADC's and the temperature sensor's. */
+    for (k = 0; k < ESP32P4_ADC_ETM_EVENTS; k++) {
+        static const int adc_evt[ESP32P4_ADC_ETM_EVENTS] = {
+            [ESP32P4_ADC_EVT_CONV_CMPLT0] = ESP32P4_ETM_ADC_EVT_CONV_CMPLT0,
+            [ESP32P4_ADC_EVT_EQ_ABOVE_THRESH0] =
+                ESP32P4_ETM_ADC_EVT_EQ_ABOVE_THRESH0,
+            [ESP32P4_ADC_EVT_EQ_ABOVE_THRESH1] =
+                ESP32P4_ETM_ADC_EVT_EQ_ABOVE_THRESH1,
+            [ESP32P4_ADC_EVT_EQ_BELOW_THRESH0] =
+                ESP32P4_ETM_ADC_EVT_EQ_BELOW_THRESH0,
+            [ESP32P4_ADC_EVT_EQ_BELOW_THRESH1] =
+                ESP32P4_ETM_ADC_EVT_EQ_BELOW_THRESH1,
+            [ESP32P4_ADC_EVT_STOPPED0] = ESP32P4_ETM_ADC_EVT_STOPPED0,
+            [ESP32P4_ADC_EVT_STARTED0] = ESP32P4_ETM_ADC_EVT_STARTED0,
+        };
+
+        esp32p4_etm_connect_event(etm, adc_evt[k], DEVICE(&s->adc),
+                                  ESP32P4_ADC_ETM_EVENT, k);
+    }
+    for (k = 0; k < ESP32P4_ADC_ETM_TASKS; k++) {
+        esp32p4_etm_connect_task(etm, ESP32P4_ETM_ADC_TASK_SAMPLE0 + k,
+                                 DEVICE(&s->adc), ESP32P4_ADC_ETM_TASK, k);
+    }
+    esp32p4_etm_connect_event(etm, ESP32P4_ETM_TMPSNSR_EVT_OVER_LIMIT,
+                              DEVICE(&s->tsens), ESP32P4_TSENS_ETM_EVENT, 0);
+    for (k = 0; k < ESP32P4_TSENS_ETM_TASKS; k++) {
+        esp32p4_etm_connect_task(etm, ESP32P4_ETM_TMPSNSR_TASK_START_SAMPLE + k,
+                                 DEVICE(&s->tsens), ESP32P4_TSENS_ETM_TASK, k);
     }
 
     /* The PMU's sleep request and its wakeup to HP_ACTIVE. */
@@ -3994,6 +4217,22 @@ static void esp32p4_reload_kernel(ESP32P4MachineState *s)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.boot]
+ * What the boot ROM does at boot that a program -kernel starts in its
+ * place finds done, as a system reset completes. Of the super watchdog,
+ * the ROM's main() only clears SWD_RESET_FLAG on core 0
+ * (clear_super_wdt_reset_flag()); it neither feeds the watchdog nor sets
+ * SWD_AUTO_FEED_EN, nor writes LP_SYSTEM's FIB control, so the watchdog
+ * runs on, unfed, as it does here.
+ */
+static void esp32p4_rom_boot_state(void *opaque)
+{
+    ESP32P4MachineState *s = opaque;
+
+    esp32p4_lp_wdt_swd_rst_flag_clr(&s->lp_wdt);
+}
+
 /* [spec:nuos:req:emu.esp32p4.machine] */
 static void esp32p4_load(ESP32P4MachineState *s)
 {
@@ -4028,6 +4267,7 @@ static void esp32p4_load(ESP32P4MachineState *s)
     }
     s->kernel_entry = entry;
     s->hp_cpu[0].parent_obj.env.resetvec = entry;
+    qemu_register_reset(esp32p4_rom_boot_state, s);
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */
@@ -4074,6 +4314,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_twai(s);
     esp32p4_init_pwm(s);
     esp32p4_init_rmt_pcnt(s);
+    esp32p4_init_analog(s);
     esp32p4_init_etm(s);
     esp32p4_init_usb(s);
     esp32p4_init_debug(s);

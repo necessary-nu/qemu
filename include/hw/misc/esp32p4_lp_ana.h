@@ -25,14 +25,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPAnaState, ESP32P4_LP_ANA)
 #define ESP32P4_LP_ANA_SIZE     0x1000
 #define ESP32P4_LP_ANA_NREGS    (ESP32P4_LP_ANA_SIZE / 4)
 
+/* The touch sensor's configuration registers, TOUCH_* (0xFC to 0x1FC). */
+#define ESP32P4_LP_ANA_TOUCH_FIRST 0x0fc
+#define ESP32P4_LP_ANA_TOUCH_LAST  0x1fc
+
+typedef struct ESP32P4TouchState ESP32P4TouchState;
+
 /*
  * Inputs and outputs:
  *
  *   - Clock input "fast": LP_DYN_FAST_CLK, which the brown-out counter and
  *     the battery's under-voltage filters count.
  *   - Links "clkrst", which carries out the detectors' resets and records
- *     their causes; "ana", whose BIAS registers hold the thresholds; and
- *     "efuse", whose EFUSE_PVT_GLITCH_EN enables the power supply detector.
+ *     their causes; "ana", whose BIAS registers hold the thresholds;
+ *     "efuse", whose EFUSE_PVT_GLITCH_EN enables the power supply detector;
+ *     and "touch", the touch sensor, which the TOUCH_* registers configure
+ *     and which is told of each write to them
+ *     (esp32p4_touch_ana_write()) and of their reset.
  *   - Properties "vdda-mv" and "vbat-mv": the board's VDD_ANA and VDD_BAT
  *     supplies in millivolts, 3300 each by default, settable with -global
  *     before the machine starts and with qom-set while it runs.
@@ -91,6 +100,7 @@ struct ESP32P4LPAnaState {
     ESP32P4ClkRstState *clkrst;
     ESP32P4AnaState *ana;
     ESP32P4EfuseState *efuse;
+    ESP32P4TouchState *touch;
 
     uint32_t regs[ESP32P4_LP_ANA_NREGS];
 
@@ -129,5 +139,8 @@ struct ESP32P4LPAnaState {
     bool brownout_level;
     bool vbat_undervoltage_level;
 };
+
+/* A TOUCH_* register at @offset as stored, for the touch sensor. */
+uint32_t esp32p4_lp_ana_touch_reg(ESP32P4LPAnaState *s, hwaddr offset);
 
 #endif

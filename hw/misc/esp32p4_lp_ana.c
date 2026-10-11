@@ -77,10 +77,10 @@
  * core's interrupt; the raw bits clear when written with 1 and through
  * the clear registers.
  *
- * The touch sensor's registers, 0xFC to 0x1FC, are kept as written for
- * the touch sensor, which is not modelled; writing them is logged as
- * such. The block is in the LP always-on domain: a system reset resets
- * it, as LP_CLKRST_RST_EN_LP_ANAPERI does.
+ * The touch sensor's registers, 0xFC to 0x1FC, hold its configuration,
+ * for the touch sensor (esp32p4_touch.c), which is told of each write and
+ * reads them back. The block is in the LP always-on domain: a system
+ * reset resets it, as LP_CLKRST_RST_EN_LP_ANAPERI does.
  */
 
 #include "qemu/osdep.h"
@@ -92,6 +92,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/esp32p4_lp_ana.h"
+#include "hw/misc/esp32p4_touch.h"
 #include "migration/vmstate.h"
 #include "system/runstate.h"
 
@@ -111,8 +112,8 @@
 #define A_LP_INT_ST             0x034
 #define A_LP_INT_ENA            0x038
 #define A_LP_INT_CLR            0x03c
-#define A_TOUCH_FIRST           0x0fc
-#define A_TOUCH_LAST            0x1fc
+#define A_TOUCH_FIRST           ESP32P4_LP_ANA_TOUCH_FIRST
+#define A_TOUCH_LAST            ESP32P4_LP_ANA_TOUCH_LAST
 #define A_DATE                  0x3fc
 
 #define R(a)                    ((a) / 4)
@@ -580,7 +581,7 @@ static void lp_ana_write(void *opaque, hwaddr addr, uint64_t value,
     uint32_t v = ((uint32_t)value << shift) & lanes;
     const LPAnaReg *info = esp32p4_lp_ana_reg_info(reg);
     uint32_t *r;
-    uint32_t wt;
+    uint32_t wt, old;
 
     if (!info) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write of %u bytes at reserved "
@@ -594,14 +595,15 @@ static void lp_ana_write(void *opaque, hwaddr addr, uint64_t value,
         return;
     }
     r = &s->regs[R(reg)];
+    old = *r;
     *r = (*r & ~(info->rw & lanes)) | (v & info->rw);
     *r &= ~(v & info->wtc);
     wt = v & info->wt;
 
     if (reg >= A_TOUCH_FIRST && reg <= A_TOUCH_LAST) {
-        qemu_log_mask(LOG_UNIMP, "%s: the touch sensor is not modelled "
-                      "(write of 0x%" PRIx64 " at 0x%" HWADDR_PRIx ")\n",
-                      TYPE_ESP32P4_LP_ANA, value, addr);
+        if (s->touch) {
+            esp32p4_touch_ana_write(s->touch, reg, old, *r, wt);
+        }
         return;
     }
     switch (reg) {
@@ -781,7 +783,19 @@ static void esp32p4_lp_ana_reset_hold(Object *obj, ResetType type)
 
 static void esp32p4_lp_ana_reset_exit(Object *obj, ResetType type)
 {
-    lp_ana_update(ESP32P4_LP_ANA(obj));
+    ESP32P4LPAnaState *s = ESP32P4_LP_ANA(obj);
+
+    lp_ana_update(s);
+    if (s->touch) {
+        esp32p4_touch_ana_reset(s->touch);
+    }
+}
+
+/* [spec:nuos:req:emu.esp32p4.analog] */
+uint32_t esp32p4_lp_ana_touch_reg(ESP32P4LPAnaState *s, hwaddr offset)
+{
+    assert(offset >= A_TOUCH_FIRST && offset <= A_TOUCH_LAST);
+    return s->regs[R(offset)];
 }
 
 static void esp32p4_lp_ana_init(Object *obj)
@@ -909,6 +923,8 @@ static const Property esp32p4_lp_ana_properties[] = {
                      ESP32P4AnaState *),
     DEFINE_PROP_LINK("efuse", ESP32P4LPAnaState, efuse, TYPE_ESP32P4_EFUSE,
                      ESP32P4EfuseState *),
+    DEFINE_PROP_LINK("touch", ESP32P4LPAnaState, touch, TYPE_ESP32P4_TOUCH,
+                     ESP32P4TouchState *),
 };
 
 static void esp32p4_lp_ana_class_init(ObjectClass *klass, const void *data)

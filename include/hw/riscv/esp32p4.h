@@ -30,8 +30,10 @@
 #include "hw/intc/esp32p4_intmatrix.h"
 #include "hw/intc/esp32p4_lp_intr.h"
 #include "hw/ssi/ssi.h"
+#include "hw/misc/esp32p4_adc.h"
 #include "hw/misc/esp32p4_aes.h"
 #include "hw/misc/esp32p4_ana.h"
+#include "hw/misc/esp32p4_ana_cmpr.h"
 #include "hw/misc/esp32p4_assist_debug.h"
 #include "hw/misc/esp32p4_axi_perf_mon.h"
 #include "hw/misc/esp32p4_cache.h"
@@ -58,8 +60,10 @@
 #include "hw/misc/esp32p4_rmt.h"
 #include "hw/misc/esp32p4_rsa.h"
 #include "hw/misc/esp32p4_sha.h"
+#include "hw/misc/esp32p4_touch.h"
 #include "hw/misc/esp32p4_trace.h"
 #include "hw/misc/esp32p4_trng.h"
+#include "hw/misc/esp32p4_tsens.h"
 #include "hw/net/esp32p4_emac.h"
 #include "hw/net/esp32p4_twai.h"
 #include "hw/net/ip101_phy.h"
@@ -294,6 +298,14 @@ struct ESP32P4MachineState {
     ESP32P4TrngState trng;
     /* RST_EN_DS, _ECDSA, _KM and _HMAC, to the blocks each holds. */
     SplitIRQ crypto_rst_split[ESP32P4_CRYPTO_RST_SPLITS];
+
+    /* The analog blocks. */
+    ESP32P4AdcState adc;
+    ESP32P4TsensState tsens;
+    ESP32P4TouchState touch;
+    ESP32P4AnaCmprState ana_cmpr;
+    /* LP_SLEEP to the clock tree and the touch sensor. */
+    SplitIRQ lp_sleep_split;
 };
 
 /*
