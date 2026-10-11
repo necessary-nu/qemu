@@ -93,7 +93,9 @@ enum {
  *     starts.
  *
  *   - esp32p4_gdma_tx_pending() and esp32p4_gdma_rx_room() give the
- *     bytes a pull would get and a push could give at the moment.
+ *     bytes a pull would get and a push could give at the moment, and
+ *     esp32p4_gdma_tx_flowing() and esp32p4_gdma_rx_flowing() whether
+ *     more will come without software's help.
  *
  * The channel reads and writes memory as the bus arbitration lets it, at
  * the controller's bus clock, through the access permission managers as
@@ -117,6 +119,17 @@ size_t esp32p4_gdma_push(ESP32P4GdmaState *s, unsigned periph,
                          const uint8_t *buf, size_t len, unsigned flags);
 size_t esp32p4_gdma_tx_pending(ESP32P4GdmaState *s, unsigned periph);
 size_t esp32p4_gdma_rx_room(ESP32P4GdmaState *s, unsigned periph);
+
+/*
+ * Whether the channel serving @periph will go on moving data by itself: a
+ * TX channel with bytes in its FIFO, or running (and clocked) with
+ * descriptors still to read; an RX channel taking bytes, with room in its
+ * FIFO or running with descriptors still to fill. A peripheral whose own
+ * FIFO meets an empty or full DMA FIFO waits for the DMA while this holds,
+ * and under- or overflows when it does not.
+ */
+bool esp32p4_gdma_tx_flowing(ESP32P4GdmaState *s, unsigned periph);
+bool esp32p4_gdma_rx_flowing(ESP32P4GdmaState *s, unsigned periph);
 
 /*
  * Named GPIOs.
