@@ -28,7 +28,11 @@
  * 1.5) cycles when enabled and half a cycle otherwise (TRM 46.6). DTR moves
  * two bits per lane in each cycle of an output clock halved for it (as
  * ESP-IDF configures it), so a state takes the same time either way. At
- * its end SPI_USR clears and SPI_TRANS_DONE_INT rises.
+ * its end SPI_USR clears and SPI_TRANS_DONE_INT rises. The half cycles
+ * are counted at clk_spi_mst's exact period (esp32p4_clk_period.h) from
+ * the transaction's start, each step at the first nanosecond its time
+ * has come; the segments of a segmented transfer at one clock follow
+ * each other on the same count.
  *
  * The master works from its own copy of its configuration registers
  * (SPI_ADDR, _CTRL, _CLOCK, _USER, _USER1, _USER2, _MS_DLEN, _MISC, the
@@ -1621,28 +1625,29 @@ static void slave_cs(ESP32P4SpiState *s, bool active)
 
 /* The master */
 
-static int64_t half_to_ns(uint64_t half_units, uint64_t h)
+/*
+ * The first whole ns by which @h half cycles of @half have elapsed,
+ * capped so that a time it is added to stays in range.
+ */
+static int64_t half_to_ns(ESP32P4ClkPeriod half, uint64_t h)
 {
-    uint64_t lo, hi;
-
-    mulu64(&lo, &hi, half_units, h);
-    return (int64_t)((hi << 32) | (lo >> 32));
+    return MIN(esp32p4_clk_cycles_ns(half, h), INT64_MAX / 2);
 }
 
-/* Half an SPI_CLK cycle, in 2^-32 ns; 0 while clk_spi_mst is stopped. */
-static uint64_t master_half_units(ESP32P4SpiState *s)
+/*
+ * Half an SPI_CLK cycle, exactly, from clk_spi_mst's exact period; stopped
+ * while that is.
+ */
+static ESP32P4ClkPeriod master_half(ESP32P4SpiState *s)
 {
     uint32_t clock = s->x[ESP32P4_SPI_M_CLOCK];
-    uint64_t p = clock_get(s->mst_clk);
+    uint64_t div = 1;
 
-    if (!p) {
-        return 0;
-    }
     if (!(clock & R_CLOCK_CLK_EQU_SYSCLK_MASK)) {
-        p *= (FIELD_EX32(clock, CLOCK, CLKDIV_PRE) + 1) *
-             (FIELD_EX32(clock, CLOCK, CLKCNT_N) + 1);
+        div = (FIELD_EX32(clock, CLOCK, CLKDIV_PRE) + 1) *
+              (FIELD_EX32(clock, CLOCK, CLKCNT_N) + 1);
     }
-    return MAX(p / 2, 1);
+    return esp32p4_clk_period_scale(esp32p4_clk_exact(s->mst_clk), div, 2);
 }
 
 static bool master_clocks(ESP32P4SpiState *s)
@@ -2326,20 +2331,20 @@ static void master_run(ESP32P4SpiState *s)
         ESP32P4SpiPhase *ph = &s->ph[s->cur];
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         uint32_t step = step_halves(s);
+        ESP32P4ClkPeriod half;
         int64_t end;
 
         if (!s->entered) {
             master_enter(s);
             s->entered = true;
         }
-        end = s->t0 + half_to_ns(s->half_units, s->h + step);
+        end = s->t0 + half_to_ns(s->half, s->h + step);
         if (end > now) {
             uint32_t ahead = ph->beats ? 2 * MIN(BATCH_BEATS,
                                                  ph->beats - s->cur_beat)
                                        : step;
 
-            timer_mod(s->timer,
-                      s->t0 + half_to_ns(s->half_units, s->h + ahead));
+            timer_mod(s->timer, s->t0 + half_to_ns(s->half, s->h + ahead));
             break;
         }
         if (!ph->beats) {
@@ -2353,10 +2358,19 @@ static void master_run(ESP32P4SpiState *s)
                                      INT_DMA_SEG_TRANS_DONE);
                     break;
                 }
-                /* The segment runs on the clock its CONF buffer set. */
-                s->t0 = end;
-                s->h = 0;
-                s->half_units = master_half_units(s);
+                /*
+                 * The segment runs on the clock its CONF buffer set,
+                 * from the CONF state's exact end if that is the clock
+                 * the last ran on.
+                 */
+                half = master_half(s);
+                if (esp32p4_clk_period_eq(half, s->half)) {
+                    s->h += step;
+                } else {
+                    s->t0 = end;
+                    s->h = 0;
+                    s->half = half;
+                }
                 master_plan(s);
                 s->entered = false;
                 continue;
@@ -2428,7 +2442,7 @@ static void master_try_start(ESP32P4SpiState *s)
             }
         }
     }
-    s->half_units = master_half_units(s);
+    s->half = master_half(s);
     s->waiting = false;
     s->stalled = false;
     s->abort = false;
@@ -2459,7 +2473,7 @@ static void master_kick(ESP32P4SpiState *s)
     }
     s->stalled = false;
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    end = s->t0 + half_to_ns(s->half_units, s->h + step_halves(s));
+    end = s->t0 + half_to_ns(s->half, s->h + step_halves(s));
     if (now > end) {
         s->t0 += now - end;
     }
@@ -2521,7 +2535,7 @@ static void spi_schedule_update(ESP32P4SpiState *s)
     if (s->update_pending && clock_is_enabled(s->mst_clk) &&
         !timer_pending(s->update_timer)) {
         timer_mod(s->update_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  clock_ticks_to_ns(s->mst_clk, 2));
+                  esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->mst_clk), 2));
     }
 }
 
@@ -2530,7 +2544,7 @@ static void spi_schedule_update(ESP32P4SpiState *s)
 static void spi_mst_clk_update(void *opaque, ClockEvent event)
 {
     ESP32P4SpiState *s = opaque;
-    uint64_t hu;
+    ESP32P4ClkPeriod half;
 
     if (event == ClockPreUpdate) {
         if (s->busy && !s->waiting) {
@@ -2549,9 +2563,9 @@ static void spi_mst_clk_update(void *opaque, ClockEvent event)
         master_try_start(s);
         return;
     }
-    hu = master_half_units(s);
-    if (hu) {
-        s->half_units = hu;
+    half = master_half(s);
+    if (esp32p4_clk_period_running(half)) {
+        s->half = half;
         master_resume(s);
     }
 }
@@ -2569,8 +2583,7 @@ static void master_resume(ESP32P4SpiState *s)
         master_try_start(s);
         return;
     }
-    s->t0 = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
-            half_to_ns(s->half_units, s->h);
+    s->t0 = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - half_to_ns(s->half, s->h);
     s->stalled = false;
     master_run(s);
 }
@@ -3085,8 +3098,8 @@ static const VMStateDescription vmstate_esp32p4_spi_beat = {
 
 static const VMStateDescription vmstate_esp32p4_spi = {
     .name = TYPE_ESP32P4_SPI,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = esp32p4_spi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(cmd, ESP32P4SpiState),
@@ -3136,7 +3149,7 @@ static const VMStateDescription vmstate_esp32p4_spi = {
         VMSTATE_UINT8(nph, ESP32P4SpiState),
         VMSTATE_UINT8(cur, ESP32P4SpiState),
         VMSTATE_UINT32(cur_beat, ESP32P4SpiState),
-        VMSTATE_UINT64(half_units, ESP32P4SpiState),
+        VMSTATE_ESP32P4_CLK_PERIOD(half, ESP32P4SpiState),
         VMSTATE_INT64(t0, ESP32P4SpiState),
         VMSTATE_UINT64(h, ESP32P4SpiState),
         VMSTATE_UINT8(gen, ESP32P4SpiState),

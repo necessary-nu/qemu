@@ -174,7 +174,7 @@ int64_t dwc2_otg_phy_ticks_ns(DWC2OTGState *s, uint64_t ticks)
 {
     uint64_t hz = dwc2_otg_phy_hz(s);
 
-    return hz ? muldiv64(ticks, NANOSECONDS_PER_SECOND, hz) : 0;
+    return hz ? muldiv64_round_up(ticks, NANOSECONDS_PER_SECOND, hz) : 0;
 }
 
 /* FIFO RAM */
@@ -1582,8 +1582,8 @@ static const VMStateDescription vmstate_dwc2_otg_reqq = {
 
 static const VMStateDescription vmstate_dwc2_otg = {
     .name = TYPE_DWC2_OTG,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .pre_save = dwc2_otg_pre_save,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(gotgctl, DWC2OTGState),
@@ -1650,6 +1650,9 @@ static const VMStateDescription vmstate_dwc2_otg = {
         VMSTATE_TIMER_PTR(bus_timer, DWC2OTGState),
         VMSTATE_INT64(frame_start_ns, DWC2OTGState),
         VMSTATE_INT64(frame_ns, DWC2OTGState),
+        VMSTATE_INT64(frame_origin_ns, DWC2OTGState),
+        VMSTATE_UINT64(frame_ticks, DWC2OTGState),
+        VMSTATE_UINT64(frame_hz, DWC2OTGState),
         VMSTATE_UINT16(frnum, DWC2OTGState),
         VMSTATE_BOOL(xact_busy, DWC2OTGState),
         VMSTATE_UINT8(xact_chan, DWC2OTGState),

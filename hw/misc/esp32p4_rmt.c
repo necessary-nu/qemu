@@ -280,51 +280,27 @@ enum {
 
 /* Clocks and cycles */
 
-/* rmt_sclk's period in 2^-32 ns; 0 while it is stopped. */
-static uint64_t sclk_period(ESP32P4RmtState *s)
-{
-    return clock_get(s->sclk);
-}
-
 /* The rmt_sclk cycle a channel anchored at (a_ns, a_c) is in at time t */
 static uint64_t cyc_at(ESP32P4RmtState *s, int64_t a_ns, uint64_t a_c,
                        int64_t t)
 {
-    uint64_t period = sclk_period(s);
-    uint64_t lo, hi, d;
-
-    if (!period || t <= a_ns) {
+    if (t <= a_ns) {
         return a_c;
     }
-    d = t - a_ns;
-    lo = d << 32;
-    hi = d >> 32;
-    divu128(&lo, &hi, period);
-    return a_c + lo;
+    return a_c + esp32p4_clk_ns_cycles(s->sclk_period, t - a_ns);
 }
 
 /* The first time at which such a channel has reached cycle cyc */
 static int64_t cyc_time(ESP32P4RmtState *s, int64_t a_ns, uint64_t a_c,
                         uint64_t cyc)
 {
-    uint64_t period = sclk_period(s);
-    uint64_t lo, hi, ns;
+    int64_t ns;
 
     if (cyc <= a_c) {
         return a_ns;
     }
-    if (!period) {
-        return NEVER;
-    }
-    mulu64(&lo, &hi, cyc - a_c, period);
-    if (hi >> 31) {
-        return NEVER;
-    }
-    ns = (hi << 32) | (lo >> 32);
-    if (lo & 0xffffffffu) {
-        ns++;
-    }
-    if (ns > (uint64_t)(NEVER - a_ns)) {
+    ns = esp32p4_clk_cycles_ns(s->sclk_period, cyc - a_c);
+    if (ns >= NEVER - a_ns) {
         return NEVER;
     }
     return a_ns + ns;
@@ -971,8 +947,8 @@ static void rx_raw(ESP32P4RmtState *s, unsigned m, int64_t t, uint8_t level)
         /* The pulse was shorter than RX_FILTER_THRES */
         c->filt_pending = false;
     } else if (level != c->in_filt) {
-        uint64_t ns = clock_is_enabled(s->sclk) ?
-                      clock_ticks_to_ns(s->sclk, thres) : 0;
+        uint64_t ns = esp32p4_clk_period_running(s->sclk_period) ?
+                      esp32p4_clk_cycles_ns(s->sclk_period, thres) : 0;
 
         c->filt_pending = true;
         c->filt_ns = ns ? t + ns : NEVER;
@@ -1718,7 +1694,7 @@ static const MemoryRegionOps esp32p4_rmt_ram_ops = {
 
 /*
  * rmt_sclk is about to change: bring the channels up to now with the old
- * period, and restart their cycle counts there.
+ * period, and restart their cycle counts there, at its new exact period.
  */
 static void esp32p4_rmt_clk_update(void *opaque, ClockEvent event)
 {
@@ -1736,6 +1712,7 @@ static void esp32p4_rmt_clk_update(void *opaque, ClockEvent event)
             s->rx[m].anchor_ns = now;
         }
     } else {
+        s->sclk_period = esp32p4_clk_exact(s->sclk);
         rmt_schedule(s);
     }
 }
@@ -1747,6 +1724,7 @@ static void esp32p4_rmt_reset_hold(Object *obj, ResetType type)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     timer_del(&s->timer);
+    s->sclk_period = esp32p4_clk_exact(s->sclk);
     s->int_raw = 0;
     s->int_ena = 0;
     s->sys_conf = SYS_CONF_RESET;
@@ -1920,8 +1898,8 @@ static const VMStateDescription vmstate_esp32p4_rmt_rx = {
 
 static const VMStateDescription vmstate_esp32p4_rmt = {
     .name = TYPE_ESP32P4_RMT,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(ram, ESP32P4RmtState, RAM_WORDS),
         VMSTATE_UINT8_ARRAY(eof_bytes, ESP32P4RmtState, RAM_WORDS),
@@ -1938,6 +1916,7 @@ static const VMStateDescription vmstate_esp32p4_rmt = {
                              vmstate_esp32p4_rmt_rx, ESP32P4RmtRx),
         VMSTATE_TIMER(timer, ESP32P4RmtState),
         VMSTATE_CLOCK(sclk, ESP32P4RmtState),
+        VMSTATE_ESP32P4_CLK_PERIOD(sclk_period, ESP32P4RmtState),
         VMSTATE_END_OF_LIST()
     }
 };

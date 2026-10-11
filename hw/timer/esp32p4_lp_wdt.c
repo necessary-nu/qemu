@@ -141,35 +141,29 @@ static const uint16_t rwdt_reset_length_ns[8] = {
     100, 200, 300, 400, 500, 800, 1600, 3200,
 };
 
-/* The least time in which @clk makes @n cycles, capped for timer_mod(). */
-static int64_t lp_wdt_cycles_ns(Clock *clk, uint64_t n)
-{
-    uint64_t ns = clock_ticks_to_ns(clk, n);
-
-    while (ns < INT64_MAX / 4 && clock_ns_to_ticks(clk, ns) < n) {
-        ns++;
-    }
-    return MIN(ns, INT64_MAX / 4);
-}
-
-/*
- * Fold the cycles counted up to @now into @c's count, keeping its sync
- * point on a clock edge.
- */
-static void lp_wdt_sync(ESP32P4LPWdtCounter *c, Clock *clk, int64_t now)
+/* Fold the cycles counted up to @now into @c's count. */
+static void lp_wdt_sync(ESP32P4LPWdtCounter *c, int64_t now)
 {
     uint64_t cycles;
 
     if (!c->running) {
-        c->sync_ns = now;
         return;
     }
-    if (now <= c->sync_ns) {
-        return;
+    cycles = esp32p4_clk_count_at(&c->edges, now);
+    if (cycles > c->synced) {
+        c->count += cycles - c->synced;
+        c->synced = cycles;
     }
-    cycles = clock_ns_to_ticks(clk, now - c->sync_ns);
-    c->count += cycles;
-    c->sync_ns += lp_wdt_cycles_ns(clk, cycles);
+}
+
+/*
+ * Count @clk's cycles from @now on, afresh: the counter starts, or its
+ * clock changes.
+ */
+static void lp_wdt_restart(ESP32P4LPWdtCounter *c, Clock *clk, int64_t now)
+{
+    esp32p4_clk_count_start(&c->edges, clk, now);
+    c->synced = 0;
 }
 
 /* Start or stop @c, after a sync at @now, and schedule it for @target. */
@@ -177,14 +171,16 @@ static void lp_wdt_run(ESP32P4LPWdtCounter *c, Clock *clk, bool running,
                        uint64_t target, int64_t now)
 {
     if (running && !c->running) {
-        c->sync_ns = now;
+        lp_wdt_restart(c, clk, now);
     }
     c->running = running;
     timer_del(&c->timer);
     if (!running) {
         return;
     }
-    c->due_ns = c->sync_ns + lp_wdt_cycles_ns(clk, target - c->count);
+    c->due_ns = MIN(esp32p4_clk_count_time(&c->edges,
+                                           c->synced + target - c->count),
+                    INT64_MAX / 4);
     timer_mod(&c->timer, c->due_ns);
 }
 
@@ -293,7 +289,7 @@ static void rwdt_timeout(ESP32P4LPWdtState *s, int64_t due)
     ESP32P4LPWdtCounter *c = &s->rwdt;
     unsigned action;
 
-    lp_wdt_sync(c, s->slow, due);
+    lp_wdt_sync(c, due);
     if (rwdt_flashboot(s)) {
         action = s->stage ? STG_OFF : STG_SYSTEM_RESET;
     } else {
@@ -342,7 +338,7 @@ static void swd_event(ESP32P4LPWdtState *s, int64_t due)
 {
     ESP32P4LPWdtCounter *c = &s->swd;
 
-    lp_wdt_sync(c, s->swd_clk, due);
+    lp_wdt_sync(c, due);
     if (c->count >= SWD_TIMEOUT_CYCLES) {
         if (s->swd_reset_en) {
             lp_wdt_run(c, s->swd_clk, false, 0, due);
@@ -392,10 +388,10 @@ static void lp_wdt_slow_update(void *opaque, ClockEvent event)
 
     if (event == ClockPreUpdate) {
         lp_wdt_catch_up(s, now);
-        lp_wdt_sync(&s->rwdt, s->slow, now);
+        lp_wdt_sync(&s->rwdt, now);
         return;
     }
-    s->rwdt.sync_ns = now;
+    lp_wdt_restart(&s->rwdt, s->slow, now);
     rwdt_update(s, now);
 }
 
@@ -406,10 +402,10 @@ static void lp_wdt_swd_clk_update(void *opaque, ClockEvent event)
 
     if (event == ClockPreUpdate) {
         lp_wdt_catch_up(s, now);
-        lp_wdt_sync(&s->swd, s->swd_clk, now);
+        lp_wdt_sync(&s->swd, now);
         return;
     }
-    s->swd.sync_ns = now;
+    lp_wdt_restart(&s->swd, s->swd_clk, now);
     swd_update(s, now);
 }
 
@@ -420,7 +416,7 @@ static void lp_wdt_set_spi_boot(void *opaque, int n, int level)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     lp_wdt_catch_up(s, now);
-    lp_wdt_sync(&s->rwdt, s->slow, now);
+    lp_wdt_sync(&s->rwdt, now);
     s->spi_boot = level;
     rwdt_update(s, now);
 }
@@ -443,7 +439,7 @@ static void lp_wdt_set_sleep(void *opaque, int n, int level)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     lp_wdt_catch_up(s, now);
-    lp_wdt_sync(&s->rwdt, s->slow, now);
+    lp_wdt_sync(&s->rwdt, now);
     s->sleep = level;
     rwdt_update(s, now);
 }
@@ -516,7 +512,7 @@ static void lp_wdt_write_rwdt(ESP32P4LPWdtState *s, hwaddr addr,
                       TYPE_ESP32P4_LP_WDT, addr);
         return;
     }
-    lp_wdt_sync(&s->rwdt, s->slow, now);
+    lp_wdt_sync(&s->rwdt, now);
     switch (addr) {
     case A_CONFIG0:
         s->config0 = value & CONF0_RW;
@@ -555,7 +551,7 @@ static void lp_wdt_write_swd(ESP32P4LPWdtState *s, uint32_t value,
         }
         return;
     }
-    lp_wdt_sync(&s->swd, s->swd_clk, now);
+    lp_wdt_sync(&s->swd, now);
     s->swd_config = value & SWD_RW;
     if (ones & SWD_FEED) {
         s->swd.count = 0;
@@ -678,7 +674,7 @@ static void esp32p4_lp_wdt_reset_hold(Object *obj, ResetType type)
 
         timer_del(&c->timer);
         c->count = 0;
-        c->sync_ns = now;
+        lp_wdt_restart(c, i ? s->swd_clk : s->slow, now);
         c->running = false;
     }
 }
@@ -729,12 +725,13 @@ static void esp32p4_lp_wdt_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_esp32p4_lp_wdt_counter = {
     .name = TYPE_ESP32P4_LP_WDT "/counter",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER(timer, ESP32P4LPWdtCounter),
         VMSTATE_UINT64(count, ESP32P4LPWdtCounter),
-        VMSTATE_INT64(sync_ns, ESP32P4LPWdtCounter),
+        VMSTATE_ESP32P4_CLK_COUNT(edges, ESP32P4LPWdtCounter),
+        VMSTATE_UINT64(synced, ESP32P4LPWdtCounter),
         VMSTATE_BOOL(running, ESP32P4LPWdtCounter),
         VMSTATE_INT64(due_ns, ESP32P4LPWdtCounter),
         VMSTATE_END_OF_LIST()
@@ -743,8 +740,8 @@ static const VMStateDescription vmstate_esp32p4_lp_wdt_counter = {
 
 static const VMStateDescription vmstate_esp32p4_lp_wdt = {
     .name = TYPE_ESP32P4_LP_WDT,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(slow, ESP32P4LPWdtState),
         VMSTATE_CLOCK(swd_clk, ESP32P4LPWdtState),
@@ -757,9 +754,9 @@ static const VMStateDescription vmstate_esp32p4_lp_wdt = {
         VMSTATE_UINT32(int_ena, ESP32P4LPWdtState),
         VMSTATE_UINT32(date, ESP32P4LPWdtState),
         VMSTATE_UINT32(stage, ESP32P4LPWdtState),
-        VMSTATE_STRUCT(rwdt, ESP32P4LPWdtState, 1,
+        VMSTATE_STRUCT(rwdt, ESP32P4LPWdtState, 2,
                        vmstate_esp32p4_lp_wdt_counter, ESP32P4LPWdtCounter),
-        VMSTATE_STRUCT(swd, ESP32P4LPWdtState, 1,
+        VMSTATE_STRUCT(swd, ESP32P4LPWdtState, 2,
                        vmstate_esp32p4_lp_wdt_counter, ESP32P4LPWdtCounter),
         VMSTATE_BOOL(swd_reset_flag, ESP32P4LPWdtState),
         VMSTATE_BOOL(spi_boot, ESP32P4LPWdtState),

@@ -74,12 +74,16 @@ typedef struct ESP32P4TimgTimer {
     uint64_t latched;
 
     /*
-     * The count at @sync_ns, @pre function clock cycles into the current
-     * cycle of TB_CLK, and whether it counts since then.
+     * The count as of function clock cycle @synced, counted from when the
+     * timer last started or its clock changed (@edges), @pre function
+     * clock cycles into the current cycle of TB_CLK, and whether it counts
+     * since then. While it is stopped, @edges' origin is the time of its
+     * last change, from which a start counts.
      */
     uint64_t count;
     uint32_t pre;
-    int64_t sync_ns;
+    ESP32P4ClkCount edges;
+    uint64_t synced;
     bool running;
     /* When the scheduled alarm falls due. */
     int64_t due_ns;
@@ -100,13 +104,16 @@ typedef struct ESP32P4TimgWdt {
     uint32_t act_hold[ESP32P4_TIMG_WDT_STAGES];
 
     /*
-     * The current stage and its count at @sync_ns, @pre function clock
-     * cycles into the current cycle of the MWDT's clock.
+     * The current stage and its count as of function clock cycle @synced,
+     * counted from when the MWDT last started or its clock changed
+     * (@edges), @pre function clock cycles into the current cycle of the
+     * MWDT's clock.
      */
     uint32_t stage;
     uint32_t count;
     uint32_t pre;
-    int64_t sync_ns;
+    ESP32P4ClkCount edges;
+    uint64_t synced;
     bool running;
     /* When the current stage times out. */
     int64_t due_ns;
@@ -127,9 +134,11 @@ typedef struct ESP32P4TimgCal {
     /*
      * The measurement under way: one-shot or cycling, whether the measured
      * clock's first edge has come, the cycles to count, the measured
-     * clock's cycles and XTAL_CLK's counted up to @seg_ns since it did,
-     * and the time of its next event; and for its timeout, XTAL_CLK's
-     * cycles since it began, up to @to_seg_ns.
+     * clock's cycles and XTAL_CLK's counted since it did, up to the
+     * measured clock's cycle @first (of the timer group's @cal_edges; the
+     * first edge's, before it comes), and the time of its next event; and
+     * for its timeout, XTAL_CLK's cycles since it began, up to XTAL_CLK's
+     * cycle @xtal_first (of @xtal_edges).
      */
     bool active;
     bool oneshot;
@@ -137,10 +146,10 @@ typedef struct ESP32P4TimgCal {
     uint32_t target;
     uint64_t cycles;
     uint64_t xtal;
-    int64_t seg_ns;
+    uint64_t first;
     int64_t event_ns;
     uint64_t since_start;
-    int64_t to_seg_ns;
+    uint64_t xtal_first;
     /* A cycling measurement waits after a timeout before starting again. */
     bool restart_pending;
 } ESP32P4TimgCal;
@@ -154,6 +163,9 @@ struct ESP32P4TimgState {
 
     Clock *xtal;
     Clock *cal_clk;
+    /* XTAL_CLK's and the measured clock's cycles since their last change. */
+    ESP32P4ClkCount xtal_edges;
+    ESP32P4ClkCount cal_edges;
     qemu_irq irq[ESP32P4_TIMG_TIMERS + 1];
     qemu_irq etm_event[ESP32P4_TIMG_TIMERS];
     qemu_irq cpu_reset[ESP32P4_CLKRST_HP_CORES];

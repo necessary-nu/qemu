@@ -110,46 +110,39 @@ static const uint8_t esp32p4_i2c_ana_mst_conf2_bit[ESP32P4_ANA_NUM_SLAVES] = {
     [ESP32P4_ANA_SLAVE_BIAS]     = 12,
 };
 
-/* The period of the clock the masters count, in Clock units; 0, stopped. */
-static uint64_t esp32p4_i2c_ana_mst_period(ESP32P4I2CAnaMstState *s)
+/* The exact period of the clock the masters count; stopped, stopped. */
+static ESP32P4ClkPeriod esp32p4_i2c_ana_mst_period(ESP32P4I2CAnaMstState *s)
 {
     if (!clock_is_enabled(s->bus)) {
-        return 0;
+        return esp32p4_clk_period_stopped();
     }
-    return clock_get((s->regs[R_CLK160M] & 1) ? s->pll_f160m : s->lp_fast);
+    return esp32p4_clk_exact((s->regs[R_CLK160M] & 1) ? s->pll_f160m
+                                                       : s->lp_fast);
 }
 
 /*
- * Count the cycles master @n's transaction has had since xfer_mark at
- * the clock's old period, and time the rest at its current one.
+ * Count the cycles master @n's transaction has had since the clock last
+ * changed, at the clock's old period, and time the rest at its current
+ * one.
  */
 static void esp32p4_i2c_ana_mst_schedule(ESP32P4I2CAnaMstState *s, int n)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint64_t done, lo, hi;
+    uint64_t done;
 
     if (!s->busy[n]) {
         return;
     }
-    if (s->xfer_period[n] && now > s->xfer_mark[n]) {
-        mulu64(&lo, &hi, now - s->xfer_mark[n], 1ull << 32);
-        divu128(&lo, &hi, s->xfer_period[n]);
-        done = hi ? UINT64_MAX : lo;
-        s->xfer_left[n] -= MIN(done, s->xfer_left[n]);
-    }
-    s->xfer_mark[n] = now;
-    s->xfer_period[n] = esp32p4_i2c_ana_mst_period(s);
-    if (!s->xfer_period[n]) {
+    done = esp32p4_clk_count_at(&s->xfer[n], now);
+    s->xfer_left[n] -= MIN(done, s->xfer_left[n]);
+    s->xfer[n].period = esp32p4_i2c_ana_mst_period(s);
+    s->xfer[n].origin_ns = now;
+    if (!esp32p4_clk_count_running(&s->xfer[n])) {
         timer_del(s->timer[n]);
         return;
     }
-    mulu64(&lo, &hi, s->xfer_left[n], s->xfer_period[n]);
-    lo = (lo >> 32) | (hi << 32);
-    if (hi >> 32 || lo > INT64_MAX - now) {
-        timer_mod(s->timer[n], INT64_MAX);
-    } else {
-        timer_mod(s->timer[n], now + lo);
-    }
+    timer_mod(s->timer[n], esp32p4_clk_count_time(&s->xfer[n],
+                                                  s->xfer_left[n]));
 }
 
 /*
@@ -206,8 +199,8 @@ static void esp32p4_i2c_ana_mst_start(ESP32P4I2CAnaMstState *s, int n)
 
     s->busy[n] = true;
     s->xfer_left[n] = (uint64_t)MAX(bit, 1) * (write ? WRITE_BITS : READ_BITS);
-    s->xfer_mark[n] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    s->xfer_period[n] = 0;
+    s->xfer[n].origin_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->xfer[n].period = esp32p4_clk_period_stopped();
     esp32p4_i2c_ana_mst_schedule(s, n);
 }
 
@@ -312,7 +305,7 @@ static void esp32p4_i2c_ana_mst_reset_hold(Object *obj, ResetType type)
         s->busy[n] = false;
         timer_del(s->timer[n]);
         s->xfer_left[n] = 0;
-        s->xfer_period[n] = 0;
+        s->xfer[n].period = esp32p4_clk_period_stopped();
     }
 }
 
@@ -354,8 +347,8 @@ static void esp32p4_i2c_ana_mst_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_esp32p4_i2c_ana_mst = {
     .name = TYPE_ESP32P4_I2C_ANA_MST,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(bus, ESP32P4I2CAnaMstState),
         VMSTATE_CLOCK(lp_fast, ESP32P4I2CAnaMstState),
@@ -368,10 +361,9 @@ static const VMStateDescription vmstate_esp32p4_i2c_ana_mst = {
                                 ESP32P4_I2C_ANA_MST_MASTERS),
         VMSTATE_UINT64_ARRAY(xfer_left, ESP32P4I2CAnaMstState,
                              ESP32P4_I2C_ANA_MST_MASTERS),
-        VMSTATE_INT64_ARRAY(xfer_mark, ESP32P4I2CAnaMstState,
-                            ESP32P4_I2C_ANA_MST_MASTERS),
-        VMSTATE_UINT64_ARRAY(xfer_period, ESP32P4I2CAnaMstState,
-                             ESP32P4_I2C_ANA_MST_MASTERS),
+        VMSTATE_STRUCT_ARRAY(xfer, ESP32P4I2CAnaMstState,
+                             ESP32P4_I2C_ANA_MST_MASTERS, 0,
+                             vmstate_esp32p4_clk_count, ESP32P4ClkCount),
         VMSTATE_END_OF_LIST()
     },
 };

@@ -204,22 +204,27 @@ static bool tsens_quiet(ESP32P4TsensState *s, uint32_t v)
 
 /*
  * Arm the timer for the first sample after @now on the sampling period's
- * grid that would do something.
+ * grid that would do something: sample k comes as the clock completes
+ * k periods of SAMPLE_RATE cycles from the anchor, exactly (a rate of 0
+ * samples every nanosecond).
  */
 static void tsens_schedule(ESP32P4TsensState *s, int64_t now)
 {
-    int64_t period, next;
+    ESP32P4ClkPeriod p = esp32p4_clk_exact(s->clk);
+    uint64_t rate = SAMPLE_RATE(REG(s, A_SAMPLE_RATE));
+    uint64_t k;
 
     if (!tsens_monitoring(s) || tsens_quiet(s, tsens_out(s))) {
         timer_del(&s->sample_timer);
         return;
     }
-    period = MAX(clock_ticks_to_ns(s->clk,
-                                   SAMPLE_RATE(REG(s, A_SAMPLE_RATE))), 1);
-    next = s->anchor_ns + ((MAX(now, s->anchor_ns) - s->anchor_ns) / period
-                           + 1) * period;
-    s->next_ns = next;
-    timer_mod(&s->sample_timer, next);
+    if (!rate) {
+        s->next_ns = MAX(now, s->anchor_ns) + 1;
+    } else {
+        k = esp32p4_clk_ns_cycles(p, now - s->anchor_ns) / rate + 1;
+        s->next_ns = s->anchor_ns + esp32p4_clk_cycles_ns(p, k * rate);
+    }
+    timer_mod(&s->sample_timer, s->next_ns);
 }
 
 /* [spec:nuos:req:emu.esp32p4.analog] */
@@ -545,8 +550,8 @@ static void esp32p4_tsens_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_esp32p4_tsens = {
     .name = TYPE_ESP32P4_TSENS,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, ESP32P4TsensState, ESP32P4_TSENS_NREGS),
         VMSTATE_BOOL(powered, ESP32P4TsensState),

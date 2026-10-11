@@ -878,8 +878,8 @@ static const Property aes_properties[] = {
 
 static const VMStateDescription vmstate_esp32p4_aes = {
     .name = TYPE_ESP32P4_AES,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_ESP32P4_CRYPTO_TIMER(op, ESP32P4AesState),
         VMSTATE_BOOL_ARRAY(reset_in, ESP32P4AesState, ESP32P4_AES_RESETS),

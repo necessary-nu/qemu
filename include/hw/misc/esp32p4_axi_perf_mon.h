@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -49,9 +50,14 @@ typedef struct ESP32P4AxiPerfMonMeasure {
     int64_t avg_start_ns;
     uint64_t avg_beats;
     int64_t avg_last_ns;
-    /* Instantaneous bandwidth: the window's start and its beats. */
+    /*
+     * Instantaneous bandwidth: the AXI clock's cycles counted from the
+     * first of a train of windows, the cycle the current one ends at, and
+     * its beats.
+     */
     bool ins_running;
-    int64_t ins_start_ns;
+    ESP32P4ClkCount ins_edges;
+    uint64_t ins_end;
     uint64_t ins_beats;
     QEMUTimer *ins_timer;
 } ESP32P4AxiPerfMonMeasure;
