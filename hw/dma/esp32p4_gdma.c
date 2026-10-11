@@ -685,6 +685,10 @@ static void chan_start(ESP32P4GdmaState *s, int dir, int ch)
     c->desc_next = c->link_addr;
     c->pos = 0;
     crc_restart(s, c);
+    /* An RX channel takes bytes from now on: its peripheral may push. */
+    if (dir == IN && !chan_m2m(s, ch) && c->peri_sel < ESP32P4_GDMA_PERIPHS) {
+        s->notify |= BIT(16 + c->peri_sel);
+    }
     gdma_kick(s);
 }
 

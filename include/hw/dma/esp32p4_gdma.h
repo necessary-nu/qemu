@@ -89,14 +89,17 @@ enum {
  *     the descriptor with suc_eof (IN_SUC_EOF); ESP32P4_GDMA_ERR_EOF ends it
  *     in error (err_eof, IN_ERR_EOF), which only UHCI and PARLIO report. A
  *     push that takes fewer bytes than given takes no flag. ops->rx_ready
- *     is called whenever room appears in a full FIFO.
+ *     is called whenever room appears in a full FIFO and when the channel
+ *     starts.
  *
  *   - esp32p4_gdma_tx_pending() and esp32p4_gdma_rx_room() give the
  *     bytes a pull would get and a push could give at the moment.
  *
  * The channel reads and writes memory as the bus arbitration lets it, at
  * the controller's bus clock, through the access permission managers as
- * the DMA master of the peripheral it serves.
+ * the DMA master of the peripheral it serves. A qtest can play any
+ * peripheral through the controller's "periph" property
+ * (hw/dma/esp32p4_gdma.c).
  */
 #define ESP32P4_GDMA_EOF        (1u << 0)
 #define ESP32P4_GDMA_ERR_EOF    (1u << 1)
