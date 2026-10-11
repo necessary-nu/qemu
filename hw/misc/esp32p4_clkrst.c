@@ -92,9 +92,25 @@
  * PMU, in the states that give it control, gates the clocks
  * PMU_n1_DIG_ICG_FUNC_EN lists (TRM table 15.4-2) and selects and gates
  * ROOT_CLK's source in place of HP_ROOT_CLK_SRC_SEL and HP_ROOT_CLK_EN.
- * FORCE_ON bits bypass automatic clock gating, which leaves a clock
- * running while its block is busy, and have no other effect; the WAITI gating of the cores' clocks and the DPA
- * strategy's random divider of the crypto clock are not modelled.
+ * FORCE_ON bits bypass automatic clock gating, which on the chip stops a
+ * clock while its block is idle and restarts it as the block is used, so
+ * that software sees no difference; ESP-IDF names one exception, and keeps
+ * L2MEM_MEM_CLK_FORCE_ON set as a DMA access to L2MEM does not restart its
+ * clock: clearing it is logged as unimplemented. The WFI autoclock gating
+ * of the CPU subsystem (ESP-IDF's name) is of that kind. Once every HP
+ * core whose CPU_WAITI_CTRL0 WAITI_ICG_EN is set waits in WFI, it stops
+ * CPUICM_CLK, the clock of the subsystem's own interconnect, the
+ * CPUICM_DELAY_NUM cycles of ROOT_CLK_CTRL0 on, unless
+ * CLK_FORCE_ON_CTRL0's CPUICM_GATED_CLK_FORCE_ON bypasses that, as it
+ * does from reset (ESP-IDF clears it as it boots), and restarts it as a
+ * core leaves WFI; ESP-IDF clears core 1's WAITI_ICG_EN while it keeps
+ * core 1 stopped, so that core 0's WFI alone gates the clock. The TRM
+ * names the clock only in those registers' descriptions. Only the cores
+ * reach memory and the peripherals through it, and none does while every
+ * one waits: the cores' own clocks (which their cycle counters count),
+ * their CLICs, the CLINT and every other master's path run on, and the
+ * model shows nothing of it. The DPA strategy's random divider of the
+ * crypto clock is not modelled.
  *
  * Resets. HP_RST_EN*, LP_CLKRST's resets and LPPERI_RESET_EN hold their
  * blocks in reset while set, unless the block's FORCE_NORST bit is set;
@@ -445,6 +461,7 @@ static const ESP32P4ClkRstReg esp32p4_clkrst_regs[ESP32P4_CLKRST_NREGS] = {
 /* Fields of the registers this file acts on. */
 #define SOC_CLK_DIV_UPDATE          BIT(4)
 #define SDIO_LS_CLK_EDGE_CFG_UPDATE BIT(8)
+#define L2MEM_MEM_CLK_FORCE_ON      BIT(14)
 #define CORE_CPU_CLK_EN(n)          BIT(3 + (n))
 #define RST_EN_CORE_GLOBAL(n)       BIT(7 + (n))
 #define FORCE_NORST_CORE(n)         BIT(n)
@@ -2063,6 +2080,13 @@ static void esp32p4_clkrst_check_kept(unsigned idx, uint32_t old,
         break;
     case R_LPPERI_RESET_EN:
         stopped = new & ~old & BIT(30);
+        break;
+    case R_CLK_FORCE_ON_CTRL0:
+        if (old & ~new & L2MEM_MEM_CLK_FORCE_ON) {
+            qemu_log_mask(LOG_UNIMP, "%s: L2MEM's clock gating, which a DMA "
+                          "access to L2MEM does not undo, is not modelled\n",
+                          TYPE_ESP32P4_CLKRST);
+        }
         break;
     default:
         break;
