@@ -42,6 +42,16 @@
  * with a k out of range, signing and export fail: ECDSA_OPERATION_RESULT
  * is 0 and the outputs zero.
  *
+ * The SHA interface is the SHA accelerator's (TRM: ECDSA_SHA_BUSY "the
+ * working state of the SHA accelerator in the ECDSA_DS process"), and
+ * starts as it does (hw/misc/esp32p4_sha.c): ECDSA_SHA_START and
+ * _CONTINUE take the block in ECDSA_MESSAGE_MEM as they start, so that
+ * software may write the next block meanwhile, as TRM 33.5.1.6 (note 1)
+ * allows; one written while the interface is busy waits on the bus,
+ * holding the core that writes it, until the block in progress is done
+ * (a start from another master is ignored and logged). ECDSA_LOAD_DONE
+ * abandons a block in progress, and a waiting start then finds LOAD over.
+ *
  * State-dependent access (TRM 33.4.3.2): ECDSA_CONF_REG and _CLK_REG take
  * writes and read back only in IDLE, the SHA interface only in LOAD, the
  * memories only in LOAD (and read in GET); other accesses are dropped and
@@ -66,6 +76,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/esp32p4_ecdsa.h"
 #include "migration/vmstate.h"
+#include "target/riscv/esp32p4_cpu.h"
 
 #define A_CONF          0x04
 #define A_CLK           0x08
@@ -406,14 +417,29 @@ static void ecdsa_op_done(void *opaque)
     }
 }
 
+/* The cores waiting to start a block may make their writes again. */
+/* [spec:nuos:req:emu.esp32p4.crypto] */
+static void ecdsa_release_waiters(ESP32P4EcdsaState *s)
+{
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        if (s->waiters & BIT(cs->cpu_index)) {
+            esp32p4_cpu_bus_release(ESP32P4_CPU(cs));
+        }
+    }
+    s->waiters = 0;
+}
+
 /* [spec:nuos:req:emu.esp32p4.crypto] */
 static void ecdsa_sha_done(void *opaque)
 {
     ESP32P4EcdsaState *s = opaque;
 
-    esp32p4_sha_compress(s->op_sha_mode, &s->sha_state, s->message);
+    esp32p4_sha_compress(s->op_sha_mode, &s->sha_state, s->op_message);
     s->sha_started = true;
     s->sha_busy = false;
+    ecdsa_release_waiters(s);
 }
 
 /* [spec:nuos:req:emu.esp32p4.crypto] */
@@ -432,6 +458,7 @@ static void ecdsa_start_reg(ESP32P4EcdsaState *s, uint32_t v)
                           TYPE_ESP32P4_ECDSA);
             esp32p4_crypto_timer_cancel(&s->sha_op);
             s->sha_busy = false;
+            ecdsa_release_waiters(s);
         }
         s->stage = STAGE_PROC;
         s->state = STATE_BUSY;
@@ -523,19 +550,29 @@ static uint64_t ecdsa_read(void *opaque, hwaddr addr, unsigned size)
     return extract32(v, (addr & 3) * 8, size * 8);
 }
 
-static void ecdsa_sha_reg(ESP32P4EcdsaState *s, bool start)
+/* [spec:nuos:req:emu.esp32p4.crypto] */
+static MemTxResult ecdsa_sha_reg(ESP32P4EcdsaState *s, bool start,
+                                 MemTxAttrs attrs)
 {
+    if (s->stage == STAGE_LOAD && s->sha_busy) {
+        ESP32P4CPU *cpu = esp32p4_cpu_bus_waiter(attrs);
+
+        if (cpu) {
+            s->waiters |= BIT(CPU(cpu)->cpu_index);
+            return esp32p4_cpu_bus_hold(cpu);
+        }
+    }
     if (s->stage != STAGE_LOAD || s->sha_busy) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: ECDSA_SHA_%s outside LOAD or "
                       "while the SHA interface is busy is ignored\n",
                       TYPE_ESP32P4_ECDSA, start ? "START" : "CONTINUE");
-        return;
+        return MEMTX_OK;
     }
     if (s->sha_mode != ESP32P4_SHA224 && s->sha_mode != ESP32P4_SHA256) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: ECDSA_SHA_MODE %u is not one the "
                       "interface takes (SHA-224, SHA-256); ignored\n",
                       TYPE_ESP32P4_ECDSA, s->sha_mode);
-        return;
+        return MEMTX_OK;
     }
     if (start) {
         s->op_sha_mode = s->sha_mode;
@@ -543,15 +580,17 @@ static void ecdsa_sha_reg(ESP32P4EcdsaState *s, bool start)
     } else if (!s->sha_started) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: ECDSA_SHA_CONTINUE before "
                       "ECDSA_SHA_START is ignored\n", TYPE_ESP32P4_ECDSA);
-        return;
+        return MEMTX_OK;
     }
+    memcpy(s->op_message, s->message, sizeof(s->message));
     s->sha_busy = true;
     esp32p4_crypto_timer_start(&s->sha_op, SHA_CYCLES);
+    return MEMTX_OK;
 }
 
 /* [spec:nuos:req:emu.esp32p4.crypto] */
-static void ecdsa_write(void *opaque, hwaddr addr, uint64_t value,
-                        unsigned size)
+static MemTxResult ecdsa_write(void *opaque, hwaddr addr, uint64_t value,
+                               unsigned size, MemTxAttrs attrs)
 {
     ESP32P4EcdsaState *s = opaque;
     hwaddr reg = addr & ~3;
@@ -563,7 +602,7 @@ static void ecdsa_write(void *opaque, hwaddr addr, uint64_t value,
                       " dropped: the peripheral is %s\n", TYPE_ESP32P4_ECDSA,
                       addr, s->in_reset ? "held in reset"
                                         : "not clocked (CRYPTO_ECDSA_CLK)");
-        return;
+        return MEMTX_OK;
     }
     if (reg >= A_MEM && reg < A_MEM_END) {
         unsigned off = reg - A_MEM;
@@ -573,7 +612,7 @@ static void ecdsa_write(void *opaque, hwaddr addr, uint64_t value,
         if (ecdsa_mem_ok(s, addr, true)) {
             stl_le_p(p, deposit32(ldl_le_p(p), shift, size * 8, value));
         }
-        return;
+        return MEMTX_OK;
     }
     switch (reg) {
     case A_CONF:
@@ -613,14 +652,13 @@ static void ecdsa_write(void *opaque, hwaddr addr, uint64_t value,
     case A_SHA_START:
     case A_SHA_CONTINUE:
         if (v & 1) {
-            ecdsa_sha_reg(s, reg == A_SHA_START);
+            return ecdsa_sha_reg(s, reg == A_SHA_START, attrs);
         }
         break;
     case A_MESSAGE ... A_MESSAGE + 0x3f:
-        if (s->stage != STAGE_LOAD || s->sha_busy) {
+        if (s->stage != STAGE_LOAD) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: ECDSA_MESSAGE_MEM written "
-                          "outside LOAD or while the SHA interface is busy; "
-                          "dropped\n", TYPE_ESP32P4_ECDSA);
+                          "outside LOAD is dropped\n", TYPE_ESP32P4_ECDSA);
         } else {
             stl_le_p(s->message + reg - A_MESSAGE,
                      deposit32(ldl_le_p(s->message + reg - A_MESSAGE),
@@ -640,11 +678,12 @@ static void ecdsa_write(void *opaque, hwaddr addr, uint64_t value,
                       HWADDR_PRIx "\n", TYPE_ESP32P4_ECDSA, addr);
         break;
     }
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps ecdsa_ops = {
     .read = ecdsa_read,
-    .write = ecdsa_write,
+    .write_with_attrs = ecdsa_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
@@ -677,6 +716,7 @@ static void ecdsa_reset_hold(Object *obj, ResetType type)
 
     esp32p4_crypto_timer_cancel(&s->op);
     esp32p4_crypto_timer_cancel(&s->sha_op);
+    ecdsa_release_waiters(s);
     ecdsa_end(s);
     s->conf = 0;
     s->clk_reg = 0;
@@ -739,8 +779,8 @@ static const VMStateDescription vmstate_esp32p4_ecdsa_sha = {
 
 static const VMStateDescription vmstate_esp32p4_ecdsa = {
     .name = TYPE_ESP32P4_ECDSA,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_ESP32P4_CRYPTO_TIMER(op, ESP32P4EcdsaState),
         VMSTATE_ESP32P4_CRYPTO_TIMER(sha_op, ESP32P4EcdsaState),
@@ -755,6 +795,8 @@ static const VMStateDescription vmstate_esp32p4_ecdsa = {
         VMSTATE_UINT32(sha_mode, ESP32P4EcdsaState),
         VMSTATE_BOOL(sha_busy, ESP32P4EcdsaState),
         VMSTATE_UINT8_ARRAY(message, ESP32P4EcdsaState, 64),
+        VMSTATE_UINT8_ARRAY(op_message, ESP32P4EcdsaState, 64),
+        VMSTATE_UINT32(waiters, ESP32P4EcdsaState),
         VMSTATE_UINT8_2DARRAY(mem, ESP32P4EcdsaState, ESP32P4_ECDSA_MEMS,
                               ESP32P4_ECDSA_MEM_BYTES),
         VMSTATE_UINT32(stage, ESP32P4EcdsaState),
