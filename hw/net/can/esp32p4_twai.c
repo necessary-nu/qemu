@@ -709,38 +709,55 @@ static int twai_resample(const TwaiBits *b, int stop, int64_t bit_ps,
  * ===========
  */
 
-/* The bit time in picoseconds, or 0 while TWAIn_CLK is stopped. */
-static int64_t twai_bit_ps(ESP32P4TwaiCtrl *c)
+/*
+ * The bit time, exactly: 2 * (BRP + 1) * (3 + TSEG1 + TSEG2) periods of
+ * TWAIn_CLK, at its exact period as it last changed (esp32p4_clk_period.h);
+ * stopped while the clock is.
+ */
+static ESP32P4ClkPeriod twai_bit(ESP32P4TwaiCtrl *c)
 {
-    uint32_t hz = clock_get_hz(c->clk);
     uint32_t brp = extract32(c->btr0, 0, 14);
     uint32_t nbt = 3 + extract32(c->btr1, 0, 4) + extract32(c->btr1, 4, 3);
 
-    if (!hz) {
+    return esp32p4_clk_period_scale(c->clk_period, 2 * (brp + 1) * nbt, 1);
+}
+
+/* @p in picoseconds, rounded down: 0 while stopped. */
+static int64_t twai_ps(ESP32P4ClkPeriod p)
+{
+    if (!esp32p4_clk_period_running(p)) {
         return 0;
     }
-    return muldiv64(1000000000000ULL, 2 * (brp + 1) * nbt, hz);
+    return esp32p4_clk_cycles_ns_floor(p, 1000);
+}
+
+/*
+ * The bit time in picoseconds, or 0 while TWAIn_CLK is stopped: the
+ * resolution at which a receiver at another bit time decodes the bus.
+ */
+static int64_t twai_bit_ps(ESP32P4TwaiCtrl *c)
+{
+    return twai_ps(twai_bit(c));
 }
 
 static void twai_timing(ESP32P4TwaiCtrl *c, TwaiTiming *t)
 {
-    uint32_t hz = clock_get_hz(c->clk);
-
-    t->tq = hz ? muldiv64(1000000000000ULL,
-                          2 * (extract32(c->btr0, 0, 14) + 1), hz) : 0;
+    t->tq = twai_ps(esp32p4_clk_period_scale(c->clk_period,
+                        2 * (extract32(c->btr0, 0, 14) + 1), 1));
     t->pbs1 = extract32(c->btr1, 0, 4) + 1;
     t->pbs2 = extract32(c->btr1, 4, 3) + 1;
     t->sjw = extract32(c->btr0, 14, 2) + 1;
 }
 
-static int64_t bits_ns(int64_t bit_ps, int64_t n)
+/* The first ns by which @n bits of exact time @bit have elapsed. */
+static int64_t bits_ns(ESP32P4ClkPeriod bit, int64_t n)
 {
-    return n * bit_ps / 1000;
+    return MIN(esp32p4_clk_cycles_ns(bit, n), INT64_MAX / 4);
 }
 
 static int64_t twai_bits_ns(ESP32P4TwaiCtrl *c, int64_t n)
 {
-    return bits_ns(twai_bit_ps(c), n);
+    return bits_ns(twai_bit(c), n);
 }
 
 static bool twai_operating(ESP32P4TwaiCtrl *c)
@@ -796,10 +813,13 @@ static bool twai_clkout(ESP32P4TwaiCtrl *c, int64_t now)
     uint32_t cd = c->cdr & CDR_CD;
     uint64_t div = cd == CDR_CD ? 1 : 2 * (cd + 1);
 
-    if ((c->cdr & CDR_CLOCK_OFF) || !clock_is_enabled(c->clk)) {
+    if ((c->cdr & CDR_CLOCK_OFF) ||
+        !esp32p4_clk_period_running(c->clk_period)) {
         return false;
     }
-    return (clock_ns_to_ticks(c->clk, 2 * now) / div) & 1;
+    return (esp32p4_clk_ns_cycles(esp32p4_clk_period_scale(c->clk_period,
+                                                           1, 2), now) /
+            div) & 1;
 }
 
 static void twai_update_lines(ESP32P4TwaiCtrl *c)
@@ -820,12 +840,13 @@ static void twai_update_lines(ESP32P4TwaiCtrl *c)
 static void twai_standby_schedule(ESP32P4TwaiCtrl *c)
 {
     if (!(c->hw_cfg & 1) || c->standby || c->idle_since == INT64_MAX ||
-        (c->sw_standby & SW_STANDBY_CLR) || !clock_get(c->clk)) {
+        (c->sw_standby & SW_STANDBY_CLR) ||
+        !esp32p4_clk_period_running(c->clk_period)) {
         timer_del(c->standby_timer);
         return;
     }
     timer_mod(c->standby_timer,
-              c->idle_since + clock_ticks_to_ns(c->clk, c->hw_standby_cnt));
+              c->idle_since + bits_ns(c->clk_period, c->hw_standby_cnt));
 }
 
 static void twai_set_standby(ESP32P4TwaiCtrl *c, bool on)
@@ -873,21 +894,23 @@ static uint64_t twai_ts_count(ESP32P4TwaiCtrl *c, int64_t t)
         return c->ts_count_base;
     }
     return c->ts_count_base +
-           clock_ns_to_ticks(c->clk, t - c->ts_base_ns) / twai_ts_div(c);
+           esp32p4_clk_ns_cycles(c->clk_period, t - c->ts_base_ns) /
+           twai_ts_div(c);
 }
 
 static void twai_ts_schedule(ESP32P4TwaiCtrl *c)
 {
     uint64_t next;
 
-    if (!(c->ts_cfg & TS_ENABLE) || !clock_get(c->clk)) {
+    if (!(c->ts_cfg & TS_ENABLE) ||
+        !esp32p4_clk_period_running(c->clk_period)) {
         timer_del(c->ts_timer);
         return;
     }
     next = (twai_ts_count(c, twai_now()) | 0xffffffffULL) + 1;
     timer_mod(c->ts_timer, c->ts_base_ns +
-              clock_ticks_to_ns(c->clk, (next - c->ts_count_base) *
-                                        twai_ts_div(c)));
+              bits_ns(c->clk_period, (next - c->ts_count_base) *
+                                     twai_ts_div(c)));
 }
 
 /* Carry the count over a change of its clock or divider. */
@@ -1129,8 +1152,9 @@ static void twai_tx_release(ESP32P4TwaiCtrl *c, bool done)
 
 /*
  * Bus-off recovery (TRM 56.4.6.3): the TEC counts down from 127 with each
- * run of 11 recessive bits the controller sees, from recov_mark, while
- * the bus is idle, and the 128th run ends bus-off. The SJA1000 freezes it
+ * run of 11 recessive bits the controller sees, from recov_mark (the
+ * first recov_runs of them already counted), while the bus is idle, and
+ * the 128th run ends bus-off. The SJA1000 freezes it
  * if reset mode is entered again.
  */
 static bool twai_hears_idle(ESP32P4TwaiCtrl *c)
@@ -1143,40 +1167,55 @@ static bool twai_hears_idle(ESP32P4TwaiCtrl *c)
     return seg < 0 || !c->s->ep[seg].active;
 }
 
+/* A run of 11 recessive bits. */
+static ESP32P4ClkPeriod twai_run(ESP32P4TwaiCtrl *c)
+{
+    return esp32p4_clk_period_scale(twai_bit(c), 11, 1);
+}
+
+/* The runs of 11 recessive bits from recov_mark up to @now. */
+static uint64_t twai_recov_runs(ESP32P4TwaiCtrl *c, int64_t now)
+{
+    return esp32p4_clk_ns_cycles(twai_run(c), now - c->recov_mark);
+}
+
 static void twai_recov_fold(ESP32P4TwaiCtrl *c, int64_t now)
 {
-    int64_t occ = 11 * twai_bit_ps(c), n;
+    uint64_t n;
 
-    if (!c->recovering || c->recov_paused || !occ || now <= c->recov_mark) {
+    if (!c->recovering || c->recov_paused ||
+        !esp32p4_clk_period_running(c->clk_period)) {
         return;
     }
-    n = (now - c->recov_mark) * 1000 / occ;
-    n = MIN(n, c->tec);
+    n = twai_recov_runs(c, now);
+    n = n > c->recov_runs ? MIN(n - c->recov_runs, c->tec) : 0;
     c->tec -= n;
-    c->recov_mark += n * occ / 1000;
+    c->recov_runs += n;
 }
 
 /* The next run that matters: the one that clears ES, or the 128th. */
 static void twai_recov_schedule(ESP32P4TwaiCtrl *c)
 {
-    int64_t occ = 11 * twai_bit_ps(c);
     int64_t runs;
 
-    if (!c->recovering || c->recov_paused || !occ) {
+    if (!c->recovering || c->recov_paused ||
+        !esp32p4_clk_period_running(c->clk_period)) {
         timer_del(c->recov_timer);
         return;
     }
     runs = c->ewl && c->tec >= c->ewl ? c->tec - c->ewl + 1 : c->tec + 1;
-    timer_mod(c->recov_timer, c->recov_mark + (runs * occ + 999) / 1000);
+    timer_mod(c->recov_timer, c->recov_mark +
+              bits_ns(twai_run(c), c->recov_runs + runs));
 }
 
 static void twai_recov_check(ESP32P4TwaiCtrl *c)
 {
-    int64_t occ = 11 * twai_bit_ps(c), now = twai_now();
+    int64_t now = twai_now();
 
     twai_recov_fold(c, now);
-    if (c->recovering && !c->recov_paused && !c->tec && occ &&
-        (now - c->recov_mark) * 1000 >= occ) {
+    if (c->recovering && !c->recov_paused && !c->tec &&
+        esp32p4_clk_period_running(c->clk_period) &&
+        twai_recov_runs(c, now) > c->recov_runs) {
         /* It has just seen 11 recessive bits: it is on the bus at once. */
         c->recovering = false;
         c->err_state = ERR_ACTIVE;
@@ -1214,6 +1253,7 @@ static void twai_recov_resume(ESP32P4TwaiCtrl *c, int64_t mark)
     if (c->recovering && c->recov_paused) {
         c->recov_paused = false;
         c->recov_mark = mark;
+        c->recov_runs = 0;
         twai_recov_check(c);
     }
 }
@@ -1246,7 +1286,7 @@ static void twai_integrate(ESP32P4TwaiCtrl *c)
 
 static int64_t ep_time(ESP32P4TwaiEpisode *ep, int64_t boundary)
 {
-    return ep->t_sof + bits_ns(ep->bit_ps, boundary);
+    return ep->t_sof + bits_ns(ep->bit, boundary);
 }
 
 static int64_t act_key(const ESP32P4TwaiAction *a)
@@ -1699,7 +1739,9 @@ static void twai_local_start(ESP32P4TwaiCtrl *c, int64_t t0);
 static void twai_kick(ESP32P4TwaiState *s, int seg)
 {
     ESP32P4TwaiEpisode *ep = &s->ep[seg];
-    int64_t now = twai_now(), earliest = INT64_MAX, bit = 0, origin, n;
+    int64_t now = twai_now(), earliest = INT64_MAX, origin;
+    ESP32P4ClkPeriod bit = esp32p4_clk_period_stopped();
+    uint64_t n;
 
     if (ep->active) {
         return;
@@ -1721,7 +1763,7 @@ static void twai_kick(ESP32P4TwaiState *s, int seg)
         t = MAX(t, now);
         if (t < earliest) {
             earliest = t;
-            bit = twai_bit_ps(c);
+            bit = twai_bit(c);
         }
     }
     if (earliest == INT64_MAX) {
@@ -1729,12 +1771,10 @@ static void twai_kick(ESP32P4TwaiState *s, int seg)
         timer_del(ep->timer);
         return;
     }
+    /* The first bit boundary of the bus's grid at or after the earliest. */
     origin = s->seg_idle_at[seg];
-    if (earliest - origin > INT64_MAX / 1000000) {
-        /* Idle for hours: the grid's phase no longer fits the arithmetic. */
-        origin = earliest;
-    }
-    n = ((earliest - origin) * 1000 + bit - 1) / bit;
+    n = earliest > origin ? esp32p4_clk_ns_cycles(bit, earliest - origin - 1)
+                            + 1 : 0;
     ep->start_pending = true;
     ep->start_at = origin + bits_ns(bit, n);
     timer_mod(ep->timer, ep->start_at);
@@ -1821,7 +1861,8 @@ static void twai_ep_start(ESP32P4TwaiState *s, int seg)
     ep->survivors = live;
     ep->winner = ctz32(live);
     memcpy(ep->frame, s->ctrl[ep->winner].txbuf, sizeof(ep->frame));
-    ep->bit_ps = twai_bit_ps(&s->ctrl[ep->winner]);
+    ep->bit = twai_bit(&s->ctrl[ep->winner]);
+    ep->bit_ps = twai_ps(ep->bit);
     ep->active = true;
 
     for (i = 0; i < ESP32P4_TWAI_NUM; i++) {
@@ -1861,7 +1902,7 @@ static void twai_depart(ESP32P4TwaiCtrl *c)
         if (!ep->active || !(ep->members & ~ep->departed & bitmask(c->idx))) {
             continue;
         }
-        cur = (twai_now() - ep->t_sof) * 1000 / ep->bit_ps;
+        cur = esp32p4_clk_ns_cycles(ep->bit, twai_now() - ep->t_sof);
         ep->departed |= bitmask(c->idx);
         c->status &= ~(ST_RS | ST_TS);
         if (cur < ep->destroy_at) {
@@ -1895,7 +1936,9 @@ static void twai_local_start(ESP32P4TwaiCtrl *c, int64_t t0)
     c->local_active = true;
     c->local_phase = LOCAL_SOF;
     c->local_bit = 0;
-    c->local_t0 = t0 + twai_bits_ns(c, 1);
+    c->local_origin = t0;
+    c->local_bits = 1;
+    c->local_t0 = t0 + twai_bits_ns(c, c->local_bits);
     c->status |= ST_TS;
     twai_bus_activity(c, true, t0);
     timer_mod(c->local_timer, c->local_t0);
@@ -1927,11 +1970,12 @@ static void twai_local_timer(void *opaque)
         }
         if (c->err_state == ERR_ACTIVE) {
             c->local_phase = LOCAL_FLAG;
-            c->local_t0 += twai_bits_ns(c, 1);
+            c->local_bits += 1;
         } else {
             c->local_phase = LOCAL_TAIL;
-            c->local_t0 += twai_bits_ns(c, 6 + 8 + 3);
+            c->local_bits += 6 + 8 + 3;
         }
+        c->local_t0 = c->local_origin + twai_bits_ns(c, c->local_bits);
         timer_mod(c->local_timer, c->local_t0);
         return;
     case LOCAL_TAIL:
@@ -1940,8 +1984,9 @@ static void twai_local_timer(void *opaque)
         if (c->tx_pending && c->tx_single_shot) {
             twai_tx_release(c, false);
         }
-        c->ready_at = c->local_t0 +
-                      (c->err_state == ERR_PASSIVE ? twai_bits_ns(c, 8) : 0);
+        c->ready_at = c->err_state == ERR_PASSIVE ?
+                      c->local_origin + twai_bits_ns(c, c->local_bits + 8) :
+                      c->local_t0;
         twai_bus_activity(c, false, c->local_t0);
         seg = twai_seg(c);
         if (seg >= 0) {
@@ -2547,6 +2592,7 @@ static void esp32p4_twai_clk_update(void *opaque, ClockEvent event)
         twai_recov_fold(c, twai_now());
         return;
     }
+    c->clk_period = esp32p4_clk_exact(c->clk);
     c->ts_base_ns = twai_now();
     twai_ts_schedule(c);
     twai_rejoin(c);
@@ -2609,6 +2655,8 @@ static void twai_ctrl_reset(ESP32P4TwaiCtrl *c)
     c->recovering = false;
     c->recov_paused = false;
     c->recov_mark = 0;
+    c->recov_runs = 0;
+    c->clk_period = esp32p4_clk_exact(c->clk);
     c->local_active = false;
     c->ts_count_base = 0;
     c->ts_base_ns = now;
@@ -2782,6 +2830,7 @@ static const VMStateDescription vmstate_esp32p4_twai_episode = {
         VMSTATE_BOOL(start_pending, ESP32P4TwaiEpisode),
         VMSTATE_INT64(start_at, ESP32P4TwaiEpisode),
         VMSTATE_INT64(t_sof, ESP32P4TwaiEpisode),
+        VMSTATE_ESP32P4_CLK_PERIOD(bit, ESP32P4TwaiEpisode),
         VMSTATE_INT64(bit_ps, ESP32P4TwaiEpisode),
         VMSTATE_UINT8(members, ESP32P4TwaiEpisode),
         VMSTATE_UINT8(departed, ESP32P4TwaiEpisode),
@@ -2859,16 +2908,20 @@ static const VMStateDescription vmstate_esp32p4_twai_ctrl = {
         VMSTATE_BOOL(recovering, ESP32P4TwaiCtrl),
         VMSTATE_BOOL(recov_paused, ESP32P4TwaiCtrl),
         VMSTATE_INT64(recov_mark, ESP32P4TwaiCtrl),
+        VMSTATE_UINT64(recov_runs, ESP32P4TwaiCtrl),
         VMSTATE_TIMER_PTR(recov_timer, ESP32P4TwaiCtrl),
         VMSTATE_BOOL(local_active, ESP32P4TwaiCtrl),
         VMSTATE_UINT8(local_phase, ESP32P4TwaiCtrl),
         VMSTATE_UINT32(local_bit, ESP32P4TwaiCtrl),
         VMSTATE_INT64(local_t0, ESP32P4TwaiCtrl),
+        VMSTATE_INT64(local_origin, ESP32P4TwaiCtrl),
+        VMSTATE_UINT64(local_bits, ESP32P4TwaiCtrl),
         VMSTATE_TIMER_PTR(local_timer, ESP32P4TwaiCtrl),
         VMSTATE_UINT8(view, ESP32P4TwaiCtrl),
         VMSTATE_BOOL(drives, ESP32P4TwaiCtrl),
         VMSTATE_BOOL(rx_level, ESP32P4TwaiCtrl),
         VMSTATE_BOOL(in_reset, ESP32P4TwaiCtrl),
+        VMSTATE_ESP32P4_CLK_PERIOD(clk_period, ESP32P4TwaiCtrl),
         VMSTATE_UINT64(ts_count_base, ESP32P4TwaiCtrl),
         VMSTATE_INT64(ts_base_ns, ESP32P4TwaiCtrl),
         VMSTATE_TIMER_PTR(ts_timer, ESP32P4TwaiCtrl),
@@ -2883,8 +2936,8 @@ static const VMStateDescription vmstate_esp32p4_twai_ctrl = {
 
 static const VMStateDescription vmstate_esp32p4_twai = {
     .name = TYPE_ESP32P4_TWAI,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = esp32p4_twai_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(ctrl, ESP32P4TwaiState, ESP32P4_TWAI_NUM, 1,
