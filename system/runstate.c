@@ -888,6 +888,15 @@ void qemu_system_guest_pvshutdown(void)
     qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
 }
 
+/*
+ * The reset takes effect for the whole machine at the request, as on
+ * hardware: every vCPU stops, not only the one making the request, and until
+ * the main loop performs it icount does not move virtual time on to the
+ * next timer for vCPUs that are idle only because they stopped for it
+ * (icount_start_warp_timer()). So a reset that a device requests from a
+ * QEMU_CLOCK_VIRTUAL timer happens at that timer's time, which under
+ * icount is exact and deterministic.
+ */
 void qemu_system_reset_request(ShutdownCause reason)
 {
     if (reboot_action == REBOOT_ACTION_SHUTDOWN &&
@@ -900,7 +909,7 @@ void qemu_system_reset_request(ShutdownCause reason)
     } else {
         reset_requested = reason;
     }
-    cpu_stop_current();
+    cpu_stop_all();
     qemu_notify_event();
 }
 
