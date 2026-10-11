@@ -65,10 +65,14 @@
  * either passes it on or refuses it. Every change to the registers
  * flushes the cores' TLBs.
  *
+ * A refused access answers with a bus error, which a core takes as an
+ * access fault unless HP_SYSTEM_CORE_ERR_RESP_DIS or
+ * LP_SYSTEM_LP_CORE_ERR_RESP_DIS disables the error response of the bus
+ * it went out on (target/riscv/esp32p4_cpu.c): then it completes without
+ * one, a read returning 0.
+ *
  * Not modelled: a register's CLK_EN (automatic clock gating, invisible to
- * software but for power) is kept as written; HP_SYSTEM_CORE_ERR_RESP_DIS
- * and LP_SYSTEM_LP_CORE_ERR_RESP_DIS, which keep a bus error from a core,
- * are not, so a refused access always faults; and the buses' record of
+ * software but for power) is kept as written; and the buses' record of
  * an access to an address nothing decodes (SECURE 1 in the same records)
  * is not kept, though the access still answers with a bus error.
  */

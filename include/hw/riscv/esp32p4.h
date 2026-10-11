@@ -12,15 +12,18 @@
 #include "qemu/units.h"
 #include "hw/core/boards.h"
 #include "hw/cpu/cluster.h"
+#include "hw/core/or-irq.h"
+#include "hw/core/split-irq.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/dma/esp32p4_gdma.h"
-#include "hw/core/split-irq.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "hw/intc/esp32p4_clic.h"
 #include "hw/intc/esp32p4_clint.h"
 #include "hw/intc/esp32p4_intmatrix.h"
 #include "hw/ssi/ssi.h"
 #include "hw/misc/esp32p4_ana.h"
+#include "hw/misc/esp32p4_assist_debug.h"
+#include "hw/misc/esp32p4_axi_perf_mon.h"
 #include "hw/misc/esp32p4_cache.h"
 #include "hw/misc/esp32p4_clkrst.h"
 #include "hw/misc/esp32p4_hp_sys.h"
@@ -28,6 +31,7 @@
 #include "hw/misc/esp32p4_icm.h"
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/misc/esp32p4_pms.h"
+#include "hw/misc/esp32p4_trace.h"
 #include "hw/net/esp32p4_emac.h"
 #include "hw/net/ip101_phy.h"
 #include "hw/nvram/esp32p4_efuse.h"
@@ -161,6 +165,18 @@ struct ESP32P4MachineState {
     ESP32P4EmacState emac;
     IP101PhyState phy;
     SplitIRQ pps_split;
+
+    ESP32P4AssistDebugState assist_debug;
+    ESP32P4AxiPerfMonState axi_perf_mon;
+    ESP32P4TraceState trace[ESP32P4_HP_CORES];
+    /* GPIO16 to GPIO54's holds: LP_SYSTEM's OR HP_SYSTEM's. */
+    OrIRQState pad_hold_or[ESP32P4_GPIO_PADS - ESP32P4_HP_SYS_HOLD_FIRST];
 };
+
+/*
+ * How long LP_SYSTEM_SYS_SW_RST holds the HP core in reset; the TRM gives
+ * no length, and this is the shortest of the RTC watchdog's.
+ */
+#define ESP32P4_SW_SYS_RESET_NS 100
 
 #endif
