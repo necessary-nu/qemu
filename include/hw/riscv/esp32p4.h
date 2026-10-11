@@ -28,7 +28,9 @@
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_icm.h"
 #include "hw/misc/esp32p4_lp_sys.h"
+#include "hw/misc/esp32p4_pcnt.h"
 #include "hw/misc/esp32p4_pms.h"
+#include "hw/misc/esp32p4_rmt.h"
 #include "hw/net/esp32p4_emac.h"
 #include "hw/net/esp32p4_twai.h"
 #include "hw/net/ip101_phy.h"
@@ -142,6 +144,8 @@ struct ESP32P4MachineState {
     ESP32P4TwaiState twai;
     /* The QEMU CAN buses on TWAI0 to TWAI2's pads, or NULL. */
     CanBusState *canbus[ESP32P4_TWAI_NUM];
+    ESP32P4RmtState rmt;
+    ESP32P4PcntState pcnt;
 
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];

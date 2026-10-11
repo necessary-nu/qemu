@@ -137,6 +137,15 @@
  *
  *       -object can-bus,id=can0 -M esp32p4,canbus0=can0,canbus1=can0
  *
+ *   - The RMT (TRM chapter 60) at 0x500A2000, behind RMT_SYS_CLK and its
+ *     reset, timed by RMT_CLK, its interrupt RMT_INTR (source 43), its four
+ *     TX outputs and four RX inputs matrix signals 246 to 249, and TX
+ *     channel 3 and RX channel 7 served by GDMA-AHB (PERI_SEL 10); and the
+ *     PCNT (TRM chapter 51) at 0x500C9000, behind PCNT_APB_CLK and its
+ *     reset, which also filters its inputs, its interrupt PCNT_INTR
+ *     (source 111), its four units' signal, control and clear inputs
+ *     matrix signals 141 to 156 and 63 to 66.
+ *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
  * a file longer than 512 bytes. A blank, all-zero, file starts as a
@@ -225,7 +234,6 @@ static const struct {
     { "dsi-host",         0x500a0000, 2 * KiB },
     { "dsi-bridge",       0x500a0800, 2 * KiB },
     { "isp",              0x500a1000, 4 * KiB },
-    { "rmt",              0x500a2000, 4 * KiB },
     { "bitscrambler",     0x500a3000, 4 * KiB },
     /* The AXI ICM's QoS command interface, above its own registers. */
     { "axi-icm-qos",      0x500a4400, 3 * KiB },
@@ -239,7 +247,6 @@ static const struct {
     { "i2s0",             0x500c6000, 4 * KiB },
     { "i2s1",             0x500c7000, 4 * KiB },
     { "i2s2",             0x500c8000, 4 * KiB },
-    { "pcnt",             0x500c9000, 4 * KiB },
     { "uart0",            0x500ca000, 4 * KiB },
     { "uart1",            0x500cb000, 4 * KiB },
     { "uart2",            0x500cc000, 4 * KiB },
@@ -1563,11 +1570,78 @@ static void esp32p4_init_twai(ESP32P4MachineState *s)
 }
 
 /*
+ * The RMT, its registers and RAM behind RMT_SYS_CLK and held by RST_EN_RMT,
+ * on RMT_CLK, its DMA channels on GDMA-AHB; and the PCNT, behind
+ * PCNT_APB_CLK, held by RST_EN_PCNT. Their pad signals go through the GPIO
+ * matrix. The RX channels' FIFO registers, whose reads move the RMT's
+ * pointers, are volatile while the block is gated.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt] */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+static void esp32p4_init_rmt_pcnt(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
+    DeviceState *dev;
+    ESP32P4ClkRstGate *g;
+    int n, u;
+
+    object_initialize_child(OBJECT(s), "rmt", &s->rmt, TYPE_ESP32P4_RMT);
+    dev = DEVICE(&s->rmt);
+    object_property_set_link(OBJECT(dev), "gdma", OBJECT(&s->gdma[0]),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "sclk", qdev_get_clock_out(clkrst, "rmt"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                 ESP32P4_RMT_BASE, ESP32P4_CLK_RMT_SYS,
+                                 ESP32P4_RST_RMT, 0);
+    esp32p4_clkrst_gate_volatile(g, 0x10, 4 * ESP32P4_RMT_RX_CHANNELS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_RMT));
+    for (n = 0; n < ESP32P4_RMT_TX_CHANNELS; n++) {
+        qdev_connect_gpio_out_named(dev, ESP32P4_RMT_SIG_OUT, n,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                                   ESP32P4_SIG_RMT_SIG_PAD_OUT0 + n));
+    }
+    for (n = 0; n < ESP32P4_RMT_RX_CHANNELS; n++) {
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+            ESP32P4_SIG_RMT_SIG_PAD_IN0 + n,
+            qdev_get_gpio_in_named(dev, ESP32P4_RMT_SIG_IN, n));
+    }
+
+    object_initialize_child(OBJECT(s), "pcnt", &s->pcnt, TYPE_ESP32P4_PCNT);
+    dev = DEVICE(&s->pcnt);
+    qdev_connect_clock_in(dev, "apb", qdev_get_clock_out(clkrst, "pcnt-apb"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_PCNT_BASE, ESP32P4_CLK_PCNT_APB,
+                             ESP32P4_RST_PCNT, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_PCNT));
+    for (u = 0; u < ESP32P4_PCNT_UNITS; u++) {
+        static const int sig[ESP32P4_PCNT_UNIT_INPUTS] = {
+            [ESP32P4_PCNT_SIG(0)] = ESP32P4_SIG_PCNT_SIG_CH0_PAD_IN0,
+            [ESP32P4_PCNT_SIG(1)] = ESP32P4_SIG_PCNT_SIG_CH1_PAD_IN0,
+            [ESP32P4_PCNT_CTRL(0)] = ESP32P4_SIG_PCNT_CTRL_CH0_PAD_IN0,
+            [ESP32P4_PCNT_CTRL(1)] = ESP32P4_SIG_PCNT_CTRL_CH1_PAD_IN0,
+            [ESP32P4_PCNT_RST] = ESP32P4_SIG_PCNT_RST_PAD_IN0,
+        };
+
+        for (n = 0; n < ESP32P4_PCNT_UNIT_INPUTS; n++) {
+            qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN, sig[n] + u,
+                qdev_get_gpio_in_named(dev, ESP32P4_PCNT_INPUT,
+                                       u * ESP32P4_PCNT_UNIT_INPUTS + n));
+        }
+    }
+}
+
+/*
  * The event task matrix (TRM chapter 14), its registers behind
  * ETM_APB_CLK, running on ETM_SYS_CLK, held by RST_EN_ETM; and every
  * modelled block's events and tasks, by their IDs, as its header
  * (hw/misc/esp32p4_etm.h) describes: a block that generates events or
  * takes tasks adds a line here for each.
+ *
+ * The RMT and the PCNT have no events or tasks on the P4.
  *
  * Not connected, as their blocks are not modelled: the LED PWM, MCPWM,
  * ADC, REGDMA, temperature sensor, I2S, 2D-DMA and PMU events and tasks;
@@ -1832,6 +1906,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_emac(s);
     esp32p4_init_dma(s);
     esp32p4_init_twai(s);
+    esp32p4_init_rmt_pcnt(s);
     esp32p4_init_etm(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
