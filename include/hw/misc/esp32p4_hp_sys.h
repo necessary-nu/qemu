@@ -53,6 +53,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4HPSysState, ESP32P4_HP_SYS)
 #define ESP32P4_HP_SYS_CACHE_RESET "cache-reset"
 #define ESP32P4_HP_SYS_CACHE_RESET_LINES 3
 
+/*
+ * Named GPIO output ESP32P4_HP_SYS_USBOTG20_CTRL: HP_SYSTEM_SYS_USBOTG20_
+ * CTRL's PHY_SUSPENDM, PHY_SUSPEND_FORCE_EN, PHY_RSTN, PHY_RESET_FORCE_EN,
+ * PHY_PLL_FORCE_EN, PHY_PLL_EN and OTG_SUSPENDM (bits 15 to 21), to the
+ * UTMI+ PHY's "sys-ctrl" inputs. Named GPIO input
+ * ESP32P4_HP_SYS_USB_OTGHS_PHY_ST: the PHY's session end, VBUS valid,
+ * B-valid and session valid, which HP_SYSTEM_USB_OTGHS_PHY_ST reads.
+ */
+#define ESP32P4_HP_SYS_USBOTG20_CTRL "usbotg20-ctrl"
+#define ESP32P4_HP_SYS_USBOTG20_CTRL_LINES 7
+#define ESP32P4_HP_SYS_USB_OTGHS_PHY_ST "usb-otghs-phy-st"
+
 struct ESP32P4HPSysState {
     SysBusDevice parent_obj;
 
@@ -69,6 +81,10 @@ struct ESP32P4HPSysState {
     uint32_t l2_mem_int_record0;
     uint32_t l2_mem_err_resp_ctrl;
     qemu_irq l2mem_err_resp;
+    uint32_t usb20otg_mem_ctrl;
+    uint32_t sys_usbotg20_ctrl;
+    uint32_t usb_otghs_phy_st;
+    qemu_irq usbotg20_ctrl_out[ESP32P4_HP_SYS_USBOTG20_CTRL_LINES];
     /* HP_SYSREG_INTR, sysbus IRQ 0. */
     qemu_irq sysreg_irq;
 };

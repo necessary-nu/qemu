@@ -37,6 +37,16 @@
  *     else answers L2MEM accesses with an error. Their interrupt is the
  *     HP_SYSREG source (sysbus IRQ 0).
  *
+ *   - HP_SYSTEM_USB20OTG_MEM_CTRL_REG (0xF8), HP_SYSTEM_SYS_USBOTG20_CTRL_REG
+ *     (0x15C) and HP_SYSTEM_USB_OTGHS_PHY_ST_REG (0x1E8): the high-speed
+ *     OTG's UTMI+ PHY. SYS_USBOTG20_CTRL's suspend, reset and PLL forces
+ *     go to the PHY ("usbotg20-ctrl" outputs), which stops its clock as
+ *     they say; its other fields (the FIFO RAM's power controls, the
+ *     transmit bit stuffing and reference clock mode) hold what software
+ *     writes, and the PHY's BIST (OTG_PHY_BISTEN) is logged as
+ *     unimplemented, its TEST_DONE reading 0. USB_OTGHS_PHY_ST reads the
+ *     PHY's VBUS comparators ("usb-otghs-phy-st" inputs).
+ *
  * The rest of the block's registers are logged as unimplemented and read
  * as zero.
  */
@@ -68,6 +78,14 @@
 #define RECORD0_WE              BIT(21)
 #define A_L2_MEM_ERR_RESP_CTRL  0x198
 #define L2_MEM_ERR_RESP_EN      BIT(0)
+#define A_USB20OTG_MEM_CTRL     0xf8
+#define USB20OTG_MEM_CTRL_MASK  BIT(0)
+#define A_SYS_USBOTG20_CTRL     0x15c
+#define USBOTG20_CTRL_MASK      0x01fffffe
+#define USBOTG20_CTRL_RESET     0x00822640
+#define USBOTG20_CTRL_PHY_SHIFT 15
+#define USBOTG20_CTRL_BISTEN    BIT(24)
+#define A_USB_OTGHS_PHY_ST      0x1e8
 
 static bool esp32p4_hp_sys_is_cpu_intr(hwaddr addr)
 {
@@ -118,6 +136,12 @@ static uint32_t esp32p4_hp_sys_reg(ESP32P4HPSysState *s, hwaddr addr,
         return s->l2_mem_int_record0;
     case A_L2_MEM_ERR_RESP_CTRL:
         return s->l2_mem_err_resp_ctrl;
+    case A_USB20OTG_MEM_CTRL:
+        return s->usb20otg_mem_ctrl;
+    case A_SYS_USBOTG20_CTRL:
+        return s->sys_usbotg20_ctrl;
+    case A_USB_OTGHS_PHY_ST:
+        return s->usb_otghs_phy_st << 1;
     default:
         *known = false;
         return 0;
@@ -143,6 +167,23 @@ static void esp32p4_hp_sys_update_crypto(ESP32P4HPSysState *s)
     for (int i = 0; i < ESP32P4_HP_SYS_CRYPTO_CTRL_LINES; i++) {
         qemu_set_irq(s->crypto_ctrl_out[i], extract32(s->crypto_ctrl, i, 1));
     }
+}
+
+/* [spec:nuos:req:emu.esp32p4.usb] */
+static void esp32p4_hp_sys_update_usb(ESP32P4HPSysState *s)
+{
+    for (int i = 0; i < ESP32P4_HP_SYS_USBOTG20_CTRL_LINES; i++) {
+        qemu_set_irq(s->usbotg20_ctrl_out[i],
+                     extract32(s->sys_usbotg20_ctrl,
+                               USBOTG20_CTRL_PHY_SHIFT + i, 1));
+    }
+}
+
+static void esp32p4_hp_sys_phy_st_in(void *opaque, int n, int level)
+{
+    ESP32P4HPSysState *s = opaque;
+
+    s->usb_otghs_phy_st = deposit32(s->usb_otghs_phy_st, n, 1, level);
 }
 
 /* L1_I0_CACHE_RESET (bit 5), L1_I1_CACHE_RESET (4), L1_D_CACHE_RESET (1). */
@@ -207,6 +248,21 @@ static void esp32p4_hp_sys_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     case A_L2_MEM_INT_ST:
     case A_L2_MEM_INT_RECORD0:
+    case A_USB_OTGHS_PHY_ST:
+        break;
+    case A_USB20OTG_MEM_CTRL:
+        s->usb20otg_mem_ctrl = ((s->usb20otg_mem_ctrl & ~mask) |
+                                (v & mask)) & USB20OTG_MEM_CTRL_MASK;
+        break;
+    case A_SYS_USBOTG20_CTRL:
+        s->sys_usbotg20_ctrl = ((s->sys_usbotg20_ctrl & ~mask) |
+                                (v & mask)) & USBOTG20_CTRL_MASK;
+        if (s->sys_usbotg20_ctrl & USBOTG20_CTRL_BISTEN) {
+            qemu_log_mask(LOG_UNIMP, "%s: the USB 2.0 OTG PHY's BIST "
+                          "(SYS_OTG_PHY_BISTEN) is not modelled\n",
+                          TYPE_ESP32P4_HP_SYS);
+        }
+        esp32p4_hp_sys_update_usb(s);
         break;
     case A_L2_MEM_ERR_RESP_CTRL:
         s->l2_mem_err_resp_ctrl = ((s->l2_mem_err_resp_ctrl & ~mask) |
@@ -244,6 +300,8 @@ static void esp32p4_hp_sys_reset_hold(Object *obj, ResetType type)
     s->l2_mem_int_ena = 0;
     s->l2_mem_int_record0 = 0;
     s->l2_mem_err_resp_ctrl = 0;
+    s->usb20otg_mem_ctrl = 0;
+    s->sys_usbotg20_ctrl = USBOTG20_CTRL_RESET;
 }
 
 static void esp32p4_hp_sys_reset_exit(Object *obj, ResetType type)
@@ -256,6 +314,7 @@ static void esp32p4_hp_sys_reset_exit(Object *obj, ResetType type)
     esp32p4_hp_sys_update_cache_reset(s);
     esp32p4_hp_sys_update_crypto(s);
     qemu_set_irq(s->l2mem_err_resp, s->l2_mem_err_resp_ctrl);
+    esp32p4_hp_sys_update_usb(s);
     esp32p4_hp_sys_update_irq(s);
 }
 
@@ -278,7 +337,24 @@ static void esp32p4_hp_sys_init(Object *obj)
                              ESP32P4_HP_SYS_CRYPTO_CTRL_LINES);
     qdev_init_gpio_out_named(DEVICE(obj), &s->l2mem_err_resp,
                              ESP32P4_HP_SYS_L2MEM_ERR_RESP, 1);
+    qdev_init_gpio_out_named(DEVICE(obj), s->usbotg20_ctrl_out,
+                             ESP32P4_HP_SYS_USBOTG20_CTRL,
+                             ESP32P4_HP_SYS_USBOTG20_CTRL_LINES);
+    qdev_init_gpio_in_named(DEVICE(obj), esp32p4_hp_sys_phy_st_in,
+                            ESP32P4_HP_SYS_USB_OTGHS_PHY_ST, 4);
 }
+
+static const VMStateDescription vmstate_esp32p4_hp_sys_usb = {
+    .name = TYPE_ESP32P4_HP_SYS "/usb",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(usb20otg_mem_ctrl, ESP32P4HPSysState),
+        VMSTATE_UINT32(sys_usbotg20_ctrl, ESP32P4HPSysState),
+        VMSTATE_UINT32(usb_otghs_phy_st, ESP32P4HPSysState),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static const VMStateDescription vmstate_esp32p4_hp_sys = {
     .name = TYPE_ESP32P4_HP_SYS,
@@ -295,6 +371,10 @@ static const VMStateDescription vmstate_esp32p4_hp_sys = {
         VMSTATE_UINT32(l2_mem_int_record0, ESP32P4HPSysState),
         VMSTATE_UINT32(l2_mem_err_resp_ctrl, ESP32P4HPSysState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_esp32p4_hp_sys_usb,
+        NULL
     },
 };
 

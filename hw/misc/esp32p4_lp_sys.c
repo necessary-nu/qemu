@@ -32,6 +32,17 @@
  *   core's bus timeouts, the ETM's ULP task and the slow clock tick are
  *   not modelled.
  *
+ * - LP_SYSTEM_REG_USB_CTRL_REG (0x100): SW_HW_USB_PHY_SEL and
+ *   SW_USB_PHY_SEL, which choose the full-speed PHYs of USB Serial/JTAG
+ *   and the full-speed OTG, to USB_WRAP ("usb-phy-sel" outputs); the
+ *   high-speed OTG's suspend and mode flags for the PMU, which hold what
+ *   software writes (the PMU is not modelled), and USBOTG20_WAKEUP_CLR,
+ *   which reads as zero.
+ * - LP_SYSTEM_REG_HP_USB_OTGHS_PHY_CTRL_REG (0x204): the high-speed OTG
+ *   PHY's ID pull-up, D+/D- pull-downs and VBUS charge and discharge,
+ *   which hold what software writes: the model does not take the bus's
+ *   electrical state from them.
+ *
  * The rest of the block's registers are logged as unimplemented and read
  * as zero.
  */
@@ -43,6 +54,9 @@
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "migration/vmstate.h"
 
+#define A_USB_CTRL              0x100
+#define USB_CTRL_MASK           0x1b
+#define USB_CTRL_WAKEUP_CLR     BIT(2)
 #define A_BOOT_ADDR_HP_CORE1    0x164
 #define A_LP_ADDRHOLE_ADDR      0x168
 #define A_LP_ADDRHOLE_INFO      0x16c
@@ -52,6 +66,9 @@
 #define A_INT_CLR               0x17c
 #define A_IDBUS_ADDRHOLE_ADDR   0x198
 #define A_IDBUS_ADDRHOLE_INFO   0x19c
+#define A_HP_USB_OTGHS_PHY_CTRL 0x204
+#define OTGHS_PHY_CTRL_MASK     0x1f
+#define OTGHS_PHY_CTRL_RESET    0x07
 
 /* LP_ADDRHOLE_INT, IDBUS_ADDRHOLE_INT, the three bus timeouts, ETM, tick. */
 #define INT_LP_ADDRHOLE         BIT(0)
@@ -65,6 +82,13 @@
 static void esp32p4_lp_sys_update(ESP32P4LPSysState *s)
 {
     qemu_set_irq(s->irq, !!(s->int_raw & s->int_ena));
+}
+
+/* [spec:nuos:req:emu.esp32p4.usb] */
+static void esp32p4_lp_sys_update_usb(ESP32P4LPSysState *s)
+{
+    qemu_set_irq(s->usb_phy_sel[0], extract32(s->usb_ctrl, 0, 1));
+    qemu_set_irq(s->usb_phy_sel[1], extract32(s->usb_ctrl, 1, 1));
 }
 
 /* [spec:nuos:req:emu.esp32p4.pms] */
@@ -85,6 +109,12 @@ static bool esp32p4_lp_sys_reg(ESP32P4LPSysState *s, hwaddr addr,
                                uint32_t *v)
 {
     switch (addr) {
+    case A_USB_CTRL:
+        *v = s->usb_ctrl;
+        return true;
+    case A_HP_USB_OTGHS_PHY_CTRL:
+        *v = s->hp_usb_otghs_phy_ctrl;
+        return true;
     case A_BOOT_ADDR_HP_CORE1:
         *v = s->boot_addr_hp_core1;
         return true;
@@ -137,6 +167,17 @@ static void esp32p4_lp_sys_write(void *opaque, hwaddr addr, uint64_t value,
     uint32_t v;
 
     switch (reg) {
+    case A_USB_CTRL:
+        /* USBOTG20_WAKEUP_CLR clears the PMU's wakeup and reads as 0. */
+        s->usb_ctrl = deposit32(s->usb_ctrl, shift, size * 8, value) &
+                      USB_CTRL_MASK & ~USB_CTRL_WAKEUP_CLR;
+        esp32p4_lp_sys_update_usb(s);
+        break;
+    case A_HP_USB_OTGHS_PHY_CTRL:
+        s->hp_usb_otghs_phy_ctrl = deposit32(s->hp_usb_otghs_phy_ctrl, shift,
+                                             size * 8, value) &
+                                   OTGHS_PHY_CTRL_MASK;
+        break;
     case A_BOOT_ADDR_HP_CORE1:
         s->boot_addr_hp_core1 = deposit32(s->boot_addr_hp_core1, shift,
                                           size * 8, value);
@@ -187,11 +228,14 @@ static void esp32p4_lp_sys_reset_hold(Object *obj, ResetType type)
     s->lp_addrhole_info = 0;
     s->int_raw = 0;
     s->int_ena = 0;
+    s->usb_ctrl = 0;
+    s->hp_usb_otghs_phy_ctrl = OTGHS_PHY_CTRL_RESET;
 }
 
 static void esp32p4_lp_sys_reset_exit(Object *obj, ResetType type)
 {
     esp32p4_lp_sys_update(ESP32P4_LP_SYS(obj));
+    esp32p4_lp_sys_update_usb(ESP32P4_LP_SYS(obj));
 }
 
 static void esp32p4_lp_sys_init(Object *obj)
@@ -202,7 +246,20 @@ static void esp32p4_lp_sys_init(Object *obj)
                           TYPE_ESP32P4_LP_SYS, ESP32P4_LP_SYS_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    qdev_init_gpio_out_named(DEVICE(obj), s->usb_phy_sel,
+                             ESP32P4_LP_SYS_USB_PHY_SEL, 2);
 }
+
+static const VMStateDescription vmstate_esp32p4_lp_sys_usb = {
+    .name = TYPE_ESP32P4_LP_SYS "/usb",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(usb_ctrl, ESP32P4LPSysState),
+        VMSTATE_UINT32(hp_usb_otghs_phy_ctrl, ESP32P4LPSysState),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static const VMStateDescription vmstate_esp32p4_lp_sys = {
     .name = TYPE_ESP32P4_LP_SYS,
@@ -215,6 +272,10 @@ static const VMStateDescription vmstate_esp32p4_lp_sys = {
         VMSTATE_UINT32(int_raw, ESP32P4LPSysState),
         VMSTATE_UINT32(int_ena, ESP32P4LPSysState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_esp32p4_lp_sys_usb,
+        NULL
     },
 };
 

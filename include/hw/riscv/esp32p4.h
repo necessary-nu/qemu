@@ -28,6 +28,8 @@
 #include "hw/misc/esp32p4_pms.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/ssi/esp32p4_mspi.h"
+#include "hw/usb/dwc2-otg.h"
+#include "hw/usb/esp32p4_usb.h"
 #include "system/memory.h"
 #include "target/riscv/esp32p4_cpu.h"
 
@@ -129,6 +131,11 @@ struct ESP32P4MachineState {
     MemoryRegion flash_window_alias;
     MemoryRegion psram_window_alias;
     ESP32P4CacheState cache;
+    /* The USB 2.0 OTG controllers, high and full speed, and their PHYs. */
+    DWC2OTGState usb_hs;
+    DWC2OTGState usb_fs;
+    ESP32P4UsbUtmiState usb_utmi;
+    ESP32P4UsbWrapState usb_wrap;
     SSIBus *flash_bus;
     uint64_t flash_size;
 };

@@ -90,6 +90,25 @@
  *
  *       -M esp32p4,strap-mode=0x08
  *
+ *   - The USB 2.0 OTG controllers (TRM chapters 52 and 53,
+ *     hw/usb/esp32p4_usb.c): OTG_HS (0x50000000) on its UTMI+ PHY
+ *     (0x5009C000) and OTG_FS (0x50040000) on a full-speed PHY that
+ *     USB_WRAP (0x50080000) controls, behind their bus clocks and resets,
+ *     their DMA through the DMA access permission manager, their
+ *     interrupts sources 93, 94 and 103, OTG_FS's OTG signals through the
+ *     GPIO matrix. In host mode QEMU's USB devices plug into a
+ *     controller's port, the bus named after it: usb-otg-hs.0 and
+ *     usb-otg-fs.0,
+ *
+ *       -device usb-kbd,bus=usb-otg-hs.0
+ *
+ *     and in device mode one of the built-in hosts of hw/usb/usb-devport.h
+ *     is at the other end of the cable, the token port or the CDC-ACM
+ *     bridge on a chardev:
+ *
+ *       -chardev socket,id=tok,path=tok.sock,server=on,wait=off
+ *       -global esp32p4-usb-otg-fs.token-chardev=tok
+ *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
  * a file longer than 512 bytes. A blank, all-zero, file starts as a
@@ -154,9 +173,6 @@ static const struct {
     { "tcm-monitor",      0x3ff0f000, 4 * KiB },
 
     /* HP peripherals 0. */
-    { "usb-otg-hs",       0x50000000, 256 * KiB },
-    { "usb-otg-fs",       0x50040000, 256 * KiB },
-    { "usb-wrap",         0x50080000, 4 * KiB },
     { "vdma",             0x50081000, 4 * KiB },
     { "pau",              0x50082000, 4 * KiB },
     { "sdmmc",            0x50083000, 4 * KiB },
@@ -175,7 +191,6 @@ static const struct {
     { "hmac",             0x50095000, 4 * KiB },
     { "ecdsa",            0x50096000, 4 * KiB },
     { "emac",             0x50098000, 16 * KiB },
-    { "usb-phy",          0x5009c000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
     { "pvt",              0x5009e000, 4 * KiB },
     { "csi-host",         0x5009f000, 2 * KiB },
@@ -993,6 +1008,189 @@ static void esp32p4_init_pms(ESP32P4MachineState *s)
                                     ESP32P4_PMS_LP_RESET, 0));
 }
 
+/*
+ * The full-speed OTG's UTMI+ OTG signals through the GPIO matrix (TRM
+ * table 10.12-1, signals 110 to 115), as ESP-IDF's usb_phy.c routes them:
+ * the session end through USB_WRAP, which can override it.
+ */
+static const struct {
+    int sig;
+    int line;
+} esp32p4_usb_fs_sense[] = {
+    { ESP32P4_SIG_USB_OTG11_IDDIG_PAD_IN, DWC2_OTG_SENSE_IDDIG },
+    { ESP32P4_SIG_USB_OTG11_AVALID_PAD_IN, DWC2_OTG_SENSE_AVALID },
+    { ESP32P4_SIG_USB_SRP_BVALID_PAD_IN, DWC2_OTG_SENSE_BVALID },
+    { ESP32P4_SIG_USB_OTG11_VBUSVALID_PAD_IN, DWC2_OTG_SENSE_VBUSVALID },
+}, esp32p4_usb_fs_ctl[] = {
+    { ESP32P4_SIG_USB_OTG11_IDPULLUP_PAD_OUT, DWC2_OTG_CTL_IDPULLUP },
+    { ESP32P4_SIG_USB_OTG11_DPPULLDOWN_PAD_OUT, DWC2_OTG_CTL_DPPULLDOWN },
+    { ESP32P4_SIG_USB_OTG11_DMPULLDOWN_PAD_OUT, DWC2_OTG_CTL_DMPULLDOWN },
+    { ESP32P4_SIG_USB_OTG11_DRVVBUS_PAD_OUT, DWC2_OTG_CTL_DRVVBUS },
+    { ESP32P4_SIG_USB_SRP_CHRGVBUS_PAD_OUT, DWC2_OTG_CTL_CHRGVBUS },
+    { ESP32P4_SIG_USB_SRP_DISCHRGVBUS_PAD_OUT, DWC2_OTG_CTL_DISCHRGVBUS },
+};
+
+/* Map a DWC2 core's registers and FIFOs behind its bus clock and reset. */
+static void esp32p4_map_usb_core(ESP32P4MachineState *s, DWC2OTGState *core,
+                                 hwaddr base, unsigned clock, unsigned reset)
+{
+    ESP32P4ClkRstGate *g;
+
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(core),
+                                 DWC2_OTG_MMIO_CSR, base, clock, reset, 0);
+    /* GRXSTSP pops the receive FIFO. */
+    esp32p4_clkrst_gate_volatile(g, DWC2_OTG_GRXSTSP, 4);
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(core),
+                                 DWC2_OTG_MMIO_FIFO,
+                                 base + DWC2_OTG_FIFO_BASE, clock, reset, 0);
+    /* Reading a push/pop window pops the receive FIFO. */
+    esp32p4_clkrst_gate_volatile(g, 0, DWC2_OTG_MAX_EPS * 0x1000);
+}
+
+/*
+ * The USB 2.0 OTG controllers. OTG_HS: its registers and the UTMI+ PHY's
+ * behind USB_OTG20_SYS_CLK, the core reset by RST_EN_USB_OTG20 and the
+ * PHY by RST_EN_USB_OTG20_PHY, the PHY's PLL on USB_OTG20_PHYREF_CLK; its
+ * PHY controls in HP_SYSTEM; its interrupts USB_OTG_INTR (93) and
+ * USB_OTG_ENDP_MULTI_PROC_INTR (94). OTG_FS: its registers and USB_WRAP's
+ * behind USB_OTG11_SYS_CLK, both reset by RST_EN_USB_OTG11, its PHY on
+ * USB_OTG11_48M_CLK; its PHY selection in LP_SYS and the eFuses; its
+ * interrupt USB_OTG11_INTR (103). Both DMA through the DMA APM.
+ */
+/* [spec:nuos:req:emu.esp32p4.usb] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+static void esp32p4_init_usb(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    DeviceState *gpio = DEVICE(&s->gpio);
+    DeviceState *hs, *fs, *utmi, *wrap;
+    int i;
+
+    object_initialize_child(OBJECT(s), "usb-utmi", &s->usb_utmi,
+                            TYPE_ESP32P4_USB_UTMI);
+    utmi = DEVICE(&s->usb_utmi);
+    qdev_connect_clock_in(utmi, "refclk",
+                          qdev_get_clock_out(clkrst, "usb-otg20-phyref"));
+    sysbus_realize(SYS_BUS_DEVICE(utmi), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(utmi), 0,
+                             ESP32P4_USB_UTMI_BASE, ESP32P4_CLK_USB_OTG20_SYS,
+                             ESP32P4_RST_USB_OTG20_PHY, 0);
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_USB_OTG20_PHY,
+                                qdev_get_gpio_in_named(utmi,
+                                    ESP32P4_USB_UTMI_PHY_RESET, 0));
+    for (i = 0; i < ESP32P4_HP_SYS_USBOTG20_CTRL_LINES; i++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->hp_sys),
+                                    ESP32P4_HP_SYS_USBOTG20_CTRL, i,
+                                    qdev_get_gpio_in_named(utmi,
+                                        ESP32P4_USB_UTMI_SYS_CTRL, i));
+    }
+    for (i = 0; i < 4; i++) {
+        qdev_connect_gpio_out_named(utmi, ESP32P4_USB_UTMI_PHY_ST, i,
+                                    qdev_get_gpio_in_named(
+                                        DEVICE(&s->hp_sys),
+                                        ESP32P4_HP_SYS_USB_OTGHS_PHY_ST, i));
+    }
+
+    object_initialize_child(OBJECT(s), "usb-otg-hs", &s->usb_hs,
+                            TYPE_ESP32P4_USB_OTG_HS);
+    hs = DEVICE(&s->usb_hs);
+    dwc2_otg_set_dma(&s->usb_hs, esp32p4_pms_bus_as(&s->pms),
+                     esp32p4_dma_attrs(ESP32P4_DMA_MASTER_USB_OTG_HS,
+                                       ESP32P4_ICM_ID_USB_OTG_HS));
+    qdev_connect_clock_in(hs, "utmi", qdev_get_clock_out(utmi, "utmi"));
+    sysbus_realize(SYS_BUS_DEVICE(hs), &error_fatal);
+    esp32p4_map_usb_core(s, &s->usb_hs, ESP32P4_USB_OTG_HS_BASE,
+                         ESP32P4_CLK_USB_OTG20_SYS, ESP32P4_RST_USB_OTG20);
+    sysbus_connect_irq(SYS_BUS_DEVICE(hs), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_USB_OTG));
+    sysbus_connect_irq(SYS_BUS_DEVICE(hs), 1,
+                       esp32p4_intr_source(s,
+                           ESP32P4_INTR_USB_OTG_ENDP_MULTI_PROC));
+    for (i = 0; i < DWC2_OTG_SENSE_NUM; i++) {
+        qdev_connect_gpio_out_named(utmi, DWC2_OTG_SENSE, i,
+                                    qdev_get_gpio_in_named(hs,
+                                        DWC2_OTG_SENSE, i));
+    }
+    qdev_connect_gpio_out_named(hs, DWC2_OTG_CTL, DWC2_OTG_CTL_DRVVBUS,
+                                qdev_get_gpio_in_named(utmi,
+                                    ESP32P4_USB_UTMI_DRVVBUS, 0));
+    qdev_connect_gpio_out_named(hs, DWC2_OTG_HOST_ATTACHED, 0,
+                                qdev_get_gpio_in_named(utmi,
+                                    ESP32P4_USB_UTMI_HOST_ATTACHED, 0));
+
+    object_initialize_child(OBJECT(s), "usb-wrap", &s->usb_wrap,
+                            TYPE_ESP32P4_USB_WRAP);
+    wrap = DEVICE(&s->usb_wrap);
+    object_property_set_link(OBJECT(wrap), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    sysbus_realize(SYS_BUS_DEVICE(wrap), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(wrap), 0,
+                             ESP32P4_USB_WRAP_BASE, ESP32P4_CLK_USB_OTG11_SYS,
+                             ESP32P4_RST_USB_OTG11, 0);
+    for (i = 0; i < 2; i++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->lp_sys),
+                                    ESP32P4_LP_SYS_USB_PHY_SEL, i,
+                                    qdev_get_gpio_in_named(wrap,
+                                        ESP32P4_USB_WRAP_PHY_SEL, i));
+    }
+
+    object_initialize_child(OBJECT(s), "usb-otg-fs", &s->usb_fs,
+                            TYPE_ESP32P4_USB_OTG_FS);
+    fs = DEVICE(&s->usb_fs);
+    dwc2_otg_set_dma(&s->usb_fs, esp32p4_pms_bus_as(&s->pms),
+                     esp32p4_dma_attrs(ESP32P4_DMA_MASTER_USB_OTG_FS,
+                                       ESP32P4_ICM_ID_USB_OTG_FS));
+    qdev_connect_clock_in(fs, "fsphy",
+                          qdev_get_clock_out(clkrst, "usb-otg11-48m"));
+    sysbus_realize(SYS_BUS_DEVICE(fs), &error_fatal);
+    esp32p4_map_usb_core(s, &s->usb_fs, ESP32P4_USB_OTG_FS_BASE,
+                         ESP32P4_CLK_USB_OTG11_SYS, ESP32P4_RST_USB_OTG11);
+    sysbus_connect_irq(SYS_BUS_DEVICE(fs), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_USB_OTG11_CH0));
+    qdev_connect_gpio_out_named(wrap, DWC2_OTG_PHY_CONNECTED, 0,
+                                qdev_get_gpio_in_named(fs,
+                                    DWC2_OTG_PHY_CONNECTED, 0));
+    for (i = 0; i < 2; i++) {
+        qdev_connect_gpio_out_named(wrap, DWC2_OTG_PULL_OVERRIDE, i,
+                                    qdev_get_gpio_in_named(fs,
+                                        DWC2_OTG_PULL_OVERRIDE, i));
+    }
+    for (i = 0; i < ARRAY_SIZE(esp32p4_usb_fs_sense); i++) {
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                                    esp32p4_usb_fs_sense[i].sig,
+                                    qdev_get_gpio_in_named(fs,
+                                        DWC2_OTG_SENSE,
+                                        esp32p4_usb_fs_sense[i].line));
+    }
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                                ESP32P4_SIG_USB_SRP_SESSEND_PAD_IN,
+                                qdev_get_gpio_in_named(wrap,
+                                    ESP32P4_USB_WRAP_SESSEND_IN, 0));
+    qdev_connect_gpio_out_named(wrap, ESP32P4_USB_WRAP_SESSEND, 0,
+                                qdev_get_gpio_in_named(fs, DWC2_OTG_SENSE,
+                                    DWC2_OTG_SENSE_SESSEND));
+    /*
+     * The D+ pull-up OTG_FS's PHY puts on its pad: GPIO27, of the PHY the
+     * OTG has by default. GPIO25's pull-up is USB Serial/JTAG's line.
+     */
+    qdev_connect_gpio_out_named(fs, DWC2_OTG_DP_PULLUP, 0,
+                                qdev_get_gpio_in_named(wrap,
+                                    ESP32P4_USB_WRAP_CORE_DP_PULLUP, 0));
+    qdev_connect_gpio_out_named(wrap, ESP32P4_USB_WRAP_PHY_DP_PULLUP, 1,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_PAD_PULL_UP, 27));
+    for (i = 0; i < ARRAY_SIZE(esp32p4_usb_fs_ctl); i++) {
+        qdev_connect_gpio_out_named(fs, DWC2_OTG_CTL,
+                                    esp32p4_usb_fs_ctl[i].line,
+                                    qdev_get_gpio_in_named(gpio,
+                                        ESP32P4_GPIO_SIG_OUT,
+                                        esp32p4_usb_fs_ctl[i].sig));
+    }
+}
+
 /* The memories -kernel can load into: those the cores address directly. */
 static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
 {
@@ -1129,6 +1327,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_gpio(s);
     esp32p4_init_pms(s);
     esp32p4_init_ext_memory(s);
+    esp32p4_init_usb(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
                         esp32p4_unimplemented[i].name,
