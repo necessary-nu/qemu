@@ -15,6 +15,7 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "qemu/bswap.h"
+#include "qobject/qdict.h"
 
 #define I2S(n)              (0x500c6000 + 0x1000 * (n))
 #define LP_I2S              0x50125000
@@ -1056,6 +1057,64 @@ static void test_mclk(void)
     qtest_quit(qts);
 }
 
+/* A clock's period, in Clock units of 2^-32 ns. */
+static uint64_t clock_period(QTestState *qts, const char *path)
+{
+    QDict *r = qtest_qmp(qts, "{ 'execute': 'qom-get', 'arguments': "
+                         "{ 'path': %s, 'property': 'qtest-clock-period' } }",
+                         path);
+    uint64_t period;
+
+    g_assert(qdict_haskey(r, "return"));
+    period = qdict_get_uint(r, "return");
+    qobject_unref(r);
+    return period;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.i2s/test]
+ * [spec:nuos:req:emu.esp32p4.clocks/test]
+ * A clock through a pad loop keeps its exact period: I2S0's TX clock,
+ * XTAL_CLK by 4 + 2/3, 350/3 ns, which is no whole number of Clock units,
+ * goes out on I2S0_MCLK_out and back in to PAD_I2S1_MCLK; I2S1's receiver
+ * divides it by 2, 700/3 ns, a Clock period of 700/3 * 2^32 rounded down
+ * once (not twice I2S0's rounded period). Its frames, 4 BCK cycles of 8
+ * of those and 32 BCK cycles a frame, are 89600/3 ns: the 100th ends at
+ * 2986666 2/3 ns after the start, and RX_DONE comes at the first
+ * nanosecond after.
+ */
+static void test_mclk_exact(void)
+{
+    QTestState *qts = start();
+    int64_t t0;
+
+    clocks_on(qts, 0);
+    clocks_on(qts, 1);
+    /* N 4, b/a 2/3: x 0, y 1, z 2 */
+    set_fld(qts, unit_clk[0][1].x, 0);
+    set_fld(qts, unit_clk[0][1].y, 1);
+    set_fld(qts, unit_clk[0][1].z, 2);
+    set_fld(qts, unit_clk[0][1].n, 4);
+    set_fld(qts, mst_sel[0], 1);
+    wire(qts, 24, SIG_MCLK(0), SIG_MCLK(1));
+    qtest_writel(qts, LP_HP_CLK_CTRL,
+                 qtest_readl(qts, LP_HP_CLK_CTRL) | PAD_I2S_MCLK_EN(1));
+    set_unit_clk(qts, 1, 0, SRC_PAD_MCLK, 2);
+    g_assert_cmpuint(clock_period(qts, "/machine/clkrst/i2s1-rx"), ==,
+                     700ull * (1ull << 32) / 3);
+
+    i2s_w(qts, 1, RXEOF_NUM, 2 * 100 - 1);
+    dma_rx(qts, 1, PERI_I2S(1), MEM, MEM + 0x2000, 1024);
+    t0 = qtest_clock_step(qts, 1);
+    unit_go(qts, 1, false, (RX_BASE & ~C_MSB_SHIFT) | C_TDM_EN |
+            C_BCK_DIV(4), STD_CONF1, STD_TDM);
+    g_assert_cmpint(qtest_clock_step(qts, 2986666), ==, t0 + 2986666);
+    g_assert_cmphex(i2s_r(qts, 1, INT_RAW) & INT_RX_DONE, ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(i2s_r(qts, 1, INT_RAW) & INT_RX_DONE, ==, INT_RX_DONE);
+    qtest_quit(qts);
+}
+
 /* ---- The LP I2S and its VAD ---- */
 
 static void lp_w(QTestState *qts, uint32_t reg, uint32_t v)
@@ -1529,6 +1588,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4-i2s/hung", test_hung);
     qtest_add_func("/esp32p4-i2s/etm", test_etm);
     qtest_add_func("/esp32p4-i2s/mclk", test_mclk);
+    qtest_add_func("/esp32p4-i2s/mclk-exact", test_mclk_exact);
     qtest_add_func("/esp32p4-i2s/lp-mem", test_lp_mem);
     qtest_add_func("/esp32p4-i2s/vad-manual", test_vad_manual);
     qtest_add_func("/esp32p4-i2s/lp-from-hp", test_lp_from_hp);
