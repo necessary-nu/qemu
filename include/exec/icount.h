@@ -49,6 +49,13 @@ int64_t icount_get_raw(void);
 /* return the virtual CPU time in ns, based on the instruction counter. */
 int64_t icount_get(void);
 /*
+ * icount_get_precise: the virtual time icount_get() returns, and in @frac
+ * the fraction of a nanosecond beyond it, in units of 2^-32 ns, that the
+ * instructions of CPUs executing at a clock's rate have run up (see
+ * icount_set_cpu_clock()); 0 when no CPU has a clock.
+ */
+int64_t icount_get_precise(uint32_t *frac);
+/*
  * convert an instruction counter value to ns, based on the icount shift.
  * This shift is set as a fixed value with the icount "shift" option
  * (precise mode), or it is constantly approximated and corrected at
