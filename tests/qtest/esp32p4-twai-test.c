@@ -135,9 +135,13 @@ static void start(const char *extra)
 }
 
 /* A QEMU CAN bus with TWAI0 and TWAI1 on it. */
-static void start_bus(void)
+static void start_bus(const char *extra)
 {
-    start(",canbus0=can0,canbus1=can0 -object can-bus,id=can0");
+    g_autofree char *args =
+        g_strdup_printf("%s,canbus0=can0,canbus1=can0 "
+                        "-object can-bus,id=can0", extra);
+
+    start(args);
 }
 
 static void stop(void)
@@ -180,16 +184,24 @@ static void setup(int n, uint32_t btr0, uint32_t btr1, uint32_t mode)
     wr(n, MODE, mode);
 }
 
-/* TWAI0 and TWAI1 on one bus at 1 Mbit/s, past their integration. */
-static void two_nodes(void)
+/*
+ * TWAI0 and TWAI1 on one bus at 1 Mbit/s, past their integration, with
+ * @extra machine options.
+ */
+static void two_nodes_with(const char *extra)
 {
-    start_bus();
+    start_bus(extra);
     clocks_on();
     route(0, 20, 21);
     route(1, 22, 23);
     setup(0, BTR0_1M, BTR1_1M, 0);
     setup(1, BTR0_1M, BTR1_1M, 0);
     step(20 * BIT_NS);
+}
+
+static void two_nodes(void)
+{
+    two_nodes_with("");
 }
 
 /* Frames, in the transmit buffer's layout */
@@ -1168,7 +1180,11 @@ static void test_timestamp(void)
     uint8_t f[13];
     int64_t t_en, sof;
 
-    two_nodes();
+    /*
+     * Strapped for download boot: the flash boot watchdogs, which would
+     * reset the chip within seconds, do not run.
+     */
+    two_nodes_with(",strap-mode=0");
     wr(1, TS_PRESCALER, 39);
     t_en = now;
     wr(1, TS_CFG, 1);
