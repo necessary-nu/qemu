@@ -86,6 +86,8 @@
 #include "qemu/timer.h"
 #include "qapi/error.h"
 #include "migration/vmstate.h"
+#include "system/tcg.h"
+#include "hw/misc/esp32p4_pms.h"
 #include "target/riscv/esp32p4_cpu.h"
 #include "internals.h"
 #ifdef CONFIG_TCG
@@ -127,7 +129,8 @@ static bool esp32p4_cpu_has_work(CPUState *cs)
 {
     ESP32P4CPU *cpu = container_of(cs, ESP32P4CPU, parent_obj.parent_obj);
 
-    if (esp32p4_cpu_held(cpu) || qatomic_read(&cpu->lp_debug_mode)) {
+    if (esp32p4_cpu_held(cpu) || qatomic_read(&cpu->lp_debug_mode) ||
+        qatomic_read(&cpu->bus_wait)) {
         return false;
     }
     if (qatomic_read(&cpu->wakeup)) {
@@ -184,6 +187,93 @@ void esp32p4_cpu_set_mintthresh(ESP32P4CPU *cpu, uint8_t th)
 bool esp32p4_cpu_mid_block(void)
 {
     return icount_enabled() && current_cpu && !current_cpu->neg.can_do_io;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.machine]
+ * The core whose own load or store this is: the core running on this
+ * thread, whose identity the access carries (esp32p4_hp_tlb_fill()), not
+ * a block's access that the core's store has set off.
+ */
+ESP32P4CPU *esp32p4_cpu_bus_waiter(MemTxAttrs attrs)
+{
+#ifdef CONFIG_TCG
+    CPUState *cs = current_cpu;
+    ESP32P4CPU *cpu;
+    CPURISCVState *env;
+    uint16_t rid;
+
+    if (!tcg_enabled() || !cs || !qemu_cpu_is_self(cs) || !cs->mem_io_pc ||
+        attrs.unspecified ||
+        !object_dynamic_cast(OBJECT(cs), TYPE_ESP32P4_CPU)) {
+        return NULL;
+    }
+    cpu = ESP32P4_CPU(cs);
+    env = &cpu->parent_obj.env;
+    rid = ESP32P4_REQUESTER_CPU(esp32p4_env_is_hp(env)
+                                ? env->mhartid : ESP32P4_MASTER_LP_CORE);
+    if (attrs.requester_id == rid) {
+        return cpu;
+    }
+#endif
+    return NULL;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.machine]
+ * The access fails, and the core's transaction failure hook, outside the
+ * device and the memory system, stops the core there
+ * (esp32p4_cpu_bus_wait_check()).
+ */
+MemTxResult esp32p4_cpu_bus_hold(ESP32P4CPU *cpu)
+{
+    cpu->bus_hold = true;
+    return MEMTX_ERROR;
+}
+
+#ifdef CONFIG_TCG
+/*
+ * [spec:nuos:req:emu.esp32p4.machine]
+ * A failed access that a device holds: the core unwinds to the start of
+ * the instruction, which has not retired (esp32p4_restore_state_to_opc())
+ * and executes again when the core goes on, as QEMU's MIPS ITC storage
+ * blocks a core.
+ */
+static void esp32p4_cpu_bus_wait_check(CPUState *cs, uintptr_t retaddr)
+{
+    ESP32P4CPU *cpu = ESP32P4_CPU(cs);
+
+    if (!cpu->bus_hold) {
+        return;
+    }
+    cpu->bus_hold = false;
+    qatomic_set(&cpu->bus_wait, true);
+    cs->halted = 1;
+    cs->exception_index = EXCP_HLT;
+    cpu_loop_exit_restore(cs, retaddr);
+}
+#endif
+
+/* Run on the core: its access may go through now. */
+static void esp32p4_cpu_bus_go(CPUState *cs, run_on_cpu_data data)
+{
+    ESP32P4CPU *cpu = ESP32P4_CPU(cs);
+
+    if (!qatomic_read(&cpu->bus_wait)) {
+        return;
+    }
+    qatomic_set(&cpu->bus_wait, false);
+    if (!esp32p4_cpu_held(cpu) && !cpu->clock_halted) {
+        cs->halted = 0;
+    }
+}
+
+/* [spec:nuos:req:emu.esp32p4.machine] */
+void esp32p4_cpu_bus_release(ESP32P4CPU *cpu)
+{
+    if (qatomic_read(&cpu->bus_wait)) {
+        async_run_on_cpu(CPU(cpu), esp32p4_cpu_bus_go, RUN_ON_CPU_NULL);
+    }
 }
 
 /* Waiters for stops of cores on other threads: see esp32p4_cpu_await(). */
@@ -641,6 +731,7 @@ static void esp32p4_hp_do_transaction_failed(CPUState *cs, hwaddr physaddr,
     uint32_t pc;
     int bus = esp32p4_cpu_bus(addr, access_type == MMU_INST_FETCH);
 
+    esp32p4_cpu_bus_wait_check(cs, retaddr);
     if (qatomic_read(&cpu->err_resp_dis) & BIT(bus)) {
         return;
     }
@@ -794,6 +885,8 @@ static void esp32p4_cpu_reset_hold(Object *obj, ResetType type)
     }
     CPU(obj)->halted = esp32p4_cpu_held(cpu);
     cpu->clock_halted = !cpu->reset && esp32p4_cpu_clock_off(cpu);
+    qatomic_set(&cpu->bus_wait, false);
+    cpu->bus_hold = false;
 #ifdef CONFIG_TCG
     esp32p4_counters_reset(cpu);
     if (esp32p4_env_is_hp(&cpu->parent_obj.env)) {
@@ -864,7 +957,7 @@ static bool esp32p4_cpu_get_in_wfi(Object *obj, Error **errp)
     ESP32P4CPU *cpu = ESP32P4_CPU(obj);
 
     return CPU(cpu)->halted && !esp32p4_cpu_held(cpu) &&
-           !cpu->clock_halted && !cpu->lp_debug_mode;
+           !cpu->clock_halted && !cpu->lp_debug_mode && !cpu->bus_wait;
 }
 
 #ifdef CONFIG_TCG
@@ -1021,11 +1114,12 @@ static const VMStateDescription vmstate_esp32p4_counters = {
 /* The inputs from the system registers and the debug assistant's state. */
 static const VMStateDescription vmstate_esp32p4_debug = {
     .name = "esp32p4-cpu/debug",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(err_resp_dis, ESP32P4CPU),
         VMSTATE_BOOL(wakeup, ESP32P4CPU),
+        VMSTATE_BOOL(bus_wait, ESP32P4CPU),
         VMSTATE_UINT32(exc_pc, ESP32P4CPU),
         VMSTATE_UINT32(assist_watch, ESP32P4CPU),
         VMSTATE_UINT32_ARRAY(assist_lo, ESP32P4CPU, ESP32P4_ASSIST_REGIONS),
@@ -1152,7 +1246,7 @@ static void esp32p4_hp_cpu_exec_exit(CPUState *cs)
         esp32p4_tcg_ops.cpu_exec_exit(cs);
     }
     if (cs->halted && !cpu->ctr_wfi && !esp32p4_cpu_held(cpu) &&
-        !cpu->clock_halted) {
+        !cpu->clock_halted && !cpu->bus_wait) {
         BQL_LOCK_GUARD();
         esp32p4_counters_wfi(cpu, true);
     }
@@ -1241,6 +1335,7 @@ static void esp32p4_lp_do_transaction_failed(CPUState *cs, hwaddr physaddr,
     ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
     int bus = ESP32P4_CPU_BUS_AHB;
 
+    esp32p4_cpu_bus_wait_check(cs, retaddr);
     if (addr >= 0x50100000 && addr < 0x50110000) {
         bus = access_type == MMU_INST_FETCH ? ESP32P4_CPU_BUS_IBUS
                                             : ESP32P4_CPU_BUS_DBUS;
