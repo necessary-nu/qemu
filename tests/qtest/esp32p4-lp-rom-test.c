@@ -406,8 +406,9 @@ static void test_reset(void)
 }
 
 /*
- * Without the property the LP ROM is absent, as before: the LP core reads
- * 0 there and starts at the application's boot address.
+ * Without the property the LP ROM is absent: the LP core reads 0 there and
+ * starts at the application's boot address; HP core 0 and a DMA master
+ * still cannot reach it, and get a bus error.
  */
 /* [spec:nuos:req:emu.esp32p4.lp-rom/test] */
 static void test_absent(void)
@@ -422,8 +423,13 @@ static void test_absent(void)
     qobject_unref(r);
     g_assert(cpu_read(qts, LP_CPU_INDEX, LP_ROM_ENTRY, 'w', 1, v));
     g_assert_cmphex(v[0], ==, 0);
-    g_assert(cpu_read(qts, HP_CPU0_INDEX, LP_ROM_ENTRY, 'w', 1, v));
-    g_assert_cmphex(v[0], ==, 0);
+    g_assert(!cpu_read(qts, HP_CPU0_INDEX, LP_ROM_ENTRY, 'w', 1, v));
+    g_assert_cmpuint(probe(qts, REQUESTER_HP_CORE0, 'r', LP_ROM_ENTRY), ==,
+                     MEMTX_DECODE_ERROR);
+    g_assert_cmpuint(probe(qts, REQUESTER_GDMA_CH0, 'r', LP_ROM_ENTRY), ==,
+                     MEMTX_DECODE_ERROR);
+    g_assert_cmpuint(probe(qts, REQUESTER_GDMA_CH0, 'w', LP_ROM_ENTRY), ==,
+                     MEMTX_DECODE_ERROR);
     qtest_writel(qts, BOOT_ADDR_HP_LP, LP_SRAM + 0x80);
     lp_wake(qts);
     g_assert_cmphex(lp_dbg_pc(qts), ==, LP_SRAM + 0x80);

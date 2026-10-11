@@ -170,9 +170,9 @@ struct ESP32P4MachineState {
     MemoryRegion lp_rom;
     bool lp_rom_loaded;
     /*
-     * With an image, the LP ROM is on the LP core's own buses: the LP
-     * core's address space is the bus with the LP ROM over it, and the bus
-     * itself answers the LP ROM's addresses with an error.
+     * The LP ROM is on the LP core's own buses: the LP core's address
+     * space is the bus with the LP ROM over it, and the bus itself answers
+     * the LP ROM's addresses with an error.
      */
     MemoryRegion lp_mem;
     MemoryRegion lp_bus;

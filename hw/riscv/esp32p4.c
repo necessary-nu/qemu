@@ -333,15 +333,16 @@
  *   -drive if=mtd,format=raw,file=flash.img
  *
  * The LP ROM's contents are not published, and the machine ships no image
- * of it. By default the LP ROM is absent: every access to it is logged as
- * unavailable, and a start of the LP core at the LP ROM's entry continues
- * at the application's boot address software has set
- * (LP_SYSTEM_BOOT_ADDR_HP_LP, where the ROM would start it), as ESP-IDF's
- * skip_lp_rom_boot does. Given a raw image of the whole LP ROM, its 16 KiB
- * dumped from 0x50100000 on the user's own chip, the machine runs that
- * instead, as the chip does: the LP core starts at its entry and fetches
- * and reads it as any memory, and as on the chip no other master reaches
- * it. The image is ROM: no reset or sleep changes it.
+ * of it. As on the chip, only the LP core reaches the LP ROM: an access by
+ * an HP core or a DMA master answers with a bus error. By default the LP
+ * ROM is absent: the LP core reads 0 there, each access logged as
+ * unavailable, and its start at the LP ROM's entry continues at the
+ * application's boot address software has set (LP_SYSTEM_BOOT_ADDR_HP_LP,
+ * where the ROM would start it), as ESP-IDF's skip_lp_rom_boot does.
+ * Given a raw image of the whole LP ROM, its 16 KiB dumped from 0x50100000
+ * on the user's own chip, the machine runs that instead, as the chip does:
+ * the LP core starts at its entry and fetches and reads it as any memory.
+ * The image is ROM: no reset or sleep changes it.
  *
  *   -M esp32p4,lp-rom=lp-rom.bin
  *
@@ -470,9 +471,8 @@ static void esp32p4_map(DeviceState *dev, hwaddr base)
  * APM manages it (table 20.1-1).
  *
  * Espressif does not publish its contents, and the machine ships no image
- * of it. Without the user's image the LP ROM is absent: an access reads 0,
- * as an unimplemented device's does, and is logged, whichever master
- * makes it.
+ * of it. Without the user's image the LP ROM is absent: an access by the
+ * LP core reads 0, as an unimplemented device's does, and is logged.
  */
 /* [spec:nuos:req:emu.esp32p4.lp-rom] */
 static uint64_t esp32p4_lp_rom_read(void *opaque, hwaddr addr,
@@ -535,8 +535,8 @@ static const MemoryRegionOps esp32p4_lp_rom_image_ops = {
 
 /*
  * The LP ROM's addresses as the bus answers them for every master but the
- * LP core, with an image in place: they reach nothing, and the bus answers
- * with an error, which a core takes as an access fault.
+ * LP core, with an image or without: they reach nothing, and the bus
+ * answers with an error, which a core takes as an access fault.
  */
 /* [spec:nuos:req:emu.esp32p4.lp-rom] */
 static MemTxResult esp32p4_lp_rom_hole_read(void *opaque, hwaddr addr,
@@ -669,9 +669,9 @@ static void esp32p4_init_memory(ESP32P4MachineState *s)
     memory_region_add_subregion(sys_mem, ESP32P4_LP_SRAM_BASE, &s->lp_sram);
 
     /*
-     * The LP ROM: the user's image, for the LP core's address space alone
-     * (esp32p4_init_bus()), the bus answering its addresses with an error;
-     * or, without one, absent, for every master.
+     * The LP ROM, for the LP core's address space alone (esp32p4_init_bus()):
+     * the user's image, or, without one, absent. The bus answers its
+     * addresses with an error.
      */
     if (s->lp_rom_file && *s->lp_rom_file) {
         memory_region_init_rom_device(&s->lp_rom, owner,
@@ -679,17 +679,13 @@ static void esp32p4_init_memory(ESP32P4MachineState *s)
                                       "esp32p4.lp-rom", ESP32P4_LP_ROM_SIZE,
                                       &error_fatal);
         esp32p4_load_lp_rom(s);
-        memory_region_init_io(&s->lp_rom_hole, OBJECT(s),
-                              &esp32p4_lp_rom_hole_ops, s,
-                              "esp32p4.lp-rom-hole", ESP32P4_LP_ROM_SIZE);
-        memory_region_add_subregion(sys_mem, ESP32P4_LP_ROM_BASE,
-                                    &s->lp_rom_hole);
     } else {
         memory_region_init_io(&s->lp_rom, OBJECT(s), &esp32p4_lp_rom_ops, s,
                               "esp32p4.lp-rom", ESP32P4_LP_ROM_SIZE);
-        memory_region_add_subregion(sys_mem, ESP32P4_LP_ROM_BASE,
-                                    &s->lp_rom);
     }
+    memory_region_init_io(&s->lp_rom_hole, OBJECT(s), &esp32p4_lp_rom_hole_ops,
+                          s, "esp32p4.lp-rom-hole", ESP32P4_LP_ROM_SIZE);
+    memory_region_add_subregion(sys_mem, ESP32P4_LP_ROM_BASE, &s->lp_rom_hole);
 
     /* Behind the PSRAM windows, for the MMU to map. */
     memory_region_init_ram(&s->psram, owner, "esp32p4.psram",
@@ -768,8 +764,8 @@ static void esp32p4_init_flash(ESP32P4MachineState *s)
  * realized, before the blocks the APMs record refusals in exist. The HP
  * cores take it with the caches' views over it at 0x4xxxxxxx
  * (esp32p4_init_ext_memory()): their cached accesses are for their PMP
- * alone. The LP core takes it with the user's LP ROM image over it, on
- * its own buses, which no APM sees.
+ * alone. The LP core takes it with the LP ROM over it, on its own buses,
+ * which no APM sees.
  */
 /* [spec:nuos:req:emu.esp32p4.pms] */
 /* [spec:nuos:req:emu.esp32p4.memory] */
@@ -786,10 +782,8 @@ static void esp32p4_init_bus(ESP32P4MachineState *s)
     memory_region_init_alias(&s->lp_bus, OBJECT(s), "esp32p4.lp-bus",
                              esp32p4_pms_bus(&s->pms), 0, UINT64_MAX);
     memory_region_add_subregion_overlap(&s->lp_mem, 0, &s->lp_bus, 0);
-    if (s->lp_rom_loaded) {
-        memory_region_add_subregion_overlap(&s->lp_mem, ESP32P4_LP_ROM_BASE,
-                                            &s->lp_rom, 1);
-    }
+    memory_region_add_subregion_overlap(&s->lp_mem, ESP32P4_LP_ROM_BASE,
+                                        &s->lp_rom, 1);
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */
