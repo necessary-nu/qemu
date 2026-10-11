@@ -45,6 +45,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
  * ESP32P4_LP_SYS_HP_ROOT_CLK: HP_ROOT_CLK_CTRL's CPU_CLK_EN and
  *   SYS_CLK_EN, the gates of the HP system's 400 MHz CPU and 480 MHz
  *   system root clocks, for the reset and clock control.
+ * ESP32P4_LP_SYS_USB_PHY_SEL: USB_CTRL's SW_HW_USB_PHY_SEL and
+ *   SW_USB_PHY_SEL, to USB_WRAP's "phy-sel" inputs.
  *
  * Named GPIO inputs
  * =================
@@ -67,6 +69,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
 #define ESP32P4_LP_SYS_SWD_RESET_EN     "swd-reset-en"
 #define ESP32P4_LP_SYS_BOD_RESET_EN     "bod-reset-en"
 #define ESP32P4_LP_SYS_HP_ROOT_CLK      "hp-root-clk"
+#define ESP32P4_LP_SYS_USB_PHY_SEL      "usb-phy-sel"
 #define ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP "lp-core-etm-wakeup"
 #define ESP32P4_LP_SYS_ETM_TASK_ULP_INT "etm-task-ulp-int"
 #define ESP32P4_LP_SYS_SLOW_CLK_TICK    "slow-clk-tick"
@@ -90,6 +93,7 @@ struct ESP32P4LPSysState {
     qemu_irq swd_reset_en;
     qemu_irq bod_reset_en;
     qemu_irq hp_root_clk[2];
+    qemu_irq usb_phy_sel[2];
 };
 
 /*
@@ -113,7 +117,7 @@ uint32_t esp32p4_lp_sys_lp_core_boot_addr(ESP32P4LPSysState *s);
 /*
  * A register as software reads it, for the blocks whose configuration
  * lives here (the PAU's BACKUP_DMA_CFG*, the memories' aux controls, the
- * USB PHY selection, the analog comparators, ...).
+ * analog comparators, ...).
  */
 uint32_t esp32p4_lp_sys_reg(ESP32P4LPSysState *s, hwaddr offset);
 

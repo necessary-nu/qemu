@@ -83,13 +83,21 @@
  * - EXT_WAKEUP1_STATUS records the RTC pads of the PMU's ext1 wakeup
  *   (esp32p4_lp_sys_ext_wakeup1()) until EXT_WAKEUP1_STATUS_CLR.
  *
+ * - USB_CTRL (0x100): SW_HW_USB_PHY_SEL and SW_USB_PHY_SEL, which choose
+ *   the full-speed PHYs of USB Serial/JTAG and the full-speed OTG, to
+ *   USB_WRAP ("usb-phy-sel" outputs); the high-speed OTG's suspend and
+ *   mode flags for the PMU hold what software writes, and
+ *   USBOTG20_WAKEUP_CLR reads as zero. HP_USB_OTGHS_PHY_CTRL (0x204), the
+ *   high-speed OTG PHY's ID pull-up, D+/D- pull-downs and VBUS charge and
+ *   discharge, holds what software writes: the model does not take the
+ *   bus's electrical state from it.
+ *
  * Kept as written for the blocks that would act on them, none of which is
  * modelled, and given to them by esp32p4_lp_sys_reg(): the reset bypasses
  * (LP_RST_CTRL, HP_POR_RST_BYPASS_CTRL), the boot mode override
  * FORCE_DOWNLOAD_BOOT, the IO MUX reset disable, the PAU's
  * BACKUP_DMA_CFG0 to 2, the memories' and ROMs' aux and power controls,
- * the USB PHY selection and OTG controls, the analog comparators
- * (PAD_COMP0/1), the pad groups' power, the discharge controls, the bus
+ * the analog comparators (PAD_COMP0/1), the pad groups' power, the discharge controls, the bus
  * timeouts' thresholds, the ECO registers and BOOT_ADDR_HP_LP. The debug
  * probe's signals are not modelled: LP_PROBE_OUT reads 0.
  */
@@ -356,6 +364,8 @@ static void esp32p4_lp_sys_update_outputs(ESP32P4LPSysState *s)
     for (i = 0; i < 2; i++) {
         qemu_set_irq(s->hp_root_clk[i],
                      extract32(s->regs[R(A_HP_ROOT_CLK_CTRL)], i, 1));
+        qemu_set_irq(s->usb_phy_sel[i],
+                     extract32(s->regs[R(A_USB_CTRL)], i, 1));
     }
 }
 
@@ -476,6 +486,7 @@ static void esp32p4_lp_sys_write(void *opaque, hwaddr addr, uint64_t value,
     case A_PAD_RTC_HOLD_CTRL0:
     case A_PAD_RTC_HOLD_CTRL1:
     case A_HP_ROOT_CLK_CTRL:
+    case A_USB_CTRL:
         esp32p4_lp_sys_update_outputs(s);
         break;
     default:
@@ -555,6 +566,8 @@ static void esp32p4_lp_sys_init(Object *obj)
     qdev_init_gpio_out_named(dev, &s->bod_reset_en,
                              ESP32P4_LP_SYS_BOD_RESET_EN, 1);
     qdev_init_gpio_out_named(dev, s->hp_root_clk, ESP32P4_LP_SYS_HP_ROOT_CLK,
+                             2);
+    qdev_init_gpio_out_named(dev, s->usb_phy_sel, ESP32P4_LP_SYS_USB_PHY_SEL,
                              2);
     qdev_init_gpio_in_named(dev, esp32p4_lp_sys_set_etm_wakeup,
                             ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP, 1);

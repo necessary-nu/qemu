@@ -91,6 +91,10 @@ enum {
  * ESP32P4_HP_SYS_GMAC_PHY_INTF: three lines, SYS_GMAC_CTRL0's
  *   PHY_INTF_SEL bits, and ESP32P4_HP_SYS_GMAC_SBD_FLOWCTRL, its
  *   SBD_FLOWCTRL, to the EMAC.
+ * ESP32P4_HP_SYS_USBOTG20_CTRL: SYS_USBOTG20_CTRL's PHY_SUSPENDM,
+ *   PHY_SUSPEND_FORCE_EN, PHY_RSTN, PHY_RESET_FORCE_EN, PHY_PLL_FORCE_EN,
+ *   PHY_PLL_EN and OTG_SUSPENDM (bits 15 to 21), to the USB OTG HS UTMI+
+ *   PHY's "sys-ctrl" inputs.
  *
  * Named GPIO inputs
  * =================
@@ -105,10 +109,8 @@ enum {
  * ESP32P4_HP_SYS_GMAC_STATUS: the EMAC's outputs that SYS_GMAC_CTRL0
  *   shows, by line ESP32P4_HP_SYS_GMAC_*: its PPS output and its resets
  *   in its transmit and receive clock domains.
- * ESP32P4_HP_SYS_OTG_PHY_STATUS: the USB OTG HS PHY's
- *   USB_SOFT_RESET_ACTV_PDOMAIN, UTMISRP_SESSEND, UTMIOTG_VBUSVALID,
- *   UTMISRP_BVALID and UTMISRP_SESSVALID, for USB_OTGHS_PHY_ST; and line 5,
- *   OTG_PHY_TEST_DONE, for SYS_USBOTG20_CTRL.
+ * ESP32P4_HP_SYS_USB_OTGHS_PHY_ST: the USB OTG HS PHY's session end,
+ *   VBUS valid, B-valid and session valid, USB_OTGHS_PHY_ST's bits 1 to 4.
  *
  * Sysbus IRQ 0 is HP_SYSREG_INTR, source 110 of the interrupt matrix.
  */
@@ -128,6 +130,8 @@ enum {
 #define ESP32P4_HP_SYS_GMAC_PHY_INTF    "gmac-phy-intf-sel"
 #define ESP32P4_HP_SYS_GMAC_PHY_INTF_LINES 3
 #define ESP32P4_HP_SYS_GMAC_SBD_FLOWCTRL "gmac-sbd-flowctrl"
+#define ESP32P4_HP_SYS_USBOTG20_CTRL    "usbotg20-ctrl"
+#define ESP32P4_HP_SYS_USBOTG20_CTRL_LINES 7
 #define ESP32P4_HP_SYS_HP_SOURCE        "hp-source"
 #define ESP32P4_HP_SYS_CORE_STALLED     "core-stalled"
 #define ESP32P4_HP_SYS_DMACTIVE_LPCORE  "dmactive-lpcore"
@@ -138,8 +142,8 @@ enum {
     ESP32P4_HP_SYS_GMAC_RST_CLK_RX_N,
     ESP32P4_HP_SYS_GMAC_STATUS_LINES,
 };
-#define ESP32P4_HP_SYS_OTG_PHY_STATUS   "otg-phy-status"
-#define ESP32P4_HP_SYS_OTG_PHY_STATUS_LINES 6
+#define ESP32P4_HP_SYS_USB_OTGHS_PHY_ST "usb-otghs-phy-st"
+#define ESP32P4_HP_SYS_USB_OTGHS_PHY_ST_LINES 4
 
 struct ESP32P4HPSysState {
     SysBusDevice parent_obj;
@@ -153,7 +157,7 @@ struct ESP32P4HPSysState {
     uint32_t core_stalled;
     bool dmactive_lpcore;
     uint32_t gmac_status;
-    uint32_t otg_phy_status;
+    uint32_t usb_otghs_phy_st;
     /* The EMAC's system time, which SYS_GMAC_CTRL1 and _CTRL2 read. */
     uint64_t (*gmac_ptp_time)(void *opaque);
     void *gmac_ptp_opaque;
@@ -171,6 +175,7 @@ struct ESP32P4HPSysState {
     qemu_irq addr_interchange[2];
     qemu_irq gmac_phy_intf[ESP32P4_HP_SYS_GMAC_PHY_INTF_LINES];
     qemu_irq gmac_sbd_flowctrl;
+    qemu_irq usbotg20_ctrl_out[ESP32P4_HP_SYS_USBOTG20_CTRL_LINES];
     /* HP_SYSREG_INTR, sysbus IRQ 0. */
     qemu_irq sysreg_irq;
 };

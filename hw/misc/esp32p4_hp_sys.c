@@ -78,10 +78,18 @@
  *     the EMAC drives them ("gmac-status" inputs); and its system time,
  *     read from the EMAC (esp32p4_hp_sys_set_gmac_ptp()).
  *     GMAC_MEM_CLK_FORCE_ON is held: the EMAC's FIFO memories always run.
- *   - CPU_CORESTALLED_ST, CORE_DMACTIVE_LPCORE and the USB OTG PHY's
- *     status bits of SYS_USBOTG20_CTRL and USB_OTGHS_PHY_ST show the
- *     inputs from the blocks that drive them (see the header), which read
- *     low until connected.
+ *   - USB20OTG_MEM_CTRL (0xF8), SYS_USBOTG20_CTRL (0x15C) and
+ *     USB_OTGHS_PHY_ST (0x1E8): the high-speed OTG's UTMI+ PHY.
+ *     SYS_USBOTG20_CTRL's suspend, reset and PLL forces go to the PHY
+ *     ("usbotg20-ctrl" outputs), which stops its clock as they say; its
+ *     other fields (the FIFO RAM's power controls, the transmit bit
+ *     stuffing and reference clock mode) hold what software writes, and
+ *     the PHY's BIST (OTG_PHY_BISTEN) is logged as unimplemented, its
+ *     TEST_DONE reading 0. USB_OTGHS_PHY_ST reads the PHY's VBUS
+ *     comparators ("usb-otghs-phy-st" inputs).
+ *   - CPU_CORESTALLED_ST and CORE_DMACTIVE_LPCORE show the inputs from
+ *     the blocks that drive them (see the header), which read low until
+ *     connected.
  *   - SYS_DMA_ADDR_CTRL (0x2C) and PSRAM_FLASH_ADDR_INTERCHANGE (0x180)
  *     go out for the DMA engines and the external memory model
  *     ("dma-addr-sel", "psram-flash-interchange").
@@ -104,7 +112,7 @@
  * registers; CPU_WAITI_CONF; the debug run-stall between the HP and LP
  * cores, which have no debugger; BITSCRAMBLER_PERI_SEL and SYS_GDMA_CTRL,
  * for blocks not modelled (esp32p4_hp_sys_reg() gives them to a block
- * that needs them); and the EMAC and USB PHY controls. The debug probe
+ * that needs them). The debug probe
  * (PROBEA_CTRL, PROBEB_CTRL) selects internal signals that are not
  * modelled: PROBE_OUT reads 0, logged as unimplemented once the probe is
  * enabled.
@@ -237,7 +245,8 @@
 #define GMAC_CTRL0_PHY_INTF_SHIFT 2
 #define GMAC_CTRL0_PHY_INTF     (7u << GMAC_CTRL0_PHY_INTF_SHIFT)
 #define GMAC_CTRL0_STATUS       (BIT(0) | BIT(6) | BIT(7))
-#define USBOTG20_TEST_DONE      BIT(0)
+#define USBOTG20_CTRL_PHY_SHIFT 15
+#define USBOTG20_CTRL_BISTEN    BIT(24)
 #define GROUP3_MASK             0x3fff
 
 /* A register: its reset value and the bits software writes. */
@@ -496,6 +505,16 @@ static void esp32p4_hp_sys_update_gmac(ESP32P4HPSysState *s)
     qemu_set_irq(s->gmac_sbd_flowctrl, !!(ctrl0 & GMAC_CTRL0_SBD_FLOWCTRL));
 }
 
+/* [spec:nuos:req:emu.esp32p4.usb] */
+static void esp32p4_hp_sys_update_usb(ESP32P4HPSysState *s)
+{
+    for (int i = 0; i < ESP32P4_HP_SYS_USBOTG20_CTRL_LINES; i++) {
+        qemu_set_irq(s->usbotg20_ctrl_out[i],
+                     extract32(s->regs[R(A_SYS_USBOTG20_CTRL)],
+                               USBOTG20_CTRL_PHY_SHIFT + i, 1));
+    }
+}
+
 static void esp32p4_hp_sys_update_misc(ESP32P4HPSysState *s)
 {
     qemu_set_irq(s->l2mem_err_resp, s->regs[R(A_L2_MEM_ERR_RESP_CTRL)]);
@@ -554,11 +573,8 @@ uint32_t esp32p4_hp_sys_reg(ESP32P4HPSysState *s, hwaddr offset)
         return esp32p4_hp_sys_gmac_time(s);
     case A_SYS_GMAC_CTRL2:
         return esp32p4_hp_sys_gmac_time(s) >> 32;
-    case A_SYS_USBOTG20_CTRL:
-        return r[R(offset)] |
-               (extract32(s->otg_phy_status, 5, 1) ? USBOTG20_TEST_DONE : 0);
     case A_USB_OTGHS_PHY_ST:
-        return s->otg_phy_status & 0x1f;
+        return s->usb_otghs_phy_st << 1;
     case A_HP2LP_INTR_GROUP_ST(0) ... A_HP2LP_INTR_GROUP_ST(3):
         n = (offset - A_HP2LP_INTR_GROUP_ST(0)) / 4;
         return s->hp_source[n] & r[R(A_HP2LP_INTR_GROUP_EN(n))];
@@ -688,6 +704,14 @@ static void esp32p4_hp_sys_write(void *opaque, hwaddr addr, uint64_t value,
     case A_PSRAM_FLASH_ADDR_INTERCHANGE:
         esp32p4_hp_sys_update_misc(s);
         break;
+    case A_SYS_USBOTG20_CTRL:
+        if (*r & USBOTG20_CTRL_BISTEN) {
+            qemu_log_mask(LOG_UNIMP, "%s: the USB 2.0 OTG PHY's BIST "
+                          "(SYS_OTG_PHY_BISTEN) is not modelled\n",
+                          TYPE_ESP32P4_HP_SYS);
+        }
+        esp32p4_hp_sys_update_usb(s);
+        break;
     case A_SYS_GMAC_CTRL0: {
         unsigned intf = (*r & GMAC_CTRL0_PHY_INTF) >>
                         GMAC_CTRL0_PHY_INTF_SHIFT;
@@ -756,7 +780,7 @@ static void esp32p4_hp_sys_set_otg_phy(void *opaque, int n, int level)
 {
     ESP32P4HPSysState *s = opaque;
 
-    s->otg_phy_status = deposit32(s->otg_phy_status, n, 1, level != 0);
+    s->usb_otghs_phy_st = deposit32(s->usb_otghs_phy_st, n, 1, level != 0);
 }
 
 static void esp32p4_hp_sys_reset_hold(Object *obj, ResetType type)
@@ -783,6 +807,7 @@ static void esp32p4_hp_sys_reset_exit(Object *obj, ResetType type)
     esp32p4_hp_sys_update_hp2lp(s);
     esp32p4_hp_sys_update_misc(s);
     esp32p4_hp_sys_update_gmac(s);
+    esp32p4_hp_sys_update_usb(s);
     esp32p4_hp_sys_update_irq(s);
 }
 
@@ -822,6 +847,9 @@ static void esp32p4_hp_sys_init(Object *obj)
                              ESP32P4_HP_SYS_GMAC_PHY_INTF_LINES);
     qdev_init_gpio_out_named(dev, &s->gmac_sbd_flowctrl,
                              ESP32P4_HP_SYS_GMAC_SBD_FLOWCTRL, 1);
+    qdev_init_gpio_out_named(dev, s->usbotg20_ctrl_out,
+                             ESP32P4_HP_SYS_USBOTG20_CTRL,
+                             ESP32P4_HP_SYS_USBOTG20_CTRL_LINES);
     qdev_init_gpio_in_named(dev, esp32p4_hp_sys_set_source,
                             ESP32P4_HP_SYS_HP_SOURCE,
                             ESP32P4_HP_SYS_HP2LP_SOURCES);
@@ -833,8 +861,8 @@ static void esp32p4_hp_sys_init(Object *obj)
                             ESP32P4_HP_SYS_GMAC_STATUS,
                             ESP32P4_HP_SYS_GMAC_STATUS_LINES);
     qdev_init_gpio_in_named(dev, esp32p4_hp_sys_set_otg_phy,
-                            ESP32P4_HP_SYS_OTG_PHY_STATUS,
-                            ESP32P4_HP_SYS_OTG_PHY_STATUS_LINES);
+                            ESP32P4_HP_SYS_USB_OTGHS_PHY_ST,
+                            ESP32P4_HP_SYS_USB_OTGHS_PHY_ST_LINES);
 }
 
 static const VMStateDescription vmstate_esp32p4_hp_sys = {
@@ -847,7 +875,7 @@ static const VMStateDescription vmstate_esp32p4_hp_sys = {
         VMSTATE_UINT32(core_stalled, ESP32P4HPSysState),
         VMSTATE_BOOL(dmactive_lpcore, ESP32P4HPSysState),
         VMSTATE_UINT32(gmac_status, ESP32P4HPSysState),
-        VMSTATE_UINT32(otg_phy_status, ESP32P4HPSysState),
+        VMSTATE_UINT32(usb_otghs_phy_st, ESP32P4HPSysState),
         VMSTATE_END_OF_LIST()
     },
 };
