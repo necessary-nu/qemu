@@ -21,8 +21,10 @@
  *
  *   - the boot mode is SPI boot: GPIO_STRAP's GPIO35 bit set (the strapping
  *     latched at reset, LP_SYSTEM_FORCE_DOWNLOAD_BOOT able to override it);
- *     the ROM otherwise enters download mode (or, for the strapping the TRM
- *     calls invalid, stops);
+ *     the ROM otherwise enters a download mode: joint download, SPI
+ *     download, or for 0x2 and 0x0, which the TRM calls invalid, UART0
+ *     and USB download alone (its UART0_BOOT and USB_BOOT), stopping for
+ *     0x3;
  *   - core 0's reset cause is one main() accepts (mask 0x0DDDBAAA: the
  *     causes its table names but cause 6); for any other the ROM prints
  *     "invalid reset" and resets the system;

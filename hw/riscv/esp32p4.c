@@ -153,6 +153,13 @@
  *
  *       -serial stdio -serial null -serial file:uart2.log
  *
+ *     Port 0 thus holds the strapping pin GPIO38 high through a reset,
+ *     unless its terminal holds a break there (its "break" property), as
+ *     a host straps the pin low before letting the line go idle:
+ *
+ *       -global driver=esp32.uart-terminal,property=break,value=on
+ *       (QMP) qom-set /machine/terminal[0] break false
+ *
  *     UHCI0 (0x500DF000), behind UHCI_APB_CLK and its reset, its
  *     interrupt source 30, moves the data of the UART CONF0.UART_SEL
  *     names through GDMA-AHB as peripheral UHCI0.
