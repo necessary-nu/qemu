@@ -1200,10 +1200,18 @@ static void gpio_access_read(void *opaque)
     a->value = a->read(a->s, a->addr);
 }
 
+/*
+ * A write first brings the line sources up to its moment, as a sample
+ * does: a source whose edges due before the write are not yet driven (its
+ * timer running late) would otherwise drive them on reacting to the
+ * write's change, from inside the resolution of that change, which would
+ * propagate them at the write's time rather than their own.
+ */
 static void gpio_access_write(void *opaque)
 {
     GpioAccess *a = opaque;
 
+    esp32_line_sync();
     a->write(a->s, a->addr, a->value);
 }
 
@@ -1214,7 +1222,8 @@ static void gpio_access_write(void *opaque)
  * IO_MUX), the samples of the line sources it takes and the modulators'
  * bitstreams all carry that time (see esp32_line.h), so that every block
  * an edge reaches sees it at the same moment however its handlers are
- * ordered, and without icount however long they take.
+ * ordered, and without icount however long they take. A write first
+ * brings the line sources up to that moment (gpio_access_write()).
  */
 static uint64_t gpio_read_at_start(Esp32GpioState *s, hwaddr addr,
                                    uint64_t (*read)(Esp32GpioState *,
