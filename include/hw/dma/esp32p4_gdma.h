@@ -93,7 +93,9 @@ enum {
  *     starts.
  *
  *   - esp32p4_gdma_tx_pending() and esp32p4_gdma_rx_room() give the
- *     bytes a pull would get and a push could give at the moment.
+ *     bytes a pull would get and a push could give at the moment, and
+ *     esp32p4_gdma_tx_flowing() and esp32p4_gdma_rx_flowing() whether
+ *     more will come without software's help.
  *
  * The channel reads and writes memory as the bus arbitration lets it, at
  * the controller's bus clock, through the access permission managers as
@@ -117,6 +119,68 @@ size_t esp32p4_gdma_push(ESP32P4GdmaState *s, unsigned periph,
                          const uint8_t *buf, size_t len, unsigned flags);
 size_t esp32p4_gdma_tx_pending(ESP32P4GdmaState *s, unsigned periph);
 size_t esp32p4_gdma_rx_room(ESP32P4GdmaState *s, unsigned periph);
+
+/*
+ * Whether the channel serving @periph will go on moving data by itself: a
+ * TX channel with bytes in its FIFO, or running (and clocked) with
+ * descriptors still to read; an RX channel taking bytes, with room in its
+ * FIFO or running with descriptors still to fill. A peripheral whose own
+ * FIFO meets an empty or full DMA FIFO waits for the DMA while this holds,
+ * and under- or overflows when it does not.
+ */
+bool esp32p4_gdma_tx_flowing(ESP32P4GdmaState *s, unsigned periph);
+bool esp32p4_gdma_rx_flowing(ESP32P4GdmaState *s, unsigned periph);
+
+/*
+ * A block in a peripheral's DMA stream: the BitScrambler
+ * ======================================================
+ *
+ * The BitScrambler (include/hw/dma/esp32p4_bitscrambler.h) sits between
+ * a peripheral and the channels that serve it, on the paths
+ * HP_SYSTEM_BITSCRAMBLER_PERI_SEL attaches it to (TRM 62.4.2), and
+ * rewrites the bytes that pass. It interposes on one path of one
+ * peripheral with esp32p4_gdma_interpose(s, dir, periph, ops, opaque),
+ * @dir ESP32P4_GDMA_OUT for the TX path or ESP32P4_GDMA_IN for the RX
+ * path; NULL ops restore the direct path. While it does:
+ *
+ *   - the peripheral's own calls on that path reach the interposer's ops
+ *     in place of the channel: esp32p4_gdma_pull() and _tx_pending() call
+ *     ops->pull and ops->tx_pending, esp32p4_gdma_push() and _rx_room()
+ *     call ops->push and ops->rx_room, with the same meaning;
+ *   - the channel's readiness that would have reached the peripheral
+ *     (bytes arriving in an empty TX FIFO; room in a full RX FIFO, or an
+ *     RX channel starting) calls ops->chan_ready(opaque, dir) instead;
+ *   - the interposer reaches the channel with esp32p4_gdma_chan_pull(),
+ *     _chan_push(), _chan_tx_pending() and _chan_rx_room(), which act on
+ *     the channel exactly as the peripheral's calls do on a direct path,
+ *     and tells the peripheral of bytes it has for it, or room it has
+ *     made, with esp32p4_gdma_periph_ready(), which calls the
+ *     peripheral's tx_ready or rx_ready.
+ *
+ * The interposition is wiring, not controller state: a reset of the
+ * controller keeps it.
+ */
+typedef struct ESP32P4GdmaInterposerOps {
+    size_t (*pull)(void *opaque, uint8_t *buf, size_t len, bool *eof);
+    size_t (*tx_pending)(void *opaque);
+    size_t (*push)(void *opaque, const uint8_t *buf, size_t len,
+                   unsigned flags);
+    size_t (*rx_room)(void *opaque);
+    void (*chan_ready)(void *opaque, int dir);
+} ESP32P4GdmaInterposerOps;
+
+void esp32p4_gdma_interpose(ESP32P4GdmaState *s, int dir, unsigned periph,
+                            const ESP32P4GdmaInterposerOps *ops,
+                            void *opaque);
+size_t esp32p4_gdma_chan_pull(ESP32P4GdmaState *s, unsigned periph,
+                              uint8_t *buf, size_t len, bool *eof);
+size_t esp32p4_gdma_chan_push(ESP32P4GdmaState *s, unsigned periph,
+                              const uint8_t *buf, size_t len,
+                              unsigned flags);
+size_t esp32p4_gdma_chan_tx_pending(ESP32P4GdmaState *s, unsigned periph);
+size_t esp32p4_gdma_chan_rx_room(ESP32P4GdmaState *s, unsigned periph);
+void esp32p4_gdma_periph_ready(ESP32P4GdmaState *s, unsigned periph,
+                               int dir);
 
 /*
  * Named GPIOs.
@@ -220,6 +284,8 @@ struct ESP32P4GdmaState {
     qemu_irq etm_event[ESP32P4_GDMA_ETM_EVENTS];
     Clock *clk;
     QEMUTimer *timer;
+    /* When the round @timer runs falls due. */
+    int64_t due_ns;
     /* The bus as the channels reach it, through the APMs. */
     MemoryRegion *bus;
     AddressSpace *as;
@@ -259,6 +325,9 @@ struct ESP32P4GdmaState {
 
     const ESP32P4GdmaPeriphOps *periph_ops[ESP32P4_GDMA_PERIPHS];
     void *periph_opaque[ESP32P4_GDMA_PERIPHS];
+    /* The interposers on each path, by direction and peripheral. */
+    const ESP32P4GdmaInterposerOps *ip_ops[2][ESP32P4_GDMA_PERIPHS];
+    void *ip_opaque[2][ESP32P4_GDMA_PERIPHS];
 
     /* The qtest hook's last result. */
     char *periph_probe;

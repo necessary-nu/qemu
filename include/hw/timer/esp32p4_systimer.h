@@ -59,6 +59,8 @@ typedef struct ESP32P4SysTimerComp {
     uint64_t real;
     /* Comparing for an alarm: target mode alarms once. */
     bool armed;
+    /* When the alarm @timer runs falls due. */
+    int64_t due_ns;
     QEMUTimer timer;
 } ESP32P4SysTimerComp;
 

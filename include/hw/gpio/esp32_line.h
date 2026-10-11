@@ -26,6 +26,12 @@
  * UART receiver times its bits by these stamps, not by when its handlers
  * happen to run.
  *
+ * A model that catches up on its own changes, running late what fell due
+ * earlier (a timer whose QEMU timer runs late, a filter whose output
+ * changed in the past), runs each with esp32_line_run_at(), so that every
+ * line it changes and everything those reach sees the change's time, as
+ * if each line were set with esp32_line_set_at().
+ *
  * A source whose output follows a function of time faster than it is
  * worth timing edge by edge (a PWM output, a clock) registers with
  * esp32_line_add_source(); esp32_line_sync() asks every such source to
@@ -38,6 +44,8 @@
  */
 int64_t esp32_line_time(void);
 void esp32_line_set_at(qemu_irq line, int level, int64_t when_ns);
+void esp32_line_run_at(int64_t when_ns, void (*fn)(void *opaque),
+                       void *opaque);
 void esp32_line_add_source(Notifier *n);
 void esp32_line_sync(void);
 

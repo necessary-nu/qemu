@@ -1,5 +1,5 @@
 /*
- * A board-level serial terminal on an ESP32 UART's pads
+ * A board-level serial terminal on an Espressif UART's pads
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -25,7 +25,7 @@
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/irq.h"
 #include "hw/char/esp32_uart_terminal.h"
-#include "hw/gpio/esp32_gpio.h"
+#include "hw/gpio/esp32_line.h"
 #include "migration/vmstate.h"
 
 static gboolean term_out_ready(void *do_not_use, GIOCondition cond,
@@ -66,6 +66,7 @@ static gboolean term_out_ready(void *do_not_use, GIOCondition cond,
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] A frame received from the chip's TXD. */
+/* [spec:nuos:req:emu.esp32p4.uart] */
 static void term_rx_deliver(void *opaque, unsigned data, unsigned flags)
 {
     Esp32UartTerminalState *s = ESP32_UART_TERMINAL(opaque);
@@ -85,7 +86,7 @@ static bool term_format(void *opaque, Esp32UartFrameFmt *fmt)
 {
     Esp32UartTerminalState *s = ESP32_UART_TERMINAL(opaque);
 
-    return esp32_uart_line_format(s->uart, fmt);
+    return esp32_uart_line_get_format(s->uart, fmt);
 }
 
 static void term_rx_in(void *opaque, int n, int level)
@@ -130,7 +131,8 @@ static bool term_tx_start(Esp32UartTerminalState *s, int64_t start_ns)
     Esp32UartFrameFmt fmt;
     bool was_full = fifo8_is_full(&s->in);
 
-    if (fifo8_is_empty(&s->in) || !esp32_uart_line_format(s->uart, &fmt)) {
+    if (fifo8_is_empty(&s->in) ||
+        !esp32_uart_line_get_format(s->uart, &fmt)) {
         return false;
     }
     s->tx_nbits = esp32_uart_frame_levels(&fmt, fifo8_pop(&s->in),
@@ -195,6 +197,7 @@ static int term_can_receive(void *opaque)
 
 /*
  * [spec:nuos:req:emu.esp32.gpio]
+ * [spec:nuos:req:emu.esp32p4.uart]
  * Bytes from the chardev wait in the terminal's FIFO and go out as frames,
  * back to back, at the UART's baud rate.
  */
@@ -239,7 +242,7 @@ static void esp32_uart_terminal_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "esp32.uart-terminal: 'uart' link not set");
         return;
     }
-    esp32_uart_add_format_notifier(s->uart, &s->format_notifier);
+    esp32_uart_line_add_format_notifier(s->uart, &s->format_notifier);
     esp32_line_add_source(&s->line_source);
     qemu_chr_fe_set_handlers(&s->chr, term_can_receive, term_receive,
                              term_event, NULL, s, NULL, true);
@@ -259,8 +262,8 @@ static void esp32_uart_terminal_init(Object *obj)
     timer_init_ns(&s->tx_timer, QEMU_CLOCK_VIRTUAL, term_tx_timer_cb, s);
     qdev_init_gpio_in_named(dev, term_rx_in, ESP32_UART_TERMINAL_RX, 1);
     qdev_init_gpio_out_named(dev, &s->tx_out, ESP32_UART_TERMINAL_TX, 1);
-    object_property_add_link(obj, "uart", TYPE_ESP32_UART,
-                             (Object **)&s->uart,
+    object_property_add_link(obj, "uart", TYPE_ESP32_UART_LINE_IF,
+                             &s->uart,
                              qdev_prop_allow_set_link_before_realize,
                              OBJ_PROP_LINK_STRONG);
     s->format_notifier.notify = term_format_changed;
@@ -304,6 +307,7 @@ static void esp32_uart_terminal_class_init(ObjectClass *klass,
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] */
+/* [spec:nuos:req:emu.esp32p4.uart] */
 static const TypeInfo esp32_uart_terminal_info = {
     .name = TYPE_ESP32_UART_TERMINAL,
     .parent = TYPE_DEVICE,
