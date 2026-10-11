@@ -47,6 +47,14 @@ static TCGv load_res;
 static TCGv load_res_size;
 #endif
 static TCGv load_val;
+#ifndef CONFIG_USER_ONLY
+/*
+ * The instructions an ESP32-P4 core has retired (ESP32P4CPU's insns): a
+ * global, so that consecutive instructions add to it in a host register.
+ * Only ESP32-P4 cores' code uses it.
+ */
+static TCGv_i64 esp32p4_insns;
+#endif
 
 /*
  * If an operation is being performed on less than TARGET_LONG_BITS,
@@ -140,6 +148,8 @@ typedef struct DisasContext {
     bool spmon;
     /* ESP32-P4 HP core: the trace encoder traces the core. */
     bool trace;
+    /* An ESP32-P4 core: it counts the instructions it retires. */
+    bool esp32p4_insns;
 } DisasContext;
 
 static inline bool has_ext(DisasContext *ctx, uint32_t ext)
@@ -271,9 +281,19 @@ static void gen_update_pc(DisasContext *ctx, target_long diff)
     ctx->pc_save = ctx->base.pc_next + diff;
 }
 
+#ifndef CONFIG_USER_ONLY
+static void gen_esp32p4_count_insn(DisasContext *ctx, int n);
+#endif
+
 static void generate_exception(DisasContext *ctx, RISCVException excp)
 {
     gen_update_pc(ctx, 0);
+#ifndef CONFIG_USER_ONLY
+    if (ctx->esp32p4_insns) {
+        /* The instruction raising the exception does not retire. */
+        gen_esp32p4_count_insn(ctx, -1);
+    }
+#endif
     gen_helper_raise_exception(tcg_env, tcg_constant_i32(excp));
     ctx->base.is_jmp = DISAS_NORETURN;
 }
@@ -1447,6 +1467,9 @@ static void riscv_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
                                 ESP32P4_PIE_DIRTY);
     ctx->spmon = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, ESP32P4_SPMON);
     ctx->trace = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, ESP32P4_TRACE);
+#ifndef CONFIG_USER_ONLY
+    ctx->esp32p4_insns = esp32p4_env_is_hp(env) || esp32p4_env_is_lp(env);
+#endif
 }
 
 static void riscv_tr_tb_start(DisasContextBase *db, CPUState *cpu)
@@ -1472,6 +1495,9 @@ static void riscv_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     CPURISCVState *env = cpu_env(cpu);
 
 #ifndef CONFIG_USER_ONLY
+    if (ctx->esp32p4_insns) {
+        gen_esp32p4_count_insn(ctx, 1);
+    }
     if (ctx->trace) {
         gen_esp32p4_trace_insn(ctx, env);
     }
@@ -1612,4 +1638,9 @@ void riscv_translate_init(void)
                                        "load_res_size");
 #endif
     load_val = tcg_global_mem_new(tcg_env, val_offset, "load_val");
+#ifndef CONFIG_USER_ONLY
+    esp32p4_insns = tcg_global_mem_new_i64(tcg_env,
+                                           ESP32P4_ENV_OFFSET(insns),
+                                           "esp32p4_insns");
+#endif
 }

@@ -81,6 +81,10 @@ enum {
  *   HP2LP_WAKEUP_GROUP<n>_EN enables is high, for the PMU's wakeup logic.
  * ESP32P4_HP_SYS_CPU_WAKEUP: per HP core, HP_SYSTEM_CPU_WAKEUP_EVENT's
  *   bit, to the core's ESP32P4_CPU_WAKEUP input, which wakes it from WFI.
+ * ESP32P4_HP_SYS_CPU_WAITI_CONF: line core * ESP32P4_HP_SYS_WAITI_LINES +
+ *   n, HP_SYSTEM_CPU_WAITI_CONF's bit n (WAIT_MODE_FORCE_ON, then
+ *   WAITI_DELAY_NUM's four), to each HP core's ESP32P4_CPU_WAITI_CONF
+ *   input: whether and when the core's clock stops in WFI.
  * ESP32P4_HP_SYS_DMA_ADDR_SEL: SYS_DMA_ADDR_SEL, high while the DMA
  *   masters address the external memories at 0x4xxxxxxx rather than
  *   0x8xxxxxxx, for the DMA engines.
@@ -128,6 +132,8 @@ enum {
 #define ESP32P4_HP_SYS_HP_INTR          "hp-intr"
 #define ESP32P4_HP_SYS_HP_WAKEUP        "hp-wakeup"
 #define ESP32P4_HP_SYS_CPU_WAKEUP       "cpu-wakeup"
+#define ESP32P4_HP_SYS_CPU_WAITI_CONF   "cpu-waiti-conf"
+#define ESP32P4_HP_SYS_WAITI_LINES      5
 #define ESP32P4_HP_SYS_DMA_ADDR_SEL     "dma-addr-sel"
 #define ESP32P4_HP_SYS_ADDR_INTERCHANGE "psram-flash-interchange"
 #define ESP32P4_HP_SYS_GMAC_PHY_INTF    "gmac-phy-intf-sel"
@@ -184,6 +190,8 @@ struct ESP32P4HPSysState {
     qemu_irq hp_intr;
     qemu_irq hp_wakeup;
     qemu_irq cpu_wakeup[ESP32P4_HP_SYS_CORES];
+    qemu_irq cpu_waiti_conf[ESP32P4_HP_SYS_CORES *
+                            ESP32P4_HP_SYS_WAITI_LINES];
     qemu_irq dma_addr_sel;
     qemu_irq addr_interchange[2];
     qemu_irq gmac_phy_intf[ESP32P4_HP_SYS_GMAC_PHY_INTF_LINES];
