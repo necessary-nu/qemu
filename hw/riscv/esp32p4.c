@@ -201,8 +201,6 @@ static const struct {
     { "mcpwm1",           0x500c1000, 4 * KiB },
     { "timg0",            0x500c2000, 4 * KiB },
     { "timg1",            0x500c3000, 4 * KiB },
-    { "i2c0",             0x500c4000, 4 * KiB },
-    { "i2c1",             0x500c5000, 4 * KiB },
     { "i2s0",             0x500c6000, 4 * KiB },
     { "i2s1",             0x500c7000, 4 * KiB },
     { "i2s2",             0x500c8000, 4 * KiB },
@@ -249,7 +247,6 @@ static const struct {
 
     /* LP peripherals. */
     { "lp-uart",          0x50121000, 4 * KiB },
-    { "lp-i2c",           0x50122000, 4 * KiB },
     { "lp-spi",           0x50123000, 4 * KiB },
     { "lp-i2s",           0x50125000, 4 * KiB },
     { "lp-trng",          0x50126000, 4 * KiB },
@@ -783,6 +780,109 @@ static void esp32p4_init_gpio(ESP32P4MachineState *s)
 }
 
 /*
+ * I2C0 and I2C1 (0x500C4000, 0x500C5000), their registers behind
+ * I2Cn_APB_CLK and HP_SYS_CLKRST's I2Cn reset, timed by I2Cn_CLK, their
+ * interrupts sources 44 and 45 and their lines the GPIO matrix's signals
+ * 68 to 71; and the LP I2C (0x50122000), behind LPPERI's LP_I2C clock
+ * gate and reset, timed by LP_I2C_SCLK, its interrupt source 11 and its
+ * lines the LP GPIO matrix's signals 0 and 1. Their QEMU I2C buses,
+ * "i2c0", "i2c1" and "lp-i2c", stand for the board's wires on the pads
+ * each controller is routed to; the board has nothing on them, and
+ * -device puts i2c-slave devices there:
+ *
+ *   -device tmp105,bus=i2c0,address=0x48
+ */
+/* [spec:nuos:req:emu.esp32p4.i2c] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_i2c(ESP32P4MachineState *s)
+{
+    static const struct {
+        const char *bus;
+        hwaddr base;
+        unsigned bus_clock;
+        unsigned reset;
+        const char *sclk;
+        int intr;
+        unsigned scl;
+        unsigned sda;
+    } hp[] = {
+        { "i2c0", 0x500c4000, ESP32P4_CLK_I2C0_APB, ESP32P4_RST_I2C0, "i2c0",
+          ESP32P4_INTR_I2C0, ESP32P4_SIG_I2C0_SCL_PAD_OUT,
+          ESP32P4_SIG_I2C0_SDA_PAD_OUT },
+        { "i2c1", 0x500c5000, ESP32P4_CLK_I2C1_APB, ESP32P4_RST_I2C1, "i2c1",
+          ESP32P4_INTR_I2C1, ESP32P4_SIG_I2C1_SCL_PAD_OUT,
+          ESP32P4_SIG_I2C1_SDA_PAD_OUT },
+    };
+    DeviceState *gpio = DEVICE(&s->gpio), *clkrst = DEVICE(&s->clkrst);
+    ESP32P4ClkRstGate *g;
+    DeviceState *dev;
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(hp); i++) {
+        object_initialize_child(OBJECT(s), hp[i].bus, &s->i2c[i],
+                                TYPE_ESP32P4_I2C);
+        dev = DEVICE(&s->i2c[i]);
+        qdev_prop_set_string(dev, "bus-name", hp[i].bus);
+        qdev_connect_clock_in(dev, "sclk",
+                              qdev_get_clock_out(clkrst, hp[i].sclk));
+        sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+        g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                     hp[i].base, hp[i].bus_clock,
+                                     hp[i].reset, 0);
+        esp32p4_clkrst_gate_volatile(g, 0x1c, 4);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           esp32p4_intr_source(s, hp[i].intr));
+        qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SCL_OUT, 0,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT, hp[i].scl));
+        qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SCL_OE, 0,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OE, hp[i].scl));
+        qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SDA_OUT, 0,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT, hp[i].sda));
+        qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SDA_OE, 0,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OE, hp[i].sda));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN, hp[i].scl,
+            qdev_get_gpio_in_named(dev, ESP32P4_I2C_SCL_IN, 0));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN, hp[i].sda,
+            qdev_get_gpio_in_named(dev, ESP32P4_I2C_SDA_IN, 0));
+    }
+
+    object_initialize_child(OBJECT(s), "lp-i2c", &s->lp_i2c,
+                            TYPE_ESP32P4_LP_I2C);
+    dev = DEVICE(&s->lp_i2c);
+    qdev_prop_set_string(dev, "bus-name", "lp-i2c");
+    qdev_connect_clock_in(dev, "sclk",
+                          qdev_get_clock_out(clkrst, "lp-i2c-sclk"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                 0x50122000, ESP32P4_CLK_LP_I2C,
+                                 ESP32P4_RST_LP_I2C, 0);
+    esp32p4_clkrst_gate_volatile(g, 0x1c, 4);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_I2C));
+    qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SCL_OUT, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_LP_SIG_OUT,
+                               ESP32P4_LP_SIG_I2C_SCL_PAD_OUT));
+    qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SCL_OE, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_LP_SIG_OE,
+                               ESP32P4_LP_SIG_I2C_SCL_PAD_OUT));
+    qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SDA_OUT, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_LP_SIG_OUT,
+                               ESP32P4_LP_SIG_I2C_SDA_PAD_OUT));
+    qdev_connect_gpio_out_named(dev, ESP32P4_I2C_SDA_OE, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_LP_SIG_OE,
+                               ESP32P4_LP_SIG_I2C_SDA_PAD_OUT));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_LP_SIG_IN,
+                                ESP32P4_LP_SIG_I2C_SCL_PAD_IN,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_I2C_SCL_IN, 0));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_LP_SIG_IN,
+                                ESP32P4_LP_SIG_I2C_SDA_PAD_IN,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_I2C_SDA_IN, 0));
+}
+
+/*
  * The access permission managers and the blocks that record what they
  * refuse: the AXI ICM, its registers behind ICM_APB_CLK, whose interrupt
  * is SYS_ICM_INTR (source 21), and LP_SYS, whose interrupt is
@@ -961,6 +1061,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_intmatrix(s);
     esp32p4_init_efuse(s);
     esp32p4_init_gpio(s);
+    esp32p4_init_i2c(s);
     esp32p4_init_pms(s);
     esp32p4_init_flash(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {

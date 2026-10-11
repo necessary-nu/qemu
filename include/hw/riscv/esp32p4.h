@@ -14,6 +14,7 @@
 #include "hw/cpu/cluster.h"
 #include "hw/core/split-irq.h"
 #include "hw/gpio/esp32p4_gpio.h"
+#include "hw/i2c/esp32p4_i2c.h"
 #include "hw/intc/esp32p4_clic.h"
 #include "hw/intc/esp32p4_clint.h"
 #include "hw/intc/esp32p4_intmatrix.h"
@@ -113,6 +114,8 @@ struct ESP32P4MachineState {
     /* The access permission managers, every master's way onto the bus. */
     ESP32P4PmsState pms;
     ESP32P4IcmState icm;
+    ESP32P4I2CState i2c[2];
+    ESP32P4I2CState lp_i2c;
 
     SSIBus *flash_bus;
     uint64_t flash_size;

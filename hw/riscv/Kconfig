@@ -15,10 +15,15 @@ config ESP32P4
     depends on RISCV32 && TCG
     select CPU_CLUSTER
     select ESP32_LINE
+    select I2C
+    select I3C
     select SSI
     select SPLIT_IRQ
     select SSI_M25P80
     select UNIMP
+    imply I2C_DEVICES
+    imply I3C_DEVICES
+    imply AT24C
 
 config MICROCHIP_PFSOC
     bool
