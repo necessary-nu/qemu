@@ -96,13 +96,13 @@ static USBDevice *host_root(DWC2OTGState *s)
 static bool host_port_powered(DWC2OTGState *s)
 {
     return s->host_mode && (s->hprt & HPRT0_PWR) && s->phy_connected &&
-           dwc2_otg_phy_hz(s);
+           dwc2_otg_phy_period(s);
 }
 
 static bool host_running(DWC2OTGState *s)
 {
     return s->port_connected && (s->hprt & HPRT0_ENA) &&
-           !(s->hprt & (HPRT0_SUSP | HPRT0_RST)) && dwc2_otg_phy_hz(s);
+           !(s->hprt & (HPRT0_SUSP | HPRT0_RST)) && dwc2_otg_phy_period(s);
 }
 
 static bool chan_is_in(DWC2OTGHostChan *c)
@@ -248,7 +248,7 @@ static void host_frames_update(DWC2OTGState *s)
             s->frame_start_ns = now - s->frame_ns;
             s->frame_origin_ns = now;
             s->frame_ticks = 0;
-            s->frame_hz = dwc2_otg_phy_hz(s);
+            s->frame_period = dwc2_otg_phy_period(s);
             timer_mod(s->frame_timer, now);
         }
     } else {
@@ -257,16 +257,19 @@ static void host_frames_update(DWC2OTGState *s)
     }
 }
 
+/*
+ * HFNUM: the frame number, and the PHY clocks left in the frame, of those
+ * counted from the frames' origin.
+ */
 uint32_t dwc2_otg_hfnum_read(DWC2OTGState *s)
 {
-    uint64_t hz = dwc2_otg_phy_hz(s);
-    int64_t left = 0;
+    uint64_t left = 0, done;
 
-    if (timer_pending(s->frame_timer) && hz) {
-        left = s->frame_start_ns + s->frame_ns -
-               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        left = MAX(left, 0);
-        left = muldiv64(left, hz, NANOSECONDS_PER_SECOND);
+    if (timer_pending(s->frame_timer) && s->frame_period &&
+        s->frame_period == dwc2_otg_phy_period(s)) {
+        done = dwc2_otg_phy_ticks(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                                     s->frame_origin_ns);
+        left = s->frame_ticks > done ? s->frame_ticks - done : 0;
     }
     return s->frnum | (MIN(left, 0xffff) << HFNUM_FRREM_SHIFT);
 }
@@ -420,12 +423,12 @@ void dwc2_otg_hprt_write(DWC2OTGState *s, uint32_t val)
                  * Unprogrammed, the (micro)frame interval follows the PHY
                  * clock: 125 us at high speed, 1 ms otherwise.
                  */
-                uint64_t hz = dwc2_otg_phy_hz(s);
+                uint64_t ticks = dwc2_otg_phy_ticks(s,
+                    s->port_speed == DWC2_SPEED_HIGH ? HS_FRAME_NS
+                                                     : FS_FRAME_NS);
 
                 s->hfir = (s->hfir & ~HFIR_FRINT_MASK) |
-                          MIN(s->port_speed == DWC2_SPEED_HIGH ? hz / 8000
-                                                               : hz / 1000,
-                              HFIR_FRINT_MASK);
+                          MIN(ticks, HFIR_FRINT_MASK);
             }
         }
     }
@@ -1468,24 +1471,23 @@ static void host_bus(void *opaque)
  */
 static void host_frame_next(DWC2OTGState *s)
 {
-    uint64_t hz = dwc2_otg_phy_hz(s);
+    uint64_t period = dwc2_otg_phy_period(s);
     uint32_t len = s->hfir & HFIR_FRINT_MASK;
 
     s->frame_start_ns += s->frame_ns;
-    if (hz != s->frame_hz) {
-        s->frame_hz = hz;
+    if (period != s->frame_period) {
+        s->frame_period = period;
         s->frame_origin_ns = s->frame_start_ns;
         s->frame_ticks = 0;
     }
-    if (!hz || !len) {
+    if (!period || !len) {
         s->frame_ns = host_frame_len_ns(s);
-        s->frame_hz = 0;
+        s->frame_period = 0;
         return;
     }
     s->frame_ticks += len;
     s->frame_ns = s->frame_origin_ns +
-                  muldiv64_round_up(s->frame_ticks, NANOSECONDS_PER_SECOND,
-                                    hz) - s->frame_start_ns;
+                  dwc2_otg_phy_ticks_ns(s, s->frame_ticks) - s->frame_start_ns;
 }
 
 /* A (micro)frame boundary: the SOF, and a new round of transactions. */
@@ -1620,7 +1622,7 @@ void dwc2_otg_host_reset(DWC2OTGState *s)
     s->frame_start_ns = 0;
     s->frame_origin_ns = 0;
     s->frame_ticks = 0;
-    s->frame_hz = 0;
+    s->frame_period = 0;
     s->np_next = 0;
     host_reset_toggles(s);
     qemu_set_irq(s->suspended_out, 0);

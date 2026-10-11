@@ -87,12 +87,8 @@ typedef struct ESP32P4TwaiEpisode {
     bool start_pending;
     int64_t start_at;
     int64_t t_sof;
-    /*
-     * The bit time of the winning transmitter, exactly, and in
-     * picoseconds, rounded down, for receivers at other bit times.
-     */
+    /* The bit time of the winning transmitter, exactly. */
     ESP32P4ClkPeriod bit;
-    int64_t bit_ps;
     /* The controllers that took part from SOF, and those since gone. */
     uint8_t members;
     uint8_t departed;
