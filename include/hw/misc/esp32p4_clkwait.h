@@ -10,24 +10,33 @@
 #define HW_MISC_ESP32P4_CLKWAIT_H
 
 #include "hw/core/clock.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "migration/vmstate.h"
 #include "qemu/timer.h"
 
 /*
  * A wait of a number of cycles of one clock, as a block's counter
- * counts them: @left cycles still to count from @base_ns. Its timer runs
- * to the end at the clock's current rate. While the clock is stopped the
- * count holds and the timer is not armed. A block whose clock is about to
+ * counts them: until cycle @end of @count, the clock's cycles counted
+ * exactly from an edge at its origin, the wait's start. Its timer runs to
+ * the first nanosecond the count reaches @end, at least a nanosecond
+ * after the wait began (@from_ns). While the clock is stopped the count
+ * holds and the timer is not armed. A block whose clock is about to
  * change (ClockPreUpdate) folds the cycles counted so far into the wait;
  * once it has changed (ClockUpdate), it reschedules: the wait goes on at
- * the new rate from the moment of the change.
+ * the new rate from the moment of the change. A wait started at the end
+ * of the one before (@ended_ns), as a periodic timer starts its next
+ * period, goes on counting from that wait's exact end rather than the
+ * nanosecond it was seen at, so that a train of waits keeps to the
+ * clock's edges.
  */
 typedef struct ESP32P4ClkWait {
     QEMUTimer timer;
     /* The clock counted; set at the block's init, not migrated. */
     Clock *clk;
-    int64_t base_ns;
-    uint64_t left;
+    ESP32P4ClkCount count;
+    uint64_t end;
+    int64_t from_ns;
+    int64_t ended_ns;
     bool active;
 } ESP32P4ClkWait;
 

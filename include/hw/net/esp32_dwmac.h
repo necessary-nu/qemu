@@ -149,6 +149,15 @@ struct Esp32DwmacClass {
     void (*tx_drive)(Esp32DwmacState *s, bool on);
     /* The core's reset state changed: held, or a software reset pending */
     void (*reset_changed)(Esp32DwmacState *s);
+    /*
+     * The edges of @clk (the bus or the PTP reference clock) counted from
+     * time 0: how many have come by @ns, and the first nanosecond by which
+     * edge @edge has. By default from the clock's frequency in whole Hz; a
+     * subclass whose clocks carry exact periods of their own counts at
+     * those.
+     */
+    uint64_t (*clock_edges)(Esp32DwmacState *s, Clock *clk, int64_t ns);
+    int64_t (*clock_edge_ns)(Esp32DwmacState *s, Clock *clk, uint64_t edge);
 };
 
 struct Esp32DwmacState {

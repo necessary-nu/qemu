@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "hw/gpio/esp32_line.h"
 #include "hw/gpio/esp32p4_gpio_sig.h"
 #include "qemu/notify.h"
@@ -416,13 +417,14 @@ struct ESP32P4GpioState {
 
     /*
      * The filters, their sample cycles counted from each clock's anchor,
-     * when its frequency last changed.
+     * when its frequency last changed: the cycles of the IO MUX and LP IO
+     * MUX clocks from there.
      */
     ESP32P4GpioFilter pin_filter[ESP32P4_GPIO_PADS];
     ESP32P4GpioFilter glitch_filter[ESP32P4_GPIO_GLITCH_FILTERS];
     ESP32P4GpioFilter lp_pin_filter[ESP32P4_GPIO_LP_PADS];
-    int64_t iomux_anchor_ns;
-    int64_t lp_anchor_ns;
+    ESP32P4ClkCount iomux_edges;
+    ESP32P4ClkCount lp_edges;
 
     /* The analog comparators' outputs, and their last interrupts' times. */
     uint8_t ana_comp[ESP32P4_GPIO_ANA_COMPS];

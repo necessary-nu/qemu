@@ -450,8 +450,8 @@ static const Property huk_properties[] = {
 
 static const VMStateDescription vmstate_esp32p4_huk = {
     .name = TYPE_ESP32P4_HUK,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_ESP32P4_CRYPTO_TIMER(op, ESP32P4HukState),
         VMSTATE_UINT32(clk_reg, ESP32P4HukState),

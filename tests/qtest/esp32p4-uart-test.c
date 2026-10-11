@@ -404,6 +404,49 @@ static void test_baud_timing(void)
 }
 
 /*
+ * A train of frames from a core clock whose period is not a whole
+ * nanosecond: UART1_SCLK from PLL_F80M_CLK (the SPLL's 480 MHz by 6)
+ * divided by 1 + 1/3, 60 MHz, and CLKDIV 7, bits of 350/3 ns and frames
+ * of 3500/3. The frames follow each other at once, so that the 95th ends
+ * at exactly 95 * 3500/3 = 110833 1/3 ns: TX_DONE comes at the first
+ * nanosecond after, 110834 ns, not a frame's fraction of a nanosecond
+ * early per frame.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+static void test_exact_frames(void)
+{
+    QTestState *qts = start();
+    int64_t t0;
+    int i;
+
+    qtest_writel(qts, HP_SYS_CLKRST_PERI_CLK_CTRL111,
+                 (qtest_readl(qts, HP_SYS_CLKRST_PERI_CLK_CTRL111) &
+                  ~(3u << 24)) | (2u << 24));
+    qtest_writel(qts, HP_SYS_CLKRST_PERI_CLK_CTRL112,
+                 (qtest_readl(qts, HP_SYS_CLKRST_PERI_CLK_CTRL112) &
+                  ~0xffffffu) | (1u << 8) | (3u << 16));
+    setup(qts, UART(1), CONF0_8N1);
+    wr(qts, UART(1), CLKDIV, 7);
+    update(qts, UART(1));
+    t0 = qtest_clock_step(qts, 1);
+    for (i = 0; i < 95; i++) {
+        wr(qts, UART(1), FIFO, i);
+    }
+    /* Frame 48 ends at 56000 ns exactly, and frame 50 begins. */
+    qtest_clock_step(qts, 56000 - 1);
+    g_assert_cmpuint(STATUS_TXFIFO_CNT(rd(qts, UART(1), STATUS)), ==,
+                     95 - 48);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(STATUS_TXFIFO_CNT(rd(qts, UART(1), STATUS)), ==,
+                     95 - 49);
+    g_assert_cmpint(qtest_clock_step(qts, 110833 - 56000), ==, t0 + 110833);
+    g_assert_false(rd(qts, UART(1), INT_RAW) & INT_TX_DONE);
+    qtest_clock_step(qts, 1);
+    g_assert_true(rd(qts, UART(1), INT_RAW) & INT_TX_DONE);
+    qtest_quit(qts);
+}
+
+/*
  * The FIFOs and their interrupts, through the internal loopback:
  * RXFIFO_FULL at the threshold, TXFIFO_EMPTY below its threshold, latched
  * until cleared and set again while their condition holds; RXFIFO_TOUT
@@ -1602,6 +1645,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/uart/reset_values", test_reset_values);
     qtest_add_func("esp32p4/uart/reg_update", test_reg_update);
     qtest_add_func("esp32p4/uart/baud_timing", test_baud_timing);
+    qtest_add_func("esp32p4/uart/exact_frames", test_exact_frames);
     qtest_add_func("esp32p4/uart/fifo_irq", test_fifo_irq);
     qtest_add_func("esp32p4/uart/uart_to_uart", test_uart_to_uart);
     qtest_add_func("esp32p4/uart/hw_flow", test_hw_flow);

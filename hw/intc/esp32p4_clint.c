@@ -88,30 +88,16 @@ static bool clint_should_run(ESP32P4ClintState *s)
            !device_is_in_reset(DEVICE(s));
 }
 
-/*
- * Virtual time taken by n counts at the current rate, which is not zero,
- * rounded up; a time too far off to schedule is capped.
- */
-static int64_t clint_counts_ns(ESP32P4ClintState *s, uint64_t n)
-{
-    uint64_t ns = clock_ticks_to_ns(s->mtime_clk, n);
-
-    if (ns >= INT64_MAX / 2) {
-        return INT64_MAX / 2;
-    }
-    while (clock_ns_to_ticks(s->mtime_clk, ns) < n) {
-        ns++;
-    }
-    return ns;
-}
-
-/* Whole counts since sync_ns. */
+/* Whole counts since the count was last folded. */
 static uint64_t clint_elapsed(ESP32P4ClintState *s, int64_t now)
 {
-    if (!s->running || now <= s->sync_ns) {
+    uint64_t cycles;
+
+    if (!s->running) {
         return 0;
     }
-    return clock_ns_to_ticks(s->mtime_clk, now - s->sync_ns);
+    cycles = esp32p4_clk_count_at(&s->edges, now);
+    return cycles > s->synced ? cycles - s->synced : 0;
 }
 
 static uint64_t clint_count(ESP32P4ClintState *s)
@@ -128,10 +114,10 @@ static void clint_set_ovf(ESP32P4ClintState *s)
 }
 
 /*
- * Fold elapsed counts into the count, keeping sync_ns on a count boundary
- * so that the time towards the next count is not lost; note an overflow
- * on the way. Called before anything that changes the count, rate or run
- * state, or that reads the overflow flag.
+ * Fold elapsed counts into the count, noting an overflow on the way; while
+ * the counter is stopped, count afresh from now, where it starts. Called
+ * before anything that changes the count, rate or run state, or that reads
+ * the overflow flag.
  */
 static void clint_sync(ESP32P4ClintState *s)
 {
@@ -139,14 +125,15 @@ static void clint_sync(ESP32P4ClintState *s)
     uint64_t n = clint_elapsed(s, now);
 
     if (!s->running) {
-        s->sync_ns = now;
+        esp32p4_clk_count_start(&s->edges, s->mtime_clk, now);
+        s->synced = 0;
         return;
     }
     if (n && UINT64_MAX - s->count < n) {
         clint_set_ovf(s);
     }
     s->count += n;
-    s->sync_ns += clint_counts_ns(s, n);
+    s->synced += n;
     if (s->count == UINT64_MAX) {
         clint_set_ovf(s);
     }
@@ -154,8 +141,8 @@ static void clint_sync(ESP32P4ClintState *s)
 
 /*
  * Drive a core's timer interrupt from the count and its mtimecmp, and
- * schedule it for when the count reaches mtimecmp. The deadline is rounded
- * up, so the count has reached mtimecmp when the callback runs.
+ * schedule it for when the count reaches mtimecmp: the first nanosecond
+ * at which it has, a time too far off to schedule capped.
  */
 /* [spec:nuos:req:emu.esp32p4.clic] */
 static void clint_update_timer(ESP32P4ClintCore *c)
@@ -173,8 +160,13 @@ static void clint_update_timer(ESP32P4ClintCore *c)
         timer_del(c->timer);
         return;
     }
-    timer_mod(c->timer, s->sync_ns + clint_counts_ns(s, c->mtimecmp -
-                                                        s->count));
+    if (c->mtimecmp - s->count > UINT64_MAX - s->synced) {
+        timer_mod(c->timer, INT64_MAX / 2);
+        return;
+    }
+    timer_mod(c->timer, MIN(esp32p4_clk_count_time(&s->edges, s->synced +
+                                                   c->mtimecmp - s->count),
+                            INT64_MAX / 2));
 }
 
 static void clint_update_timers(ESP32P4ClintState *s)
@@ -209,7 +201,9 @@ static void clint_mtime_clk_update(void *opaque, ClockEvent event)
         clint_sync(s);
         return;
     }
-    s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    esp32p4_clk_count_start(&s->edges, s->mtime_clk,
+                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    s->synced = 0;
     clint_restart(s);
 }
 
@@ -494,7 +488,9 @@ static void esp32p4_clint_reset_enter(Object *obj, ResetType type)
     }
     s->count = 0;
     s->running = false;
-    s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    esp32p4_clk_count_start(&s->edges, s->mtime_clk,
+                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    s->synced = 0;
 }
 
 static void esp32p4_clint_reset_hold(Object *obj, ResetType type)
@@ -511,7 +507,9 @@ static void esp32p4_clint_reset_exit(Object *obj, ResetType type)
 {
     ESP32P4ClintState *s = ESP32P4_CLINT(obj);
 
-    s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    esp32p4_clk_count_start(&s->edges, s->mtime_clk,
+                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    s->synced = 0;
     clint_restart(s);
 }
 
@@ -536,11 +534,12 @@ static const VMStateDescription vmstate_esp32p4_clint_core = {
 
 static const VMStateDescription vmstate_esp32p4_clint = {
     .name = TYPE_ESP32P4_CLINT,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT64(count, ESP32P4ClintState),
-        VMSTATE_INT64(sync_ns, ESP32P4ClintState),
+        VMSTATE_ESP32P4_CLK_COUNT(edges, ESP32P4ClintState),
+        VMSTATE_UINT64(synced, ESP32P4ClintState),
         VMSTATE_BOOL(running, ESP32P4ClintState),
         VMSTATE_CLOCK(mtime_clk, ESP32P4ClintState),
         VMSTATE_STRUCT_ARRAY(core, ESP32P4ClintState, ESP32P4_CLINT_CORES, 1,

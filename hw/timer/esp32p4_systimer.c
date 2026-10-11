@@ -111,33 +111,18 @@
 #define COUNT_MASK          MAKE_64BIT_MASK(0, COUNT_BITS)
 #define PASSED_RANGE        (1ull << 51)
 
-/* The least time in which @clk makes @n cycles. */
-static uint64_t systimer_cycles_ns(Clock *clk, uint64_t n)
-{
-    uint64_t ns = clock_ticks_to_ns(clk, n);
-
-    while (ns < INT64_MAX && clock_ns_to_ticks(clk, ns) < n) {
-        ns++;
-    }
-    return ns;
-}
-
 /* CNT_CLK's edges up to @now. */
 static uint64_t systimer_edges(ESP32P4SysTimerState *s, int64_t now)
 {
-    if (!clock_is_enabled(s->clk) || now <= s->clk_ns) {
-        return s->clk_edges;
-    }
-    return s->clk_edges + clock_ns_to_ticks(s->clk, now - s->clk_ns) * 2 / 5;
+    return s->clk_edges + esp32p4_clk_count_at(&s->clk_count, now) * 2 / 5;
 }
 
 /* When CNT_CLK edge @e comes, at its current rate; e > clk_edges. */
 static int64_t systimer_edge_ns(ESP32P4SysTimerState *s, uint64_t e)
 {
     uint64_t cycles = DIV_ROUND_UP((e - s->clk_edges) * 5, 2);
-    uint64_t ns = systimer_cycles_ns(s->clk, cycles);
 
-    return MIN(ns, INT64_MAX / 2 - s->clk_ns) + s->clk_ns;
+    return MIN(esp32p4_clk_count_time(&s->clk_count, cycles), INT64_MAX / 2);
 }
 
 static bool systimer_unit_should_run(ESP32P4SysTimerState *s, int n)
@@ -343,10 +328,10 @@ static void systimer_clk_update(void *opaque, ClockEvent event)
         edges = systimer_edges(s, now);
         systimer_sync_units(s, edges);
         s->clk_edges = edges;
-        s->clk_ns = now;
+        s->clk_count.origin_ns = now;
         return;
     }
-    s->clk_ns = now;
+    esp32p4_clk_count_start(&s->clk_count, s->clk, now);
     systimer_update(s, s->clk_edges, now);
 }
 
@@ -703,8 +688,8 @@ static const VMStateDescription vmstate_esp32p4_systimer_comp = {
 
 static const VMStateDescription vmstate_esp32p4_systimer = {
     .name = TYPE_ESP32P4_SYSTIMER,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4SysTimerState),
         VMSTATE_UINT32(conf, ESP32P4SysTimerState),
@@ -722,7 +707,7 @@ static const VMStateDescription vmstate_esp32p4_systimer = {
         VMSTATE_BOOL_ARRAY(stall, ESP32P4SysTimerState,
                            ESP32P4_SYSTIMER_CORES),
         VMSTATE_UINT64(clk_edges, ESP32P4SysTimerState),
-        VMSTATE_INT64(clk_ns, ESP32P4SysTimerState),
+        VMSTATE_ESP32P4_CLK_COUNT(clk_count, ESP32P4SysTimerState),
         VMSTATE_END_OF_LIST()
     },
 };

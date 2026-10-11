@@ -95,42 +95,22 @@
 #define COUNT_MASK          MAKE_64BIT_MASK(0, COUNT_BITS)
 #define ALARM_OVF           ESP32P4_LP_TIMER_TARGETS
 
-/* The least time in which @clk makes @n cycles, capped for timer_mod(). */
-static int64_t lp_timer_cycles_ns(Clock *clk, uint64_t n)
-{
-    uint64_t ns = clock_ticks_to_ns(clk, n);
-
-    while (ns < INT64_MAX / 4 && clock_ns_to_ticks(clk, ns) < n) {
-        ns++;
-    }
-    return MIN(ns, INT64_MAX / 4);
-}
-
 /* The count at @now: with the clock stopped, as last synced. */
 static uint64_t lp_timer_count(ESP32P4LPTimerState *s, int64_t now)
 {
-    if (!clock_is_enabled(s->slow) || now <= s->sync_ns) {
+    uint64_t cycles = esp32p4_clk_count_at(&s->edges, now);
+
+    if (cycles <= s->synced) {
         return s->count;
     }
-    return (s->count + clock_ns_to_ticks(s->slow, now - s->sync_ns)) &
-           COUNT_MASK;
+    return (s->count + cycles - s->synced) & COUNT_MASK;
 }
 
-/* Fold the counts up to @now, keeping the sync point on a clock edge. */
+/* Fold the counts up to @now into the count. */
 static void lp_timer_sync(ESP32P4LPTimerState *s, int64_t now)
 {
-    uint64_t cycles;
-
-    if (!clock_is_enabled(s->slow)) {
-        s->sync_ns = now;
-        return;
-    }
-    if (now <= s->sync_ns) {
-        return;
-    }
-    cycles = clock_ns_to_ticks(s->slow, now - s->sync_ns);
-    s->count = (s->count + cycles) & COUNT_MASK;
-    s->sync_ns += lp_timer_cycles_ns(s->slow, cycles);
+    s->count = lp_timer_count(s, now);
+    s->synced = MAX(s->synced, esp32p4_clk_count_at(&s->edges, now));
 }
 
 /*
@@ -172,7 +152,8 @@ static void lp_timer_schedule(ESP32P4LPTimerState *s, int n)
     } else {
         ahead = (s->target[n] - s->count) & COUNT_MASK;
     }
-    a->due_ns = s->sync_ns + lp_timer_cycles_ns(s->slow, ahead);
+    a->due_ns = MIN(esp32p4_clk_count_time(&s->edges, s->synced + ahead),
+                    INT64_MAX / 4);
     timer_mod(&a->timer, a->due_ns);
 }
 
@@ -269,7 +250,8 @@ static void lp_timer_slow_update(void *opaque, ClockEvent event)
         lp_timer_sync(s, now);
         return;
     }
-    s->sync_ns = now;
+    esp32p4_clk_count_start(&s->edges, s->slow, now);
+    s->synced = 0;
     lp_timer_schedule_all(s);
 }
 
@@ -539,7 +521,9 @@ static void esp32p4_lp_timer_reset_hold(Object *obj, ResetType type)
     s->lp_int_ena = 0;
     s->date = DATE_RESET;
     s->count = 0;
-    s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    esp32p4_clk_count_start(&s->edges, s->slow,
+                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    s->synced = 0;
 }
 
 static void esp32p4_lp_timer_reset_exit(Object *obj, ResetType type)
@@ -614,8 +598,8 @@ static const VMStateDescription vmstate_esp32p4_lp_timer_alarm = {
 
 static const VMStateDescription vmstate_esp32p4_lp_timer = {
     .name = TYPE_ESP32P4_LP_TIMER,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(slow, ESP32P4LPTimerState),
         VMSTATE_UINT64_ARRAY(target, ESP32P4LPTimerState,
@@ -630,7 +614,8 @@ static const VMStateDescription vmstate_esp32p4_lp_timer = {
         VMSTATE_UINT32(lp_int_ena, ESP32P4LPTimerState),
         VMSTATE_UINT32(date, ESP32P4LPTimerState),
         VMSTATE_UINT64(count, ESP32P4LPTimerState),
-        VMSTATE_INT64(sync_ns, ESP32P4LPTimerState),
+        VMSTATE_ESP32P4_CLK_COUNT(edges, ESP32P4LPTimerState),
+        VMSTATE_UINT64(synced, ESP32P4LPTimerState),
         VMSTATE_STRUCT_ARRAY(alarm, ESP32P4LPTimerState,
                              ESP32P4_LP_TIMER_TARGETS + 1, 1,
                              vmstate_esp32p4_lp_timer_alarm,

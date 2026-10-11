@@ -631,8 +631,8 @@ static const VMStateDescription vmstate_esp32p4_hmac_sha = {
 
 static const VMStateDescription vmstate_esp32p4_hmac = {
     .name = TYPE_ESP32P4_HMAC,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_ESP32P4_CRYPTO_TIMER(op, ESP32P4HmacState),
         VMSTATE_BOOL(in_reset, ESP32P4HmacState),

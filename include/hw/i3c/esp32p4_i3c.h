@@ -157,7 +157,9 @@ struct ESP32P4I3CMstState {
      * The command being run and where it has got to: its words, the
      * phase the timer ends next, the bytes left and done, its error, the
      * device it addresses, the address retries made and what follows a
-     * repeated START. phase_left holds the cycles of I3C_MST_CLK a phase
+     * repeated START. The phases end phase_cyc cycles of I3C_MST_CLK, at
+     * its exact period phase_period, after phase_origin, the current one
+     * at phase_due; phase_left holds the cycles of I3C_MST_CLK a phase
      * has left while the clock is stopped.
      */
     bool busy;
@@ -166,8 +168,10 @@ struct ESP32P4I3CMstState {
     uint32_t cmd_h;
     uint32_t phase;
     int64_t phase_due;
-    uint64_t phase_period;
+    ESP32P4ClkPeriod phase_period;
     uint64_t phase_left;
+    int64_t phase_origin;
+    uint64_t phase_cyc;
     uint32_t left;
     uint32_t done;
     uint8_t err;

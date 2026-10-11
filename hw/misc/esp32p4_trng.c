@@ -69,23 +69,45 @@ static bool trng_sampling(ESP32P4TrngState *s)
            (s->cfg & CFG_TIMER_EN);
 }
 
-/* The samples taken since sample_ns, at the current configuration. */
-static uint32_t trng_new_samples(ESP32P4TrngState *s)
+/*
+ * The clock's cycles since the count was last settled, @pre of them
+ * already into the next sample's.
+ */
+static uint64_t trng_new_cycles(ESP32P4TrngState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t cycles = esp32p4_clk_count_at(&s->edges, now);
 
-    if (!trng_sampling(s) || now <= s->sample_ns) {
+    if (!trng_sampling(s) || cycles <= s->synced) {
         return 0;
     }
-    return clock_ns_to_ticks(s->clk, now - s->sample_ns) /
-           (CFG_PSCALE(s->cfg) + 1);
+    return s->pre + cycles - s->synced;
 }
 
-/* Count the samples so far, before what paces them changes. */
+/* The samples taken since the count was last settled. */
+static uint32_t trng_new_samples(ESP32P4TrngState *s)
+{
+    return trng_new_cycles(s) / (CFG_PSCALE(s->cfg) + 1);
+}
+
+/*
+ * Count the samples so far, before what paces them changes; while the
+ * generator does not sample, the cycles go by uncounted and the next
+ * sample's start over.
+ */
 static void trng_settle(ESP32P4TrngState *s)
 {
-    s->samples += trng_new_samples(s);
-    s->sample_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t cycles = trng_new_cycles(s);
+    uint32_t div = CFG_PSCALE(s->cfg) + 1;
+
+    if (!trng_sampling(s)) {
+        s->pre = 0;
+    } else if (cycles) {
+        s->samples += cycles / div;
+        s->pre = cycles % div;
+    }
+    s->synced = esp32p4_clk_count_at(&s->edges,
+                                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 /* RNG_DATA_REG: a new number while the generator runs. */
@@ -135,6 +157,9 @@ static void trng_write(void *opaque, hwaddr addr, uint64_t value,
     switch (addr & ~3) {
     case A_CFG:
         s->cfg = deposit32(s->cfg, shift, size * 8, value) & CFG_RW_MASK;
+        if (s->pre > CFG_PSCALE(s->cfg)) {
+            s->pre = 0;
+        }
         break;
     case A_RSTN:
         s->rstn = deposit32(s->rstn, shift, size * 8, value) & 1;
@@ -174,7 +199,9 @@ static void trng_clk_update(void *opaque, ClockEvent event)
     if (event == ClockPreUpdate) {
         trng_settle(s);
     } else {
-        s->sample_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        esp32p4_clk_count_start(&s->edges, s->clk,
+                                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        s->synced = 0;
     }
 }
 
@@ -187,7 +214,10 @@ static void trng_reset_hold(Object *obj, ResetType type)
     s->rstn = 1;
     s->date = DATE_RESET;
     s->samples = 0;
-    s->sample_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->pre = 0;
+    esp32p4_clk_count_start(&s->edges, s->clk,
+                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    s->synced = 0;
 }
 
 static void trng_init(Object *obj)
@@ -203,15 +233,17 @@ static void trng_init(Object *obj)
 
 static const VMStateDescription vmstate_esp32p4_trng = {
     .name = TYPE_ESP32P4_TRNG,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(cfg, ESP32P4TrngState),
         VMSTATE_UINT32(data, ESP32P4TrngState),
         VMSTATE_UINT32(rstn, ESP32P4TrngState),
         VMSTATE_UINT32(date, ESP32P4TrngState),
         VMSTATE_UINT32(samples, ESP32P4TrngState),
-        VMSTATE_INT64(sample_ns, ESP32P4TrngState),
+        VMSTATE_UINT32(pre, ESP32P4TrngState),
+        VMSTATE_ESP32P4_CLK_COUNT(edges, ESP32P4TrngState),
+        VMSTATE_UINT64(synced, ESP32P4TrngState),
         VMSTATE_END_OF_LIST()
     },
 };

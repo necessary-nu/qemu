@@ -902,8 +902,6 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
 
     qdev_connect_clock_in(ana, "xtal", qdev_get_clock_out(clkrst,
                                                           "osc-xtal"));
-    object_property_set_link(OBJECT(clkrst), "ana", OBJECT(ana),
-                             &error_abort);
     for (i = 0; i < ESP32P4_ANA_NUM_PLLS; i++) {
         g_autofree char *in = g_strdup_printf("%s-in",
                                               esp32p4_ana_pll_names[i]);

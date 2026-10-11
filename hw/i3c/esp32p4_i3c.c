@@ -286,14 +286,10 @@ static int64_t esp32p4_i3c_now(void)
     return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
-/* @n cycles of @period (Clock units) in ns */
-static int64_t esp32p4_i3c_cyc(uint64_t period, uint64_t n)
+/* The first ns by which @n cycles of exact period @period have elapsed */
+static int64_t esp32p4_i3c_cyc(ESP32P4ClkPeriod period, uint64_t n)
 {
-    uint64_t lo, hi;
-
-    mulu64(&lo, &hi, n, period);
-    lo = (lo >> 32) | (hi << 32);
-    return (hi >> 32 || lo > INT64_MAX / 2) ? INT64_MAX / 2 : lo;
+    return MIN(esp32p4_clk_cycles_ns(period, n), INT64_MAX / 2);
 }
 
 /* Master: interrupts and buffers */
@@ -429,38 +425,48 @@ static int esp32p4_i3c_mst_data_kind(ESP32P4I3CMstState *s)
     return s->dev_i2c ? BIT_I2C : BIT_PP;
 }
 
-/*
- * End the current phase @cycles of I3C_MST_CLK after @from (a time),
- * moving to @phase; with the clock stopped the phase waits for it.
- */
-static void esp32p4_i3c_mst_at(ESP32P4I3CMstState *s, int64_t from,
-                               uint64_t cycles, uint32_t phase)
+/* The master's phases count from @t afresh. */
+static void esp32p4_i3c_mst_from(ESP32P4I3CMstState *s, int64_t t)
 {
-    uint64_t period = clock_get(s->clk);
+    s->phase_due = t;
+    s->phase_origin = t;
+    s->phase_cyc = 0;
+}
+
+/*
+ * End the current phase @cycles of I3C_MST_CLK after the last ended,
+ * moving to @phase; with the clock stopped the phase waits for it. The
+ * phases count I3C_MST_CLK's cycles at its exact period from where they
+ * last started afresh, each ending at the first nanosecond its cycles
+ * have elapsed, so that a run of them keeps to the clock.
+ */
+static void esp32p4_i3c_mst_after(ESP32P4I3CMstState *s, uint64_t cycles,
+                                  uint32_t phase)
+{
+    ESP32P4ClkPeriod period = esp32p4_clk_exact(s->clk);
 
     s->phase = phase;
-    s->phase_period = period;
-    if (!period) {
+    if (!esp32p4_clk_period_eq(period, s->phase_period)) {
+        esp32p4_i3c_mst_from(s, s->phase_due);
+        s->phase_period = period;
+    }
+    if (!esp32p4_clk_period_running(period)) {
         s->phase_left = cycles;
         timer_del(&s->timer);
         return;
     }
     s->phase_left = 0;
-    s->phase_due = from + esp32p4_i3c_cyc(period, cycles);
+    s->phase_cyc += cycles;
+    s->phase_due = s->phase_origin + esp32p4_i3c_cyc(period, s->phase_cyc);
     timer_mod(&s->timer, s->phase_due);
-}
-
-static void esp32p4_i3c_mst_after(ESP32P4I3CMstState *s, uint64_t cycles,
-                                  uint32_t phase)
-{
-    esp32p4_i3c_mst_at(s, s->phase_due, cycles, phase);
 }
 
 static void esp32p4_i3c_mst_timer(void *opaque)
 {
     ESP32P4I3CMstState *s = opaque;
 
-    if (s->phase == PH_NONE || s->phase >= PH_WAIT_TX || !s->phase_period) {
+    if (s->phase == PH_NONE || s->phase >= PH_WAIT_TX ||
+        !esp32p4_clk_period_running(s->phase_period)) {
         return;
     }
     esp32p4_i3c_mst_phase_end(s, s->phase_due);
@@ -474,26 +480,26 @@ static void esp32p4_i3c_mst_timer(void *opaque)
 static void esp32p4_i3c_mst_clock_update(void *opaque, ClockEvent event)
 {
     ESP32P4I3CMstState *s = opaque;
-    uint64_t period = clock_get(s->clk);
+    ESP32P4ClkPeriod period = esp32p4_clk_exact(s->clk);
     int64_t now = esp32p4_i3c_now();
-    uint64_t lo, hi;
 
     if (s->phase == PH_NONE || s->phase >= PH_WAIT_TX) {
         return;
     }
-    if (s->phase_period) {
+    if (esp32p4_clk_period_running(s->phase_period)) {
         s->phase_left = 0;
         if (s->phase_due > now) {
-            mulu64(&lo, &hi, s->phase_due - now, 1ull << 32);
-            divu128(&lo, &hi, s->phase_period);
-            s->phase_left = hi ? UINT64_MAX : lo;
+            s->phase_left = esp32p4_clk_ns_cycles(s->phase_period,
+                                                  s->phase_due - now);
         }
     }
     s->phase_period = period;
-    if (!period) {
+    esp32p4_i3c_mst_from(s, now);
+    if (!esp32p4_clk_period_running(period)) {
         timer_del(&s->timer);
         return;
     }
+    s->phase_cyc = s->phase_left;
     s->phase_due = now + esp32p4_i3c_cyc(period, s->phase_left);
     s->phase_left = 0;
     timer_mod(&s->timer, s->phase_due);
@@ -824,7 +830,7 @@ static void esp32p4_i3c_mst_next(ESP32P4I3CMstState *s)
                           "CCC 0x%02x\n", TYPE_ESP32P4_I3C_MST,
                           CMD_CCC(s->cmd_l));
             esp32p4_i3c_mst_raise(s, INT_CMD_CCC_MISMATCH);
-            s->phase_due = esp32p4_i3c_now();
+            esp32p4_i3c_mst_from(s, esp32p4_i3c_now());
             s->in_txn = true;
             esp32p4_i3c_mst_fail(s, ERR_BROADCAST_NACK);
             return;
@@ -850,7 +856,7 @@ static void esp32p4_i3c_mst_next(ESP32P4I3CMstState *s)
     s->in_txn = true;
     s->connected = false;
     esp32p4_i3c_mst_drive(s, true, false, from);
-    s->phase_due = from;
+    esp32p4_i3c_mst_from(s, from);
     esp32p4_i3c_mst_after(s, extract32(s->regs[R_SCL_START_HOLD], 0, 9) + 1,
                           PH_START);
 }
@@ -895,7 +901,7 @@ static void esp32p4_i3c_mst_ibi_run(ESP32P4I3CMstState *s)
         return;
     }
     s->busy = true;
-    s->phase_due = MAX(esp32p4_i3c_now(), s->free_at);
+    esp32p4_i3c_mst_from(s, MAX(esp32p4_i3c_now(), s->free_at));
     /* The header, the payload and the STOP */
     bits = 9 * esp32p4_i3c_mst_bit(s, BIT_OD) +
            9 * s->ibi_pend.len * esp32p4_i3c_mst_bit(s, BIT_PP) +
@@ -1222,7 +1228,9 @@ static void esp32p4_i3c_mst_resume(ESP32P4I3CMstState *s)
     if ((s->phase == PH_WAIT_TX && !fifo32_is_empty(&s->tx)) ||
         (s->phase == PH_WAIT_RX && !fifo32_is_full(&s->rx))) {
         s->phase = PH_NONE;
-        s->phase_due = MAX(s->phase_due, esp32p4_i3c_now());
+        if (esp32p4_i3c_now() > s->phase_due) {
+            esp32p4_i3c_mst_from(s, esp32p4_i3c_now());
+        }
         esp32p4_i3c_mst_data(s);
     }
 }
@@ -1515,7 +1523,7 @@ static void esp32p4_i3c_mst_reset_hold(Object *obj, ResetType type)
     s->present_dct = 0;
     s->present_dat = 0;
     s->phase = PH_NONE;
-    s->phase_period = 0;
+    s->phase_period = esp32p4_clk_period_stopped();
     s->phase_left = 0;
     s->busy = false;
     s->in_txn = false;
@@ -1603,8 +1611,8 @@ static const VMStateDescription vmstate_esp32p4_i3c_ibi = {
 
 static const VMStateDescription vmstate_esp32p4_i3c_mst = {
     .name = TYPE_ESP32P4_I3C_MST,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4I3CMstState),
         VMSTATE_TIMER(timer, ESP32P4I3CMstState),
@@ -1641,8 +1649,10 @@ static const VMStateDescription vmstate_esp32p4_i3c_mst = {
         VMSTATE_UINT32(cmd_h, ESP32P4I3CMstState),
         VMSTATE_UINT32(phase, ESP32P4I3CMstState),
         VMSTATE_INT64(phase_due, ESP32P4I3CMstState),
-        VMSTATE_UINT64(phase_period, ESP32P4I3CMstState),
+        VMSTATE_ESP32P4_CLK_PERIOD(phase_period, ESP32P4I3CMstState),
         VMSTATE_UINT64(phase_left, ESP32P4I3CMstState),
+        VMSTATE_INT64(phase_origin, ESP32P4I3CMstState),
+        VMSTATE_UINT64(phase_cyc, ESP32P4I3CMstState),
         VMSTATE_UINT32(left, ESP32P4I3CMstState),
         VMSTATE_UINT32(done, ESP32P4I3CMstState),
         VMSTATE_UINT8(err, ESP32P4I3CMstState),

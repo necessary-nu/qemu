@@ -229,6 +229,7 @@ system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_ana_cmpr.c',
   'esp32p4_axi_perf_mon.c',
   'esp32p4_cache.c',
+  'esp32p4_clk_period.c',
   'esp32p4_clkrst.c',
   'esp32p4_clkwait.c',
   'esp32p4_crypto.c',

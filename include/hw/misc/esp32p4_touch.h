@@ -129,7 +129,8 @@ struct ESP32P4TouchState {
      * the scan's or software's, and whether the touch timer started it,
      * the frequency mode and modes to
      * measure, and the measurement's counter: the cycles counted up to
-     * meas_base_ns and when the pulses it waits for will have come.
+     * the origin of meas_edges, from which LP_DYN_FAST_CLK's cycles are
+     * counted since, and when the pulses it waits for will have come.
      */
     uint8_t fsm_phase;
     uint8_t cur_ch;
@@ -141,7 +142,7 @@ struct ESP32P4TouchState {
     uint8_t scan_last;
     ESP32P4ClkWait xpd_wait;
     QEMUTimer meas_timer;
-    int64_t meas_base_ns;
+    ESP32P4ClkCount meas_edges;
     uint64_t meas_count;
     int64_t meas_end_ns;
     /* When the timer is due: the end, or the timeout. */

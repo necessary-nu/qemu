@@ -10,6 +10,7 @@
 #define HW_MISC_ESP32P4_PARLIO_H
 
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "hw/core/clock.h"
 #include "hw/dma/esp32p4_gdma.h"
 #include "hw/misc/esp32p4_clkrst.h"
@@ -79,7 +80,7 @@ typedef struct ESP32P4ParlioClk {
     Clock *clk;
     QEMUTimer *timer;
     int64_t base_ns;        /* the internal clock's edge 0 */
-    uint64_t period;        /* ... its period then, in Clock units */
+    ESP32P4ClkPeriod half;  /* ... half its period then, exactly */
     uint64_t next;          /* the next internal edge's number */
     bool running;           /* edges being taken, one after the other */
     bool in_level;          /* the divided input clock */

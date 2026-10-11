@@ -10,6 +10,7 @@
 #define HW_DMA_ESP32P4_GDMA_H
 
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "hw/core/clock.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -306,7 +307,12 @@ struct ESP32P4GdmaState {
     qemu_irq etm_event[ESP32P4_GDMA_ETM_EVENTS];
     Clock *clk;
     QEMUTimer *timer;
-    /* When the round @timer runs falls due. */
+    /*
+     * The bus clock's cycles, counted from its last change, and the cycle
+     * of the round @timer runs, which falls due at @due_ns.
+     */
+    ESP32P4ClkCount bus_edges;
+    int64_t due_cycle;
     int64_t due_ns;
     /* The bus as the channels reach it, through the APMs. */
     MemoryRegion *bus;
@@ -338,7 +344,10 @@ struct ESP32P4GdmaState {
     uint32_t link_switch_state;
     bool etm_task_level[ESP32P4_GDMA_ETM_TASKS];
 
-    /* The arbiters: the last channel granted and their time slots' starts. */
+    /*
+     * The arbiters: the last channel granted and their time slots' starts,
+     * as cycles of @bus_edges.
+     */
     uint32_t rr_last[2];
     int64_t slot_start[2];
 

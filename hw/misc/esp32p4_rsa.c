@@ -537,8 +537,8 @@ static void rsa_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_esp32p4_rsa = {
     .name = TYPE_ESP32P4_RSA,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_ESP32P4_CRYPTO_TIMER(op, ESP32P4RsaState),
         VMSTATE_BOOL_ARRAY(reset_in, ESP32P4RsaState, ESP32P4_RSA_RESETS),
