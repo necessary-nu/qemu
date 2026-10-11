@@ -24,6 +24,7 @@ config ESP32P4
     imply I2C_DEVICES
     imply I3C_DEVICES
     imply AT24C
+    imply MOCK_I3C_TARGET
 
 config MICROCHIP_PFSOC
     bool

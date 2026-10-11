@@ -15,6 +15,7 @@
 #include "hw/core/split-irq.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "hw/i2c/esp32p4_i2c.h"
+#include "hw/i3c/esp32p4_i3c.h"
 #include "hw/intc/esp32p4_clic.h"
 #include "hw/intc/esp32p4_clint.h"
 #include "hw/intc/esp32p4_intmatrix.h"
@@ -116,6 +117,8 @@ struct ESP32P4MachineState {
     ESP32P4IcmState icm;
     ESP32P4I2CState i2c[2];
     ESP32P4I2CState lp_i2c;
+    ESP32P4I3CMstState i3c_mst;
+    ESP32P4I3CSlvState i3c_slv;
 
     SSIBus *flash_bus;
     uint64_t flash_size;
