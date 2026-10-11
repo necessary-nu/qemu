@@ -179,6 +179,13 @@
 #define LP_SIG_I_SD         10
 #define LP_SIG_I_WS         11
 
+/* The PMU's sleep request and rejection */
+#define PMU                 0x50115000
+#define PMU_SLP_WAKEUP_CNTL0 (PMU + 0x120)
+#define PMU_SLP_WAKEUP_CNTL1 (PMU + 0x124)
+#define PMU_SLP_WAKEUP_CNTL4 (PMU + 0x130)
+#define PMU_SLP_WAKEUP_STATUS1 (PMU + 0x148)
+
 /* The interrupt matrix's source status, core 0 */
 #define INTMTX_STATUS(w)    (0x500d6000 + 0x200 + 4 * (w))
 #define SRC_LP_I2S          12
@@ -1113,7 +1120,8 @@ static void test_lp_mem(void)
  * frame then is not speech; loud frames are, and after
  * PARAM_HANGOVER_SPEECH + 1 of them VAD_FLAG rises; frames below
  * PARAM_MIN_ENERGY are not speech and, past PARAM_HANGOVER_SILENT, VAD_FLAG
- * falls. VAD_DONE marks each frame, VAD_RESET_DONE the reset.
+ * falls. VAD_DONE marks each frame, VAD_RESET_DONE the reset; VAD_FLAG,
+ * LP_I2S_WAKEUP, reaches the PMU as its wakeup source 19.
  */
 static void test_vad_manual(void)
 {
@@ -1145,6 +1153,15 @@ static void test_vad_manual(void)
         g_assert_cmphex(lp_r(qts, LP_VAD_OB(0)) & 0xff, ==, i + 1);
     }
     g_assert_cmphex(lp_r(qts, LP_VAD_RESULT), ==, 3);
+    /*
+     * VAD_FLAG is LP_I2S_WAKEUP, the PMU's wakeup source 19: enabled to
+     * reject sleep, it rejects a sleep request.
+     */
+    qtest_writel(qts, PMU_SLP_WAKEUP_CNTL1, (1u << 31) | (1u << 19));
+    qtest_writel(qts, PMU_SLP_WAKEUP_CNTL0, 1u << 31);
+    g_assert_cmphex(qtest_readl(qts, PMU_SLP_WAKEUP_STATUS1), ==, 1u << 19);
+    qtest_writel(qts, PMU_SLP_WAKEUP_CNTL1, 0);
+    qtest_writel(qts, PMU_SLP_WAKEUP_CNTL4, 1u << 31);
     g_assert_cmphex(lp_r(qts, LP_VAD_OB(0)) >> 16, ==, 8000);
     /* Energy of the frame: 256 * 8000^2 */
     g_assert_cmphex(lp_r(qts, LP_VAD_OB(7)), ==,

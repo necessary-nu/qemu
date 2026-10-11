@@ -1853,9 +1853,10 @@ static void esp32p4_hp_top_power(void *opaque, int n, int level)
  *     HP_SYSTEM's interrupt wakeup (the TRM's "HP CPU" source) and the EXT
  *     wakeup on pads GPIO0 to GPIO15, which LP_SYSTEM records too. Its ETM
  *     task, PMU_TASK_SLEEP_REQ, and event, PMU_EVT_SLEEP_WAKEUP, are the
- *     ETM's (esp32p4_init_etm()). The other sources' "wakeup" lines,
- *     UART_WAKEUP_EN and the LP interrupt wait for the blocks that take
- *     them (UARTs, USB, SDIO, touch, LP I2S, EMAC, the LP core's
+ *     ETM's (esp32p4_init_etm()), and the LP I2S's VAD wakeup is
+ *     connected with the LP I2S (esp32p4_init_i2s()). The other sources'
+ *     "wakeup" lines, UART_WAKEUP_EN and the LP interrupt wait for the
+ *     blocks that take them (UARTs, USB, SDIO, touch, EMAC, the LP core's
  *     interrupts).
  *   - LP_ANALOG_PERI, behind its LP_CLKRST reset, its interrupt source 8:
  *     the brown-out detector, on BIAS's thresholds, and the glitch and
@@ -2296,7 +2297,7 @@ static void esp32p4_init_twai(ESP32P4MachineState *s)
  * 27 to 29) and its signals are matrix signals 25 to 45. The LP I2S is
  * behind LPPERI's LP_I2S clock gate and reset, receives on LP_I2S_RX_CLK,
  * interrupts with LP_I2S_INTR (source 12) and has LP matrix signals 9 to
- * 11; its VAD's wakeup is for the PMU, which is not modelled. Every
+ * 11; its VAD's LP_I2S_WAKEUP is the PMU's wakeup source 19. Every
  * controller sees the others, so that one's master clock can drive
  * another's slave units through the pads.
  */
@@ -2354,6 +2355,11 @@ static void esp32p4_init_i2s(ESP32P4MachineState *s)
             esp32p4_clkrst_gate_volatile(g, 0xc00, 0x400);
             sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                                esp32p4_intr_source(s, ESP32P4_INTR_LP_I2S));
+            qdev_connect_gpio_out_named(dev, ESP32P4_I2S_WAKEUP, 0,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&s->pmu),
+                                            ESP32P4_PMU_WAKEUP,
+                                            ESP32P4_PMU_WAKE_LP_I2S));
         } else {
             esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
                                      ESP32P4_I2S0_BASE + i * ESP32P4_I2S_SIZE,
