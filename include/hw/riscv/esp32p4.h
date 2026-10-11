@@ -16,6 +16,7 @@
 #include "hw/cpu/cluster.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/dma/esp32p4_gdma.h"
+#include "hw/dma/esp32p4_uhci.h"
 #include "hw/core/split-irq.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "hw/intc/esp32p4_clic.h"
@@ -172,6 +173,7 @@ struct ESP32P4MachineState {
     ESP32P4UartState uart[ESP32P4_UART_COUNT];
     ESP32P4UartState lp_uart;
     Esp32UartTerminalState terminal[ESP32P4_SERIAL_PORTS];
+    ESP32P4UhciState uhci;
 };
 
 #endif

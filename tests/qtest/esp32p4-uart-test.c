@@ -985,6 +985,202 @@ static void test_rom_banner(void)
     unlink(log);
 }
 
+/* UHCI0 and GDMA-AHB */
+#define UHCI                0x500df000
+#define UHCI_CONF0          (UHCI + 0x00)
+#define UHCI_INT_RAW        (UHCI + 0x04)
+#define UHCI_INT_CLR        (UHCI + 0x10)
+#define UHCI_CONF1          (UHCI + 0x14)
+#define UHCI_ESCAPE_CONF    (UHCI + 0x20)
+#define UHCI_HUNG_CONF      (UHCI + 0x24)
+#define UHCI_QUICK_SENT     (UHCI + 0x30)
+#define UHCI_Q_WORD(n, w)   (UHCI + 0x34 + 8 * (n) + 4 * (w))
+#define UHCI_ESC_CONF0      (UHCI + 0x6c)
+#define UHCI_PKT_THRES      (UHCI + 0x7c)
+#define UHCI_DATE           (UHCI + 0x80)
+#define UHCI_SEL(n)         ((n) << 2)
+#define UHCI_SEPER_EN       (1u << 5)
+#define UHCI_IDLE_EOF_EN    (1u << 8)
+#define UHCI_LEN_EOF_EN     (1u << 9)
+#define UHCI_BRK_EOF_EN     (1u << 12)
+#define UHCI_INT_RX_START   (1u << 0)
+#define UHCI_INT_TX_START   (1u << 1)
+#define UHCI_INT_TX_HUNG    (1u << 3)
+#define UHCI_INT_SEND_S_Q   (1u << 4)
+
+#define AHB                 0x50085000
+#define AHB_IN_INT_RAW(ch)  (AHB + 0x10 * (ch))
+#define AHB_OUT_INT_RAW(ch) (AHB + 0x30 + 0x10 * (ch))
+#define AHB_IN(ch)          (AHB + 0x70 + 0xc0 * (ch))
+#define AHB_OUT(ch)         (AHB + 0xd0 + 0xc0 * (ch))
+#define AHB_IN_LINK_ADDR(ch)  (AHB + 0x3ac + 4 * (ch))
+#define AHB_OUT_LINK_ADDR(ch) (AHB + 0x3b8 + 4 * (ch))
+#define AHB_LINK            0x10
+#define AHB_PERI_SEL        0x30
+#define AHB_IN_LINK_START   (1u << 2)
+#define AHB_OUT_LINK_START  (1u << 1)
+#define AHB_PERI_UHCI0      2
+#define AHB_IN_SUC_EOF      (1u << 1)
+#define AHB_OUT_TOTAL_EOF   (1u << 3)
+#define DW0(size, len)      ((size) | (len) << 12)
+#define DESC_SUC_EOF        (1u << 30)
+#define DESC_OWNER          (1u << 31)
+#define MEM                 0x4ff40000
+
+static void desc(QTestState *qts, uint32_t addr, uint32_t dw0, uint32_t buf,
+                 uint32_t next)
+{
+    qtest_writel(qts, addr, dw0);
+    qtest_writel(qts, addr + 4, buf);
+    qtest_writel(qts, addr + 8, next);
+}
+
+/* GDMA-AHB channel 0's TX (or RX) side on UHCI0, its list at @list. */
+static void ahb_start(QTestState *qts, bool rx, uint32_t list)
+{
+    if (rx) {
+        qtest_writel(qts, AHB_IN(0) + AHB_PERI_SEL, AHB_PERI_UHCI0);
+        qtest_writel(qts, AHB_IN_LINK_ADDR(0), list);
+        qtest_writel(qts, AHB_IN(0) + AHB_LINK, AHB_IN_LINK_START);
+    } else {
+        qtest_writel(qts, AHB_OUT(0) + AHB_PERI_SEL, AHB_PERI_UHCI0);
+        qtest_writel(qts, AHB_OUT_LINK_ADDR(0), list);
+        qtest_writel(qts, AHB_OUT(0) + AHB_LINK, AHB_OUT_LINK_START);
+    }
+}
+
+/*
+ * UHCI sending: GDMA-AHB's TX channel on UHCI0 feeds UART1's TX FIFO as
+ * it has room, here looped back into UART1's RX FIFO; with SEPER_EN the
+ * encoder frames the data with separators and escapes 0xC0 and 0xDB.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+static void test_uhci_tx(void)
+{
+    QTestState *qts = start();
+    static const uint8_t data[] = { 0x01, 0xc0, 0xdb, 0x02 };
+    static const uint8_t line[] = {
+        0xc0, 0x01, 0xdb, 0xdc, 0xdb, 0xdd, 0x02, 0xc0,
+    };
+    uint32_t list = MEM, buf = MEM + 0x100;
+    int i;
+
+    g_assert_cmphex(qtest_readl(qts, UHCI_CONF0), ==, 0x6fc);
+    g_assert_cmphex(qtest_readl(qts, UHCI_ESC_CONF0), ==, 0x00dcdbc0);
+    g_assert_cmphex(qtest_readl(qts, UHCI_HUNG_CONF), ==, 0x00810810);
+    g_assert_cmphex(qtest_readl(qts, UHCI_PKT_THRES), ==, 0x80);
+    g_assert_cmphex(qtest_readl(qts, UHCI_DATE), ==, 0x02201100);
+
+    setup(qts, UART(1), CONF0_8N1 | CONF0_LOOPBACK);
+    qtest_memwrite(qts, buf, data, sizeof(data));
+    desc(qts, list, DESC_OWNER | DESC_SUC_EOF | DW0(4, 4), buf, 0);
+    /* Raw, as ESP-IDF sets it up without separators: no escapes either */
+    qtest_writel(qts, UHCI_CONF0, UHCI_SEL(1));
+    qtest_writel(qts, UHCI_ESCAPE_CONF, 0);
+    ahb_start(qts, false, list);
+    qtest_clock_step(qts, 5 * FRAME_NS);
+    g_assert_cmpuint(rx_count(qts, UART(1)), ==, 4);
+    for (i = 0; i < 4; i++) {
+        g_assert_cmphex(rd(qts, UART(1), FIFO), ==, data[i]);
+    }
+    g_assert_true(qtest_readl(qts, AHB_OUT_INT_RAW(0)) & AHB_OUT_TOTAL_EOF);
+
+    qtest_writel(qts, UHCI_INT_CLR, 0x1ff);
+    qtest_writel(qts, UHCI_CONF0, UHCI_SEL(1) | UHCI_SEPER_EN);
+    qtest_writel(qts, UHCI_ESCAPE_CONF, 0x33);
+    desc(qts, list, DESC_OWNER | DESC_SUC_EOF | DW0(4, 4), buf, 0);
+    ahb_start(qts, false, list);
+    qtest_clock_step(qts, 9 * FRAME_NS);
+    g_assert_true(qtest_readl(qts, UHCI_INT_RAW) & UHCI_INT_RX_START);
+    g_assert_cmpuint(rx_count(qts, UART(1)), ==, sizeof(line));
+    for (i = 0; i < sizeof(line); i++) {
+        g_assert_cmphex(rd(qts, UART(1), FIFO), ==, line[i]);
+    }
+
+    /* A short packet: Q2's two words, little-endian, as a frame */
+    qtest_writel(qts, UHCI_Q_WORD(2, 0), 0x44332211);
+    qtest_writel(qts, UHCI_Q_WORD(2, 1), 0x88776655);
+    qtest_writel(qts, UHCI_QUICK_SENT, 2 | (1u << 3));
+    qtest_clock_step(qts, 11 * FRAME_NS);
+    g_assert_true(qtest_readl(qts, UHCI_INT_RAW) & UHCI_INT_SEND_S_Q);
+    g_assert_cmpuint(rx_count(qts, UART(1)), ==, 10);
+    g_assert_cmphex(rd(qts, UART(1), FIFO), ==, 0xc0);
+    for (i = 0; i < 8; i++) {
+        g_assert_cmphex(rd(qts, UART(1), FIFO), ==, 0x11 * (i + 1));
+    }
+    g_assert_cmphex(rd(qts, UART(1), FIFO), ==, 0xc0);
+    qtest_quit(qts);
+}
+
+/*
+ * UHCI receiving: UART1's RX FIFO into GDMA-AHB's RX channel on UHCI0,
+ * through the decoder; a frame ends at its closing separator, when the
+ * UART has idled RX_IDLE_THRHD bits (UART_IDLE_EOF_EN), or after PKT_THRS
+ * bytes (LEN_EOF_EN); with no RX channel the bytes stay in the FIFO.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+static void test_uhci_rx(void)
+{
+    QTestState *qts = start();
+    static const uint8_t line[] = {
+        0xc0, 0x01, 0xdb, 0xdc, 0xdb, 0xdd, 0x02, 0xc0,
+    };
+    static const uint8_t want[] = { 0x01, 0xc0, 0xdb, 0x02 };
+    uint32_t list = MEM, buf = MEM + 0x100;
+    uint8_t got[16];
+    int i;
+
+    setup(qts, UART(1), CONF0_8N1 | CONF0_LOOPBACK);
+    qtest_writel(qts, UHCI_CONF0, UHCI_SEL(1) | UHCI_SEPER_EN);
+    /* No RX channel: the UART keeps its bytes for software. */
+    wr(qts, UART(1), FIFO, 0x55);
+    qtest_clock_step(qts, FRAME_NS + BIT_NS);
+    g_assert_cmpuint(rx_count(qts, UART(1)), ==, 1);
+    rd(qts, UART(1), FIFO);
+
+    desc(qts, list, DESC_OWNER | DW0(16, 0), buf, 0);
+    ahb_start(qts, true, list);
+    for (i = 0; i < sizeof(line); i++) {
+        wr(qts, UART(1), FIFO, line[i]);
+    }
+    qtest_clock_step(qts, 9 * FRAME_NS);
+    g_assert_cmpuint(rx_count(qts, UART(1)), ==, 0);
+    g_assert_true(qtest_readl(qts, UHCI_INT_RAW) & UHCI_INT_TX_START);
+    g_assert_true(qtest_readl(qts, AHB_IN_INT_RAW(0)) & AHB_IN_SUC_EOF);
+    g_assert_cmphex(qtest_readl(qts, list), ==, DESC_SUC_EOF | DW0(16, 4));
+    qtest_memread(qts, buf, got, 4);
+    g_assert_cmpmem(got, 4, want, 4);
+
+    /* Raw, ended by 10 bits of idle */
+    wr(qts, UART(1), IDLE_CONF, 10);
+    update(qts, UART(1));
+    qtest_writel(qts, UHCI_CONF0, UHCI_SEL(1) | UHCI_IDLE_EOF_EN);
+    qtest_writel(qts, AHB_IN_INT_RAW(0) + 0xc, 0xff);
+    desc(qts, list, DESC_OWNER | DW0(16, 0), buf, 0);
+    ahb_start(qts, true, list);
+    for (i = 0; i < 3; i++) {
+        wr(qts, UART(1), FIFO, 0xa0 + i);
+    }
+    qtest_clock_step(qts, 3 * FRAME_NS + 5 * BIT_NS);
+    g_assert_false(qtest_readl(qts, AHB_IN_INT_RAW(0)) & AHB_IN_SUC_EOF);
+    qtest_clock_step(qts, 10 * BIT_NS);
+    g_assert_true(qtest_readl(qts, AHB_IN_INT_RAW(0)) & AHB_IN_SUC_EOF);
+    g_assert_cmphex(qtest_readl(qts, list), ==, DESC_SUC_EOF | DW0(16, 3));
+
+    /* Raw, ended after PKT_THRS bytes */
+    qtest_writel(qts, UHCI_CONF0, UHCI_SEL(1) | UHCI_LEN_EOF_EN);
+    qtest_writel(qts, UHCI_PKT_THRES, 2);
+    qtest_writel(qts, AHB_IN_INT_RAW(0) + 0xc, 0xff);
+    desc(qts, list, DESC_OWNER | DW0(16, 0), buf, 0);
+    ahb_start(qts, true, list);
+    for (i = 0; i < 3; i++) {
+        wr(qts, UART(1), FIFO, 0xb0 + i);
+    }
+    qtest_clock_step(qts, 3 * FRAME_NS + BIT_NS);
+    g_assert_cmphex(qtest_readl(qts, list), ==, DESC_SUC_EOF | DW0(16, 2));
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1004,6 +1200,8 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/uart/resets", test_resets);
     qtest_add_func("esp32p4/uart/wakeup", test_wakeup);
     qtest_add_func("esp32p4/uart/serial_port", test_serial_port);
+    qtest_add_func("esp32p4/uart/uhci_tx", test_uhci_tx);
+    qtest_add_func("esp32p4/uart/uhci_rx", test_uhci_rx);
     qtest_add_func("esp32p4/uart/rom_banner", test_rom_banner);
 
     return g_test_run();

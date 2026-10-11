@@ -138,6 +138,10 @@
  *
  *       -serial stdio -serial null -serial file:uart2.log
  *
+ *     UHCI0 (0x500DF000), behind UHCI_APB_CLK and its reset, its
+ *     interrupt source 30, moves the data of the UART CONF0.UART_SEL
+ *     names through GDMA-AHB as peripheral UHCI0.
+ *
  *   - The DMA controllers (TRM chapters 6 and 7): GDMA-AHB at 0x50085000
  *     and GDMA-AXI at 0x5008A000, three RX and three TX channels each,
  *     behind AHB_PDMA_SYS_CLK and AXI_PDMA_SYS_CLK and their resets, their
@@ -266,7 +270,6 @@ static const struct {
     { "i3c-slv",          0x500db000, 4 * KiB },
     { "lcd-cam",          0x500dc000, 4 * KiB },
     { "adc",              0x500de000, 4 * KiB },
-    { "uhci",             0x500df000, 4 * KiB },
     { "iomux-mspi-pin",   0x500e1200, 4 * KiB - 0x200 },
     { "mem-monitor",      0x500e3000, 4 * KiB },
     { "audio-addc",       0x500e4000, 4 * KiB },
@@ -1640,7 +1643,7 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
  * comment): each UART's registers behind its bus clock and APB reset,
  * FIFO_REG's read popping the RX FIFO and reading 0 while gated; its core
  * on its function clock and core reset; its lines through the GPIO
- * matrix.
+ * matrix. Then UHCI0, between the UARTs and GDMA-AHB.
  */
 /* [spec:nuos:req:emu.esp32p4.uart] */
 static void esp32p4_init_uart(ESP32P4MachineState *s)
@@ -1774,6 +1777,24 @@ static void esp32p4_init_uart(ESP32P4MachineState *s)
                                         ESP32P4_GPIO_PAD_IN, rx_pad));
         qdev_realize(term, NULL, &error_fatal);
     }
+
+    object_initialize_child(OBJECT(s), "uhci", &s->uhci, TYPE_ESP32P4_UHCI);
+    dev = DEVICE(&s->uhci);
+    object_property_set_link(OBJECT(dev), "gdma", OBJECT(&s->gdma[0]),
+                             &error_abort);
+    for (i = 0; i < ESP32P4_UART_COUNT; i++) {
+        g_autofree char *link = g_strdup_printf("uart%d", i);
+
+        object_property_set_link(OBJECT(dev), link, OBJECT(&s->uart[i]),
+                                 &error_abort);
+    }
+    qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, "uhci-sys"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_UHCI_BASE, ESP32P4_CLK_UHCI_APB,
+                             ESP32P4_RST_UHCI, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_UHCI0));
 }
 
 /* The memories -kernel can load into: those the cores address directly. */
