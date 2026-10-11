@@ -120,17 +120,22 @@ bool i3c_scan_bus(I3CBus *bus, uint8_t address, enum I3CEvent event)
         g_free(node);
     }
 
+    /*
+     * A broadcast reaches every target, but for the broadcast address
+     * read in ENTDAA, which the target that wins the arbitration of its
+     * provisioned ID answers alone; a direct address, its target.
+     */
     QTAILQ_FOREACH(child, &bus->parent_obj.children, sibling) {
         DeviceState *qdev = child->child;
         I3CTarget *target = I3C_TARGET(qdev);
 
-        if (i3c_target_match_and_add(bus, target, address, event)) {
+        if (i3c_target_match_and_add(bus, target, address, event) &&
+            (!bus->broadcast || bus->in_entdaa)) {
             return true;
         }
     }
 
-    /* No one on the bus could respond. */
-    return false;
+    return !QLIST_EMPTY(&bus->current_devs);
 }
 
 /* Class-level event handling, since we do some CCCs at the class level. */
@@ -162,9 +167,21 @@ static int i3c_do_start_transfer(I3CBus *bus, uint8_t address,
 
     if (address == I3C_BROADCAST) {
         bus->broadcast = true;
-        /* If we're not in ENTDAA, a broadcast is the start of a new CCC. */
+        /*
+         * If we're not in ENTDAA, a broadcast is the start of a new CCC,
+         * for every target.
+         */
         if (!bus->in_entdaa) {
+            BusChild *child;
+
             bus->in_ccc = false;
+            QTAILQ_FOREACH(child, &bus->parent_obj.children, sibling) {
+                I3CTarget *t = I3C_TARGET(child->child);
+
+                t->in_ccc = false;
+                t->curr_ccc = 0;
+                t->ccc_byte_offset = 0;
+            }
         }
     } else {
         bus->broadcast = false;
@@ -214,38 +231,27 @@ void i3c_end_transfer(I3CBus *bus)
 {
     I3CTargetClass *tc;
     I3CNode *node, *next;
+    BusChild *child;
 
     trace_i3c_end_transfer();
 
     /*
-     * If we're in ENTDAA, we need to notify all devices when ENTDAA is done.
-     * This is because everyone initially participates due to the broadcast,
-     * but gradually drops out as they get assigned addresses.
-     * Since the current_devs list only stores who's currently participating,
-     * and not everyone who previously participated, we send the STOP to all
-     * children.
+     * Every target sees the STOP, not only those still in the transfer:
+     * a broadcast CCC reached them all, and those a repeated START left
+     * out (to another target, or to the next device in ENTDAA) are still
+     * in it until the STOP ends it.
      */
-    if (bus->in_entdaa) {
-        BusChild *child;
-
-        QTAILQ_FOREACH(child, &bus->parent_obj.children, sibling) {
-            DeviceState *qdev = child->child;
-            I3CTarget *t = I3C_TARGET(qdev);
-            tc = I3C_TARGET_GET_CLASS(t);
-            if (tc->event) {
-                i3c_target_event(t, I3C_STOP);
-            }
+    QTAILQ_FOREACH(child, &bus->parent_obj.children, sibling) {
+        DeviceState *qdev = child->child;
+        I3CTarget *t = I3C_TARGET(qdev);
+        tc = I3C_TARGET_GET_CLASS(t);
+        if (tc->event) {
+            i3c_target_event(t, I3C_STOP);
         }
-    } else {
-        QLIST_FOREACH_SAFE(node, &bus->current_devs, next, next) {
-            I3CTarget *t = node->target;
-            tc = I3C_TARGET_GET_CLASS(t);
-            if (tc->event) {
-                i3c_target_event(t, I3C_STOP);
-            }
-            QLIST_REMOVE(node, next);
-            g_free(node);
-        }
+    }
+    QLIST_FOREACH_SAFE(node, &bus->current_devs, next, next) {
+        QLIST_REMOVE(node, next);
+        g_free(node);
     }
     bus->broadcast = false;
     bus->in_entdaa = false;
@@ -286,7 +292,14 @@ static int i3c_target_handle_ccc_write(I3CTarget *t, const uint8_t *data,
         }
         break;
     case I3C_CCCD_SETDASA:
-        t->address = t->static_address;
+        /*
+         * The byte after the target's static address is its dynamic
+         * address, shifted up by one.
+         */
+        if (*num_sent < num_to_send) {
+            t->address = data[*num_sent] >> 1;
+            ++*num_sent;
+        }
         break;
     case I3C_CCC_SETAASA:
         t->address = t->static_address;
@@ -295,10 +308,13 @@ static int i3c_target_handle_ccc_write(I3CTarget *t, const uint8_t *data,
         t->address = 0;
         break;
     case I3C_CCCD_SETNEWDA:
-        /* If this isn't the CCC byte, it's our new address. */
-        if (*num_sent == 0) {
-            t->address = *data;
-            *num_sent = 1;
+        /*
+         * If this isn't the CCC byte, it's our new address, shifted up
+         * by one.
+         */
+        if (*num_sent < num_to_send) {
+            t->address = data[*num_sent] >> 1;
+            ++*num_sent;
         }
         break;
     case I3C_CCC_ENTTM:

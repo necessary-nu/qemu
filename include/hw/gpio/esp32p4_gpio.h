@@ -143,6 +143,12 @@ enum {
  *     pad n: the pads driven from outside and their levels, settable
  *     with -global before the machine starts and with qom-set while it
  *     runs, for a board's fixed wiring.
+ *   Property "pad-wires": pads the board wires together, as groups of
+ *     GPIO numbers joined by ':' and separated by ',' ("7:9,8:10" joins
+ *     GPIO7 to GPIO9 and GPIO8 to GPIO10). The pads of a wire share its
+ *     level, low while any is driven low (open-drain buses through two
+ *     controllers' pads), else high while any is driven high or pulled
+ *     up.
  *   Property "strap-mode": the board's strapping of GPIO34 to GPIO38, in
  *     GPIO_STRAP's layout, which GPIO_STRAP latches at reset for each of
  *     those pads not then driven from outside. The default is SPI boot.
@@ -188,6 +194,11 @@ enum {
  *     _CLEAR or _TOGGLE): a rising level sets, clears or toggles GPIO_OUT
  *     of each pad whose GPIO_EXT_ETM_TASK_GPIOn_EN is set and whose
  *     _SEL names the channel.
+ *   ESP32P4_GPIO_ETM_ZERO_DET, "etm-zero-det" (output, 4 lines): the
+ *     analog comparators' ETM events GPIO_EVT_ZERO_DET_POS<n> (line 2n)
+ *     and _NEG<n> (line 2n + 1), pulsed on the rising and falling edges
+ *     that set COMP<n>_POS_INT_RAW and _NEG_INT_RAW, through the same
+ *     GPIO_ZERO_DET<n>_FILTER_CNT filter.
  *
  * The interrupts are the sysbus IRQs, in the order of ESP32P4GpioIrq,
  * each a source of the interrupt matrix; the LP GPIO interrupt reaches
@@ -214,6 +225,7 @@ enum {
 #define ESP32P4_GPIO_LP_WAKEUP      "lp-wakeup"
 #define ESP32P4_GPIO_ETM_EVENT      "etm-event"
 #define ESP32P4_GPIO_ETM_TASK       "etm-task"
+#define ESP32P4_GPIO_ETM_ZERO_DET   "etm-zero-det"
 
 #define ESP32P4_GPIO_IOMUX_LINE(pad, func) \
     ((pad) * ESP32P4_IOMUX_FUNCS + (func))
@@ -241,6 +253,7 @@ enum {
 #define ESP32P4_GPIO_ETM_LINES (ESP32P4_GPIO_ETM_CHANNELS * 3)
 
 #define ESP32P4_GPIO_ANA_COMPS 2
+#define ESP32P4_GPIO_ETM_ZERO_DET_LINES (ESP32P4_GPIO_ANA_COMPS * 2)
 
 /*
  * The interrupt outputs, sources of the interrupt matrix: GPIO_INTR0 to
@@ -293,6 +306,7 @@ struct ESP32P4GpioState {
     qemu_irq wakeup_out;
     qemu_irq lp_wakeup_out;
     qemu_irq etm_event[ESP32P4_GPIO_ETM_LINES];
+    qemu_irq etm_zero_det[ESP32P4_GPIO_ETM_ZERO_DET_LINES];
     Notifier line_source;
     NotifierList route_notifiers;
 
@@ -378,6 +392,8 @@ struct ESP32P4GpioState {
     uint64_t ext_level;
     uint64_t ext_pull_up;
     uint64_t ext_hold;
+    /* The board's wire each pad is on, numbered from 1; 0 for none. */
+    uint8_t pad_wire[ESP32P4_GPIO_PADS];
     bool light_sleep;
     uint8_t sig_out[ESP32P4_GPIO_SIGS];
     uint8_t sig_oe[ESP32P4_GPIO_SIGS];
@@ -443,13 +459,22 @@ bool esp32p4_gpio_pad_driven(ESP32P4GpioState *s, unsigned n, bool *level);
 /*
  * The output signal that reaches input signal sig through a pad: the pad
  * the GPIO matrix or IO MUX connects to sig has its input enabled, is not
- * driven from outside and is driven, push-pull, by output signal *src
- * through the matrix or its IO MUX function. *inverted says whether the
- * path inverts the level. Returns false if sig has no such source. For a
- * peripheral that models a serial link a frame at a time, to find which
- * of its own outputs one of its inputs listens to.
+ * driven from outside or on a board wire, and is driven, push-pull, by
+ * output signal *src through the matrix or its IO MUX function.
+ * *inverted says whether the path inverts the level. Returns false if sig
+ * has no such source. For a peripheral that models a serial link a frame
+ * at a time, to find which of its own outputs one of its inputs listens
+ * to.
  */
 bool esp32p4_gpio_sig_in_source(ESP32P4GpioState *s, unsigned sig,
                                 unsigned *src, bool *inverted);
+
+/*
+ * Whether HP pad n's IO MUX selects function func, with its input
+ * enabled: for a block whose IO MUX function takes a clock from the pad,
+ * which no line carries.
+ */
+bool esp32p4_gpio_iomux_in_selected(ESP32P4GpioState *s, unsigned n,
+                                    unsigned func);
 
 #endif

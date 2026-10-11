@@ -13,12 +13,23 @@ config ESP32P4
     bool
     default y
     depends on RISCV32 && TCG
+    select CAN_BUS
     select CPU_CLUSTER
+    select DWC_SDMMC
+    select ESP32_DWMAC
+    select ESP32P4_USB
     select ESP32_LINE
+    select I2C
+    select I3C
+    select OR_IRQ
     select SSI
     select SPLIT_IRQ
     select SSI_M25P80
     select UNIMP
+    imply I2C_DEVICES
+    imply I3C_DEVICES
+    imply AT24C
+    imply MOCK_I3C_TARGET
 
 config MICROCHIP_PFSOC
     bool
