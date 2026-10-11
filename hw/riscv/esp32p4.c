@@ -324,7 +324,11 @@
  * image -bios names. With -kernel, an ELF's segments are loaded into
  * L2MEM (past the L2 cache), the TCM or LP SRAM, and core 0 starts at the
  * ELF's entry point rather than in the ROM, with the caches empty; core 1
- * is still held for software to release.
+ * is still held for software to release. The program finds the super
+ * watchdog as the ROM leaves the program it boots: running since the
+ * reset, unfed, its SWD_RESET_FLAG cleared (the ROM's main() clears it on
+ * core 0 at every boot), and its reset not enabled by LP_SYSTEM's FIB
+ * control until software enables it.
  *
  * The ELF stands for the program the ROM boots from flash, and takes the
  * ROM's place whenever the HP system starts: after an HP core reset that
@@ -2078,11 +2082,8 @@ static void esp32p4_hp_top_power(void *opaque, int n, int level)
  *     the LP core takes the PMU's interrupts as sources 6 and 7.
  *   - LP_ANALOG_PERI, behind its LP_CLKRST reset, its interrupt source 8:
  *     the brown-out detector, on BIAS's thresholds, and the glitch and
- *     power supply detectors. The detector's "bod-en" is left at the
- *     analog default, enabled, rather than taken from LP_SYSTEM's
- *     "bod-reset-en", which reads a set FIB bit as disabling the detector
- *     and so, from its reset value, would disable it, where TRM 21.2.2.2
- *     has a set bit enable it.
+ *     power supply detectors, the detector enabled by LP_SYSTEM's FIB
+ *     control (esp32p4_init_debug()).
  *   - The LP mailbox, behind its LP_CLKRST reset, MB_HP_INTR and MB_LP_INTR
  *     sources 4 and 5.
  */
@@ -2361,10 +2362,10 @@ static void esp32p4_sw_sys_reset(void *opaque, int n, int level)
  *     pads are the GPIO block's "hold-all", esp32p4_init_low_power()).
  *   - LP_SYSTEM's software system reset, an HP core reset with cause 0x03
  *     (TRM table 11.1-1), its choice of the core whose stall the RTC
- *     timer follows, and its FIB control of the super watchdog's reset,
- *     to the RTC watchdog. Its LP core disable is the LP core's
- *     (esp32p4_init_lp_core()); its brownout reset enable is not
- *     connected (see esp32p4_init_low_power()).
+ *     timer follows, and its FIB control (TRM 21.2.2.2) of the super
+ *     watchdog's reset, to the RTC watchdog block, and of the brownout
+ *     detector, to LP_ANALOG_PERI. Its LP core disable is the LP core's
+ *     (esp32p4_init_lp_core()).
  *   - The debug assistant (0x3FF06000), not gated by BUSMON_CPU_CLK_EN, its
  *     interrupt ASSIST_DEBUG_INTR (source 127), watching the HP cores and
  *     taking their resets for its PC records.
@@ -2444,6 +2445,9 @@ static void esp32p4_init_debug(ESP32P4MachineState *s)
     qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_SWD_RESET_EN, 0,
                                 qdev_get_gpio_in_named(DEVICE(&s->lp_wdt),
                                     ESP32P4_LP_WDT_SWD_RESET_EN, 0));
+    qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_BOD_RESET_EN, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->lp_ana),
+                                    ESP32P4_LP_ANA_BOD_EN, 0));
 
     object_initialize_child(OBJECT(s), "assist-debug", &s->assist_debug,
                             TYPE_ESP32P4_ASSIST_DEBUG);
@@ -3846,6 +3850,22 @@ static void esp32p4_reload_kernel(ESP32P4MachineState *s)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.boot]
+ * What the boot ROM does at boot that a program -kernel starts in its
+ * place finds done, as a system reset completes. Of the super watchdog,
+ * the ROM's main() only clears SWD_RESET_FLAG on core 0
+ * (clear_super_wdt_reset_flag()); it neither feeds the watchdog nor sets
+ * SWD_AUTO_FEED_EN, nor writes LP_SYSTEM's FIB control, so the watchdog
+ * runs on, unfed, as it does here.
+ */
+static void esp32p4_rom_boot_state(void *opaque)
+{
+    ESP32P4MachineState *s = opaque;
+
+    esp32p4_lp_wdt_swd_rst_flag_clr(&s->lp_wdt);
+}
+
 /* [spec:nuos:req:emu.esp32p4.machine] */
 static void esp32p4_load(ESP32P4MachineState *s)
 {
@@ -3880,6 +3900,7 @@ static void esp32p4_load(ESP32P4MachineState *s)
     }
     s->kernel_entry = entry;
     s->hp_cpu[0].parent_obj.env.resetvec = entry;
+    qemu_register_reset(esp32p4_rom_boot_state, s);
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */
