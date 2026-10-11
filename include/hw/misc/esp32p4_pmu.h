@@ -87,7 +87,8 @@ enum {
  *   - Clock inputs "fast" (LP_DYN_FAST_CLK) and "slow" (LP_DYN_SLOW_CLK),
  *     which time the state machine and the regulators' counters.
  *   - Links "clkrst", where the PMU records its resets of the cores;
- *     "lp-cpu", whose wait for an interrupt LP_CPU_WAITI_RDY shows; and
+ *     "lp-cpu", whose wait for an interrupt (its "in-wfi" property)
+ *     LP_CPU_WAITI_RDY shows; and
  *     "lp-sys", where LP_SYSTEM's EXT_WAKEUP1_STATUS records the pads of
  *     an EXT wakeup.
  *   - Sysbus IRQs 0 and 1: PMU_INTR (the HP_INT_* registers) and the
@@ -108,8 +109,12 @@ enum {
  *     "pad-sleep", the pads' sleep configuration select; "pause-wdt", the
  *     RTC watchdog's pause; "xtal-off", high while the crystal is powered
  *     down; "bod-vbat-sel", BOD_SOURCE_SEL in the current state;
- *     "uart-wakeup-en", the UARTs' wakeup enable; "etm-event", the ETM
- *     event PMU_EVT_SLEEP_WAKEUP, pulsed as the chip wakes.
+ *     "uart-wakeup-en", the UARTs' wakeup enable; "lp-core-intr-mask",
+ *     high while the LP CPU's sleep process masks its interrupts;
+ *     "etm-event", per ESP32P4_PMU_ETM_EVT_*, the ETM events
+ *     PMU_EVT_SLEEP_WAKEUP, pulsed as the chip wakes, ULP_EVT_START_INTR,
+ *     as the LP CPU's clock starts on its wakeup, and ULP_EVT_HALT, as
+ *     the LP CPU's sleep process ends.
  */
 #define ESP32P4_PMU_WAKEUP          "wakeup"
 #define ESP32P4_PMU_EXT_PAD         "ext-pad"
@@ -131,7 +136,15 @@ enum {
 #define ESP32P4_PMU_XTAL_OFF        "xtal-off"
 #define ESP32P4_PMU_BOD_VBAT_SEL    "bod-vbat-sel"
 #define ESP32P4_PMU_UART_WAKEUP_EN  "uart-wakeup-en"
+#define ESP32P4_PMU_LP_CORE_INTR_MASK "lp-core-intr-mask"
 #define ESP32P4_PMU_ETM_EVENT       "etm-event"
+
+enum {
+    ESP32P4_PMU_ETM_EVT_SLEEP_WAKEUP,
+    ESP32P4_PMU_ETM_EVT_LP_CPU_START,
+    ESP32P4_PMU_ETM_EVT_LP_CPU_HALT,
+    ESP32P4_PMU_ETM_EVTS,
+};
 
 #define ESP32P4_PMU_EXT_PADS        16
 
@@ -200,6 +213,7 @@ typedef struct ESP32P4PMULevels {
     bool xtal_off;
     bool bod_vbat_sel;
     bool uart_wakeup_en;
+    bool lp_core_intr_mask;
 } ESP32P4PMULevels;
 
 typedef struct ESP32P4PMULdo {
@@ -233,7 +247,8 @@ struct ESP32P4PMUState {
     qemu_irq xtal_off;
     qemu_irq bod_vbat_sel;
     qemu_irq uart_wakeup_en;
-    qemu_irq etm_event;
+    qemu_irq lp_core_intr_mask;
+    qemu_irq etm_event[ESP32P4_PMU_ETM_EVTS];
     Clock *fast;
     Clock *slow;
     ESP32P4ClkRstState *clkrst;
@@ -259,10 +274,18 @@ struct ESP32P4PMUState {
     uint32_t wakeup_in;
     uint32_t ext_pads;
 
-    /* The LP CPU's power control. */
+    /*
+     * The LP CPU's power control: its clock on, its reset held, its stall;
+     * its sleep process under way, which waits lp_sleep_timer out before
+     * stopping it, and whether that process masks its interrupts.
+     */
     bool lp_cpu_on;
     bool lp_cpu_held;
     bool lp_cpu_stalled;
+    bool lp_cpu_sleeping;
+    bool lp_cpu_masked;
+    bool lp_sleep_waiting;
+    QEMUTimer lp_sleep_timer;
 
     ESP32P4PMULdo ldo[ESP32P4_PMU_EXT_LDOS];
 

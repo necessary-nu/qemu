@@ -557,9 +557,10 @@ static void test_ext_wakeup(void)
  * The LP CPU's power: released by an enabled wakeup source (the HP CPU's
  * trigger), recording the cause and raising PMU_LP_CPU_WAKEUP_INT; its
  * sleep request rejected while a reject-enabled source is active, or
- * granted, stalling and resetting it (PMU LP CPU reset, 0x0A, once
- * LPCORE_RESET_CAUSE_PMU_LP_CPU_MASK is cleared). With the LP CPU running
- * the HP system sleeps in HP_SLEEP; its sleep takes the chip on to
+ * granted, stalling it at once and, SLP_STALL_WAIT (255) cycles of its
+ * 40 MHz clock later, stopping and resetting it (PMU LP CPU reset, 0x0A,
+ * once LPCORE_RESET_CAUSE_PMU_LP_CPU_MASK is cleared). With the LP CPU
+ * running the HP system sleeps in HP_SLEEP; its sleep takes the chip on to
  * LP_SLEEP.
  */
 /* [spec:nuos:req:emu.esp32p4.low-power/test] */
@@ -601,6 +602,11 @@ static void test_lp_cpu(void)
        LP_CPU_SLP_RESET_EN);
     cause = qtest_readl(qts, LP_CLKRST_RESET_CAUSE);
     wr(qts, LP_CPU_PWR1, 1u << 31);
+    g_assert_cmphex(rd(qts, LP_CPU_PWR0) & 3, ==, 2);
+    g_assert(!qtest_qom_get_bool(qts, LP_CPU, "in-reset"));
+    qtest_clock_step(qts, 6 * US);
+    g_assert(!qtest_qom_get_bool(qts, LP_CPU, "in-reset"));
+    qtest_clock_step(qts, 1 * US);
     g_assert(qtest_qom_get_bool(qts, LP_CPU, "in-reset"));
     g_assert(!qtest_qom_get_bool(qts, LP_CPU, "clock-running"));
     g_assert_cmphex(rd(qts, LP_CPU_PWR0) & 3, ==, 2);
@@ -623,6 +629,7 @@ static void test_lp_cpu(void)
                  ~LPCORE_CAUSE_MASK_PMU);
     wr(qts, LP_INT_CLR, LP_INT_HP_SW_TRIGGER);
     wr(qts, LP_CPU_PWR1, 1u << 31);
+    qtest_clock_step(qts, 10 * US);
     g_assert_cmphex(qtest_readl(qts, LP_CLKRST_RESET_CAUSE) & 0x3f, ==, 0x0a);
 
     /* The RTC timer wakes the HP system from LP_SLEEP. */

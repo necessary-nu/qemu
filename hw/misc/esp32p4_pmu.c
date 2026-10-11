@@ -108,17 +108,25 @@
  * LP_DYN_SLOW_CLK. The TRM gives the waits but not their sequence; this
  * sums them. A wait whose clock is stopped waits for it to run.
  *
- * The LP CPU (TRM 15.4.2.2). Held in reset from power-on, it starts when
- * a wakeup source PMU_LP_CPU_WAKEUP_EN enables is active, recording the
- * sources in PMU_LP_CPU_WAKEUP_CAUSE and raising PMU_LP_CPU_WAKEUP_INT
- * (from LP_SLEEP, after the switch to HP_SLEEP). PMU_LP_CPU_SLEEP_REQ puts
- * it to sleep, unless a source PMU_LP_CPU_REJECT_EN enables is active
- * (PMU_LP_CPU_REJECT_CAUSE, PMU_LP_CPU_SLEEP_REJECT_INT): its clock stops,
- * with SLP_STALL_EN it is stalled and with SLP_RESET_EN it is held in
- * reset, recording PMU LP CPU reset (0x0A) unless
- * LP_CLKRST_LPCORE_RESET_CAUSE_PMU_LP_CPU_MASK masks it. FORCE_STALL
- * stalls it. STALL_RDY shows it stalled and WAITI_RDY it waiting for an
- * interrupt; SLP_WAITI_FLAG_EN's wait for that is logged as not modelled.
+ * The LP CPU (TRM 15.4.2.2, 5.10). Held in reset from power-on, it
+ * starts when a wakeup source PMU_LP_CPU_WAKEUP_EN enables is active,
+ * recording the sources in PMU_LP_CPU_WAKEUP_CAUSE and raising
+ * PMU_LP_CPU_WAKEUP_INT (from LP_SLEEP, after the switch to HP_SLEEP): its
+ * stall and interrupt mask are lifted and its clock starts (the ETM event
+ * ULP_EVT_START_INTR), its reset released if it was held.
+ * PMU_LP_CPU_SLEEP_REQ starts its sleep process, unless a source
+ * PMU_LP_CPU_REJECT_EN enables is active (PMU_LP_CPU_REJECT_CAUSE,
+ * PMU_LP_CPU_SLEEP_REJECT_INT): with SLP_STALL_EN it is stalled at once,
+ * with SLP_BYPASS_INTR_EN its interrupts are masked, and after
+ * SLP_STALL_WAIT cycles of its clock (LP_DYN_FAST_CLK) the clock stops
+ * (ULP_EVT_HALT) and, with SLP_RESET_EN, it is held in reset, recording
+ * PMU LP CPU reset (0x0A) unless LP_CLKRST_LPCORE_RESET_CAUSE_PMU_LP_CPU_MASK
+ * masks it. A wakeup source active by then wakes it again at once.
+ * FORCE_STALL stalls it. STALL_RDY shows it stalled and WAITI_RDY it
+ * waiting for an interrupt in WFI; SLP_WAITI_FLAG_EN's wait for that is
+ * logged as not modelled. The LP CPU's exception, wakeup source 16, holds
+ * from the exception until software clears PMU_LP_CPU_EXC_INT_RAW, as
+ * ESP-IDF does before it sleeps.
  *
  * The output regulators' waiting counters (TRM 15.4.2.9): an enabled
  * regulator (its XPD) counts LP_DYN_SLOW_CLK / 16, and raises its
@@ -372,8 +380,10 @@
 #define LP_CPU_STALL_RDY        BIT(1)
 #define LP_CPU_FORCE_STALL      BIT(18)
 #define LP_CPU_SLP_WAITI_FLAG_EN BIT(19)
+#define LP_CPU_SLP_STALL_WAIT(v) extract32((v), 21, 8)
 #define LP_CPU_SLP_STALL_EN     BIT(29)
 #define LP_CPU_SLP_RESET_EN     BIT(30)
+#define LP_CPU_SLP_BYPASS_INTR_EN BIT(31)
 /* LP_CPU_PWR1 */
 #define LP_CPU_SLEEP_REQ        BIT(31)
 /* HP_LP_CPU_COMM */
@@ -700,6 +710,9 @@ static uint32_t pmu_sources(ESP32P4PMUState *s)
     if (s->regs[R(A_LP_INT_RAW)] & LP_INT_HP_SW_TRIGGER) {
         v |= BIT(ESP32P4_PMU_WAKE_LP_CPU);
     }
+    if (s->regs[R(A_HP_INT_RAW)] & HP_INT_LP_CPU_EXC) {
+        v |= BIT(ESP32P4_PMU_WAKE_LP_CPU_EXC);
+    }
     return v & SOURCES_MASK;
 }
 
@@ -872,6 +885,8 @@ static void pmu_drive_outputs(ESP32P4PMUState *s, bool force)
               force);
     pmu_drive(s->uart_wakeup_en, &o->uart_wakeup_en, c->uart_wakeup_en,
               force);
+    pmu_drive(s->lp_core_intr_mask, &o->lp_core_intr_mask, s->lp_cpu_masked,
+              force);
     pmu_update_irqs(s);
 }
 
@@ -1000,13 +1015,16 @@ static void pmu_start_wake(ESP32P4PMUState *s, uint32_t sources)
 }
 
 /* [spec:nuos:req:emu.esp32p4.low-power] */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
 static void pmu_lp_cpu_wake(ESP32P4PMUState *s, uint32_t sources)
 {
     s->regs[R(A_LP_CPU_PWR3)] = sources;
     s->lp_cpu_on = true;
     s->lp_cpu_held = false;
     s->lp_cpu_stalled = false;
+    s->lp_cpu_masked = false;
     pmu_raise_lp(s, LP_INT_LP_CPU_WAKEUP);
+    qemu_irq_pulse(s->etm_event[ESP32P4_PMU_ETM_EVT_LP_CPU_START]);
 }
 
 /* Switch from HP_SLEEP to LP_SLEEP, the LP CPU being asleep. */
@@ -1202,7 +1220,7 @@ static void pmu_seq_cb(void *opaque)
         s->state = ESP32P4_PMU_ST_HP_ACTIVE;
         pmu_raise_lp(s, LP_INT_SLEEP_SWITCH_ACTIVE_END);
         pmu_raise_hp(s, HP_INT_SOC_WAKEUP);
-        qemu_irq_pulse(s->etm_event);
+        qemu_irq_pulse(s->etm_event[ESP32P4_PMU_ETM_EVT_SLEEP_WAKEUP]);
         pmu_check(s);
         break;
     default:
@@ -1213,16 +1231,34 @@ static void pmu_seq_cb(void *opaque)
 }
 
 /*
+ * Time the LP CPU's sleep process: PMU_LP_CPU_SLP_STALL_WAIT cycles of its
+ * clock, LP_DYN_FAST_CLK, or, while that is stopped, from when it runs.
+ */
+static void pmu_lp_sleep_arm(ESP32P4PMUState *s)
+{
+    uint32_t cycles = LP_CPU_SLP_STALL_WAIT(s->regs[R(A_LP_CPU_PWR0)]);
+
+    timer_del(&s->lp_sleep_timer);
+    s->lp_sleep_waiting = !clock_is_enabled(s->fast);
+    if (s->lp_sleep_waiting) {
+        return;
+    }
+    timer_mod(&s->lp_sleep_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              MAX(clock_ticks_to_ns(s->fast, cycles), 1));
+}
+
+/*
  * [spec:nuos:req:emu.esp32p4.low-power]
- * PMU_LP_CPU_SLEEP_REQ: put the LP CPU to sleep, unless a source rejects
- * it; then, with the HP system asleep, the chip goes on to LP_SLEEP.
+ * [spec:nuos:req:emu.esp32p4.lp-core]
+ * PMU_LP_CPU_SLEEP_REQ: start the LP CPU's sleep process, unless a source
+ * rejects it, stalling it and masking its interrupts as the process says.
  */
 static void pmu_lp_cpu_sleep_request(ESP32P4PMUState *s)
 {
     uint32_t pwr0 = s->regs[R(A_LP_CPU_PWR0)];
     uint32_t reject = pmu_sources(s) & s->regs[R(A_LP_CPU_PWR4)];
 
-    if (!s->lp_cpu_on) {
+    if (!s->lp_cpu_on || s->lp_cpu_sleeping) {
         return;
     }
     if (reject) {
@@ -1234,14 +1270,35 @@ static void pmu_lp_cpu_sleep_request(ESP32P4PMUState *s)
         qemu_log_mask(LOG_UNIMP, "%s: LP_CPU_SLP_WAITI_FLAG_EN's wait for "
                       "the LP CPU's WFI is not modelled\n", TYPE_ESP32P4_PMU);
     }
-    s->lp_cpu_on = false;
+    s->lp_cpu_sleeping = true;
     s->lp_cpu_stalled = pwr0 & LP_CPU_SLP_STALL_EN;
-    if (pwr0 & LP_CPU_SLP_RESET_EN) {
+    s->lp_cpu_masked = pwr0 & LP_CPU_SLP_BYPASS_INTR_EN;
+    pmu_lp_sleep_arm(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
+ * [spec:nuos:req:emu.esp32p4.lp-core]
+ * The LP CPU's sleep process ends: its clock stops and, with
+ * SLP_RESET_EN, its reset is held; then, with the HP system asleep, the
+ * chip goes on to LP_SLEEP. A wakeup source already active wakes it at
+ * once, after it has stopped, so that it starts again from its reset.
+ */
+static void pmu_lp_sleep_cb(void *opaque)
+{
+    ESP32P4PMUState *s = opaque;
+
+    s->lp_cpu_sleeping = false;
+    s->lp_cpu_on = false;
+    if (s->regs[R(A_LP_CPU_PWR0)] & LP_CPU_SLP_RESET_EN) {
         s->lp_cpu_held = true;
         esp32p4_clkrst_record_reset(s->clkrst, ESP32P4_CLKRST_CORE_LP,
                                     ESP32P4_RESET_CAUSE_PMU_LP_CPU);
     }
+    qemu_irq_pulse(s->etm_event[ESP32P4_PMU_ETM_EVT_LP_CPU_HALT]);
+    pmu_update_outputs(s);
     pmu_check(s);
+    pmu_update_outputs(s);
 }
 
 /* [spec:nuos:req:emu.esp32p4.low-power] */
@@ -1441,8 +1498,8 @@ static uint32_t pmu_value(ESP32P4PMUState *s, hwaddr reg)
         if (s->lp_cpu_stalled || (v & LP_CPU_FORCE_STALL)) {
             v |= LP_CPU_STALL_RDY;
         }
-        if (s->lp_cpu && s->lp_cpu->halted && s->lp_cpu_on &&
-            !s->lp_cpu_held) {
+        if (s->lp_cpu && s->lp_cpu_on && !s->lp_cpu_held &&
+            object_property_get_bool(OBJECT(s->lp_cpu), "in-wfi", NULL)) {
             v |= LP_CPU_WAITI_RDY;
         }
         return v;
@@ -1725,6 +1782,9 @@ static void esp32p4_pmu_clock_update(void *opaque, ClockEvent event)
     if (s->seq_waiting) {
         pmu_seq_arm(s, s->seq_fast, s->seq_slow);
     }
+    if (s->lp_sleep_waiting) {
+        pmu_lp_sleep_arm(s);
+    }
     for (n = 0; n < ESP32P4_PMU_EXT_LDOS; n++) {
         pmu_ldo_schedule(s, n);
     }
@@ -1764,6 +1824,10 @@ static void esp32p4_pmu_reset_hold(Object *obj, ResetType type)
     s->lp_cpu_on = false;
     s->lp_cpu_held = true;
     s->lp_cpu_stalled = false;
+    s->lp_cpu_sleeping = false;
+    s->lp_cpu_masked = false;
+    s->lp_sleep_waiting = false;
+    timer_del(&s->lp_sleep_timer);
     for (i = 0; i < ESP32P4_PMU_EXT_LDOS; i++) {
         timer_del(&s->ldo[i].timer);
         s->ldo[i].running = false;
@@ -1804,6 +1868,7 @@ static void esp32p4_pmu_init(Object *obj)
     s->slow = qdev_init_clock_in(dev, "slow", esp32p4_pmu_clock_update, s,
                                  ClockUpdate);
     timer_init_ns(&s->seq_timer, QEMU_CLOCK_VIRTUAL, pmu_seq_cb, s);
+    timer_init_ns(&s->lp_sleep_timer, QEMU_CLOCK_VIRTUAL, pmu_lp_sleep_cb, s);
     for (i = 0; i < ESP32P4_PMU_EXT_LDOS; i++) {
         s->ldo[i].s = s;
         timer_init_ns(&s->ldo[i].timer, QEMU_CLOCK_VIRTUAL, pmu_ldo_cb,
@@ -1845,7 +1910,10 @@ static void esp32p4_pmu_init(Object *obj)
                              1);
     qdev_init_gpio_out_named(dev, &s->uart_wakeup_en,
                              ESP32P4_PMU_UART_WAKEUP_EN, 1);
-    qdev_init_gpio_out_named(dev, &s->etm_event, ESP32P4_PMU_ETM_EVENT, 1);
+    qdev_init_gpio_out_named(dev, &s->lp_core_intr_mask,
+                             ESP32P4_PMU_LP_CORE_INTR_MASK, 1);
+    qdev_init_gpio_out_named(dev, s->etm_event, ESP32P4_PMU_ETM_EVENT,
+                             ESP32P4_PMU_ETM_EVTS);
 }
 
 static void esp32p4_pmu_realize(DeviceState *dev, Error **errp)
@@ -1862,6 +1930,7 @@ static void esp32p4_pmu_finalize(Object *obj)
     int i;
 
     timer_del(&s->seq_timer);
+    timer_del(&s->lp_sleep_timer);
     for (i = 0; i < ESP32P4_PMU_EXT_LDOS; i++) {
         timer_del(&s->ldo[i].timer);
     }
@@ -1920,8 +1989,8 @@ static const VMStateDescription vmstate_esp32p4_pmu_ldo = {
 
 static const VMStateDescription vmstate_esp32p4_pmu_levels = {
     .name = TYPE_ESP32P4_PMU "/levels",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL_ARRAY(xpd, ESP32P4PMULevels, ESP32P4_CLKRST_NUM_XPD),
         VMSTATE_BOOL_ARRAY(pll_xpd, ESP32P4PMULevels, ESP32P4_ANA_NUM_PLLS),
@@ -1940,14 +2009,15 @@ static const VMStateDescription vmstate_esp32p4_pmu_levels = {
         VMSTATE_BOOL(xtal_off, ESP32P4PMULevels),
         VMSTATE_BOOL(bod_vbat_sel, ESP32P4PMULevels),
         VMSTATE_BOOL(uart_wakeup_en, ESP32P4PMULevels),
+        VMSTATE_BOOL(lp_core_intr_mask, ESP32P4PMULevels),
         VMSTATE_END_OF_LIST()
     },
 };
 
 static const VMStateDescription vmstate_esp32p4_pmu = {
     .name = TYPE_ESP32P4_PMU,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(fast, ESP32P4PMUState),
         VMSTATE_CLOCK(slow, ESP32P4PMUState),
@@ -1967,10 +2037,14 @@ static const VMStateDescription vmstate_esp32p4_pmu = {
         VMSTATE_BOOL(lp_cpu_on, ESP32P4PMUState),
         VMSTATE_BOOL(lp_cpu_held, ESP32P4PMUState),
         VMSTATE_BOOL(lp_cpu_stalled, ESP32P4PMUState),
+        VMSTATE_BOOL(lp_cpu_sleeping, ESP32P4PMUState),
+        VMSTATE_BOOL(lp_cpu_masked, ESP32P4PMUState),
+        VMSTATE_BOOL(lp_sleep_waiting, ESP32P4PMUState),
+        VMSTATE_TIMER(lp_sleep_timer, ESP32P4PMUState),
         VMSTATE_STRUCT_ARRAY(ldo, ESP32P4PMUState, ESP32P4_PMU_EXT_LDOS, 1,
                              vmstate_esp32p4_pmu_ldo, ESP32P4PMULdo),
         VMSTATE_BOOL_ARRAY(power_level, ESP32P4PMUState, ESP32P4_PMU_NUM_PD),
-        VMSTATE_STRUCT(out, ESP32P4PMUState, 1, vmstate_esp32p4_pmu_levels,
+        VMSTATE_STRUCT(out, ESP32P4PMUState, 2, vmstate_esp32p4_pmu_levels,
                        ESP32P4PMULevels),
         VMSTATE_END_OF_LIST()
     },

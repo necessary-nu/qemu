@@ -415,10 +415,13 @@ static void test_cores(void)
     QTestState *qts = start();
     g_autofree char *regs = qtest_hmp(qts, "info registers -a");
 
-    /* Both HP cores start at the HP ROM and the LP core at the LP ROM. */
+    /*
+     * Both HP cores start at the HP ROM and the LP core at the LP ROM's
+     * entry, 0x80 into its vector table.
+     */
     g_assert_cmphex(dump_reg(regs, 0, "pc"), ==, HP_ROM_BASE);
     g_assert_cmphex(dump_reg(regs, 1, "pc"), ==, HP_ROM_BASE);
-    g_assert_cmphex(dump_reg(regs, 2, "pc"), ==, 0x50100000);
+    g_assert_cmphex(dump_reg(regs, 2, "pc"), ==, 0x50100080);
     g_assert_cmphex(dump_reg(regs, 1, "mhartid"), ==, 1);
     g_assert_cmphex(dump_reg(regs, 2, "mhartid"), ==, 0);
     /* RV32IMAFCBU with Espressif's extensions (X), and RV32IMAC. */
