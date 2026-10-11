@@ -126,6 +126,17 @@
  *     include/hw/dma/esp32p4_gdma.h describes; VDMA's handshaking
  *     interfaces, for MIPI DSI and the ISP, are its named GPIOs.
  *
+ *   - The TWAI controllers TWAI0 to TWAI2 (TRM chapter 56) at 0x500D7000,
+ *     0x500D8000 and 0x500D9000, each behind its bus clock, on its function
+ *     clock and reset, its interrupt TWAIn_INTR (sources 40 to 42), its
+ *     twai_tx, twai_rx, twai_bus_off_on, twai_clkout and twai_standby
+ *     signals through the GPIO matrix. Each controller's pads can lead to a
+ *     QEMU CAN bus, the machine's canbus0 to canbus2; controllers on one
+ *     bus arbitrate and acknowledge each other, and can-host-socketcan on
+ *     the bus connects it to the host's (on Linux):
+ *
+ *       -object can-bus,id=can0 -M esp32p4,canbus0=can0,canbus1=can0
+ *
  *   - I2C0, I2C1 and the LP I2C (TRM chapter 47), and the I3C master and
  *     slave, at the level of their lines through the GPIO matrices, timed
  *     by their function clocks, their interrupts through the interrupt
@@ -252,9 +263,6 @@ static const struct {
     { "spi3",             0x500d1000, 4 * KiB },
     { "usb-serial-jtag",  0x500d2000, 4 * KiB },
     { "ledc",             0x500d3000, 4 * KiB },
-    { "twai0",            0x500d7000, 4 * KiB },
-    { "twai1",            0x500d8000, 4 * KiB },
-    { "twai2",            0x500d9000, 4 * KiB },
     { "lcd-cam",          0x500dc000, 4 * KiB },
     { "adc",              0x500de000, 4 * KiB },
     { "uhci",             0x500df000, 4 * KiB },
@@ -1709,6 +1717,73 @@ static void esp32p4_init_dma(ESP32P4MachineState *s)
 }
 
 /*
+ * The TWAI controllers, each behind TWAIn_APB_CLK, timed by TWAIn_CLK and
+ * reset by HP_SYS_CLKRST_RST_EN_CANn, which the device takes itself as it
+ * resets one controller of three; their interrupts TWAI0_INTR to
+ * TWAI2_INTR (sources 40 to 42) and their pad signals; and the QEMU CAN
+ * bus on each one's pads. Reading the interrupt register clears it, and
+ * reading the capture registers re-arms them.
+ */
+/* [spec:nuos:req:emu.esp32p4.twai] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_twai(ESP32P4MachineState *s)
+{
+    DeviceState *twai, *gpio = DEVICE(&s->gpio);
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    int i;
+
+    object_initialize_child(OBJECT(s), "twai", &s->twai, TYPE_ESP32P4_TWAI);
+    twai = DEVICE(&s->twai);
+    object_property_set_link(OBJECT(twai), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
+    for (i = 0; i < ESP32P4_TWAI_NUM; i++) {
+        g_autofree char *link = g_strdup_printf("canbus%d", i);
+        g_autofree char *clk = g_strdup_printf("twai%d", i);
+
+        if (s->canbus[i]) {
+            object_property_set_link(OBJECT(twai), link,
+                                     OBJECT(s->canbus[i]), &error_abort);
+        }
+        qdev_connect_clock_in(twai, clk, qdev_get_clock_out(clkrst, clk));
+    }
+    sysbus_realize(SYS_BUS_DEVICE(twai), &error_fatal);
+    for (i = 0; i < ESP32P4_TWAI_NUM; i++) {
+        ESP32P4ClkRstGate *g;
+
+        g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(twai), i,
+                                     ESP32P4_TWAI0_BASE +
+                                     i * ESP32P4_TWAI_STRIDE,
+                                     ESP32P4_CLK_TWAI0_APB + i,
+                                     ESP32P4_CLKRST_GATE_NO_RESET, 0);
+        esp32p4_clkrst_gate_volatile(g, 0x0c, 4);
+        esp32p4_clkrst_gate_volatile(g, 0x2c, 4);
+        esp32p4_clkrst_gate_volatile(g, 0x30, 4);
+        qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                    ESP32P4_RST_CAN0 + i,
+                                    qdev_get_gpio_in_named(twai,
+                                        ESP32P4_TWAI_RESET, i));
+        sysbus_connect_irq(SYS_BUS_DEVICE(twai), i,
+                           esp32p4_intr_source(s, ESP32P4_INTR_TWAI0 + i));
+        qdev_connect_gpio_out_named(twai, ESP32P4_TWAI_TX, i,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                ESP32P4_SIG_TWAI0_TX_PAD_OUT + 3 * i));
+        qdev_connect_gpio_out_named(twai, ESP32P4_TWAI_BUS_OFF, i,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                ESP32P4_SIG_TWAI0_BUS_OFF_ON_PAD_OUT + 3 * i));
+        qdev_connect_gpio_out_named(twai, ESP32P4_TWAI_CLKOUT, i,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                ESP32P4_SIG_TWAI0_CLKOUT_PAD_OUT + 3 * i));
+        qdev_connect_gpio_out_named(twai, ESP32P4_TWAI_STANDBY, i,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                ESP32P4_SIG_TWAI0_STANDBY_PAD_OUT + i));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+            ESP32P4_SIG_TWAI0_RX_PAD_IN + 3 * i,
+            qdev_get_gpio_in_named(twai, ESP32P4_TWAI_RX, i));
+    }
+}
+
+/*
  * The event task matrix (TRM chapter 14), its registers behind
  * ETM_APB_CLK, running on ETM_SYS_CLK, held by RST_EN_ETM; and every
  * modelled block's events and tasks, by their IDs, as its header
@@ -1979,6 +2054,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_emac(s);
     esp32p4_init_dma(s);
     esp32p4_init_i3c(s);
+    esp32p4_init_twai(s);
     esp32p4_init_etm(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
@@ -2043,6 +2119,7 @@ static void esp32p4_set_strap_mode(Object *obj, Visitor *v,
     ESP32P4_MACHINE(obj)->strap_mode = value;
 }
 
+/* [spec:nuos:req:emu.esp32p4.twai] */
 static void esp32p4_machine_instance_init(Object *obj)
 {
     ESP32P4MachineState *s = ESP32P4_MACHINE(obj);
@@ -2051,6 +2128,17 @@ static void esp32p4_machine_instance_init(Object *obj)
     /* Early, for the clock tree to take the EMAC's pad clock. */
     object_initialize_child(obj, "emac", &s->emac, TYPE_ESP32P4_EMAC);
     object_initialize_child(obj, "phy", &s->phy, TYPE_IP101_PHY);
+    for (int i = 0; i < ESP32P4_TWAI_NUM; i++) {
+        g_autofree char *name = g_strdup_printf("canbus%d", i);
+        g_autofree char *desc = g_strdup_printf("The QEMU CAN bus (-object "
+                                                "can-bus) on TWAI%d's pads",
+                                                i);
+
+        object_property_add_link(obj, name, TYPE_CAN_BUS,
+                                 (Object **)&s->canbus[i],
+                                 object_property_allow_set_link, 0);
+        object_property_set_description(obj, name, desc);
+    }
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */
