@@ -1481,13 +1481,19 @@ static void test_usj_host(void)
     qtest_quit(qts);
 }
 
-/* Read from @fd into @buf, up to @len bytes, until @want shows or 30 s. */
+/* How long esptool waits for SYNC's response before resending it. */
+#define SYNC_WAIT_MS    100
+
+/*
+ * Read from @fd into @buf, up to @len bytes, until @want shows or @ms
+ * milliseconds pass without it.
+ */
 static size_t read_until(int fd, char *buf, size_t len, const char *want,
-                         size_t want_len)
+                         size_t want_len, int ms)
 {
     size_t got = 0;
 
-    for (int i = 0; i < 300; i++) {
+    for (int i = 0; i < ms / 100; i++) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
 
         if (poll(&pfd, 1, 100) > 0) {
@@ -1507,7 +1513,9 @@ static size_t read_until(int fd, char *buf, size_t len, const char *want,
  * The boot ROM in download mode (strap-mode 0x04, GPIO35 low and GPIO36
  * high) through serial port 0: it says it is waiting, then answers
  * esptool's SLIP-framed SYNC command, received on GPIO38 by UART0 with
- * the ROM's interrupt-driven receiver, with SYNC's response.
+ * the ROM's interrupt-driven receiver, with SYNC's response. The ROM
+ * detects the baud rate from the first SYNC and answers a later one, so
+ * SYNC is resent until answered, as esptool resends it.
  */
 /* [spec:nuos:req:emu.esp32p4.uart/test] */
 static void test_rom_download_sync(void)
@@ -1530,13 +1538,15 @@ static void test_rom_download_sync(void)
         "-M esp32p4,flash-size=16M,strap-mode=0x04 -accel tcg "
         "-icount shift=0,sleep=off", &fd);
 
-    got = read_until(fd, buf, sizeof(buf) - 1, waiting, strlen(waiting));
+    got = read_until(fd, buf, sizeof(buf) - 1, waiting, strlen(waiting),
+                     30000);
     g_assert_nonnull(memmem(buf, got, "DOWNLOAD(USB/UART0/SPI)", 23));
     g_assert_nonnull(memmem(buf, got, waiting, strlen(waiting)));
-    for (i = 0; i < 10; i++) {
+    for (i = 0; i < 30000 / SYNC_WAIT_MS; i++) {
         g_assert_cmpint(send(fd, sync_cmd, sizeof(sync_cmd), 0), ==,
                         sizeof(sync_cmd));
-        got = read_until(fd, buf, sizeof(buf), sync_resp, sizeof(sync_resp));
+        got = read_until(fd, buf, sizeof(buf), sync_resp, sizeof(sync_resp),
+                         SYNC_WAIT_MS);
         if (memmem(buf, got, sync_resp, sizeof(sync_resp))) {
             break;
         }
@@ -1570,10 +1580,11 @@ static void test_rom_download_sync_usj(void)
     QTestState *qts = start_usj_args(&fd, ",strap-mode=0x04 -accel tcg "
                                      "-icount shift=0,sleep=off");
 
-    for (i = 0; i < 20; i++) {
+    for (i = 0; i < 30000 / SYNC_WAIT_MS; i++) {
         g_assert_cmpint(send(fd, sync_cmd, sizeof(sync_cmd), 0), ==,
                         sizeof(sync_cmd));
-        got = read_until(fd, buf, sizeof(buf), sync_resp, sizeof(sync_resp));
+        got = read_until(fd, buf, sizeof(buf), sync_resp, sizeof(sync_resp),
+                         SYNC_WAIT_MS);
         if (memmem(buf, got, sync_resp, sizeof(sync_resp))) {
             break;
         }
