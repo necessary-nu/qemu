@@ -95,10 +95,12 @@
  *   discharge, holds what software writes: the model does not take the
  *   bus's electrical state from it.
  *
+ * - SYS_CTRL's FORCE_DOWNLOAD_BOOT, the boot mode override, goes to the
+ *   boot mode the chip boots in ("force-download-boot").
+ *
  * Kept as written for the blocks that would act on them, none of which is
  * modelled, and given to them by esp32p4_lp_sys_reg(): the reset bypasses
- * (LP_RST_CTRL, HP_POR_RST_BYPASS_CTRL), the boot mode override
- * FORCE_DOWNLOAD_BOOT, the IO MUX reset disable, the PAU's
+ * (LP_RST_CTRL, HP_POR_RST_BYPASS_CTRL), the IO MUX reset disable, the PAU's
  * BACKUP_DMA_CFG0 to 2, the memories' and ROMs' aux and power controls,
  * the analog comparators (PAD_COMP0/1), the pad groups' power, the
  * discharge controls, the bus timeouts' thresholds and the ECO registers.
@@ -179,6 +181,7 @@
 /* SYS_CTRL */
 #define SYS_CTRL_LP_CORE_DISABLE BIT(0)
 #define SYS_CTRL_SYS_SW_RST     BIT(1)
+#define SYS_CTRL_FORCE_DOWNLOAD_BOOT BIT(2)
 #define SYS_CTRL_DIG_FIB_SHIFT  3
 #define SYS_CTRL_ANA_FIB_SHIFT  14
 #define SYS_CTRL_LP_FIB_SEL_SHIFT 21
@@ -372,6 +375,7 @@ static void esp32p4_lp_sys_update_outputs(ESP32P4LPSysState *s)
     qemu_set_irq(s->stall_sel, !!(ctrl & SYS_CTRL_SYSTIMER_STALL_SEL));
     qemu_set_irq(s->swd_reset_en, esp32p4_lp_sys_fib_enable(s, FIB_SWD));
     qemu_set_irq(s->bod_reset_en, esp32p4_lp_sys_fib_enable(s, FIB_BOD));
+    qemu_set_irq(s->force_download, !!(ctrl & SYS_CTRL_FORCE_DOWNLOAD_BOOT));
     for (i = 0; i < 2; i++) {
         qemu_set_irq(s->hp_root_clk[i],
                      extract32(s->regs[R(A_HP_ROOT_CLK_CTRL)], i, 1));
@@ -584,6 +588,8 @@ static void esp32p4_lp_sys_init(Object *obj)
                              2);
     qdev_init_gpio_out_named(dev, &s->etm_wakeup_flag,
                              ESP32P4_LP_SYS_ETM_WAKEUP_FLAG, 1);
+    qdev_init_gpio_out_named(dev, &s->force_download,
+                             ESP32P4_LP_SYS_FORCE_DOWNLOAD, 1);
     qdev_init_gpio_in_named(dev, esp32p4_lp_sys_set_etm_wakeup,
                             ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP, 1);
     qdev_init_gpio_in_named(dev, esp32p4_lp_sys_set_etm_task_ulp,

@@ -50,6 +50,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
  * ESP32P4_LP_SYS_ETM_WAKEUP_FLAG: LP_CORE_ETM_WAKEUP_FLAG, the PMU's ETM
  *   wakeup source, high from the ETM's ULP_TASK_WAKEUP_CPU until software
  *   clears the flag.
+ * ESP32P4_LP_SYS_FORCE_DOWNLOAD: SYS_CTRL's FORCE_DOWNLOAD_BOOT, which
+ *   takes a chip strapped for SPI boot into joint download boot (TRM
+ *   12.2.2, 21.2.2.3) unless EFUSE_DIS_FORCE_DOWNLOAD is set.
  *
  * Named GPIO inputs
  * =================
@@ -77,6 +80,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
 #define ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP "lp-core-etm-wakeup"
 #define ESP32P4_LP_SYS_ETM_TASK_ULP_INT "etm-task-ulp-int"
 #define ESP32P4_LP_SYS_SLOW_CLK_TICK    "slow-clk-tick"
+#define ESP32P4_LP_SYS_FORCE_DOWNLOAD   "force-download-boot"
 
 struct ESP32P4LPSysState {
     SysBusDevice parent_obj;
@@ -99,6 +103,7 @@ struct ESP32P4LPSysState {
     qemu_irq hp_root_clk[2];
     qemu_irq usb_phy_sel[2];
     qemu_irq etm_wakeup_flag;
+    qemu_irq force_download;
 };
 
 /*
