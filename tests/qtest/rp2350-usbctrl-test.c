@@ -11,6 +11,7 @@
 #include <sys/un.h>
 #include "libqtest.h"
 #include "qobject/qdict.h"
+#include "qemu/bswap.h"
 #include "rp2350-clocks.h"
 #include "rp2350-resets.h"
 
@@ -683,9 +684,9 @@ static void test_device_bridge_attach(void)
 
 /* Host mode with a QEMU USB keyboard on the port */
 
-static QTestState *host_start(void)
+static QTestState *host_start_with(const char *devices)
 {
-    QTestState *qts = start("-device usb-kbd,port=1");
+    QTestState *qts = start(devices);
 
     irq_intercept(qts);
     qtest_writel(qts, MAIN_CTRL, MAIN_CTRL_EN | MAIN_CTRL_HOST);
@@ -693,6 +694,11 @@ static QTestState *host_start(void)
                  SIE_CTRL_PULLDOWN_EN);
     qtest_writel(qts, DP_EPX_CTRL, EP_CTRL_ENABLE | EP_CTRL_INT_1BUF | 0x180);
     return qts;
+}
+
+static QTestState *host_start(void)
+{
+    return host_start_with("-device usb-kbd,port=1");
 }
 
 static void host_trans(QTestState *qts, uint32_t flags)
@@ -941,6 +947,195 @@ static void test_host_interrupt(void)
     qtest_quit(qts);
 }
 
+/*
+ * Unplugging an enumerated device: SPEED reads disconnected and the bus
+ * SE0 as the device goes, with HOST_CONN_DIS raised without software
+ * touching the controller, and transactions then time out. A device
+ * plugged in again is a new connection, answering at address 0.
+ */
+/* [spec:nuos:req:emu.usb/test] */
+static void test_host_disconnect(void)
+{
+    static const uint8_t get_dev[8] = { 0x80, 6, 0, 1, 0, 0, 18, 0 };
+    static const uint8_t set_addr[8] = { 0x00, 5, 7, 0, 0, 0, 0, 0 };
+    QTestState *qts = host_start_with("-device usb-kbd,port=1,id=kbd");
+    uint32_t st, bc;
+
+    qtest_writel(qts, INTE, INT_HOST_CONN_DIS);
+    g_assert_cmpuint(ST_SPEED(qtest_readl(qts, SIE_STATUS)), ==, 2);
+    qtest_writel(qts, SIE_STATUS, 3u << 8);
+    g_assert_false(qtest_get_irq(qts, 0));
+
+    host_setup(qts, 0, get_dev);
+    host_in(qts, 0, 0, BUF_AVAIL | BUF_PID1 | 8);
+    host_setup(qts, 0, set_addr);
+    host_in(qts, 0, 0, BUF_AVAIL | BUF_PID1 | BUF_LAST);
+    host_setup(qts, 7, get_dev);
+    bc = host_in(qts, 7, 0, BUF_AVAIL | BUF_PID1 | 8);
+    g_assert_cmphex(bc, ==, BUF_FULL | BUF_PID1 | 8);
+    qtest_writel(qts, BUFF_STATUS, 0xffffffff);
+    qtest_writel(qts, SIE_STATUS, 0xffffffff);
+
+    qtest_qmp_device_del(qts, "kbd");
+    g_assert_true(qtest_get_irq(qts, 0));
+    g_assert_cmphex(qtest_readl(qts, INTR) & INT_HOST_CONN_DIS, ==,
+                    INT_HOST_CONN_DIS);
+    st = qtest_readl(qts, SIE_STATUS);
+    g_assert_cmpuint(ST_SPEED(st), ==, 0);
+    g_assert_cmpuint(ST_LINE_STATE(st), ==, 0);
+    qtest_writel(qts, SIE_STATUS, 3u << 8);
+    g_assert_false(qtest_get_irq(qts, 0));
+
+    /* Nothing answers at the old address, or at address 0. */
+    qtest_writel(qts, ADDR_ENDP(0), 7);
+    qtest_memwrite(qts, DPRAM, get_dev, 8);
+    host_trans(qts, SIE_CTRL_SEND_SETUP);
+    g_assert_cmphex(qtest_readl(qts, SIE_STATUS) &
+                    (ST_RX_TIMEOUT | ST_TRANS_COMPLETE), ==, ST_RX_TIMEOUT);
+    qtest_writel(qts, SIE_STATUS, 0xffffffff);
+    qtest_writel(qts, ADDR_ENDP(0), 0);
+    host_trans(qts, SIE_CTRL_SEND_SETUP);
+    g_assert_cmphex(qtest_readl(qts, SIE_STATUS) &
+                    (ST_RX_TIMEOUT | ST_TRANS_COMPLETE), ==, ST_RX_TIMEOUT);
+    qtest_writel(qts, SIE_STATUS, 0xffffffff);
+    g_assert_cmphex(qtest_readl(qts, INTR) & INT_HOST_CONN_DIS, ==, 0);
+
+    qtest_qmp_device_add(qts, "usb-kbd", "kbd2", "{'port': '1'}");
+    g_assert_true(qtest_get_irq(qts, 0));
+    st = qtest_readl(qts, SIE_STATUS);
+    g_assert_cmpuint(ST_SPEED(st), ==, 2);
+    g_assert_cmpuint(ST_LINE_STATE(st), ==, 1);
+    qtest_writel(qts, SIE_STATUS, 3u << 8);
+    g_assert_false(qtest_get_irq(qts, 0));
+    host_setup(qts, 0, get_dev);
+    bc = host_in(qts, 0, 0, BUF_AVAIL | BUF_PID1 | 8);
+    g_assert_cmphex(bc, ==, BUF_FULL | BUF_PID1 | 8);
+    g_assert_cmphex(qtest_readl(qts, DPRAM + 0x180), ==, 0x02000112);
+    qtest_quit(qts);
+}
+
+/*
+ * The far end of a usb-redir device: a usbredir peer that has no
+ * capabilities, so headers carry 32-bit ids and the optional fields are
+ * absent. It offers one full-speed device with only a control endpoint
+ * and never answers the packets QEMU forwards to it.
+ */
+enum {
+    REDIR_HELLO = 0,
+    REDIR_DEVICE_CONNECT = 1,
+    REDIR_INTERFACE_INFO = 4,
+    REDIR_EP_INFO = 5,
+};
+
+static void redir_send(int fd, uint32_t type, const void *payload,
+                       uint32_t len)
+{
+    uint8_t hdr[12] = { 0 };
+
+    stl_le_p(hdr, type);
+    stl_le_p(hdr + 4, len);
+    g_assert_cmpint(write(fd, hdr, sizeof(hdr)), ==, sizeof(hdr));
+    g_assert_cmpint(write(fd, payload, len), ==, len);
+}
+
+static void redir_plug(int fd)
+{
+    uint8_t hello[68] = "rp2350-usbctrl-test";
+    uint8_t ifaces[132] = { 0 };
+    uint8_t eps[96];
+    uint8_t conn[8] = { 1, 0xff, 0, 0 };
+
+    redir_send(fd, REDIR_HELLO, hello, sizeof(hello));
+    stl_le_p(ifaces, 1);
+    ifaces[4 + 32] = 0xff;
+    redir_send(fd, REDIR_INTERFACE_INFO, ifaces, sizeof(ifaces));
+    /* Endpoint types by index (IN endpoints at 16 + n): only EP0. */
+    memset(eps, 0, sizeof(eps));
+    memset(eps, 0xff, 32);
+    eps[0] = 0;
+    eps[16] = 0;
+    redir_send(fd, REDIR_EP_INFO, eps, sizeof(eps));
+    stw_le_p(conn + 4, 0x1234);
+    stw_le_p(conn + 6, 0x5678);
+    redir_send(fd, REDIR_DEVICE_CONNECT, conn, sizeof(conn));
+}
+
+/* Wait for the host port to see SPEED, as QEMU takes in the peer. */
+static void wait_host_speed(QTestState *qts, uint32_t speed)
+{
+    int i;
+
+    for (i = 0; i < 1000; i++) {
+        if (ST_SPEED(qtest_readl(qts, SIE_STATUS)) == speed) {
+            return;
+        }
+        qtest_clock_step(qts, 1000);
+        g_usleep(1000);
+    }
+    g_assert_cmpuint(ST_SPEED(qtest_readl(qts, SIE_STATUS)), ==, speed);
+}
+
+/*
+ * A device that goes away by itself, here a redirected device whose
+ * peer hangs up, while a SETUP it has not answered is on the bus: the
+ * port shows the disconnect with no register access to prompt it, and
+ * the SETUP, getting no handshake, ends with RX_TIMEOUT.
+ */
+/* [spec:nuos:req:emu.usb/test] */
+static void test_host_disconnect_pending(void)
+{
+    static const uint8_t get_dev[8] = { 0x80, 6, 0, 1, 0, 0, 18, 0 };
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    g_autofree char *dir = NULL;
+    g_autofree char *path = NULL;
+    g_autofree char *args = NULL;
+    GError *err = NULL;
+    QTestState *qts;
+    uint32_t st;
+    int fd;
+
+    if (!qtest_has_device("usb-redir")) {
+        g_test_skip("usb-redir is not built");
+        return;
+    }
+    dir = g_dir_make_tmp("usbctrl-XXXXXX", &err);
+    g_assert_no_error(err);
+    path = g_strdup_printf("%s/r", dir);
+    g_assert_cmpuint(strlen(path), <, sizeof(sa.sun_path));
+    args = g_strdup_printf("-chardev socket,id=redir,path=%s,server=on,"
+                           "wait=off -device usb-redir,chardev=redir,port=1",
+                           path);
+    qts = host_start_with(args);
+    qtest_writel(qts, INTE, INT_HOST_CONN_DIS);
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    g_assert_cmpint(fd, >=, 0);
+    strcpy(sa.sun_path, path);
+    g_assert_cmpint(connect(fd, (struct sockaddr *)&sa, sizeof(sa)), ==, 0);
+    redir_plug(fd);
+    wait_host_speed(qts, 2);
+    qtest_writel(qts, SIE_STATUS, 0xffffffff);
+    g_assert_false(qtest_get_irq(qts, 0));
+
+    qtest_writel(qts, ADDR_ENDP(0), 0);
+    qtest_memwrite(qts, DPRAM, get_dev, 8);
+    host_trans(qts, SIE_CTRL_SEND_SETUP);
+    g_assert_cmphex(qtest_readl(qts, SIE_STATUS) &
+                    (ST_ACK_REC | ST_TRANS_COMPLETE | ST_RX_TIMEOUT), ==, 0);
+
+    close(fd);
+    wait_host_speed(qts, 0);
+    g_assert_true(qtest_get_irq(qts, 0));
+    g_assert_cmphex(qtest_readl(qts, INTR) & INT_HOST_CONN_DIS, ==,
+                    INT_HOST_CONN_DIS);
+    st = qtest_readl(qts, SIE_STATUS);
+    g_assert_cmpuint(ST_LINE_STATE(st), ==, 0);
+    g_assert_cmphex(st & (ST_ACK_REC | ST_TRANS_COMPLETE | ST_RX_TIMEOUT),
+                    ==, ST_RX_TIMEOUT);
+    qtest_quit(qts);
+    unlink(path);
+    rmdir(dir);
+}
+
 int main(int argc, char **argv)
 {
     static const uint32_t blank[2];
@@ -970,6 +1165,9 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/usbctrl/host/control", test_host_control);
     qtest_add_func("/rp2350/usbctrl/host/errors", test_host_errors);
     qtest_add_func("/rp2350/usbctrl/host/interrupt", test_host_interrupt);
+    qtest_add_func("/rp2350/usbctrl/host/disconnect", test_host_disconnect);
+    qtest_add_func("/rp2350/usbctrl/host/disconnect-pending",
+                   test_host_disconnect_pending);
 
     ret = g_test_run();
     unlink(rom_path);

@@ -93,6 +93,9 @@
  *   - SYS_DMA_ADDR_CTRL (0x2C) and PSRAM_FLASH_ADDR_INTERCHANGE (0x180)
  *     go out for the DMA engines and the external memory model
  *     ("dma-addr-sel", "psram-flash-interchange").
+ *   - BITSCRAMBLER_PERI_SEL (0x140): the peripherals whose DMA paths the
+ *     BitScrambler's RX and TX cores are attached to, to the BitScrambler
+ *     ("bitscrambler-peri-sel" outputs).
  *   - RSA_PD_CTRL (0x1D0) and ECC_PD_CTRL (0x1D4): the power of the RSA
  *     and ECC accelerators' memories, down while MEM_FORCE_PD is set or
  *     MEM_PD is set without MEM_FORCE_PU, to the accelerators ("mem-pd"
@@ -114,9 +117,8 @@
  * the bus timeouts' thresholds; the post-write enables; the arbitration
  * weights of TCM_RAM_WRR_CONFIG; the ECO and design-for-verification
  * registers; CPU_WAITI_CONF; the debug run-stall between the HP and LP
- * cores, which have no debugger; BITSCRAMBLER_PERI_SEL and SYS_GDMA_CTRL,
- * for blocks not modelled (esp32p4_hp_sys_reg() gives them to a block
- * that needs them). The debug probe
+ * cores, which have no debugger; SYS_GDMA_CTRL, for blocks not modelled
+ * (esp32p4_hp_sys_reg() gives it to a block that needs it). The debug probe
  * (PROBEA_CTRL, PROBEB_CTRL) selects internal signals that are not
  * modelled: PROBE_OUT reads 0, logged as unimplemented once the probe is
  * enabled.
@@ -533,6 +535,15 @@ static void esp32p4_hp_sys_update_usb(ESP32P4HPSysState *s)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.parlio] */
+static void esp32p4_hp_sys_update_bs(ESP32P4HPSysState *s)
+{
+    for (int i = 0; i < ESP32P4_HP_SYS_BS_PERI_SEL_LINES; i++) {
+        qemu_set_irq(s->bs_peri_sel[i],
+                     extract32(s->regs[R(A_BITSCRAMBLER_PERI_SEL)], i, 1));
+    }
+}
+
 static void esp32p4_hp_sys_update_misc(ESP32P4HPSysState *s)
 {
     qemu_set_irq(s->l2mem_err_resp, s->regs[R(A_L2_MEM_ERR_RESP_CTRL)]);
@@ -726,6 +737,9 @@ static void esp32p4_hp_sys_write(void *opaque, hwaddr addr, uint64_t value,
     case A_PSRAM_FLASH_ADDR_INTERCHANGE:
         esp32p4_hp_sys_update_misc(s);
         break;
+    case A_BITSCRAMBLER_PERI_SEL:
+        esp32p4_hp_sys_update_bs(s);
+        break;
     case A_SYS_USBOTG20_CTRL:
         if (*r & USBOTG20_CTRL_BISTEN) {
             qemu_log_mask(LOG_UNIMP, "%s: the USB 2.0 OTG PHY's BIST "
@@ -830,6 +844,7 @@ static void esp32p4_hp_sys_reset_exit(Object *obj, ResetType type)
     esp32p4_hp_sys_update_misc(s);
     esp32p4_hp_sys_update_gmac(s);
     esp32p4_hp_sys_update_usb(s);
+    esp32p4_hp_sys_update_bs(s);
     esp32p4_hp_sys_update_mem_pd(s);
     esp32p4_hp_sys_update_irq(s);
 }
@@ -873,6 +888,8 @@ static void esp32p4_hp_sys_init(Object *obj)
     qdev_init_gpio_out_named(dev, s->usbotg20_ctrl_out,
                              ESP32P4_HP_SYS_USBOTG20_CTRL,
                              ESP32P4_HP_SYS_USBOTG20_CTRL_LINES);
+    qdev_init_gpio_out_named(dev, s->bs_peri_sel, ESP32P4_HP_SYS_BS_PERI_SEL,
+                             ESP32P4_HP_SYS_BS_PERI_SEL_LINES);
     qdev_init_gpio_out_named(dev, s->mem_pd, ESP32P4_HP_SYS_MEM_PD,
                              ESP32P4_HP_SYS_MEM_PD_LINES);
     qdev_init_gpio_in_named(dev, esp32p4_hp_sys_set_source,
