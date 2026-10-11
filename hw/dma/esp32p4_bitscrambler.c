@@ -78,6 +78,13 @@
  * once with HALT_MODE set), and FIFO_RST empties them at any time.
  * The core takes input only while running or paused.
  *
+ * Each cycle happens at its own time, however late the QEMU timer that
+ * runs it: a late cycle runs as of its time (esp32_line_run_at()), with
+ * the channel's bus rounds due before it run first, and the next follows
+ * a cycle after it. The peripheral's DMA path and register accesses
+ * first take the cycles due before them (the interposer's sync op,
+ * include/hw/dma/esp32p4_gdma.h).
+ *
  * STATE's FIFO bit: for the TX core it reads 1 while the output FIFO
  * holds bytes for the peripheral (ESP-IDF's bitscrambler_ll_is_fifo_ready
  * reads it so; its reset value 0 agrees), for the RX core while the input
@@ -104,6 +111,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/dma/esp32p4_bitscrambler.h"
+#include "hw/gpio/esp32_line.h"
 #include "migration/vmstate.h"
 
 #define TX                  ESP32P4_BS_TX
@@ -265,11 +273,20 @@ static bool core_takes_input(ESP32P4BsCore *c)
     return (c->ctrl & CTRL_ENA) && c->state == BS_RUN && !c->reset_held;
 }
 
+static void core_arm(ESP32P4BsCore *c, int64_t when)
+{
+    c->due_ns = when;
+    timer_mod(c->timer, when);
+}
+
+/*
+ * Let the core run from the cycle after the change that lets it, at
+ * esp32_line_time().
+ */
 static void core_kick(ESP32P4BsCore *c)
 {
     if (core_active(c) && !timer_pending(c->timer)) {
-        timer_mod(c->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                            clock_ticks_to_ns(c->clk, 1));
+        core_arm(c, esp32_line_time() + clock_ticks_to_ns(c->clk, 1));
     }
 }
 
@@ -850,8 +867,11 @@ static void core_exchange(ESP32P4BsCore *c, bool out_had, bool in_full)
     }
 }
 
-/* [spec:nuos:req:emu.esp32p4.parlio] */
-static void core_timer_cb(void *opaque)
+/*
+ * [spec:nuos:req:emu.esp32p4.parlio]
+ * A cycle, at esp32_line_time().
+ */
+static void core_run(void *opaque)
 {
     ESP32P4BsCore *c = opaque;
     bool out_had = c->fifo_out.num;
@@ -862,8 +882,38 @@ static void core_timer_cb(void *opaque)
     progress = core_active(c) && core_step(c);
     core_exchange(c, out_had, in_full);
     if (progress && core_active(c)) {
-        timer_mod(c->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                            clock_ticks_to_ns(c->clk, 1));
+        core_arm(c, esp32_line_time() + clock_ticks_to_ns(c->clk, 1));
+    }
+}
+
+/* The cycle falls due: run it at its time, which a late timer has passed. */
+static void core_timer_cb(void *opaque)
+{
+    ESP32P4BsCore *c = opaque;
+
+    esp32_line_run_at(c->due_ns, core_run, c);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.parlio]
+ * Run the cycles that fell due by @when, in order, each at its own time
+ * after the channel's rounds due by then.
+ */
+static void core_catch_up(ESP32P4BsCore *c, int64_t when)
+{
+    while (timer_pending(c->timer) && c->due_ns <= when) {
+        timer_del(c->timer);
+        if (c->gdma) {
+            esp32p4_gdma_chan_sync(c->gdma, c->due_ns);
+        }
+        esp32_line_run_at(c->due_ns, core_run, c);
+    }
+}
+
+static void bs_catch_up(ESP32P4BitScramblerState *s, int64_t when)
+{
+    for (int i = 0; i < 2; i++) {
+        core_catch_up(&s->core[i], when);
     }
 }
 
@@ -871,6 +921,10 @@ static void core_clk_update(void *opaque, ClockEvent event)
 {
     ESP32P4BsCore *c = opaque;
 
+    if (event == ClockPreUpdate) {
+        core_catch_up(c, esp32_line_time());
+        return;
+    }
     if (clock_is_enabled(c->clk)) {
         core_kick(c);
     } else {
@@ -956,12 +1010,18 @@ static void bs_path_chan_ready(void *opaque, int dir)
     core_kick(c);
 }
 
+static void bs_path_sync(void *opaque, int64_t when)
+{
+    core_catch_up(opaque, when);
+}
+
 static const ESP32P4GdmaInterposerOps bs_path_ops = {
     .pull = bs_path_pull,
     .tx_pending = bs_path_tx_pending,
     .push = bs_path_push,
     .rx_room = bs_path_rx_room,
     .chan_ready = bs_path_chan_ready,
+    .sync = bs_path_sync,
 };
 
 /* In loopback the peripheral's RX path is cut off. */
@@ -982,6 +1042,7 @@ static const ESP32P4GdmaInterposerOps bs_loop_rx_ops = {
     .push = bs_loop_rx_push,
     .rx_room = bs_loop_rx_room,
     .chan_ready = bs_path_chan_ready,
+    .sync = bs_path_sync,
 };
 
 /* Registers */
@@ -1034,6 +1095,7 @@ static uint64_t bs_read(void *opaque, hwaddr addr, unsigned size)
     ESP32P4BsCore *c;
     uint32_t *w;
 
+    bs_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     switch (addr) {
     case A_INST_CFG0(TX):
     case A_INST_CFG0(RX):
@@ -1100,6 +1162,7 @@ static void bs_write(void *opaque, hwaddr addr, uint64_t value,
     ESP32P4BsCore *c;
     uint32_t *w;
 
+    bs_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     switch (addr) {
     case A_INST_CFG0(TX):
     case A_INST_CFG0(RX):
@@ -1204,6 +1267,7 @@ static void bs_core_reset_in(void *opaque, int n, int level)
     if (level == c->reset_held) {
         return;
     }
+    core_catch_up(c, esp32_line_time());
     c->reset_held = level;
     core_reset(c);
     bs_update_paths(s);
@@ -1245,7 +1309,8 @@ static void bs_init(Object *obj)
         c->s = s;
         c->dir = i;
         c->clk = qdev_init_clock_in(DEVICE(obj), clk_names[i],
-                                    core_clk_update, c, ClockUpdate);
+                                    core_clk_update, c,
+                                    ClockPreUpdate | ClockUpdate);
         c->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, core_timer_cb, c);
     }
 }
@@ -1307,8 +1372,8 @@ static const VMStateDescription vmstate_bs_fifo = {
 
 static const VMStateDescription vmstate_bs_core = {
     .name = "esp32p4-bitscrambler-core",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(inst_cfg0, ESP32P4BsCore),
         VMSTATE_UINT32(lut_cfg0, ESP32P4BsCore),
@@ -1336,14 +1401,15 @@ static const VMStateDescription vmstate_bs_core = {
                        ESP32P4BsFifo),
         VMSTATE_CLOCK(clk, ESP32P4BsCore),
         VMSTATE_TIMER_PTR(timer, ESP32P4BsCore),
+        VMSTATE_INT64(due_ns, ESP32P4BsCore),
         VMSTATE_END_OF_LIST()
     },
 };
 
 static const VMStateDescription vmstate_bs = {
     .name = TYPE_ESP32P4_BITSCRAMBLER,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = bs_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(core, ESP32P4BitScramblerState, 2, 1,

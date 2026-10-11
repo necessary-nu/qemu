@@ -128,6 +128,8 @@ struct ESP32P4DwGdmaState {
     qemu_irq hs_ack[ESP32P4_DW_GDMA_HS];
     Clock *clk;
     QEMUTimer *timer;
+    /* When the round @timer runs falls due. */
+    int64_t due_ns;
     AddressSpace *as;
     Object *pms;
 

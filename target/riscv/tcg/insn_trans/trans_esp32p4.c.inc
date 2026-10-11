@@ -24,6 +24,18 @@
 #ifndef CONFIG_USER_ONLY
 
 /*
+ * Add @n to the instructions an ESP32-P4 core has retired (minstret,
+ * esp32p4_counters.c): 1 as each instruction starts, -1 as one raises its
+ * exception.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void gen_esp32p4_count_insn(DisasContext *ctx, int n)
+{
+    tcg_gen_addi_i64(esp32p4_insns, esp32p4_insns, n);
+}
+
+/*
  * Continue after the current instruction at next, the next instruction
  * when next is NULL, or a loop's start if the instruction ends one, and
  * end the TB.

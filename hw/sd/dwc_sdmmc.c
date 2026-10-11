@@ -107,6 +107,15 @@
  * IDMAC; each bit clears after two bus clock cycles, and, for the first
  * two, two cclk_in cycles more.
  *
+ * Time. Every timed event (a command taken, sent or answered, a chunk of
+ * data on the bus, a timeout, a reset's end, a card detect debounced)
+ * happens at its own time, however late the QEMU timer that runs it: a
+ * late event runs as of its time (esp32_line_run_at(), as the Espressif
+ * integrations time their lines), and what it times from there it times
+ * from that. Register accesses, clock changes and the card-side inputs
+ * first take the events that fell due before them, in time order, so
+ * that software sees the controller as it is at the access.
+ *
  * Not modelled: boot mode, CE-ATA (CCS, CCSD) and MMC CMD40's interrupt
  * response, which are logged as unimplemented; the phase and delay
  * settings, which shape signals the model does not draw; the SD signals
@@ -123,6 +132,7 @@
 #include "qapi/error.h"
 #include "hw/sd/dwc_sdmmc.h"
 #include "hw/core/irq.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -381,12 +391,41 @@ static int64_t dwc_cycles_ns(uint64_t period, uint64_t cycles)
     return MAX((lo >> 32 | hi << 32) + !!(uint32_t)lo, 1);
 }
 
+/*
+ * The present: the time of the event being taken, or of the change being
+ * made (include/hw/gpio/esp32_line.h).
+ */
+static int64_t dwc_now(void)
+{
+    return esp32_line_time();
+}
+
 static int64_t dwc_after(uint64_t period, uint64_t cycles)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = dwc_now();
     int64_t ns = dwc_cycles_ns(period, cycles);
 
     return ns > INT64_MAX - now ? INT64_MAX : now + ns;
+}
+
+/* Arm @t for @when, which *@due keeps for when the timer runs late. */
+static void dwc_arm(QEMUTimer *t, int64_t *due, int64_t when)
+{
+    *due = when;
+    timer_mod(t, when);
+}
+
+static void dwc_catch_up(DWCSDMMCState *s, int64_t now);
+
+/* Take the timed event @fn at @when, its changes catching up nothing. */
+static void dwc_run_event(DWCSDMMCState *s, int64_t when,
+                          void (*fn)(void *opaque), void *opaque)
+{
+    bool was = s->in_event;
+
+    s->in_event = true;
+    esp32_line_run_at(when, fn, opaque);
+    s->in_event = was;
 }
 
 static uint64_t dwc_default_cclk_period(DWCSDMMCState *s)
@@ -533,7 +572,7 @@ static void dwc_cmd_try_take(DWCSDMMCState *s)
         return;
     }
     s->cmd_phase = DWC_CMD_TAKING;
-    timer_mod(&s->cmd_timer, dwc_after(period, CIU_SYNC_CYCLES));
+    dwc_arm(&s->cmd_timer, &s->cmd_due, dwc_after(period, CIU_SYNC_CYCLES));
 }
 
 static void dwc_idmac_start(DWCSDMMCState *s);
@@ -685,7 +724,7 @@ static void dwc_cmd_issue(DWCSDMMCState *s, uint32_t cmd, uint32_t arg,
 
     s->cmd_sent_ns = dwc_after(period, sent);
     s->cmd_phase = DWC_CMD_BUSY;
-    timer_mod(&s->cmd_timer, dwc_after(period, cycles));
+    dwc_arm(&s->cmd_timer, &s->cmd_due, dwc_after(period, cycles));
 
     if (!autostop && (cmd & CMD_DATA_EXPECTED)) {
         dwc_data_setup(s, cmd);
@@ -714,7 +753,8 @@ static void dwc_cmd_update_clock(DWCSDMMCState *s, uint32_t cmd)
 
 static void dwc_data_end(DWCSDMMCState *s, uint32_t rint, bool normal);
 
-static void dwc_cmd_timer(void *opaque)
+/* The command path's next step, at its time, dwc_now(). */
+static void dwc_cmd_run(void *opaque)
 {
     DWCSDMMCState *s = opaque;
 
@@ -767,6 +807,13 @@ static void dwc_cmd_timer(void *opaque)
     dwc_sdmmc_update(s);
 }
 
+static void dwc_cmd_timer(void *opaque)
+{
+    DWCSDMMCState *s = opaque;
+
+    dwc_run_event(s, s->cmd_due, dwc_cmd_run, s);
+}
+
 /* The data path */
 
 static void dwc_timeout_arm(DWCSDMMCState *s, int kind)
@@ -779,8 +826,8 @@ static void dwc_timeout_arm(DWCSDMMCState *s, int kind)
     }
     s->timeout_kind = kind;
     if (period) {
-        timer_mod(&s->timeout_timer,
-                  dwc_after(period, extract32(s->tmout, 8, 24)));
+        dwc_arm(&s->timeout_timer, &s->timeout_due,
+                dwc_after(period, extract32(s->tmout, 8, 24)));
     } else {
         timer_del(&s->timeout_timer);
     }
@@ -899,10 +946,11 @@ static void dwc_data_kick(DWCSDMMCState *s)
     }
     s->chunk_len = n;
     s->chunk_busy = true;
-    timer_mod(&s->data_timer, dwc_after(period, cycles));
+    dwc_arm(&s->data_timer, &s->data_due, dwc_after(period, cycles));
 }
 
-static void dwc_data_timer(void *opaque)
+/* The chunk on the bus has moved, at its time, dwc_now(). */
+static void dwc_data_run(void *opaque)
 {
     DWCSDMMCState *s = opaque;
     SDBus *bus = dwc_bus(s, s->data_slot);
@@ -936,7 +984,15 @@ static void dwc_data_timer(void *opaque)
     dwc_sdmmc_update(s);
 }
 
-static void dwc_timeout_timer(void *opaque)
+static void dwc_data_timer(void *opaque)
+{
+    DWCSDMMCState *s = opaque;
+
+    dwc_run_event(s, s->data_due, dwc_data_run, s);
+}
+
+/* The data timeout, at its time, dwc_now(). */
+static void dwc_timeout_run(void *opaque)
 {
     DWCSDMMCState *s = opaque;
     int kind = s->timeout_kind;
@@ -953,6 +1009,13 @@ static void dwc_timeout_timer(void *opaque)
         dwc_raise(s, INT_HTO);
     }
     dwc_sdmmc_update(s);
+}
+
+static void dwc_timeout_timer(void *opaque)
+{
+    DWCSDMMCState *s = opaque;
+
+    dwc_run_event(s, s->timeout_due, dwc_timeout_run, s);
 }
 
 /* The IDMAC */
@@ -1191,15 +1254,14 @@ static void dwc_resets_schedule(DWCSDMMCState *s)
         cclk) {
         delay += dwc_cycles_ns(cclk, RESET_CYCLES);
     }
-    timer_mod(&s->reset_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay);
+    dwc_arm(&s->reset_timer, &s->reset_due, dwc_now() + delay);
 }
 
 /*
  * The bus clock has run two cycles: DMA_RESET clears; the other two once
  * cclk_in has run two cycles as well, and wait for it while it is stopped.
  */
-static void dwc_reset_timer(void *opaque)
+static void dwc_reset_run(void *opaque)
 {
     DWCSDMMCState *s = opaque;
     uint32_t done = CTRL_DMA_RESET;
@@ -1213,6 +1275,13 @@ static void dwc_reset_timer(void *opaque)
         dwc_resets_schedule(s);
     }
     dwc_sdmmc_update(s);
+}
+
+static void dwc_reset_timer(void *opaque)
+{
+    DWCSDMMCState *s = opaque;
+
+    dwc_run_event(s, s->reset_due, dwc_reset_run, s);
 }
 
 static void dwc_controller_reset(DWCSDMMCState *s)
@@ -1348,7 +1417,7 @@ static uint32_t dwc_status(DWCSDMMCState *s)
                STATUS_DATA_MC_BUSY;
     }
     if (s->cmd_phase == DWC_CMD_BUSY) {
-        if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->cmd_sent_ns) {
+        if (dwc_now() < s->cmd_sent_ns) {
             fsm = 4;                /* Send cmd index + arg */
         } else if (s->ciu_cmd & CMD_RESP_EXPECT) {
             fsm = 11;               /* Receive resp data */
@@ -1568,6 +1637,7 @@ static uint64_t dwc_sdmmc_read(void *opaque, hwaddr offset, unsigned size)
     hwaddr reg = offset & ~3;
     uint32_t v;
 
+    dwc_catch_up(s, dwc_now());
     if (reg == A_BUFFIFO) {
         if (size != 4) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: %u-byte access to BUFFIFO\n",
@@ -1766,6 +1836,7 @@ static void dwc_sdmmc_write(void *opaque, hwaddr offset, uint64_t value,
     unsigned shift = (offset & 3) * 8;
     uint32_t mask = MAKE_64BIT_MASK(shift, size * 8);
 
+    dwc_catch_up(s, dwc_now());
     if (reg == A_BUFFIFO) {
         if (size != 4) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: %u-byte access to BUFFIFO\n",
@@ -1804,12 +1875,12 @@ static void dwc_debounce_arm(DWCSDMMCState *s, unsigned slot)
         return;
     }
     if (hclk) {
-        timer_mod(&s->debounce_timer[slot],
-                  dwc_after(hclk, extract32(s->debnce, 0, 24)));
+        dwc_arm(&s->debounce_timer[slot], &s->debounce_due[slot],
+                dwc_after(hclk, extract32(s->debnce, 0, 24)));
     }
 }
 
-static void dwc_debounce_timer(DWCSDMMCState *s, unsigned slot)
+static void dwc_debounce_run(DWCSDMMCState *s, unsigned slot)
 {
     if ((s->cd_n_in ^ s->cd_n) & BIT(slot)) {
         s->cd_n ^= BIT(slot);
@@ -1818,20 +1889,86 @@ static void dwc_debounce_timer(DWCSDMMCState *s, unsigned slot)
     }
 }
 
+static void dwc_debounce_run0(void *opaque)
+{
+    dwc_debounce_run(opaque, 0);
+}
+
+static void dwc_debounce_run1(void *opaque)
+{
+    dwc_debounce_run(opaque, 1);
+}
+
 static void dwc_debounce_timer0(void *opaque)
 {
-    dwc_debounce_timer(opaque, 0);
+    DWCSDMMCState *s = opaque;
+
+    dwc_run_event(s, s->debounce_due[0], dwc_debounce_run0, s);
 }
 
 static void dwc_debounce_timer1(void *opaque)
 {
-    dwc_debounce_timer(opaque, 1);
+    DWCSDMMCState *s = opaque;
+
+    dwc_run_event(s, s->debounce_due[1], dwc_debounce_run1, s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * Take the timed events that fell due by @now, in time order, each at its
+ * own time, before a change at @now. A change an event makes is part of
+ * it and catches up nothing.
+ */
+static void dwc_catch_up(DWCSDMMCState *s, int64_t now)
+{
+    static void (*const debounce_run[DWC_SDMMC_MAX_SLOTS])(void *) = {
+        dwc_debounce_run0, dwc_debounce_run1,
+    };
+
+    if (s->in_event) {
+        return;
+    }
+    for (;;) {
+        QEMUTimer *timer = NULL;
+        void (*run)(void *opaque) = NULL;
+        int64_t due = INT64_MAX;
+
+#define DWC_EARLIEST(t, when, fn) \
+        do { \
+            if (timer_pending(t) && (when) < due) { \
+                timer = (t); \
+                due = (when); \
+                run = (fn); \
+            } \
+        } while (0)
+
+        DWC_EARLIEST(&s->reset_timer, s->reset_due, dwc_reset_run);
+        DWC_EARLIEST(&s->cmd_timer, s->cmd_due, dwc_cmd_run);
+        DWC_EARLIEST(&s->data_timer, s->data_due, dwc_data_run);
+        DWC_EARLIEST(&s->timeout_timer, s->timeout_due, dwc_timeout_run);
+        for (unsigned slot = 0; slot < DWC_SDMMC_MAX_SLOTS; slot++) {
+            DWC_EARLIEST(&s->debounce_timer[slot], s->debounce_due[slot],
+                         debounce_run[slot]);
+        }
+#undef DWC_EARLIEST
+        if (!timer || due > now) {
+            return;
+        }
+        timer_del(timer);
+        dwc_run_event(s, due, run, s);
+    }
+}
+
+void dwc_sdmmc_catch_up(DWCSDMMCState *s)
+{
+    dwc_catch_up(s, dwc_now());
 }
 
 static void dwc_card_detect_n(void *opaque, int slot, int level)
 {
     DWCSDMMCState *s = opaque;
 
+    dwc_catch_up(s, dwc_now());
     s->cd_n_in = deposit32(s->cd_n_in, slot, 1, level != 0);
     dwc_debounce_arm(s, slot);
 }
@@ -1847,6 +1984,7 @@ static void dwc_card_int_n(void *opaque, int slot, int level)
 {
     DWCSDMMCState *s = opaque;
 
+    dwc_catch_up(s, dwc_now());
     s->int_n_in = deposit32(s->int_n_in, slot, 1, level != 0);
     dwc_sdio_irq_update(s);
     dwc_sdmmc_update_irq(s);
@@ -1856,6 +1994,7 @@ static void dwc_card_irq(DeviceState *dev, unsigned slot, bool level)
 {
     DWCSDMMCState *s = DWC_SDMMC(dev);
 
+    dwc_catch_up(s, dwc_now());
     s->card_irq = deposit32(s->card_irq, slot, 1, level);
     dwc_sdio_irq_update(s);
     dwc_sdmmc_update_irq(s);
@@ -1875,6 +2014,10 @@ static void dwc_clock_update(void *opaque, ClockEvent event)
 {
     DWCSDMMCState *s = opaque;
 
+    if (event == ClockPreUpdate) {
+        dwc_catch_up(s, dwc_now());
+        return;
+    }
     for (unsigned slot = 0; slot < s->num_slots; slot++) {
         if (!timer_pending(&s->debounce_timer[slot])) {
             dwc_debounce_arm(s, slot);
@@ -1908,9 +2051,9 @@ static void dwc_sdmmc_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
     s->hclk = qdev_init_clock_in(dev, "hclk", dwc_clock_update, s,
-                                 ClockUpdate);
+                                 ClockPreUpdate | ClockUpdate);
     s->cclk = qdev_init_clock_in(dev, "cclk-in", dwc_clock_update, s,
-                                 ClockUpdate);
+                                 ClockPreUpdate | ClockUpdate);
     qdev_init_gpio_in_named(dev, dwc_card_detect_n, DWC_SDMMC_CARD_DETECT_N,
                             DWC_SDMMC_MAX_SLOTS);
     qdev_init_gpio_in_named(dev, dwc_card_write_prt,
@@ -1966,6 +2109,7 @@ static void dwc_sdmmc_reset_hold(Object *obj, ResetType type)
     for (unsigned slot = 0; slot < DWC_SDMMC_MAX_SLOTS; slot++) {
         timer_del(&s->debounce_timer[slot]);
     }
+    s->in_event = false;
 
     s->ctrl = s->ctrl_reset;
     s->pwren = 0;
@@ -2047,14 +2191,20 @@ static void dwc_sdmmc_reset_exit(Object *obj, ResetType type)
 
 const VMStateDescription vmstate_dwc_sdmmc = {
     .name = TYPE_DWC_SDMMC,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER(cmd_timer, DWCSDMMCState),
         VMSTATE_TIMER(data_timer, DWCSDMMCState),
         VMSTATE_TIMER(timeout_timer, DWCSDMMCState),
         VMSTATE_TIMER(reset_timer, DWCSDMMCState),
         VMSTATE_TIMER_ARRAY(debounce_timer, DWCSDMMCState,
+                            DWC_SDMMC_MAX_SLOTS),
+        VMSTATE_INT64(cmd_due, DWCSDMMCState),
+        VMSTATE_INT64(data_due, DWCSDMMCState),
+        VMSTATE_INT64(timeout_due, DWCSDMMCState),
+        VMSTATE_INT64(reset_due, DWCSDMMCState),
+        VMSTATE_INT64_ARRAY(debounce_due, DWCSDMMCState,
                             DWC_SDMMC_MAX_SLOTS),
         VMSTATE_UINT32(ctrl, DWCSDMMCState),
         VMSTATE_UINT32(pwren, DWCSDMMCState),

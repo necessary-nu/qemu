@@ -705,6 +705,55 @@ static void test_sha(void)
     qtest_quit(qts);
 }
 
+/*
+ * The next block written into SHA_M while the accelerator hashes this one
+ * (TRM 31.4.2.1, note 1), as the boot ROM's ets_sha_process() writes it,
+ * with SHA_MODE, before it waits for SHA_BUSY: the block in progress is
+ * the one SHA_M held at SHA_START, and SHA_CONTINUE then hashes the new
+ * one. FIPS 180-4's two-block SHA-256 example.
+ */
+/* [spec:nuos:req:emu.esp32p4.crypto/test] */
+static void test_sha_next_block_busy(void)
+{
+    QTestState *qts = start();
+    const char *msg = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmno"
+                      "mnopnopq";
+    uint8_t m1[64] = { 0 }, m2[64] = { 0 };
+
+    memcpy(m1, msg, 56);
+    m1[56] = 0x80;
+    stq_be_p(m2 + 56, 448);
+
+    wr_bytes(qts, SHA_M(0), m1, 64);
+    qtest_writel(qts, SHA_MODE, 2);
+    qtest_writel(qts, SHA_START, 1);
+    g_assert_cmphex(qtest_readl(qts, SHA_BUSY), ==, 1);
+    qtest_writel(qts, SHA_MODE, 2);
+    wr_bytes(qts, SHA_M(0), m2, 64);
+    g_assert_cmphex(qtest_readl(qts, SHA_BUSY), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, SHA_M(15)), ==,
+                    (uint32_t)ldl_le_p(m2 + 60));
+    g_assert_cmphex(qtest_readl(qts, SHA_MODE), ==, 2);
+    qtest_clock_step(qts, 10000);
+    g_assert_cmphex(qtest_readl(qts, SHA_BUSY), ==, 0);
+    /* The first block's intermediate hash value. */
+    check_hex(qts, SHA_H(0), "85e655d6417a17953363376a624cde5c"
+                             "76e09589cac5f811cc4b32c1f20e533a");
+
+    qtest_writel(qts, SHA_CONTINUE, 1);
+    qtest_clock_step(qts, 10000);
+    check_hex(qts, SHA_H(0), "248d6a61d20638b8e5c026930c3e6039"
+                             "a33ce45964ff2167f6ecedd419db06c1");
+
+    /* SHA_H written while it is busy is dropped: the result stands. */
+    wr_bytes(qts, SHA_M(0), m1, 64);
+    qtest_writel(qts, SHA_START, 1);
+    qtest_writel(qts, SHA_H(0), 0);
+    qtest_clock_step(qts, 10000);
+    check_hex(qts, SHA_H(0), "85e655d6417a17953363376a624cde5c");
+    qtest_quit(qts);
+}
+
 /* [spec:nuos:req:emu.esp32p4.crypto/test] */
 static void test_sha_dma(void)
 {
@@ -943,11 +992,27 @@ static void test_rng(void)
 
     g_assert_cmphex(qtest_readl(qts, RNG_CFG), ==, (255u << 1) | (1u << 9));
     g_assert_cmphex(qtest_readl(qts, RNG_DATE), ==, 2425091);
-    /* Until RNG_CLK_EN the generator does not run. */
-    g_assert_cmphex(qtest_readl(qts, RNG_DATA), ==, 0);
-    g_assert_cmphex(qtest_readl(qts, RNG_DATA), ==, 0);
 
+    /*
+     * From reset, RNG_CLK_EN clear, each read is a new number, as the boot
+     * ROM's stack guard set-up needs (RNG_SAMPLE_ENABLE set, two reads,
+     * non-zero and different).
+     */
+    qtest_writel(qts, RNG_CFG, qtest_readl(qts, RNG_CFG) | 1);
+    a = qtest_readl(qts, RNG_DATA);
+    b = qtest_readl(qts, RNG_DATA);
+    c = qtest_readl(qts, RNG_DATA);
+    g_assert_true(a != b || b != c);
+    g_assert_true(a || b || c);
+    qtest_writel(qts, RNG_CFG, qtest_readl(qts, RNG_CFG) & ~1u);
+
+    /* Without the BUF_CHAIN too; RNG_CLK_EN, the register clock gate, holds. */
+    a = qtest_readl(qts, RNG_DATA);
+    b = qtest_readl(qts, RNG_DATA);
+    c = qtest_readl(qts, RNG_DATA);
+    g_assert_true(a != b || b != c);
     qtest_writel(qts, RNG_DATE, qtest_readl(qts, RNG_DATE) | RNG_CLK_EN);
+    g_assert_cmphex(qtest_readl(qts, RNG_DATE), ==, 2425091 | RNG_CLK_EN);
     a = qtest_readl(qts, RNG_DATA);
     b = qtest_readl(qts, RNG_DATA);
     c = qtest_readl(qts, RNG_DATA);
@@ -1143,6 +1208,8 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4-crypto/aes-typical", test_aes_typical);
     qtest_add_func("/esp32p4-crypto/aes-dma", test_aes_dma);
     qtest_add_func("/esp32p4-crypto/sha", test_sha);
+    qtest_add_func("/esp32p4-crypto/sha-next-block-busy",
+                   test_sha_next_block_busy);
     qtest_add_func("/esp32p4-crypto/sha-dma", test_sha_dma);
     qtest_add_func("/esp32p4-crypto/rsa", test_rsa);
     qtest_add_func("/esp32p4-crypto/ecc", test_ecc);
