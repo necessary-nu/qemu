@@ -21,11 +21,16 @@
  *     section 11.1.3 gives 0x30100000, which the register's description,
  *     ESP-IDF and the ROM's own entry point contradict), or at LP SRAM
  *     once software clears it; core 1 is held in reset with its clock
- *     gated until software releases it through HP_SYS_CLKRST. The LP core,
- *     which starts at the LP ROM, is held in reset until the PMU starts
- *     it. Each core executes at the clock that drives it,
- *     the HP cores at CPU_CLK and the LP core at LP_DYN_FAST_CLK, and
- *     under icount an instruction takes a cycle of it.
+ *     gated until software releases it through HP_SYS_CLKRST. The LP core
+ *     is held in reset until the PMU starts it, at its boot address
+ *     (LP_SYSTEM_LP_CORE_BOOT_ADDR, by default the LP ROM's); it executes
+ *     from LP SRAM, HP L2MEM (directly, past the caches) and the LP ROM,
+ *     takes its interrupts from LP_INTR (0x5012C000), the LP peripherals'
+ *     and HP_SYSTEM's HP_INTR, sleeps and wakes through the PMU and wakes
+ *     the HP system through it. Each core executes at the clock that
+ *     drives it, the HP cores at CPU_CLK and the LP core at
+ *     LP_DYN_FAST_CLK, and under icount an instruction takes a cycle of
+ *     it.
  *   - The HP ROM (128 KiB) at 0x4FC00000, and at 0x8FC00000 for direct
  *     access; HP L2MEM (768 KiB) at 0x4FF00000, and at 0x8FF00000 for
  *     direct access; the HP TCM (8 KiB) at 0x30100000; the LP ROM (16 KiB)
@@ -308,6 +313,13 @@
  *
  *   -drive if=mtd,format=raw,file=flash.img
  *
+ * The LP ROM's contents are not published, and the machine ships no image
+ * of it: the LP ROM is absent. Every access to it is logged as
+ * unavailable, and a start of the LP core at the LP ROM's entry continues
+ * at the application's boot address software has set
+ * (LP_SYSTEM_BOOT_ADDR_HP_LP, where the ROM would start it), as ESP-IDF's
+ * skip_lp_rom_boot does.
+ *
  * The HP ROM image is the esp32p4-rev3-rom.bin firmware file, or the raw
  * image -bios names. With -kernel, an ELF's segments are loaded into
  * L2MEM (past the L2 cache), the TCM or LP SRAM, and core 0 starts at the
@@ -398,9 +410,6 @@ static const struct {
     { "mem-monitor",      0x500e3000, 4 * KiB },
     { "audio-addc",       0x500e4000, 4 * KiB },
 
-    /* The LP ROM, whose contents Espressif does not publish. */
-    { "lp-rom",           ESP32P4_LP_ROM_BASE, ESP32P4_LP_ROM_SIZE },
-
     /* The MIPI bridges' memories. */
     { "mipi-csi-mem",     0x50104000, 4 * KiB },
     { "mipi-dsi-mem",     0x50105000, 4 * KiB },
@@ -412,7 +421,6 @@ static const struct {
     { "lp-spi",           0x50123000, 4 * KiB },
     { "lp-adc",           0x50127000, 4 * KiB },
     { "lp-touch",         0x50128000, 4 * KiB },
-    { "lp-intr",          0x5012c000, 4 * KiB },
     { "lp-tsens",         0x5012f000, 4 * KiB },
 };
 
@@ -431,6 +439,68 @@ static void esp32p4_map(DeviceState *dev, hwaddr base)
 {
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, base);
+}
+
+/*
+ * The LP ROM, absent: Espressif does not publish its contents. An access
+ * reads 0, as an unimplemented device's does, and is logged.
+ */
+/* [spec:nuos:req:emu.esp32p4.lp-rom] */
+static uint64_t esp32p4_lp_rom_read(void *opaque, hwaddr addr,
+                                    unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "esp32p4.lp-rom: read of %u bytes at 0x%"
+                  HWADDR_PRIx ": the LP ROM is unavailable\n", size, addr);
+    return 0;
+}
+
+/* [spec:nuos:req:emu.esp32p4.lp-rom] */
+static void esp32p4_lp_rom_write(void *opaque, hwaddr addr, uint64_t value,
+                                 unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "esp32p4.lp-rom: write of %u bytes at 0x%"
+                  HWADDR_PRIx ": the LP ROM is unavailable\n", size, addr);
+}
+
+static const MemoryRegionOps esp32p4_lp_rom_ops = {
+    .read = esp32p4_lp_rom_read,
+    .write = esp32p4_lp_rom_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+/*
+ * The LP core's start (TRM 5.4): 0x80 into the vector table at its boot
+ * address, LP_SYSTEM_LP_CORE_BOOT_ADDR, the table's base taking the
+ * address's upper 24 bits, as mtvec's does; mtvec takes the table. The
+ * TRM gives the start as the boot address plus 0x80, from 0x50100000, the
+ * LP ROM, after reset; ESP-IDF's skip_lp_rom_boot sets the boot address to
+ * the application's reset vector, itself 0x80 into its 256-byte aligned
+ * vector table, and the core starts there. Both hold when the core starts
+ * at the boot address's 256-byte aligned base plus 0x80, which the LP
+ * ROM's layout fits too: the jump table ESP-IDF links against begins at
+ * 0x50100090, just past the entry.
+ *
+ * With the LP ROM absent, a start at its entry continues at the
+ * application's boot address, LP_SYSTEM_BOOT_ADDR_HP_LP, to which the ROM
+ * would hand over (ESP-IDF's lp_core_ll_set_app_boot_address()).
+ */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+/* [spec:nuos:req:emu.esp32p4.lp-rom] */
+static void esp32p4_lp_core_boot(void *opaque, uint32_t *pc, uint32_t *mtvec)
+{
+    ESP32P4MachineState *s = opaque;
+    uint32_t base = esp32p4_lp_sys_lp_core_boot_addr(&s->lp_sys) & ~0xffu;
+
+    *mtvec = base | 1;
+    *pc = base + ESP32P4_LP_BOOT_OFFSET;
+    if (!s->lp_rom_loaded && *pc == ESP32P4_LP_RESET_VECTOR) {
+        *pc = esp32p4_lp_sys_lp_core_app_addr(&s->lp_sys);
+        qemu_log_mask(LOG_UNIMP, "esp32p4: the LP ROM is unavailable: the LP "
+                      "core starts at the application's boot address 0x%08"
+                      PRIx32 "\n", *pc);
+    }
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */
@@ -464,6 +534,10 @@ static void esp32p4_init_memory(ESP32P4MachineState *s)
     memory_region_init_ram(&s->lp_sram, owner, "esp32p4.lp-sram",
                            ESP32P4_LP_SRAM_SIZE, &error_fatal);
     memory_region_add_subregion(sys_mem, ESP32P4_LP_SRAM_BASE, &s->lp_sram);
+
+    memory_region_init_io(&s->lp_rom, OBJECT(s), &esp32p4_lp_rom_ops, s,
+                          "esp32p4.lp-rom", ESP32P4_LP_ROM_SIZE);
+    memory_region_add_subregion(sys_mem, ESP32P4_LP_ROM_BASE, &s->lp_rom);
 
     /* Behind the PSRAM windows, for the MMU to map. */
     memory_region_init_ram(&s->psram, owner, "esp32p4.psram",
@@ -727,6 +801,8 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
                                     ESP32P4_CPU_CLOCK, 0));
     icount_set_cpu_clock(CPU(&s->lp_cpu), qdev_get_clock_out(clkrst,
                                                              "lp-core"));
+    clock_set_source(qdev_get_clock_in(DEVICE(&s->lp_cpu), ESP32P4_CPU_LP_CLK),
+                     qdev_get_clock_out(clkrst, "lp-core"));
 
     object_initialize_child(OBJECT(s), "lp-sys", &s->lp_sys,
                             TYPE_ESP32P4_LP_SYS);
@@ -1999,9 +2075,11 @@ static void esp32p4_hp_top_power(void *opaque, int n, int level)
  *     task, PMU_TASK_SLEEP_REQ, and event, PMU_EVT_SLEEP_WAKEUP, are the
  *     ETM's (esp32p4_init_etm()), and the LP I2S's VAD wakeup is
  *     connected with the LP I2S (esp32p4_init_i2s()); the UARTs' wakeups
- *     and UART_WAKEUP_EN are the UARTs' (esp32p4_init_uart()). The other
- *     sources' "wakeup" lines and the LP interrupt wait for the blocks
- *     that take them (USB, SDIO, touch, EMAC, the LP core's interrupts).
+ *     and UART_WAKEUP_EN are the UARTs' (esp32p4_init_uart()); the LP
+ *     core's exception and ETM wakeup sources and its interrupt mask are
+ *     the LP core's (esp32p4_init_lp_core()). The other sources' "wakeup"
+ *     lines wait for the blocks that take them (USB, SDIO, touch, EMAC);
+ *     the LP core takes the PMU's interrupts as sources 6 and 7.
  *   - LP_ANALOG_PERI, behind its LP_CLKRST reset, its interrupt source 8:
  *     the brown-out detector, on BIAS's thresholds, and the glitch and
  *     power supply detectors, the detector enabled by LP_SYSTEM's FIB
@@ -2189,6 +2267,72 @@ static void esp32p4_init_low_power(ESP32P4MachineState *s)
                        esp32p4_intr_source(s, ESP32P4_INTR_MB_LP));
 }
 
+/*
+ * The LP core (TRM chapter 5):
+ *
+ *   - Its interrupt controller, LP_INTR (0x5012C000), behind LPPERI's
+ *     LP_INTR clock and reset, taking the LP interrupt sources from the
+ *     interrupt matrix's fan-out of every source's level and HP_INTR from
+ *     HP_SYSTEM, its own software interrupt LP_SW_INTR being source 18;
+ *     the PMU's sleep process masks it.
+ *   - Its start, from LP_SYSTEM's boot address and the LP ROM
+ *     (esp32p4_lp_core_boot()), and LP_SYSTEM's LP_CORE_DISABLE.
+ *   - Its exception, the PMU's LP CPU exception wakeup source, and
+ *     LP_SYSTEM's LP_CORE_ETM_WAKEUP_FLAG, the PMU's ETM wakeup source.
+ */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void esp32p4_init_lp_core(ESP32P4MachineState *s)
+{
+    DeviceState *lp_cpu = DEVICE(&s->lp_cpu);
+    DeviceState *lp_sys = DEVICE(&s->lp_sys);
+    DeviceState *pmu = DEVICE(&s->pmu);
+    DeviceState *intr;
+    int n;
+
+    object_initialize_child(OBJECT(s), "lp-intr", &s->lp_intr,
+                            TYPE_ESP32P4_LP_INTR);
+    intr = DEVICE(&s->lp_intr);
+    sysbus_realize(SYS_BUS_DEVICE(intr), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(intr), 0,
+                             ESP32P4_LP_INTR_BASE, ESP32P4_CLK_LP_INTR,
+                             ESP32P4_RST_LP_INTR, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(intr), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_SW));
+    for (n = 0; n < ESP32P4_LP_INTR_SOURCES; n++) {
+        if (n == ESP32P4_INTR_LP_SW) {
+            continue;
+        }
+        qdev_connect_gpio_out_named(DEVICE(&s->intmatrix),
+                                    ESP32P4_INTMATRIX_SOURCE_OUT, n,
+                                    qdev_get_gpio_in_named(intr,
+                                        ESP32P4_LP_INTR_SOURCE, n));
+    }
+    qdev_connect_gpio_out_named(DEVICE(&s->hp_sys), ESP32P4_HP_SYS_HP_INTR, 0,
+                                qdev_get_gpio_in_named(intr,
+                                    ESP32P4_LP_INTR_HP, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LP_CORE_INTR_MASK, 0,
+                                qdev_get_gpio_in_named(intr,
+                                    ESP32P4_LP_INTR_MASK, 0));
+    for (n = 0; n < ESP32P4_LP_INTR_CPU_IRQS; n++) {
+        qdev_connect_gpio_out_named(intr, ESP32P4_LP_INTR_CPU_IRQ, n,
+                                    qdev_get_gpio_in_named(lp_cpu,
+                                        ESP32P4_CPU_LP_IRQ, n));
+    }
+
+    esp32p4_lp_cpu_set_boot(&s->lp_cpu, esp32p4_lp_core_boot, s);
+    qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_LP_CORE_DISABLE, 0,
+                                qdev_get_gpio_in_named(lp_cpu,
+                                    ESP32P4_CPU_LP_DISABLE, 0));
+    qdev_connect_gpio_out_named(lp_cpu, ESP32P4_CPU_LP_EXCEPTION, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_LP_CPU_EXC));
+    qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_ETM_WAKEUP_FLAG, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_ETM));
+}
+
 /* LP_SYSTEM_SYS_SW_RST: the software system reset, an HP core reset. */
 /* [spec:nuos:req:emu.esp32p4.debug] */
 static void esp32p4_sw_sys_reset(void *opaque, int n, int level)
@@ -2208,9 +2352,10 @@ static void esp32p4_sw_sys_reset(void *opaque, int n, int level)
  *   - HP_SYSTEM's and LP_SYSTEM's bus error response disables to the HP
  *     cores and the LP core; HP_SYSTEM's WFI wakeup events to the HP cores;
  *     its HP2LP interrupt groups over sources 21 to 130 of the interrupt
- *     matrix, whose HP_INTR waits for the LP core's interrupt controller
- *     and whose HP wakeup is the PMU's (esp32p4_init_low_power()); and the
- *     HP cores' stalls for CPU_CORESTALLED_ST.
+ *     matrix, whose HP_INTR is the LP core's interrupt 30
+ *     (esp32p4_init_lp_core()) and whose HP wakeup is the PMU's
+ *     (esp32p4_init_low_power()); and the HP cores' stalls for
+ *     CPU_CORESTALLED_ST.
  *   - The pads' holds: each pad's GPIO block "pad-hold" input is the OR of
  *     LP_SYSTEM_PAD_RTC_HOLD_CTRL's bit for it and, for GPIO16 to GPIO54,
  *     HP_SYSTEM_GPIO_O_HOLD_CTRL's (the PMU's holds of all the HP or LP
@@ -2219,8 +2364,8 @@ static void esp32p4_sw_sys_reset(void *opaque, int n, int level)
  *     (TRM table 11.1-1), its choice of the core whose stall the RTC
  *     timer follows, and its FIB control (TRM 21.2.2.2) of the super
  *     watchdog's reset, to the RTC watchdog block, and of the brownout
- *     detector, to LP_ANALOG_PERI. Its LP core disable is not connected,
- *     as the PMU does not act on it.
+ *     detector, to LP_ANALOG_PERI. Its LP core disable is the LP core's
+ *     (esp32p4_init_lp_core()).
  *   - The debug assistant (0x3FF06000), not gated by BUSMON_CPU_CLK_EN, its
  *     interrupt ASSIST_DEBUG_INTR (source 127), watching the HP cores and
  *     taking their resets for its PC records.
@@ -2786,11 +2931,8 @@ static void esp32p4_init_rmt_pcnt(ESP32P4MachineState *s)
  * The RMT and the PCNT have no events or tasks on the P4.
  *
  * Not connected, as their blocks are not modelled: the ADC, REGDMA,
- * temperature sensor and 2D-DMA events and tasks;
- * the LP core's events (ULP_EVT_*) and ULP_TASK_WAKEUP_CPU, the PMU's LP
- * core wakeup, whose LP_CORE_ETM_WAKEUP_FLAG in LP_SYS is not modelled;
- * and the RTC timer's tasks (RTC_TASK_*), which the TRM says it does not
- * take.
+ * temperature sensor and 2D-DMA events and tasks; and the RTC timer's
+ * tasks (RTC_TASK_*), which the TRM says it does not take.
  */
 /* [spec:nuos:req:emu.esp32p4.etm] */
 static void esp32p4_init_etm(ESP32P4MachineState *s)
@@ -2938,7 +3080,8 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
 
     /* The PMU's sleep request and its wakeup to HP_ACTIVE. */
     esp32p4_etm_connect_event(etm, ESP32P4_ETM_PMU_EVT_SLEEP_WEEKUP,
-                              DEVICE(&s->pmu), ESP32P4_PMU_ETM_EVENT, 0);
+                              DEVICE(&s->pmu), ESP32P4_PMU_ETM_EVENT,
+                              ESP32P4_PMU_ETM_EVT_SLEEP_WAKEUP);
     esp32p4_etm_connect_task(etm, ESP32P4_ETM_PMU_TASK_SLEEP_REQ,
                              DEVICE(&s->pmu), ESP32P4_PMU_ETM_TASK, 0);
 
@@ -2962,8 +3105,17 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
 
     /*
      * The LP core's interrupt, through LP_SYS's ETM_TASK_ULP_INT, and its
-     * wakeup, which LP_SYS's LP_CORE_ETM_WAKEUP_FLAG records.
+     * wakeup, which LP_SYS's LP_CORE_ETM_WAKEUP_FLAG records for the PMU;
+     * its exception, and the PMU's start and halt of it.
      */
+    esp32p4_etm_connect_event(etm, ESP32P4_ETM_ULP_EVT_ERR_INTR,
+                              DEVICE(&s->lp_cpu), ESP32P4_CPU_ETM_EVENT, 0);
+    esp32p4_etm_connect_event(etm, ESP32P4_ETM_ULP_EVT_START_INTR,
+                              DEVICE(&s->pmu), ESP32P4_PMU_ETM_EVENT,
+                              ESP32P4_PMU_ETM_EVT_LP_CPU_START);
+    esp32p4_etm_connect_event(etm, ESP32P4_ETM_ULP_EVT_HALT,
+                              DEVICE(&s->pmu), ESP32P4_PMU_ETM_EVENT,
+                              ESP32P4_PMU_ETM_EVT_LP_CPU_HALT);
     esp32p4_etm_connect_task(etm, ESP32P4_ETM_ULP_TASK_INT_CPU,
                              DEVICE(&s->lp_sys),
                              ESP32P4_LP_SYS_ETM_TASK_ULP_INT, 0);
@@ -3787,6 +3939,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_spi(s);
     esp32p4_init_parlio(s);
     esp32p4_init_low_power(s);
+    esp32p4_init_lp_core(s);
     esp32p4_init_uart(s);
     esp32p4_init_usb_serial_jtag(s);
     esp32p4_init_i2s(s);
@@ -3804,7 +3957,7 @@ static void esp32p4_init(MachineState *machine)
                     esp32p4_unimplemented[i].base);
     }
     qemu_log_mask(LOG_UNIMP, "esp32p4: the LP ROM's contents are not "
-                  "published, so it is an unimplemented device\n");
+                  "published, so it is absent\n");
 
     esp32p4_load(s);
 }

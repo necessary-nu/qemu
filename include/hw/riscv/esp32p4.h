@@ -28,6 +28,7 @@
 #include "hw/intc/esp32p4_clic.h"
 #include "hw/intc/esp32p4_clint.h"
 #include "hw/intc/esp32p4_intmatrix.h"
+#include "hw/intc/esp32p4_lp_intr.h"
 #include "hw/ssi/ssi.h"
 #include "hw/misc/esp32p4_aes.h"
 #include "hw/misc/esp32p4_ana.h"
@@ -124,9 +125,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 #define ESP32P4_MCPWM_STRIDE        0x1000
 #define ESP32P4_MCPWM_NUM           2
 
-/* Where each core starts from reset. */
+/*
+ * Where each core starts from reset: the LP core 0x80 into the vector
+ * table at its boot address, LP_SYSTEM_LP_CORE_BOOT_ADDR, whose reset value
+ * is the LP ROM's.
+ */
 #define ESP32P4_HP_RESET_VECTOR     ESP32P4_HP_ROM_BASE
-#define ESP32P4_LP_RESET_VECTOR     ESP32P4_LP_ROM_BASE
+#define ESP32P4_LP_BOOT_OFFSET      0x80
+#define ESP32P4_LP_RESET_VECTOR     (ESP32P4_LP_ROM_BASE + \
+                                     ESP32P4_LP_BOOT_OFFSET)
 
 #define ESP32P4_ROM_FILE            "esp32p4-rev3-rom.bin"
 
@@ -150,6 +157,12 @@ struct ESP32P4MachineState {
     MemoryRegion l2mem;
     MemoryRegion l2mem_direct;
     MemoryRegion lp_sram;
+    /*
+     * The LP ROM, and whether it holds an image: the machine ships none,
+     * so it is absent and the LP core starts past it.
+     */
+    MemoryRegion lp_rom;
+    bool lp_rom_loaded;
     MemoryRegion psram;
     /* The HP cores' address space, and the bus in it. */
     MemoryRegion hp_mem;
@@ -161,6 +174,8 @@ struct ESP32P4MachineState {
     ESP32P4ClicState clic;
     ESP32P4IntMatrixState intmatrix;
     ESP32P4HPSysState hp_sys;
+    /* The LP core's interrupt controller. */
+    ESP32P4LPIntrState lp_intr;
 
     ESP32P4ClkRstState clkrst;
     ESP32P4AnaState ana;
