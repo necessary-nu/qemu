@@ -26,6 +26,9 @@
  *   recorded, so the record of the LP core's IBUS and DBUS, which only
  *   such accesses raise, IDBUS_ADDRHOLE_ADDR and _INFO, stays clear.
  *
+ * - LP_SYSTEM_REG_RNG_DATA_REG, which reads the random number generator
+ *   (esp32p4_trng.c, the "trng" link) as its RNG_DATA_REG does.
+ *
  * - The interrupt registers INT_RAW, INT_ST, INT_ENA and INT_CLR, whose
  *   enabled raw bits drive LP_SYSREG_INTR, source 19 of the interrupt
  *   matrix. Of the raw bits only LP_ADDRHOLE_INT is ever set: the LP
@@ -52,6 +55,7 @@
 #define A_INT_CLR               0x17c
 #define A_IDBUS_ADDRHOLE_ADDR   0x198
 #define A_IDBUS_ADDRHOLE_INFO   0x19c
+#define A_RNG_DATA              0x1a4
 
 /* LP_ADDRHOLE_INT, IDBUS_ADDRHOLE_INT, the three bus timeouts, ETM, tick. */
 #define INT_LP_ADDRHOLE         BIT(0)
@@ -108,6 +112,9 @@ static bool esp32p4_lp_sys_reg(ESP32P4LPSysState *s, hwaddr addr,
     case A_IDBUS_ADDRHOLE_INFO:
         *v = 0;
         return true;
+    case A_RNG_DATA:
+        *v = s->trng ? esp32p4_trng_read(s->trng) : 0;
+        return true;
     default:
         return false;
     }
@@ -157,6 +164,7 @@ static void esp32p4_lp_sys_write(void *opaque, hwaddr addr, uint64_t value,
     case A_INT_ST:
     case A_IDBUS_ADDRHOLE_ADDR:
     case A_IDBUS_ADDRHOLE_INFO:
+    case A_RNG_DATA:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write to read-only offset 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_LP_SYS, addr);
         break;
@@ -202,6 +210,10 @@ static void esp32p4_lp_sys_init(Object *obj)
                           TYPE_ESP32P4_LP_SYS, ESP32P4_LP_SYS_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    object_property_add_link(obj, "trng", TYPE_ESP32P4_TRNG,
+                             (Object **)&s->trng,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static const VMStateDescription vmstate_esp32p4_lp_sys = {

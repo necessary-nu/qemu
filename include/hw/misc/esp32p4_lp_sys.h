@@ -10,6 +10,7 @@
 #define HW_MISC_ESP32P4_LP_SYS_H
 
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_trng.h"
 #include "qom/object.h"
 
 #define TYPE_ESP32P4_LP_SYS "esp32p4-lp-sys"
@@ -27,6 +28,8 @@ struct ESP32P4LPSysState {
     uint32_t lp_addrhole_info;
     uint32_t int_raw;
     uint32_t int_ena;
+    /* The random number generator LP_SYSTEM_REG_RNG_DATA_REG reads. */
+    ESP32P4TrngState *trng;
 };
 
 /*

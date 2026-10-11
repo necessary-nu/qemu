@@ -20,14 +20,24 @@
 #include "hw/intc/esp32p4_clint.h"
 #include "hw/intc/esp32p4_intmatrix.h"
 #include "hw/ssi/ssi.h"
+#include "hw/misc/esp32p4_aes.h"
 #include "hw/misc/esp32p4_ana.h"
 #include "hw/misc/esp32p4_cache.h"
 #include "hw/misc/esp32p4_clkrst.h"
+#include "hw/misc/esp32p4_ds.h"
+#include "hw/misc/esp32p4_ecc.h"
+#include "hw/misc/esp32p4_ecdsa.h"
+#include "hw/misc/esp32p4_hmac.h"
 #include "hw/misc/esp32p4_hp_sys.h"
+#include "hw/misc/esp32p4_huk.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_icm.h"
+#include "hw/misc/esp32p4_keymng.h"
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/misc/esp32p4_pms.h"
+#include "hw/misc/esp32p4_rsa.h"
+#include "hw/misc/esp32p4_sha.h"
+#include "hw/misc/esp32p4_trng.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/timer/esp32p4_lp_timer.h"
 #include "hw/timer/esp32p4_lp_wdt.h"
@@ -85,6 +95,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 #define ESP32P4_LP_RESET_VECTOR     ESP32P4_LP_ROM_BASE
 
 #define ESP32P4_ROM_FILE            "esp32p4-rev3-rom.bin"
+
+/* The crypto block resets that hold more than their own block. */
+#define ESP32P4_CRYPTO_RST_SPLITS   4
 
 struct ESP32P4MachineState {
     MachineState parent_obj;
@@ -149,6 +162,20 @@ struct ESP32P4MachineState {
     ESP32P4CacheState cache;
     SSIBus *flash_bus;
     uint64_t flash_size;
+
+    /* The cryptography blocks. */
+    ESP32P4AesState aes;
+    ESP32P4ShaDevState sha;
+    ESP32P4RsaState rsa;
+    ESP32P4EccState ecc;
+    ESP32P4HmacState hmac;
+    ESP32P4DsState ds;
+    ESP32P4EcdsaState ecdsa;
+    ESP32P4KeyMngState keymng;
+    ESP32P4HukState huk;
+    ESP32P4TrngState trng;
+    /* RST_EN_DS, _ECDSA, _KM and _HMAC, to the blocks each holds. */
+    SplitIRQ crypto_rst_split[ESP32P4_CRYPTO_RST_SPLITS];
 };
 
 #endif

@@ -53,6 +53,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4HPSysState, ESP32P4_HP_SYS)
 #define ESP32P4_HP_SYS_CACHE_RESET "cache-reset"
 #define ESP32P4_HP_SYS_CACHE_RESET_LINES 3
 
+/*
+ * Named GPIO output ESP32P4_HP_SYS_MEM_PD: HP_SYSTEM_RSA_PD_CTRL_REG's and
+ * HP_SYSTEM_ECC_PD_CTRL_REG's power-down of the RSA and ECC accelerators'
+ * memories, in that order, high while down, to their "mem-pd" inputs.
+ */
+#define ESP32P4_HP_SYS_MEM_PD "mem-pd"
+#define ESP32P4_HP_SYS_MEM_PD_LINES 2
+
 struct ESP32P4HPSysState {
     SysBusDevice parent_obj;
 
@@ -69,6 +77,8 @@ struct ESP32P4HPSysState {
     uint32_t l2_mem_int_record0;
     uint32_t l2_mem_err_resp_ctrl;
     qemu_irq l2mem_err_resp;
+    uint32_t mem_pd_ctrl[ESP32P4_HP_SYS_MEM_PD_LINES];
+    qemu_irq mem_pd[ESP32P4_HP_SYS_MEM_PD_LINES];
     /* HP_SYSREG_INTR, sysbus IRQ 0. */
     qemu_irq sysreg_irq;
 };

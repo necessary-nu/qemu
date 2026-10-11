@@ -36,6 +36,10 @@
  *     interrupts never raise: L2MEM has no ECC errors here, and nothing
  *     else answers L2MEM accesses with an error. Their interrupt is the
  *     HP_SYSREG source (sysbus IRQ 0).
+ *   - HP_SYSTEM_RSA_PD_CTRL_REG (0x1D0) and _ECC_PD_CTRL_REG (0x1D4): the
+ *     power of the RSA and ECC accelerators' memories, down while
+ *     MEM_FORCE_PD is set or MEM_PD is set without MEM_FORCE_PU, to the
+ *     accelerators ("mem-pd" outputs).
  *
  * The rest of the block's registers are logged as unimplemented and read
  * as zero.
@@ -68,6 +72,13 @@
 #define RECORD0_WE              BIT(21)
 #define A_L2_MEM_ERR_RESP_CTRL  0x198
 #define L2_MEM_ERR_RESP_EN      BIT(0)
+#define A_RSA_PD_CTRL           0x1d0
+#define A_ECC_PD_CTRL           0x1d4
+#define MEM_FORCE_PD            BIT(0)
+#define MEM_FORCE_PU            BIT(1)
+#define MEM_PD                  BIT(2)
+#define MEM_PD_CTRL_MASK        0x7
+#define MEM_PD_CTRL_RESET       MEM_FORCE_PU
 
 static bool esp32p4_hp_sys_is_cpu_intr(hwaddr addr)
 {
@@ -118,6 +129,9 @@ static uint32_t esp32p4_hp_sys_reg(ESP32P4HPSysState *s, hwaddr addr,
         return s->l2_mem_int_record0;
     case A_L2_MEM_ERR_RESP_CTRL:
         return s->l2_mem_err_resp_ctrl;
+    case A_RSA_PD_CTRL:
+    case A_ECC_PD_CTRL:
+        return s->mem_pd_ctrl[((addr & ~3) - A_RSA_PD_CTRL) / 4];
     default:
         *known = false;
         return 0;
@@ -142,6 +156,17 @@ static void esp32p4_hp_sys_update_crypto(ESP32P4HPSysState *s)
 {
     for (int i = 0; i < ESP32P4_HP_SYS_CRYPTO_CTRL_LINES; i++) {
         qemu_set_irq(s->crypto_ctrl_out[i], extract32(s->crypto_ctrl, i, 1));
+    }
+}
+
+/* [spec:nuos:req:emu.esp32p4.crypto] */
+static void esp32p4_hp_sys_update_mem_pd(ESP32P4HPSysState *s)
+{
+    for (int i = 0; i < ESP32P4_HP_SYS_MEM_PD_LINES; i++) {
+        uint32_t c = s->mem_pd_ctrl[i];
+
+        qemu_set_irq(s->mem_pd[i], (c & MEM_FORCE_PD) ||
+                                   ((c & MEM_PD) && !(c & MEM_FORCE_PU)));
     }
 }
 
@@ -213,6 +238,12 @@ static void esp32p4_hp_sys_write(void *opaque, hwaddr addr, uint64_t value,
                                    (v & mask)) & L2_MEM_ERR_RESP_EN;
         qemu_set_irq(s->l2mem_err_resp, s->l2_mem_err_resp_ctrl);
         break;
+    case A_RSA_PD_CTRL:
+    case A_ECC_PD_CTRL:
+        reg = &s->mem_pd_ctrl[((addr & ~3) - A_RSA_PD_CTRL) / 4];
+        *reg = ((*reg & ~mask) | (v & mask)) & MEM_PD_CTRL_MASK;
+        esp32p4_hp_sys_update_mem_pd(s);
+        break;
     default:
         qemu_log_mask(LOG_UNIMP, "%s: unimplemented write of %u bytes at "
                       "0x%" HWADDR_PRIx " (value 0x%" PRIx64 ")\n",
@@ -244,6 +275,9 @@ static void esp32p4_hp_sys_reset_hold(Object *obj, ResetType type)
     s->l2_mem_int_ena = 0;
     s->l2_mem_int_record0 = 0;
     s->l2_mem_err_resp_ctrl = 0;
+    for (int i = 0; i < ESP32P4_HP_SYS_MEM_PD_LINES; i++) {
+        s->mem_pd_ctrl[i] = MEM_PD_CTRL_RESET;
+    }
 }
 
 static void esp32p4_hp_sys_reset_exit(Object *obj, ResetType type)
@@ -256,6 +290,7 @@ static void esp32p4_hp_sys_reset_exit(Object *obj, ResetType type)
     esp32p4_hp_sys_update_cache_reset(s);
     esp32p4_hp_sys_update_crypto(s);
     qemu_set_irq(s->l2mem_err_resp, s->l2_mem_err_resp_ctrl);
+    esp32p4_hp_sys_update_mem_pd(s);
     esp32p4_hp_sys_update_irq(s);
 }
 
@@ -278,12 +313,14 @@ static void esp32p4_hp_sys_init(Object *obj)
                              ESP32P4_HP_SYS_CRYPTO_CTRL_LINES);
     qdev_init_gpio_out_named(DEVICE(obj), &s->l2mem_err_resp,
                              ESP32P4_HP_SYS_L2MEM_ERR_RESP, 1);
+    qdev_init_gpio_out_named(DEVICE(obj), s->mem_pd, ESP32P4_HP_SYS_MEM_PD,
+                             ESP32P4_HP_SYS_MEM_PD_LINES);
 }
 
 static const VMStateDescription vmstate_esp32p4_hp_sys = {
     .name = TYPE_ESP32P4_HP_SYS,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(cpu_int_from_cpu, ESP32P4HPSysState,
                              ESP32P4_HP_SYS_CPU_INTRS),
@@ -294,6 +331,8 @@ static const VMStateDescription vmstate_esp32p4_hp_sys = {
         VMSTATE_UINT32(l2_mem_int_ena, ESP32P4HPSysState),
         VMSTATE_UINT32(l2_mem_int_record0, ESP32P4HPSysState),
         VMSTATE_UINT32(l2_mem_err_resp_ctrl, ESP32P4HPSysState),
+        VMSTATE_UINT32_ARRAY(mem_pd_ctrl, ESP32P4HPSysState,
+                             ESP32P4_HP_SYS_MEM_PD_LINES),
         VMSTATE_END_OF_LIST()
     },
 };
