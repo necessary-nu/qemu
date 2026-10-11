@@ -41,7 +41,9 @@
  * the AES decryption (16 a block), the SHA-256 of MD (72 a block) and the
  * RSA accelerator's constant-time exponentiation (esp32p4_rsa.c); the
  * finish 8. DS_QUERY_BUSY_REG reads 1 meanwhile and writes are dropped
- * and logged.
+ * and logged. The calculation starts as DS_SET_CONTINUE_REG is written,
+ * however long the model takes to make it, and register accesses see it
+ * end at its time, however late its QEMU timer runs.
  */
 
 #include "qemu/osdep.h"
@@ -51,6 +53,7 @@
 #include "crypto/aes.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_ds.h"
 #include "migration/vmstate.h"
 
@@ -240,6 +243,7 @@ static uint64_t ds_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr reg = addr & ~3;
     uint32_t v = 0;
 
+    esp32p4_crypto_timer_sync(&s->op, esp32_line_time());
     switch (reg) {
     case A_Z_MEM ... A_Z_MEM + 0x1ff:
         if (s->phase == DS_DONE) {
@@ -288,7 +292,9 @@ static void ds_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
     hwaddr reg = addr & ~3;
     int shift = (addr & 3) * 8;
     uint32_t v = deposit32(0, shift, size * 8, value);
+    int64_t now = esp32_line_time();
 
+    esp32p4_crypto_timer_sync(&s->op, now);
     if (s->in_reset || !clock_is_enabled(s->clk)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write at 0x%" HWADDR_PRIx
                       " dropped: the peripheral is %s\n", TYPE_ESP32P4_DS,
@@ -343,7 +349,7 @@ static void ds_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
         }
         s->phase = DS_SIGNING;
         s->busy = true;
-        esp32p4_crypto_timer_start(&s->op, ds_sign(s));
+        esp32p4_crypto_timer_start_at(&s->op, ds_sign(s), now);
         break;
     case A_SET_FINISH:
         if (!(v & 1)) {

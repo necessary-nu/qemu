@@ -61,6 +61,10 @@ struct ESP32P4ShaDevState {
     uint32_t op_kind;
     uint32_t op_mode;
     uint32_t left;
+    /*
+     * The block being hashed: SHA_M_n_REG's as a typical operation
+     * started, or the one DMA delivers.
+     */
     uint8_t in_buf[128];
     uint32_t in_len;
     ESP32P4ShaState state;

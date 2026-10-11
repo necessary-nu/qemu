@@ -10,18 +10,31 @@
  * hw_random.c.
  *
  * Each read of RNG_DATA_REG gives a new 32-bit number from the host's
- * CSPRNG (qemu_guest_getrandom), while the generator runs: RNG_CLK_EN
- * (bit 31 of RNG_DATE_REG, clear from reset; ESP-IDF's rng_ll_enable()
- * sets it), RNG_RSTN set and its clock running. Otherwise the register
- * holds its last value, zero from reset; RNG_RSTN low clears it.
+ * CSPRNG (qemu_guest_getrandom), while the generator runs: RNG_RSTN set
+ * and its clock running. Otherwise the register holds its last value,
+ * zero from reset; RNG_RSTN low clears it.
  *
- * The TRM's sources of entropy (the SAR ADC, RC_FAST_CLK, the BUF_CHAIN)
- * decide whether the numbers are true or pseudo random, which software
- * cannot tell apart; the host's numbers stand for both. The TRM's limit
- * on the rate of reads (1 MHz for full entropy) is advice to software.
- * RNG_SAMPLE_CNT counts the BUF_CHAIN's samples, one each
- * RNG_TIMER_PSCALE + 1 cycles of the clock while RNG_SAMPLE_ENABLE and
- * RNG_TIMER_EN are set and the generator runs.
+ * The register is the output of a pseudo-random generator into which the
+ * TRM's sources of entropy feed (35.3, 35.4): the SAR ADC while it
+ * is enabled, RC_FAST_CLK while the PMU powers it (XPD_FOSC) and
+ * LPPERI_CK_EN_RNG passes it, and the BUF_CHAIN while RNG_SAMPLE_ENABLE is
+ * set. Without any of them the numbers are pseudo-random, not zero
+ * ("Otherwise, pseudo-random numbers will be returned"); with them they
+ * are true random numbers, which software cannot tell apart; the host's
+ * numbers stand for both. The TRM's limit on the rate of reads (1 MHz for
+ * full entropy) is advice to software. RNG_SAMPLE_CNT counts the
+ * BUF_CHAIN's samples, one each RNG_TIMER_PSCALE + 1 cycles of the clock
+ * while RNG_SAMPLE_ENABLE and RNG_TIMER_EN are set and the generator runs.
+ *
+ * RNG_CLK_EN (bit 31 of RNG_DATE_REG, clear from reset) forces the
+ * register clock gate on, as the CLK_EN bits of the other cryptography
+ * blocks' date registers do (ECC_MULT_CLK_EN, HUK_CLK_EN: "0: No effect,
+ * 1: Force on"), and is held: the generator runs with it clear, as the
+ * v3.x boot ROM's ets_stack_guard_setup() needs, which sets only
+ * RNG_SAMPLE_ENABLE, then requires two reads of RNG_DATA_REG to be
+ * non-zero and different, resetting the chip otherwise when Secure Boot
+ * or the security download mode is enabled. ESP-IDF's rng_ll_enable()
+ * sets it.
  */
 
 #include "qemu/osdep.h"
@@ -43,13 +56,11 @@
 #define CFG_TIMER_EN        BIT(9)
 #define CFG_RW_MASK         0x3ff
 #define CFG_RESET           ((255u << 1) | CFG_TIMER_EN)
-#define DATE_CLK_EN         BIT(31)
 #define DATE_RESET          2425091
 
 static bool trng_running(ESP32P4TrngState *s)
 {
-    return (s->date & DATE_CLK_EN) && (s->rstn & 1) &&
-           clock_is_enabled(s->clk);
+    return (s->rstn & 1) && clock_is_enabled(s->clk);
 }
 
 static bool trng_sampling(ESP32P4TrngState *s)

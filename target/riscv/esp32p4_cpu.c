@@ -23,7 +23,7 @@
  * The LP core (TRM chapter 5) takes the interrupts of its interrupt
  * controller as the levels of mip's bits 3, 7, 11 and 16 to 30, which mie
  * enables, vectored through mtvec; the lowest pending ID is taken first.
- * Its CSRs, counters and two triggers are in tcg/esp32p4_lp.c. As its
+ * Its CSRs and two triggers are in tcg/esp32p4_lp.c. As its
  * reset is released it starts where the machine says (ESP32P4LPBootFn),
  * from LP_SYSTEM_LP_CORE_BOOT_ADDR, with mtvec at the boot address's
  * vector table, and its reset returns its CSRs to their reset values. An
@@ -64,6 +64,11 @@
  * An HP core tells the interrupt matrix whether it is in machine mode,
  * through its ESP32P4_CPU_M_MODE output, as each trap and trap return
  * changes the mode.
+ *
+ * Both cores' cycle, instruction and event counters are in
+ * tcg/esp32p4_counters.c: each counts its own clock's cycles
+ * (ESP32P4_CPU_CLK) and its own retired instructions, which the code QEMU
+ * translates for it counts.
  */
 
 #include "qemu/osdep.h"
@@ -250,9 +255,7 @@ static void esp32p4_cpu_set_reset(void *opaque, int n, int level)
         return;
     }
 #ifdef CONFIG_TCG
-    if (cpu->lp_clk) {
-        esp32p4_lp_counters_update(cpu);
-    }
+    esp32p4_counters_update(cpu);
 #endif
     qatomic_set(&cpu->reset, reset);
     async_run_on_cpu(CPU(cpu), reset ? esp32p4_cpu_reset_asserted
@@ -286,9 +289,7 @@ static void esp32p4_cpu_set_clock(void *opaque, int n, int level)
         return;
     }
 #ifdef CONFIG_TCG
-    if (cpu->lp_clk) {
-        esp32p4_lp_counters_update(cpu);
-    }
+    esp32p4_counters_update(cpu);
 #endif
     qatomic_set(&cpu->clock_stopped, stopped);
     esp32p4_cpu_clock_changed(cpu, was_off);
@@ -696,7 +697,6 @@ static void esp32p4_hp_reset_hold(ESP32P4CPU *cpu)
     cpu->bus_error = false;
     cpu->bus_error_store = false;
     memset(cpu->mhpmevent, 0, sizeof(cpu->mhpmevent));
-    cpu->mcountinhibit_tm = false;
     esp32p4_triggers_reset(cpu);
     esp32p4_pie_reset(cpu);
     esp32p4_pmp_reset(cpu);
@@ -707,8 +707,8 @@ static void esp32p4_hp_reset_hold(ESP32P4CPU *cpu)
 /*
  * The LP core's CSRs from reset (TRM 5.3.2), which QEMU's RISC-V reset
  * leaves as they were: mstatus, mie, mscratch, mepc and mtval clear; mtvec
- * at the reset boot address's vector table; the counters and triggers.
- * mip follows the interrupt lines, which reset does not change.
+ * at the reset boot address's vector table; the triggers. mip follows the
+ * interrupt lines, which reset does not change.
  */
 /* [spec:nuos:req:emu.esp32p4.lp-core] */
 static void esp32p4_lp_reset_hold(ESP32P4CPU *cpu)
@@ -721,7 +721,6 @@ static void esp32p4_lp_reset_hold(ESP32P4CPU *cpu)
     env->mepc = 0;
     env->mtval = 0;
     env->mtvec = (env->resetvec & ~(target_ulong)0xff) | 1;
-    esp32p4_lp_counters_reset(cpu);
     esp32p4_lp_triggers_reset(cpu);
 }
 #endif
@@ -741,9 +740,10 @@ static void esp32p4_cpu_reset_hold(Object *obj, ResetType type)
     CPU(obj)->halted = esp32p4_cpu_held(cpu);
     cpu->clock_halted = !cpu->reset && esp32p4_cpu_clock_off(cpu);
 #ifdef CONFIG_TCG
+    esp32p4_counters_reset(cpu);
     if (esp32p4_env_is_hp(&cpu->parent_obj.env)) {
         esp32p4_hp_reset_hold(cpu);
-    } else if (cpu->lp_clk) {
+    } else if (esp32p4_env_is_lp(&cpu->parent_obj.env)) {
         esp32p4_lp_reset_hold(cpu);
     }
 #endif
@@ -766,6 +766,14 @@ static void esp32p4_cpu_reset_exit(Object *obj, ResetType type)
 #endif
 }
 
+#ifdef CONFIG_TCG
+/* The core's clock is about to change rate: count at the old one first. */
+static void esp32p4_cpu_clk_update(void *opaque, ClockEvent event)
+{
+    esp32p4_counters_update(opaque);
+}
+#endif
+
 static void esp32p4_cpu_init(Object *obj)
 {
     qdev_init_gpio_in_named(DEVICE(obj), esp32p4_cpu_set_reset,
@@ -774,6 +782,11 @@ static void esp32p4_cpu_init(Object *obj)
                             ESP32P4_CPU_CLOCK, 1);
     qdev_init_gpio_in_named(DEVICE(obj), esp32p4_cpu_set_err_resp_dis,
                             ESP32P4_CPU_ERR_RESP_DIS, 3);
+#ifdef CONFIG_TCG
+    ESP32P4_CPU(obj)->clk = qdev_init_clock_in(DEVICE(obj), ESP32P4_CPU_CLK,
+                                               esp32p4_cpu_clk_update, obj,
+                                               ClockPreUpdate);
+#endif
 }
 
 static bool esp32p4_cpu_get_in_reset(Object *obj, Error **errp)
@@ -860,8 +873,7 @@ static const VMStateDescription vmstate_esp32p4_hp_state = {
         VMSTATE_UINT32_ARRAY(stpc, ESP32P4CPU, 3),
         VMSTATE_UINT32_ARRAY(sttval, ESP32P4CPU, 3),
         VMSTATE_BOOL(bus_error_store, ESP32P4CPU),
-        VMSTATE_UINT32_ARRAY(mhpmevent, ESP32P4CPU, 3),
-        VMSTATE_BOOL(mcountinhibit_tm, ESP32P4CPU),
+        VMSTATE_UINT32_ARRAY(mhpmevent, ESP32P4CPU, ESP32P4_HP_HPM_COUNTERS),
         VMSTATE_UINT32(tselect, ESP32P4CPU),
         VMSTATE_UINT32_ARRAY(tdata1, ESP32P4CPU, ESP32P4_TRIGGERS),
         VMSTATE_UINT32_ARRAY(tdata2, ESP32P4CPU, ESP32P4_TRIGGERS),
@@ -914,8 +926,8 @@ static int esp32p4_lp_state_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_esp32p4_lp_state = {
     .name = "esp32p4-cpu/lp",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 1,
+    .minimum_version_id = 1,
     .needed = esp32p4_lp_state_needed,
     .post_load = esp32p4_lp_state_post_load,
     .fields = (const VMStateField[]) {
@@ -927,17 +939,28 @@ static const VMStateDescription vmstate_esp32p4_lp_state = {
         VMSTATE_UINT32(lp_dpc, ESP32P4CPU),
         VMSTATE_UINT32(lp_dcsr, ESP32P4CPU),
         VMSTATE_TIMER_PTR(lp_exc_timer, ESP32P4CPU),
-        VMSTATE_CLOCK(lp_clk, ESP32P4CPU),
-        VMSTATE_UINT64(lp_cycles, ESP32P4CPU),
-        VMSTATE_UINT64(lp_edges.period.num_hi, ESP32P4CPU),
-        VMSTATE_UINT64(lp_edges.period.num_lo, ESP32P4CPU),
-        VMSTATE_UINT64(lp_edges.period.den, ESP32P4CPU),
-        VMSTATE_INT64(lp_edges.origin_ns, ESP32P4CPU),
-        VMSTATE_UINT64(lp_synced, ESP32P4CPU),
-        VMSTATE_UINT64_ARRAY(lp_ctr_base, ESP32P4CPU, 2),
-        VMSTATE_UINT64_ARRAY(lp_ctr_ref, ESP32P4CPU, 2),
-        VMSTATE_UINT64_ARRAY(lp_hpm, ESP32P4CPU, ESP32P4_LP_HPM_COUNTERS),
-        VMSTATE_UINT32(lp_mcountinhibit, ESP32P4CPU),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_esp32p4_counters = {
+    .name = "esp32p4-cpu/counters",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_CLOCK(clk, ESP32P4CPU),
+        VMSTATE_UINT64(cycles, ESP32P4CPU),
+        VMSTATE_INT64(cycles_ns, ESP32P4CPU),
+        VMSTATE_UINT32(cycles_frac, ESP32P4CPU),
+        VMSTATE_UINT64(insns, ESP32P4CPU),
+        VMSTATE_UINT64_ARRAY(ctr_base, ESP32P4CPU, 2),
+        VMSTATE_UINT64_ARRAY(ctr_ref, ESP32P4CPU, 2),
+        VMSTATE_UINT64_ARRAY(hpm, ESP32P4CPU, ESP32P4_LP_HPM_COUNTERS),
+        VMSTATE_UINT32(mcountinhibit, ESP32P4CPU),
+        VMSTATE_BOOL(waiti_force_on, ESP32P4CPU),
+        VMSTATE_UINT8(waiti_delay, ESP32P4CPU),
+        VMSTATE_BOOL(ctr_wfi, ESP32P4CPU),
+        VMSTATE_UINT32(wfi_left, ESP32P4CPU),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -982,6 +1005,7 @@ static const VMStateDescription vmstate_esp32p4_cpu = {
         &vmstate_esp32p4_pie,
         &vmstate_esp32p4_hp_clic,
         &vmstate_esp32p4_lp_state,
+        &vmstate_esp32p4_counters,
 #endif
         NULL
     },
@@ -993,6 +1017,27 @@ static const VMStateDescription vmstate_esp32p4_cpu = {
  * the HP type extends in its own TCG table.
  */
 static SysemuCPUOps esp32p4_sysemu_ops;
+
+#ifdef CONFIG_TCG
+static void (*esp32p4_riscv_restore_state_to_opc)(CPUState *cs,
+                                                  const TranslationBlock *tb,
+                                                  const uint64_t *data);
+
+/*
+ * The core unwinds from the middle of an instruction's code to its start,
+ * as the instruction raises an exception or is to execute again: it has
+ * not retired, though it counted itself as it started.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void esp32p4_restore_state_to_opc(CPUState *cs,
+                                         const TranslationBlock *tb,
+                                         const uint64_t *data)
+{
+    esp32p4_riscv_restore_state_to_opc(cs, tb, data);
+    esp32p4_cpu_of(cs)->insns--;
+}
+#endif
 
 static void esp32p4_cpu_class_init(ObjectClass *oc, const void *data)
 {
@@ -1011,6 +1056,8 @@ static void esp32p4_cpu_class_init(ObjectClass *oc, const void *data)
 #ifdef CONFIG_TCG
     esp32p4_tcg_ops = *cc->tcg_ops;
     esp32p4_tcg_ops.cpu_exec_halt = esp32p4_cpu_has_work;
+    esp32p4_riscv_restore_state_to_opc = esp32p4_tcg_ops.restore_state_to_opc;
+    esp32p4_tcg_ops.restore_state_to_opc = esp32p4_restore_state_to_opc;
     cc->tcg_ops = &esp32p4_tcg_ops;
 #endif
 
@@ -1038,6 +1085,55 @@ static void esp32p4_hp_cpu_set_gpio_in(void *opaque, int n, int level)
     qatomic_set(&cpu->gpio_in, deposit32(qatomic_read(&cpu->gpio_in), n, 1,
                                          level != 0));
 }
+
+/* HP_SYSTEM_CPU_WAITI_CONF: whether, and when, the clock stops in WFI. */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static void esp32p4_hp_cpu_set_waiti_conf(void *opaque, int n, int level)
+{
+    ESP32P4CPU *cpu = opaque;
+    bool force_on = cpu->waiti_force_on;
+    uint8_t delay = cpu->waiti_delay;
+
+    if (n == 0) {
+        force_on = level != 0;
+    } else {
+        delay = deposit32(delay, n - 1, 1, level != 0);
+    }
+    esp32p4_counters_set_waiti(cpu, force_on, delay);
+}
+
+/*
+ * The core has left the code it was executing: if it now waits in WFI,
+ * its counters learn when it started to.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static void esp32p4_hp_cpu_exec_exit(CPUState *cs)
+{
+    ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
+
+    if (esp32p4_tcg_ops.cpu_exec_exit) {
+        esp32p4_tcg_ops.cpu_exec_exit(cs);
+    }
+    if (cs->halted && !cpu->ctr_wfi && !esp32p4_cpu_held(cpu) &&
+        !cpu->clock_halted) {
+        BQL_LOCK_GUARD();
+        esp32p4_counters_wfi(cpu, true);
+    }
+}
+
+/* A halted core asks whether to carry on: one in WFI leaves it as it does. */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static bool esp32p4_hp_cpu_exec_halt(CPUState *cs)
+{
+    ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
+    bool wake = esp32p4_cpu_has_work(cs);
+
+    if (wake && cpu->ctr_wfi) {
+        BQL_LOCK_GUARD();
+        esp32p4_counters_wfi(cpu, false);
+    }
+    return wake;
+}
 #endif
 
 /*
@@ -1059,6 +1155,10 @@ static void esp32p4_hp_cpu_init(Object *obj)
     qdev_init_gpio_in_named(dev, esp32p4_hp_cpu_set_gpio_in,
                             ESP32P4_CPU_GPIO_IN, ESP32P4_CPU_GPIOS);
     qdev_init_gpio_out_named(dev, &cpu->m_mode_irq, ESP32P4_CPU_M_MODE, 1);
+    qdev_init_gpio_in_named(dev, esp32p4_hp_cpu_set_waiti_conf,
+                            ESP32P4_CPU_WAITI_CONF,
+                            ESP32P4_CPU_WAITI_CONF_LINES);
+    cpu->waiti_force_on = true;
 #endif
     qdev_init_gpio_in_named(DEVICE(obj), esp32p4_cpu_set_wakeup,
                             ESP32P4_CPU_WAKEUP, 1);
@@ -1083,6 +1183,8 @@ static void esp32p4_hp_cpu_class_init(ObjectClass *oc, const void *data)
         esp32p4_debug_check_breakpoint;
     esp32p4_hp_tcg_ops.debug_check_watchpoint =
         esp32p4_debug_check_watchpoint;
+    esp32p4_hp_tcg_ops.cpu_exec_exit = esp32p4_hp_cpu_exec_exit;
+    esp32p4_hp_tcg_ops.cpu_exec_halt = esp32p4_hp_cpu_exec_halt;
     cc->tcg_ops = &esp32p4_hp_tcg_ops;
     esp32p4_csr_class_init();
 #endif
@@ -1174,22 +1276,9 @@ static void esp32p4_lp_cpu_set_disable(void *opaque, int n, int level)
     if (cpu->disabled == !!level) {
         return;
     }
-    esp32p4_lp_counters_update(cpu);
+    esp32p4_counters_update(cpu);
     qatomic_set(&cpu->disabled, level != 0);
     esp32p4_cpu_clock_changed(cpu, was_off);
-}
-
-/*
- * The core's clock is about to change rate: count at the old one first,
- * then from the change at the new one.
- */
-static void esp32p4_lp_cpu_clk_update(void *opaque, ClockEvent event)
-{
-    if (event == ClockPreUpdate) {
-        esp32p4_lp_counters_update(opaque);
-    } else {
-        esp32p4_lp_counters_clock_changed(opaque);
-    }
 }
 #endif
 
@@ -1202,8 +1291,7 @@ void esp32p4_lp_cpu_set_boot(ESP32P4CPU *cpu, ESP32P4LPBootFn fn,
 
 /*
  * The LP core's own trigger module replaces QEMU's, and it has an
- * interrupt controller's lines, LP_CORE_DISABLE, its exception outputs and
- * the clock its counters count.
+ * interrupt controller's lines, LP_CORE_DISABLE and its exception outputs.
  */
 /* [spec:nuos:req:emu.esp32p4.lp-core] */
 static void esp32p4_lp_cpu_init(Object *obj)
@@ -1222,9 +1310,6 @@ static void esp32p4_lp_cpu_init(Object *obj)
                              ESP32P4_CPU_LP_EXCEPTION, 1);
     qdev_init_gpio_out_named(dev, &cpu->lp_etm_event, ESP32P4_CPU_ETM_EVENT,
                              1);
-    cpu->lp_clk = qdev_init_clock_in(dev, ESP32P4_CPU_LP_CLK,
-                                     esp32p4_lp_cpu_clk_update, cpu,
-                                     ClockPreUpdate | ClockUpdate);
     cpu->lp_exc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32p4_lp_exc_timer,
                                      cpu);
 #endif

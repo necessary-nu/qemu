@@ -10,7 +10,6 @@
 #define TARGET_RISCV_ESP32P4_CPU_H
 
 #include "target/riscv/cpu.h"
-#include "hw/misc/esp32p4_clk_period.h"
 #include "target/riscv/esp32p4_pie.h"
 #include "qom/object.h"
 
@@ -27,6 +26,22 @@ OBJECT_DECLARE_TYPE(ESP32P4CPU, ESP32P4CPUClass, ESP32P4_CPU)
  */
 #define ESP32P4_CPU_RESET "reset"
 #define ESP32P4_CPU_CLOCK "clock"
+
+/*
+ * Clock input of both cores: the core's clock, CPU_CLK as HP_SYS_CLKRST
+ * gates it for each HP core and LP_CORE's clock for the LP core, whose
+ * cycles mcycle counts at the clock's current frequency.
+ */
+#define ESP32P4_CPU_CLK "clk"
+
+/*
+ * Named GPIO input of the HP core, HP_SYSTEM_CPU_WAITI_CONF (TRM register
+ * 21.43): line 0 high while WAIT_MODE_FORCE_ON keeps the core's clock
+ * running in WFI, lines 1 to 4 WAITI_DELAY_NUM, the cycles the clock runs
+ * on in WFI before it stops when it is not forced on.
+ */
+#define ESP32P4_CPU_WAITI_CONF "waiti-conf"
+#define ESP32P4_CPU_WAITI_CONF_LINES 5
 
 /*
  * The HP core's fast GPIO (TRM 2.5, cpu_gpio_* CSRs): eight outputs each
@@ -84,12 +99,10 @@ OBJECT_DECLARE_TYPE(ESP32P4CPU, ESP32P4CPUClass, ESP32P4_CPU)
  *   an exception, for the PMU's LP CPU exception wakeup source.
  * ESP32P4_CPU_ETM_EVENT: named GPIO output, one line, the ETM event
  *   ULP_EVT_ERR_INTR, pulsed as the core takes an exception.
- * ESP32P4_CPU_LP_CLK: clock input, the core's clock, which mcycle counts.
  */
 #define ESP32P4_CPU_LP_DISABLE "lp-disable"
 #define ESP32P4_CPU_LP_EXCEPTION "lp-exception"
 #define ESP32P4_CPU_ETM_EVENT "etm-event"
-#define ESP32P4_CPU_LP_CLK "clk"
 
 /*
  * The LP core's start: as its reset is released, the machine gives the
@@ -107,6 +120,9 @@ typedef void (*ESP32P4LPBootFn)(void *opaque, uint32_t *pc,
 #define ESP32P4_LP_TRIGGERS 2
 #define ESP32P4_LP_HPM_FIRST 3
 #define ESP32P4_LP_HPM_COUNTERS 10
+
+/* The HP core's event counters, mhpmcounter8, 9 and 13 (TRM 2.5). */
+#define ESP32P4_HP_HPM_COUNTERS 3
 
 /* The HP core's PMP and PMA checker entries (TRM 2.10). */
 #define ESP32P4_PMP_ENTRIES 32
@@ -309,9 +325,7 @@ struct ESP32P4CPU {
     bool bus_error;
     bool bus_error_store;
     /* mhpmevent8, mhpmevent9 and mhpmevent13. */
-    uint32_t mhpmevent[3];
-    /* mcountinhibit.TM, which the core keeps but the time is not its. */
-    bool mcountinhibit_tm;
+    uint32_t mhpmevent[ESP32P4_HP_HPM_COUNTERS];
     /* Trigger module. */
     uint32_t tselect;
     uint32_t tdata1[ESP32P4_TRIGGERS];
@@ -422,21 +436,38 @@ struct ESP32P4CPU {
     bool lp_debug_mode;
     uint32_t lp_dpc;
     uint32_t lp_dcsr;
+
     /*
-     * The counters (TRM 5.7). The core's clock, and the cycles it has
-     * counted while running, up to its cycle lp_synced counted from when
-     * it last started running or the clock changed (lp_edges); mcycle and
-     * minstret are lp_ctr_base[] plus the cycles since lp_ctr_ref[], while
-     * counting; mhpmcounter3 to 12, 40 bits each, hold what is written.
+     * Both cores' counters (tcg/esp32p4_counters.c). The core's clock
+     * (ESP32P4_CPU_CLK), and the cycles of it counted up to the virtual
+     * time cycles_ns plus cycles_frac 2^-32 ns, the end of the last whole
+     * cycle counted while the clock runs. insns counts the instructions
+     * the core has started, less those that did not retire; the code
+     * QEMU translates for the core adds to it. mcycle and minstret are
+     * ctr_base[] plus the cycles or instructions since ctr_ref[] while
+     * they count, and ctr_base[] while mcountinhibit stops them; the
+     * event counters (mhpmcounter8, 9 and 13 on the HP core, 3 to 12 on
+     * the LP core) hold what is written.
      */
-    Clock *lp_clk;
-    uint64_t lp_cycles;
-    ESP32P4ClkCount lp_edges;
-    uint64_t lp_synced;
-    uint64_t lp_ctr_base[2];
-    uint64_t lp_ctr_ref[2];
-    uint64_t lp_hpm[ESP32P4_LP_HPM_COUNTERS];
-    uint32_t lp_mcountinhibit;
+    Clock *clk;
+    uint64_t cycles;
+    int64_t cycles_ns;
+    uint32_t cycles_frac;
+    uint64_t insns;
+    uint64_t ctr_base[2];
+    uint64_t ctr_ref[2];
+    uint64_t hpm[ESP32P4_LP_HPM_COUNTERS];
+    uint32_t mcountinhibit;
+    /*
+     * The HP core's clock in WFI: HP_SYSTEM_CPU_WAITI_CONF's
+     * WAIT_MODE_FORCE_ON and WAITI_DELAY_NUM (ESP32P4_CPU_WAITI_CONF);
+     * whether the counters have seen the core enter WFI; and, while the
+     * clock is not forced on there, the cycles it runs on before it stops.
+     */
+    bool waiti_force_on;
+    uint8_t waiti_delay;
+    bool ctr_wfi;
+    uint32_t wfi_left;
 };
 
 struct ESP32P4CPUClass {
@@ -536,9 +567,6 @@ RISCVException esp32p4_lp_csr_read(CPURISCVState *env, int csrno,
                                    target_ulong *val);
 RISCVException esp32p4_lp_csr_write(CPURISCVState *env, int csrno,
                                     target_ulong val);
-void esp32p4_lp_counters_update(ESP32P4CPU *cpu);
-void esp32p4_lp_counters_clock_changed(ESP32P4CPU *cpu);
-void esp32p4_lp_counters_reset(ESP32P4CPU *cpu);
 void esp32p4_lp_triggers_reset(ESP32P4CPU *cpu);
 void esp32p4_lp_triggers_rebuild(ESP32P4CPU *cpu);
 bool esp32p4_lp_debug_check_breakpoint(CPUState *cs);
@@ -559,6 +587,23 @@ void esp32p4_trace_set_enabled(ESP32P4CPU *cpu, bool en);
 void esp32p4_trace_trap(ESP32P4CPU *cpu, uint32_t epc, uint32_t cause,
                         bool interrupt, uint32_t tval, int priv,
                         bool retired);
+
+/*
+ * esp32p4_counters.c: both cores' counters. The counters' CSRs, which the
+ * chip's CSR table hands over; the core's state changing, with the BQL
+ * held: before its reset or clock enable changes or its clock changes
+ * rate (esp32p4_counters_update()), as it enters WFI and as it leaves,
+ * and as HP_SYSTEM_CPU_WAITI_CONF changes; and its reset.
+ */
+RISCVException esp32p4_counters_read(CPURISCVState *env, int csrno,
+                                     target_ulong *val);
+RISCVException esp32p4_counters_write(CPURISCVState *env, int csrno,
+                                      target_ulong val);
+void esp32p4_counters_update(ESP32P4CPU *cpu);
+void esp32p4_counters_wfi(ESP32P4CPU *cpu, bool wfi);
+void esp32p4_counters_set_waiti(ESP32P4CPU *cpu, bool force_on,
+                                uint8_t delay);
+void esp32p4_counters_reset(ESP32P4CPU *cpu);
 
 /* esp32p4_pie.c */
 bool esp32p4_insn_is_pie(uint32_t insn);

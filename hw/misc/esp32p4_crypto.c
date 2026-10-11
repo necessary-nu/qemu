@@ -19,26 +19,36 @@
 #include "crypto/sha256_i.h"
 #include "crypto/sha384_i.h"
 #include "crypto/sha512_i.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_crypto.h"
 
-static void crypto_timer_arm(ESP32P4CryptoTimer *t)
+/* Run the cycles left from @now at the clock's present rate. */
+static void crypto_timer_arm(ESP32P4CryptoTimer *t, int64_t now)
 {
-    esp32p4_clk_count_start(&t->stretch, t->clk,
-                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    esp32p4_clk_count_start(&t->stretch, t->clk, now);
     if (!esp32p4_clk_count_running(&t->stretch)) {
         timer_del(&t->timer);
         return;
     }
-    timer_mod(&t->timer, esp32p4_clk_count_time(&t->stretch, t->left));
+    t->due_ns = esp32p4_clk_count_time(&t->stretch, t->left);
+    timer_mod(&t->timer, t->due_ns);
 }
 
-static void crypto_timer_cb(void *opaque)
+/* The cycles have run, at esp32_line_time(). */
+static void crypto_timer_done(void *opaque)
 {
     ESP32P4CryptoTimer *t = opaque;
 
     t->active = false;
     t->left = 0;
     t->done(t->opaque);
+}
+
+static void crypto_timer_cb(void *opaque)
+{
+    ESP32P4CryptoTimer *t = opaque;
+
+    esp32_line_run_at(t->due_ns, crypto_timer_done, t);
 }
 
 void esp32p4_crypto_timer_init(ESP32P4CryptoTimer *t, Clock *clk,
@@ -50,11 +60,25 @@ void esp32p4_crypto_timer_init(ESP32P4CryptoTimer *t, Clock *clk,
     timer_init_ns(&t->timer, QEMU_CLOCK_VIRTUAL, crypto_timer_cb, t);
 }
 
-void esp32p4_crypto_timer_start(ESP32P4CryptoTimer *t, uint64_t cycles)
+void esp32p4_crypto_timer_start_at(ESP32P4CryptoTimer *t, uint64_t cycles,
+                                   int64_t when)
 {
     t->active = true;
     t->left = MAX(cycles, 1);
-    crypto_timer_arm(t);
+    crypto_timer_arm(t, when);
+}
+
+void esp32p4_crypto_timer_start(ESP32P4CryptoTimer *t, uint64_t cycles)
+{
+    esp32p4_crypto_timer_start_at(t, cycles, esp32_line_time());
+}
+
+void esp32p4_crypto_timer_sync(ESP32P4CryptoTimer *t, int64_t now)
+{
+    if (t->active && timer_pending(&t->timer) && t->due_ns <= now) {
+        timer_del(&t->timer);
+        esp32_line_run_at(t->due_ns, crypto_timer_done, t);
+    }
 }
 
 void esp32p4_crypto_timer_cancel(ESP32P4CryptoTimer *t)
@@ -70,8 +94,7 @@ void esp32p4_crypto_timer_cancel(ESP32P4CryptoTimer *t)
  */
 void esp32p4_crypto_timer_clock_update(ESP32P4CryptoTimer *t)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-
+    int64_t now = esp32_line_time();
     uint64_t done;
 
     if (!t->active) {
@@ -81,18 +104,19 @@ void esp32p4_crypto_timer_clock_update(ESP32P4CryptoTimer *t)
         done = esp32p4_clk_count_at(&t->stretch, now);
         t->left = done >= t->left ? 1 : t->left - done;
     }
-    crypto_timer_arm(t);
+    crypto_timer_arm(t, now);
 }
 
 const VMStateDescription vmstate_esp32p4_crypto_timer = {
     .name = "esp32p4-crypto-timer",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER(timer, ESP32P4CryptoTimer),
         VMSTATE_BOOL(active, ESP32P4CryptoTimer),
         VMSTATE_UINT64(left, ESP32P4CryptoTimer),
         VMSTATE_ESP32P4_CLK_COUNT(stretch, ESP32P4CryptoTimer),
+        VMSTATE_INT64(due_ns, ESP32P4CryptoTimer),
         VMSTATE_END_OF_LIST()
     },
 };

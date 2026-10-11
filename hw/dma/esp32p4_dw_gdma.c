@@ -82,7 +82,10 @@
  * read arbiter (LLI fetches first, then source reads) and a write arbiter
  * (destination writes) each grant one transaction at a time, to the
  * highest CH_PRIOR, round robin among equals where the TRM says the
- * choice is random.
+ * choice is random. Each round of the bus happens at the time it falls
+ * due, however late the QEMU timer that runs it (esp32_line_run_at()),
+ * and the next is timed from it; register accesses, the handshake inputs
+ * and clock changes first run the rounds due before them, in order.
  *
  * Not modelled: the low-power clock gating, the AXI IDs, QoS, cache and
  * protection attributes, burst lengths (ARLEN, AWLEN), outstanding limits
@@ -99,6 +102,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "migration/vmstate.h"
 
@@ -862,21 +866,29 @@ static int dw_grant(ESP32P4DwGdmaState *s, bool write, bool *lli)
     return best;
 }
 
+/* When the round @timer runs falls due. */
+static int64_t dw_due_ns(ESP32P4DwGdmaState *s)
+{
+    return esp32p4_clk_count_time(&s->bus_edges, s->due_cycle);
+}
+
 /* Arm the engine's timer for a round at bus cycle @cycle. */
 static void dw_arm(ESP32P4DwGdmaState *s, uint64_t cycle)
 {
     s->due_cycle = cycle;
-    timer_mod(s->timer, esp32p4_clk_count_time(&s->bus_edges, cycle));
+    timer_mod(s->timer, dw_due_ns(s));
 }
 
 /*
- * One round of the bus, on an edge of its clock: the read and the write
- * arbiters each grant a transaction, and the engine comes back when they
- * are over, as many cycles later.
+ * One round of the bus, on an edge of its clock, at the time it falls
+ * due, esp32_line_time(): the read and the write arbiters each grant a
+ * transaction, and the engine comes back when they are over, as many
+ * cycles later.
  */
 /* [spec:nuos:req:emu.esp32p4.dma] */
-static void dw_run(ESP32P4DwGdmaState *s)
+static void dw_run(void *opaque)
 {
+    ESP32P4DwGdmaState *s = opaque;
     uint32_t cost = 0;
     bool lli;
     int r, w;
@@ -907,31 +919,54 @@ static void dw_run(ESP32P4DwGdmaState *s)
     }
 }
 
+/* The round falls due: run it at its time, which a late timer has passed. */
 static void dw_timer_cb(void *opaque)
 {
-    dw_run(opaque);
+    ESP32P4DwGdmaState *s = opaque;
+
+    esp32_line_run_at(dw_due_ns(s), dw_run, s);
 }
 
-/* Look for work at the bus clock's next edge. */
-static void dw_kick(ESP32P4DwGdmaState *s)
+/*
+ * [spec:nuos:req:emu.esp32p4.dma]
+ * Run the rounds that fell due by @now, in order, each at its own time.
+ */
+static void dw_catch_up(ESP32P4DwGdmaState *s, int64_t now)
 {
-    if (!timer_pending(s->timer) && clock_is_enabled(s->clk)) {
-        dw_arm(s, esp32p4_clk_count_at(&s->bus_edges,
-                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) + 1);
+    while (timer_pending(s->timer) && dw_due_ns(s) <= now) {
+        timer_del(s->timer);
+        esp32_line_run_at(dw_due_ns(s), dw_run, s);
     }
 }
 
 /*
- * The bus clock changes: its cycles are counted afresh from the change,
- * and a round under way takes the cycles it has left, at the new rate.
+ * Let the engine look for work at the bus clock's next edge after the
+ * change that calls for it, at esp32_line_time().
+ */
+static void dw_kick(ESP32P4DwGdmaState *s)
+{
+    if (!timer_pending(s->timer) && clock_is_enabled(s->clk)) {
+        dw_arm(s, esp32p4_clk_count_at(&s->bus_edges,
+                                       esp32_line_time()) + 1);
+    }
+}
+
+/*
+ * The bus clock changes: the rounds due before it run at the old rate;
+ * its cycles are counted afresh from the change, and a round under way
+ * takes the cycles it has left, at the new rate.
  */
 static void dw_clk_update(void *opaque, ClockEvent event)
 {
     ESP32P4DwGdmaState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint64_t done = esp32p4_clk_count_at(&s->bus_edges, now);
-    uint64_t left = 0;
+    int64_t now = esp32_line_time();
+    uint64_t done, left = 0;
 
+    if (event == ClockPreUpdate) {
+        dw_catch_up(s, now);
+        return;
+    }
+    done = esp32p4_clk_count_at(&s->bus_edges, now);
     if (timer_pending(s->timer)) {
         left = s->due_cycle > done ? s->due_cycle - done : 1;
     }
@@ -1324,6 +1359,7 @@ static uint64_t esp32p4_dw_gdma_read(void *opaque, hwaddr addr,
     ESP32P4DwGdmaState *s = opaque;
     uint32_t v = 0;
 
+    dw_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     if (addr >= 0x100 && addr < A_CHANNELS_END) {
         return ch_read(s, (addr >> 8) - 1, addr & 0xff);
     }
@@ -1379,6 +1415,7 @@ static void esp32p4_dw_gdma_write(void *opaque, hwaddr addr, uint64_t value,
     ESP32P4DwGdmaState *s = opaque;
     uint32_t v = value;
 
+    dw_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     if (addr >= 0x100 && addr < A_CHANNELS_END) {
         ch_write(s, (addr >> 8) - 1, addr & 0xff, v);
         return;
@@ -1454,10 +1491,15 @@ static const MemoryRegionOps esp32p4_dw_gdma_ops = {
 
 /* Handshake inputs */
 
+/*
+ * A handshake input changes at esp32_line_time(), after the rounds due
+ * before it.
+ */
 static void dw_hs_req(void *opaque, int n, int level)
 {
     ESP32P4DwGdmaState *s = opaque;
 
+    dw_catch_up(s, esp32_line_time());
     s->hs_req[n] = level;
     dw_kick(s);
 }
@@ -1466,6 +1508,7 @@ static void dw_hs_single(void *opaque, int n, int level)
 {
     ESP32P4DwGdmaState *s = opaque;
 
+    dw_catch_up(s, esp32_line_time());
     s->hs_single[n] = level;
     dw_kick(s);
 }
@@ -1474,6 +1517,7 @@ static void dw_hs_last(void *opaque, int n, int level)
 {
     ESP32P4DwGdmaState *s = opaque;
 
+    dw_catch_up(s, esp32_line_time());
     s->hs_last[n] = level;
 }
 
@@ -1527,7 +1571,8 @@ static void esp32p4_dw_gdma_init(Object *obj)
                             ESP32P4_DW_GDMA_HS);
     qdev_init_gpio_out_named(dev, s->hs_ack, ESP32P4_DW_GDMA_HS_ACK,
                              ESP32P4_DW_GDMA_HS);
-    s->clk = qdev_init_clock_in(dev, "clk", dw_clk_update, s, ClockUpdate);
+    s->clk = qdev_init_clock_in(dev, "clk", dw_clk_update, s,
+                                ClockPreUpdate | ClockUpdate);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dw_timer_cb, s);
 }
 
@@ -1613,8 +1658,8 @@ static const VMStateDescription vmstate_esp32p4_dw_gdma_chan = {
 
 static const VMStateDescription vmstate_esp32p4_dw_gdma = {
     .name = TYPE_ESP32P4_DW_GDMA,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(ch, ESP32P4DwGdmaState, NCH, 1,
                              vmstate_esp32p4_dw_gdma_chan,

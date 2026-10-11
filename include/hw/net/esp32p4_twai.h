@@ -130,6 +130,8 @@ typedef struct ESP32P4TwaiEpisode {
     ESP32P4TwaiAction act[ESP32P4_TWAI_ACTIONS];
     int64_t idle_at;
     QEMUTimer *timer;
+    /* When the action or start @timer runs falls due. */
+    int64_t due;
 } ESP32P4TwaiEpisode;
 
 typedef struct ESP32P4TwaiCtrl {
@@ -212,6 +214,7 @@ typedef struct ESP32P4TwaiCtrl {
     int64_t recov_mark;
     uint64_t recov_runs;
     QEMUTimer *recov_timer;
+    int64_t recov_due;
 
     /*
      * A transmission that cannot reach any bus, failing bit by bit: its
@@ -238,11 +241,13 @@ typedef struct ESP32P4TwaiCtrl {
     uint64_t ts_count_base;
     int64_t ts_base_ns;
     QEMUTimer *ts_timer;
+    int64_t ts_due;
 
     /* The transceiver standby signal and the bus idle it counts. */
     bool standby;
     int64_t idle_since;
     QEMUTimer *standby_timer;
+    int64_t standby_due;
 
     bool clkout_level;
 } ESP32P4TwaiCtrl;
@@ -262,6 +267,8 @@ struct ESP32P4TwaiState {
     Notifier line_source;
     /* A frame of ours is going out to the QEMU CAN bus. */
     bool sending;
+    /* Timed events are being taken: a change they make catches up none. */
+    bool in_event;
 };
 
 #endif

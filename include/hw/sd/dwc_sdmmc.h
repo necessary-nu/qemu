@@ -122,6 +122,14 @@ struct DWCSDMMCState {
     QEMUTimer timeout_timer;
     QEMUTimer reset_timer;
     QEMUTimer debounce_timer[DWC_SDMMC_MAX_SLOTS];
+    /* When the event each timer runs falls due. */
+    int64_t cmd_due;
+    int64_t data_due;
+    int64_t timeout_due;
+    int64_t reset_due;
+    int64_t debounce_due[DWC_SDMMC_MAX_SLOTS];
+    /* A timed event is being taken: a change it makes catches up none. */
+    bool in_event;
 
     /* Where the IDMAC's accesses go, and as whom. */
     AddressSpace *dma_as;
@@ -256,8 +264,11 @@ extern const VMStateDescription vmstate_dwc_sdmmc;
 
 /*
  * For a subclass whose cclk_period() depends on clocks of its own: they
- * changed, so whatever waits on the card interface clock is re-timed.
+ * are about to change, so the events due before run at the old rate
+ * (dwc_sdmmc_catch_up()); they changed, so whatever waits on the card
+ * interface clock is re-timed (dwc_sdmmc_clock_changed()).
  */
+void dwc_sdmmc_catch_up(DWCSDMMCState *s);
 void dwc_sdmmc_clock_changed(DWCSDMMCState *s);
 
 #endif /* DWC_SDMMC_H */

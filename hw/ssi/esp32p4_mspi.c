@@ -174,6 +174,15 @@
  * 0 (wt), and raw status bits a write of 1 clears (w1c). The rest are
  * read-only to software: the hardware's status, and the reserved fields,
  * which read as their reset values.
+ *
+ * SPI0's MOSI_DLEN and MISO_DLEN (0x024, 0x028), the lengths of a user
+ * command's write and read data in bits less one (bits 9:0), are the
+ * IP's, which the v3 headers leave out of SPI0 as reserved: SPI1 has them
+ * at those offsets, the SPI0 of the IP's earlier chips (ESP32-S3, -C6,
+ * -H2) has them, the headers hide registers of SPI0 that it has (v1's hid
+ * RD_STATUS and CACHE_SCTRL, which v3's name), and the v3 boot ROM's
+ * SPI_init() sets both to 256 bits in every flash boot. They hold what is
+ * written: SPI0's user command, which would use them, is not modelled.
  */
 typedef struct {
     const char *name;
@@ -197,6 +206,8 @@ static const ESP32P4MSPIReg esp32p4_spi0_flash_regs[ESP32P4_MSPI_NREGS] = {
     REG(0x018, "USER", 0x00000000, 0x240002c0, 0x00000000, 0x00000000),
     REG(0x01c, "USER1", 0x5c000047, 0xfc00003f, 0x00000000, 0x00000000),
     REG(0x020, "USER2", 0x70000000, 0xf000ffff, 0x00000000, 0x00000000),
+    REG(0x024, "MOSI_DLEN", 0x00000000, 0x000003ff, 0x00000000, 0x00000000),
+    REG(0x028, "MISO_DLEN", 0x00000000, 0x000003ff, 0x00000000, 0x00000000),
     REG(0x02c, "RD_STATUS", 0x00000000, 0x00ff0000, 0x00000000, 0x00000000),
     REG(0x034, "MISC", 0x00000070, 0x00000670, 0x00000000, 0x00000000),
     REG(0x03c, "CACHE_FCTRL", 0xc0000000, 0x800001ff, 0x00000000, 0x00000000),
@@ -322,6 +333,8 @@ static const ESP32P4MSPIReg esp32p4_spi0_psram_regs[ESP32P4_MSPI_NREGS] = {
     REG(0x018, "USER", 0x00000000, 0x240002c0, 0x00000000, 0x00000000),
     REG(0x01c, "USER1", 0x5c000047, 0xfc00003f, 0x00000000, 0x00000000),
     REG(0x020, "USER2", 0x70000000, 0xf000ffff, 0x00000000, 0x00000000),
+    REG(0x024, "MOSI_DLEN", 0x00000000, 0x000003ff, 0x00000000, 0x00000000),
+    REG(0x028, "MISO_DLEN", 0x00000000, 0x000003ff, 0x00000000, 0x00000000),
     REG(0x02c, "RD_STATUS", 0x00000000, 0x00ff0000, 0x00000000, 0x00000000),
     REG(0x034, "MISC", 0x00000070, 0x00000670, 0x00000000, 0x00000000),
     REG(0x03c, "CACHE_FCTRL", 0xc0000000, 0xc00fffff, 0x00000000, 0x00000000),

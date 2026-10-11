@@ -35,7 +35,14 @@
  * algorithm has rounds, plus 8 (the model's figures), during which
  * SHA_BUSY_REG reads 1; computing SHA-512/t's initial value is one
  * SHA-512 block. The accelerator waits while its clock is stopped.
- * Registers written while it is busy are dropped and logged, as are
+ *
+ * SHA_START_REG and SHA_CONTINUE_REG take the block in SHA_M_n_REG and
+ * the algorithm in SHA_MODE_REG as the operation starts, so that, as the
+ * TRM's Typical SHA process notes (31.4.2.1, note 1), software may write
+ * the next block into SHA_M_n_REG while the accelerator hashes this one;
+ * the v3.x boot ROM's ets_sha_process() writes SHA_MODE_REG and the next
+ * block before it waits for SHA_BUSY_REG, and only then starts the block.
+ * Other registers written while it is busy are dropped and logged, as are
  * writes while its clock is stopped or it is held in reset. While HMAC,
  * RSA_DS or ECDSA_DS occupies it its registers read as zero and take no
  * writes, and it resets when released.
@@ -117,7 +124,7 @@ static void sha_op_done(void *opaque)
     switch (s->op_kind) {
     case OP_START:
     case OP_CONTINUE:
-        esp32p4_sha_compress(s->op_mode, &s->state, s->m);
+        esp32p4_sha_compress(s->op_mode, &s->state, s->in_buf);
         sha_store(s);
         break;
     case OP_T_INIT:
@@ -190,6 +197,9 @@ static void sha_begin(ESP32P4ShaDevState *s, uint32_t kind, bool initial)
     }
     s->op_kind = kind;
     s->busy = true;
+    if (kind == OP_START || kind == OP_CONTINUE) {
+        memcpy(s->in_buf, s->m, esp32p4_sha_block_size(s->op_mode));
+    }
     if (kind == OP_DMA) {
         s->left = s->dma_block_num;
         s->in_len = 0;
@@ -273,7 +283,8 @@ static void sha_write(void *opaque, hwaddr addr, uint64_t value,
                       : "not clocked (CRYPTO_SHA_CLK)");
         return;
     }
-    if (s->busy && reg != A_CLEAR_IRQ && reg != A_IRQ_ENA) {
+    if (s->busy && reg != A_CLEAR_IRQ && reg != A_IRQ_ENA &&
+        reg != A_MODE && !(reg >= A_M_MEM && reg < SHA_REGS_END)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write at 0x%" HWADDR_PRIx
                       " while the accelerator is busy is dropped\n",
                       TYPE_ESP32P4_SHA, addr);

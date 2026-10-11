@@ -75,14 +75,25 @@
  * carries TX_FIFO_REMPTY and TX_EOF; HP_PARLIO_RX_INTR, RX_FIFO_WOVF.
  * There are no ETM events or tasks.
  *
- * On the host's clock, rather than icount, the units' internal clocks
- * slip behind virtual time when their timers run late, so that the DMA,
- * which times itself from the present, keeps up (see uclk_timer_cb()).
+ * Every edge, and the receive timeout, happens at its own time however
+ * late the QEMU timer that takes it runs, as under icount: a late edge is
+ * taken as of its time (esp32_line_run_at()), and register accesses, the
+ * units' clock changes and resets first take the edges and timeouts that
+ * fell due before them, in order. GDMA-AXI keeps in step: before an edge
+ * the unit takes late, the channels' bus rounds due by then run
+ * (esp32p4_gdma_sync()), and GDMA-AXI's own register accesses first let
+ * the unit take its edges due by then (ops->sync). An edge costs the host
+ * far more than a MHz clock's period, so on the host's clock a unit
+ * clocked that fast for long falls behind; once it is PARLIO_MAX_LAG_NS
+ * behind, its clocks slip to the present (logged) rather than hold the
+ * system back for ever.
  *
  * Not modelled: the FIFOs' depth, which the TRM does not give, is taken
  * as 16 bytes; a fractional divider on a pad clock divides by its
  * integer part (logged); a unit's clock toggles on its output only while
- * the unit is busy (TX with a frame to send, RX with RX_START set), so a
+ * the unit is busy (TX with a frame to send, RX with RX_START set and
+ * something its samples can change: an enable to watch, a frame open or
+ * RX_SW_EN set) or, for RX, while TX is busy on a pad's clock, so a
  * device on the pads clocked by an idle unit sees no edges, and RX in
  * software enable mode clocked by the TX unit's idle clock samples
  * nothing between TX's frames; TX_CNT and RX_CNT, the TRM's "cycle
@@ -187,8 +198,8 @@
 
 #define BITCNT_MASK             0x7ffffu
 
-/* How late an internal edge may be taken before the clock slips. */
-#define PARLIO_SLIP_NS          2000
+/* How far the host may fall behind the units' edges before they slip. */
+#define PARLIO_MAX_LAG_NS       (10 * SCALE_MS)
 
 /* The FIFO entries' marks. */
 #define F_EOF                   BIT(0)
@@ -651,13 +662,13 @@ static void rx_end_frame(ESP32P4ParlioState *s, bool err)
 }
 
 /*
- * The receive timeout counts from the frame's last data, or, on the
- * host's clock, from when the data's edge was taken late or a unit's
- * clock last slipped, whichever is latest.
+ * The receive timeout counts from the frame's last data, or from the
+ * change that armed it (enabling it, or PARLIO_SYS_CLK starting), if
+ * later.
  */
 static int64_t rx_timeout_at(ESP32P4ParlioState *s)
 {
-    return MAX(s->rx_timeout_from, s->slip_ns) +
+    return s->rx_timeout_from +
            MIN(esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->sys_clk),
                                      RX_TIMEOUT_THRES(s->rx_genrl_act)),
                INT64_MAX / 2);
@@ -670,21 +681,19 @@ static void rx_arm_timeout(ESP32P4ParlioState *s)
         timer_del(s->rx_timeout_timer);
         return;
     }
-    s->rx_timeout_from = MAX(s->rx_last_data_ns,
-                             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    s->rx_timeout_from = MAX(s->rx_last_data_ns, esp32_line_time());
     timer_mod(s->rx_timeout_timer, rx_timeout_at(s));
 }
 
-/* [spec:nuos:req:emu.esp32p4.parlio] */
-static void rx_timeout_cb(void *opaque)
+/*
+ * [spec:nuos:req:emu.esp32p4.parlio]
+ * The receive timeout, at its time.
+ */
+static void rx_timeout_run(void *opaque)
 {
     ESP32P4ParlioState *s = opaque;
 
     if (!s->rx_in_frame || !(s->rx_genrl_act & RX_TIMEOUT_EN)) {
-        return;
-    }
-    if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < rx_timeout_at(s)) {
-        timer_mod(s->rx_timeout_timer, rx_timeout_at(s));
         return;
     }
     rx_end_frame(s, true);
@@ -854,17 +863,60 @@ static void uclk_in_edge(ESP32P4ParlioClk *u, bool level, int64_t when)
 }
 
 /*
- * Time the internal clock's next edge while the unit is busy, and until
- * the clock in is low after it, where an idle clock rests. Edges are
- * taken one by one, each at its own time, however late the timer runs; a
- * clock that was resting picks up at the first edge after the present.
+ * Whether RX's samples change nothing while RXD keeps its levels: in
+ * level enable mode, the enable inactive outside a frame; in pulse
+ * enable mode, no pulse open and no edge of the enable to find; in
+ * software enable mode, RX_SW_EN clear.
+ */
+static bool rx_idle(ESP32P4ParlioState *s)
+{
+    uint32_t mode = s->rx_mode_act;
+    bool en = ((s->rxd >> RX_EXT_EN_SEL(mode)) & 1) ^ !!(mode & RX_EXT_EN_INV);
+
+    switch (RX_SMP_MODE(mode)) {
+    case SMP_LEVEL:
+        return !en && !s->rx_in_frame;
+    case SMP_PULSE:
+        return !s->rx_pulse_open && en == s->rx_prev_en;
+    case SMP_SW:
+        return !(mode & RX_SW_EN);
+    default:
+        return true;
+    }
+}
+
+/*
+ * Whether a unit's internal clock has edges to give: TX's while it is
+ * busy; RX's while it is busy and its samples can change something, or
+ * while TX is busy on a pad's clock, which RX's clock out may be.
+ */
+static bool uclk_needed(ESP32P4ParlioClk *u)
+{
+    ESP32P4ParlioState *s = u->s;
+    ESP32P4ClkDiv div;
+
+    if (u->unit == TX) {
+        return unit_busy(s, TX);
+    }
+    if (!unit_busy(s, RX)) {
+        return false;
+    }
+    return !rx_idle(s) || (unit_busy(s, TX) && uclk_pad(&s->uclk[TX], &div));
+}
+
+/*
+ * Time the internal clock's next edge while it has edges to give, and
+ * until the clock in is low after it, where an idle clock rests. Edges
+ * are taken one by one, each at its own time, however late the timer
+ * runs; a clock that was resting picks up at the first edge after the
+ * change that wakes it, in its phase.
  */
 static void uclk_schedule(ESP32P4ParlioClk *u)
 {
     uint64_t n;
 
     if (!esp32p4_clk_period_running(u->half) ||
-        (!unit_busy(u->s, u->unit) && !u->in_level)) {
+        (!uclk_needed(u) && !u->in_level)) {
         timer_del(u->timer);
         u->running = false;
         return;
@@ -873,7 +925,7 @@ static void uclk_schedule(ESP32P4ParlioClk *u)
         return;
     }
     if (!u->running) {
-        n = uclk_edge_after(u, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        n = uclk_edge_after(u, esp32_line_time());
         if (n > u->next) {
             u->next = n;
             /* The clock in as it is before that edge, a rising one if even. */
@@ -884,90 +936,176 @@ static void uclk_schedule(ESP32P4ParlioClk *u)
     timer_mod(u->timer, uclk_edge_ns(u, u->next));
 }
 
-/* Whether TX's next data cycle has its bits, or GDMA's frame has ended. */
-static bool tx_can_shift(ESP32P4ParlioState *s)
+/* Both units' clocks, after a change to what either needs. */
+static void parlio_schedule(ESP32P4ParlioState *s)
 {
-    unsigned width = bus_width(s->tx_data_cfg);
-    uint32_t avail;
-    bool ends;
+    uclk_schedule(&s->uclk[TX]);
+    uclk_schedule(&s->uclk[RX]);
+}
 
-    if (s->tx_state != TXS_DATA || s->tx_all_sent || s->tx_byte_bits) {
-        return true;
-    }
-    avail = tx_frame_bytes(s, &ends);
-    return ends || avail >= (width == 16 ? 2u : 1u);
+/* The time the internal clock's next edge is due, while its timer runs. */
+static int64_t uclk_due(ESP32P4ParlioClk *u)
+{
+    return uclk_edge_ns(u, u->next);
 }
 
 /*
- * Whether the unit's next active edge waits for the DMA: TX's FIFO has
- * not got its next cycle's bits, or RX's FIFO is full.
+ * [spec:nuos:req:emu.esp32p4.parlio]
+ * An internal edge, taken at its own time, esp32_line_time().
  */
-static bool unit_waits_for_dma(ESP32P4ParlioState *s, int unit)
+static void uclk_take_edge(void *opaque)
 {
-    if (unit == TX) {
-        return unit_busy(s, TX) && !tx_can_shift(s);
-    }
-    return unit_busy(s, RX) && !fifo_room(&s->rx_fifo);
+    ESP32P4ParlioClk *u = opaque;
+    uint64_t n = u->next;
+
+    u->next++;
+    uclk_in_edge(u, !(n & 1), esp32_line_time());
+    uclk_schedule(u);
 }
 
-/* Move the internal clock's edges later, the next one to @when. */
-static void uclk_slip(ESP32P4ParlioClk *u, int64_t when)
+/* The earliest edge or timeout due, its time in *due: 0, 1 or 2, or -1. */
+static int parlio_next_event(ESP32P4ParlioState *s, int64_t *due)
 {
-    int64_t delta = when - uclk_edge_ns(u, u->next);
+    int next = -1;
 
-    if (delta > 0) {
-        u->base_ns += delta;
-        u->s->slip_ns = MAX(u->s->slip_ns,
-                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    *due = INT64_MAX;
+    for (int i = 0; i < 2; i++) {
+        if (timer_pending(s->uclk[i].timer) && uclk_due(&s->uclk[i]) < *due) {
+            *due = uclk_due(&s->uclk[i]);
+            next = i;
+        }
+    }
+    if (timer_pending(s->rx_timeout_timer) && rx_timeout_at(s) < *due) {
+        *due = rx_timeout_at(s);
+        next = 2;
+    }
+    return next;
+}
+
+/*
+ * The host has fallen more than PARLIO_MAX_LAG_NS behind the units' edges
+ * at @now: the clocks' next edges move to the present, and the receive
+ * timeout counts from it.
+ */
+static void parlio_slip(ESP32P4ParlioState *s, int64_t now)
+{
+    if (!s->lag_logged) {
+        s->lag_logged = true;
+        qemu_log_mask(LOG_UNIMP, "%s: the host is too slow for the units' "
+                      "clocks: their edges move later\n", TYPE_ESP32P4_PARLIO);
+    }
+    for (int i = 0; i < 2; i++) {
+        ESP32P4ParlioClk *u = &s->uclk[i];
+        int64_t delta = now + esp32p4_clk_cycles_ns(u->half, 1) -
+                        uclk_due(u);
+
+        if (timer_pending(u->timer) && delta > 0) {
+            u->base_ns += delta;
+            timer_mod(u->timer, uclk_due(u));
+        }
+    }
+    if (timer_pending(s->rx_timeout_timer)) {
+        s->rx_timeout_from = MAX(s->rx_timeout_from, now);
+        timer_mod(s->rx_timeout_timer, rx_timeout_at(s));
     }
 }
 
 /*
  * [spec:nuos:req:emu.esp32p4.parlio]
- * An internal edge, at its own time. Under icount the timer runs at that
- * time; on the host's clock it may run behind it, and the GDMA channels,
- * which time their transfers from the present, then fall behind the edges
- * the unit catches up on: an active edge whose DMA has not kept up, and
- * the edges after one taken more than PARLIO_SLIP_NS late, slip to the
- * present instead, so that what goes over the bus stays whole.
+ * Take the edges and the receive timeout that fell due by @upto, in time
+ * order, each at its own time, with GDMA-AXI's rounds due by each run
+ * before it. Each edge costs the host far longer than a MHz clock's
+ * period (every pad change settles the GPIO matrix), so on the host's
+ * clock a unit clocked that fast for long cannot keep up: when the
+ * earliest is more than PARLIO_MAX_LAG_NS behind @now, the clocks slip
+ * to the present rather than hold the system back for ever.
+ */
+static void parlio_catch_up(ESP32P4ParlioState *s, int64_t upto, int64_t now)
+{
+    int64_t due;
+    int next = parlio_next_event(s, &due);
+
+    if (next >= 0 && now - due > PARLIO_MAX_LAG_NS) {
+        parlio_slip(s, now);
+    }
+    while ((next = parlio_next_event(s, &due)) >= 0 && due <= upto) {
+        if (s->gdma) {
+            esp32p4_gdma_sync(s->gdma, due);
+        }
+        if (next == 2) {
+            timer_del(s->rx_timeout_timer);
+            esp32_line_run_at(due, rx_timeout_run, s);
+        } else {
+            timer_del(s->uclk[next].timer);
+            esp32_line_run_at(due, uclk_take_edge, &s->uclk[next]);
+        }
+    }
+}
+
+/*
+ * Everything due by @now, before a change at @now: the units' edges and
+ * timeouts, then GDMA-AXI's rounds.
+ */
+static void parlio_sync(ESP32P4ParlioState *s, int64_t now)
+{
+    parlio_catch_up(s, now, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    if (s->gdma) {
+        esp32p4_gdma_sync(s->gdma, now);
+    }
+}
+
+static void parlio_gdma_sync(void *opaque, int64_t when)
+{
+    parlio_sync(opaque, when);
+}
+
+/*
+ * An edge or the timeout falls due: take it, and whatever else of the
+ * units' is due by then, each at its own time, which a late timer has
+ * passed. The expired timer is set again for its time, so that the
+ * catch-up finds it among the others.
  */
 static void uclk_timer_cb(void *opaque)
 {
     ESP32P4ParlioClk *u = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint64_t n = u->next;
-    int64_t when = uclk_edge_ns(u, n);
-    bool level = !(n & 1);
-    bool active = level ^ !!(clk_cfg(u->s, u->unit) & CLK_I_INV);
+    int64_t due = uclk_due(u);
 
-    if (when < now && active && unit_waits_for_dma(u->s, u->unit)) {
-        uclk_slip(u, now + esp32p4_clk_cycles_ns(u->half, 1));
-        timer_mod(u->timer, uclk_edge_ns(u, n));
-        return;
-    }
-    u->next++;
-    uclk_in_edge(u, level, when);
-    if (now - when > PARLIO_SLIP_NS) {
-        uclk_slip(u, now + esp32p4_clk_cycles_ns(u->half, 1));
-    }
-    uclk_schedule(u);
+    timer_mod(u->timer, due);
+    parlio_catch_up(u->s, due, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
+static void rx_timeout_cb(void *opaque)
+{
+    ESP32P4ParlioState *s = opaque;
+    int64_t due = rx_timeout_at(s);
+
+    timer_mod(s->rx_timeout_timer, due);
+    parlio_catch_up(s, due, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+/*
+ * A unit's core clock changes: the edges due before run at the old rate,
+ * and the clock starts again, low, at the new one.
+ */
 static void uclk_update(void *opaque, ClockEvent event)
 {
     ESP32P4ParlioClk *u = opaque;
 
+    if (event == ClockPreUpdate) {
+        parlio_sync(u->s, esp32_line_time());
+        return;
+    }
     timer_del(u->timer);
     u->running = false;
     u->half = esp32p4_clk_period_scale(esp32p4_clk_exact(u->clk), 1, 2);
-    u->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    u->base_ns = esp32_line_time();
     u->next = 0;
     if (esp32p4_clk_period_running(u->half)) {
         /* A started clock starts low. */
         u->in_level = false;
         unit_redrive_clk(u->s, u->unit, u->base_ns);
     }
-    uclk_schedule(u);
+    parlio_schedule(u->s);
 }
 
 /* [spec:nuos:req:emu.esp32p4.parlio] */
@@ -1009,6 +1147,7 @@ static void parlio_rxd_in(void *opaque, int n, int level)
     ESP32P4ParlioState *s = opaque;
 
     s->rxd = deposit32(s->rxd, n, 1, !!level);
+    uclk_schedule(&s->uclk[RX]);
 }
 
 static void parlio_tx_clk_in(void *opaque, int n, int level)
@@ -1052,8 +1191,9 @@ static void rx_core_reset(ESP32P4ParlioState *s)
 static void parlio_core_reset_in(void *opaque, int n, int level)
 {
     ESP32P4ParlioState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
 
+    parlio_sync(s, now);
     if (n == TX) {
         s->tx_reset_held = level;
         tx_core_reset(s, now);
@@ -1061,13 +1201,17 @@ static void parlio_core_reset_in(void *opaque, int n, int level)
         s->rx_reset_held = level;
         rx_core_reset(s);
     }
-    uclk_schedule(&s->uclk[n]);
+    parlio_schedule(s);
 }
 
 static void parlio_sys_update(void *opaque, ClockEvent event)
 {
     ESP32P4ParlioState *s = opaque;
 
+    if (event == ClockPreUpdate) {
+        parlio_sync(s, esp32_line_time());
+        return;
+    }
     if (sys_running(s)) {
         tx_fill(s);
         rx_drain(s);
@@ -1083,6 +1227,7 @@ static uint64_t parlio_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4ParlioState *s = opaque;
 
+    parlio_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     switch (addr) {
     case A_RX_MODE_CFG:
         return s->rx_mode_cfg;
@@ -1150,6 +1295,7 @@ static void parlio_write(void *opaque, hwaddr addr, uint64_t value,
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t v = value, old;
 
+    parlio_sync(s, now);
     switch (addr) {
     case A_RX_MODE_CFG:
         s->rx_mode_cfg = v & RX_MODE_MASK;
@@ -1175,7 +1321,7 @@ static void parlio_write(void *opaque, hwaddr addr, uint64_t value,
             timer_del(s->rx_timeout_timer);
         }
         unit_redrive_clk(s, RX, now);
-        uclk_schedule(&s->uclk[RX]);
+        parlio_schedule(s);
         break;
     case A_TX_DATA_CFG:
         s->tx_data_cfg = v & DATA_CFG_MASK;
@@ -1193,7 +1339,7 @@ static void parlio_write(void *opaque, hwaddr addr, uint64_t value,
         } else if (!(old & START) && s->tx_state == TXS_DONE) {
             s->tx_state = TXS_IDLE;
         }
-        uclk_schedule(&s->uclk[TX]);
+        parlio_schedule(s);
         break;
     case A_TX_GENRL_CFG:
         s->tx_genrl_cfg = v & TX_GENRL_MASK;
@@ -1219,7 +1365,7 @@ static void parlio_write(void *opaque, hwaddr addr, uint64_t value,
             s->rx_data_act = s->rx_data_cfg;
             s->rx_genrl_act = s->rx_genrl_cfg;
             rx_arm_timeout(s);
-            uclk_schedule(&s->uclk[RX]);
+            parlio_schedule(s);
         }
         break;
     case A_INT_ENA:
@@ -1274,6 +1420,7 @@ static const MemoryRegionOps parlio_ops = {
 static const ESP32P4GdmaPeriphOps parlio_dma_ops = {
     .tx_ready = tx_ready_cb,
     .rx_ready = rx_ready_cb,
+    .sync = parlio_gdma_sync,
 };
 
 /* Device */
@@ -1358,7 +1505,7 @@ static void parlio_init(Object *obj)
     qdev_init_gpio_in_named(dev, parlio_core_reset_in,
                             ESP32P4_PARLIO_CORE_RESET, 2);
     s->sys_clk = qdev_init_clock_in(dev, "sys", parlio_sys_update, s,
-                                    ClockUpdate);
+                                    ClockPreUpdate | ClockUpdate);
     s->rx_timeout_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rx_timeout_cb, s);
     for (int i = 0; i < 2; i++) {
         ESP32P4ParlioClk *u = &s->uclk[i];
@@ -1366,7 +1513,7 @@ static void parlio_init(Object *obj)
         u->s = s;
         u->unit = i;
         u->clk = qdev_init_clock_in(dev, i == TX ? "tx" : "rx", uclk_update,
-                                    u, ClockUpdate);
+                                    u, ClockPreUpdate | ClockUpdate);
         u->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, uclk_timer_cb, u);
     }
 }
@@ -1435,8 +1582,8 @@ static const VMStateDescription vmstate_parlio_clk = {
 
 static const VMStateDescription vmstate_parlio = {
     .name = TYPE_ESP32P4_PARLIO,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(sys_clk, ESP32P4ParlioState),
         VMSTATE_TIMER_PTR(rx_timeout_timer, ESP32P4ParlioState),
@@ -1485,7 +1632,7 @@ static const VMStateDescription vmstate_parlio = {
         VMSTATE_UINT8(rx_byte_bits, ESP32P4ParlioState),
         VMSTATE_INT64(rx_last_data_ns, ESP32P4ParlioState),
         VMSTATE_INT64(rx_timeout_from, ESP32P4ParlioState),
-        VMSTATE_INT64(slip_ns, ESP32P4ParlioState),
+        VMSTATE_BOOL(lag_logged, ESP32P4ParlioState),
         VMSTATE_STRUCT(rx_fifo, ESP32P4ParlioState, 1, vmstate_parlio_fifo,
                        ESP32P4ParlioFifo),
         VMSTATE_END_OF_LIST()

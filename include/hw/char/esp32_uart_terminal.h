@@ -61,6 +61,8 @@ struct Esp32UartTerminalState {
     uint64_t tx_off;
     ESP32P4ClkPeriod tx_bit_time;
     bool tx_chained;
+    /* The host holds its TX line low, a break ("break" property). */
+    bool brk;
 
     Notifier format_notifier;
     Notifier line_source;
