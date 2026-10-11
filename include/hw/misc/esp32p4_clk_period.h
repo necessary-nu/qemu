@@ -400,8 +400,8 @@ struct ESP32P4ClkSourceClass {
  * ClockPreUpdate, as the source has already moved on: a block that counts
  * a clock across its changes keeps the period it took at the last
  * ClockUpdate (an ESP32P4ClkCount). A change of the exact period that
- * leaves the Clock's rounding as it was, less than a Clock unit, runs no
- * callbacks and is seen from the block's next look.
+ * leaves the Clock's rounding as it was, less than a Clock unit, runs the
+ * callbacks all the same (esp32p4_clk_update()).
  */
 static inline ESP32P4ClkPeriod esp32p4_clk_exact(Clock *clk)
 {
@@ -431,6 +431,26 @@ static inline ESP32P4ClkPeriod esp32p4_clk_exact(Clock *clk)
         }
     }
     return esp32p4_clk_period_exact(period);
+}
+
+/*
+ * Drive @clk, an output of a TYPE_ESP32P4_CLK_SOURCE, whose exact period
+ * has changed from @old to @new: its Clock to @new rounded, which runs the
+ * callbacks of the clocks connected to it if that changes, and when it
+ * does not, while @new is not @old, the same callbacks all the same
+ * (clock_propagate_retime()), so that the blocks timed from the clock
+ * take its new period.
+ */
+static inline void esp32p4_clk_update(Clock *clk, ESP32P4ClkPeriod old,
+                                      ESP32P4ClkPeriod new)
+{
+    uint64_t period = esp32p4_clk_period_clock(new);
+
+    if (clock_get(clk) != period) {
+        clock_update(clk, period);
+    } else if (!esp32p4_clk_period_eq(old, new)) {
+        clock_propagate_retime(clk);
+    }
 }
 
 /*
