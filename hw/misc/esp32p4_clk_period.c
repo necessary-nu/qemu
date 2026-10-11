@@ -12,7 +12,7 @@
 #include "qemu/osdep.h"
 #include "hw/misc/esp32p4_clk_period.h"
 
-static const VMStateDescription vmstate_esp32p4_clk_period = {
+const VMStateDescription vmstate_esp32p4_clk_period = {
     .name = "esp32p4-clk-period",
     .version_id = 1,
     .minimum_version_id = 1,

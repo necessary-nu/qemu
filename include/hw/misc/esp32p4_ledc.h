@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/notify.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -64,12 +65,13 @@ typedef struct ESP32P4LedcTimer {
     bool etm_paused;        /* paused by the PAUSE and RESUME tasks */
     /*
      * The counter: count anchor_cnt of cycle anchor_cycle at anchor_ns,
-     * moving one count every q / 2^32 ns (0 while it stands still).
+     * moving one count every period q, exactly (stopped while it stands
+     * still).
      */
     int64_t anchor_ns;
     uint64_t anchor_cycle;
     uint32_t anchor_cnt;
-    uint64_t q;
+    ESP32P4ClkPeriod q;
     /* The first cycle whose overflow, and CMP match, are not yet seen */
     uint64_t ovf_next;
     uint64_t cmp_next;

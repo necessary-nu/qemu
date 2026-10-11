@@ -64,6 +64,12 @@ static inline bool esp32p4_clk_period_eq(ESP32P4ClkPeriod a,
     return a.num_hi == b.num_hi && a.num_lo == b.num_lo && a.den == b.den;
 }
 
+extern const VMStateDescription vmstate_esp32p4_clk_period;
+
+#define VMSTATE_ESP32P4_CLK_PERIOD(field, state) \
+    VMSTATE_STRUCT(field, state, 0, vmstate_esp32p4_clk_period, \
+                   ESP32P4ClkPeriod)
+
 /* A whole number of units. */
 static inline ESP32P4ClkPeriod esp32p4_clk_period_exact(uint64_t period)
 {
