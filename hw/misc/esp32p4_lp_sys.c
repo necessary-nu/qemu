@@ -36,8 +36,8 @@
  *   SW_USB_PHY_SEL, which choose the full-speed PHYs of USB Serial/JTAG
  *   and the full-speed OTG, to USB_WRAP ("usb-phy-sel" outputs); the
  *   high-speed OTG's suspend and mode flags for the PMU, which hold what
- *   software writes (the PMU is not modelled), and USBOTG20_WAKEUP_CLR,
- *   which reads as zero.
+ *   software writes (the PMU's USB wakeup is not modelled), and
+ *   USBOTG20_WAKEUP_CLR, which reads as zero.
  * - LP_SYSTEM_REG_HP_USB_OTGHS_PHY_CTRL_REG (0x204): the high-speed OTG
  *   PHY's ID pull-up, D+/D- pull-downs and VBUS charge and discharge,
  *   which hold what software writes: the model does not take the bus's

@@ -30,8 +30,8 @@
  *     up and down; a powered-down source is stopped. FOSC_DFREQ is the
  *     one trim the model applies: ESP-IDF gives RC_FAST 17.5 MHz at 100,
  *     the TRM 20 MHz at the reset value, and the model takes it to be
- *     linear through those. The other trims (SOSC_DFREQ, RC32K_DFREQ, the XTAL32K
- *     settings) are not characterised and change nothing, and the
+ *     linear through those. The other trims (SOSC_DFREQ, RC32K_DFREQ, the
+ *     XTAL32K settings) are not characterised and change nothing, and the
  *     oscillators run from the moment they are powered up.
  *   - LP_CLKRST_HP_CLK_CTRL and CLK_TO_HP gate each source into the HP
  *     system, and gate the clocks the pads bring in.
