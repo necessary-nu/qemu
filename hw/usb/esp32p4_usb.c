@@ -37,6 +37,11 @@
  * OTG (master 23, ICM ID 3). OTG_HS raises USB_OTG_INTR and, for its
  * endpoints, USB_OTG_ENDP_MULTI_PROC_INTR; OTG_FS USB_OTG11_INTR.
  *
+ * Both cores count their PHY clocks at the clocks' exact periods
+ * (esp32p4_clk_period.h): a (micro)frame of HFIR.FrInt PHY clocks ends at
+ * the first ns that many have elapsed, counted from the first frame, at
+ * whatever frequency the clock tree gives the PHY clock, whole Hz or not.
+ *
  * The UTMI+ PHY's PLL makes its 60 MHz clock from the reference clock
  * while the PHY is out of reset and HP_SYSTEM_SYS_USBOTG20_CTRL does not
  * force it into reset, suspend or its PLL off; the reference's frequency
@@ -63,6 +68,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "hw/usb/esp32p4_usb.h"
 #include "migration/vmstate.h"
 
@@ -92,6 +98,27 @@ static void esp32p4_usb_otg_fs_init(Object *obj)
     s->hwcfg3 = 0x00c804b5;
     s->hwcfg4 = 0xd3f0a030;
     s->ram_words = 256;
+}
+
+/* The PHY clocks' cycles, at the clock tree's exact periods. */
+static uint64_t esp32p4_usb_clock_cycles(DWC2OTGState *s, Clock *clk,
+                                         int64_t ns)
+{
+    return esp32p4_clk_ns_cycles(esp32p4_clk_exact(clk), ns);
+}
+
+static int64_t esp32p4_usb_clock_cycles_ns(DWC2OTGState *s, Clock *clk,
+                                           uint64_t n)
+{
+    return esp32p4_clk_cycles_ns(esp32p4_clk_exact(clk), n);
+}
+
+static void esp32p4_usb_otg_class_init(ObjectClass *klass, const void *data)
+{
+    DWC2OTGClass *oc = DWC2_OTG_CLASS(klass);
+
+    oc->clock_cycles = esp32p4_usb_clock_cycles;
+    oc->clock_cycles_ns = esp32p4_usb_clock_cycles_ns;
 }
 
 /* USB_WRAP */
@@ -372,6 +399,12 @@ static void wrap_class_init(ObjectClass *klass, const void *data)
 
 #define UTMI_HZ                 60000000
 
+/* The PLL's 60 MHz, exactly: 50/3 ns. */
+static ESP32P4ClkPeriod utmi_period(void)
+{
+    return esp32p4_clk_period_of_hz(UTMI_HZ, 1);
+}
+
 static const uint8_t utmi_reset[ESP32P4_USB_UTMI_REGS] = {
     0x80, 0xf2, 0x47, 0x05, 0x00, 0xc1, 0x40, 0x00,
 };
@@ -396,7 +429,20 @@ static void utmi_update_clock(ESP32P4UsbUtmiState *s)
               (!c[ESP32P4_USB_UTMI_CTRL_PHY_PLL_FORCE_EN] ||
                c[ESP32P4_USB_UTMI_CTRL_PHY_PLL_EN]);
 
-    clock_update_hz(s->utmi_clk, on ? UTMI_HZ : 0);
+    clock_update(s->utmi_clk, on ? esp32p4_clk_period_clock(utmi_period())
+                                 : 0);
+}
+
+/* [spec:nuos:req:emu.esp32p4.usb] */
+static bool utmi_exact_period(Object *obj, Clock *out, ESP32P4ClkPeriod *p)
+{
+    ESP32P4UsbUtmiState *s = ESP32P4_USB_UTMI(obj);
+
+    if (out != s->utmi_clk) {
+        return false;
+    }
+    *p = clock_get(out) ? utmi_period() : esp32p4_clk_period_stopped();
+    return true;
 }
 
 /*
@@ -550,11 +596,13 @@ static void utmi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
+    ESP32P4ClkSourceClass *csc = ESP32P4_CLK_SOURCE_CLASS(klass);
 
     dc->desc = "ESP32-P4 USB 2.0 high-speed OTG UTMI+ PHY";
     dc->vmsd = &vmstate_utmi;
     rc->phases.hold = utmi_reset_hold;
     rc->phases.exit = utmi_reset_exit;
+    csc->exact_period = utmi_exact_period;
 }
 
 /* [spec:nuos:req:emu.esp32p4.usb] */
@@ -563,11 +611,13 @@ static const TypeInfo esp32p4_usb_types[] = {
         .name          = TYPE_ESP32P4_USB_OTG_HS,
         .parent        = TYPE_DWC2_OTG,
         .instance_init = esp32p4_usb_otg_hs_init,
+        .class_init    = esp32p4_usb_otg_class_init,
     },
     {
         .name          = TYPE_ESP32P4_USB_OTG_FS,
         .parent        = TYPE_DWC2_OTG,
         .instance_init = esp32p4_usb_otg_fs_init,
+        .class_init    = esp32p4_usb_otg_class_init,
     },
     {
         .name          = TYPE_ESP32P4_USB_WRAP,
@@ -582,6 +632,10 @@ static const TypeInfo esp32p4_usb_types[] = {
         .instance_size = sizeof(ESP32P4UsbUtmiState),
         .instance_init = utmi_init,
         .class_init    = utmi_class_init,
+        .interfaces    = (const InterfaceInfo[]) {
+            { TYPE_ESP32P4_CLK_SOURCE },
+            { }
+        },
     },
 };
 

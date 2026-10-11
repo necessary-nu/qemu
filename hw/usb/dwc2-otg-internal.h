@@ -63,8 +63,16 @@ enum {
 
 /* Core */
 void dwc2_otg_update_irq(DWC2OTGState *s);
-uint64_t dwc2_otg_phy_hz(DWC2OTGState *s);
+/*
+ * The PHY clock the core runs at: its period in Clock units, as its Clock
+ * has it, 0 while it is stopped; the first ns by which @ticks of it have
+ * elapsed from one of its edges, 0 while stopped; and its whole cycles in
+ * @ns from one, at the period the class counts it at
+ * (DWC2OTGClass.clock_cycles).
+ */
+uint64_t dwc2_otg_phy_period(DWC2OTGState *s);
 int64_t dwc2_otg_phy_ticks_ns(DWC2OTGState *s, uint64_t ticks);
+uint64_t dwc2_otg_phy_ticks(DWC2OTGState *s, int64_t ns);
 bool dwc2_otg_dma_enabled(DWC2OTGState *s);
 bool dwc2_otg_dma_read(DWC2OTGState *s, uint32_t addr, void *buf,
                        uint32_t len);

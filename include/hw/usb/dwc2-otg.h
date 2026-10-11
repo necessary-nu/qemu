@@ -18,7 +18,20 @@
 #include "qom/object.h"
 
 #define TYPE_DWC2_OTG "dwc2-otg"
-OBJECT_DECLARE_SIMPLE_TYPE(DWC2OTGState, DWC2_OTG)
+OBJECT_DECLARE_TYPE(DWC2OTGState, DWC2OTGClass, DWC2_OTG)
+
+struct DWC2OTGClass {
+    SysBusDeviceClass parent_class;
+
+    /*
+     * The whole cycles of @clk, one of the core's PHY clocks, in @ns from
+     * one of its edges, and the first ns by which @n of them have elapsed:
+     * by default at the Clock's period; a machine that knows the clock's
+     * period more exactly than a Clock holds it counts at that.
+     */
+    uint64_t (*clock_cycles)(DWC2OTGState *s, Clock *clk, int64_t ns);
+    int64_t (*clock_cycles_ns)(DWC2OTGState *s, Clock *clk, uint64_t n);
+};
 
 /*
  * The core's 256 KiB: its control and status registers (CSRs) in the
@@ -279,12 +292,13 @@ struct DWC2OTGState {
     int64_t frame_start_ns;
     int64_t frame_ns;
     /*
-     * The frames counted from frame_origin_ns at the PHY clock frame_hz,
+     * The frames counted from frame_origin_ns at the PHY clock of
+     * frame_period (its Clock's period, as dwc2_otg_phy_period() gives it),
      * the current one ending frame_ticks PHY clocks after it.
      */
     int64_t frame_origin_ns;
     uint64_t frame_ticks;
-    uint64_t frame_hz;
+    uint64_t frame_period;
     uint16_t frnum;
     /* The transaction in flight while a QEMU device completes it. */
     bool xact_async;
