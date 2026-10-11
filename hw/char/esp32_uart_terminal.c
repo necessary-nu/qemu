@@ -66,6 +66,7 @@ static gboolean term_out_ready(void *do_not_use, GIOCondition cond,
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] A frame received from the chip's TXD. */
+/* [spec:nuos:req:emu.esp32p4.uart] */
 static void term_rx_deliver(void *opaque, unsigned data, unsigned flags)
 {
     Esp32UartTerminalState *s = ESP32_UART_TERMINAL(opaque);
@@ -196,6 +197,7 @@ static int term_can_receive(void *opaque)
 
 /*
  * [spec:nuos:req:emu.esp32.gpio]
+ * [spec:nuos:req:emu.esp32p4.uart]
  * Bytes from the chardev wait in the terminal's FIFO and go out as frames,
  * back to back, at the UART's baud rate.
  */
@@ -305,6 +307,7 @@ static void esp32_uart_terminal_class_init(ObjectClass *klass,
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] */
+/* [spec:nuos:req:emu.esp32p4.uart] */
 static const TypeInfo esp32_uart_terminal_info = {
     .name = TYPE_ESP32_UART_TERMINAL,
     .parent = TYPE_DEVICE,

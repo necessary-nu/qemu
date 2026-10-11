@@ -12,6 +12,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <poll.h>
 #include "libqtest.h"
 #include "qobject/qdict.h"
 
@@ -1304,22 +1305,28 @@ static void test_usj_registers(void)
     qtest_quit(qts);
 }
 
-static QTestState *start_usj(int *fd)
+static QTestState *start_usj_args(int *fd, const char *extra)
 {
     g_autofree char *dir = g_dir_make_tmp("esp32p4-usj-XXXXXX", NULL);
     g_autofree char *path = g_strdup_printf("%s/sock", dir);
     int srv = qtest_socket_server(path);
     QTestState *qts;
 
-    qts = qtest_initf("-M esp32p4,flash-size=16M -serial none "
+    qts = qtest_initf("-M esp32p4,flash-size=16M%s -serial none "
                       "-chardev socket,id=usj,path=%s "
-                      "-global esp32p4-usb-serial-jtag.chardev=usj", path);
+                      "-global esp32p4-usb-serial-jtag.chardev=usj", extra,
+                      path);
     *fd = accept(srv, NULL, NULL);
     g_assert_cmpint(*fd, >=, 0);
     close(srv);
     unlink(path);
     rmdir(dir);
     return qts;
+}
+
+static QTestState *start_usj(int *fd)
+{
+    return start_usj_args(fd, "");
 }
 
 /*
@@ -1397,6 +1404,108 @@ static void test_usj_host(void)
     qtest_quit(qts);
 }
 
+/* Read from @fd into @buf, up to @len bytes, until @want shows or 30 s. */
+static size_t read_until(int fd, char *buf, size_t len, const char *want,
+                         size_t want_len)
+{
+    size_t got = 0;
+
+    for (int i = 0; i < 300; i++) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+
+        if (poll(&pfd, 1, 100) > 0) {
+            ssize_t n = recv(fd, buf + got, len - got, 0);
+
+            g_assert_cmpint(n, >, 0);
+            got += n;
+        }
+        if (memmem(buf, got, want, want_len) || got == len) {
+            break;
+        }
+    }
+    return got;
+}
+
+/*
+ * The boot ROM in download mode (strap-mode 0x04, GPIO35 low and GPIO36
+ * high) through serial port 0: it says it is waiting, then answers
+ * esptool's SLIP-framed SYNC command, received on GPIO38 by UART0 with
+ * the ROM's interrupt-driven receiver, with SYNC's response.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+static void test_rom_download_sync(void)
+{
+    static const uint8_t sync_cmd[] = {
+        0xc0, 0x00, 0x08, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x07, 0x07, 0x12, 0x20,
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0xc0,
+    };
+    static const char sync_resp[] = { (char)0xc0, 0x01, 0x08 };
+    static const char waiting[] = "waiting for download";
+    char buf[512];
+    size_t got = 0;
+    int fd, i;
+    QTestState *qts = qtest_init_with_serial(
+        "-M esp32p4,flash-size=16M,strap-mode=0x04 -accel tcg "
+        "-icount shift=0,sleep=off", &fd);
+
+    got = read_until(fd, buf, sizeof(buf) - 1, waiting, strlen(waiting));
+    g_assert_nonnull(memmem(buf, got, "DOWNLOAD(USB/UART0/SPI)", 23));
+    g_assert_nonnull(memmem(buf, got, waiting, strlen(waiting)));
+    for (i = 0; i < 10; i++) {
+        g_assert_cmpint(send(fd, sync_cmd, sizeof(sync_cmd), 0), ==,
+                        sizeof(sync_cmd));
+        got = read_until(fd, buf, sizeof(buf), sync_resp, sizeof(sync_resp));
+        if (memmem(buf, got, sync_resp, sizeof(sync_resp))) {
+            break;
+        }
+    }
+    g_assert_nonnull(memmem(buf, got, sync_resp, sizeof(sync_resp)));
+    close(fd);
+    qtest_quit(qts);
+}
+
+/*
+ * The boot ROM in download mode answers esptool's SYNC over the USB
+ * Serial/JTAG port too, once the host has enumerated it; its banner went
+ * to the IN buffer before that, and the bus reset emptied it.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+static void test_rom_download_sync_usj(void)
+{
+    static const uint8_t sync_cmd[] = {
+        0xc0, 0x00, 0x08, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x07, 0x07, 0x12, 0x20,
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0xc0,
+    };
+    static const char sync_resp[] = { (char)0xc0, 0x01, 0x08 };
+    char buf[512];
+    size_t got = 0;
+    int fd, i;
+    QTestState *qts = start_usj_args(&fd, ",strap-mode=0x04 -accel tcg "
+                                     "-icount shift=0,sleep=off");
+
+    for (i = 0; i < 20; i++) {
+        g_assert_cmpint(send(fd, sync_cmd, sizeof(sync_cmd), 0), ==,
+                        sizeof(sync_cmd));
+        got = read_until(fd, buf, sizeof(buf), sync_resp, sizeof(sync_resp));
+        if (memmem(buf, got, sync_resp, sizeof(sync_resp))) {
+            break;
+        }
+    }
+    g_assert_nonnull(memmem(buf, got, sync_resp, sizeof(sync_resp)));
+    close(fd);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1422,6 +1531,9 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/uart/usj_registers", test_usj_registers);
     qtest_add_func("esp32p4/uart/usj_host", test_usj_host);
     qtest_add_func("esp32p4/uart/rom_banner", test_rom_banner);
+    qtest_add_func("esp32p4/uart/rom_download_sync", test_rom_download_sync);
+    qtest_add_func("esp32p4/uart/rom_download_sync_usj",
+                   test_rom_download_sync_usj);
 
     return g_test_run();
 }
