@@ -94,11 +94,11 @@ static bool etm_running(ESP32P4EtmState *s)
 /* Whether times @last and @t fall in the same cycle of SYS_CLK. */
 static bool etm_same_cycle(ESP32P4EtmState *s, int64_t last, int64_t t)
 {
-    if (last < s->clk_ns || t < s->clk_ns) {
+    if (last < s->clk_count.origin_ns || t < s->clk_count.origin_ns) {
         return false;
     }
-    return clock_ns_to_ticks(s->clk, last - s->clk_ns) ==
-           clock_ns_to_ticks(s->clk, t - s->clk_ns);
+    return esp32p4_clk_count_at(&s->clk_count, last) ==
+           esp32p4_clk_count_at(&s->clk_count, t);
 }
 
 /*
@@ -178,15 +178,10 @@ static bool etm_tick_mapped(ESP32P4EtmState *s)
     return false;
 }
 
-/* The time of RTC_EVT_TICK edge @n since @tick_ns, capped for timer_mod(). */
+/* The time of RTC_EVT_TICK edge @n since its change, capped for timer_mod(). */
 static int64_t etm_tick_edge_ns(ESP32P4EtmState *s, uint64_t n)
 {
-    uint64_t ns = clock_ticks_to_ns(s->rtc_tick, n);
-
-    while (ns < INT64_MAX / 4 && clock_ns_to_ticks(s->rtc_tick, ns) < n) {
-        ns++;
-    }
-    return s->tick_ns + MIN(ns, INT64_MAX / 4);
+    return MIN(esp32p4_clk_count_time(&s->tick_count, n), INT64_MAX / 4);
 }
 
 /*
@@ -199,10 +194,7 @@ static void etm_tick_fold(ESP32P4EtmState *s, int64_t now)
 {
     uint64_t edges;
 
-    if (!clock_is_enabled(s->rtc_tick) || now <= s->tick_ns) {
-        return;
-    }
-    edges = clock_ns_to_ticks(s->rtc_tick, now - s->tick_ns);
+    edges = esp32p4_clk_count_at(&s->tick_count, now);
     if (edges <= s->tick_seen) {
         return;
     }
@@ -251,7 +243,7 @@ static void etm_tick_update(void *opaque, ClockEvent event)
         etm_tick_fold(s, now);
         return;
     }
-    s->tick_ns = now;
+    esp32p4_clk_count_start(&s->tick_count, s->rtc_tick, now);
     s->tick_seen = 0;
     etm_tick_schedule(s);
 }
@@ -266,7 +258,7 @@ static void etm_clk_update(void *opaque, ClockEvent event)
         etm_tick_fold(s, now);
         return;
     }
-    s->clk_ns = now;
+    esp32p4_clk_count_start(&s->clk_count, s->clk, now);
     etm_tick_schedule(s);
 }
 
@@ -539,8 +531,8 @@ static void esp32p4_etm_init(Object *obj)
 
 static const VMStateDescription vmstate_esp32p4_etm = {
     .name = TYPE_ESP32P4_ETM,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4EtmState),
         VMSTATE_CLOCK(rtc_tick, ESP32P4EtmState),
@@ -553,10 +545,10 @@ static const VMStateDescription vmstate_esp32p4_etm = {
                              ESP32P4_ETM_TASK_WORDS),
         VMSTATE_UINT32(clk_en, ESP32P4EtmState),
         VMSTATE_UINT32(date, ESP32P4EtmState),
-        VMSTATE_INT64(clk_ns, ESP32P4EtmState),
+        VMSTATE_ESP32P4_CLK_COUNT(clk_count, ESP32P4EtmState),
         VMSTATE_INT64_ARRAY(evt_ns, ESP32P4EtmState, ESP32P4_ETM_EVENTS),
         VMSTATE_INT64_ARRAY(task_ns, ESP32P4EtmState, ESP32P4_ETM_TASKS),
-        VMSTATE_INT64(tick_ns, ESP32P4EtmState),
+        VMSTATE_ESP32P4_CLK_COUNT(tick_count, ESP32P4EtmState),
         VMSTATE_UINT64(tick_seen, ESP32P4EtmState),
         VMSTATE_TIMER(tick_timer, ESP32P4EtmState),
         VMSTATE_END_OF_LIST()

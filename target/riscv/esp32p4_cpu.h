@@ -10,6 +10,7 @@
 #define TARGET_RISCV_ESP32P4_CPU_H
 
 #include "target/riscv/cpu.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "target/riscv/esp32p4_pie.h"
 #include "qom/object.h"
 
@@ -423,13 +424,15 @@ struct ESP32P4CPU {
     uint32_t lp_dcsr;
     /*
      * The counters (TRM 5.7). The core's clock, and the cycles it has
-     * counted while running, up to lp_cycles_ns; mcycle and minstret are
-     * lp_ctr_base[] plus the cycles since lp_ctr_ref[], while counting;
-     * mhpmcounter3 to 12, 40 bits each, hold what is written.
+     * counted while running, up to its cycle lp_synced counted from when
+     * it last started running or the clock changed (lp_edges); mcycle and
+     * minstret are lp_ctr_base[] plus the cycles since lp_ctr_ref[], while
+     * counting; mhpmcounter3 to 12, 40 bits each, hold what is written.
      */
     Clock *lp_clk;
     uint64_t lp_cycles;
-    int64_t lp_cycles_ns;
+    ESP32P4ClkCount lp_edges;
+    uint64_t lp_synced;
     uint64_t lp_ctr_base[2];
     uint64_t lp_ctr_ref[2];
     uint64_t lp_hpm[ESP32P4_LP_HPM_COUNTERS];
@@ -534,6 +537,7 @@ RISCVException esp32p4_lp_csr_read(CPURISCVState *env, int csrno,
 RISCVException esp32p4_lp_csr_write(CPURISCVState *env, int csrno,
                                     target_ulong val);
 void esp32p4_lp_counters_update(ESP32P4CPU *cpu);
+void esp32p4_lp_counters_clock_changed(ESP32P4CPU *cpu);
 void esp32p4_lp_counters_reset(ESP32P4CPU *cpu);
 void esp32p4_lp_triggers_reset(ESP32P4CPU *cpu);
 void esp32p4_lp_triggers_rebuild(ESP32P4CPU *cpu);

@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -81,11 +82,11 @@ struct ESP32P4SysTimerState {
     bool stall[ESP32P4_SYSTIMER_CORES];
 
     /*
-     * CNT_CLK: @clk_edges edges up to @clk_ns, an edge of the function
-     * clock from which it has run at its current rate.
+     * CNT_CLK: @clk_edges edges up to the origin of @clk_count, an edge of
+     * the function clock from which it has run at its current rate.
      */
     uint64_t clk_edges;
-    int64_t clk_ns;
+    ESP32P4ClkCount clk_count;
 };
 
 #endif

@@ -323,6 +323,41 @@ static void test_logging(void)
     qtest_quit(qts);
 }
 
+/*
+ * RC_SLOW_CLK's period is 6666 2/3 ns: count n comes at exactly n * 20000/3
+ * ns, the first nanosecond at or after it, however the count was folded
+ * on the way. Each write of a target folds the count; one at a fraction of
+ * a nanosecond past an edge must not move the edges after it. Count 2
+ * comes at 13333 1/3 ns, count 4 at 26666 2/3 ns and count 150000, and
+ * the target, at 1 s.
+ */
+/* [spec:nuos:req:emu.esp32p4.timers/test] */
+static void test_exact_cycles(void)
+{
+    QTestState *qts = start();
+
+    wr(qts, INT_ENA, INT_TARGET);
+    set_target(qts, 0, 150000, true);
+    step(qts, 13334);
+    g_assert_cmpuint(count(qts), ==, 2);
+    set_target(qts, 0, 150000, true);
+    step(qts, 26666 - now);
+    g_assert_cmpuint(count(qts), ==, 3);
+    step(qts, 1);
+    g_assert_cmpuint(count(qts), ==, 4);
+    set_target(qts, 0, 150000, true);
+    step(qts, 40001 - now);
+    g_assert_cmpuint(count(qts), ==, 6);
+    set_target(qts, 0, 150000, true);
+    step(qts, 1 * S - 1 - now);
+    g_assert_cmpuint(count(qts), ==, 149999);
+    g_assert_cmphex(rd(qts, INT_RAW), ==, 0);
+    step(qts, 1);
+    g_assert_cmpuint(count(qts), ==, 150000);
+    g_assert_cmphex(rd(qts, INT_RAW), ==, INT_TARGET);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -332,5 +367,6 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/lp-timer/targets", test_targets);
     qtest_add_func("/esp32p4/lp-timer/overflow", test_overflow);
     qtest_add_func("/esp32p4/lp-timer/logging", test_logging);
+    qtest_add_func("/esp32p4/lp-timer/exact-cycles", test_exact_cycles);
     return g_test_run();
 }

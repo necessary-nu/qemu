@@ -94,9 +94,13 @@ struct ESP32P4LPTimerState {
     uint32_t lp_int_ena;
     uint32_t date;
 
-    /* The 48-bit count at @sync_ns, a clock edge. */
+    /*
+     * The 48-bit count, as of LP_DYN_SLOW_CLK's cycle @synced counted from
+     * the clock's last change (@edges).
+     */
     uint64_t count;
-    int64_t sync_ns;
+    ESP32P4ClkCount edges;
+    uint64_t synced;
     /* Targets 0 and 1, and the overflow. */
     ESP32P4LPTimerAlarm alarm[ESP32P4_LP_TIMER_TARGETS + 1];
 

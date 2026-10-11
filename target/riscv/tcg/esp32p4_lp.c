@@ -56,6 +56,7 @@
 #include "accel/tcg/cpu-loop.h"
 #include "exec/breakpoint.h"
 #include "hw/core/clock.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "target/riscv/esp32p4_cpu.h"
 
 #define LP_MTVEC_BASE           (~(target_ulong)0xff)
@@ -145,30 +146,42 @@ static bool esp32p4_lp_running(ESP32P4CPU *cpu)
 }
 
 /*
- * Bring lp_cycles up to the present: the cycles of the core's clock since
- * lp_cycles_ns while the core runs. Called with the BQL held, before the
- * core starts or stops running and before its clock changes rate.
+ * Bring lp_cycles up to the present: the cycles of the core's clock while
+ * the core runs, counted from when it last started running or its clock
+ * changed (lp_edges). Called with the BQL held, before the core starts or
+ * stops running and before its clock changes rate.
  */
 /* [spec:nuos:req:emu.esp32p4.lp-core] */
 static uint64_t esp32p4_lp_cycles(ESP32P4CPU *cpu)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint64_t ticks;
+    uint64_t cycles;
 
     if (!cpu->lp_clk || !esp32p4_lp_running(cpu) ||
-        !clock_is_enabled(cpu->lp_clk) || now <= cpu->lp_cycles_ns) {
-        cpu->lp_cycles_ns = MAX(now, cpu->lp_cycles_ns);
+        !clock_is_enabled(cpu->lp_clk)) {
+        cpu->lp_edges.origin_ns = MAX(now, cpu->lp_edges.origin_ns);
+        cpu->lp_synced = 0;
         return cpu->lp_cycles;
     }
-    ticks = clock_ns_to_ticks(cpu->lp_clk, now - cpu->lp_cycles_ns);
-    cpu->lp_cycles += ticks;
-    cpu->lp_cycles_ns += clock_ticks_to_ns(cpu->lp_clk, ticks);
+    cycles = esp32p4_clk_count_at(&cpu->lp_edges, now);
+    if (cycles > cpu->lp_synced) {
+        cpu->lp_cycles += cycles - cpu->lp_synced;
+        cpu->lp_synced = cycles;
+    }
     return cpu->lp_cycles;
 }
 
 void esp32p4_lp_counters_update(ESP32P4CPU *cpu)
 {
     esp32p4_lp_cycles(cpu);
+}
+
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+void esp32p4_lp_counters_clock_changed(ESP32P4CPU *cpu)
+{
+    esp32p4_clk_count_start(&cpu->lp_edges, cpu->lp_clk,
+                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    cpu->lp_synced = 0;
 }
 
 static uint64_t esp32p4_lp_ctr(ESP32P4CPU *cpu, int c, uint32_t inhibit)

@@ -914,8 +914,8 @@ static int esp32p4_lp_state_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_esp32p4_lp_state = {
     .name = "esp32p4-cpu/lp",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .needed = esp32p4_lp_state_needed,
     .post_load = esp32p4_lp_state_post_load,
     .fields = (const VMStateField[]) {
@@ -929,7 +929,11 @@ static const VMStateDescription vmstate_esp32p4_lp_state = {
         VMSTATE_TIMER_PTR(lp_exc_timer, ESP32P4CPU),
         VMSTATE_CLOCK(lp_clk, ESP32P4CPU),
         VMSTATE_UINT64(lp_cycles, ESP32P4CPU),
-        VMSTATE_INT64(lp_cycles_ns, ESP32P4CPU),
+        VMSTATE_UINT64(lp_edges.period.num_hi, ESP32P4CPU),
+        VMSTATE_UINT64(lp_edges.period.num_lo, ESP32P4CPU),
+        VMSTATE_UINT64(lp_edges.period.den, ESP32P4CPU),
+        VMSTATE_INT64(lp_edges.origin_ns, ESP32P4CPU),
+        VMSTATE_UINT64(lp_synced, ESP32P4CPU),
         VMSTATE_UINT64_ARRAY(lp_ctr_base, ESP32P4CPU, 2),
         VMSTATE_UINT64_ARRAY(lp_ctr_ref, ESP32P4CPU, 2),
         VMSTATE_UINT64_ARRAY(lp_hpm, ESP32P4CPU, ESP32P4_LP_HPM_COUNTERS),
@@ -1175,10 +1179,17 @@ static void esp32p4_lp_cpu_set_disable(void *opaque, int n, int level)
     esp32p4_cpu_clock_changed(cpu, was_off);
 }
 
-/* The core's clock is about to change rate: count at the old one first. */
+/*
+ * The core's clock is about to change rate: count at the old one first,
+ * then from the change at the new one.
+ */
 static void esp32p4_lp_cpu_clk_update(void *opaque, ClockEvent event)
 {
-    esp32p4_lp_counters_update(opaque);
+    if (event == ClockPreUpdate) {
+        esp32p4_lp_counters_update(opaque);
+    } else {
+        esp32p4_lp_counters_clock_changed(opaque);
+    }
 }
 #endif
 
@@ -1213,7 +1224,7 @@ static void esp32p4_lp_cpu_init(Object *obj)
                              1);
     cpu->lp_clk = qdev_init_clock_in(dev, ESP32P4_CPU_LP_CLK,
                                      esp32p4_lp_cpu_clk_update, cpu,
-                                     ClockPreUpdate);
+                                     ClockPreUpdate | ClockUpdate);
     cpu->lp_exc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32p4_lp_exc_timer,
                                      cpu);
 #endif
