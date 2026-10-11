@@ -1115,6 +1115,99 @@ static void test_mclk_exact(void)
     qtest_quit(qts);
 }
 
+/* The analog I2C master, to the audio PLL's registers. */
+#define ANA_I2C_MST         0x50124000
+#define ANA_I2C0_CTRL       (ANA_I2C_MST + 0x00)
+#define ANA_CONF2           (ANA_I2C_MST + 0x20)
+#define ANA_CTRL_WRITE      (1u << 24)
+#define ANA_CTRL_BUSY       (1u << 25)
+#define ANA_CONF2_PLLA      (1u << 8)
+#define SLAVE_PLLA          0x6f
+#define PLLA_OR_OUTPUT_DIV  4
+#define PLLA_SDM            5
+#define PLLA_SDM_RSTB       (1u << 6)
+#define PLLA_DSDM2          7
+#define PLLA_DSDM1          8
+#define PLLA_DSDM0          9
+#define SRC_APLL            1
+
+static void plla_write(QTestState *qts, uint8_t reg, uint8_t data)
+{
+    qtest_writel(qts, ANA_CONF2, ANA_CONF2_PLLA);
+    qtest_writel(qts, ANA_I2C0_CTRL, SLAVE_PLLA | (reg << 8) | (data << 16) |
+                 ANA_CTRL_WRITE);
+    for (int i = 0; i < 100; i++) {
+        if (!(qtest_readl(qts, ANA_I2C0_CTRL) & ANA_CTRL_BUSY)) {
+            return;
+        }
+        qtest_clock_step(qts, 1000);
+    }
+    g_assert_not_reached();
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.i2s/test]
+ * [spec:nuos:req:emu.esp32p4.clocks/test]
+ * A change of a clock's exact period too small for its Clock period,
+ * less than 2^-32 ns, still reaches the blocks timed from it. I2S0's TX
+ * clock, XTAL_CLK by 3 + 510/244421 (N 3, X 478, Y 131, Z 510), goes out
+ * on I2S0_MCLK_out to PAD_I2S1_MCLK, I2S1's receiver's clock by 2. One
+ * write moves I2S0's TX clock to the audio PLL, set to 40 MHz *
+ * 1528566/655360 (OR_OUTPUT_DIV 3, SDM2 19, SDM1 82, SDM0 246), by
+ * 7 + 510/244421 (N 7): a period 0.57 Clock units longer, the same Clock
+ * period. I2S1 then receives 319 frames of 32 BCK cycles of 56 of its
+ * clock's: 1143296 periods of the pad's clock, which end 85806839.00008
+ * ns after the start at the PLL's period, against 85806838.99992 at the
+ * crystal's. RX_DONE comes at the first ns after.
+ */
+static void test_mclk_retime(void)
+{
+    QTestState *qts = start();
+    uint64_t period;
+    uint32_t ctrl13;
+    int64_t t0;
+
+    qtest_set_irq_in(qts, "/machine/ana", "xpd", 0, 1);
+    plla_write(qts, PLLA_OR_OUTPUT_DIV, 3);
+    plla_write(qts, PLLA_DSDM2, 19);
+    plla_write(qts, PLLA_DSDM1, 82);
+    plla_write(qts, PLLA_DSDM0, 246);
+    plla_write(qts, PLLA_SDM, PLLA_SDM_RSTB);
+    qtest_clock_step(qts, 11 * 1000);
+
+    clocks_on(qts, 0);
+    clocks_on(qts, 1);
+    set_fld(qts, unit_clk[0][1].x, 478);
+    set_fld(qts, unit_clk[0][1].y, 131);
+    set_fld(qts, unit_clk[0][1].z, 510);
+    set_fld(qts, unit_clk[0][1].n, 3);
+    set_fld(qts, mst_sel[0], 1);
+    wire(qts, 24, SIG_MCLK(0), SIG_MCLK(1));
+    qtest_writel(qts, LP_HP_CLK_CTRL,
+                 qtest_readl(qts, LP_HP_CLK_CTRL) | PAD_I2S_MCLK_EN(1));
+    set_unit_clk(qts, 1, 0, SRC_PAD_MCLK, 2);
+
+    /* Source and N, which share a register, in one write. */
+    period = clock_period(qts, "/machine/clkrst/i2s0-tx");
+    ctrl13 = qtest_readl(qts, unit_clk[0][1].n.reg);
+    qtest_writel(qts, unit_clk[0][1].n.reg,
+                 (ctrl13 & ~(0x3u << 11) & ~(0xffu << 13)) |
+                 (SRC_APLL << 11) | (7u << 13));
+    g_assert_cmpuint(clock_period(qts, "/machine/clkrst/i2s0-tx"), ==,
+                     period);
+
+    i2s_w(qts, 1, RXEOF_NUM, 2 * 319 - 1);
+    dma_rx(qts, 1, PERI_I2S(1), MEM, MEM + 0x2000, 2048);
+    t0 = qtest_clock_step(qts, 1);
+    unit_go(qts, 1, false, (RX_BASE & ~C_MSB_SHIFT) | C_TDM_EN |
+            C_BCK_DIV(56), STD_CONF1, STD_TDM);
+    g_assert_cmpint(qtest_clock_step(qts, 85806839), ==, t0 + 85806839);
+    g_assert_cmphex(i2s_r(qts, 1, INT_RAW) & INT_RX_DONE, ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(i2s_r(qts, 1, INT_RAW) & INT_RX_DONE, ==, INT_RX_DONE);
+    qtest_quit(qts);
+}
+
 /* ---- The LP I2S and its VAD ---- */
 
 static void lp_w(QTestState *qts, uint32_t reg, uint32_t v)
@@ -1589,6 +1682,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4-i2s/etm", test_etm);
     qtest_add_func("/esp32p4-i2s/mclk", test_mclk);
     qtest_add_func("/esp32p4-i2s/mclk-exact", test_mclk_exact);
+    qtest_add_func("/esp32p4-i2s/mclk-retime", test_mclk_retime);
     qtest_add_func("/esp32p4-i2s/lp-mem", test_lp_mem);
     qtest_add_func("/esp32p4-i2s/vad-manual", test_vad_manual);
     qtest_add_func("/esp32p4-i2s/lp-from-hp", test_lp_from_hp);

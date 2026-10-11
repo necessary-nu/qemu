@@ -102,18 +102,22 @@
  * retires; a write takes effect after the writing instruction, which
  * the next one reads. A counter's reset value is 0.
  *
- * The cycles of a clock over an interval are the whole periods of it gone
- * by, at the period of its Clock, as every block of the chip counts them
- * (see esp32p4_clk_period.h); a clock that starts, or changes rate,
- * starts its first cycle there. Virtual time is taken to the fraction of a
- * nanosecond icount leaves when CPUs execute at their clocks' rate
- * (icount_get_precise()): under icount, a core executes an instruction a
- * cycle of its clock, so that a core running alone counts one cycle for
- * each instruction it executes, at any frequency. Cores running together
- * take turns of at most a quantum of virtual time (icount_set_cpu_clock()),
- * through which each one's mcycle follows virtual time, as the chip's
- * timers do, and so its own instructions to within that quantum. Without
- * icount virtual time follows the host's clock, as do the cycles.
+ * The cycles of a clock are the whole periods of it gone by since it
+ * started its current run, at its exact period, as every block of the
+ * chip counts them (see esp32p4_clk_period.h), so that cycle n of a run
+ * ends n exact periods after its start however large n is; a clock that
+ * starts, or changes rate, starts its first cycle there. Virtual time is
+ * taken to the fraction of a nanosecond icount leaves when CPUs execute
+ * at their clocks' rate (icount_get_precise()): under icount, a core
+ * executes an instruction a cycle of its clock, its exact period each
+ * (icount_set_cpu_period_frac()), so that a core running alone counts one
+ * cycle for each instruction it executes, at any frequency. That time is
+ * the instructions' exact time rounded down to a 2^-32 ns unit, so the
+ * count allows for a unit more. Cores running together take turns of at
+ * most a quantum of virtual time (icount_set_cpu_clock()), through which
+ * each one's mcycle follows virtual time, as the chip's timers do, and so
+ * its own instructions to within that quantum. Without icount virtual
+ * time follows the host's clock, as do the cycles.
  *
  * The instructions are counted by the code QEMU translates for the core,
  * which adds one to the core's count as each instruction starts. One that
@@ -203,37 +207,23 @@ static bool ctr_before(CtrTime a, CtrTime b)
     return a.ns < b.ns || (a.ns == b.ns && a.frac < b.frac);
 }
 
-/* The whole periods of @period units from @from to @to, @to later. */
-static uint64_t ctr_periods(CtrTime from, CtrTime to, uint64_t period)
+/* @to - @from, @to later, in Clock units (2^-32 ns), as *@hi:*@lo. */
+static void ctr_elapsed(CtrTime from, CtrTime to, uint64_t *hi, uint64_t *lo)
 {
     uint64_t ns = to.ns - from.ns;
-    uint64_t hi = ns >> 32, lo = ns << 32;
+    uint64_t d;
 
+    *hi = ns >> 32;
+    *lo = ns << 32;
     if (to.frac >= from.frac) {
-        uint64_t d = to.frac - from.frac;
-
-        lo += d;
-        hi += lo < d;
+        d = to.frac - from.frac;
+        *lo += d;
+        *hi += *lo < d;
     } else {
-        uint64_t d = from.frac - to.frac;
-
-        hi -= lo < d;
-        lo -= d;
+        d = from.frac - to.frac;
+        *hi -= *lo < d;
+        *lo -= d;
     }
-    divu128(&lo, &hi, period);
-    return hi ? UINT64_MAX : lo;
-}
-
-/* @t plus @n periods of @period units. */
-static CtrTime ctr_advance(CtrTime t, uint64_t n, uint64_t period)
-{
-    uint64_t lo, hi, frac;
-
-    mulu64(&lo, &hi, n, period);
-    frac = (uint64_t)t.frac + (uint32_t)lo;
-    t.ns += (int64_t)((hi << 32) | (lo >> 32)) + (int64_t)(frac >> 32);
-    t.frac = (uint32_t)frac;
-    return t;
 }
 
 static bool ctr_is_hp(ESP32P4CPU *cpu)
@@ -252,35 +242,38 @@ static bool ctr_clock_runs(ESP32P4CPU *cpu)
            !qatomic_read(&cpu->disabled) && !cpu->ctr_wfi;
 }
 
+/* The clock starts a run at @now, from its first cycle. */
+static void ctr_restart(ESP32P4CPU *cpu, CtrTime now)
+{
+    cpu->cycles_ns = now.ns;
+    cpu->cycles_frac = now.frac;
+    cpu->cycles_synced = 0;
+}
+
 /*
- * Count the cycles of the core's clock up to @now: the whole periods
- * since the end of the last cycle counted, while mcycle counts.
- * cycles_ns and cycles_frac stay at the end of the last whole cycle
- * counted while it counts, and follow @now while it does not.
+ * Count the cycles of the core's clock up to @now: the whole exact periods
+ * since its run began, while mcycle counts; the run restarts as mcycle
+ * counts again.
  */
 static void ctr_cycles_sync(ESP32P4CPU *cpu, CtrTime now)
 {
     CtrTime from = { cpu->cycles_ns, cpu->cycles_frac };
-    uint64_t period, n;
+    uint64_t hi, lo, n;
 
-    if (!ctr_before(from, now)) {
-        if (ctr_before(now, from)) {
-            cpu->cycles_ns = now.ns;
-            cpu->cycles_frac = now.frac;
-        }
+    if (ctr_before(now, from) || !ctr_clock_runs(cpu)) {
+        ctr_restart(cpu, now);
         return;
     }
-    if (!ctr_clock_runs(cpu)) {
-        cpu->cycles_ns = now.ns;
-        cpu->cycles_frac = now.frac;
-        return;
+    ctr_elapsed(from, now, &hi, &lo);
+    if (icount_enabled()) {
+        lo++;
+        hi += !lo;
     }
-    period = clock_get(cpu->clk);
-    n = ctr_periods(from, now, period);
-    cpu->cycles += n;
-    from = ctr_advance(from, n, period);
-    cpu->cycles_ns = from.ns;
-    cpu->cycles_frac = from.frac;
+    n = esp32p4_clk_units_cycles(cpu->clk_period, hi, lo);
+    if (n > cpu->cycles_synced) {
+        cpu->cycles += n - cpu->cycles_synced;
+        cpu->cycles_synced = n;
+    }
 }
 
 /* The count a counter counts: cycles, or instructions started. */
@@ -619,8 +612,25 @@ void esp32p4_counters_update(ESP32P4CPU *cpu)
     CtrTime now = ctr_now();
 
     ctr_cycles_sync(cpu, now);
-    cpu->cycles_ns = now.ns;
-    cpu->cycles_frac = now.frac;
+    ctr_restart(cpu, now);
+}
+
+/*
+ * The core's clock has changed: count at its new exact period, and
+ * execute at it under icount. The run restarted as the change began.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+void esp32p4_counters_clock_changed(ESP32P4CPU *cpu)
+{
+    ESP32P4ClkPeriod p = esp32p4_clk_exact(cpu->clk);
+    uint64_t lo = p.num_lo, hi = p.num_hi, frac;
+
+    cpu->clk_period = p;
+    if (esp32p4_clk_period_running(p)) {
+        frac = divu128(&lo, &hi, p.den);
+        icount_set_cpu_period_frac(CPU(cpu), frac, p.den);
+    }
 }
 
 /*
@@ -643,11 +653,9 @@ void esp32p4_counters_wfi(ESP32P4CPU *cpu, bool wfi)
 /* [spec:nuos:req:emu.esp32p4.lp-core] */
 void esp32p4_counters_reset(ESP32P4CPU *cpu)
 {
-    CtrTime now = ctr_now();
-
     cpu->cycles = 0;
-    cpu->cycles_ns = now.ns;
-    cpu->cycles_frac = now.frac;
+    esp32p4_counters_clock_changed(cpu);
+    ctr_restart(cpu, ctr_now());
     cpu->insns = 0;
     memset(cpu->ctr_base, 0, sizeof(cpu->ctr_base));
     memset(cpu->ctr_ref, 0, sizeof(cpu->ctr_ref));
