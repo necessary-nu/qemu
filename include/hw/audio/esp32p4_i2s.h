@@ -330,10 +330,12 @@ struct ESP32P4I2sState {
 
     /*
      * A master's period is running through the units on its clock; the
-     * ETM tasks that come meanwhile wait for its end.
+     * ETM tasks that come meanwhile wait for its end, keeping the times
+     * of their events.
      */
     bool in_run;
     uint8_t etm_deferred;
+    int64_t etm_deferred_ns[ESP32P4_I2S_ETM_TASKS];
 
     bool logged_conv;
     bool logged_slave_clk;
