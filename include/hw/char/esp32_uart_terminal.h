@@ -44,9 +44,11 @@ struct Esp32UartTerminalState {
     Fifo8 in;
 
     /*
-     * Transmitter: like the UART's, the frame in tx_levels began at
-     * tx_start_ns with bits tx_q32 / 2^32 ns long, and bit tx_bit is on the
-     * line.
+     * Transmitter: like the UART's, the frame in tx_levels began tx_off
+     * half bits after tx_start_ns, with bits exactly tx_bit_time long (the
+     * frames of a back-to-back run counted from the first's start), and
+     * bit tx_bit is on the line; tx_chained while the next frame is to
+     * follow the last without a gap.
      */
     qemu_irq tx_out;
     QEMUTimer tx_timer;
@@ -56,7 +58,9 @@ struct Esp32UartTerminalState {
     uint8_t tx_half;
     uint8_t tx_bit;
     int64_t tx_start_ns;
-    uint64_t tx_q32;
+    uint64_t tx_off;
+    ESP32P4ClkPeriod tx_bit_time;
+    bool tx_chained;
 
     Notifier format_notifier;
     Notifier line_source;

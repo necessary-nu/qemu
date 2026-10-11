@@ -32,7 +32,11 @@
  * transmitter keeps after a transfer, once the TX FIFO has emptied, before
  * it starts the next (ESP-IDF's uart_set_tx_idle_num()). Fractional baud
  * dividers spread their extra core clock cycles over the bits (TRM figure
- * 45.4-1); the model gives every bit the average length.
+ * 45.4-1); the model gives every bit the average length, exactly: the
+ * core clock's exact period (esp32p4_clk_period.h) times the divider. An
+ * edge comes at the first nanosecond at or after its exact time, and the
+ * frames of a back-to-back transfer are timed from the first one's
+ * start, so that they keep to the bit time however long the transfer.
  */
 
 #include "qemu/osdep.h"
@@ -378,39 +382,54 @@ static bool fifo_port_running(ESP32P4UartState *s)
 
 /*
  * [spec:nuos:req:emu.esp32p4.uart]
- * The bit time in 2^-32 ns: (CLKDIV + CLKDIV_FRAG / 16) periods of the
- * UART core clock at its current frequency (TRM 45.4.3.1); 0 while the
+ * The bit time, exactly: (CLKDIV + CLKDIV_FRAG / 16) periods of the UART
+ * core clock at its current frequency (TRM 45.4.3.1); stopped while the
  * core cannot run or the divider is 0.
  */
-static uint64_t uart_bit_q32(ESP32P4UartState *s)
+static ESP32P4ClkPeriod uart_bit(ESP32P4UartState *s)
 {
     uint32_t div = s->core[R(A_CLKDIV)];
     uint64_t div16 = ((uint64_t)CLKDIV_INT(div) << 4) | CLKDIV_FRAG(div);
 
     if (!core_running(s) || div16 == 0) {
-        return 0;
+        return esp32p4_clk_period_stopped();
     }
-    return esp32_uart_mul_shr(clock_get(s->sclk), div16, 4);
+    return esp32p4_clk_period_scale(esp32p4_clk_exact(s->sclk), div16, 16);
 }
 
-static uint64_t tx_bit_q32(ESP32P4UartState *s)
+/* 2^-16 of the transmitter's bit time, its unit; stopped if it is. */
+static ESP32P4ClkPeriod tx_bit_unit(ESP32P4UartState *s)
 {
-    return tx_running(s) ? uart_bit_q32(s) : 0;
+    if (!tx_running(s)) {
+        return esp32p4_clk_period_stopped();
+    }
+    return esp32p4_clk_period_scale(uart_bit(s), 1, 1 << 16);
+}
+
+/*
+ * The first whole ns by which `n` of 1 / `per` bit times have elapsed, at
+ * the current baud rate; 0 if stopped.
+ */
+static int64_t frac_bits_ns(ESP32P4UartState *s, uint64_t n, uint64_t per)
+{
+    ESP32P4ClkPeriod bit = uart_bit(s);
+
+    if (!esp32p4_clk_period_running(bit)) {
+        return 0;
+    }
+    return esp32p4_clk_cycles_ns(esp32p4_clk_period_scale(bit, 1, per), n);
 }
 
 /* `bits` bit times, in ns, at the current baud rate; 0 if stopped. */
 static int64_t bits_ns(ESP32P4UartState *s, uint64_t bits)
 {
-    return esp32_uart_mul_shr(bits, uart_bit_q32(s), 32);
+    return frac_bits_ns(s, bits, 1);
 }
 
 /* Whole UART core clock cycles in `ns`. */
 static uint64_t sclk_cycles(ESP32P4UartState *s, int64_t ns)
 {
-    if (ns <= 0) {
-        return 0;
-    }
-    return muldiv64(ns, clock_get_hz(s->sclk), NANOSECONDS_PER_SECOND);
+    return esp32p4_clk_ns_cycles(esp32p4_clk_exact(s->sclk), ns);
 }
 
 static void uart_format(ESP32P4UartState *s, Esp32UartFrameFmt *fmt)
@@ -422,7 +441,7 @@ static void uart_format(ESP32P4UartState *s, Esp32UartFrameFmt *fmt)
     fmt->parity_en = c0 & CONF0_PARITY_EN;
     fmt->parity_odd = c0 & CONF0_PARITY;
     fmt->stop_half_bits = stop_half_bits[CONF0_STOP_NUM(c0)];
-    fmt->bit_q32 = uart_bit_q32(s);
+    fmt->bit = uart_bit(s);
 }
 
 static void uart_format_changed(ESP32P4UartState *s)
@@ -674,9 +693,20 @@ static void uart_rx_fifo_changed(ESP32P4UartState *s, int64_t t)
 
 /* ---- Transmitter ---- */
 
+static bool tx_clocked(ESP32P4UartState *s)
+{
+    return esp32p4_clk_period_running(s->tx_unit);
+}
+
+/* The time of sixteenth t16 of the current phase. */
 static int64_t tx_time16(ESP32P4UartState *s, uint64_t t16)
 {
-    return s->tx_start_ns + esp32_uart_mul_shr(t16, s->tx_q32, 36);
+    int64_t ns = esp32p4_clk_cycles_ns(s->tx_unit,
+                                       MAX(s->tx_shift + (int64_t)t16 * 4096,
+                                           0));
+
+    return ns >= INT64_MAX - s->tx_start_ns ? INT64_MAX
+                                            : s->tx_start_ns + ns;
 }
 
 /* Put the transmitter's level on TXD at t, and on the receiver in loopback. */
@@ -718,15 +748,26 @@ static void tx_wave_bit(ESP32P4UartState *s, unsigned i, bool v)
     }
 }
 
+/*
+ * Begin a phase at t: from the exact end of the phase before, when it
+ * follows that at once at the same bit time, or afresh from t.
+ */
 static void tx_begin(ESP32P4UartState *s, uint8_t phase, uint32_t end16,
                      int64_t t)
 {
+    ESP32P4ClkPeriod unit = tx_bit_unit(s);
+
+    if (t == s->tx_chain_ns && esp32p4_clk_period_eq(unit, s->tx_unit)) {
+        s->tx_shift = s->tx_chain_pos;
+    } else {
+        s->tx_start_ns = t;
+        s->tx_shift = 0;
+        s->tx_unit = unit;
+    }
     s->tx_phase = phase;
     s->tx_n_edges = 0;
     s->tx_next_edge = 0;
     s->tx_end16 = end16;
-    s->tx_start_ns = t;
-    s->tx_q32 = tx_bit_q32(s);
     s->tx_pos16 = 0;
 }
 
@@ -876,7 +917,7 @@ static bool tx_start_next(ESP32P4UartState *s, int64_t t)
 
 static void uart_tx_schedule(ESP32P4UartState *s)
 {
-    if (s->tx_phase == ESP32P4_UART_TX_IDLE || !s->tx_q32) {
+    if (s->tx_phase == ESP32P4_UART_TX_IDLE || !tx_clocked(s)) {
         timer_del(&s->tx_timer);
         return;
     }
@@ -972,7 +1013,7 @@ static void uart_tx_advance(ESP32P4UartState *s)
 {
     int64_t now = now_ns();
 
-    while (s->tx_phase != ESP32P4_UART_TX_IDLE && s->tx_q32) {
+    while (s->tx_phase != ESP32P4_UART_TX_IDLE && tx_clocked(s)) {
         int64_t t;
 
         if (s->tx_next_edge < s->tx_n_edges) {
@@ -988,6 +1029,8 @@ static void uart_tx_advance(ESP32P4UartState *s)
         if (t > now) {
             break;
         }
+        s->tx_chain_ns = t;
+        s->tx_chain_pos = s->tx_shift + (int64_t)s->tx_end16 * 4096;
         tx_phase_end(s, t);
     }
     uart_tx_schedule(s);
@@ -997,40 +1040,41 @@ static void uart_tx_advance(ESP32P4UartState *s)
 /* How far the current phase has got, in 2^-16 bits. */
 static uint64_t tx_pos16_at(ESP32P4UartState *s, int64_t t)
 {
-    uint64_t lo, hi;
+    int64_t pos;
 
-    if (!s->tx_q32) {
+    if (!tx_clocked(s)) {
         return s->tx_pos16;
     }
-    if (t <= s->tx_start_ns) {
-        return 0;
-    }
-    hi = (uint64_t)(t - s->tx_start_ns);
-    lo = hi << 48;
-    hi >>= 16;
-    divu128(&lo, &hi, s->tx_q32);
-    return hi ? UINT64_MAX : lo;
+    pos = esp32p4_clk_ns_cycles(s->tx_unit, t - s->tx_start_ns) -
+          s->tx_shift;
+    return MAX(pos, 0);
 }
 
 /* Note how far the phase has got, before the bit time changes. */
 static void uart_tx_freeze(ESP32P4UartState *s, int64_t t)
 {
-    if (s->tx_phase != ESP32P4_UART_TX_IDLE && s->tx_q32) {
+    if (s->tx_phase != ESP32P4_UART_TX_IDLE && tx_clocked(s)) {
         s->tx_pos16 = tx_pos16_at(s, t);
     }
 }
 
-/* Continue the phase in flight at the current bit time. */
+/*
+ * Continue the phase in flight at the current bit time: from where it has
+ * got, if that changed.
+ */
 static void uart_tx_rerate(ESP32P4UartState *s, int64_t t)
 {
-    uint64_t q32 = tx_bit_q32(s);
+    ESP32P4ClkPeriod unit = tx_bit_unit(s);
 
-    if (s->tx_phase != ESP32P4_UART_TX_IDLE && q32 && !s->tx_q32) {
-        s->tx_start_ns = t - esp32_uart_mul_shr(s->tx_pos16, q32, 48);
-    } else if (s->tx_phase != ESP32P4_UART_TX_IDLE && q32) {
-        s->tx_start_ns = t - esp32_uart_mul_shr(tx_pos16_at(s, t), q32, 48);
+    if (!esp32p4_clk_period_eq(unit, s->tx_unit)) {
+        if (s->tx_phase != ESP32P4_UART_TX_IDLE &&
+            esp32p4_clk_period_running(unit)) {
+            s->tx_shift = -(int64_t)tx_pos16_at(s, t);
+            s->tx_start_ns = t;
+        }
+        s->tx_unit = unit;
+        s->tx_chain_ns = INT64_MIN;
     }
-    s->tx_q32 = q32;
     uart_tx_schedule(s);
 }
 
@@ -1043,8 +1087,9 @@ static void uart_tx_reset(ESP32P4UartState *s, int64_t t, bool drive)
     s->tx_in_transfer = false;
     s->tx_n_edges = 0;
     s->tx_next_edge = 0;
-    s->tx_q32 = 0;
+    s->tx_unit = esp32p4_clk_period_stopped();
     s->tx_pos16 = 0;
+    s->tx_chain_ns = INT64_MIN;
     s->send_xon = false;
     s->send_xoff = false;
     s->sw_xoff_sent = false;
@@ -1141,12 +1186,13 @@ static void uart_rx_filtered(ESP32P4UartState *s, bool level, int64_t t)
 static int64_t filt_width_ns(ESP32P4UartState *s)
 {
     uint32_t f = s->regs[R(A_RX_FILT)];
-    uint64_t hz = clock_get_hz(s->sclk);
+    ESP32P4ClkPeriod p = esp32p4_clk_exact(s->sclk);
 
-    if (!(f & RX_FILT_EN) || !RX_FILT_WIDTH(f) || !hz) {
+    if (!(f & RX_FILT_EN) || !RX_FILT_WIDTH(f) ||
+        !esp32p4_clk_period_running(p)) {
         return 0;
     }
-    return muldiv64(RX_FILT_WIDTH(f), NANOSECONDS_PER_SECOND, hz);
+    return esp32p4_clk_cycles_ns(p, RX_FILT_WIDTH(f));
 }
 
 static void uart_filt_commit(ESP32P4UartState *s)
@@ -1222,7 +1268,7 @@ static void uart_irda_in(ESP32P4UartState *s, bool level, int64_t t)
         s->irda_low = true;
         uart_rx_chain(s, false, t);
     }
-    s->irda_high_ns = t + bits_ns(s, 1) + bits_ns(s, 1) / 8;
+    s->irda_high_ns = t + frac_bits_ns(s, 9, 8);
     timer_mod_ns(&s->irda_timer, s->irda_high_ns);
 }
 
@@ -1295,7 +1341,7 @@ static bool uart_rx_format(void *opaque, Esp32UartFrameFmt *fmt)
         return false;
     }
     uart_format(s, fmt);
-    return fmt->bit_q32 != 0;
+    return esp32_uart_fmt_runs(fmt);
 }
 
 /* Whether `timer` was due by `t`: the bus was idle long enough. */
@@ -1338,7 +1384,7 @@ static void uart_rx_glitch(void *opaque)
     ESP32P4UartState *s = ESP32P4_UART(opaque);
 
     uart_raise(s, INT_GLITCH_DET);
-    uart_tx_try_start(s, s->rx.frame_start_ns + bits_ns(s, 1) / 2);
+    uart_tx_try_start(s, s->rx.frame_start_ns + frac_bits_ns(s, 1, 2));
 }
 
 /*
@@ -1405,7 +1451,7 @@ static void uart_rx_deliver(void *opaque, unsigned data, unsigned flags)
     uint32_t c0 = cconf0(s), sw = s->core[R(A_SWFC_CONF0)];
     int64_t start = s->rx.frame_start_ns;
     int64_t done = s->rx.frame_end_ns;
-    int64_t end = done + bits_ns(s, 1) / 2;
+    int64_t end = done + frac_bits_ns(s, 1, 2);
     bool bad = flags & (ESP32_UART_RX_PARITY_ERR | ESP32_UART_RX_FRAME_ERR);
     bool store = true;
     uint32_t idle;
@@ -1620,16 +1666,16 @@ static void uart_sync(ESP32P4UartState *s)
 
 static void uart_update_schedule(ESP32P4UartState *s)
 {
-    uint64_t hz = clock_get_hz(s->sclk);
+    ESP32P4ClkPeriod p = esp32p4_clk_exact(s->sclk);
 
-    if (!s->update_pending || !core_running(s) || !hz) {
+    if (!s->update_pending || !core_running(s) ||
+        !esp32p4_clk_period_running(p)) {
         timer_del(&s->update_timer);
         return;
     }
     if (!timer_pending(&s->update_timer)) {
         timer_mod_ns(&s->update_timer, now_ns() +
-                     muldiv64(UPDATE_SYNC_CYCLES, NANOSECONDS_PER_SECOND, hz)
-                     + 1);
+                     esp32p4_clk_cycles_ns(p, UPDATE_SYNC_CYCLES));
     }
 }
 
@@ -1785,14 +1831,11 @@ static uint32_t uart_fsm_status(ESP32P4UartState *s)
         }
         break;
     }
-    if (s->rx.busy && s->rx.fmt.bit_q32) {
-        uint64_t lo, hi;
+    if (s->rx.busy && esp32_uart_fmt_runs(&s->rx.fmt)) {
+        uint64_t bits = esp32p4_clk_ns_cycles(s->rx.fmt.bit,
+                                              t - s->rx.edge_ns[0]);
 
-        hi = (uint64_t)MAX(t - s->rx.edge_ns[0], 0);
-        lo = hi << 32;
-        hi >>= 32;
-        divu128(&lo, &hi, s->rx.fmt.bit_q32);
-        rx = fsm_bit_state(MIN(lo, 15), s->rx.fmt.data_bits,
+        rx = fsm_bit_state(MIN(bits, 15), s->rx.fmt.data_bits,
                            s->rx.fmt.parity_en);
     }
     return rx | (tx << 4);
@@ -2123,7 +2166,7 @@ static void uart_line_sync(Notifier *n, void *data)
 static bool uart_line_get_format(Object *obj, Esp32UartFrameFmt *fmt)
 {
     uart_format(ESP32P4_UART(obj), fmt);
-    return fmt->bit_q32 != 0;
+    return esp32_uart_fmt_runs(fmt);
 }
 
 static void uart_line_add_format_notifier(Object *obj, Notifier *n)
@@ -2238,8 +2281,8 @@ static void uart_init(Object *obj)
 
 static const VMStateDescription vmstate_esp32p4_uart = {
     .name = TYPE_ESP32P4_UART,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(sclk, ESP32P4UartState),
         VMSTATE_CLOCK(sys_clk, ESP32P4UartState),
@@ -2277,8 +2320,11 @@ static const VMStateDescription vmstate_esp32p4_uart = {
         VMSTATE_UINT8_ARRAY(tx_lvl, ESP32P4UartState, ESP32P4_UART_TX_EDGES),
         VMSTATE_UINT32(tx_end16, ESP32P4UartState),
         VMSTATE_INT64(tx_start_ns, ESP32P4UartState),
-        VMSTATE_UINT64(tx_q32, ESP32P4UartState),
+        VMSTATE_ESP32P4_CLK_PERIOD(tx_unit, ESP32P4UartState),
+        VMSTATE_INT64(tx_shift, ESP32P4UartState),
         VMSTATE_UINT64(tx_pos16, ESP32P4UartState),
+        VMSTATE_INT64(tx_chain_ns, ESP32P4UartState),
+        VMSTATE_INT64(tx_chain_pos, ESP32P4UartState),
         VMSTATE_INT64(tx_free_ns, ESP32P4UartState),
         VMSTATE_UINT8(tx_byte, ESP32P4UartState),
         VMSTATE_UINT8(tx_frame_bits, ESP32P4UartState),
