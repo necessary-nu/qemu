@@ -1643,6 +1643,28 @@ static void propagate(ESP32P4GpioState *s)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32p4.boot]
+ * GPIO_STRAP: the strapping as latched at reset, its boot mode bits
+ * (GPIO35 and GPIO36) those of joint download boot while the boot mode
+ * override holds a chip strapped for SPI boot there.
+ */
+static uint32_t esp32p4_gpio_strap(ESP32P4GpioState *s)
+{
+    if (s->force_download && (s->strap & ESP32P4_GPIO_STRAP_SPI_BOOT)) {
+        return (s->strap & ~ESP32P4_GPIO_STRAP_SPI_BOOT) |
+               ESP32P4_GPIO_STRAP_JOINT_DOWNLOAD;
+    }
+    return s->strap;
+}
+
+/* [spec:nuos:req:emu.esp32p4.boot] */
+static void esp32p4_gpio_update_boot_mode(ESP32P4GpioState *s)
+{
+    qemu_set_irq(s->spi_boot_out,
+                 !!(esp32p4_gpio_strap(s) & ESP32P4_GPIO_STRAP_SPI_BOOT));
+}
+
+/*
  * Bound on re-resolving the pads when peripherals answer an input change
  * with an output change, as a loop through the matrix that inverts itself
  * would otherwise never settle.
@@ -1986,7 +2008,7 @@ static bool gpio_read_reg(ESP32P4GpioState *s, hwaddr addr, uint32_t *v)
         *v = 0;
         return true;
     case A_STRAP:
-        *v = s->strap;
+        *v = esp32p4_gpio_strap(s);
         return true;
     case A_IN:
         esp32p4_gpio_sample(s);
@@ -2872,6 +2894,20 @@ static void esp32p4_gpio_set_light_sleep(void *opaque, int n, int level)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32p4.boot]
+ * LP_SYSTEM_FORCE_DOWNLOAD_BOOT, unless EFUSE_DIS_FORCE_DOWNLOAD disables
+ * it, changes the boot mode of a chip strapped for SPI boot to joint
+ * download boot.
+ */
+static void esp32p4_gpio_set_force_download(void *opaque, int n, int level)
+{
+    ESP32P4GpioState *s = opaque;
+
+    s->force_download = level;
+    esp32p4_gpio_update_boot_mode(s);
+}
+
+/*
  * [spec:nuos:req:emu.esp32p4.gpio]
  * [spec:nuos:req:emu.esp32p4.etm]
  * An analog comparator's output: its edges latch COMP<n>_POS_INT_RAW
@@ -3093,6 +3129,8 @@ static void esp32p4_gpio_reset_hold(Object *obj, ResetType type)
 static void esp32p4_gpio_reset_exit(Object *obj, ResetType type)
 {
     ESP32P4GpioState *s = ESP32P4_GPIO(obj);
+
+    esp32p4_gpio_update_boot_mode(s);
 
     /* Interrupt types are all disabled, so this latches no interrupt. */
     esp32p4_gpio_update(s);
@@ -3331,6 +3369,9 @@ static void esp32p4_gpio_init(Object *obj)
                             ESP32P4_GPIO_ETM_LINES);
     qdev_init_gpio_out_named(dev, s->etm_zero_det, ESP32P4_GPIO_ETM_ZERO_DET,
                              ESP32P4_GPIO_ETM_ZERO_DET_LINES);
+    qdev_init_gpio_in_named(dev, esp32p4_gpio_set_force_download,
+                            ESP32P4_GPIO_FORCE_DOWNLOAD, 1);
+    qdev_init_gpio_out_named(dev, &s->spi_boot_out, ESP32P4_GPIO_SPI_BOOT, 1);
 
     /*
      * The signals peripherals drive are theirs, not reset with this block:
@@ -3398,6 +3439,7 @@ static const VMStateDescription vmstate_esp32p4_gpio = {
         VMSTATE_UINT32_ARRAY(out, ESP32P4GpioState, 2),
         VMSTATE_UINT32_ARRAY(enable, ESP32P4GpioState, 2),
         VMSTATE_UINT32(strap, ESP32P4GpioState),
+        VMSTATE_BOOL(force_download, ESP32P4GpioState),
         VMSTATE_UINT32_ARRAY(status, ESP32P4GpioState, 2),
         VMSTATE_UINT32_ARRAY(pin, ESP32P4GpioState, ESP32P4_GPIO_SLOTS),
         VMSTATE_UINT32_ARRAY(func_in_sel, ESP32P4GpioState,
