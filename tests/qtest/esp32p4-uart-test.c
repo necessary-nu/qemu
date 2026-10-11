@@ -719,6 +719,50 @@ static void test_rs485(void)
     qtest_quit(qts);
 }
 
+#define CONF0_IRDA_DPLX     (1u << 7)
+#define CONF0_IRDA_TX_EN    (1u << 8)
+#define CONF0_IRDA_EN       (1u << 14)
+
+/*
+ * IrDA (TRM 45.4.7): a 0 bit is a high pulse in the 9th to 11th
+ * sixteenths of its bit time and a 1 bit no pulse; UART1's frames reach
+ * UART2's IrDA receiver through the matrix, and come back to UART1's own
+ * receiver with IRDA_DPLX.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+static void test_irda(void)
+{
+    QTestState *qts = start();
+
+    route_uart1_to_uart2(qts);
+    setup(qts, UART(1), CONF0_8N1 | CONF0_IRDA_EN | CONF0_IRDA_TX_EN);
+    setup(qts, UART(2), CONF0_8N1 | CONF0_IRDA_EN);
+    g_assert_false(rd(qts, UART(1), STATUS) & STATUS_TXD);
+    wr(qts, UART(1), FIFO, 0xf0);
+    /* The start bit: low, then its pulse */
+    qtest_clock_step(qts, 300);
+    g_assert_false(rd(qts, UART(1), STATUS) & STATUS_TXD);
+    qtest_clock_step(qts, 300);
+    g_assert_true(rd(qts, UART(1), STATUS) & STATUS_TXD);
+    qtest_clock_step(qts, 200);
+    g_assert_false(rd(qts, UART(1), STATUS) & STATUS_TXD);
+    /* Data bit 4 is a 1: no pulse */
+    qtest_clock_step(qts, 4 * BIT_NS);
+    g_assert_false(rd(qts, UART(1), STATUS) & STATUS_TXD);
+    qtest_clock_step(qts, 6 * BIT_NS);
+    g_assert_cmpuint(rx_count(qts, UART(2)), ==, 1);
+    g_assert_cmphex(rd(qts, UART(2), FIFO), ==, 0xf0);
+    /* Sending, UART1 hears nothing; with IRDA_DPLX it hears itself. */
+    g_assert_cmpuint(rx_count(qts, UART(1)), ==, 0);
+    setup(qts, UART(1), CONF0_8N1 | CONF0_IRDA_EN | CONF0_IRDA_TX_EN |
+          CONF0_IRDA_DPLX);
+    wr(qts, UART(1), FIFO, 0x5a);
+    qtest_clock_step(qts, FRAME_NS + BIT_NS);
+    g_assert_cmpuint(rx_count(qts, UART(1)), ==, 1);
+    g_assert_cmphex(rd(qts, UART(1), FIFO), ==, 0x5a);
+    qtest_quit(qts);
+}
+
 /*
  * AT_CMD detection: three '+' within RX_GAP_TOUT bits of each other,
  * after PRE_IDLE_NUM bits of quiet, followed by POST_IDLE_NUM bits of it.
@@ -1367,6 +1411,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/uart/autobaud", test_autobaud);
     qtest_add_func("esp32p4/uart/glitch", test_glitch);
     qtest_add_func("esp32p4/uart/rs485", test_rs485);
+    qtest_add_func("esp32p4/uart/irda", test_irda);
     qtest_add_func("esp32p4/uart/at_cmd", test_at_cmd);
     qtest_add_func("esp32p4/uart/lp_uart", test_lp_uart);
     qtest_add_func("esp32p4/uart/resets", test_resets);

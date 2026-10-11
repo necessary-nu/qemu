@@ -630,7 +630,6 @@ static void uart_update_lines(ESP32P4UartState *s, int64_t t)
     }
     esp32_line_set_at(s->rts_out, s->rts_line ^ !!(conf1 & CONF1_RTS_INV), t);
     esp32_line_set_at(s->dtr_out, s->dtr_line ^ !!(conf1 & CONF1_DTR_INV), t);
-    esp32_line_set_at(s->txd_out, txd_pin_level(s, s->tx_line), t);
     uart_update_inputs(s, t, true);
     if (was_blocking && !rts_blocking(s) && s->rx_had_byte &&
         (s->core[R(A_TOUT_CONF)] & TOUT_FLOW_DIS)) {
@@ -784,6 +783,7 @@ static void tx_begin_gap(ESP32P4UartState *s, int64_t t)
         return;
     }
     s->tx_phase = ESP32P4_UART_TX_IDLE;
+    s->tx_free_ns = t;
     s->tx_in_transfer = false;
     s->int_raw |= INT_TX_BRK_IDLE;
 }
@@ -842,6 +842,8 @@ static bool tx_start_next(ESP32P4UartState *s, int64_t t)
         !tx_line_free(s)) {
         return false;
     }
+    /* An event stamped before the line went idle starts nothing earlier. */
+    t = MAX(t, s->tx_free_ns);
     if (s->send_xoff && still && cts_ok) {
         s->send_xoff = false;
         s->regs[R(A_SWFC_CONF0)] &= ~SWFC_SEND_XOFF;
@@ -901,6 +903,7 @@ static void uart_tx_try_start(ESP32P4UartState *s, int64_t t)
 static void tx_frame_done(ESP32P4UartState *s, int64_t t)
 {
     s->tx_phase = ESP32P4_UART_TX_IDLE;
+    s->tx_free_ns = t;
     if (tx_start_next(s, t)) {
         return;
     }
@@ -947,6 +950,7 @@ static void tx_phase_end(ESP32P4UartState *s, int64_t t)
         break;
     case ESP32P4_UART_TX_GAP:
         s->tx_phase = ESP32P4_UART_TX_IDLE;
+        s->tx_free_ns = t;
         s->tx_in_transfer = false;
         s->int_raw |= INT_TX_BRK_IDLE;
         tx_start_next(s, t);
@@ -1035,6 +1039,7 @@ static void uart_tx_reset(ESP32P4UartState *s, int64_t t, bool drive)
 {
     timer_del(&s->tx_timer);
     s->tx_phase = ESP32P4_UART_TX_IDLE;
+    s->tx_free_ns = t;
     s->tx_in_transfer = false;
     s->tx_n_edges = 0;
     s->tx_next_edge = 0;
@@ -1238,21 +1243,34 @@ static void uart_irda_timer_cb(void *opaque)
 /*
  * [spec:nuos:req:emu.esp32p4.uart]
  * The level the receiver sees: RXD inverted by RXD_INV, or TXD looped
- * back inside the UART; in IrDA mode the decoded pulses of RXD inverted
- * by IRDA_RX_INV, or of the IrDA transmitter with IRDA_DPLX, and nothing
- * while IRDA_TX_EN has the transceiver sending.
+ * back inside the UART; in IrDA mode the decoded pulses of the IrDA
+ * transmitter looped back with IRDA_DPLX, or of RXD inverted by
+ * IRDA_RX_INV, and nothing while IRDA_TX_EN has the half-duplex
+ * transceiver sending.
  */
+static bool uart_irda_input(ESP32P4UartState *s)
+{
+    uint32_t c0 = cconf0(s);
+
+    if (c0 & CONF0_IRDA_DPLX) {
+        return s->tx_line;
+    }
+    if (!(c0 & CONF0_IRDA_TX_EN)) {
+        return s->rxd_pin ^ !!(c0 & CONF0_IRDA_RX_INV);
+    }
+    return false;
+}
+
 static void uart_rx_input(ESP32P4UartState *s, int64_t t)
 {
     uint32_t c0 = cconf0(s);
 
     if (irda(s)) {
-        bool v = (c0 & CONF0_IRDA_DPLX) ? s->tx_line : s->rxd_pin;
-
-        if (c0 & CONF0_IRDA_TX_EN) {
-            v = false;
+        uart_irda_in(s, uart_irda_input(s), t);
+        if (!s->irda_low) {
+            /* No pulse: the decoded line idles high. */
+            uart_rx_chain(s, true, t);
         }
-        uart_irda_in(s, v ^ !!(c0 & CONF0_IRDA_RX_INV), t);
         return;
     }
     if (s->irda_low) {
@@ -1538,6 +1556,21 @@ static void uart_sync(ESP32P4UartState *s)
     }
     c0 = cconf0(s);
     sw = s->core[R(A_SWFC_CONF0)];
+    if (!s->lp && ((c0 ^ old_c0) & CONF0_IRDA_EN)) {
+        /*
+         * Into or out of IrDA mode the receiver starts afresh from the
+         * line as it now decodes: idle high, with no pulse made of the
+         * level the pin is at.
+         */
+        s->irda_low = false;
+        timer_del(&s->irda_timer);
+        s->irda_pin = irda(s) && uart_irda_input(s);
+        s->filt_pending = false;
+        timer_del(&s->filt_timer);
+        s->filt_out = irda(s) || ((c0 & CONF0_LOOPBACK) ? s->tx_line :
+                                  s->rxd_pin ^ !!(c0 & CONF0_RXD_INV));
+        uart_rx_reset(s);
+    }
     if (c0 & CONF0_TXFIFO_RST) {
         fifo_reset(&s->tx_fifo);
     }
@@ -1571,6 +1604,9 @@ static void uart_sync(ESP32P4UartState *s)
     if (s->tx_phase == ESP32P4_UART_TX_IDLE &&
         s->tx_line != tx_idle_level(s)) {
         uart_set_tx_line(s, tx_idle_level(s), t);
+    } else {
+        /* TXD_INV or IRDA_TX_INV may have changed. */
+        esp32_line_set_at(s->txd_out, txd_pin_level(s, s->tx_line), t);
     }
     uart_update_lines(s, t);
     uart_rx_input(s, t);
@@ -2138,6 +2174,7 @@ static void uart_reset_exit(Object *obj, ResetType type)
     ESP32P4UartState *s = ESP32P4_UART(obj);
 
     qemu_set_irq(s->wakeup_out, 0);
+    qemu_set_irq(s->txd_out, txd_pin_level(s, s->tx_line));
     uart_update_lines(s, now_ns());
     s->int_raw &= ~(INT_CTS_CHG | INT_DSR_CHG);
     uart_update_irq(s);
@@ -2242,6 +2279,7 @@ static const VMStateDescription vmstate_esp32p4_uart = {
         VMSTATE_INT64(tx_start_ns, ESP32P4UartState),
         VMSTATE_UINT64(tx_q32, ESP32P4UartState),
         VMSTATE_UINT64(tx_pos16, ESP32P4UartState),
+        VMSTATE_INT64(tx_free_ns, ESP32P4UartState),
         VMSTATE_UINT8(tx_byte, ESP32P4UartState),
         VMSTATE_UINT8(tx_frame_bits, ESP32P4UartState),
         VMSTATE_UINT8(tx_data_bits, ESP32P4UartState),

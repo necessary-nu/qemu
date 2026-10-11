@@ -172,6 +172,8 @@ struct ESP32P4UartState {
     int64_t tx_start_ns;
     uint64_t tx_q32;
     uint64_t tx_pos16;
+    /* When the transmitter last went idle. */
+    int64_t tx_free_ns;
     /* The frame on the line: its byte, bit count, and its stop bits. */
     uint8_t tx_byte;
     uint8_t tx_frame_bits;
