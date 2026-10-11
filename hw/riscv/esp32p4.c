@@ -59,8 +59,9 @@
  *     cores, the LP system running on) or the whole system, each with its
  *     reset cause in LP_CLKRST.
  *   - The event task matrix (TRM chapter 14) at 0x500D5000, mapping the
- *     events of the GPIO matrix, the timers and the RTC timer to the
- *     tasks of the GPIO matrix, the timer groups and the LP core.
+ *     events of the GPIO matrix, the timers, the RTC timer and GDMA to
+ *     the tasks of the GPIO matrix, the timer groups, GDMA and the LP
+ *     core.
  *   - Permission control (TRM chapter 20): the HP, LP and DMA access
  *     permission managers, through which every core (and DMA master)
  *     reaches the bus, each access carrying its master and privilege mode,
@@ -1268,11 +1269,11 @@ static void esp32p4_init_dma(ESP32P4MachineState *s)
  * takes tasks adds a line here for each.
  *
  * Not connected, as their blocks are not modelled: the LED PWM, MCPWM,
- * ADC, REGDMA, temperature sensor, I2S, PDMA (GDMA-AHB and GDMA-AXI),
- * 2D-DMA and PMU events and tasks; the LP core's events (ULP_EVT_*) and
- * ULP_TASK_WAKEUP_CPU, the PMU's LP core wakeup, whose
- * LP_CORE_ETM_WAKEUP_FLAG in LP_SYS is not modelled; and the RTC timer's
- * tasks (RTC_TASK_*), which the TRM says it does not take.
+ * ADC, REGDMA, temperature sensor, I2S, 2D-DMA and PMU events and tasks;
+ * the LP core's events (ULP_EVT_*) and ULP_TASK_WAKEUP_CPU, the PMU's LP
+ * core wakeup, whose LP_CORE_ETM_WAKEUP_FLAG in LP_SYS is not modelled;
+ * and the RTC timer's tasks (RTC_TASK_*), which the TRM says it does not
+ * take.
  */
 /* [spec:nuos:req:emu.esp32p4.etm] */
 static void esp32p4_init_etm(ESP32P4MachineState *s)
@@ -1360,6 +1361,28 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
     esp32p4_etm_connect_event(etm, ESP32P4_ETM_RTC_EVT_OVF,
                               DEVICE(&s->lp_timer), ESP32P4_LP_TIMER_ETM_EVENT,
                               ESP32P4_LP_TIMER_EVT_OVF);
+
+    /* GDMA-AHB's and GDMA-AXI's channels. */
+    for (g = 0; g < 2; g++) {
+        static const int evt[] = {
+            ESP32P4_ETM_PDMA_AHB_EVT_IN_DONE_CH0,
+            ESP32P4_ETM_PDMA_AXI_EVT_IN_DONE_CH0,
+        };
+        static const int task[] = {
+            ESP32P4_ETM_PDMA_AHB_TASK_IN_START_CH0,
+            ESP32P4_ETM_PDMA_AXI_TASK_IN_START_CH0,
+        };
+
+        dev = DEVICE(&s->gdma[g]);
+        for (k = 0; k < ESP32P4_GDMA_ETM_EVENTS; k++) {
+            esp32p4_etm_connect_event(etm, evt[g] + k, dev,
+                                      ESP32P4_GDMA_ETM_EVENT, k);
+        }
+        for (k = 0; k < ESP32P4_GDMA_ETM_TASKS; k++) {
+            esp32p4_etm_connect_task(etm, task[g] + k, dev,
+                                     ESP32P4_GDMA_ETM_TASK, k);
+        }
+    }
 
     /* The LP core's interrupt, through LP_SYS's ETM_TASK_ULP_INT. */
     esp32p4_etm_connect_task(etm, ESP32P4_ETM_ULP_TASK_INT_CPU,

@@ -105,6 +105,45 @@
 #define LP_TAR_HIGH0        (LP_TIMER + 0x04)
 #define LP_TAR_EN           (1u << 31)
 
+#define AHB_GDMA            0x50085000
+#define AHB_IN_INT_RAW(ch)  (AHB_GDMA + 0x10 * (ch))
+#define AHB_IN(ch)          (AHB_GDMA + 0x70 + 0xc0 * (ch))
+#define AHB_OUT(ch)         (AHB_GDMA + 0xd0 + 0xc0 * (ch))
+#define AHB_IN_LINK_ADDR(ch)  (AHB_GDMA + 0x3ac + 4 * (ch))
+#define AHB_OUT_LINK_ADDR(ch) (AHB_GDMA + 0x3b8 + 4 * (ch))
+#define AXI_GDMA            0x5008a000
+#define AXI_IN(ch)          (AXI_GDMA + 0x68 * (ch))
+#define AXI_OUT(ch)         (AXI_GDMA + 0x138 + 0x68 * (ch))
+#define G_CONF0             0x00
+#define G_PERI_SEL          0x30
+#define X_RAW               0x00
+#define X_CONF0             0x10
+#define X_LINK2             0x24
+#define X_PERI_SEL          0x44
+#define AHB_MEM_TRANS       (1u << 4)
+#define AHB_IN_ETM_EN       (1u << 5)
+#define AHB_OUT_ETM_EN      (1u << 6)
+#define AXI_MEM_TRANS       (1u << 2)
+#define AXI_IN_ETM_EN       (1u << 3)
+#define AXI_OUT_ETM_EN      (1u << 4)
+#define IN_DONE             (1u << 0)
+#define IN_SUC_EOF          (1u << 1)
+#define DW0(size, len)      ((size) | (len) << 12)
+#define SUC_EOF             (1u << 30)
+#define OWNER               (1u << 31)
+#define AHB_DUMMY           1
+#define AXI_DUMMY           6
+#define MEM                 0x4ff40000
+
+#define PDMA_AHB_EVT_IN_SUC_EOF(c)    (170 + (c))
+#define PDMA_AHB_EVT_OUT_TOTAL_EOF(c) (185 + (c))
+#define PDMA_AXI_EVT_IN_SUC_EOF(c)    (197 + (c))
+#define PDMA_AXI_EVT_OUT_EOF(c)       (209 + (c))
+#define PDMA_AHB_TASK_IN_START(c)     (185 + (c))
+#define PDMA_AHB_TASK_OUT_START(c)    (188 + (c))
+#define PDMA_AXI_TASK_IN_START(c)     (191 + (c))
+#define PDMA_AXI_TASK_OUT_START(c)    (194 + (c))
+
 #define DATE_RESET          0x02303031u
 #define TASK_PAD            5
 #define EVENT_PAD           7
@@ -587,6 +626,97 @@ static void test_rtc_tick(void)
     qtest_quit(qts);
 }
 
+static void desc(QTestState *qts, uint32_t addr, uint32_t dw0, uint32_t buf)
+{
+    qtest_writel(qts, addr, dw0);
+    qtest_writel(qts, addr + 4, buf);
+    qtest_writel(qts, addr + 8, 0);
+}
+
+static void fill(QTestState *qts, uint32_t addr, uint32_t len)
+{
+    g_autofree uint8_t *b = g_malloc(len);
+
+    for (uint32_t i = 0; i < len; i++) {
+        b[i] = i * 7 + 3;
+    }
+    qtest_memwrite(qts, addr, b, len);
+}
+
+static void check_copy(QTestState *qts, uint32_t dst, uint32_t src,
+                       uint32_t len)
+{
+    g_autofree uint8_t *a = g_malloc(len);
+    g_autofree uint8_t *b = g_malloc(len);
+
+    qtest_memread(qts, src, a, len);
+    qtest_memread(qts, dst, b, len);
+    g_assert_cmpmem(a, len, b, len);
+}
+
+/*
+ * GDMA-AHB's channel 1 and GDMA-AXI's channel 2, their *_ETM_EN set, copy
+ * memory to memory as an event's ETM tasks start their RX and TX sides;
+ * their EOF events come back to the ETM, AHB's IN_SUC_EOF toggling a pad.
+ */
+/* [spec:nuos:req:emu.esp32p4.etm/test] */
+static void test_gdma(void)
+{
+    QTestState *qts = start_running();
+    uint32_t tx = MEM, rx = MEM + 0x100, src = MEM + 0x1000;
+    uint32_t dst = MEM + 0x4000;
+
+    fill(qts, src, 256);
+    qtest_memset(qts, dst, 0, 512);
+    desc(qts, tx, OWNER | SUC_EOF | DW0(256, 256), src);
+    desc(qts, rx, OWNER | DW0(256, 0), dst);
+    qtest_writel(qts, AHB_IN(1) + G_PERI_SEL, AHB_DUMMY + 5);
+    qtest_writel(qts, AHB_OUT(1) + G_PERI_SEL, AHB_DUMMY + 5);
+    qtest_writel(qts, AHB_IN(1) + G_CONF0, AHB_MEM_TRANS | AHB_IN_ETM_EN);
+    qtest_writel(qts, AHB_OUT(1) + G_CONF0,
+                 qtest_readl(qts, AHB_OUT(1) + G_CONF0) | AHB_OUT_ETM_EN);
+    qtest_writel(qts, AHB_IN_LINK_ADDR(1), rx);
+    qtest_writel(qts, AHB_OUT_LINK_ADDR(1), tx);
+
+    desc(qts, tx + 0x40, OWNER | SUC_EOF | DW0(256, 256), src);
+    desc(qts, rx + 0x40, OWNER | DW0(256, 0), dst + 256);
+    qtest_writel(qts, AXI_IN(2) + X_PERI_SEL, AXI_DUMMY);
+    qtest_writel(qts, AXI_OUT(2) + X_PERI_SEL, AXI_DUMMY);
+    qtest_writel(qts, AXI_IN(2) + X_CONF0, AXI_MEM_TRANS | AXI_IN_ETM_EN);
+    qtest_writel(qts, AXI_OUT(2) + X_CONF0,
+                 qtest_readl(qts, AXI_OUT(2) + X_CONF0) | AXI_OUT_ETM_EN);
+    qtest_writel(qts, AXI_IN(2) + X_LINK2, rx + 0x40);
+    qtest_writel(qts, AXI_OUT(2) + X_LINK2, tx + 0x40);
+
+    gpio_task_pad(qts, 0);
+    map(qts, 0, SYSTIMER_EVT_CMP(0), PDMA_AHB_TASK_IN_START(1), true);
+    map(qts, 1, SYSTIMER_EVT_CMP(0), PDMA_AHB_TASK_OUT_START(1), true);
+    map(qts, 2, SYSTIMER_EVT_CMP(0), PDMA_AXI_TASK_IN_START(2), true);
+    map(qts, 3, SYSTIMER_EVT_CMP(0), PDMA_AXI_TASK_OUT_START(2), true);
+    map(qts, 4, PDMA_AHB_EVT_IN_SUC_EOF(1), GPIO_TASK_TOGGLE(0), true);
+    qtest_clock_step(qts, 1000 * 1000);
+    g_assert_cmphex(qtest_readl(qts, AHB_IN_INT_RAW(1)), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, AXI_IN(2) + X_RAW), ==, 0);
+
+    pulse(qts, SYSTIMER_EVT_CMP(0));
+    qtest_clock_step(qts, 1000 * 1000);
+    g_assert_cmphex(qtest_readl(qts, AHB_IN_INT_RAW(1)), ==,
+                    IN_DONE | IN_SUC_EOF);
+    g_assert_cmphex(qtest_readl(qts, AXI_IN(2) + X_RAW), ==,
+                    IN_DONE | IN_SUC_EOF);
+    check_copy(qts, dst, src, 256);
+    check_copy(qts, dst + 256, src, 256);
+    g_assert_true(task_st(qts, PDMA_AHB_TASK_OUT_START(1)));
+    g_assert_true(task_st(qts, PDMA_AXI_TASK_IN_START(2)));
+    g_assert_true(evt_st(qts, PDMA_AHB_EVT_IN_SUC_EOF(1)));
+    g_assert_true(evt_st(qts, PDMA_AHB_EVT_OUT_TOTAL_EOF(1)));
+    g_assert_true(evt_st(qts, PDMA_AXI_EVT_IN_SUC_EOF(2)));
+    g_assert_true(evt_st(qts, PDMA_AXI_EVT_OUT_EOF(2)));
+    g_assert_false(evt_st(qts, PDMA_AXI_EVT_IN_SUC_EOF(1)));
+    g_assert_true(task_pad(qts));
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -600,5 +730,6 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/etm/gpio-events", test_gpio_events);
     qtest_add_func("esp32p4/etm/timer-events", test_timer_events);
     qtest_add_func("esp32p4/etm/rtc-tick", test_rtc_tick);
+    qtest_add_func("esp32p4/etm/gdma", test_gdma);
     return g_test_run();
 }
