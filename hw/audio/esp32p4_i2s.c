@@ -1281,7 +1281,7 @@ static uint32_t pdm_cic_out(ESP32P4I2sPdmChan *p, const I2sCfg *c,
 
 /* ---- The transmitter ---- */
 
-/* Bytes of channel data the transmit FIFO holds, without GDMA's. */
+/* Whether the transmit FIFO, topped up from GDMA, holds @bytes. */
 static bool tx_has(ESP32P4I2sState *s, uint32_t bytes)
 {
     if (s->tx_fifo.num < bytes) {
@@ -1822,16 +1822,66 @@ static bool i2s_loopback(ESP32P4I2sState *s)
 }
 
 /*
+ * The output line of a controller that drives pad @pad, on the pad or on
+ * another pad of the board wire it is on (the GPIO block's pad-wires), as
+ * no driver from outside the chip or pad hold overrides.
+ */
+static bool i2s_pad_source(ESP32P4I2sState *c, int pad,
+                           ESP32P4I2sState **src, unsigned *src_line)
+{
+    ESP32P4GpioState *g = c->gpio;
+    uint64_t pads = BIT_ULL(pad);
+
+    if (g->pad_wire[pad]) {
+        for (unsigned p = 0; p < ESP32P4_GPIO_PADS; p++) {
+            if (g->pad_wire[p] == g->pad_wire[pad]) {
+                pads |= BIT_ULL(p);
+            }
+        }
+    }
+    if (pads & (g->ext_driven | g->held)) {
+        return false;
+    }
+    for (unsigned k = 0; k < ESP32P4_I2S_COUNT; k++) {
+        ESP32P4I2sState *d = k == c->id ? c : c->bus[k];
+
+        if (!d) {
+            continue;
+        }
+        for (unsigned l = 0; l < ESP32P4_I2S_OUT_COUNT; l++) {
+            int o = out_sig[k][l];
+            uint64_t hit;
+
+            if (o < 0) {
+                continue;
+            }
+            if (k == ESP32P4_I2S_LP_ID) {
+                hit = esp32p4_gpio_lp_sig_out_pads(g, o) & pads;
+            } else {
+                hit = esp32p4_gpio_sig_out_pads(g, o) & pads;
+            }
+            if (hit) {
+                *src = d;
+                *src_line = l;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
  * The output line of a controller that drives input line @line of @c
  * through the pads, with whether the way inverts it: through the HP
- * matrix, or between the HP and LP matrices by the pad they share.
+ * matrix's own query; else, between the HP and LP matrices or over a
+ * board wire, by the pads (with no inversion).
  */
 static bool i2s_route(ESP32P4I2sState *c, unsigned line,
                       ESP32P4I2sState **src, unsigned *src_line, bool *inv)
 {
     int sig = in_sig[c->id][line];
     unsigned out;
-    int pad = -1;
+    int pad;
 
     *inv = false;
     if (sig < 0 || !c->gpio) {
@@ -1840,9 +1890,11 @@ static bool i2s_route(ESP32P4I2sState *c, unsigned line,
     if (!i2s_is_lp(c)) {
         if (esp32p4_gpio_sig_in_source(c->gpio, sig, &out, inv)) {
             for (unsigned k = 0; k < ESP32P4_I2S_HP_COUNT; k++) {
+                ESP32P4I2sState *d = k == c->id ? c : c->bus[k];
+
                 for (unsigned l = 0; l < ESP32P4_I2S_OUT_COUNT; l++) {
-                    if (out_sig[k][l] == (int)out && c->bus[k]) {
-                        *src = c->bus[k];
+                    if (out_sig[k][l] == (int)out && d) {
+                        *src = d;
                         *src_line = l;
                         return true;
                     }
@@ -1850,39 +1902,12 @@ static bool i2s_route(ESP32P4I2sState *c, unsigned line,
             }
             return false;
         }
-        /* Only the LP matrix's outputs are left: through an LP pad. */
+        *inv = false;
         pad = esp32p4_gpio_sig_in_pad(c->gpio, sig);
     } else {
         pad = esp32p4_gpio_lp_sig_in_pad(c->gpio, sig);
     }
-    if (pad < 0) {
-        return false;
-    }
-    for (unsigned k = 0; k < ESP32P4_I2S_COUNT; k++) {
-        if (!c->bus[k] || (!i2s_is_lp(c) && k != ESP32P4_I2S_LP_ID)) {
-            continue;
-        }
-        for (unsigned l = 0; l < ESP32P4_I2S_OUT_COUNT; l++) {
-            int o = out_sig[k][l];
-            bool hit;
-
-            if (o < 0) {
-                continue;
-            }
-            if (k == ESP32P4_I2S_LP_ID) {
-                hit = pad < ESP32P4_GPIO_LP_PADS &&
-                      (esp32p4_gpio_lp_sig_out_pads(c->gpio, o) & BIT(pad));
-            } else {
-                hit = esp32p4_gpio_sig_out_pads(c->gpio, o) & BIT_ULL(pad);
-            }
-            if (hit) {
-                *src = c->bus[k];
-                *src_line = l;
-                return true;
-            }
-        }
-    }
-    return false;
+    return pad >= 0 && i2s_pad_source(c, pad, src, src_line);
 }
 
 /* The BCK and WS lines a unit drives as master, or follows as slave. */

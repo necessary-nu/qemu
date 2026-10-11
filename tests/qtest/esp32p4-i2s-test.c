@@ -1460,6 +1460,39 @@ static void test_pad_slave(void)
     qtest_quit(qts);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.i2s/test]
+ * Controllers on different pads that the board wires together (the GPIO
+ * block's pad-wires): I2S2's transmitter on GPIO20 to GPIO22, I2S1's
+ * receiver on GPIO30 to GPIO32.
+ */
+static void test_pad_wires(void)
+{
+    QTestState *qts = qtest_init("-M esp32p4 -global "
+                                 "esp32p4-gpio.pad-wires=20:30,21:31,22:32");
+    uint8_t tx[64], rx[64];
+
+    for (int i = 0; i < sizeof(tx); i++) {
+        tx[i] = i * 11 + 7;
+    }
+    clocks_on(qts, 1);
+    clocks_on(qts, 2);
+    pad_out(qts, 20, SIG_O_BCK(2));
+    pad_out(qts, 21, SIG_O_WS(2));
+    pad_out(qts, 22, SIG_SD(2));
+    for (int pad = 30; pad < 33; pad++) {
+        qtest_writel(qts, IO_MUX_GPIO(pad), MCU_SEL_GPIO | FUN_IE);
+    }
+    pad_in(qts, 30, SIG_I_BCK(1));
+    pad_in(qts, 31, SIG_I_WS(1));
+    pad_in(qts, 32, SIG_SD(1));
+    transfer(qts, 2, TX_BASE | C_TDM_EN | C_BCK_DIV(8), STD_CONF1, STD_TDM,
+             1, RX_BASE | C_TDM_EN | C_SLAVE, STD_CONF1, STD_TDM,
+             tx, sizeof(tx), rx, sizeof(rx), 2, 1000);
+    g_assert_cmpmem(rx, sizeof(rx), tx, sizeof(tx));
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1486,6 +1519,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4-i2s/lp-pdm", test_lp_pdm);
     qtest_add_func("/esp32p4-i2s/lp-master-audio", test_lp_master_audio);
     qtest_add_func("/esp32p4-i2s/pad-slave", test_pad_slave);
+    qtest_add_func("/esp32p4-i2s/pad-wires", test_pad_wires);
 
     return g_test_run();
 }
