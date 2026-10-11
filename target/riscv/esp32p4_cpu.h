@@ -44,6 +44,26 @@ OBJECT_DECLARE_TYPE(ESP32P4CPU, ESP32P4CPUClass, ESP32P4_CPU)
  */
 #define ESP32P4_CPU_M_MODE "m-mode"
 
+/*
+ * Named GPIO input of both cores: line 0 the IBUS, 1 the DBUS and 2 the
+ * AHB bus, each high while the bus's error response is disabled
+ * (HP_SYSTEM_CORE_ERR_RESP_DIS for the HP cores,
+ * LP_SYSTEM_LP_CORE_ERR_RESP_DIS for the LP core): an access the bus
+ * would answer with an error completes without one, a read giving 0, and
+ * the core takes no access fault.
+ */
+#define ESP32P4_CPU_ERR_RESP_DIS "err-resp-dis"
+#define ESP32P4_CPU_BUS_IBUS 0
+#define ESP32P4_CPU_BUS_DBUS 1
+#define ESP32P4_CPU_BUS_AHB  2
+
+/*
+ * Named GPIO input of the HP core: its dedicated wakeup input
+ * (HP_SYSTEM_CPU_WAKEUP_EVENT), which wakes it from WFI; while it is high
+ * a WFI does not wait.
+ */
+#define ESP32P4_CPU_WAKEUP "wakeup"
+
 /* The HP core's hardware loops (TRM 2.7.1) and debug triggers (2.11.3). */
 #define ESP32P4_HWLP_LOOPS 2
 #define ESP32P4_TRIGGERS 3
@@ -134,6 +154,60 @@ typedef struct ESP32P4ClicOps {
      */
     void (*claim)(void *opaque, int id);
 } ESP32P4ClicOps;
+
+/*
+ * The debug assistant's interface to an HP core
+ * (hw/misc/esp32p4_assist_debug.c). The core reports, with the BQL held:
+ *
+ * sp: its SP left or re-entered the bounds in spmon_min and spmon_max, at
+ *   the instruction at @pc; @raw has ESP32P4_ASSIST_SP_MIN set while SP is
+ *   below spmon_min and ESP32P4_ASSIST_SP_MAX while above spmon_max.
+ * region: a load (@write false) or store by the instruction at @pc, with
+ *   SP @sp, touched a region assist_watch watches; @hits holds the
+ *   matching bits of assist_watch.
+ */
+#define ESP32P4_ASSIST_SP_MIN   BIT(8)
+#define ESP32P4_ASSIST_SP_MAX   BIT(9)
+#define ESP32P4_ASSIST_REGIONS  4
+
+typedef struct ESP32P4AssistOps {
+    void (*sp)(void *opaque, int core, uint32_t raw, uint32_t pc);
+    void (*region)(void *opaque, int core, uint32_t hits, uint32_t pc,
+                   uint32_t sp);
+} ESP32P4AssistOps;
+
+/*
+ * The trace encoder's interface to an HP core (hw/misc/esp32p4_trace.c).
+ * While trace_en is set the core reports, without the BQL:
+ *
+ * insn: an instruction at @pc in privilege mode @priv starts, so the one
+ *   before it has retired; @kind is the instruction's ESP32P4_TRACE_KIND_*
+ *   and its length (ESP32P4_TRACE_LEN_4 for 4 bytes, else 2).
+ * trap: a trap is taken to @handler: an interrupt (@interrupt) or an
+ *   exception, its cause @cause and trap value @tval, at @epc, from
+ *   privilege mode @priv; @retired says whether the instruction last
+ *   started retired (an interrupt, or an exception taken between
+ *   instructions) or raised the exception.
+ * trigger: a debug trigger with trace action @action (2 on, 3 off, 4
+ *   notify) fired, before the instruction about to start (@before, an
+ *   execute trigger) or during the one started (a load or store trigger).
+ */
+enum {
+    ESP32P4_TRACE_KIND_PLAIN,
+    ESP32P4_TRACE_KIND_BRANCH,
+    ESP32P4_TRACE_KIND_JAL,
+    ESP32P4_TRACE_KIND_JALR,
+    ESP32P4_TRACE_KIND_XRET,
+};
+#define ESP32P4_TRACE_KIND_MASK 0x7
+#define ESP32P4_TRACE_LEN_4     BIT(3)
+
+typedef struct ESP32P4TraceOps {
+    void (*insn)(void *opaque, uint32_t pc, uint32_t kind, int priv);
+    void (*trap)(void *opaque, uint32_t epc, uint32_t cause, bool interrupt,
+                 uint32_t tval, uint32_t handler, int priv, bool retired);
+    void (*trigger)(void *opaque, int action, bool before);
+} ESP32P4TraceOps;
 
 /* The base addresses mclicbase and uclicbase hold. */
 #define ESP32P4_MCLICBASE 0x20800000
@@ -250,6 +324,44 @@ struct ESP32P4CPU {
     /* ESP32P4_CPU_M_MODE and the level last driven on it. */
     qemu_irq m_mode_irq;
     bool m_mode_level;
+
+    /* The ESP32P4_CPU_ERR_RESP_DIS inputs, bit n for line n. */
+    uint32_t err_resp_dis;
+    /* The HP core's ESP32P4_CPU_WAKEUP input is high. */
+    bool wakeup;
+    /*
+     * The PC at the core's last trap: LP_SYSTEM_LP_CPU_EXC_PC on the LP
+     * core, the debug assistant's LASTPC_BEFORE_EXCEPTION on an HP core.
+     */
+    uint32_t exc_pc;
+
+    /*
+     * The debug assistant (HP cores): its interface; the region monitors
+     * it enables, ASSIST_DEBUG_CORE_n_INTR_ENA's bits 7:0 (read and write
+     * of DRAM0 regions 0 and 1, then of PIF regions 0 and 1), and their
+     * bounds, inclusive; and the SP monitor: whether it is enabled, the
+     * bounds SP must stay within (0 and 0xFFFFFFFF for a bound not
+     * monitored), and whether SP was last outside them.
+     */
+    const ESP32P4AssistOps *assist_ops;
+    void *assist_opaque;
+    uint32_t assist_watch;
+    uint32_t assist_lo[ESP32P4_ASSIST_REGIONS];
+    uint32_t assist_hi[ESP32P4_ASSIST_REGIONS];
+    bool spmon_en;
+    uint32_t spmon_min;
+    uint32_t spmon_max;
+    uint32_t spmon_out;
+
+    /*
+     * The trace encoder (HP cores): its interface, whether it traces the
+     * core, and whether the trap being taken comes after the instruction
+     * last started retired (an exception taken between instructions).
+     */
+    const ESP32P4TraceOps *trace_ops;
+    void *trace_opaque;
+    bool trace_en;
+    bool trap_after_retire;
 };
 
 struct ESP32P4CPUClass {
@@ -297,6 +409,15 @@ void esp32p4_cpu_clic_present(ESP32P4CPU *cpu, uint32_t sel);
 uint8_t esp32p4_cpu_mintthresh(ESP32P4CPU *cpu);
 void esp32p4_cpu_set_mintthresh(ESP32P4CPU *cpu, uint8_t th);
 
+/*
+ * Whether the calling thread is a core in the middle of a block of
+ * translated code, where under icount it may neither raise an interrupt
+ * nor read the virtual clock (QEMU allows them only to the instruction
+ * that ends a block). The blocks the cores report to from their
+ * instructions defer their interrupts while it holds.
+ */
+bool esp32p4_cpu_mid_block(void);
+
 /* esp32p4_csr.c */
 void esp32p4_hp_csr_class_init(void);
 void esp32p4_hp_update_fp_status(ESP32P4CPU *cpu);
@@ -314,6 +435,19 @@ void esp32p4_tdata_write(ESP32P4CPU *cpu, int index, target_ulong val);
 
 /* esp32p4_helper.c */
 void esp32p4_bus_error_check_pending(ESP32P4CPU *cpu);
+void esp32p4_assist_connect(ESP32P4CPU *cpu, const ESP32P4AssistOps *ops,
+                            void *opaque);
+void esp32p4_assist_sp_update(ESP32P4CPU *cpu);
+void esp32p4_assist_access(ESP32P4CPU *cpu, vaddr addr, int size,
+                           MMUAccessType access_type, uintptr_t retaddr);
+bool esp32p4_assist_watches_page(ESP32P4CPU *cpu, vaddr page);
+int esp32p4_cpu_bus(uint32_t addr, bool fetch);
+void esp32p4_trace_connect(ESP32P4CPU *cpu, const ESP32P4TraceOps *ops,
+                           void *opaque);
+void esp32p4_trace_set_enabled(ESP32P4CPU *cpu, bool en);
+void esp32p4_trace_trap(ESP32P4CPU *cpu, uint32_t epc, uint32_t cause,
+                        bool interrupt, uint32_t tval, int priv,
+                        bool retired);
 
 /* esp32p4_pie.c */
 bool esp32p4_insn_is_pie(uint32_t insn);

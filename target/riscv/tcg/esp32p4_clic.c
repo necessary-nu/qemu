@@ -210,6 +210,7 @@ void esp32p4_clic_take(ESP32P4CPU *cpu, uint32_t sel)
     CPUState *cs = CPU(cpu);
     int priv = sel_priv(sel);
     int id = sel_id(sel);
+    int prev_priv = env->priv;
     uint64_t last_pc = env->pc;
     target_ulong handler;
     uint64_t s = env->mstatus;
@@ -253,11 +254,13 @@ void esp32p4_clic_take(ESP32P4CPU *cpu, uint32_t sel)
         esp32p4_clic_claim(cpu, id);
         if (!esp32p4_clic_fetch_vector(cpu, (tvt & XTVEC_BASE_MASK) + 4 * id,
                                        &handler)) {
+            esp32p4_trace_trap(cpu, last_pc, id, true, 0, prev_priv, true);
             esp32p4_hp_do_interrupt(cs);
             return;
         }
     }
     env->pc = handler;
+    esp32p4_trace_trap(cpu, last_pc, id, true, 0, prev_priv, true);
 }
 
 /*
