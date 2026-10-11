@@ -158,11 +158,21 @@ struct ESP32P4MachineState {
     MemoryRegion l2mem_direct;
     MemoryRegion lp_sram;
     /*
-     * The LP ROM, and whether it holds an image: the machine ships none,
-     * so it is absent and the LP core starts past it.
+     * The LP ROM, and whether it holds an image. The machine ships none:
+     * without the lp-rom property's image, dumped by the user from their
+     * own chip, the LP ROM is absent and the LP core starts past it.
      */
+    char *lp_rom_file;
     MemoryRegion lp_rom;
     bool lp_rom_loaded;
+    /*
+     * With an image, the LP ROM is on the LP core's own buses: the LP
+     * core's address space is the bus with the LP ROM over it, and the bus
+     * itself answers the LP ROM's addresses with an error.
+     */
+    MemoryRegion lp_mem;
+    MemoryRegion lp_bus;
+    MemoryRegion lp_rom_hole;
     MemoryRegion psram;
     /* The HP cores' address space, and the bus in it. */
     MemoryRegion hp_mem;
