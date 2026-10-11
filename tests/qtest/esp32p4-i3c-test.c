@@ -336,6 +336,36 @@ static void test_private(void)
     g_assert_cmphex(rd(qts, MST, DATA_BUFFER_STATUS_LEVEL) >> 16, ==, 2);
     g_assert_cmphex(rd(qts, MST, RX_DATA_PORT), ==, 0x44332211);
     g_assert_cmphex(rd(qts, MST, RX_DATA_PORT) & 0xffff, ==, 0x6655);
+
+    /*
+     * Chained by repeated STARTs (TOC clear): a write, a read that goes
+     * on where the write left off, with no STOP between, and a direct
+     * CCC (GETPID), which starts with the broadcast address again.
+     */
+    {
+        uint32_t chain[] = { CMDL(0, 1, 0, 0, 0, 0, 0, 1, 0), DL(2),
+                             CMDL(0, 2, 0, 0, 0, 0, 1, 1, 0), DL(2),
+                             CMDL(0, 3, CCC_GETPID, 1, 0, 0, 1, 1, 1),
+                             DL(6) };
+
+        wr(qts, MST, TX_DATA_PORT, 0x7c5b);
+        run(qts, chain, 6);
+        wait_complete(qts);
+        g_assert_cmphex(rd(qts, MST, INT_RAW) & INT_TRANSFER_ERR, ==, 0);
+        r = rd(qts, MST, RESPONSE_BUF_PORT);
+        g_assert_cmphex(RESP_TID(r), ==, 1);
+        g_assert_cmphex(RESP_ERR(r), ==, 0);
+        r = rd(qts, MST, RESPONSE_BUF_PORT);
+        g_assert_cmphex(RESP_TID(r), ==, 2);
+        g_assert_cmphex(RESP_DL(r), ==, 2);
+        r = rd(qts, MST, RESPONSE_BUF_PORT);
+        g_assert_cmphex(RESP_TID(r), ==, 3);
+        g_assert_cmphex(RESP_DL(r), ==, 6);
+        g_assert_cmphex(rd(qts, MST, RX_DATA_PORT) & 0xffff, ==, 0x4433);
+        /* The mock's PID, 0xaabbccddeeff, as it sends it */
+        g_assert_cmphex(rd(qts, MST, RX_DATA_PORT), ==, 0xddccbbaa);
+        g_assert_cmphex(rd(qts, MST, RX_DATA_PORT) & 0xffff, ==, 0xffee);
+    }
     qtest_quit(qts);
 }
 

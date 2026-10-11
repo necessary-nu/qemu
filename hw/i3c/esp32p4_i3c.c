@@ -150,9 +150,10 @@ enum {
 #define INT_IBI_DETECT          BIT(14)
 #define INT_CMD_CCC_MISMATCH    BIT(15)
 #define INT_MASK                0xffff
-#define INT_LEVELS              (INT_TX_DATA_BUF_THLD | INT_RX_DATA_BUF_THLD | \
-                                 INT_IBI_STATUS_THLD | INT_CMD_BUF_EMPTY_THLD | \
-                                 INT_RESP_READY)
+#define INT_LEVELS              (INT_TX_DATA_BUF_THLD | \
+                                 INT_RX_DATA_BUF_THLD | \
+                                 INT_IBI_STATUS_THLD | \
+                                 INT_CMD_BUF_EMPTY_THLD | INT_RESP_READY)
 
 /* RESET_CTRL */
 #define RST_CORE_SOFT           BIT(0)
@@ -229,6 +230,7 @@ enum {
 
 /* What follows a repeated START */
 enum {
+    NEXT_CMD,
     NEXT_DIRECT,
     NEXT_DAA,
     NEXT_DASA,
@@ -758,15 +760,20 @@ static void esp32p4_i3c_mst_data(ESP32P4I3CMstState *s)
                           esp32p4_i3c_mst_data_kind(s)), PH_DATA);
 }
 
-/* After a START or repeated START, the header the command starts with. */
+/*
+ * After a START or repeated START, the header the command starts with:
+ * the broadcast address for a CCC, and with BA_INCLUDE for a private
+ * transfer to an I3C device after a START, where a target's IBI can win
+ * the arbitration of the header.
+ */
 static void esp32p4_i3c_mst_header(ESP32P4I3CMstState *s, bool after_start)
 {
     uint32_t attr = CMD_ATTR(s->cmd_l);
     bool bcast = attr == ATTR_ADDR_ASSIGN || CMD_CP(s->cmd_l) ||
-                 (!s->dev_i2c &&
+                 (after_start && !s->dev_i2c &&
                   (s->regs[R_DEVICE_CTRL] & CTRL_BA_INCLUDE));
 
-    if (after_start && bcast) {
+    if (bcast) {
         esp32p4_i3c_mst_after(s, 9 * esp32p4_i3c_mst_bit(s, BIT_OD),
                               PH_HDR_BCAST);
         return;
@@ -835,7 +842,7 @@ static void esp32p4_i3c_mst_next(ESP32P4I3CMstState *s)
                       TYPE_ESP32P4_I3C_MST);
     }
     if (s->in_txn) {
-        esp32p4_i3c_mst_rstart(s, NEXT_DIRECT);
+        esp32p4_i3c_mst_rstart(s, NEXT_CMD);
         return;
     }
     /* A START once the bus has been free long enough */
@@ -1037,6 +1044,11 @@ static void esp32p4_i3c_mst_phase_end(ESP32P4I3CMstState *s, int64_t t)
         case NEXT_DASA:
             esp32p4_i3c_mst_after(s, 9 * esp32p4_i3c_mst_bit(s, BIT_PP),
                                   PH_DASA_HDR);
+            break;
+        case NEXT_DIRECT:
+            esp32p4_i3c_mst_after(s, 9 * esp32p4_i3c_mst_bit(s,
+                                  s->dev_i2c ? BIT_I2C : BIT_PP),
+                                  PH_HDR_DIRECT);
             break;
         default:
             esp32p4_i3c_mst_header(s, false);
@@ -1962,8 +1974,10 @@ static int esp32p4_i3c_slv_event(I3CTarget *t, enum I3CEvent event)
     return 0;
 }
 
-/* A private write: the bytes go to the RX FIFO, those it lacks room for
- * are lost (ERRWARN). */
+/*
+ * A private write: the bytes go to the RX FIFO, those it lacks room for
+ * are lost (ERRWARN).
+ */
 static int esp32p4_i3c_slv_send(I3CTarget *t, const uint8_t *data,
                                 uint32_t num_to_send, uint32_t *num_sent)
 {
