@@ -9,9 +9,9 @@
  * reset, so 150 cycles are 1 ms; its stage 0 hold is doubled, as
  * EFUSE_WDT_DELAY_SEL is 0. The super watchdog requests a feed after
  * 860 ms and resets the system at 960 ms, once LP_SYSTEM's FIB control
- * lets it ("swd-reset-en", which nothing drives). System resets are awaited as
- * QMP RESET events; interrupts are seen in the interrupt matrix's status
- * of source 1.
+ * lets it ("swd-reset-en", which the test drives). System resets are
+ * awaited as QMP RESET events; interrupts are seen in the interrupt
+ * matrix's status of source 1.
  */
 
 #include "qemu/osdep.h"

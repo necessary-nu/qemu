@@ -13,6 +13,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/misc/esp32p4_ana.h"
 #include "hw/misc/esp32p4_clkrst.h"
+#include "hw/misc/esp32p4_lp_sys.h"
 #include "qemu/timer.h"
 #include "hw/core/cpu.h"
 #include "qom/object.h"
@@ -85,8 +86,10 @@ enum {
  *
  *   - Clock inputs "fast" (LP_DYN_FAST_CLK) and "slow" (LP_DYN_SLOW_CLK),
  *     which time the state machine and the regulators' counters.
- *   - Links "clkrst", where the PMU records its resets of the cores, and
- *     "lp-cpu", whose wait for an interrupt LP_CPU_WAITI_RDY shows.
+ *   - Links "clkrst", where the PMU records its resets of the cores;
+ *     "lp-cpu", whose wait for an interrupt LP_CPU_WAITI_RDY shows; and
+ *     "lp-sys", where LP_SYSTEM's EXT_WAKEUP1_STATUS records the pads of
+ *     an EXT wakeup.
  *   - Sysbus IRQs 0 and 1: PMU_INTR (the HP_INT_* registers) and the
  *     LP_INT_* registers' interrupt, interrupt matrix sources 6 and 7; the
  *     latter is also the named GPIO output "lp-int", for the LP core.
@@ -235,6 +238,7 @@ struct ESP32P4PMUState {
     Clock *slow;
     ESP32P4ClkRstState *clkrst;
     CPUState *lp_cpu;
+    ESP32P4LPSysState *lp_sys;
 
     uint32_t regs[ESP32P4_PMU_NREGS];
 

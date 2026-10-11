@@ -684,6 +684,7 @@ enum {
  * esp32p4_clkrst_record_reset().
  */
 #define ESP32P4_RESET_CAUSE_CHIP        0x01
+#define ESP32P4_RESET_CAUSE_SW_SYS      0x03
 #define ESP32P4_RESET_CAUSE_PMU_HP_PD   0x05
 #define ESP32P4_RESET_CAUSE_MWDT_CORE   0x07
 #define ESP32P4_RESET_CAUSE_RWDT_CORE   0x09
@@ -705,6 +706,7 @@ enum {
     ESP32P4_HP_CORE_RESET_MWDT0,
     ESP32P4_HP_CORE_RESET_MWDT1,
     ESP32P4_HP_CORE_RESET_RWDT,
+    ESP32P4_HP_CORE_RESET_SW,
 };
 
 /* The cores in esp32p4_clkrst_record_reset()'s mask. */
@@ -852,7 +854,7 @@ void esp32p4_clkrst_record_reset(ESP32P4ClkRstState *s, unsigned cores,
 /*
  * The cause the next system reset records for every core, in place of a
  * chip reset's: a block that resets the system (a watchdog's system
- * reset, LP_SYSTEM_SYS_SW_RST) sets it before it requests the reset.
+ * reset) sets it before it requests the reset.
  */
 void esp32p4_clkrst_set_system_reset_cause(ESP32P4ClkRstState *s,
                                            uint8_t cause);
@@ -879,8 +881,9 @@ uint8_t esp32p4_clkrst_system_reset_cause(ESP32P4ClkRstState *s);
  * the HP system's reset, of both HP cores, every HP block and
  * HP_SYS_CLKRST's registers, held for @length_ns and leaving the LP system
  * (LP_CLKRST, LPPERI, the LP blocks and the LP core) as it is. Both HP
- * cores record the source's cause, MWDT core reset (0x07) or RWDT core
- * reset (0x09). An MWDT's request takes effect only if
+ * cores record the source's cause, MWDT core reset (0x07), RWDT core
+ * reset (0x09) or, for LP_SYSTEM_SYS_SW_RST, software system reset
+ * (0x03). An MWDT's request takes effect only if
  * HPCORE<n>_WDT_RESET_SOURCE_SEL picks it for one of the cores (TRM table
  * 11.1-1, note 2). The caller may itself be reset before this returns.
  */

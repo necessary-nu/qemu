@@ -47,9 +47,11 @@
  *   - The reset and clock control, HP_SYS_CLKRST, LP_AON_CLKRST and
  *     LPPERI, with the clock tree from the crystal, the RC oscillators and
  *     the PLLs to every block's clocks, and the analog I2C controller
- *     through which software configures the PLLs; and LP_SYS's
- *     BOOT_ADDR_HP_CORE1 and its record of refused accesses, the rest of
- *     whose registers are logged as unimplemented.
+ *     through which software configures the PLLs.
+ *   - The system registers (TRM chapter 21), HP_SYSTEM at 0x500E5000 and
+ *     LP_SYSTEM at 0x50110000, every register of each (esp32p4_hp_sys.c,
+ *     esp32p4_lp_sys.c), driving what the machine models of the blocks
+ *     they configure (esp32p4_init_debug()).
  *   - The eFuse controller and its array, on its clock and reset from
  *     LPPERI, its interrupt a source of the interrupt matrix.
  *   - The system timer, the two timer groups (each two timers, an MWDT
@@ -93,12 +95,9 @@
  *     core 1's 2 KiB above, behind its bus clock and reset: every
  *     peripheral interrupt source, as its source input, to the CLIC
  *     external interrupts 16 to 47 of either HP core, remapped as each
- *     core's mode and its CLIC's user-mode interrupts decide. Of HP_SYSTEM
- *     (0x500E5000), the cores' software interrupts CPU_INTR_FROM_CPU_0 to
- *     _3, sources of the matrix, the L1 caches' resets, the external
- *     memory encryption enables and the L2MEM error response and
- *     interrupt; the rest of its registers are logged as unimplemented. A
- *     source no modelled block drives stays low.
+ *     core's mode and its CLIC's user-mode interrupts decide. HP_SYSTEM's
+ *     software interrupts CPU_INTR_FROM_CPU_0 to _3 are sources of the
+ *     matrix. A source no modelled block drives stays low.
  *   - The GPIO matrix and IO MUX (TRM chapter 10), HP and LP, with
  *     GPIO_EXT's sigma-delta modulators, glitch filters and ETM, behind
  *     IOMUX_APB_CLK and the LP IO MUX's clock and their resets, timed by
@@ -134,6 +133,11 @@
  *     peripheral served by GDMA attaches to its controller as
  *     include/hw/dma/esp32p4_gdma.h describes; VDMA's handshaking
  *     interfaces, for MIPI DSI and the ISP, are its named GPIOs.
+ *   - The debug blocks (TRM chapters 3, 22 and 23): the debug assistant at
+ *     0x3FF06000, watching the HP cores' SP, their accesses to four
+ *     regions and their PCs; each HP core's RISC-V trace encoder, at
+ *     0x3FF04000 and 0x3FF05000, writing Efficient Trace packets to
+ *     memory; and the AXI performance monitor at 0x500A8000.
  *
  *   - The USB 2.0 OTG controllers (TRM chapters 52 and 53,
  *     hw/usb/esp32p4_usb.c): OTG_HS (0x50000000) on its UTMI+ PHY
@@ -255,9 +259,6 @@ static const struct {
     hwaddr size;
 } esp32p4_unimplemented[] = {
     /* HP CPU peripherals. */
-    { "trace0",           0x3ff04000, 4 * KiB },
-    { "trace1",           0x3ff05000, 4 * KiB },
-    { "bus-monitor",      0x3ff06000, 4 * KiB },
     { "l2mem-monitor",    0x3ff0e000, 4 * KiB },
     { "tcm-monitor",      0x3ff0f000, 4 * KiB },
 
@@ -600,11 +601,14 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
         DeviceState *cpu = DEVICE(&s->hp_cpu[i]);
         g_autofree char *clk = g_strdup_printf("core%d-cpu", i);
 
-        /* A core's reset also resets its CLIC. */
+        /*
+         * A core's reset also resets its CLIC, stops its PC record in the
+         * debug assistant and is its trace encoder's reset sideband.
+         */
         object_initialize_child(OBJECT(s), "core-reset-split[*]",
                                 &s->core_reset_split[i], TYPE_SPLIT_IRQ);
         qdev_prop_set_uint16(DEVICE(&s->core_reset_split[i]), "num-lines",
-                             2);
+                             4);
         qdev_realize(DEVICE(&s->core_reset_split[i]), NULL, &error_fatal);
         qdev_connect_gpio_out(DEVICE(&s->core_reset_split[i]), 0,
                               qdev_get_gpio_in_named(cpu, ESP32P4_CPU_RESET,
@@ -634,6 +638,8 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
 
     object_initialize_child(OBJECT(s), "lp-sys", &s->lp_sys,
                             TYPE_ESP32P4_LP_SYS);
+    object_property_set_link(OBJECT(&s->lp_sys), "lp-cpu",
+                             OBJECT(&s->lp_cpu), &error_abort);
     sysbus_realize(SYS_BUS_DEVICE(&s->lp_sys), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->lp_sys), 0, ESP32P4_LP_SYS_BASE);
 }
@@ -792,7 +798,8 @@ static void esp32p4_init_efuse(ESP32P4MachineState *s)
 
 /*
  * The HP core reset of the HP blocks with no reset line of their own,
- * HP_SYSTEM's registers, the CLINT and the AXI ICM; the rest take theirs
+ * HP_SYSTEM's registers, the CLINT, the AXI ICM and the debug assistant
+ * (whose PC records survive it); the rest take theirs
  * from the reset and clock control, which holds every HP block reset line
  * and the HP cores through it. (The HP and DMA access permission managers
  * have no reset of their own in the PMS model, which resets them only with
@@ -807,6 +814,7 @@ static void esp32p4_hp_core_reset(void *opaque, int n, int level)
         device_cold_reset(DEVICE(&s->hp_sys));
         device_cold_reset(DEVICE(&s->clint));
         device_cold_reset(DEVICE(&s->icm));
+        device_cold_reset(DEVICE(&s->assist_debug));
     }
 }
 
@@ -835,9 +843,8 @@ static void esp32p4_hp_core_reset(void *opaque, int n, int level)
  * is no -kernel, which loads the program in the ROM's place, with no flash
  * boot to protect. Pads driven from outside at reset, which GPIO_STRAP
  * latches in place of the strapping, and LP_SYSTEM_FORCE_DOWNLOAD_BOOT do
- * not change it. LP_SYSTEM's FIB control of the super watchdog's reset is
- * not modelled: the "swd-reset-en" input stays low, as the FIB's analog
- * default leaves it.
+ * not change it. LP_SYSTEM's FIB control enables the super watchdog's
+ * reset (see esp32p4_init_debug()).
  */
 /* [spec:nuos:req:emu.esp32p4.timers] */
 static void esp32p4_init_timers(ESP32P4MachineState *s)
@@ -852,7 +859,7 @@ static void esp32p4_init_timers(ESP32P4MachineState *s)
         object_initialize_child(OBJECT(s), "core-stall-split[*]",
                                 &s->core_stall_split[n], TYPE_SPLIT_IRQ);
         qdev_prop_set_uint16(DEVICE(&s->core_stall_split[n]), "num-lines",
-                             2);
+                             3);
         qdev_realize(DEVICE(&s->core_stall_split[n]), NULL, &error_fatal);
         qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_CORE_STALL, n,
                                     qdev_get_gpio_in(
@@ -1820,18 +1827,21 @@ static void esp32p4_hp_top_power(void *opaque, int n, int level)
  *     core, holds the pads and switches them to their sleep configuration,
  *     pauses the RTC watchdog and lets the brown-out detector see VDD_BAT.
  *     Its wakeup sources: the GPIO and LP GPIO wakeups, the RTC timer's
- *     targets, the brown-out detector and VDD_BAT's under-voltage, and the
- *     EXT wakeup on pads GPIO0 to GPIO15. Its ETM task, PMU_TASK_SLEEP_REQ,
- *     and event, PMU_EVT_SLEEP_WAKEUP, are the ETM's (esp32p4_init_etm()).
- *     The other sources' "wakeup" lines, UART_WAKEUP_EN and the LP
- *     interrupt wait for the blocks that take them (UARTs, USB, SDIO, touch,
- *     LP I2S, EMAC, the LP core's interrupts, HP_SYSTEM's interrupt
- *     wakeup).
+ *     targets, the brown-out detector and VDD_BAT's under-voltage,
+ *     HP_SYSTEM's interrupt wakeup (the TRM's "HP CPU" source) and the EXT
+ *     wakeup on pads GPIO0 to GPIO15, which LP_SYSTEM records too. Its ETM
+ *     task, PMU_TASK_SLEEP_REQ, and event, PMU_EVT_SLEEP_WAKEUP, are the
+ *     ETM's (esp32p4_init_etm()). The other sources' "wakeup" lines,
+ *     UART_WAKEUP_EN and the LP interrupt wait for the blocks that take
+ *     them (UARTs, USB, SDIO, touch, LP I2S, EMAC, the LP core's
+ *     interrupts).
  *   - LP_ANALOG_PERI, behind its LP_CLKRST reset, its interrupt source 8:
  *     the brown-out detector, on BIAS's thresholds, and the glitch and
- *     power supply detectors. LP_SYSTEM's FIB enable of the detector waits
- *     for LP_SYSTEM to drive it; until then the detector takes the analog
- *     default, enabled.
+ *     power supply detectors. The detector's "bod-en" is left at the
+ *     analog default, enabled, rather than taken from LP_SYSTEM's
+ *     "bod-reset-en", which reads a set FIB bit as disabling the detector
+ *     and so, from its reset value, would disable it, where TRM 21.2.2.2
+ *     has a set bit enable it.
  *   - The LP mailbox, behind its LP_CLKRST reset, MB_HP_INTR and MB_LP_INTR
  *     sources 4 and 5.
  */
@@ -1848,6 +1858,8 @@ static void esp32p4_init_low_power(ESP32P4MachineState *s)
     object_property_set_link(OBJECT(pmu), "clkrst", OBJECT(&s->clkrst),
                              &error_abort);
     object_property_set_link(OBJECT(pmu), "lp-cpu", OBJECT(&s->lp_cpu),
+                             &error_abort);
+    object_property_set_link(OBJECT(pmu), "lp-sys", OBJECT(&s->lp_sys),
                              &error_abort);
     qdev_connect_clock_in(pmu, "fast", qdev_get_clock_out(clkrst,
                                                           "lp-dyn-fast"));
@@ -1948,6 +1960,10 @@ static void esp32p4_init_low_power(ESP32P4MachineState *s)
                                 qdev_get_gpio_in_named(pmu,
                                     ESP32P4_PMU_WAKEUP,
                                     ESP32P4_PMU_WAKE_LP_GPIO));
+    qdev_connect_gpio_out_named(DEVICE(&s->hp_sys), ESP32P4_HP_SYS_HP_WAKEUP,
+                                0, qdev_get_gpio_in_named(pmu,
+                                       ESP32P4_PMU_WAKEUP,
+                                       ESP32P4_PMU_WAKE_HP_CPU));
     qdev_connect_gpio_out_named(DEVICE(&s->lp_timer),
                                 ESP32P4_LP_TIMER_SOC_WAKEUP, 0,
                                 qdev_get_gpio_in_named(pmu,
@@ -2007,6 +2023,180 @@ static void esp32p4_init_low_power(ESP32P4MachineState *s)
                        esp32p4_intr_source(s, ESP32P4_INTR_MB_HP));
     sysbus_connect_irq(SYS_BUS_DEVICE(mb), ESP32P4_LP_MAILBOX_IRQ_LP,
                        esp32p4_intr_source(s, ESP32P4_INTR_MB_LP));
+}
+
+/* LP_SYSTEM_SYS_SW_RST: the software system reset, an HP core reset. */
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static void esp32p4_sw_sys_reset(void *opaque, int n, int level)
+{
+    ESP32P4MachineState *s = opaque;
+
+    if (level) {
+        esp32p4_clkrst_hp_core_reset(&s->clkrst, ESP32P4_HP_CORE_RESET_SW,
+                                     ESP32P4_SW_SYS_RESET_NS);
+    }
+}
+
+/*
+ * The system registers' connections and the debug blocks (TRM chapters 21
+ * to 23 and 3):
+ *
+ *   - HP_SYSTEM's and LP_SYSTEM's bus error response disables to the HP
+ *     cores and the LP core; HP_SYSTEM's WFI wakeup events to the HP cores;
+ *     its HP2LP interrupt groups over sources 21 to 130 of the interrupt
+ *     matrix, whose HP_INTR waits for the LP core's interrupt controller
+ *     and whose HP wakeup is the PMU's (esp32p4_init_low_power()); and the
+ *     HP cores' stalls for CPU_CORESTALLED_ST.
+ *   - The pads' holds: each pad's GPIO block "pad-hold" input is the OR of
+ *     LP_SYSTEM_PAD_RTC_HOLD_CTRL's bit for it and, for GPIO16 to GPIO54,
+ *     HP_SYSTEM_GPIO_O_HOLD_CTRL's (the PMU's holds of all the HP or LP
+ *     pads are the GPIO block's "hold-all", esp32p4_init_low_power()).
+ *   - LP_SYSTEM's software system reset, an HP core reset with cause 0x03
+ *     (TRM table 11.1-1), its choice of the core whose stall the RTC
+ *     timer follows, and its FIB control of the super watchdog's reset,
+ *     to the RTC watchdog. Its LP core disable is not connected, as the
+ *     PMU does not act on it, nor its brownout reset enable (see
+ *     esp32p4_init_low_power()).
+ *   - The debug assistant (0x3FF06000), not gated by BUSMON_CPU_CLK_EN, its
+ *     interrupt ASSIST_DEBUG_INTR (source 127), watching the HP cores and
+ *     taking their resets for its PC records.
+ *   - The AXI performance monitor (0x500A8000), behind AXI_PERF_MON_SYS_CLK
+ *     and its reset, counting SYS_CLK, the AXI matrix's clock, its
+ *     interrupt AXI_PERF_MON_INTR (source 130).
+ *   - Each HP core's trace encoder (0x3FF04000, 0x3FF05000), behind
+ *     TRACE_CPU_CLK and its RST_EN_CORETRACE<n> reset, its AHB master on
+ *     TRACE_SYS_CLK writing the trace memory through the access permission
+ *     managers, its interrupt CORE<n>_TRACE_INTR (sources 97, 98), taking
+ *     its core's reset as its reset sideband.
+ */
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static void esp32p4_init_debug(ESP32P4MachineState *s)
+{
+    DeviceState *hp_sys = DEVICE(&s->hp_sys);
+    DeviceState *lp_sys = DEVICE(&s->lp_sys);
+    DeviceState *gpio = DEVICE(&s->gpio);
+    DeviceState *dev;
+    int core, n;
+
+    for (core = 0; core < ESP32P4_HP_CORES; core++) {
+        DeviceState *cpu = DEVICE(&s->hp_cpu[core]);
+
+        for (n = 0; n < ESP32P4_BUSES; n++) {
+            qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_ERR_RESP_DIS,
+                                        core * ESP32P4_BUSES + n,
+                                        qdev_get_gpio_in_named(cpu,
+                                            ESP32P4_CPU_ERR_RESP_DIS, n));
+        }
+        qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_CPU_WAKEUP, core,
+                                    qdev_get_gpio_in_named(cpu,
+                                        ESP32P4_CPU_WAKEUP, 0));
+        qdev_connect_gpio_out(DEVICE(&s->core_stall_split[core]), 2,
+                              qdev_get_gpio_in_named(hp_sys,
+                                  ESP32P4_HP_SYS_CORE_STALLED, core));
+    }
+    for (n = 0; n < ESP32P4_HP_SYS_HP2LP_SOURCES; n++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->intmatrix),
+                                    ESP32P4_INTMATRIX_SOURCE_OUT,
+                                    ESP32P4_HP_SYS_HP2LP_FIRST + n,
+                                    qdev_get_gpio_in_named(hp_sys,
+                                        ESP32P4_HP_SYS_HP_SOURCE, n));
+    }
+    for (n = 0; n < ESP32P4_BUSES; n++) {
+        qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_ERR_RESP_DIS, n,
+                                    qdev_get_gpio_in_named(DEVICE(&s->lp_cpu),
+                                        ESP32P4_CPU_ERR_RESP_DIS, n));
+    }
+
+    for (n = 0; n < ESP32P4_GPIO_PADS; n++) {
+        qemu_irq hold = qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_PAD_HOLD, n);
+        int h = n - ESP32P4_HP_SYS_HOLD_FIRST;
+
+        if (h < 0) {
+            qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_PAD_HOLD, n,
+                                        hold);
+            continue;
+        }
+        object_initialize_child(OBJECT(s), "pad-hold-or[*]",
+                                &s->pad_hold_or[h], TYPE_OR_IRQ);
+        dev = DEVICE(&s->pad_hold_or[h]);
+        qdev_prop_set_uint16(dev, "num-lines", 2);
+        qdev_realize(dev, NULL, &error_fatal);
+        qdev_connect_gpio_out(dev, 0, hold);
+        qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_PAD_HOLD, n,
+                                    qdev_get_gpio_in(dev, 0));
+        qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_PAD_HOLD, h,
+                                    qdev_get_gpio_in(dev, 1));
+    }
+
+    qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_SW_RESET, 0,
+                                qemu_allocate_irq(esp32p4_sw_sys_reset, s, 0));
+    qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_STALL_SEL, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->lp_timer),
+                                    ESP32P4_LP_TIMER_STALL_SEL, 0));
+    qdev_connect_gpio_out_named(lp_sys, ESP32P4_LP_SYS_SWD_RESET_EN, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->lp_wdt),
+                                    ESP32P4_LP_WDT_SWD_RESET_EN, 0));
+
+    object_initialize_child(OBJECT(s), "assist-debug", &s->assist_debug,
+                            TYPE_ESP32P4_ASSIST_DEBUG);
+    dev = DEVICE(&s->assist_debug);
+    for (core = 0; core < ESP32P4_HP_CORES; core++) {
+        g_autofree char *link = g_strdup_printf("cpu%d", core);
+
+        object_property_set_link(OBJECT(dev), link,
+                                 OBJECT(&s->hp_cpu[core]), &error_abort);
+    }
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, ESP32P4_ASSIST_DEBUG_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_ASSIST_DEBUG));
+    for (core = 0; core < ESP32P4_HP_CORES; core++) {
+        qdev_connect_gpio_out(DEVICE(&s->core_reset_split[core]), 2,
+                              qdev_get_gpio_in_named(dev,
+                                  ESP32P4_ASSIST_DEBUG_CORE_RESET, core));
+    }
+
+    object_initialize_child(OBJECT(s), "axi-perf-mon", &s->axi_perf_mon,
+                            TYPE_ESP32P4_AXI_PERF_MON);
+    dev = DEVICE(&s->axi_perf_mon);
+    qdev_connect_clock_in(dev, "axi", qdev_get_clock_out(DEVICE(&s->clkrst),
+                                                         "sys"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_AXI_PERF_MON_BASE,
+                             ESP32P4_CLK_AXI_PERF_MON_SYS,
+                             ESP32P4_RST_AXI_PERF_MON, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_AXI_PERF_MON));
+
+    for (core = 0; core < ESP32P4_HP_CORES; core++) {
+        static const hwaddr base[] = { ESP32P4_TRACE0_BASE,
+                                       ESP32P4_TRACE1_BASE };
+
+        object_initialize_child(OBJECT(s), "trace[*]", &s->trace[core],
+                                TYPE_ESP32P4_TRACE);
+        dev = DEVICE(&s->trace[core]);
+        qdev_prop_set_uint8(dev, "core", core);
+        object_property_set_link(OBJECT(dev), "cpu",
+                                 OBJECT(&s->hp_cpu[core]), &error_abort);
+        object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
+                                 &error_abort);
+        qdev_connect_clock_in(dev, "sys-clk",
+                              qdev_get_clock_out(DEVICE(&s->clkrst),
+                                                 "trace-sys"));
+        sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+        esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                 base[core], ESP32P4_CLK_TRACE_CPU,
+                                 core ? ESP32P4_RST_CORETRACE1
+                                      : ESP32P4_RST_CORETRACE0, 0);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           esp32p4_intr_source(s, core ?
+                                               ESP32P4_INTR_CORE1_TRACE :
+                                               ESP32P4_INTR_CORE0_TRACE));
+        qdev_connect_gpio_out(DEVICE(&s->core_reset_split[core]), 3,
+                              qdev_get_gpio_in_named(dev,
+                                  ESP32P4_TRACE_CORE_RESET, 0));
+    }
 }
 
 /*
@@ -2205,10 +2395,16 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
     esp32p4_etm_connect_task(etm, ESP32P4_ETM_PMU_TASK_SLEEP_REQ,
                              DEVICE(&s->pmu), ESP32P4_PMU_ETM_TASK, 0);
 
-    /* The LP core's interrupt, through LP_SYS's ETM_TASK_ULP_INT. */
+    /*
+     * The LP core's interrupt, through LP_SYS's ETM_TASK_ULP_INT, and its
+     * wakeup, which LP_SYS's LP_CORE_ETM_WAKEUP_FLAG records.
+     */
     esp32p4_etm_connect_task(etm, ESP32P4_ETM_ULP_TASK_INT_CPU,
                              DEVICE(&s->lp_sys),
                              ESP32P4_LP_SYS_ETM_TASK_ULP_INT, 0);
+    esp32p4_etm_connect_task(etm, ESP32P4_ETM_ULP_TASK_WAKEUP_CPU,
+                             DEVICE(&s->lp_sys),
+                             ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP, 0);
 }
 
 /*
@@ -2587,6 +2783,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_twai(s);
     esp32p4_init_etm(s);
     esp32p4_init_usb(s);
+    esp32p4_init_debug(s);
     for (i = 0; i < ARRAY_SIZE(esp32p4_unimplemented); i++) {
         esp32p4_map(esp32p4_unimplemented_device(
                         esp32p4_unimplemented[i].name,

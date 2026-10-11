@@ -1873,7 +1873,9 @@ void esp32p4_clkrst_hp_core_reset(ESP32P4ClkRstState *s, unsigned source,
 {
     uint8_t cause = ESP32P4_RESET_CAUSE_RWDT_CORE;
 
-    if (source != ESP32P4_HP_CORE_RESET_RWDT) {
+    if (source == ESP32P4_HP_CORE_RESET_SW) {
+        cause = ESP32P4_RESET_CAUSE_SW_SYS;
+    } else if (source != ESP32P4_HP_CORE_RESET_RWDT) {
         unsigned mwdt = source - ESP32P4_HP_CORE_RESET_MWDT0;
         uint32_t sel = s->regs[R_HPCORE_WDT_RESET_SOURCE0];
 

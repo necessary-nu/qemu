@@ -28,13 +28,14 @@
  *
  * The wakeup sources (TRM table 15.4-1) are levels: those of the blocks
  * that raise them (the "wakeup" inputs: the GPIO and LP GPIO wakeups, the
- * brown-out detector's, VDD_BAT's under-voltage, and the hooks the
- * machine leaves for the UARTs, USB, SDIO, touch, the ETM, LP I2S, the
- * EMAC and HP_SYSTEM's interrupt wakeup), the RTC timer's alarms (its raw
- * target interrupts, which hold until cleared), the EXT wakeup (a pad
+ * brown-out detector's, VDD_BAT's under-voltage, HP_SYSTEM's interrupt
+ * wakeup, source 23, and the hooks the machine leaves for the UARTs, USB,
+ * SDIO, touch, the ETM, LP I2S and the EMAC), the RTC timer's alarms (its
+ * raw target interrupts, which hold until cleared), the EXT wakeup (a pad
  * PMU_EXT_WAKEUP_SEL selects, of GPIO0 to GPIO15, at the level of its
  * PMU_EXT_WAKEUP_LV bit; the pads are recorded in PMU_EXT_WAKEUP_ST as
- * they wake the chip, and PMU_EXT_WAKEUP_STATUS_CLR holds it clear), the
+ * they wake the chip, and PMU_EXT_WAKEUP_STATUS_CLR holds it clear, and
+ * in LP_SYSTEM's EXT_WAKEUP1_STATUS, as ESP-IDF reads them), the
  * LP CPU's exception, and the CPUs' software triggers: PMU_LP_TRIGGER_HP
  * raises PMU_SW_INT, whose raw bit is source 1 (ESP-IDF's
  * PMU_LP_CORE_WAKEUP_HP_EN), and PMU_HP_TRIGGER_LP raises
@@ -976,9 +977,15 @@ static void pmu_start_lp_wake(ESP32P4PMUState *s, int target)
 static void pmu_start_wake(ESP32P4PMUState *s, uint32_t sources)
 {
     s->regs[R(A_SLP_WAKEUP_STATUS0)] = sources;
-    if (sources & BIT(ESP32P4_PMU_WAKE_EXT) &&
-        !(s->regs[R(A_EXT_WAKEUP_CNTL)] & EXT_STATUS_CLR)) {
-        s->regs[R(A_EXT_WAKEUP_ST)] |= pmu_ext_pads_active(s);
+    if (sources & BIT(ESP32P4_PMU_WAKE_EXT)) {
+        uint32_t pads = pmu_ext_pads_active(s);
+
+        if (!(s->regs[R(A_EXT_WAKEUP_CNTL)] & EXT_STATUS_CLR)) {
+            s->regs[R(A_EXT_WAKEUP_ST)] |= pads;
+        }
+        if (s->lp_sys) {
+            esp32p4_lp_sys_ext_wakeup1(s->lp_sys, pads);
+        }
     }
     pmu_raise_lp(s, LP_INT_SLEEP_SWITCH_ACTIVE_START);
     if (s->state == ESP32P4_PMU_ST_LP_SLEEP) {
@@ -1974,6 +1981,8 @@ static const Property esp32p4_pmu_properties[] = {
                      ESP32P4ClkRstState *),
     DEFINE_PROP_LINK("lp-cpu", ESP32P4PMUState, lp_cpu, TYPE_CPU,
                      CPUState *),
+    DEFINE_PROP_LINK("lp-sys", ESP32P4PMUState, lp_sys, TYPE_ESP32P4_LP_SYS,
+                     ESP32P4LPSysState *),
 };
 
 static void esp32p4_pmu_class_init(ObjectClass *klass, const void *data)
