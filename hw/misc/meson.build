@@ -252,7 +252,6 @@ system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_pmu.c',
   'esp32p4_rmt.c',
   'esp32p4_rsa.c',
-  'esp32p4_sha.c',
   'esp32p4_touch.c',
   'esp32p4_trng.c',
   'esp32p4_tsens.c',
@@ -260,6 +259,7 @@ system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
 # The blocks that reach into the cores.
 specific_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_assist_debug.c',
+  'esp32p4_sha.c',
   'esp32p4_lp_sys.c',
   'esp32p4_trace.c',
 ))
