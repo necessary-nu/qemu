@@ -14,12 +14,17 @@
  * The medium is QEMU's network backend, a link partner that advertises
  * every 10/100 mode and symmetric pause. Auto-negotiation with it, and
  * reset, complete at once. The PHY's interrupt pin is not modelled.
+ *
+ * Held in reset through RESET_N the PHY has no link, does not answer on
+ * MDIO and stops its 50 MHz RMII reference output (50M_CLKO, the clock
+ * output "rmii-ref"); released, it starts from its reset state.
  */
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/net/ip101_phy.h"
 #include "hw/net/mii.h"
@@ -71,7 +76,8 @@
 
 static void ip101_update_link(IP101PhyState *s)
 {
-    bool link = s->medium_up && !(s->bmcr & MII_BMCR_PDOWN);
+    bool link = s->medium_up && !s->reset_held &&
+                !(s->bmcr & MII_BMCR_PDOWN);
     bool speed_100 = s->speed_100;
     bool full_duplex = s->full_duplex;
     uint16_t isr = 0;
@@ -146,13 +152,31 @@ bool ip101_phy_link_up(IP101PhyState *s)
 
 bool ip101_phy_loopback(IP101PhyState *s)
 {
-    return (s->bmcr & MII_BMCR_LOOPBACK) &&
+    return !s->reset_held && (s->bmcr & MII_BMCR_LOOPBACK) &&
            !(s->bmcr & (MII_BMCR_ISOLATE | MII_BMCR_PDOWN));
 }
 
 bool ip101_phy_isolated(IP101PhyState *s)
 {
-    return s->bmcr & MII_BMCR_ISOLATE;
+    return s->reset_held || (s->bmcr & MII_BMCR_ISOLATE);
+}
+
+bool ip101_phy_responds(IP101PhyState *s, unsigned addr)
+{
+    return !s->reset_held && addr == s->addr;
+}
+
+/* [spec:nuos:req:emu.esp32p4.emac] */
+static void ip101_phy_set_reset(void *opaque, int n, int level)
+{
+    IP101PhyState *s = opaque;
+
+    if (s->reset_held == !!level) {
+        return;
+    }
+    s->reset_held = level;
+    ip101_reset_regs(s);
+    clock_update_hz(s->ref_clk, level ? 0 : IP101_PHY_REF_HZ);
 }
 
 /* The resolved mode, as CSSR's operation mode field encodes it */
@@ -283,12 +307,22 @@ static void ip101_phy_reset_hold(Object *obj, ResetType type)
     ip101_reset_regs(IP101_PHY(obj));
 }
 
+static void ip101_phy_init(Object *obj)
+{
+    IP101PhyState *s = IP101_PHY(obj);
+
+    qdev_init_gpio_in_named(DEVICE(obj), ip101_phy_set_reset,
+                            IP101_PHY_RESET, 1);
+    s->ref_clk = qdev_init_clock_out(DEVICE(obj), "rmii-ref");
+}
+
 static const VMStateDescription vmstate_ip101_phy = {
     .name = TYPE_IP101_PHY,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(medium_up, IP101PhyState),
+        VMSTATE_BOOL(reset_held, IP101PhyState),
         VMSTATE_UINT16(bmcr, IP101PhyState),
         VMSTATE_UINT16(anar, IP101PhyState),
         VMSTATE_BOOL(bmsr_link, IP101PhyState),
@@ -315,7 +349,9 @@ static void ip101_phy_realize(DeviceState *dev, Error **errp)
 
     if (s->addr > 31) {
         error_setg(errp, "ip101-phy: MDIO address %u out of range", s->addr);
+        return;
     }
+    clock_set_hz(s->ref_clk, s->reset_held ? 0 : IP101_PHY_REF_HZ);
 }
 
 static void ip101_phy_class_init(ObjectClass *klass, const void *data)
@@ -334,6 +370,7 @@ static const TypeInfo ip101_phy_info = {
     .name = TYPE_IP101_PHY,
     .parent = TYPE_DEVICE,
     .instance_size = sizeof(IP101PhyState),
+    .instance_init = ip101_phy_init,
     .class_init = ip101_phy_class_init,
 };
 

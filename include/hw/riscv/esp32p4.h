@@ -28,6 +28,8 @@
 #include "hw/misc/esp32p4_icm.h"
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/misc/esp32p4_pms.h"
+#include "hw/net/esp32p4_emac.h"
+#include "hw/net/ip101_phy.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/sd/esp32p4_sdmmc.h"
 #include "hw/timer/esp32p4_lp_timer.h"
@@ -86,6 +88,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 #define ESP32P4_LP_RESET_VECTOR     ESP32P4_LP_ROM_BASE
 
 #define ESP32P4_ROM_FILE            "esp32p4-rev3-rom.bin"
+
+/* The board pad the IP101GRI's RESET_N is on */
+#define ESP32P4_BOARD_PHY_RESET_PAD 51
 
 struct ESP32P4MachineState {
     MachineState parent_obj;
@@ -151,6 +156,11 @@ struct ESP32P4MachineState {
     ESP32P4CacheState cache;
     SSIBus *flash_bus;
     uint64_t flash_size;
+
+    /* The EMAC and the board's IP101GRI PHY, and the EMAC's PPS output */
+    ESP32P4EmacState emac;
+    IP101PhyState phy;
+    SplitIRQ pps_split;
 };
 
 #endif
