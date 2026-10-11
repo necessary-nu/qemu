@@ -802,6 +802,26 @@ void esp32p4_clkrst_set_system_reset_cause(ESP32P4ClkRstState *s,
  */
 uint8_t esp32p4_clkrst_system_reset_cause(ESP32P4ClkRstState *s);
 
+/* A divider's setting: integer part (at least 1), numerator, denominator. */
+typedef struct ESP32P4ClkDiv {
+    uint32_t integer;
+    uint32_t numerator;
+    uint32_t denominator;
+} ESP32P4ClkDiv;
+
+/*
+ * Whether clock ESP32P4_CLK_@clk runs from a pad now: its mux selects its
+ * pad clock (PAD_PARLIO_RX_CLK, ...) and every gate on the way is open,
+ * its own enable and LP_CLKRST's of the pad clock. A pad clock reaches
+ * its block through the GPIO matrix, edge by edge, which a frequency
+ * cannot carry: a block whose clock can come from a pad (PARLIO's units,
+ * clocked by an external device) takes the pad's edges from the matrix
+ * itself and asks here, at each edge, whether they clock it, and through
+ * what divider, which *@div receives.
+ */
+bool esp32p4_clkrst_pad_source(ESP32P4ClkRstState *s, unsigned clk,
+                               ESP32P4ClkDiv *div);
+
 /*
  * An HP core reset (TRM 11.1) from @source, an ESP32P4_HP_CORE_RESET_*:
  * the HP system's reset, of both HP cores, every HP block and

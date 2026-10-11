@@ -1665,6 +1665,53 @@ uint8_t esp32p4_clkrst_system_reset_cause(ESP32P4ClkRstState *s)
     return s->system_reset_cause;
 }
 
+/* [spec:nuos:req:emu.esp32p4.parlio] */
+bool esp32p4_clkrst_pad_source(ESP32P4ClkRstState *s, unsigned clk,
+                               ESP32P4ClkDiv *div)
+{
+    const ClkDesc *d, *pd;
+    uint32_t sel;
+    int16_t p;
+    int i;
+
+    assert(clk < ESP32P4_NUM_CLOCKS);
+    d = &esp32p4_clk_desc[clk];
+    if (d->kind == SPECIAL) {
+        return false;
+    }
+    sel = fld(s, d->sel);
+    if (sel >= d->nparents) {
+        return false;
+    }
+    p = d->parent[sel];
+    if (p == PARENT_NONE || (p & PARENT_IN)) {
+        return false;
+    }
+    /* A pad clock: the clock input of a pad, behind its own gate. */
+    pd = &esp32p4_clk_desc[p];
+    if (pd->kind == SPECIAL || pd->nparents != 1 ||
+        pd->parent[0] == PARENT_NONE || !(pd->parent[0] & PARENT_IN)) {
+        return false;
+    }
+    for (i = 0; i < ARRAY_SIZE(d->gate); i++) {
+        if ((d->gate[i].width && !fld(s, d->gate[i])) ||
+            (pd->gate[i].width && !fld(s, pd->gate[i]))) {
+            return false;
+        }
+    }
+    div->integer = 1;
+    div->numerator = 0;
+    div->denominator = 0;
+    if (d->kind == DIV_INT || d->kind == DIV_FRAC) {
+        div->integer = fld(s, d->div[0]) + 1;
+    }
+    if (d->kind == DIV_FRAC) {
+        div->numerator = fld(s, d->div[1]);
+        div->denominator = fld(s, d->div[2]);
+    }
+    return true;
+}
+
 /*
  * Time the current phase of core @n's CPU reset, in cycles of its clock;
  * while that clock is stopped the phase waits for it.
