@@ -393,6 +393,12 @@ static int64_t pad_uv(Esp32SensState *s, unsigned unit, unsigned ch)
             return dac_uv(s, d);
         }
     }
+    /*
+     * A pad a block drives digitally is sampled at its level now: the line
+     * sources are brought up to the moment of the sample first, however
+     * late the host has run their timers.
+     */
+    esp32_line_sync();
     if (esp32_gpio_pad_driven(s->gpio, pad, &level)) {
         return level ? VDD_MV * 1000 : 0;
     }

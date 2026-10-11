@@ -20,6 +20,11 @@
  * In RTC function 1 (FUN_SEL 3) the pads TOUCH_PAD0 to TOUCH_PAD3 (RTC GPIO
  * 10 to 13) carry the RTC I2C controller's SCL and SDA, on the pads
  * RTCIO_SAR_I2C_SCL_SEL and RTCIO_SAR_I2C_SDA_SEL choose (TRM table 6.11-1).
+ *
+ * A register access acts at the moment it began (hw/gpio/esp32_line.h):
+ * every pad control it changes reaches the GPIO matrix, and every block
+ * the pads drive, at that one time, and RTC_GPIO_IN reads the pads as
+ * the line sources drive them at that time.
  */
 
 #include "qemu/osdep.h"
@@ -28,6 +33,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/gpio/esp32_rtcio.h"
 #include "hw/misc/esp32_rtc_cntl.h"
 #include "migration/vmstate.h"
@@ -374,10 +380,8 @@ void esp32_rtcio_hold_changed(Esp32RtcIoState *s)
     esp32_rtcio_update(s);
 }
 
-static uint64_t esp32_rtcio_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t rtcio_reg_read(Esp32RtcIoState *s, hwaddr addr)
 {
-    Esp32RtcIoState *s = ESP32_RTCIO(opaque);
-
     switch (addr) {
     case A_RTCIO_RTC_GPIO_OUT_W1TS:
     case A_RTCIO_RTC_GPIO_OUT_W1TC:
@@ -387,6 +391,8 @@ static uint64_t esp32_rtcio_read(void *opaque, hwaddr addr, unsigned size)
     case A_RTCIO_RTC_GPIO_STATUS_W1TC:
         return 0;
     case A_RTCIO_RTC_GPIO_IN:
+        /* The pads as the line sources drive them now */
+        esp32_line_sync();
         return s->pad_in << ESP32_RTCIO_GPIO_SHIFT;
     default:
         if (addr > A_RTCIO_DATE) {
@@ -433,10 +439,8 @@ static void esp32_rtcio_check_fun_sel(Esp32RtcIoState *s, uint32_t old,
     }
 }
 
-static void esp32_rtcio_write(void *opaque, hwaddr addr, uint64_t value,
-                              unsigned size)
+static void rtcio_reg_write(Esp32RtcIoState *s, hwaddr addr, uint64_t value)
 {
-    Esp32RtcIoState *s = ESP32_RTCIO(opaque);
     uint32_t *r = &s->regs[addr / 4];
     uint32_t v = value & RTC_GPIO_MASK;
     uint32_t old;
@@ -498,6 +502,44 @@ static void esp32_rtcio_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     }
     esp32_rtcio_update(s);
+}
+
+/* A register access under way, which acts at one moment throughout. */
+typedef struct RtcioAccess {
+    Esp32RtcIoState *s;
+    hwaddr addr;
+    uint64_t value;
+} RtcioAccess;
+
+static void rtcio_access_read(void *opaque)
+{
+    RtcioAccess *a = opaque;
+
+    a->value = rtcio_reg_read(a->s, a->addr);
+}
+
+static void rtcio_access_write(void *opaque)
+{
+    RtcioAccess *a = opaque;
+
+    rtcio_reg_write(a->s, a->addr, a->value);
+}
+
+/* [spec:nuos:req:emu.esp32.rtc] */
+static uint64_t esp32_rtcio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    RtcioAccess a = { .s = ESP32_RTCIO(opaque), .addr = addr };
+
+    esp32_line_run_at(esp32_line_time(), rtcio_access_read, &a);
+    return a.value;
+}
+
+static void esp32_rtcio_write(void *opaque, hwaddr addr, uint64_t value,
+                              unsigned size)
+{
+    RtcioAccess a = { .s = ESP32_RTCIO(opaque), .addr = addr, .value = value };
+
+    esp32_line_run_at(esp32_line_time(), rtcio_access_write, &a);
 }
 
 static const MemoryRegionOps esp32_rtcio_ops = {

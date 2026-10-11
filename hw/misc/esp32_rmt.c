@@ -23,13 +23,19 @@
  * there are no per-tick events. When the timer runs late, or a register
  * access finds events due, every due event is processed in order, each at
  * its own virtual time, so signal edges at rates far above the timer's
- * resolution are delivered as a batch with their exact times. An output
- * edge passes through the GPIO matrix at once; an RMT input that changes
- * in response takes the time of the edge that caused it, so a channel
- * receiving another's output through the matrix measures the transmitted
- * durations exactly. Every edge is still delivered: the cost of a
- * transmission is proportional to its number of edges, carrier edges
- * included.
+ * resolution are delivered as a batch with their exact times. Times are
+ * those of the signal lines (hw/gpio/esp32_line.h): an output edge is
+ * stamped with its time on the GPIO matrix signal, and an input changes
+ * at the time its change is stamped with, so a channel receiving another
+ * block's output through the matrix, or another channel's, measures the
+ * transmitted durations exactly. The block is a line source: a block that
+ * samples the pads brings the transmitters up to the moment it samples
+ * at, and a register access or the block's timer, while a receiver is
+ * enabled, first brings every other source up to the moment it acts at,
+ * so that an edge sent late (the host running behind virtual time without
+ * icount) still reaches the receiver before it records the time after it.
+ * Every edge is still delivered: the cost of a transmission is
+ * proportional to its number of edges, carrier edges included.
  *
  * Behaviour the TRM leaves open, as modelled:
  * - TX_START starts the transmitter when written as 1 while it is idle,
@@ -96,6 +102,7 @@
 #include "qemu/host-utils.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32_rmt.h"
 #include "migration/vmstate.h"
 
@@ -299,22 +306,22 @@ static void update_irq(Esp32RmtState *s)
     qemu_set_irq(s->irq, (s->int_raw & s->int_ena) != 0);
 }
 
-/* Drive channel n's output to level from time t. */
+/*
+ * Drive channel n's output to level from time t, stamped with t. An input
+ * of this block that changes in response does not run the channels again.
+ */
 static void set_out(Esp32RmtState *s, unsigned n, uint8_t level, int64_t t)
 {
     Esp32RmtChannel *c = &s->ch[n];
-    bool was_emitting = s->emitting;
-    int64_t was_ns = s->emit_ns;
+    bool was_running = s->running;
 
     if (c->out_level == level) {
         return;
     }
     c->out_level = level;
-    s->emitting = true;
-    s->emit_ns = t;
-    qemu_set_irq(s->sig_out[n], level);
-    s->emitting = was_emitting;
-    s->emit_ns = was_ns;
+    s->running = true;
+    esp32_line_set_at(s->sig_out[n], level, t);
+    s->running = was_running;
 }
 
 /* [spec:nuos:req:emu.esp32.rmt] */
@@ -702,12 +709,17 @@ static int64_t rx_next_event(Esp32RmtState *s, unsigned n)
  */
 static void rmt_sync(Esp32RmtState *s, int64_t now)
 {
+    if (s->running) {
+        return;
+    }
+    s->running = true;
     for (unsigned n = 0; n < ESP32_RMT_CHANNELS; n++) {
         tx_advance(s, n, now);
     }
     for (unsigned n = 0; n < ESP32_RMT_CHANNELS; n++) {
         rx_advance(s, n, now);
     }
+    s->running = false;
 }
 
 static void rmt_schedule(Esp32RmtState *s)
@@ -730,19 +742,74 @@ static void rmt_schedule(Esp32RmtState *s)
     update_irq(s);
 }
 
+static bool rmt_receiving(Esp32RmtState *s)
+{
+    for (unsigned n = 0; n < ESP32_RMT_CHANNELS; n++) {
+        if (ch_conf1(&s->ch[n], CONF1_RX_EN)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void rmt_sync_sources(void *opaque)
+{
+    esp32_line_sync();
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rmt]
+ * Bring the block up to now (esp32_line_time()): with a receiver enabled,
+ * every source of line changes first, this block's transmitters among
+ * them, so that no input edge older than now is still to come when the
+ * receivers run up to now.
+ */
+static void rmt_catch_up(Esp32RmtState *s)
+{
+    int64_t t = esp32_line_time();
+
+    if (rmt_receiving(s)) {
+        esp32_line_run_at(t, rmt_sync_sources, NULL);
+    }
+    rmt_sync(s, t);
+}
+
 static void rmt_timer_cb(void *opaque)
 {
     Esp32RmtState *s = opaque;
 
-    rmt_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    rmt_catch_up(s);
     rmt_schedule(s);
 }
 
-/* [spec:nuos:req:emu.esp32.rmt] */
+/*
+ * The transmitters as a line source, for blocks that sample the pads. Only
+ * the transmitters: a receiver run up to the moment of the sample could
+ * find a line idle whose edges another source, not yet brought up to it,
+ * is still to send.
+ */
+static void rmt_line_sync(Notifier *notifier, void *data)
+{
+    Esp32RmtState *s = container_of(notifier, Esp32RmtState, line_source);
+    int64_t t = esp32_line_time();
+
+    if (s->running) {
+        return;
+    }
+    s->running = true;
+    for (unsigned n = 0; n < ESP32_RMT_CHANNELS; n++) {
+        tx_advance(s, n, t);
+    }
+    s->running = false;
+    rmt_schedule(s);
+}
+
+/* [spec:nuos:req:emu.esp32.rmt] An input changes at its stamp's time. */
 static void esp32_rmt_sig_in(void *opaque, int n, int level)
 {
     Esp32RmtState *s = opaque;
     Esp32RmtChannel *c = &s->ch[n];
+    bool outer = !s->running;
     int64_t t;
 
     level = level != 0;
@@ -753,17 +820,17 @@ static void esp32_rmt_sig_in(void *opaque, int n, int level)
         c->in_raw = c->in_filt = c->in_samp = level;
         return;
     }
-    if (s->emitting) {
-        t = s->emit_ns;
-    } else {
-        t = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    t = esp32_line_time();
+    if (outer) {
+        s->running = true;
         for (unsigned i = 0; i < ESP32_RMT_CHANNELS; i++) {
             tx_advance(s, i, t);
         }
     }
     rx_advance(s, n, t);
     rx_raw(s, n, t, level);
-    if (!s->emitting) {
+    if (outer) {
+        s->running = false;
         rmt_schedule(s);
     }
 }
@@ -834,12 +901,11 @@ static void fifo_write(Esp32RmtState *s, unsigned n, uint32_t v)
     }
 }
 
-static uint64_t esp32_rmt_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t rmt_reg_read(Esp32RmtState *s, hwaddr addr)
 {
-    Esp32RmtState *s = opaque;
     unsigned n;
 
-    rmt_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    rmt_catch_up(s);
     rmt_schedule(s);
     switch (addr) {
     case A_DATA(0) ... A_DATA(7):
@@ -953,15 +1019,13 @@ static void conf1_write(Esp32RmtState *s, unsigned n, uint32_t v, int64_t now)
     }
 }
 
-static void esp32_rmt_write(void *opaque, hwaddr addr, uint64_t value,
-                            unsigned size)
+static void rmt_reg_write(Esp32RmtState *s, hwaddr addr, uint64_t value)
 {
-    Esp32RmtState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
     uint32_t v = value;
     unsigned n;
 
-    rmt_sync(s, now);
+    rmt_catch_up(s);
     switch (addr) {
     case A_DATA(0) ... A_DATA(7):
         fifo_write(s, addr / 4, v);
@@ -1007,6 +1071,51 @@ static void esp32_rmt_write(void *opaque, hwaddr addr, uint64_t value,
     rmt_schedule(s);
 }
 
+/* A register or RAM access under way, which acts at one moment throughout. */
+typedef struct RmtAccess {
+    Esp32RmtState *s;
+    hwaddr addr;
+    uint64_t value;
+    unsigned size;
+} RmtAccess;
+
+static void rmt_access_read(void *opaque)
+{
+    RmtAccess *a = opaque;
+
+    a->value = rmt_reg_read(a->s, a->addr);
+}
+
+static void rmt_access_write(void *opaque)
+{
+    RmtAccess *a = opaque;
+
+    rmt_reg_write(a->s, a->addr, a->value);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rmt]
+ * A register or RAM access acts at the moment it began (see
+ * esp32_line.h): what it reads, the transmission it starts and the line
+ * changes it makes belong to that moment, however long the access takes
+ * without icount.
+ */
+static uint64_t esp32_rmt_read(void *opaque, hwaddr addr, unsigned size)
+{
+    RmtAccess a = { .s = opaque, .addr = addr, .size = size };
+
+    esp32_line_run_at(esp32_line_time(), rmt_access_read, &a);
+    return a.value;
+}
+
+static void esp32_rmt_write(void *opaque, hwaddr addr, uint64_t value,
+                            unsigned size)
+{
+    RmtAccess a = { .s = opaque, .addr = addr, .value = value, .size = size };
+
+    esp32_line_run_at(esp32_line_time(), rmt_access_write, &a);
+}
+
 static const MemoryRegionOps esp32_rmt_ops = {
     .read = esp32_rmt_read,
     .write = esp32_rmt_write,
@@ -1033,31 +1142,46 @@ static bool ram_accessible(Esp32RmtState *s, hwaddr addr, bool write)
 }
 
 /* [spec:nuos:req:emu.esp32.rmt] */
+static void rmt_ram_access_read(void *opaque)
+{
+    RmtAccess *a = opaque;
+    Esp32RmtState *s = a->s;
+
+    rmt_catch_up(s);
+    rmt_schedule(s);
+    a->value = ram_accessible(s, a->addr, false) ?
+               extract32(s->ram[a->addr / 4], (a->addr & 3) * 8,
+                         a->size * 8) : 0;
+}
+
+static void rmt_ram_access_write(void *opaque)
+{
+    RmtAccess *a = opaque;
+    Esp32RmtState *s = a->s;
+
+    rmt_catch_up(s);
+    rmt_schedule(s);
+    if (!ram_accessible(s, a->addr, true)) {
+        return;
+    }
+    s->ram[a->addr / 4] = deposit32(s->ram[a->addr / 4], (a->addr & 3) * 8,
+                                    a->size * 8, a->value);
+}
+
 static uint64_t esp32_rmt_ram_read(void *opaque, hwaddr addr, unsigned size)
 {
-    Esp32RmtState *s = opaque;
-    unsigned shift = (addr & 3) * 8;
+    RmtAccess a = { .s = opaque, .addr = addr, .size = size };
 
-    rmt_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-    rmt_schedule(s);
-    if (!ram_accessible(s, addr, false)) {
-        return 0;
-    }
-    return extract32(s->ram[addr / 4], shift, size * 8);
+    esp32_line_run_at(esp32_line_time(), rmt_ram_access_read, &a);
+    return a.value;
 }
 
 static void esp32_rmt_ram_write(void *opaque, hwaddr addr, uint64_t value,
                                 unsigned size)
 {
-    Esp32RmtState *s = opaque;
-    unsigned shift = (addr & 3) * 8;
+    RmtAccess a = { .s = opaque, .addr = addr, .value = value, .size = size };
 
-    rmt_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-    rmt_schedule(s);
-    if (!ram_accessible(s, addr, true)) {
-        return;
-    }
-    s->ram[addr / 4] = deposit32(s->ram[addr / 4], shift, size * 8, value);
+    esp32_line_run_at(esp32_line_time(), rmt_ram_access_write, &a);
 }
 
 static const MemoryRegionOps esp32_rmt_ram_ops = {
@@ -1078,7 +1202,7 @@ static const MemoryRegionOps esp32_rmt_ram_ops = {
 static void esp32_rmt_clk_update(void *opaque, ClockEvent event)
 {
     Esp32RmtState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
 
     if (event == ClockPreUpdate) {
         rmt_sync(s, now);
@@ -1100,7 +1224,7 @@ static void esp32_rmt_reset_hold(Object *obj, ResetType type)
     s->int_ena = 0;
     s->apb_conf = 0;
     s->date = DATE_RESET;
-    s->emitting = false;
+    s->running = false;
     for (unsigned n = 0; n < ESP32_RMT_CHANNELS; n++) {
         Esp32RmtChannel *c = &s->ch[n];
         uint8_t in = c->in_raw;
@@ -1151,6 +1275,12 @@ static void esp32_rmt_init(Object *obj)
                                          esp32_rmt_clk_update, s,
                                          ClockPreUpdate | ClockUpdate);
     timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, rmt_timer_cb, s);
+    s->line_source.notify = rmt_line_sync;
+}
+
+static void esp32_rmt_realize(DeviceState *dev, Error **errp)
+{
+    esp32_line_add_source(&ESP32_RMT(dev)->line_source);
 }
 
 static const VMStateDescription vmstate_esp32_rmt_channel = {
@@ -1225,6 +1355,7 @@ static void esp32_rmt_class_init(ObjectClass *klass, const void *data)
 
     rc->phases.hold = esp32_rmt_reset_hold;
     rc->phases.exit = esp32_rmt_reset_exit;
+    dc->realize = esp32_rmt_realize;
     dc->vmsd = &vmstate_esp32_rmt;
 }
 
