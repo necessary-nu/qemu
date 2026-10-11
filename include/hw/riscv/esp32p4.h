@@ -12,6 +12,8 @@
 #include "qemu/units.h"
 #include "hw/core/boards.h"
 #include "hw/cpu/cluster.h"
+#include "hw/dma/esp32p4_dw_gdma.h"
+#include "hw/dma/esp32p4_gdma.h"
 #include "hw/core/split-irq.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "hw/intc/esp32p4_clic.h"
@@ -125,6 +127,9 @@ struct ESP32P4MachineState {
     /* The access permission managers, every master's way onto the bus. */
     ESP32P4PmsState pms;
     ESP32P4IcmState icm;
+    /* GDMA-AHB, GDMA-AXI. */
+    ESP32P4GdmaState gdma[2];
+    ESP32P4DwGdmaState vdma;
 
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];
