@@ -128,9 +128,11 @@
  *     on UARTn_SCLK and their core resets, their FIFO RAM ports on
  *     UARTn_SYS_CLK, their interrupts sources 31 to 35; and the LP UART at
  *     0x50121000, behind LPPERI's LP_UART clock and reset, its core on
- *     LP_UART_SCLK, its interrupt source 16 and its wakeup to LPPERI. Their
- *     TXD, RTS and DTR and RXD, CTS and DSR are GPIO matrix signals (the LP
- *     UART's the LP matrix's), reaching pads where software routes them.
+ *     LP_UART_SCLK, its interrupt source 16. Their wakeups, which the
+ *     PMU's UART_WAKEUP_EN arms, are PMU wakeup sources, the LP UART's
+ *     also LPPERI's LP_UART_WAKEUP_FLAG. Their TXD, RTS and DTR and RXD,
+ *     CTS and DSR are GPIO matrix signals (the LP UART's the LP matrix's),
+ *     reaching pads where software routes them.
  *
  *     The board's serial ports are terminals on UART pads, each sending and
  *     receiving frames on its pads at the format and baud rate its UART is
@@ -1862,10 +1864,10 @@ static void esp32p4_hp_top_power(void *opaque, int n, int level)
  *     HP_SYSTEM's interrupt wakeup (the TRM's "HP CPU" source) and the EXT
  *     wakeup on pads GPIO0 to GPIO15, which LP_SYSTEM records too. Its ETM
  *     task, PMU_TASK_SLEEP_REQ, and event, PMU_EVT_SLEEP_WAKEUP, are the
- *     ETM's (esp32p4_init_etm()). The other sources' "wakeup" lines,
- *     UART_WAKEUP_EN and the LP interrupt wait for the blocks that take
- *     them (UARTs, USB, SDIO, touch, LP I2S, EMAC, the LP core's
- *     interrupts).
+ *     ETM's (esp32p4_init_etm()); the UARTs' wakeups and UART_WAKEUP_EN
+ *     are the UARTs' (esp32p4_init_uart()). The other sources' "wakeup"
+ *     lines and the LP interrupt wait for the blocks that take them (USB,
+ *     SDIO, touch, LP I2S, EMAC, the LP core's interrupts).
  *   - LP_ANALOG_PERI, behind its LP_CLKRST reset, its interrupt source 8:
  *     the brown-out detector, on BIAS's thresholds, and the glitch and
  *     power supply detectors. The detector's "bod-en" is left at the
@@ -2626,7 +2628,10 @@ static void esp32p4_init_usb(ESP32P4MachineState *s)
  * comment): each UART's registers behind its bus clock and APB reset,
  * FIFO_REG's read popping the RX FIFO and reading 0 while gated; its core
  * on its function clock and core reset; its lines through the GPIO
- * matrix. Then UHCI0, between the UARTs and GDMA-AHB.
+ * matrix. Their wakeup logic is armed by the PMU's UART_WAKEUP_EN, and
+ * their wakeups are its wakeup sources UART0 to UART4 and LP_UART; the
+ * LP UART's also sets LPPERI's LP_UART_WAKEUP_FLAG. Then UHCI0, between
+ * the UARTs and GDMA-AHB.
  */
 /* [spec:nuos:req:emu.esp32p4.uart] */
 static void esp32p4_init_uart(ESP32P4MachineState *s)
@@ -2657,9 +2662,18 @@ static void esp32p4_init_uart(ESP32P4MachineState *s)
           20, 21 },
     };
     DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
+    DeviceState *pmu = DEVICE(&s->pmu), *wake_en, *lp_wake;
     DeviceState *dev, *term;
     ESP32P4ClkRstGate *g;
     int i;
+
+    object_initialize_child(OBJECT(s), "uart-wakeup-en-split",
+                            &s->uart_wakeup_en_split, TYPE_SPLIT_IRQ);
+    wake_en = DEVICE(&s->uart_wakeup_en_split);
+    qdev_prop_set_uint16(wake_en, "num-lines", ESP32P4_UART_COUNT + 1);
+    qdev_realize(wake_en, NULL, &error_fatal);
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_UART_WAKEUP_EN, 0,
+                                qdev_get_gpio_in(wake_en, 0));
 
     for (i = 0; i < ESP32P4_UART_COUNT; i++) {
         g_autofree char *sclk = g_strdup_printf("uart%d-sclk", i);
@@ -2685,6 +2699,13 @@ static void esp32p4_init_uart(ESP32P4MachineState *s)
                                         ESP32P4_UART_CORE_RESET, 0));
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                            esp32p4_intr_source(s, ESP32P4_INTR_UART0 + i));
+        qdev_connect_gpio_out(wake_en, i,
+                              qdev_get_gpio_in_named(dev,
+                                  ESP32P4_UART_WAKEUP_EN, 0));
+        qdev_connect_gpio_out_named(dev, ESP32P4_UART_WAKEUP, 0,
+                                    qdev_get_gpio_in_named(pmu,
+                                        ESP32P4_PMU_WAKEUP,
+                                        ESP32P4_PMU_WAKE_UART0 - i));
 
         qdev_connect_gpio_out_named(dev, ESP32P4_UART_TXD, 0,
             qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT, lines[i].txd));
@@ -2715,9 +2736,22 @@ static void esp32p4_init_uart(ESP32P4MachineState *s)
     esp32p4_clkrst_gate_volatile(g, 0, 4);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        esp32p4_intr_source(s, ESP32P4_INTR_LP_UART));
+    qdev_connect_gpio_out(wake_en, ESP32P4_UART_COUNT,
+                          qdev_get_gpio_in_named(dev,
+                              ESP32P4_UART_WAKEUP_EN, 0));
+    object_initialize_child(OBJECT(s), "lp-uart-wakeup-split",
+                            &s->lp_uart_wakeup_split, TYPE_SPLIT_IRQ);
+    lp_wake = DEVICE(&s->lp_uart_wakeup_split);
+    qdev_prop_set_uint16(lp_wake, "num-lines", 2);
+    qdev_realize(lp_wake, NULL, &error_fatal);
     qdev_connect_gpio_out_named(dev, ESP32P4_UART_WAKEUP, 0,
-                                qdev_get_gpio_in_named(clkrst,
-                                    ESP32P4_CLKRST_LP_UART_WAKEUP, 0));
+                                qdev_get_gpio_in(lp_wake, 0));
+    qdev_connect_gpio_out(lp_wake, 0,
+                          qdev_get_gpio_in_named(clkrst,
+                              ESP32P4_CLKRST_LP_UART_WAKEUP, 0));
+    qdev_connect_gpio_out(lp_wake, 1,
+                          qdev_get_gpio_in_named(pmu, ESP32P4_PMU_WAKEUP,
+                                                 ESP32P4_PMU_WAKE_LP_UART));
     qdev_connect_gpio_out_named(dev, ESP32P4_UART_TXD, 0,
         qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_LP_SIG_OUT,
                                ESP32P4_LP_SIG_UART_TXD_PAD_OUT));
@@ -2998,9 +3032,9 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_sdmmc(s);
     esp32p4_init_emac(s);
     esp32p4_init_dma(s);
+    esp32p4_init_low_power(s);
     esp32p4_init_uart(s);
     esp32p4_init_usb_serial_jtag(s);
-    esp32p4_init_low_power(s);
     esp32p4_init_i3c(s);
     esp32p4_init_twai(s);
     esp32p4_init_etm(s);

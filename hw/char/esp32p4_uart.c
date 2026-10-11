@@ -465,7 +465,7 @@ static void uart_raise(ESP32P4UartState *s, uint32_t bits)
 
 static void uart_wake(ESP32P4UartState *s)
 {
-    if (!s->light_sleep || s->wakeup) {
+    if (!s->wakeup_en || s->wakeup) {
         return;
     }
     s->wakeup = true;
@@ -475,7 +475,7 @@ static void uart_wake(ESP32P4UartState *s)
 
 /*
  * [spec:nuos:req:emu.esp32p4.uart]
- * The wakeup conditions of TRM 45.4.8, while the chip is in light sleep:
+ * The wakeup conditions of TRM 45.4.8, while UART_WAKEUP_EN is set:
  * mode 0, enough rising edges on RXD; mode 1, more bytes in the RX FIFO
  * than RX_WAKE_UP_THRHD; mode 2 (a start bit) is checked as one arrives
  * and mode 3 (a character sequence) as each byte does.
@@ -484,7 +484,7 @@ static void uart_wake_check(ESP32P4UartState *s)
 {
     uint32_t c2 = s->regs[R(A_SLEEP_CONF2)];
 
-    if (!s->light_sleep || s->wakeup) {
+    if (!s->wakeup_en || s->wakeup) {
         return;
     }
     switch (SLEEP2_WK_MODE(c2)) {
@@ -515,7 +515,7 @@ static void uart_wake_char(ESP32P4UartState *s, uint8_t b)
     unsigned num = SLEEP2_WK_CHAR_NUM(c2), mask = SLEEP2_WK_CHAR_MASK(c2);
     uint8_t want[5];
 
-    if (!s->light_sleep || s->wakeup || SLEEP2_WK_MODE(c2) != 3) {
+    if (!s->wakeup_en || s->wakeup || SLEEP2_WK_MODE(c2) != 3) {
         return;
     }
     memmove(s->wake_chars, s->wake_chars + 1, 4);
@@ -1131,7 +1131,7 @@ static void uart_rx_filtered(ESP32P4UartState *s, bool level, int64_t t)
     }
     s->filt_out = level;
     uart_autobaud_edge(s, level, t);
-    if (level && s->light_sleep) {
+    if (level && s->wakeup_en) {
         s->wake_edges++;
         uart_wake_check(s);
     }
@@ -2065,15 +2065,15 @@ static void uart_dsr_in(void *opaque, int n, int level)
     uart_update_irq(s);
 }
 
-/* [spec:nuos:req:emu.esp32p4.uart] Light sleep from the PMU. */
-static void uart_light_sleep_in(void *opaque, int n, int level)
+/* [spec:nuos:req:emu.esp32p4.uart] UART_WAKEUP_EN from the PMU. */
+static void uart_wakeup_en_in(void *opaque, int n, int level)
 {
     ESP32P4UartState *s = ESP32P4_UART(opaque);
 
-    if (s->light_sleep == !!level) {
+    if (s->wakeup_en == !!level) {
         return;
     }
-    s->light_sleep = level;
+    s->wakeup_en = level;
     s->wake_edges = 0;
     s->wake_nchars = 0;
     if (!level && s->wakeup) {
@@ -2212,8 +2212,8 @@ static void uart_init(Object *obj)
     qdev_init_gpio_in_named(dev, uart_dsr_in, ESP32P4_UART_DSR, 1);
     qdev_init_gpio_in_named(dev, uart_core_reset_in, ESP32P4_UART_CORE_RESET,
                             1);
-    qdev_init_gpio_in_named(dev, uart_light_sleep_in,
-                            ESP32P4_UART_LIGHT_SLEEP, 1);
+    qdev_init_gpio_in_named(dev, uart_wakeup_en_in,
+                            ESP32P4_UART_WAKEUP_EN, 1);
     timer_init_ns(&s->tx_timer, QEMU_CLOCK_VIRTUAL, uart_tx_timer_cb, s);
     timer_init_ns(&s->update_timer, QEMU_CLOCK_VIRTUAL, uart_update_timer_cb,
                   s);
@@ -2261,7 +2261,7 @@ static const VMStateDescription vmstate_esp32p4_uart = {
         VMSTATE_BOOL(rxd_pin, ESP32P4UartState),
         VMSTATE_BOOL(cts_pin, ESP32P4UartState),
         VMSTATE_BOOL(dsr_pin, ESP32P4UartState),
-        VMSTATE_BOOL(light_sleep, ESP32P4UartState),
+        VMSTATE_BOOL(wakeup_en, ESP32P4UartState),
         VMSTATE_BOOL(core_reset, ESP32P4UartState),
         VMSTATE_BOOL(tx_line, ESP32P4UartState),
         VMSTATE_BOOL(rts_line, ESP32P4UartState),

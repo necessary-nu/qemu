@@ -149,6 +149,18 @@
 #define LP_UART_WAKEUP_FLAG            (1u << 1)
 #define LP_UART_WAKEUP_EN              (1u << 29)
 
+#define PMU_HP_SLEEP_HP_SYS_CNTL       0x50115078
+#define PMU_SLP_WAKEUP_CNTL0           0x50115120
+#define PMU_SLP_WAKEUP_CNTL2           0x50115128
+#define PMU_SLP_WAKEUP_STATUS0         0x50115144
+#define PMU_MAIN_STATE                 0x501151a4
+#define PMU_CNTL_UART_WAKEUP_EN        (1u << 24)
+#define PMU_CNTL_DIG_CPU_STALL         (1u << 29)
+#define PMU_SLEEP_REQ                  (1u << 31)
+#define PMU_WAKE_UART2                 6
+#define PMU_WAKE_LP_UART               10
+#define PMU_STATE_ACTIVE               0x01
+
 static QTestState *start(void)
 {
     return qtest_init("-M esp32p4,flash-size=16M -serial none");
@@ -891,8 +903,9 @@ static void test_resets(void)
 }
 
 /*
- * Light-sleep wakeup: mode 2 wakes on a start bit, raising WAKEUP and the
- * wakeup output; mode 0 needs ACTIVE_THRESHOLD + 6 rising edges on RXD.
+ * Wakeup, armed by the PMU's UART_WAKEUP_EN: mode 2 wakes on a start
+ * bit, raising WAKEUP and the wakeup output; mode 0 needs
+ * ACTIVE_THRESHOLD + 6 rising edges on RXD.
  * The LP UART's wakeup reaches LPPERI's flag.
  */
 /* [spec:nuos:req:emu.esp32p4.uart/test] */
@@ -909,26 +922,26 @@ static void test_wakeup(void)
     wr(qts, UART(1), FIFO, 0x00);
     qtest_clock_step(qts, FRAME_NS + BIT_NS);
     g_assert_false(rd(qts, UART(2), INT_RAW) & INT_WAKEUP);
-    qtest_set_irq_in(qts, UART_PATH(2), "light-sleep", 0, 1);
+    qtest_set_irq_in(qts, UART_PATH(2), "wakeup-en", 0, 1);
     wr(qts, UART(1), FIFO, 0x00);
     qtest_clock_step(qts, BIT_NS);
     g_assert_true(rd(qts, UART(2), INT_RAW) & INT_WAKEUP);
     g_assert_true(qtest_get_irq(qts, 0));
-    qtest_set_irq_in(qts, UART_PATH(2), "light-sleep", 0, 0);
+    qtest_set_irq_in(qts, UART_PATH(2), "wakeup-en", 0, 0);
     g_assert_false(qtest_get_irq(qts, 0));
 
     /* Mode 0, ACTIVE_THRESHOLD 2: 8 rising edges; 0x55 has 5 a frame */
     qtest_clock_step(qts, 2 * FRAME_NS);
     wr(qts, UART(2), INT_CLR, INT_WAKEUP);
     wr(qts, UART(2), SLEEP_CONF2, 0x00140002);
-    qtest_set_irq_in(qts, UART_PATH(2), "light-sleep", 0, 1);
+    qtest_set_irq_in(qts, UART_PATH(2), "wakeup-en", 0, 1);
     wr(qts, UART(1), FIFO, 0x55);
     qtest_clock_step(qts, FRAME_NS);
     g_assert_false(rd(qts, UART(2), INT_RAW) & INT_WAKEUP);
     wr(qts, UART(1), FIFO, 0x55);
     qtest_clock_step(qts, FRAME_NS);
     g_assert_true(rd(qts, UART(2), INT_RAW) & INT_WAKEUP);
-    qtest_set_irq_in(qts, UART_PATH(2), "light-sleep", 0, 0);
+    qtest_set_irq_in(qts, UART_PATH(2), "wakeup-en", 0, 0);
 
     /* The LP UART, in mode 1 with RX_WAKE_UP_THRHD 0: its first byte */
     qtest_writel(qts, LPPERI_MEM_CTRL,
@@ -937,12 +950,76 @@ static void test_wakeup(void)
     wr(qts, LP_UART, CONF0, CONF0_8N1 | CONF0_LOOPBACK);
     update(qts, LP_UART);
     wr(qts, LP_UART, SLEEP_CONF2, 0x00140000 | (1u << 26));
-    qtest_set_irq_in(qts, LP_UART_PATH, "light-sleep", 0, 1);
+    qtest_set_irq_in(qts, LP_UART_PATH, "wakeup-en", 0, 1);
     g_assert_false(qtest_readl(qts, LPPERI_MEM_CTRL) & LP_UART_WAKEUP_FLAG);
     wr(qts, LP_UART, FIFO, 0x31);
     qtest_clock_step(qts, 12 * BIT_NS);
     g_assert_true(rd(qts, LP_UART, INT_RAW) & INT_WAKEUP);
     g_assert_true(qtest_readl(qts, LPPERI_MEM_CTRL) & LP_UART_WAKEUP_FLAG);
+    qtest_quit(qts);
+}
+
+static uint32_t pmu_state(QTestState *qts)
+{
+    return qtest_readl(qts, PMU_MAIN_STATE) >> 25;
+}
+
+/*
+ * Through the PMU, set up as ESP-IDF's pmu_param.c has it: HP_SLEEP's
+ * UART_WAKEUP_EN arms UART2 as the chip falls asleep, and a start bit on
+ * its RXD wakes the chip, the PMU recording source UART2; awake, with
+ * HP_ACTIVE's UART_WAKEUP_EN clear, a start bit wakes nothing. The LP
+ * UART's wakeup is the PMU's LP_UART source.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+static void test_pmu_wakeup(void)
+{
+    QTestState *qts = start();
+
+    /* RXD idles high, as a line on a pad would. */
+    qtest_set_irq_in(qts, UART_PATH(2), "rxd", 0, 1);
+    qtest_set_irq_in(qts, LP_UART_PATH, "rxd", 0, 1);
+    setup(qts, UART(2), CONF0_8N1);
+    wr(qts, UART(2), SLEEP_CONF2, 0x001404f0 | (2u << 26));
+    qtest_writel(qts, PMU_HP_SLEEP_HP_SYS_CNTL,
+                 PMU_CNTL_UART_WAKEUP_EN | PMU_CNTL_DIG_CPU_STALL);
+    qtest_writel(qts, PMU_SLP_WAKEUP_CNTL2, 1u << PMU_WAKE_UART2);
+    qtest_writel(qts, PMU_SLP_WAKEUP_CNTL0, PMU_SLEEP_REQ);
+    qtest_clock_step(qts, 100 * BIT_NS);
+    g_assert_cmphex(pmu_state(qts), !=, PMU_STATE_ACTIVE);
+
+    qtest_set_irq_in(qts, UART_PATH(2), "rxd", 0, 0);
+    qtest_clock_step(qts, BIT_NS);
+    qtest_set_irq_in(qts, UART_PATH(2), "rxd", 0, 1);
+    qtest_clock_step(qts, 200 * BIT_NS);
+    g_assert_cmphex(pmu_state(qts), ==, PMU_STATE_ACTIVE);
+    g_assert_cmphex(qtest_readl(qts, PMU_SLP_WAKEUP_STATUS0), ==,
+                    1u << PMU_WAKE_UART2);
+    g_assert_true(rd(qts, UART(2), INT_RAW) & INT_WAKEUP);
+
+    wr(qts, UART(2), INT_CLR, INT_WAKEUP);
+    qtest_set_irq_in(qts, UART_PATH(2), "rxd", 0, 0);
+    qtest_clock_step(qts, BIT_NS);
+    qtest_set_irq_in(qts, UART_PATH(2), "rxd", 0, 1);
+    qtest_clock_step(qts, FRAME_NS);
+    g_assert_false(rd(qts, UART(2), INT_RAW) & INT_WAKEUP);
+
+    /* The LP UART, in mode 1 with RX_WAKE_UP_THRHD 0: its first byte */
+    wr(qts, LP_UART, CLKDIV, 20);
+    wr(qts, LP_UART, CONF0, CONF0_8N1);
+    update(qts, LP_UART);
+    wr(qts, LP_UART, SLEEP_CONF2, 0x00140000 | (1u << 26));
+    qtest_writel(qts, PMU_SLP_WAKEUP_CNTL2, 1u << PMU_WAKE_LP_UART);
+    qtest_writel(qts, PMU_SLP_WAKEUP_CNTL0, PMU_SLEEP_REQ);
+    qtest_clock_step(qts, 100 * BIT_NS);
+    g_assert_cmphex(pmu_state(qts), !=, PMU_STATE_ACTIVE);
+    qtest_set_irq_in(qts, LP_UART_PATH, "rxd", 0, 0);
+    qtest_clock_step(qts, 9 * BIT_NS);
+    qtest_set_irq_in(qts, LP_UART_PATH, "rxd", 0, 1);
+    qtest_clock_step(qts, 200 * BIT_NS);
+    g_assert_cmphex(pmu_state(qts), ==, PMU_STATE_ACTIVE);
+    g_assert_cmphex(qtest_readl(qts, PMU_SLP_WAKEUP_STATUS0), ==,
+                    1u << PMU_WAKE_LP_UART);
     qtest_quit(qts);
 }
 
@@ -1525,6 +1602,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/uart/lp_uart", test_lp_uart);
     qtest_add_func("esp32p4/uart/resets", test_resets);
     qtest_add_func("esp32p4/uart/wakeup", test_wakeup);
+    qtest_add_func("esp32p4/uart/pmu_wakeup", test_pmu_wakeup);
     qtest_add_func("esp32p4/uart/serial_port", test_serial_port);
     qtest_add_func("esp32p4/uart/uhci_tx", test_uhci_tx);
     qtest_add_func("esp32p4/uart/uhci_rx", test_uhci_rx);

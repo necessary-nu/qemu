@@ -55,10 +55,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4UartState, ESP32P4_UART)
  *   inputs ESP32P4_UART_RXD, _CTS, _DSR;
  *   input ESP32P4_UART_CORE_RESET: high while RST_EN_UARTn_CORE holds the
  *     UART core (transmitter, receiver, FIFOs) in reset;
- *   input ESP32P4_UART_LIGHT_SLEEP: high while the PMU has the chip in
- *     light sleep, when the wakeup logic watches the receiver;
- *   output ESP32P4_UART_WAKEUP: high from a wakeup until light sleep ends;
- *     the LP UART's goes to LPPERI ("lp-uart-wakeup").
+ *   input ESP32P4_UART_WAKEUP_EN: the PMU's UART_WAKEUP_EN, high while
+ *     the wakeup logic watches the receiver (in sleep, as ESP-IDF sets
+ *     the PMU up);
+ *   output ESP32P4_UART_WAKEUP: high from a wakeup until UART_WAKEUP_EN
+ *     falls, a PMU wakeup source; the LP UART's also goes to LPPERI
+ *     ("lp-uart-wakeup").
  * The interrupt is sysbus IRQ 0, the UARTn_INTR / LP_UART_INTR source.
  */
 #define ESP32P4_UART_TXD            "txd"
@@ -68,7 +70,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4UartState, ESP32P4_UART)
 #define ESP32P4_UART_CTS            "cts"
 #define ESP32P4_UART_DSR            "dsr"
 #define ESP32P4_UART_CORE_RESET     "core-reset"
-#define ESP32P4_UART_LIGHT_SLEEP    "light-sleep"
+#define ESP32P4_UART_WAKEUP_EN      "wakeup-en"
 #define ESP32P4_UART_WAKEUP         "wakeup"
 
 /*
@@ -142,11 +144,11 @@ struct ESP32P4UartState {
     ESP32P4UartFifo tx_fifo;
     ESP32P4UartFifo rx_fifo;
 
-    /* Inputs: the pins as driven, light sleep, and the core reset. */
+    /* Inputs: the pins as driven, the wakeup enable and the core reset. */
     bool rxd_pin;
     bool cts_pin;
     bool dsr_pin;
-    bool light_sleep;
+    bool wakeup_en;
     bool core_reset;
     /* The core's side of the lines, after inversion and loopback. */
     bool tx_line;

@@ -209,6 +209,8 @@ struct ESP32P4MachineState {
 
     ESP32P4UartState uart[ESP32P4_UART_COUNT];
     ESP32P4UartState lp_uart;
+    SplitIRQ uart_wakeup_en_split;
+    SplitIRQ lp_uart_wakeup_split;
     Esp32UartTerminalState terminal[ESP32P4_SERIAL_PORTS];
     ESP32P4UhciState uhci;
     ESP32P4UsjState usj;
