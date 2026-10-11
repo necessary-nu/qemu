@@ -49,6 +49,11 @@
  * SYSCON_SARADC_DATA_TO_I2S the receiver takes the SAR ADC DIG
  * controllers' results in place of the bus, and with
  * SENS_SAR_DAC_DIG_FORCE the transmitter's data feeds the DACs.
+ *
+ * A unit's events run at their own times (hw/gpio/esp32_line.h): when its
+ * timer runs late, as the host can make it without icount, each event due
+ * is run in turn at the time it fell due, so the lines it drives (the LCD
+ * bus and its strobe) and every block they reach see that time.
  */
 
 #include "qemu/osdep.h"
@@ -2121,22 +2126,43 @@ static int64_t i2s_event_time(int64_t anchor, double period, uint64_t n)
     return anchor + (int64_t)(n * period);
 }
 
+/* A unit's event under way, run at the time it fell due. */
+typedef struct I2sEvent {
+    Esp32I2sState *s;
+    uint64_t e;
+} I2sEvent;
+
+static void i2s_tx_event_at(void *opaque)
+{
+    I2sEvent *ev = opaque;
+
+    i2s_tx_event(ev->s, ev->e);
+}
+
+static void i2s_rx_event_at(void *opaque)
+{
+    I2sEvent *ev = opaque;
+
+    i2s_rx_event(ev->s);
+}
+
 static void i2s_tx_timer_cb(void *opaque)
 {
     Esp32I2sState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     double period = s->tx_period;
     unsigned runs = 0;
+    int64_t at;
 
     if (period <= 0) {
         return;
     }
     while (!s->tx_stopped && s->tx_mode_cur != MODE_OFF &&
-           i2s_event_time(s->tx_anchor, period,
-                          s->tx_events + s->tx_offset) <= now) {
-        uint64_t e = s->tx_events++;
+           (at = i2s_event_time(s->tx_anchor, period,
+                                s->tx_events + s->tx_offset)) <= now) {
+        I2sEvent ev = { .s = s, .e = s->tx_events++ };
 
-        i2s_tx_event(s, e);
+        esp32_line_run_at(at, i2s_tx_event_at, &ev);
         if (++runs == MAX_CATCH_UP) {
             /* Too far behind to catch up: drop the backlog */
             s->tx_anchor = now - (int64_t)(s->tx_offset * period);
@@ -2158,15 +2184,18 @@ static void i2s_rx_timer_cb(void *opaque)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     double period = s->rx_period;
     unsigned runs = 0;
+    int64_t at;
 
     if (period <= 0) {
         return;
     }
     while (s->rx_mode_cur != MODE_OFF &&
-           i2s_event_time(s->rx_anchor, period,
-                          s->rx_events + s->rx_offset) <= now) {
+           (at = i2s_event_time(s->rx_anchor, period,
+                                s->rx_events + s->rx_offset)) <= now) {
+        I2sEvent ev = { .s = s };
+
         s->rx_events++;
-        i2s_rx_event(s);
+        esp32_line_run_at(at, i2s_rx_event_at, &ev);
         if (++runs == MAX_CATCH_UP) {
             s->rx_anchor = now - (int64_t)(s->rx_offset * period);
             s->rx_events = 0;
