@@ -26,6 +26,7 @@
 #include "qemu/log.h"
 #include "qemu/bitops.h"
 #include "hw/core/irq.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/i2c/esp32_rtc_i2c.h"
 #include "migration/vmstate.h"
 
@@ -281,10 +282,8 @@ static uint64_t esp32_rtc_i2c_read(void *opaque, hwaddr addr, unsigned size)
     }
 }
 
-static void esp32_rtc_i2c_write(void *opaque, hwaddr addr, uint64_t value,
-                                unsigned size)
+static void rtc_i2c_reg_write(Esp32RtcI2cState *s, hwaddr addr, uint64_t value)
 {
-    Esp32RtcI2cState *s = ESP32_RTC_I2C(opaque);
     uint32_t v = value;
 
     if (!reg_valid(addr)) {
@@ -317,6 +316,33 @@ static void esp32_rtc_i2c_write(void *opaque, hwaddr addr, uint64_t value,
         s->regs[addr / 4] = v & writable[addr / 4];
         return;
     }
+}
+
+typedef struct RtcI2cAccess {
+    Esp32RtcI2cState *s;
+    hwaddr addr;
+    uint64_t value;
+} RtcI2cAccess;
+
+static void rtc_i2c_access_write(void *opaque)
+{
+    RtcI2cAccess *a = opaque;
+
+    rtc_i2c_reg_write(a->s, a->addr, a->value);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp]
+ * A register write acts at the moment it began (see esp32_line.h): the
+ * lines it releases reach the RTC pads at that one time.
+ */
+static void esp32_rtc_i2c_write(void *opaque, hwaddr addr, uint64_t value,
+                                unsigned size)
+{
+    RtcI2cAccess a = { .s = ESP32_RTC_I2C(opaque), .addr = addr,
+                       .value = value };
+
+    esp32_line_run_at(esp32_line_time(), rtc_i2c_access_write, &a);
 }
 
 static const MemoryRegionOps esp32_rtc_i2c_ops = {

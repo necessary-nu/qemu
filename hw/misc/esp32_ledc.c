@@ -94,9 +94,13 @@ REG32(LEDC_DATE, 0x1fc)
 #define LEDC_EDGE_MIN_NS        10000
 /*
  * An output this far behind the present skips to the level shortly before
- * it rather than replaying every coalesced change.
+ * it rather than replaying every coalesced change: a bound of 100000
+ * changes on the work of one catch-up. Without icount the host can run
+ * the timers late, by milliseconds under load; every change short of the
+ * bound is replayed at its own time, so that a block timing the edges
+ * (PCNT's filter, an RMT receiver) sees the pulses the channel made.
  */
-#define LEDC_CATCHUP_NS         (100 * LEDC_EDGE_MIN_NS)
+#define LEDC_CATCHUP_NS         (100000 * LEDC_EDGE_MIN_NS)
 /*
  * Cycles looked ahead for a channel's next edge: two show a steady output's
  * pattern, seventeen a dithered one's (DUTY[3:0] repeats every sixteen),
@@ -680,11 +684,17 @@ static void ledc_timer_cb(void *opaque)
     ledc_schedule(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * A block sampling the pads brings the outputs to their exact levels at
+ * the moment it samples at (esp32_line_time()), not at a later moment the
+ * host has reached meanwhile.
+ */
 static void ledc_line_sync(Notifier *n, void *data)
 {
     Esp32LEDCState *s = container_of(n, Esp32LEDCState, line_source);
 
-    ledc_advance(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), true);
+    ledc_advance(s, esp32_line_time(), true);
     ledc_schedule(s);
 }
 
@@ -696,7 +706,7 @@ static void ledc_line_sync(Notifier *n, void *data)
 static void ledc_clk_update(void *opaque, ClockEvent event)
 {
     Esp32LEDCState *s = ESP32_LEDC(opaque);
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
 
     if (event == ClockPreUpdate) {
         ledc_advance(s, now, false);

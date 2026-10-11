@@ -11,6 +11,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
+#include "qemu/notify.h"
 #include "qemu/timer.h"
 
 #define TYPE_ESP32_RMT "esp32.rmt"
@@ -124,12 +125,13 @@ struct Esp32RmtState {
     Esp32RmtChannel ch[ESP32_RMT_CHANNELS];
 
     /*
-     * While the model drives an output change that happened at a past
-     * virtual time, the time of that change; inputs that change in
-     * response take it as theirs.
+     * While the model runs its channels or drives an output change: an
+     * input of the block that changes in response, and a sample of the
+     * line sources, do not run them again.
      */
-    bool emitting;
-    int64_t emit_ns;
+    bool running;
+    /* The transmitters as a source of line changes (esp32_line.h) */
+    Notifier line_source;
 };
 
 #endif

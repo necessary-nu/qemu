@@ -24,6 +24,13 @@
  * any enabled comparator raises the unit's interrupt and latches which
  * comparators matched in the unit's STATUS register, replacing the
  * previous latch.
+ *
+ * Times are those of the signal lines (hw/gpio/esp32_line.h): an input
+ * changes at the time its change is stamped with, and a register access
+ * or the filter's timer first brings every source of line changes up to
+ * the moment it acts at, so that a source sending late (the host running
+ * behind virtual time without icount) neither shortens a pulse in the
+ * filter's eyes nor adds a count that a later change would have filtered.
  */
 
 #include "qemu/osdep.h"
@@ -31,6 +38,7 @@
 #include "qemu/module.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32_pcnt.h"
 #include "migration/vmstate.h"
 
@@ -225,9 +233,8 @@ static bool pcnt_pending(Esp32PcntState *s, unsigned i, int64_t *due)
  * Pass every change that has matured by now through its filter, oldest
  * first, and arm the timer for the next one.
  */
-static void pcnt_sync(Esp32PcntState *s)
+static void pcnt_sync(Esp32PcntState *s, int64_t now)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t due, next;
     int best;
 
@@ -254,31 +261,50 @@ static void pcnt_sync(Esp32PcntState *s)
     }
 }
 
-static void pcnt_filter_cb(void *opaque)
+static void pcnt_sync_sources(void *opaque)
 {
-    pcnt_sync(opaque);
+    esp32_line_sync();
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.pcnt]
+ * Bring every source of line changes, then the filters, up to now
+ * (esp32_line_time()): a change a source has yet to send can still cut
+ * short a pulse waiting in a filter.
+ */
+static void pcnt_catch_up(Esp32PcntState *s)
+{
+    int64_t t = esp32_line_time();
+
+    esp32_line_run_at(t, pcnt_sync_sources, NULL);
+    pcnt_sync(s, t);
+}
+
+static void pcnt_filter_cb(void *opaque)
+{
+    pcnt_catch_up(opaque);
+}
+
+/* [spec:nuos:req:emu.esp32.pcnt] An input changes at its stamp's time. */
 static void pcnt_set_input(void *opaque, int n, int level)
 {
     Esp32PcntState *s = opaque;
+    int64_t t = esp32_line_time();
 
     level = !!level;
     if (s->raw[n] == level) {
         return;
     }
     /* A change already held long enough happened before this one */
-    pcnt_sync(s);
+    pcnt_sync(s, t);
     s->raw[n] = level;
-    s->raw_since_ns[n] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    pcnt_sync(s);
+    s->raw_since_ns[n] = t;
+    pcnt_sync(s, t);
 }
 
-static uint64_t esp32_pcnt_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t pcnt_reg_read(Esp32PcntState *s, hwaddr addr)
 {
-    Esp32PcntState *s = opaque;
-
-    pcnt_sync(s);
+    pcnt_catch_up(s);
 
     if (addr < A_UNIT_CNT(0)) {
         Esp32PcntUnit *un = &s->unit[addr / 0x0c];
@@ -320,13 +346,10 @@ static uint64_t esp32_pcnt_read(void *opaque, hwaddr addr, unsigned size)
     }
 }
 
-static void esp32_pcnt_write(void *opaque, hwaddr addr, uint64_t value,
-                             unsigned size)
+static void pcnt_reg_write(Esp32PcntState *s, hwaddr addr, uint64_t value)
 {
-    Esp32PcntState *s = opaque;
-
     /* Edges that matured before the write are counted under the old state */
-    pcnt_sync(s);
+    pcnt_catch_up(s);
     if (addr < A_UNIT_CNT(0)) {
         unsigned u = addr / 0x0c;
         Esp32PcntUnit *un = &s->unit[u];
@@ -335,7 +358,7 @@ static void esp32_pcnt_write(void *opaque, hwaddr addr, uint64_t value,
         case 0x0:
             un->conf0 = value;
             /* A new filter setting applies to changes already waiting */
-            pcnt_sync(s);
+            pcnt_sync(s, esp32_line_time());
             break;
         case 0x4:
             un->conf1 = value;
@@ -385,6 +408,49 @@ static void esp32_pcnt_write(void *opaque, hwaddr addr, uint64_t value,
     }
 }
 
+/* A register access under way, which acts at one moment throughout. */
+typedef struct PcntAccess {
+    Esp32PcntState *s;
+    hwaddr addr;
+    uint64_t value;
+} PcntAccess;
+
+static void pcnt_access_read(void *opaque)
+{
+    PcntAccess *a = opaque;
+
+    a->value = pcnt_reg_read(a->s, a->addr);
+}
+
+static void pcnt_access_write(void *opaque)
+{
+    PcntAccess *a = opaque;
+
+    pcnt_reg_write(a->s, a->addr, a->value);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.pcnt]
+ * A register access acts at the moment it began (see esp32_line.h): the
+ * count it reads is the count at that moment, however long the access
+ * takes without icount.
+ */
+static uint64_t esp32_pcnt_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PcntAccess a = { .s = opaque, .addr = addr };
+
+    esp32_line_run_at(esp32_line_time(), pcnt_access_read, &a);
+    return a.value;
+}
+
+static void esp32_pcnt_write(void *opaque, hwaddr addr, uint64_t value,
+                             unsigned size)
+{
+    PcntAccess a = { .s = opaque, .addr = addr, .value = value };
+
+    esp32_line_run_at(esp32_line_time(), pcnt_access_write, &a);
+}
+
 static const MemoryRegionOps esp32_pcnt_ops = {
     .read = esp32_pcnt_read,
     .write = esp32_pcnt_write,
@@ -422,7 +488,7 @@ static void esp32_pcnt_clk_update(void *opaque, ClockEvent event)
 {
     Esp32PcntState *s = opaque;
     bool running = clock_is_enabled(s->apb_clk);
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
 
     /*
      * With the clock stopped the filter's flops hold their state; a change
@@ -434,7 +500,7 @@ static void esp32_pcnt_clk_update(void *opaque, ClockEvent event)
         }
     }
     s->clk_running = running;
-    pcnt_sync(s);
+    pcnt_sync(s, now);
 }
 
 static void esp32_pcnt_init(Object *obj)
