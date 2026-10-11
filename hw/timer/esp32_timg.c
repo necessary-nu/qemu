@@ -25,6 +25,9 @@
 
 static uint64_t esp32_timg_timer_get_count(Esp32TimgTimerState *s, uint64_t ns_now);
 static uint64_t esp32_timg_timer_count_to_ns(Esp32TimgTimerState *s, uint64_t count);
+static int esp32_timg_timer_direction(Esp32TimgTimerState *s);
+static uint64_t esp32_timg_apb_ns(Esp32TimgState *s, uint64_t ticks,
+                                  uint32_t div);
 static void esp32_timg_timer_update_config(Esp32TimgTimerState *ts);
 static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_now);
 static void esp32_timg_timer_reload(Esp32TimgTimerState *ts, uint64_t ns_now);
@@ -34,6 +37,7 @@ static void esp32_timg_cal_begin(Esp32TimgState *s, bool oneshot);
 static void esp32_timg_cal_fold(Esp32TimgState *s, int64_t now);
 static void esp32_timg_cal_arm(Esp32TimgState *s, int64_t now);
 static void esp32_timg_int_update(Esp32TimgState *s);
+static void esp32_timg_timer_cb(void *opaque);
 static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_update_config(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_feed(Esp32TimgWdtState *ws);
@@ -43,6 +47,13 @@ static uint64_t esp32_timg_wdt_get_count(Esp32TimgWdtState *ws,
 
 
 #define TIMG_DEBUG_LOG(...) // qemu_log(__VA_ARGS__)
+
+/*
+ * A timer callback that runs this far after its deadline, as the host
+ * can make it without icount, restarts what it times from the present
+ * rather than replaying every period it missed.
+ */
+#define TIMG_CATCHUP_NS (10 * SCALE_MS)
 
 static inline void set_low_word(uint64_t *dst, uint32_t word)
 {
@@ -64,11 +75,35 @@ static inline qemu_irq get_edge_irq(Esp32TimgState* s, Esp32TimgInterruptType it
     return s->irqs[TIMG_INT_MAX + it];
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * A register access first makes the timers' alarms due by its moment take
+ * effect, each at its own time, so that what software reads and writes
+ * (INT_RAW, a reloaded count, an INT_CLR) does not depend on how promptly
+ * the host runs their QEMU timers.
+ */
+static void esp32_timg_catch_up(Esp32TimgState *s)
+{
+    Esp32TimgTimerState *timers[] = { &s->t0, &s->t1, &s->lact };
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (int i = 0; i < ARRAY_SIZE(timers); i++) {
+        Esp32TimgTimerState *ts = timers[i];
+
+        while (timer_pending(&ts->alarm_timer) &&
+               timer_expire_time_ns(&ts->alarm_timer) <= now) {
+            timer_del(&ts->alarm_timer);
+            esp32_timg_timer_cb(ts);
+        }
+    }
+}
 
 static uint64_t esp32_timg_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp32TimgState *s = ESP32_TIMG(opaque);
     Esp32TimgTimerState *ts = NULL;
+
+    esp32_timg_catch_up(s);
     if (addr <= A_TIMG_T0LOAD) {
         ts = &s->t0;
     } else if (addr <= A_TIMG_T1LOAD) {
@@ -164,6 +199,8 @@ static void esp32_timg_write(void *opaque, hwaddr addr,
 {
     Esp32TimgState *s = ESP32_TIMG(opaque);
     Esp32TimgTimerState *ts = NULL;
+
+    esp32_timg_catch_up(s);
     if (addr <= A_TIMG_T0LOAD) {
         ts = &s->t0;
     } else if (addr <= A_TIMG_T1LOAD) {
@@ -539,11 +576,41 @@ static void esp32_timg_cal_clk_update(void *opaque, ClockEvent event)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * When the alarm of timer @ts fell due: the time the counter reached
+ * ALARM, which the QEMU timer's callback, running late, may be past.
+ * ns_base is when the alarm was armed from.
+ */
+static uint64_t esp32_timg_timer_alarm_ns(Esp32TimgTimerState *ts,
+                                          uint64_t ns_now)
+{
+    int64_t count_to_alarm = ((int64_t)ts->alarm_val -
+                              (int64_t)ts->count_base) *
+                             esp32_timg_timer_direction(ts);
+    uint64_t due;
+
+    if (count_to_alarm <= 0 || !clock_is_enabled(ts->parent->apb_clk)) {
+        return ns_now;
+    }
+    due = ts->ns_base + esp32_timg_timer_count_to_ns(ts, count_to_alarm);
+    if (due > ns_now || ns_now - due > TIMG_CATCHUP_NS) {
+        return ns_now;
+    }
+    return due;
+}
+
 static void esp32_timg_timer_cb(void *opaque)
 {
     Esp32TimgTimerState *ts = (Esp32TimgTimerState*) opaque;
     Esp32TimgState *s = ts->parent;
-    uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /*
+     * The alarm acts at its own time: an autoreload restarts the count
+     * from then, so a periodic alarm keeps its period however late the
+     * host runs the callback.
+     */
+    uint64_t ns_now = esp32_timg_timer_alarm_ns(
+        ts, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
     TIMG_DEBUG_LOG("%s: TG%d ns=0x%llx\n", __func__, s->id, ns_now);
     uint32_t int_mask = 1 << (ts->int_type);
@@ -782,6 +849,29 @@ static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now)
     timer_mod_anticipate_ns(&ws->stage_timer, ns_now + ns_to_timeout);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * When the watchdog's current stage ended: the next stage counts from
+ * then, not from when the QEMU timer's callback, running late, got to it.
+ */
+static uint64_t esp32_timg_wdt_stage_end_ns(Esp32TimgWdtState *ws,
+                                            uint64_t ns_now)
+{
+    uint32_t left = ws->timeout[ws->cur_stage] - ws->count_base;
+    uint64_t due;
+
+    if (!clock_is_enabled(ws->parent->apb_clk) ||
+        ws->count_base > ws->timeout[ws->cur_stage]) {
+        return ns_now;
+    }
+    due = ws->ns_base + esp32_timg_apb_ns(ws->parent, left,
+                                          MAX(ws->prescale, 1));
+    if (due > ns_now || ns_now - due > TIMG_CATCHUP_NS) {
+        return ns_now;
+    }
+    return due;
+}
+
 static void esp32_timg_wdt_cb(void *opaque)
 {
     Esp32TimgWdtState *ws = (Esp32TimgWdtState*) opaque;
@@ -808,7 +898,8 @@ static void esp32_timg_wdt_cb(void *opaque)
     }
 
     int next_stage = (ws->cur_stage + 1) % ESP32_TIMG_WDT_STAGE_COUNT;
-    uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t ns_now = esp32_timg_wdt_stage_end_ns(
+        ws, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     ws->count_base = 0;
     ws->cur_stage = next_stage;
     ws->ns_base = ns_now;
