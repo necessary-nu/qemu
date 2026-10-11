@@ -64,9 +64,48 @@ OBJECT_DECLARE_TYPE(ESP32P4CPU, ESP32P4CPUClass, ESP32P4_CPU)
  */
 #define ESP32P4_CPU_WAKEUP "wakeup"
 
+/*
+ * The LP core's interrupt controller (TRM 5.4.1): named GPIO input
+ * ESP32P4_CPU_LP_IRQ, line n the level of interrupt ID n, of which IDs 3,
+ * 7, 11 and 16 to 30 exist; mip shows them and mie enables them.
+ */
+#define ESP32P4_CPU_LP_IRQ "lp-irq"
+#define ESP32P4_LP_IRQS 32
+#define ESP32P4_LP_IRQ_MASK (BIT(3) | BIT(7) | BIT(11) | \
+                             MAKE_64BIT_MASK(16, 15))
+
+/*
+ * The LP core's other connections:
+ *
+ * ESP32P4_CPU_LP_DISABLE: named GPIO input, LP_SYSTEM's LP_CORE_DISABLE,
+ *   which while high stops the core's clock as the clock enable does.
+ * ESP32P4_CPU_LP_EXCEPTION: named GPIO output, pulsed as the core takes
+ *   an exception, for the PMU's LP CPU exception wakeup source.
+ * ESP32P4_CPU_ETM_EVENT: named GPIO output, one line, the ETM event
+ *   ULP_EVT_ERR_INTR, pulsed as the core takes an exception.
+ * ESP32P4_CPU_LP_CLK: clock input, the core's clock, which mcycle counts.
+ */
+#define ESP32P4_CPU_LP_DISABLE "lp-disable"
+#define ESP32P4_CPU_LP_EXCEPTION "lp-exception"
+#define ESP32P4_CPU_ETM_EVENT "etm-event"
+#define ESP32P4_CPU_LP_CLK "clk"
+
+/*
+ * The LP core's start: as its reset is released, the machine gives the
+ * address it starts at and the trap vector base mtvec takes, from the
+ * boot address LP_SYSTEM_LP_CORE_BOOT_ADDR holds and the LP ROM.
+ */
+typedef void (*ESP32P4LPBootFn)(void *opaque, uint32_t *pc,
+                                uint32_t *mtvec);
+
 /* The HP core's hardware loops (TRM 2.7.1) and debug triggers (2.11.3). */
 #define ESP32P4_HWLP_LOOPS 2
 #define ESP32P4_TRIGGERS 3
+
+/* The LP core's debug triggers (TRM 5.6) and event counters (5.7). */
+#define ESP32P4_LP_TRIGGERS 2
+#define ESP32P4_LP_HPM_FIRST 3
+#define ESP32P4_LP_HPM_COUNTERS 10
 
 /* The HP core's PMP and PMA checker entries (TRM 2.10). */
 #define ESP32P4_PMP_ENTRIES 32
@@ -220,6 +259,8 @@ struct ESP32P4CPU {
     bool reset;
     /* The clock enable is low: the core does not execute. */
     bool clock_stopped;
+    /* The LP core's ESP32P4_CPU_LP_DISABLE is high, which also stops it. */
+    bool disabled;
     /*
      * The core was executing when its clock stopped, so it carries on
      * when the clock restarts; a core waiting in WFI goes on waiting.
@@ -362,6 +403,37 @@ struct ESP32P4CPU {
     void *trace_opaque;
     bool trace_en;
     bool trap_after_retire;
+
+    /*
+     * The LP core's own state (tselect, tdata1 and tdata2 above serve its
+     * two triggers).
+     */
+    ESP32P4LPBootFn lp_boot;
+    void *lp_boot_opaque;
+    qemu_irq lp_exception;
+    qemu_irq lp_etm_event;
+    /* An exception's pulses, waiting for the end of the code block. */
+    QEMUTimer *lp_exc_timer;
+    /*
+     * Debug mode, which a trigger enters (TRM 5.6.3): the core halts with
+     * dpc and dcsr's cause recording why, until it is reset.
+     */
+    bool lp_debug_mode;
+    uint32_t lp_dpc;
+    uint32_t lp_dcsr;
+    /*
+     * The counters (TRM 5.7). The core's clock, and the cycles it has
+     * counted while running, up to lp_cycles_ns; mcycle and minstret are
+     * lp_ctr_base[] plus the cycles since lp_ctr_ref[], while counting;
+     * mhpmcounter3 to 12, 40 bits each, hold what is written.
+     */
+    Clock *lp_clk;
+    uint64_t lp_cycles;
+    int64_t lp_cycles_ns;
+    uint64_t lp_ctr_base[2];
+    uint64_t lp_ctr_ref[2];
+    uint64_t lp_hpm[ESP32P4_LP_HPM_COUNTERS];
+    uint32_t lp_mcountinhibit;
 };
 
 struct ESP32P4CPUClass {
@@ -383,6 +455,14 @@ static inline ESP32P4CPU *esp32p4_cpu_from_env(CPURISCVState *env)
 static inline bool esp32p4_env_is_hp(CPURISCVState *env)
 {
     return riscv_cpu_cfg(env)->ext_xesploop;
+}
+
+/* The LP core's class, for telling it from any other RISC-V core. */
+extern ObjectClass *esp32p4_lp_cpu_class;
+
+static inline bool esp32p4_env_is_lp(CPURISCVState *env)
+{
+    return object_get_class(OBJECT(env_cpu(env))) == esp32p4_lp_cpu_class;
 }
 
 /*
@@ -418,8 +498,12 @@ void esp32p4_cpu_set_mintthresh(ESP32P4CPU *cpu, uint8_t th);
  */
 bool esp32p4_cpu_mid_block(void);
 
+/* The LP core's start, which the machine gives it. */
+void esp32p4_lp_cpu_set_boot(ESP32P4CPU *cpu, ESP32P4LPBootFn fn,
+                             void *opaque);
+
 /* esp32p4_csr.c */
-void esp32p4_hp_csr_class_init(void);
+void esp32p4_csr_class_init(void);
 void esp32p4_hp_update_fp_status(ESP32P4CPU *cpu);
 void esp32p4_hp_gpio_update(ESP32P4CPU *cpu);
 
@@ -432,6 +516,29 @@ void esp32p4_debug_excp_handler(CPUState *cs);
 void esp32p4_tselect_write(ESP32P4CPU *cpu, target_ulong val);
 target_ulong esp32p4_tdata_read(ESP32P4CPU *cpu, int index);
 void esp32p4_tdata_write(ESP32P4CPU *cpu, int index, target_ulong val);
+
+/*
+ * esp32p4_lp.c: the LP core's CSRs, counters and triggers. The chip's CSR
+ * table (esp32p4_csr.c) asks, for each CSR it holds, whether the LP core
+ * implements it its own way, lacks it, or has the standard one.
+ */
+typedef enum {
+    ESP32P4_LP_CSR_STD,
+    ESP32P4_LP_CSR_ABSENT,
+    ESP32P4_LP_CSR_OWN,
+} ESP32P4LPCsrKind;
+
+ESP32P4LPCsrKind esp32p4_lp_csr_kind(CPURISCVState *env, int csrno);
+RISCVException esp32p4_lp_csr_read(CPURISCVState *env, int csrno,
+                                   target_ulong *val);
+RISCVException esp32p4_lp_csr_write(CPURISCVState *env, int csrno,
+                                    target_ulong val);
+void esp32p4_lp_counters_update(ESP32P4CPU *cpu);
+void esp32p4_lp_counters_reset(ESP32P4CPU *cpu);
+void esp32p4_lp_triggers_reset(ESP32P4CPU *cpu);
+void esp32p4_lp_triggers_rebuild(ESP32P4CPU *cpu);
+bool esp32p4_lp_debug_check_breakpoint(CPUState *cs);
+void esp32p4_lp_debug_excp_handler(CPUState *cs);
 
 /* esp32p4_helper.c */
 void esp32p4_bus_error_check_pending(ESP32P4CPU *cpu);
