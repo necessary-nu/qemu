@@ -2417,12 +2417,38 @@ static uint32_t i2s_state(Esp32I2sState *s)
     return idle ? STATE_TX_IDLE : 0;
 }
 
+/* Whether @t is due, by now. */
+static bool i2s_timer_due(QEMUTimer *t, int64_t now)
+{
+    return timer_pending(t) && timer_expire_time_ns(t) <= now;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.i2s]
+ * A register access first runs every event of the units due by its
+ * moment, each at its own time, so that what software reads (the FIFOs,
+ * INT_RAW, the outlink's progress) does not depend on how promptly the
+ * host runs the units' timers.
+ */
+static void i2s_catch_up(Esp32I2sState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (i2s_timer_due(&s->tx_timer, now)) {
+        i2s_tx_timer_cb(s);
+    }
+    if (i2s_timer_due(&s->rx_timer, now)) {
+        i2s_rx_timer_cb(s);
+    }
+}
+
 /* [spec:nuos:req:emu.esp32.i2s] */
 static uint64_t esp32_i2s_read(void *opaque, hwaddr addr, unsigned size)
 {
     Esp32I2sState *s = opaque;
     uint32_t v;
 
+    i2s_catch_up(s);
     switch (addr) {
     case A_FIFO_WR:
         return 0;
@@ -2590,6 +2616,7 @@ static void esp32_i2s_write(void *opaque, hwaddr addr, uint64_t value,
     Esp32I2sState *s = opaque;
     uint32_t val = value;
 
+    i2s_catch_up(s);
     switch (addr) {
     case A_FIFO_WR:
         i2s_tx_fifo_push(s, val);
