@@ -1584,9 +1584,9 @@ static void esp32p4_adc_init(Object *obj)
     };
 
     memory_region_init_io(&s->hp_iomem, obj, &adc_hp_ops, s,
-                          TYPE_ESP32P4_ADC, ESP32P4_ADC_SIZE);
+                          "esp32p4.adc", ESP32P4_ADC_SIZE);
     memory_region_init_io(&s->lp_iomem, obj, &adc_lp_ops, s,
-                          TYPE_ESP32P4_ADC "-lp", ESP32P4_ADC_SIZE);
+                          "esp32p4.lp-adc", ESP32P4_ADC_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->hp_iomem);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->lp_iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->hp_irq);

@@ -144,6 +144,8 @@ struct ESP32P4TouchState {
     int64_t meas_base_ns;
     uint64_t meas_count;
     int64_t meas_end_ns;
+    /* When the timer is due: the end, or the timeout. */
+    int64_t meas_due_ns;
 
     /* The touch timer. */
     uint8_t timer_phase;

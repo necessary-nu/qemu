@@ -79,13 +79,14 @@ struct ESP32P4TsensState {
      * The automatic monitor: whether it samples, the virtual time its
      * sampling period counts from, and its last sample. A sample that
      * would change nothing is not run; the timer runs to the next sample
-     * that would.
+     * that would, due at next_ns.
      */
     bool sampling;
     int64_t anchor_ns;
     uint32_t prev;
     bool prev_valid;
     QEMUTimer sample_timer;
+    int64_t next_ns;
 
     int32_t temp_mc;
 };

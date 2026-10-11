@@ -514,6 +514,7 @@ static void touch_meas_arm(ESP32P4TouchState *s)
         }
         due = MIN(due, t);
     }
+    s->meas_due_ns = due;
     if (due == INT64_MAX) {
         timer_del(&s->meas_timer);
     } else {
@@ -657,15 +658,12 @@ static void touch_finish(ESP32P4TouchState *s, int64_t when)
 static void touch_meas_cb(void *opaque)
 {
     ESP32P4TouchState *s = opaque;
-    int64_t when = timer_expire_time_ns(&s->meas_timer);
+    int64_t when = s->meas_due_ns;
     uint64_t count;
     ESP32P4TouchChan *c = touch_cur(s);
     unsigned f = s->cur_freq;
     uint32_t raw;
 
-    if (when < 0) {
-        when = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    }
     count = touch_count_at(s, when);
     if (when < s->meas_end_ns) {
         s->fsm_phase = ESP32P4_TOUCH_FSM_IDLE;
@@ -1172,7 +1170,7 @@ static void esp32p4_touch_init(Object *obj)
     ESP32P4TouchState *s = ESP32P4_TOUCH(obj);
     DeviceState *dev = DEVICE(obj);
 
-    memory_region_init_io(&s->iomem, obj, &touch_ops, s, TYPE_ESP32P4_TOUCH,
+    memory_region_init_io(&s->iomem, obj, &touch_ops, s, "esp32p4.lp-touch",
                           ESP32P4_TOUCH_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
@@ -1261,6 +1259,7 @@ static const VMStateDescription vmstate_esp32p4_touch = {
         VMSTATE_INT64(meas_base_ns, ESP32P4TouchState),
         VMSTATE_UINT64(meas_count, ESP32P4TouchState),
         VMSTATE_INT64(meas_end_ns, ESP32P4TouchState),
+        VMSTATE_INT64(meas_due_ns, ESP32P4TouchState),
         VMSTATE_UINT8(timer_phase, ESP32P4TouchState),
         VMSTATE_ESP32P4_CLKWAIT(timer_wait, ESP32P4TouchState),
         VMSTATE_UINT32(pwr_cntl, ESP32P4TouchState),

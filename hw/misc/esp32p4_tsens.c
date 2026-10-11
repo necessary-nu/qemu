@@ -39,7 +39,9 @@
  * TSENS_INT_EN, and pulses TMPSNSR_EVT_OVER_LIMIT. Samples that would do
  * nothing, all of them while the temperature stays between the thresholds
  * or does not change, are not run, so that the sensor costs nothing while
- * it watches a steady temperature.
+ * it watches a steady temperature; nor are the samples a timer running
+ * late on the host's clock has missed (without icount), which would
+ * otherwise come all at once.
  *
  * Kept as written: TSENS_CLK_DIV, TSENS_CLK_INV, TSENS_POWER_UP_FORCE,
  * TSENS_WAKEUP_MASK and TSENS_CLK_EN, which change nothing the model
@@ -216,6 +218,7 @@ static void tsens_schedule(ESP32P4TsensState *s, int64_t now)
                                    SAMPLE_RATE(REG(s, A_SAMPLE_RATE))), 1);
     next = s->anchor_ns + ((MAX(now, s->anchor_ns) - s->anchor_ns) / period
                            + 1) * period;
+    s->next_ns = next;
     timer_mod(&s->sample_timer, next);
 }
 
@@ -223,15 +226,12 @@ static void tsens_schedule(ESP32P4TsensState *s, int64_t now)
 static void tsens_sample(void *opaque)
 {
     ESP32P4TsensState *s = opaque;
-    int64_t when = timer_expire_time_ns(&s->sample_timer);
+    int64_t when = s->next_ns;
     uint32_t *w = &REG(s, A_WAKEUP_CTRL);
     uint32_t v = tsens_out(s);
     uint32_t hi = WAKEUP_TH_HIGH(*w), lo = WAKEUP_TH_LOW(*w);
     bool wake = false, upper = false;
 
-    if (when < 0) {
-        when = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    }
     if (*w & WAKEUP_MODE) {
         if (s->prev_valid) {
             if (v > s->prev && v - s->prev > hi) {
@@ -256,7 +256,8 @@ static void tsens_sample(void *opaque)
         esp32_line_set_at(s->etm_event, 1, when);
         esp32_line_set_at(s->etm_event, 0, when);
     }
-    tsens_schedule(s, when);
+    /* A timer running late on the host's clock skips what it has missed. */
+    tsens_schedule(s, MAX(when, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)));
 }
 
 static void tsens_set_sampling(ESP32P4TsensState *s, bool on, int64_t when)
@@ -511,7 +512,7 @@ static void esp32p4_tsens_init(Object *obj)
     ESP32P4TsensState *s = ESP32P4_TSENS(obj);
     DeviceState *dev = DEVICE(obj);
 
-    memory_region_init_io(&s->iomem, obj, &tsens_ops, s, TYPE_ESP32P4_TSENS,
+    memory_region_init_io(&s->iomem, obj, &tsens_ops, s, "esp32p4.lp-tsens",
                           ESP32P4_TSENS_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
@@ -556,6 +557,7 @@ static const VMStateDescription vmstate_esp32p4_tsens = {
         VMSTATE_UINT32(prev, ESP32P4TsensState),
         VMSTATE_BOOL(prev_valid, ESP32P4TsensState),
         VMSTATE_TIMER(sample_timer, ESP32P4TsensState),
+        VMSTATE_INT64(next_ns, ESP32P4TsensState),
         VMSTATE_INT32(temp_mc, ESP32P4TsensState),
         VMSTATE_CLOCK(clk, ESP32P4TsensState),
         VMSTATE_END_OF_LIST()
