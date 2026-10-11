@@ -67,6 +67,11 @@ struct ESP32P4EfuseState {
     uint32_t rs_check[ESP32P4_EFUSE_BLOCKS][ESP32P4_EFUSE_RS_CHECK_WORDS];
     /* The file has room for the copies and parity, not only the data. */
     bool blk_has_raw;
+    /*
+     * The "chip-revision" property: the wafer version a factory-fresh
+     * array holds, major * 100 + minor (300 for v3.0).
+     */
+    uint32_t chip_revision;
 
     /*
      * What the last read operation loaded: the decoded parameters, before
