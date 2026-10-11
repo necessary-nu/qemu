@@ -115,4 +115,8 @@
   pointer table at the top of the ROM is placed at its address; and the
   .eh_frame unwinding tables, linked at the flash window, are left out.
   Bytes no section covers are zero. NuOS's emu/scripts/esp32p4-rom.py does
-  the conversion and checks the release against pinned SHA-256s.
+  the conversion and checks the release against pinned SHA-256s. No image
+  of the chip's 16 KiB LP ROM is shipped, as Espressif does not publish
+  it: the machine's lp-rom property takes a raw image a user has dumped
+  from their own chip (-M esp32p4,lp-rom=FILE), and without one the LP ROM
+  is absent.
