@@ -10,9 +10,19 @@
 #define HW_NET_IP101_PHY_H
 
 #include "hw/core/qdev.h"
+#include "hw/core/clock.h"
 
 #define TYPE_IP101_PHY "ip101-phy"
 OBJECT_DECLARE_SIMPLE_TYPE(IP101PhyState, IP101_PHY)
+
+/*
+ * Named GPIO input IP101_PHY_RESET: high while the board holds the PHY
+ * in reset, its RESET_N pin low.
+ */
+#define IP101_PHY_RESET "reset"
+
+/* The 50 MHz RMII reference clock the PHY drives on its 50M_CLKO pin */
+#define IP101_PHY_REF_HZ 50000000
 
 struct IP101PhyState {
     DeviceState parent_obj;
@@ -22,6 +32,10 @@ struct IP101PhyState {
 
     /* A link partner is on the medium */
     bool medium_up;
+    /* Held in reset through RESET_N */
+    bool reset_held;
+    /* Clock output "rmii-ref": 50M_CLKO, running while out of reset */
+    Clock *ref_clk;
 
     uint16_t bmcr;
     uint16_t anar;
@@ -43,6 +57,9 @@ struct IP101PhyState {
 
 /* Whether a link partner is present on the medium. */
 void ip101_phy_set_medium(IP101PhyState *s, bool up);
+
+/* Whether the PHY answers management frames to MDIO address @addr. */
+bool ip101_phy_responds(IP101PhyState *s, unsigned addr);
 
 uint16_t ip101_phy_mdio_read(IP101PhyState *s, unsigned reg);
 void ip101_phy_mdio_write(IP101PhyState *s, unsigned reg, uint16_t val);
