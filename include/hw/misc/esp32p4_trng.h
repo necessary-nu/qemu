@@ -22,9 +22,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4TrngState, ESP32P4_TRNG)
 #define ESP32P4_TRNG_DATA   0x04
 
 /*
- * The clock input "clk" is LPPERI's RNG clock (LPPERI_CK_EN_RNG), which
- * its registers are behind and which paces its sampling; LPPERI_RST_EN_
- * LP_RNG resets it.
+ * The clock input "clk" is RC_FAST_CLK as LPPERI_CK_EN_RNG passes it, the
+ * entropy source that paces its sampling; its registers are on the LP
+ * peripherals' bus clock, and LPPERI_RST_EN_LP_RNG resets it.
  */
 struct ESP32P4TrngState {
     SysBusDevice parent_obj;
