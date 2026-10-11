@@ -237,7 +237,8 @@ MemTxResult esp32p4_cpu_bus_hold(ESP32P4CPU *cpu)
  * A failed access that a device holds: the core unwinds to the start of
  * the instruction, which has not retired (esp32p4_restore_state_to_opc())
  * and executes again when the core goes on, as QEMU's MIPS ITC storage
- * blocks a core.
+ * blocks a core. Its wait begins once it has given back the
+ * instruction's cycle.
  */
 static void esp32p4_cpu_bus_wait_check(CPUState *cs, uintptr_t retaddr)
 {
@@ -248,9 +249,11 @@ static void esp32p4_cpu_bus_wait_check(CPUState *cs, uintptr_t retaddr)
     }
     cpu->bus_hold = false;
     qatomic_set(&cpu->bus_wait, true);
+    cpu_restore_state(cs, retaddr);
+    esp32p4_counters_bus_wait(cpu, true);
     cs->halted = 1;
     cs->exception_index = EXCP_HLT;
-    cpu_loop_exit_restore(cs, retaddr);
+    cpu_loop_exit(cs);
 }
 #endif
 
@@ -263,6 +266,9 @@ static void esp32p4_cpu_bus_go(CPUState *cs, run_on_cpu_data data)
         return;
     }
     qatomic_set(&cpu->bus_wait, false);
+#ifdef CONFIG_TCG
+    esp32p4_counters_bus_wait(cpu, false);
+#endif
     if (!esp32p4_cpu_held(cpu) && !cpu->clock_halted) {
         cs->halted = 0;
     }
@@ -783,8 +789,8 @@ static G_NORETURN void esp32p4_do_unaligned_access(CPUState *cs, vaddr addr,
  * The hardware loop and PIE state the translation of a block depends on:
  * whether the loop instructions may be used, and whether a loop counts;
  * whether the PIE instructions may be used, and whether the PIE state is
- * already dirty; whether the debug assistant monitors SP; and whether the
- * trace encoder traces the core.
+ * already dirty; whether the debug assistant monitors SP; whether the
+ * trace encoder traces the core; and whether the branch predictor runs.
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
 /* [spec:nuos:req:emu.esp32p4.pie] */
@@ -816,6 +822,9 @@ static TCGTBCPUState esp32p4_hp_get_tb_cpu_state(CPUState *cs)
     }
     if (qatomic_read(&cpu->trace_en)) {
         s.cs_base = FIELD_DP64(s.cs_base, EXT_TB_FLAGS, ESP32P4_TRACE, 1);
+    }
+    if (esp32p4_counters_predicting(cpu)) {
+        s.cs_base = FIELD_DP64(s.cs_base, EXT_TB_FLAGS, ESP32P4_BPRED, 1);
     }
     return s;
 }
@@ -1093,8 +1102,8 @@ static const VMStateDescription vmstate_esp32p4_lp_state = {
 
 static const VMStateDescription vmstate_esp32p4_counters = {
     .name = "esp32p4-cpu/counters",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4CPU),
         VMSTATE_UINT64(cycles, ESP32P4CPU),
@@ -1103,7 +1112,12 @@ static const VMStateDescription vmstate_esp32p4_counters = {
         VMSTATE_UINT64(insns, ESP32P4CPU),
         VMSTATE_UINT64_ARRAY(ctr_base, ESP32P4CPU, 2),
         VMSTATE_UINT64_ARRAY(ctr_ref, ESP32P4CPU, 2),
-        VMSTATE_UINT64_ARRAY(hpm, ESP32P4CPU, ESP32P4_LP_HPM_COUNTERS),
+        VMSTATE_UINT64_ARRAY(ev, ESP32P4CPU, ESP32P4_EVENTS),
+        VMSTATE_UINT64_ARRAY(hpm_base, ESP32P4CPU, ESP32P4_LP_HPM_COUNTERS),
+        VMSTATE_UINT64_ARRAY(hpm_ref, ESP32P4CPU, ESP32P4_LP_HPM_COUNTERS),
+        VMSTATE_UINT8_ARRAY(bht, ESP32P4CPU, ESP32P4_BHT_ENTRIES),
+        VMSTATE_UINT32(bp_history, ESP32P4CPU),
+        VMSTATE_UINT64(bus_wait_from, ESP32P4CPU),
         VMSTATE_UINT32(mcountinhibit, ESP32P4CPU),
         VMSTATE_BOOL(ctr_wfi, ESP32P4CPU),
         VMSTATE_END_OF_LIST()
