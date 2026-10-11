@@ -30,9 +30,10 @@
  * case for a free-running configuration) skips whole repetitions at once.
  * A timer fires only at the moments something becomes visible outside the
  * block: an output edge or a rising interrupt line, found by running a copy
- * of the state ahead. Output edges closer together than the min-edge-ns
- * property are coalesced: the outputs then show their true level every
- * min-edge-ns. Interrupts are never coalesced.
+ * of the state ahead. Every edge is driven at its own cycle, however close
+ * to others: a capture, a pulse counter or an ETM event that an edge
+ * reaches sees each, so the host's work grows with the edges' rate, and
+ * on the host's clock a host that cannot keep up skips ahead (below).
  *
  * The capture timer counts APB_CLK and is computed in closed form; capture
  * inputs, fault inputs and GPIO sync inputs act at the moment their level
@@ -349,7 +350,6 @@ typedef struct McpwmWatch {
     const uint8_t *driven;      /* output levels as driven */
     bool irq;                   /* whether a rising interrupt counts */
     uint64_t etm;               /* the ETM events that count */
-    uint64_t floor;             /* output changes count from this cycle */
 } McpwmWatch;
 
 typedef enum McpwmSeen {
@@ -1405,17 +1405,11 @@ static McpwmSeen core_run_group(Esp32McpwmCore *c, uint64_t target,
         uint64_t next = core_next(c, tdue, group);
 
         if (w) {
-            uint64_t check;
+            uint64_t check = core_next_carrier(c, group);
 
-            if (c->now < w->floor) {
-                check = w->floor;
-            } else {
-                check = core_next_carrier(c, group);
-            }
             if (check < next && check <= target) {
                 core_advance(c, check, NULL, group);
-                if (c->now >= w->floor &&
-                    core_outputs_differ(c, w->driven, group)) {
+                if (core_outputs_differ(c, w->driven, group)) {
                     return SEEN_OUTPUT;
                 }
                 continue;
@@ -1436,15 +1430,11 @@ static McpwmSeen core_run_group(Esp32McpwmCore *c, uint64_t target,
                 (c->etm_fired & w->etm)) {
                 return SEEN_IRQ;
             }
-            if (c->now >= w->floor &&
-                core_outputs_differ(c, w->driven, group)) {
+            if (core_outputs_differ(c, w->driven, group)) {
                 return SEEN_OUTPUT;
             }
             if (events >= WATCH_MAX_EVENTS) {
                 return SEEN_HORIZON;
-            }
-            if (c->now < w->floor) {
-                continue;
             }
         }
 
@@ -1837,9 +1827,7 @@ static void mcpwm_schedule(Esp32McpwmState *s)
 {
     McpwmWatch w;
     McpwmSeen seen;
-    int64_t floor_ns = s->last_out_ns + s->min_edge_ns;
     uint64_t when;
-    int64_t due;
 
     s->schedule_stale = false;
     if (!clock_is_enabled(s->core_clk)) {
@@ -1849,18 +1837,13 @@ static void mcpwm_schedule(Esp32McpwmState *s)
     w.driven = s->out_level;
     w.irq = !s->irq_level;
     w.etm = s->p4 ? core_etm_enabled(&s->core) : 0;
-    w.floor = MAX(mcpwm_cycle_at(s, floor_ns), s->core.now);
     seen = core_look_ahead(&s->core, &w, &when);
     if (seen == SEEN_NOTHING) {
         timer_del(s->timer);
         return;
     }
-    due = mcpwm_ns_at(s, when);
-    if (seen == SEEN_OUTPUT) {
-        due = MAX(due, floor_ns);
-    }
-    s->due_ns = due;
-    timer_mod(s->timer, due);
+    s->due_ns = mcpwm_ns_at(s, when);
+    timer_mod(s->timer, s->due_ns);
 }
 
 /*
@@ -1890,9 +1873,8 @@ static void mcpwm_update(Esp32McpwmState *s)
              */
             if (level != s->out_level[n]) {
                 s->out_level[n] = level;
-                s->last_out_ns = mcpwm_now(s);
                 mcpwm_changed(s);
-                esp32_line_set_at(s->out[n], level, s->last_out_ns);
+                esp32_line_set_at(s->out[n], level, mcpwm_now(s));
             }
         }
         if (c->etm_fired) {
@@ -1944,7 +1926,7 @@ static void core_last_changes(const Esp32McpwmCore *c, uint64_t to,
             last[n] = NO_EVENT;
         }
         for (;;) {
-            McpwmWatch watch = { .driven = level, .floor = end->now };
+            McpwmWatch watch = { .driven = level };
             uint64_t when;
 
             if (core_look_ahead(end, &watch, &when) == SEEN_NOTHING ||
@@ -2019,7 +2001,6 @@ static void mcpwm_skip_run(void *opaque)
         when = last[first] == NO_EVENT ? mcpwm_now(s)
                                        : mcpwm_ns_at(s, last[first]);
         s->out_level[first] = level[first];
-        s->last_out_ns = MAX(s->last_out_ns, when);
         esp32_line_set_at(s->out[first], level[first], when);
     }
     s->updating = false;
@@ -2973,7 +2954,6 @@ static void esp32_mcpwm_reset_hold(Object *obj, ResetType type)
     for (int n = 0; n < ESP32_MCPWM_CAPS; n++) {
         s->cap_x[n] = s->cap_in[n];
     }
-    s->last_out_ns = INT64_MIN / 2;
     /* Drive every line afresh. */
     memset(s->out_level, 0xff, sizeof(s->out_level));
     s->irq_level = 0xff;
@@ -3028,10 +3008,6 @@ static void esp32_mcpwm_realize(DeviceState *dev, Error **errp)
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mcpwm_timer_cb, s);
     esp32_line_add_source(&s->line_source);
 }
-
-static const Property esp32_mcpwm_properties[] = {
-    DEFINE_PROP_UINT32("min-edge-ns", Esp32McpwmState, min_edge_ns, 1000),
-};
 
 static const VMStateDescription vmstate_esp32_mcpwm_timer = {
     .name = TYPE_ESP32_MCPWM "-timer",
@@ -3150,8 +3126,8 @@ static const VMStateDescription vmstate_esp32p4_mcpwm_period = {
 
 static const VMStateDescription vmstate_esp32_mcpwm = {
     .name = TYPE_ESP32_MCPWM,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(core_clk, Esp32McpwmState),
         VMSTATE_CLOCK(cap_clk, Esp32McpwmState),
@@ -3176,7 +3152,6 @@ static const VMStateDescription vmstate_esp32_mcpwm = {
         VMSTATE_UINT32_ARRAY(cap_pre_cnt, Esp32McpwmState, ESP32_MCPWM_CAPS),
         VMSTATE_UINT8_ARRAY(out_level, Esp32McpwmState, ESP32_MCPWM_OUTS),
         VMSTATE_UINT8(irq_level, Esp32McpwmState),
-        VMSTATE_INT64(last_out_ns, Esp32McpwmState),
         VMSTATE_INT64(due_ns, Esp32McpwmState),
         VMSTATE_INT64(seen_ns, Esp32McpwmState),
         VMSTATE_END_OF_LIST()
@@ -3196,7 +3171,6 @@ static void esp32_mcpwm_class_init(ObjectClass *klass, const void *data)
     dc->vmsd = &vmstate_esp32_mcpwm;
     rc->phases.hold = esp32_mcpwm_reset_hold;
     rc->phases.exit = esp32_mcpwm_reset_exit;
-    device_class_set_props(dc, esp32_mcpwm_properties);
 }
 
 static void esp32p4_mcpwm_class_init(ObjectClass *klass, const void *data)

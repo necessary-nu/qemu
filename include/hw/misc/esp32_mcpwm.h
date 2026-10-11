@@ -203,11 +203,9 @@ struct Esp32McpwmState {
     bool cap_pre_out[ESP32_MCPWM_CAPS]; /* after the prescaler */
     uint32_t cap_pre_cnt[ESP32_MCPWM_CAPS];
 
-    /* Output lines as last driven, and edge coalescing */
+    /* Output lines as last driven */
     uint8_t out_level[ESP32_MCPWM_OUTS];
     uint8_t irq_level;
-    int64_t last_out_ns;
-    uint32_t min_edge_ns;
     /* When the timer is due, and whether it is firing */
     int64_t due_ns;
     bool in_timer_cb;
