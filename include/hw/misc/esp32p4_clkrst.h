@@ -567,6 +567,12 @@ extern const char *const esp32p4_reset_names[ESP32P4_NUM_RESETS];
  * "lp-core-reset", "lp-core-clock": the LP core's reset and clock enable.
  * "pll-cal-stop": per PLL (ESP32P4_ANA_PLL_*), HP_SYS_CLKRST_ANA_PLL_CTRL0's
  *   *_CAL_STOP, to the analog block.
+ * "core-stall": per HP core, high while it is stalled: by the PMU, or in
+ *   the stall that precedes a CPU reset with STALL_EN set. The system
+ *   timer's counters stop while a core they follow is stalled.
+ * "hp-core-reset": high while an HP core reset is held (see
+ *   esp32p4_clkrst_hp_core_reset()), for the HP blocks that have no reset
+ *   line of their own and for the RTC timer, which logs the time of it.
  */
 #define ESP32P4_CLKRST_RESET          "reset"
 #define ESP32P4_CLKRST_CORE_RESET     "core-reset"
@@ -575,6 +581,8 @@ extern const char *const esp32p4_reset_names[ESP32P4_NUM_RESETS];
 #define ESP32P4_CLKRST_LP_CORE_RESET  "lp-core-reset"
 #define ESP32P4_CLKRST_LP_CORE_CLOCK  "lp-core-clock"
 #define ESP32P4_CLKRST_PLL_CAL_STOP   "pll-cal-stop"
+#define ESP32P4_CLKRST_CORE_STALL     "core-stall"
+#define ESP32P4_CLKRST_HP_CORE_RESET  "hp-core-reset"
 
 /*
  * Named GPIO inputs.
@@ -587,10 +595,14 @@ extern const char *const esp32p4_reset_names[ESP32P4_NUM_RESETS];
  * "pmu-core-stall": per HP core, the PMU's software stall (not stalled).
  * "pmu-lp-core-reset", "pmu-lp-core-clock": the PMU's hold of the LP core
  *   in reset (held) and its LP CPU clock enable (off).
- * "mwdt-core-reset": per MWDT (timer group 0, 1), a pulse that requests a
- *   CPU reset of the HP cores HPCORE<n>_WDT_RESET_SOURCE_SEL picks.
- * "rwdt-core-reset": a pulse of the RTC watchdog's CPU reset, to the HP
- *   cores whose LP_WDT_HPCORE<n>_RESET_EN is set.
+ * "mwdt-core-reset": ESP32P4_CLKRST_MWDT_LINE(m, n), a pulse of MWDT m's
+ *   (timer group m's) CPU reset of HP core n, which its
+ *   TIMG_WDT_PROCPU_RESET_EN (core 0) or APPCPU_RESET_EN (core 1) lets
+ *   out; it resets core n if HPCORE<n>_WDT_RESET_SOURCE_SEL picks MWDT m.
+ * "rwdt-core-reset": per HP core, a pulse of the RTC watchdog's CPU reset
+ *   of the core, which LP_WDT_PROCPU_RESET_EN (core 0) or APPCPU_RESET_EN
+ *   (core 1) lets out; it resets the core if LP_WDT_HPCORE<n>_RESET_EN is
+ *   set.
  * "lp-uart-wakeup": a pulse of the LP UART's wakeup, which sets
  *   LPPERI_LP_UART_WAKEUP_FLAG while LP_UART_WAKEUP_EN is set.
  */
@@ -602,6 +614,9 @@ extern const char *const esp32p4_reset_names[ESP32P4_NUM_RESETS];
 #define ESP32P4_CLKRST_MWDT_CORE_RESET  "mwdt-core-reset"
 #define ESP32P4_CLKRST_RWDT_CORE_RESET  "rwdt-core-reset"
 #define ESP32P4_CLKRST_LP_UART_WAKEUP   "lp-uart-wakeup"
+
+#define ESP32P4_CLKRST_MWDTS            2
+#define ESP32P4_CLKRST_MWDT_LINE(m, n)  ((m) * ESP32P4_CLKRST_HP_CORES + (n))
 
 enum {
     ESP32P4_CLKRST_XPD_RC_FAST,
@@ -620,10 +635,21 @@ enum {
  * esp32p4_clkrst_record_reset().
  */
 #define ESP32P4_RESET_CAUSE_CHIP        0x01
+#define ESP32P4_RESET_CAUSE_MWDT_CORE   0x07
+#define ESP32P4_RESET_CAUSE_RWDT_CORE   0x09
 #define ESP32P4_RESET_CAUSE_MWDT_CPU    0x0b
 #define ESP32P4_RESET_CAUSE_SW_CPU      0x0c
 #define ESP32P4_RESET_CAUSE_RWDT_CPU    0x0d
+#define ESP32P4_RESET_CAUSE_RWDT_SYS    0x10
+#define ESP32P4_RESET_CAUSE_SWD         0x12
 #define ESP32P4_RESET_CAUSE_SW_LP_CPU   0x14
+
+/* The sources of an HP core reset, esp32p4_clkrst_hp_core_reset()'s. */
+enum {
+    ESP32P4_HP_CORE_RESET_MWDT0,
+    ESP32P4_HP_CORE_RESET_MWDT1,
+    ESP32P4_HP_CORE_RESET_RWDT,
+};
 
 /* The cores in esp32p4_clkrst_record_reset()'s mask. */
 #define ESP32P4_CLKRST_CORE_HP0 (1u << 0)
@@ -677,6 +703,8 @@ struct ESP32P4ClkRstState {
     qemu_irq lp_core_reset;
     qemu_irq lp_core_clock;
     qemu_irq pll_cal_stop[ESP32P4_CLKRST_NUM_PLL_CAL];
+    qemu_irq core_stall[ESP32P4_CLKRST_HP_CORES];
+    qemu_irq hp_core_reset_out;
 
     bool pll_cal_end[ESP32P4_CLKRST_NUM_PLL_CAL];
     bool pmu_xpd[ESP32P4_CLKRST_NUM_XPD];
@@ -702,8 +730,12 @@ struct ESP32P4ClkRstState {
     bool core_reset_level[ESP32P4_CLKRST_HP_CORES];
     bool core_clock_level[ESP32P4_CLKRST_HP_CORES];
     bool core_vector_level[ESP32P4_CLKRST_HP_CORES];
+    bool core_stall_level[ESP32P4_CLKRST_HP_CORES];
     bool lp_core_reset_level;
     bool lp_core_clock_level;
+    /* An HP core reset held until hp_core_timer releases it. */
+    bool hp_core_reset;
+    QEMUTimer *hp_core_timer;
     /* The SoC clocks' periods last checked against their limits. */
     uint64_t checked_soc[4];
     /* In the device's own reset, which does not reset the gated blocks. */
@@ -760,5 +792,27 @@ void esp32p4_clkrst_record_reset(ESP32P4ClkRstState *s, unsigned cores,
  */
 void esp32p4_clkrst_set_system_reset_cause(ESP32P4ClkRstState *s,
                                            uint8_t cause);
+
+/*
+ * The cause a system reset in progress records, for the blocks whose
+ * reset tells a system reset from a chip reset (the RTC timer keeps
+ * counting through a system reset): non-zero from the moment a block sets
+ * it until this device's reset hold phase records it, so a block's reset
+ * enter phase sees it; 0 in a chip reset.
+ */
+uint8_t esp32p4_clkrst_system_reset_cause(ESP32P4ClkRstState *s);
+
+/*
+ * An HP core reset (TRM 11.1) from @source, an ESP32P4_HP_CORE_RESET_*:
+ * the HP system's reset, of both HP cores, every HP block and
+ * HP_SYS_CLKRST's registers, held for @length_ns and leaving the LP system
+ * (LP_CLKRST, LPPERI, the LP blocks and the LP core) as it is. Both HP
+ * cores record the source's cause, MWDT core reset (0x07) or RWDT core
+ * reset (0x09). An MWDT's request takes effect only if
+ * HPCORE<n>_WDT_RESET_SOURCE_SEL picks it for one of the cores (TRM table
+ * 11.1-1, note 2). The caller may itself be reset before this returns.
+ */
+void esp32p4_clkrst_hp_core_reset(ESP32P4ClkRstState *s, unsigned source,
+                                  int64_t length_ns);
 
 #endif
