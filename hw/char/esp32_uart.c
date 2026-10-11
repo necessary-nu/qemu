@@ -157,7 +157,7 @@ void esp32_uart_update_irq(ESP32UARTState *s)
 void esp32_uart_set_rx_timeout(ESP32UARTState *s)
 {
     if (s->rx_tout_ena && s->baud_rate) {
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int64_t now = esp32_line_time();
         uint64_t thres = s->rx_tout_thres;
         /*
          * The timeout counter runs from APB_CLK: with REF_TICK as the baud
@@ -334,15 +334,15 @@ static void uart_tx_schedule(ESP32UARTState *s)
 
 /*
  * [spec:nuos:req:emu.esp32.gpio]
- * Bring the transmitter up to the present: put every bit whose time has
- * passed on TXD, stamped with its own time, and start the next frame right
- * after the stop bits of one that has ended. Register accesses and pad
- * samples call this first, so what software sees does not depend on how
- * promptly the timer callback runs.
+ * Bring the transmitter up to the present (esp32_line_time()): put every
+ * bit whose time has passed on TXD, stamped with its own time, and start
+ * the next frame right after the stop bits of one that has ended. Register
+ * accesses and receivers sampling the line call this first, so what they
+ * see does not depend on how promptly the timer callback runs.
  */
 static void uart_tx_advance(ESP32UARTState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
 
     while (s->tx_busy && s->tx_q32) {
         unsigned b = tx_next_change(s);
@@ -376,7 +376,7 @@ static void uart_tx_start(ESP32UARTState *s)
     if (s->tx_busy || !uart_tx_can_start(s)) {
         return;
     }
-    uart_tx_start_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    uart_tx_start_at(s, esp32_line_time());
     uart_tx_schedule(s);
     esp32_uart_update_irq(s);
 }
@@ -422,7 +422,7 @@ static void uart_line_sync(Notifier *n, void *data)
 static void uart_clk_update(void *opaque, ClockEvent event)
 {
     ESP32UARTState *s = ESP32_UART(opaque);
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
 
     if (event == ClockPreUpdate) {
         uart_tx_advance(s);
@@ -485,12 +485,29 @@ static bool uart_rx_format(void *opaque, Esp32UartFrameFmt *fmt)
     return fmt->bit_q32 != 0;
 }
 
-static uint64_t uart_read(void *opaque, hwaddr addr, unsigned int size)
+/*
+ * Bring the UART up to the moment of a register access: the transmitter,
+ * the receiver, whose frames due by then are decoded once their senders
+ * are up to then too, and the receive timeout, so that what software sees
+ * does not depend on how promptly the timers run.
+ */
+static void uart_catch_up(ESP32UARTState *s)
 {
-    ESP32UARTState *s = ESP32_UART(opaque);
+    uart_tx_advance(s);
+    esp32_uart_rx_flush(&s->rx);
+    if (timer_pending(&s->rx_timeout_timer) &&
+        timer_expire_time_ns(&s->rx_timeout_timer) <= esp32_line_time()) {
+        timer_del(&s->rx_timeout_timer);
+        s->rxfifo_tout = true;
+        esp32_uart_update_irq(s);
+    }
+}
+
+static uint64_t uart_reg_read(ESP32UARTState *s, hwaddr addr)
+{
     uint64_t r = 0;
 
-    uart_tx_advance(s);
+    uart_catch_up(s);
     switch (addr) {
     case A_UART_FIFO:
         if (fifo8_num_used(&s->rx_fifo) == 0) {
@@ -554,7 +571,7 @@ static uint64_t uart_read(void *opaque, hwaddr addr, unsigned int size)
  */
 static void uart_write_conf0(ESP32UARTState *s, uint32_t value)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
 
     uart_tx_freeze(s, now);
     s->reg[R_UART_CONF0] = value;
@@ -579,12 +596,9 @@ static void uart_write_conf0(ESP32UARTState *s, uint32_t value)
     notifier_list_notify(&s->format_notifiers, s);
 }
 
-static void uart_write(void *opaque, hwaddr addr,
-                       uint64_t value, unsigned int size)
+static void uart_reg_write(ESP32UARTState *s, hwaddr addr, uint64_t value)
 {
-    ESP32UARTState *s = ESP32_UART(opaque);
-
-    uart_tx_advance(s);
+    uart_catch_up(s);
     switch (addr) {
     case A_UART_FIFO:
         if (fifo8_num_free(&s->tx_fifo) == 0) {
@@ -609,10 +623,10 @@ static void uart_write(void *opaque, hwaddr addr,
         break;
 
     case A_UART_CLKDIV:
-        uart_tx_freeze(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        uart_tx_freeze(s, esp32_line_time());
         s->reg[addr / 4] = value;
         uart_update_baud(s);
-        uart_tx_rerate(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        uart_tx_rerate(s, esp32_line_time());
         uart_tx_start(s);
         notifier_list_notify(&s->format_notifiers, s);
         break;
@@ -664,6 +678,50 @@ static void uart_write(void *opaque, hwaddr addr,
 
     }
     esp32_uart_update_irq(s);
+}
+
+/* A register access under way, which acts at one moment throughout. */
+typedef struct UartAccess {
+    ESP32UARTState *s;
+    hwaddr addr;
+    uint64_t value;
+} UartAccess;
+
+static void uart_access_read(void *opaque)
+{
+    UartAccess *a = opaque;
+
+    a->value = uart_reg_read(a->s, a->addr);
+}
+
+static void uart_access_write(void *opaque)
+{
+    UartAccess *a = opaque;
+
+    uart_reg_write(a->s, a->addr, a->value);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * A register access acts at the moment it began (see esp32_line.h): a
+ * frame it starts, the line changes it makes and the frames it decodes
+ * all belong to that moment, however long the access takes without
+ * icount.
+ */
+static uint64_t uart_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    UartAccess a = { .s = ESP32_UART(opaque), .addr = addr };
+
+    esp32_line_run_at(esp32_line_time(), uart_access_read, &a);
+    return a.value;
+}
+
+static void uart_write(void *opaque, hwaddr addr,
+                       uint64_t value, unsigned int size)
+{
+    UartAccess a = { .s = ESP32_UART(opaque), .addr = addr, .value = value };
+
+    esp32_line_run_at(esp32_line_time(), uart_access_write, &a);
 }
 
 /* [spec:nuos:req:emu.esp32.uhci] */
