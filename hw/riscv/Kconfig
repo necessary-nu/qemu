@@ -19,6 +19,7 @@ config ESP32P4
     select ESP32_DWMAC
     select ESP32P4_USB
     select ESP32_LINE
+    select ESP32_UART_LINE
     select I2C
     select I3C
     select OR_IRQ

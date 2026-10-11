@@ -123,6 +123,45 @@
  *     A card is on the board, not the chip: no reset of the chip or the
  *     controller reaches it, only a power cycle (QEMU's system reset).
  *
+ *   - The UARTs (TRM chapter 45): UART0 to UART4 at 0x500CA000 to
+ *     0x500CE000, behind UARTn_APB_CLK and their APB resets, their cores
+ *     on UARTn_SCLK and their core resets, their FIFO RAM ports on
+ *     UARTn_SYS_CLK, their interrupts sources 31 to 35; and the LP UART at
+ *     0x50121000, behind LPPERI's LP_UART clock and reset, its core on
+ *     LP_UART_SCLK, its interrupt source 16. Their wakeups, which the
+ *     PMU's UART_WAKEUP_EN arms, are PMU wakeup sources, the LP UART's
+ *     also LPPERI's LP_UART_WAKEUP_FLAG. Their TXD, RTS and DTR and RXD,
+ *     CTS and DSR are GPIO matrix signals (the LP UART's the LP matrix's),
+ *     reaching pads where software routes them.
+ *
+ *     The board's serial ports are terminals on UART pads, each sending and
+ *     receiving frames on its pads at the format and baud rate its UART is
+ *     set to, as a USB-serial bridge matched to the chip would; a byte gets
+ *     through only where software has routed the UART to those pads. Port
+ *     0 (-serial, the console) is on UART0's IO MUX pads, U0TXD GPIO37 and
+ *     U0RXD GPIO38, where the boot ROM prints; port 1 on UART1's IO MUX
+ *     pads, GPIO10 (TXD) and GPIO11 (RXD); ports 2 to 4, for UART2 to
+ *     UART4, which have no IO MUX pads, on GPIO16/17, GPIO18/19 and
+ *     GPIO20/21 (TXD/RXD), which the matrix can route them to; port 5 on
+ *     the LP UART's LP IO MUX pads, GPIO14 (TXD) and GPIO15 (RXD). A port
+ *     drives its RXD pad, idle high, only while its chardev is connected:
+ *
+ *       -serial stdio -serial null -serial file:uart2.log
+ *
+ *     UHCI0 (0x500DF000), behind UHCI_APB_CLK and its reset, its
+ *     interrupt source 30, moves the data of the UART CONF0.UART_SEL
+ *     names through GDMA-AHB as peripheral UHCI0.
+ *
+ *   - The USB Serial/JTAG controller (TRM chapter 54) at 0x500D2000,
+ *     behind USB_DEVICE_APB_CLK and LP_CLKRST's USB_DEVICE reset, its USB
+ *     side on USB_DEVICE_48M_CLK, its interrupt source 22, its PHY's
+ *     pull-ups on GPIO24 and GPIO25. Its CDC-ACM serial port reaches a
+ *     chardev, a computer at the other end of the board's USB cable,
+ *     which enumerates the device as the boot ROM starts and reads and
+ *     writes the port while the chardev is open; with none, no cable:
+ *
+ *       -chardev stdio,id=usj -global esp32p4-usb-serial-jtag.chardev=usj
+ *
  *   - The DMA controllers (TRM chapters 6 and 7): GDMA-AHB at 0x50085000
  *     and GDMA-AXI at 0x5008A000, three RX and three TX channels each,
  *     behind AHB_PDMA_SYS_CLK and AXI_PDMA_SYS_CLK and their resets, their
@@ -297,12 +336,14 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "hw/misc/unimp.h"
 #include "hw/riscv/esp32p4.h"
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
 #include "system/blockdev.h"
 #include "system/reset.h"
+#include "system/system.h"
 #include "system/tcg.h"
 #include "exec/translation-block.h"
 
@@ -340,16 +381,9 @@ static const struct {
     /* HP peripherals 1. */
     { "mcpwm0",           0x500c0000, 4 * KiB },
     { "mcpwm1",           0x500c1000, 4 * KiB },
-    { "uart0",            0x500ca000, 4 * KiB },
-    { "uart1",            0x500cb000, 4 * KiB },
-    { "uart2",            0x500cc000, 4 * KiB },
-    { "uart3",            0x500cd000, 4 * KiB },
-    { "uart4",            0x500ce000, 4 * KiB },
-    { "usb-serial-jtag",  0x500d2000, 4 * KiB },
     { "ledc",             0x500d3000, 4 * KiB },
     { "lcd-cam",          0x500dc000, 4 * KiB },
     { "adc",              0x500de000, 4 * KiB },
-    { "uhci",             0x500df000, 4 * KiB },
     { "iomux-mspi-pin",   0x500e1200, 4 * KiB - 0x200 },
     { "mem-monitor",      0x500e3000, 4 * KiB },
     { "audio-addc",       0x500e4000, 4 * KiB },
@@ -365,7 +399,6 @@ static const struct {
     { "rtc-cali",         0x50119000, 4 * KiB },
 
     /* LP peripherals. */
-    { "lp-uart",          0x50121000, 4 * KiB },
     { "lp-spi",           0x50123000, 4 * KiB },
     { "lp-adc",           0x50127000, 4 * KiB },
     { "lp-touch",         0x50128000, 4 * KiB },
@@ -1955,10 +1988,10 @@ static void esp32p4_hp_top_power(void *opaque, int n, int level)
  *     wakeup on pads GPIO0 to GPIO15, which LP_SYSTEM records too. Its ETM
  *     task, PMU_TASK_SLEEP_REQ, and event, PMU_EVT_SLEEP_WAKEUP, are the
  *     ETM's (esp32p4_init_etm()), and the LP I2S's VAD wakeup is
- *     connected with the LP I2S (esp32p4_init_i2s()). The other sources'
- *     "wakeup" lines, UART_WAKEUP_EN and the LP interrupt wait for the
- *     blocks that take them (UARTs, USB, SDIO, touch, EMAC, the LP core's
- *     interrupts).
+ *     connected with the LP I2S (esp32p4_init_i2s()); the UARTs' wakeups
+ *     and UART_WAKEUP_EN are the UARTs' (esp32p4_init_uart()). The other
+ *     sources' "wakeup" lines and the LP interrupt wait for the blocks
+ *     that take them (USB, SDIO, touch, EMAC, the LP core's interrupts).
  *   - LP_ANALOG_PERI, behind its LP_CLKRST reset, its interrupt source 8:
  *     the brown-out detector, on BIAS's thresholds, and the glitch and
  *     power supply detectors. The detector's "bod-en" is left at the
@@ -3001,6 +3034,227 @@ static void esp32p4_init_usb(ESP32P4MachineState *s)
 }
 
 /*
+ * The UARTs and the board's serial ports on their pads (see the head
+ * comment): each UART's registers behind its bus clock and APB reset,
+ * FIFO_REG's read popping the RX FIFO and reading 0 while gated; its core
+ * on its function clock and core reset; its lines through the GPIO
+ * matrix. Their wakeup logic is armed by the PMU's UART_WAKEUP_EN, and
+ * their wakeups are its wakeup sources UART0 to UART4 and LP_UART; the
+ * LP UART's also sets LPPERI's LP_UART_WAKEUP_FLAG. Then UHCI0, between
+ * the UARTs and GDMA-AHB.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart] */
+static void esp32p4_init_uart(ESP32P4MachineState *s)
+{
+    static const struct {
+        int txd, rts, dtr, rxd, cts, dsr;
+        int tx_pad, rx_pad;
+    } lines[ESP32P4_UART_COUNT] = {
+        { ESP32P4_SIG_UART0_TXD_PAD_OUT, ESP32P4_SIG_UART0_RTS_PAD_OUT,
+          ESP32P4_SIG_UART0_DTR_PAD_OUT, ESP32P4_SIG_UART0_RXD_PAD_IN,
+          ESP32P4_SIG_UART0_CTS_PAD_IN, ESP32P4_SIG_UART0_DSR_PAD_IN,
+          37, 38 },
+        { ESP32P4_SIG_UART1_TXD_PAD_OUT, ESP32P4_SIG_UART1_RTS_PAD_OUT,
+          ESP32P4_SIG_UART1_DTR_PAD_OUT, ESP32P4_SIG_UART1_RXD_PAD_IN,
+          ESP32P4_SIG_UART1_CTS_PAD_IN, ESP32P4_SIG_UART1_DSR_PAD_IN,
+          10, 11 },
+        { ESP32P4_SIG_UART2_TXD_PAD_OUT, ESP32P4_SIG_UART2_RTS_PAD_OUT,
+          ESP32P4_SIG_UART2_DTR_PAD_OUT, ESP32P4_SIG_UART2_RXD_PAD_IN,
+          ESP32P4_SIG_UART2_CTS_PAD_IN, ESP32P4_SIG_UART2_DSR_PAD_IN,
+          16, 17 },
+        { ESP32P4_SIG_UART3_TXD_PAD_OUT, ESP32P4_SIG_UART3_RTS_PAD_OUT,
+          ESP32P4_SIG_UART3_DTR_PAD_OUT, ESP32P4_SIG_UART3_RXD_PAD_IN,
+          ESP32P4_SIG_UART3_CTS_PAD_IN, ESP32P4_SIG_UART3_DSR_PAD_IN,
+          18, 19 },
+        { ESP32P4_SIG_UART4_TXD_PAD_OUT, ESP32P4_SIG_UART4_RTS_PAD_OUT,
+          ESP32P4_SIG_UART4_DTR_PAD_OUT, ESP32P4_SIG_UART4_RXD_PAD_IN,
+          ESP32P4_SIG_UART4_CTS_PAD_IN, ESP32P4_SIG_UART4_DSR_PAD_IN,
+          20, 21 },
+    };
+    DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
+    DeviceState *pmu = DEVICE(&s->pmu), *wake_en, *lp_wake;
+    DeviceState *dev, *term;
+    ESP32P4ClkRstGate *g;
+    int i;
+
+    object_initialize_child(OBJECT(s), "uart-wakeup-en-split",
+                            &s->uart_wakeup_en_split, TYPE_SPLIT_IRQ);
+    wake_en = DEVICE(&s->uart_wakeup_en_split);
+    qdev_prop_set_uint16(wake_en, "num-lines", ESP32P4_UART_COUNT + 1);
+    qdev_realize(wake_en, NULL, &error_fatal);
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_UART_WAKEUP_EN, 0,
+                                qdev_get_gpio_in(wake_en, 0));
+
+    for (i = 0; i < ESP32P4_UART_COUNT; i++) {
+        g_autofree char *sclk = g_strdup_printf("uart%d-sclk", i);
+        g_autofree char *sys = g_strdup_printf("uart%d-sys", i);
+        g_autofree char *name = g_strdup_printf("esp32p4.uart%d", i);
+
+        object_initialize_child(OBJECT(s), "uart[*]", &s->uart[i],
+                                TYPE_ESP32P4_UART);
+        dev = DEVICE(&s->uart[i]);
+        qdev_prop_set_string(dev, "name", name);
+        qdev_connect_clock_in(dev, "sclk", qdev_get_clock_out(clkrst, sclk));
+        qdev_connect_clock_in(dev, "sys", qdev_get_clock_out(clkrst, sys));
+        sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+        g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                     ESP32P4_UART0_BASE +
+                                     i * ESP32P4_UART_STRIDE,
+                                     ESP32P4_CLK_UART0_APB + i,
+                                     ESP32P4_RST_UART0_APB + i, 0);
+        esp32p4_clkrst_gate_volatile(g, 0, 4);
+        qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                    ESP32P4_RST_UART0_CORE + i,
+                                    qdev_get_gpio_in_named(dev,
+                                        ESP32P4_UART_CORE_RESET, 0));
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           esp32p4_intr_source(s, ESP32P4_INTR_UART0 + i));
+        qdev_connect_gpio_out(wake_en, i,
+                              qdev_get_gpio_in_named(dev,
+                                  ESP32P4_UART_WAKEUP_EN, 0));
+        qdev_connect_gpio_out_named(dev, ESP32P4_UART_WAKEUP, 0,
+                                    qdev_get_gpio_in_named(pmu,
+                                        ESP32P4_PMU_WAKEUP,
+                                        ESP32P4_PMU_WAKE_UART0 - i));
+
+        qdev_connect_gpio_out_named(dev, ESP32P4_UART_TXD, 0,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT, lines[i].txd));
+        qdev_connect_gpio_out_named(dev, ESP32P4_UART_RTS, 0,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT, lines[i].rts));
+        qdev_connect_gpio_out_named(dev, ESP32P4_UART_DTR, 0,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT, lines[i].dtr));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN, lines[i].rxd,
+            qdev_get_gpio_in_named(dev, ESP32P4_UART_RXD, 0));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN, lines[i].cts,
+            qdev_get_gpio_in_named(dev, ESP32P4_UART_CTS, 0));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN, lines[i].dsr,
+            qdev_get_gpio_in_named(dev, ESP32P4_UART_DSR, 0));
+    }
+
+    object_initialize_child(OBJECT(s), "lp-uart", &s->lp_uart,
+                            TYPE_ESP32P4_UART);
+    dev = DEVICE(&s->lp_uart);
+    qdev_prop_set_bit(dev, "lp", true);
+    qdev_prop_set_string(dev, "name", "esp32p4.lp-uart");
+    qdev_connect_clock_in(dev, "sclk",
+                          qdev_get_clock_out(clkrst, "lp-uart-sclk"));
+    qdev_connect_clock_in(dev, "sys", qdev_get_clock_out(clkrst, "lp-uart"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                 ESP32P4_LP_UART_BASE, ESP32P4_CLK_LP_UART,
+                                 ESP32P4_RST_LP_UART, 0);
+    esp32p4_clkrst_gate_volatile(g, 0, 4);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_UART));
+    qdev_connect_gpio_out(wake_en, ESP32P4_UART_COUNT,
+                          qdev_get_gpio_in_named(dev,
+                              ESP32P4_UART_WAKEUP_EN, 0));
+    object_initialize_child(OBJECT(s), "lp-uart-wakeup-split",
+                            &s->lp_uart_wakeup_split, TYPE_SPLIT_IRQ);
+    lp_wake = DEVICE(&s->lp_uart_wakeup_split);
+    qdev_prop_set_uint16(lp_wake, "num-lines", 2);
+    qdev_realize(lp_wake, NULL, &error_fatal);
+    qdev_connect_gpio_out_named(dev, ESP32P4_UART_WAKEUP, 0,
+                                qdev_get_gpio_in(lp_wake, 0));
+    qdev_connect_gpio_out(lp_wake, 0,
+                          qdev_get_gpio_in_named(clkrst,
+                              ESP32P4_CLKRST_LP_UART_WAKEUP, 0));
+    qdev_connect_gpio_out(lp_wake, 1,
+                          qdev_get_gpio_in_named(pmu, ESP32P4_PMU_WAKEUP,
+                                                 ESP32P4_PMU_WAKE_LP_UART));
+    qdev_connect_gpio_out_named(dev, ESP32P4_UART_TXD, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_LP_SIG_OUT,
+                               ESP32P4_LP_SIG_UART_TXD_PAD_OUT));
+    qdev_connect_gpio_out_named(dev, ESP32P4_UART_RTS, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_LP_SIG_OUT,
+                               ESP32P4_LP_SIG_UART_RTSN_PAD_OUT));
+    qdev_connect_gpio_out_named(dev, ESP32P4_UART_DTR, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_LP_SIG_OUT,
+                               ESP32P4_LP_SIG_UART_DTRN_PAD_OUT));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_LP_SIG_IN,
+                                ESP32P4_LP_SIG_UART_RXD_PAD_IN,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_UART_RXD, 0));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_LP_SIG_IN,
+                                ESP32P4_LP_SIG_UART_CTSN_PAD_IN,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_UART_CTS, 0));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_LP_SIG_IN,
+                                ESP32P4_LP_SIG_UART_DSRN_PAD_IN,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_UART_DSR, 0));
+
+    for (i = 0; i < ESP32P4_SERIAL_PORTS; i++) {
+        bool lp = i == ESP32P4_UART_COUNT;
+        int tx_pad = lp ? 14 : lines[i].tx_pad;
+        int rx_pad = lp ? 15 : lines[i].rx_pad;
+
+        object_initialize_child(OBJECT(s), "terminal[*]", &s->terminal[i],
+                                TYPE_ESP32_UART_TERMINAL);
+        term = DEVICE(&s->terminal[i]);
+        qdev_prop_set_chr(term, "chardev", serial_hd(i));
+        object_property_set_link(OBJECT(term), "uart",
+                                 OBJECT(lp ? &s->lp_uart : &s->uart[i]),
+                                 &error_abort);
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_OUT, tx_pad,
+                                    qdev_get_gpio_in_named(term,
+                                        ESP32_UART_TERMINAL_RX, 0));
+        qdev_connect_gpio_out_named(term, ESP32_UART_TERMINAL_TX, 0,
+                                    qdev_get_gpio_in_named(gpio,
+                                        ESP32P4_GPIO_PAD_IN, rx_pad));
+        qdev_realize(term, NULL, &error_fatal);
+    }
+
+    object_initialize_child(OBJECT(s), "uhci", &s->uhci, TYPE_ESP32P4_UHCI);
+    dev = DEVICE(&s->uhci);
+    object_property_set_link(OBJECT(dev), "gdma", OBJECT(&s->gdma[0]),
+                             &error_abort);
+    for (i = 0; i < ESP32P4_UART_COUNT; i++) {
+        g_autofree char *link = g_strdup_printf("uart%d", i);
+
+        object_property_set_link(OBJECT(dev), link, OBJECT(&s->uart[i]),
+                                 &error_abort);
+    }
+    qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, "uhci-sys"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_UHCI_BASE, ESP32P4_CLK_UHCI_APB,
+                             ESP32P4_RST_UHCI, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_UHCI0));
+}
+
+/*
+ * The USB Serial/JTAG controller: its registers behind
+ * USB_DEVICE_APB_CLK and its reset, its USB side on USB_DEVICE_48M_CLK,
+ * its D- and D+ pull-ups on GPIO24 and GPIO25.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart] */
+static void esp32p4_init_usb_serial_jtag(ESP32P4MachineState *s)
+{
+    DeviceState *dev, *gpio = DEVICE(&s->gpio);
+
+    object_initialize_child(OBJECT(s), "usb-serial-jtag", &s->usj,
+                            TYPE_ESP32P4_USB_SERIAL_JTAG);
+    dev = DEVICE(&s->usj);
+    qdev_connect_clock_in(dev, "usb48",
+                          qdev_get_clock_out(DEVICE(&s->clkrst),
+                                             "usb-device-48m"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_USJ_BASE, ESP32P4_CLK_USB_DEVICE_APB,
+                             ESP32P4_RST_USB_DEVICE, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_USB_SERIAL_JTAG));
+    qdev_connect_gpio_out_named(dev, ESP32P4_USJ_PAD_PULL_UP, 0,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_PAD_PULL_UP, 24));
+    qdev_connect_gpio_out_named(dev, ESP32P4_USJ_PAD_PULL_UP, 1,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_PAD_PULL_UP, 25));
+}
+
+/*
  * A cryptography block: its clock, its registers behind @bus_clock, and
  * its interrupt (or none for -1).
  */
@@ -3394,6 +3648,8 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_spi(s);
     esp32p4_init_parlio(s);
     esp32p4_init_low_power(s);
+    esp32p4_init_uart(s);
+    esp32p4_init_usb_serial_jtag(s);
     esp32p4_init_i2s(s);
     esp32p4_init_i3c(s);
     esp32p4_init_twai(s);

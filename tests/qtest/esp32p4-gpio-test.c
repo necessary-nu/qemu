@@ -179,9 +179,13 @@
 
 #define CYCLE_NS            25
 
+/*
+ * A board with no serial port on UART0's pads: a connected one's bridge
+ * drives GPIO38 high, which GPIO_STRAP would latch.
+ */
 static QTestState *start_plain(void)
 {
-    return qtest_init("-M esp32p4,flash-size=16M");
+    return qtest_init("-M esp32p4,flash-size=16M -serial none");
 }
 
 static void pad_in(QTestState *qts, int n, int level)

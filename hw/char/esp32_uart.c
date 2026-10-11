@@ -42,218 +42,6 @@
 static void uart_tx_start(ESP32UARTState *s);
 static void uart_tx_advance(ESP32UARTState *s);
 
-uint64_t esp32_uart_mul_shr(uint64_t a, uint64_t b, unsigned shift)
-{
-    uint64_t lo, hi;
-
-    mulu64(&lo, &hi, a, b);
-    if (shift >= 64) {
-        return hi >> (shift - 64);
-    }
-    if (shift == 0) {
-        return hi ? UINT64_MAX : lo;
-    }
-    if (hi >> shift) {
-        return UINT64_MAX;
-    }
-    return (lo >> shift) | (hi << (64 - shift));
-}
-
-/* [spec:nuos:req:emu.esp32.gpio] */
-unsigned esp32_uart_frame_levels(const Esp32UartFrameFmt *fmt, unsigned data,
-                                 uint16_t *levels)
-{
-    uint16_t v = 0;
-    unsigned n = 1, ones = 0;
-
-    for (unsigned i = 0; i < fmt->data_bits; i++, n++) {
-        if ((data >> i) & 1) {
-            v |= 1u << n;
-            ones++;
-        }
-    }
-    if (fmt->parity_en) {
-        if ((ones & 1) ^ fmt->parity_odd) {
-            v |= 1u << n;
-        }
-        n++;
-    }
-    *levels = v;
-    return n;
-}
-
-/* The middle of bit `bit` of the frame being received, from its start bit */
-static int64_t rx_sample_ns(const Esp32UartRx *rx, unsigned bit)
-{
-    return rx->edge_ns[0] +
-           esp32_uart_mul_shr(2 * bit + 1, rx->fmt.bit_q32, 33);
-}
-
-static unsigned rx_stop_bit(const Esp32UartRx *rx)
-{
-    return 1 + rx->fmt.data_bits + rx->fmt.parity_en;
-}
-
-/*
- * The line's level at t within the frame: edge 0 is the start bit's
- * falling edge, and each later one toggles the line.
- */
-static bool rx_level_at(const Esp32UartRx *rx, int64_t t)
-{
-    unsigned n = 0;
-
-    while (n < rx->n_edges && rx->edge_ns[n] <= t) {
-        n++;
-    }
-    return !(n & 1);
-}
-
-/*
- * [spec:nuos:req:emu.esp32.gpio]
- * Sample the frame received and hand it over; then look for the next
- * start bit among the changes since the stop bit's sample, or since the
- * start bit's sample if that found the line high again (a glitch, not a
- * start bit).
- */
-static void rx_finish(Esp32UartRx *rx)
-{
-    unsigned stop = rx_stop_bit(rx);
-    int64_t resume = rx_sample_ns(rx, stop);
-    int64_t rest[ESP32_UART_RX_EDGES];
-    unsigned n_rest = 0, data = 0, flags = 0;
-    bool valid = !rx_level_at(rx, rx_sample_ns(rx, 0));
-
-    if (!valid) {
-        resume = rx_sample_ns(rx, 0);
-    } else {
-        unsigned ones = 0;
-        bool parity = false, stop_level;
-
-        for (unsigned i = 0; i < rx->fmt.data_bits; i++) {
-            if (rx_level_at(rx, rx_sample_ns(rx, 1 + i))) {
-                data |= 1u << i;
-                ones++;
-            }
-        }
-        if (rx->fmt.parity_en) {
-            parity = rx_level_at(rx, rx_sample_ns(rx, stop - 1));
-            if (((ones + parity) & 1) != rx->fmt.parity_odd) {
-                flags |= ESP32_UART_RX_PARITY_ERR;
-            }
-        }
-        stop_level = rx_level_at(rx, resume);
-        if (!stop_level || rx->noise) {
-            flags |= ESP32_UART_RX_FRAME_ERR;
-            if (!stop_level && data == 0 && !parity) {
-                flags |= ESP32_UART_RX_BREAK;
-            }
-        }
-    }
-
-    for (unsigned i = 0; i < rx->n_edges; i++) {
-        if (rx->edge_ns[i] > resume) {
-            rest[n_rest++] = rx->edge_ns[i];
-        }
-    }
-    rx->level = rx_level_at(rx, resume);
-    rx->busy = false;
-    rx->noise = false;
-    rx->n_edges = 0;
-    timer_del(&rx->timer);
-    if (valid) {
-        rx->deliver(rx->opaque, data, flags);
-    }
-    for (unsigned i = 0; i < n_rest; i++) {
-        esp32_uart_rx_line(rx, !rx->level, rest[i]);
-    }
-}
-
-/* [spec:nuos:req:emu.esp32.gpio] */
-void esp32_uart_rx_line(Esp32UartRx *rx, bool level, int64_t when_ns)
-{
-    if (level == rx->level) {
-        return;
-    }
-    if (rx->busy && when_ns > rx_sample_ns(rx, rx_stop_bit(rx))) {
-        rx_finish(rx);
-        if (level == rx->level) {
-            return;
-        }
-    }
-    rx->level = level;
-    if (rx->busy) {
-        /* Stamps from different sources may not be in order */
-        when_ns = MAX(when_ns, rx->edge_ns[rx->n_edges - 1]);
-        if (rx->n_edges < ESP32_UART_RX_EDGES) {
-            rx->edge_ns[rx->n_edges++] = when_ns;
-        } else {
-            rx->noise = true;
-        }
-        return;
-    }
-    if (level || !rx->format(rx->opaque, &rx->fmt) || !rx->fmt.bit_q32) {
-        return;
-    }
-    rx->busy = true;
-    rx->n_edges = 1;
-    rx->edge_ns[0] = when_ns;
-    timer_mod_ns(&rx->timer, rx_sample_ns(rx, rx_stop_bit(rx)));
-}
-
-static void rx_timer_cb(void *opaque)
-{
-    Esp32UartRx *rx = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-
-    /*
-     * Every change up to now must be in before the frame is sampled; one
-     * that started while the sources caught up is not due yet.
-     */
-    esp32_line_sync();
-    if (rx->busy && now >= rx_sample_ns(rx, rx_stop_bit(rx))) {
-        rx_finish(rx);
-    }
-}
-
-void esp32_uart_rx_init(Esp32UartRx *rx, Esp32UartRxFormat *format,
-                        Esp32UartRxDeliver *deliver, void *opaque)
-{
-    rx->format = format;
-    rx->deliver = deliver;
-    rx->opaque = opaque;
-    rx->level = true;
-    timer_init_ns(&rx->timer, QEMU_CLOCK_VIRTUAL, rx_timer_cb, rx);
-}
-
-void esp32_uart_rx_reset(Esp32UartRx *rx, bool level)
-{
-    timer_del(&rx->timer);
-    rx->busy = false;
-    rx->noise = false;
-    rx->n_edges = 0;
-    rx->level = level;
-}
-
-const VMStateDescription vmstate_esp32_uart_rx = {
-    .name = "esp32-uart-rx",
-    .version_id = 1,
-    .minimum_version_id = 1,
-    .fields = (const VMStateField[]) {
-        VMSTATE_TIMER(timer, Esp32UartRx),
-        VMSTATE_BOOL(level, Esp32UartRx),
-        VMSTATE_BOOL(busy, Esp32UartRx),
-        VMSTATE_BOOL(noise, Esp32UartRx),
-        VMSTATE_UINT8(fmt.data_bits, Esp32UartRx),
-        VMSTATE_BOOL(fmt.parity_en, Esp32UartRx),
-        VMSTATE_BOOL(fmt.parity_odd, Esp32UartRx),
-        VMSTATE_UINT8(fmt.stop_half_bits, Esp32UartRx),
-        VMSTATE_UINT64(fmt.bit_q32, Esp32UartRx),
-        VMSTATE_UINT8(n_edges, Esp32UartRx),
-        VMSTATE_INT64_ARRAY(edge_ns, Esp32UartRx, ESP32_UART_RX_EDGES),
-        VMSTATE_END_OF_LIST()
-    }
-};
-
 /* The UART only operates while the SoC lets its clocks run. */
 static bool uart_running(ESP32UARTState *s)
 {
@@ -307,16 +95,21 @@ static void uart_format(ESP32UARTState *s, Esp32UartFrameFmt *fmt)
     fmt->bit_q32 = uart_bit_q32(s);
 }
 
-/* [spec:nuos:req:emu.esp32.gpio] */
-bool esp32_uart_line_format(ESP32UARTState *s, Esp32UartFrameFmt *fmt)
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * The frame format and bit time the UART is configured for, as a device
+ * on the other end of its lines set up to match it sees them; false while
+ * the UART's baud clock is stopped.
+ */
+static bool uart_line_get_format(Object *obj, Esp32UartFrameFmt *fmt)
 {
-    uart_format(s, fmt);
+    uart_format(ESP32_UART(obj), fmt);
     return fmt->bit_q32 != 0;
 }
 
-void esp32_uart_add_format_notifier(ESP32UARTState *s, Notifier *n)
+static void uart_line_add_format_notifier(Object *obj, Notifier *n)
 {
-    notifier_list_add(&s->format_notifiers, n);
+    notifier_list_add(&ESP32_UART(obj)->format_notifiers, n);
 }
 
 /*
@@ -1089,6 +882,7 @@ static void esp32_uart_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     ESP32UARTClass *class = ESP32_UART_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
+    Esp32UartLineIfClass *lc = ESP32_UART_LINE_IF_CLASS(klass);
 
     /* Populate the virtual attributes and methods here (if any) */
     class->uart_write = uart_write;
@@ -1098,6 +892,8 @@ static void esp32_uart_class_init(ObjectClass *klass, const void *data)
     rc->phases.exit = esp32_uart_reset_exit;
     dc->realize = esp32_uart_realize;
     dc->vmsd = &vmstate_esp32_uart;
+    lc->get_format = uart_line_get_format;
+    lc->add_format_notifier = uart_line_add_format_notifier;
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] */
@@ -1107,7 +903,11 @@ static const TypeInfo esp32_uart_info = {
     .instance_size = sizeof(ESP32UARTState),
     .instance_init = esp32_uart_init,
     .class_init = esp32_uart_class_init,
-    .class_size = sizeof(ESP32UARTClass)
+    .class_size = sizeof(ESP32UARTClass),
+    .interfaces = (const InterfaceInfo[]) {
+        { TYPE_ESP32_UART_LINE_IF },
+        { }
+    },
 };
 
 static void esp32_uart_register_types(void)
