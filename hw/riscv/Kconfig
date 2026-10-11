@@ -17,6 +17,7 @@ config ESP32P4
     select CPU_CLUSTER
     select DWC_SDMMC
     select ESP32_DWMAC
+    select ESP32P4_USB
     select ESP32_LINE
     select I2C
     select I3C
