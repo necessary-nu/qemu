@@ -836,6 +836,78 @@ static void test_mcpwm_close_edges(void)
     qtest_quit(qts);
 }
 
+/*
+ * A change of PWM_clk's rate keeps the PWM_clk cycle in progress: the
+ * divider keeps the MCPWM0_CLK cycles it has counted into it, and counts
+ * the rest at the new rate. MCPWM0_CLK at 10 MHz (XTAL_CLK by 4), by
+ * CLK_PRESCALE + 1 = 10: PWM_clk 1 MHz, timer 0 counting it.
+ */
+/* [spec:nuos:req:emu.esp32p4.pwm/test] */
+static void test_mcpwm_rate_change(void)
+{
+    QTestState *qts = start();
+    uint32_t v = qtest_readl(qts, PERI_CLK_CTRL20) & ~MCPWM_CLK_MASK;
+    int64_t t0, tc;
+
+    qtest_writel(qts, PERI_CLK_CTRL20, v | MCPWM0_CLK_EN | MCPWM0_DIV(3));
+    pwr(qts, 0, CLK_CFG, 9);
+    pwr(qts, 0, TIMER_CFG0(0), CFG0(0, 999, 0));
+    pwr(qts, 0, TIMER_CFG1(0), CFG1(START_RUN, MOD_UP));
+    t0 = now;
+    step_to(qts, t0 + 13 * US - 1);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 12);
+    step_to(qts, t0 + 13 * US);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 13);
+
+    /*
+     * 250 ns into PWM_clk cycle 14, two and a half MCPWM0_CLK cycles,
+     * MCPWM0_CLK doubles to 20 MHz: the two whole cycles stay counted,
+     * the eight left take 400 ns, and the clock's own cycles start afresh
+     * from the change, as every block counting it takes them.
+     */
+    tc = t0 + 13 * US + 250;
+    step_to(qts, tc);
+    qtest_writel(qts, PERI_CLK_CTRL20, v | MCPWM0_CLK_EN | MCPWM0_DIV(1));
+    step_to(qts, tc + 399);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 13);
+    step_to(qts, tc + 400);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 14);
+    step_to(qts, tc + 900);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 15);
+
+    /*
+     * 175 ns into cycle 18 (at tc + 1900), three and a half 50 ns cycles,
+     * CLK_PRESCALE becomes 4: MCPWM0_CLK runs on as it was, and the cycle
+     * ends at its fifth, 250 ns in; from there every 250 ns.
+     */
+    step_to(qts, tc + 2075);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 17);
+    pwr(qts, 0, CLK_CFG, 4);
+    step_to(qts, tc + 2149);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 17);
+    step_to(qts, tc + 2150);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 18);
+    step_to(qts, tc + 2400);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 19);
+
+    /*
+     * Three cycles into the next (175 ns after tc + 2650), CLK_PRESCALE
+     * becomes 1, a division by 2 that those three cycles already exceed:
+     * the cycle ends at the next MCPWM0_CLK cycle, then every 100 ns.
+     */
+    step_to(qts, tc + 2825);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 20);
+    pwr(qts, 0, CLK_CFG, 1);
+    step_to(qts, tc + 2849);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 20);
+    step_to(qts, tc + 2850);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 21);
+    step_to(qts, tc + 2950);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 22);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -851,6 +923,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4-pwm/mcpwm/capture-ledc", test_mcpwm_capture_ledc);
     qtest_add_func("esp32p4-pwm/mcpwm/etm", test_mcpwm_etm);
     qtest_add_func("esp32p4-pwm/mcpwm/close-edges", test_mcpwm_close_edges);
+    qtest_add_func("esp32p4-pwm/mcpwm/rate-change", test_mcpwm_rate_change);
 
     return g_test_run();
 }

@@ -741,6 +741,63 @@ static void test_close_edges(void)
     qtest_quit(qts);
 }
 
+/*
+ * A change of PWM_clk's rate keeps the PWM_clk cycle in progress: the
+ * divider keeps the PLL_F160M_CLK cycles (6.25 ns) it has counted into
+ * it. PWM_clk at 10 MHz, by 16, timer 0 counting it.
+ */
+/* [spec:nuos:req:emu.esp32.mcpwm/test] */
+static void test_rate_change(void)
+{
+    QTestState *qts = start();
+    uint32_t en;
+    int64_t t0, now;
+
+    t0 = now = clocks_restart(qts);
+    wr(qts, CLK_CFG, 15);
+    wr(qts, TIMER_CFG0(0), CFG0(0, 999, 0));
+    wr(qts, TIMER_CFG1(0), CFG1(START_RUN, MOD_UP));
+    now = step_to(qts, now, t0 + 1300);
+    g_assert_cmpuint(rd(qts, TIMER_STATUS(0)), ==, 13);
+
+    /*
+     * 40 ns into cycle 14, six and two fifths PLL_F160M_CLK cycles,
+     * CLK_PRESCALE becomes 7: PLL_F160M_CLK runs on as it was, and the
+     * cycle ends at its eighth, 50 ns in; from there every 50 ns.
+     */
+    now = step_to(qts, now, t0 + 1340);
+    wr(qts, CLK_CFG, 7);
+    now = step_to(qts, now, t0 + 1349);
+    g_assert_cmpuint(rd(qts, TIMER_STATUS(0)), ==, 13);
+    now = step_to(qts, now, t0 + 1350);
+    g_assert_cmpuint(rd(qts, TIMER_STATUS(0)), ==, 14);
+    now = step_to(qts, now, t0 + 1400);
+    g_assert_cmpuint(rd(qts, TIMER_STATUS(0)), ==, 15);
+
+    /*
+     * 20 ns into cycle 18, three PLL_F160M_CLK cycles and a fifth, the
+     * clock is gated off for a microsecond: the divider holds the three,
+     * and the five left take 31.25 ns from the restart, the clock's own
+     * cycles starting afresh as it starts.
+     */
+    now = step_to(qts, now, t0 + 1520);
+    g_assert_cmpuint(rd(qts, TIMER_STATUS(0)), ==, 17);
+    en = qtest_readl(qts, DPORT_PERIP_CLK_EN);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, en & ~PERIP_PWM0);
+    now = step_to(qts, now, t0 + 2520);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, en);
+    now = step_to(qts, now, t0 + 2551);
+    g_assert_cmpuint(rd(qts, TIMER_STATUS(0)), ==, 17);
+    now = step_to(qts, now, t0 + 2552);
+    g_assert_cmpuint(rd(qts, TIMER_STATUS(0)), ==, 18);
+    now = step_to(qts, now, t0 + 2601);
+    g_assert_cmpuint(rd(qts, TIMER_STATUS(0)), ==, 18);
+    now = step_to(qts, now, t0 + 2602);
+    g_assert_cmpuint(rd(qts, TIMER_STATUS(0)), ==, 19);
+
+    qtest_quit(qts);
+}
+
 /* [spec:nuos:req:emu.esp32.mcpwm/test] */
 static void test_long_run(void)
 {
@@ -806,6 +863,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32-mcpwm/sync", test_sync);
     qtest_add_func("esp32-mcpwm/long-run", test_long_run);
     qtest_add_func("esp32-mcpwm/close-edges", test_close_edges);
+    qtest_add_func("esp32-mcpwm/rate-change", test_rate_change);
 
     return g_test_run();
 }

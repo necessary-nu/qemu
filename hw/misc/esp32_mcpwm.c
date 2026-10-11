@@ -1616,6 +1616,9 @@ static uint64_t mcpwm_clk_ns(Esp32McpwmState *s, Clock *clk, uint64_t ticks)
     if (s->p4) {
         return esp32p4_clk_cycles_ns(s->p4_period, ticks);
     }
+    if (!clock_is_enabled(clk)) {
+        return INT64_MAX;
+    }
     ns = clock_ticks_to_ns(clk, ticks);
     while (clock_ns_to_ticks(clk, ns) < ticks) {
         ns++;
@@ -1623,13 +1626,32 @@ static uint64_t mcpwm_clk_ns(Esp32McpwmState *s, Clock *clk, uint64_t ticks)
     return ns;
 }
 
+/*
+ * PWM_clk is its source clock divided by CLK_PRESCALE + 1, by a counter
+ * of the source's cycles that keeps its count through a change of the
+ * source's rate and of the division: a change keeps the part of the
+ * PWM_clk cycle in progress that the counter has counted. The source's
+ * own cycles are counted from its last change, src_ns, starting afresh
+ * there as every block counting a clock takes them (esp32p4_clk_period.h;
+ * the ESP32's Clocks likewise). At the source's cycle div_tick, at div_ns,
+ * PWM_clk cycle div_cycle had div_k of them counted.
+ */
+static uint64_t mcpwm_src_cycles(Esp32McpwmState *s, int64_t ns)
+{
+    if (ns <= s->src_ns) {
+        return 0;
+    }
+    return mcpwm_clk_cycles(s, s->core_clk, ns - s->src_ns);
+}
+
 static uint64_t mcpwm_cycle_at(Esp32McpwmState *s, int64_t ns)
 {
-    if (ns <= s->base_ns) {
-        return s->base_cycle;
+    uint64_t t = mcpwm_src_cycles(s, ns);
+
+    if (t <= s->div_tick) {
+        return s->div_cycle;
     }
-    return s->base_cycle +
-           mcpwm_clk_cycles(s, s->core_clk, ns - s->base_ns) / clk_div(s);
+    return s->div_cycle + (s->div_k + (t - s->div_tick)) / clk_div(s);
 }
 
 /* The first virtual time at which PWM_clk has reached `cycle`. */
@@ -1637,15 +1659,33 @@ static int64_t mcpwm_ns_at(Esp32McpwmState *s, uint64_t cycle)
 {
     uint64_t ticks, ns;
 
-    if (cycle <= s->base_cycle) {
-        return s->base_ns;
+    if (cycle <= s->div_cycle) {
+        return s->div_ns;
     }
-    if (cycle - s->base_cycle > UINT64_MAX / 2 / clk_div(s)) {
+    if (cycle - s->div_cycle > UINT64_MAX / 4 / clk_div(s)) {
         return INT64_MAX / 2;
     }
-    ticks = (cycle - s->base_cycle) * clk_div(s);
+    ticks = s->div_tick + (cycle - s->div_cycle) * clk_div(s) - s->div_k;
     ns = mcpwm_clk_ns(s, s->core_clk, ticks);
-    return s->base_ns + MIN(ns, (uint64_t)INT64_MAX / 2);
+    return s->src_ns + MIN(ns, (uint64_t)INT64_MAX / 2);
+}
+
+/*
+ * The counter at time t, the core run to it, taken as the start of what
+ * follows: its count kept, for a division of @div from here. A count
+ * already at or past a smaller division ends the cycle at the source's
+ * next cycle, the counter's comparison being "at least" (the TRM gives
+ * none).
+ */
+static void mcpwm_div_rebase(Esp32McpwmState *s, int64_t t, uint32_t div)
+{
+    uint64_t ticks = mcpwm_src_cycles(s, t);
+    uint64_t n = s->div_k + (ticks > s->div_tick ? ticks - s->div_tick : 0);
+
+    s->div_cycle += n / clk_div(s);
+    s->div_k = MIN(n % clk_div(s), div - 1);
+    s->div_tick = ticks;
+    s->div_ns = t;
 }
 
 /*
@@ -2585,9 +2625,8 @@ static void mcpwm_do_write(void *opaque)
     } else {
         switch (addr) {
         case A_CLK_CFG:
-            /* PWM_clk restarts its count at the new rate. */
-            s->base_ns = mcpwm_now(s);
-            s->base_cycle = c->now;
+            /* The source runs on; the counter keeps its count. */
+            mcpwm_div_rebase(s, mcpwm_now(s), (v & 0xff) + 1);
             s->clk_cfg = v & 0xff;
             break;
         case A_SYNCI_CFG: {
@@ -2835,16 +2874,18 @@ static void mcpwm_clk_pre_update(Esp32McpwmState *s)
 }
 
 /*
- * A change of PLL_F160M_CLK: run to the change at the old rate, then count
- * from there at the new one.
+ * A change of PWM_clk's source, PLL_F160M_CLK or MCPWMn_CLK: run to the
+ * change at the old rate; the counter keeps its count, and the source's
+ * cycles start afresh from the change.
  */
 static void mcpwm_core_clk_pre(void *opaque)
 {
     Esp32McpwmState *s = opaque;
 
     mcpwm_clk_pre_update(s);
-    s->base_ns = mcpwm_now(s);
-    s->base_cycle = s->core.now;
+    mcpwm_div_rebase(s, mcpwm_now(s), clk_div(s));
+    s->src_ns = s->div_ns;
+    s->div_tick = 0;
 }
 
 /* The new rate takes effect at the moment of the change. */
@@ -2863,7 +2904,7 @@ static void esp32_mcpwm_core_clk_update(void *opaque, ClockEvent event)
     if (event == ClockPreUpdate) {
         mcpwm_at(mcpwm_core_clk_pre, s);
     } else {
-        esp32_line_run_at(s->base_ns, mcpwm_core_clk_post, s);
+        esp32_line_run_at(s->src_ns, mcpwm_core_clk_post, s);
     }
 }
 
@@ -2902,7 +2943,7 @@ static void esp32p4_mcpwm_clk_update(void *opaque, ClockEvent event)
         mcpwm_at(esp32p4_mcpwm_clk_pre, s);
     } else {
         s->p4_period = esp32p4_clk_exact(s->core_clk);
-        esp32_line_run_at(s->base_ns, mcpwm_core_clk_post, s);
+        esp32_line_run_at(s->src_ns, mcpwm_core_clk_post, s);
     }
 }
 
@@ -2941,11 +2982,14 @@ static void esp32_mcpwm_reset_hold(Object *obj, ResetType type)
     s->clk_reg = 0;
     s->version = s->p4 ? P4_VERSION_RESET : VERSION_RESET;
     s->seen_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    s->base_ns = mcpwm_now(s);
-    s->base_cycle = 0;
+    /* The counter starts afresh; its source runs on. */
+    s->div_ns = mcpwm_now(s);
+    s->div_tick = mcpwm_src_cycles(s, s->div_ns);
+    s->div_cycle = 0;
+    s->div_k = 0;
     s->cap_phase = 0;
     s->cap_anchor = 0;
-    s->cap_anchor_ns = s->base_ns;
+    s->cap_anchor_ns = s->div_ns;
     memset(s->cap_cfg, 0, sizeof(s->cap_cfg));
     memset(s->cap_val, 0, sizeof(s->cap_val));
     s->cap_status = 0;
@@ -3126,8 +3170,8 @@ static const VMStateDescription vmstate_esp32p4_mcpwm_period = {
 
 static const VMStateDescription vmstate_esp32_mcpwm = {
     .name = TYPE_ESP32_MCPWM,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(core_clk, Esp32McpwmState),
         VMSTATE_CLOCK(cap_clk, Esp32McpwmState),
@@ -3137,8 +3181,11 @@ static const VMStateDescription vmstate_esp32_mcpwm = {
         VMSTATE_UINT32(clk_cfg, Esp32McpwmState),
         VMSTATE_UINT32(clk_reg, Esp32McpwmState),
         VMSTATE_UINT32(version, Esp32McpwmState),
-        VMSTATE_INT64(base_ns, Esp32McpwmState),
-        VMSTATE_UINT64(base_cycle, Esp32McpwmState),
+        VMSTATE_INT64(src_ns, Esp32McpwmState),
+        VMSTATE_INT64(div_ns, Esp32McpwmState),
+        VMSTATE_UINT64(div_tick, Esp32McpwmState),
+        VMSTATE_UINT64(div_cycle, Esp32McpwmState),
+        VMSTATE_UINT32(div_k, Esp32McpwmState),
         VMSTATE_BOOL_ARRAY(sync_in, Esp32McpwmState, ESP32_MCPWM_SYNCS),
         VMSTATE_UINT32(cap_phase, Esp32McpwmState),
         VMSTATE_UINT32(cap_anchor, Esp32McpwmState),

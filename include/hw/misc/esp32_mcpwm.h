@@ -182,9 +182,16 @@ struct Esp32McpwmState {
     uint32_t clk_reg;
     uint32_t version;
 
-    /* PWM_clk cycle core.now corresponds to virtual time base_ns at base */
-    int64_t base_ns;
-    uint64_t base_cycle;
+    /*
+     * PWM_clk's divider: its source's cycles counted from src_ns; at the
+     * source's cycle div_tick, at div_ns, PWM_clk cycle div_cycle had
+     * div_k of them (hw/misc/esp32_mcpwm.c, mcpwm_cycle_at()).
+     */
+    int64_t src_ns;
+    int64_t div_ns;
+    uint64_t div_tick;
+    uint64_t div_cycle;
+    uint32_t div_k;
     /* The ESP32-P4's MCPWMn_CLK at its exact period, as it last changed */
     ESP32P4ClkPeriod p4_period;
 
