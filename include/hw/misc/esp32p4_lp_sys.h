@@ -23,6 +23,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
 /* PAD_RTC_HOLD_CTRL0/1 hold GPIO0 to GPIO56. */
 #define ESP32P4_LP_SYS_HOLDS 57
 
+/* PAD_COMP0 and PAD_COMP1, the analog comparators'. */
+#define ESP32P4_LP_SYS_PAD_COMPS 2
+
 /*
  * Named GPIO outputs
  * ==================
@@ -50,6 +53,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
  *   system root clocks, for the reset and clock control.
  * ESP32P4_LP_SYS_USB_PHY_SEL: USB_CTRL's SW_HW_USB_PHY_SEL and
  *   SW_USB_PHY_SEL, to USB_WRAP's "phy-sel" inputs.
+ * ESP32P4_LP_SYS_PAD_COMP: line n, a pulse as software writes PAD_COMPn,
+ *   for analog comparator n, which reads it with esp32p4_lp_sys_reg().
  * ESP32P4_LP_SYS_ETM_WAKEUP_FLAG: LP_CORE_ETM_WAKEUP_FLAG, the PMU's ETM
  *   wakeup source, high from the ETM's ULP_TASK_WAKEUP_CPU until software
  *   clears the flag.
@@ -76,6 +81,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
 #define ESP32P4_LP_SYS_BOD_RESET_EN     "bod-reset-en"
 #define ESP32P4_LP_SYS_HP_ROOT_CLK      "hp-root-clk"
 #define ESP32P4_LP_SYS_USB_PHY_SEL      "usb-phy-sel"
+#define ESP32P4_LP_SYS_PAD_COMP         "pad-comp"
 #define ESP32P4_LP_SYS_ETM_WAKEUP_FLAG  "lp-core-etm-wakeup-flag"
 #define ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP "lp-core-etm-wakeup"
 #define ESP32P4_LP_SYS_ETM_TASK_ULP_INT "etm-task-ulp-int"
@@ -101,6 +107,7 @@ struct ESP32P4LPSysState {
     qemu_irq bod_reset_en;
     qemu_irq hp_root_clk[2];
     qemu_irq usb_phy_sel[2];
+    qemu_irq pad_comp[ESP32P4_LP_SYS_PAD_COMPS];
     qemu_irq etm_wakeup_flag;
 };
 
