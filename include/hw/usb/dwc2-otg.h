@@ -311,6 +311,8 @@ struct DWC2OTGState {
     bool ctrl_in;
     /* A control transfer runs from its SETUP to its status stage. */
     bool ctrl_active;
+    /* Scatter/gather: StsPhseRcvd has flagged this control transfer's. */
+    bool sts_phase;
     /*
      * The address the device answers: DCFG.DevAddr, taken once the
      * control transfer in progress (SET_ADDRESS's) has ended.

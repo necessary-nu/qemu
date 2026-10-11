@@ -41,7 +41,10 @@
  *     descriptor or a short IN packet, halting at the end-of-list one,
  *     raising BNA at an inactive one and DescLstRoll as it wraps.
  *     Periodic channels run in the frames the periodic frame list at
- *     HFLBADDR gives them while HCFG.PerSchedEna is set.
+ *     HFLBADDR gives them while HCFG.PerSchedEna is set; an isochronous
+ *     channel's list is indexed by the (micro)frame number, one
+ *     descriptor a (micro)frame, an inactive one skipping it, and runs
+ *     until a descriptor with EOL or software halts it.
  *
  * QEMU's devices have no data toggles of their own, so the controller
  * keeps each device endpoint's toggle as the device would: an OUT packet
@@ -52,9 +55,9 @@
  * it in the next (micro)frame, which the device cannot tell apart and
  * spares the host's CPU. Split transactions need a high-speed hub's
  * transaction translator, which QEMU's hubs do not have: they get no
- * reply (logged as unimplemented). Isochronous transfers in scatter/gather
- * mode are not modelled and logged as such; their slave and buffer DMA
- * forms are.
+ * reply (logged as unimplemented). An isochronous transaction is one
+ * packet a (micro)frame: high-bandwidth endpoints' several (HCCHAR.MC) are
+ * not modelled.
  */
 
 #include "qemu/osdep.h"
@@ -658,11 +661,6 @@ void dwc2_otg_hcchar_write(DWC2OTGState *s, int ch, uint32_t val)
                           "QEMU's hubs lack: channel %d gets no reply\n",
                           s->name, ch);
         }
-        if (host_ddma(s) && chan_type(c) == USB_ENDPOINT_XFER_ISOC) {
-            qemu_log_mask(LOG_UNIMP, "%s: isochronous transfers in "
-                          "scatter/gather DMA mode are not modelled\n",
-                          s->name);
-        }
     }
     if (!dma) {
         if (chan_is_in(c)) {
@@ -995,19 +993,31 @@ static void chan_result(DWC2OTGState *s, int ch, int result, uint32_t actual)
 
 /* Scatter/gather DMA */
 
+static int qtd_count(DWC2OTGHostChan *c)
+{
+    return ((c->hctsiz & TSIZ_NTD_MASK) >> TSIZ_NTD_SHIFT) + 1;
+}
+
+static uint32_t qtd_ctd_mask(DWC2OTGHostChan *c)
+{
+    return qtd_count(c) > 64 ? HCDMA_CTD_MASK_256 : HCDMA_CTD_MASK;
+}
+
 static uint32_t qtd_addr(DWC2OTGHostChan *c, int idx)
 {
-    return (c->hcdma & HCDMA_BASE_MASK) + idx * 8;
+    uint32_t base = qtd_count(c) > 64 ? HCDMA_BASE_MASK_256 : HCDMA_BASE_MASK;
+
+    return (c->hcdma & base) + idx * 8;
 }
 
 static int qtd_index(DWC2OTGHostChan *c)
 {
-    return (c->hcdma & HCDMA_CTD_MASK) >> HCDMA_CTD_SHIFT;
+    return (c->hcdma & qtd_ctd_mask(c)) >> HCDMA_CTD_SHIFT;
 }
 
-static int qtd_count(DWC2OTGHostChan *c)
+static void qtd_set_index(DWC2OTGHostChan *c, int idx)
 {
-    return ((c->hctsiz & TSIZ_NTD_MASK) >> TSIZ_NTD_SHIFT) + 1;
+    c->hcdma = (c->hcdma & ~qtd_ctd_mask(c)) | (idx << HCDMA_CTD_SHIFT);
 }
 
 /*
@@ -1066,7 +1076,78 @@ static void qtd_advance(DWC2OTGState *s, int ch)
         next = 0;
         c->hcint |= HCINT_DESC_LST_ROLL;
     }
-    c->hcdma = (c->hcdma & ~HCDMA_CTD_MASK) | (next << HCDMA_CTD_SHIFT);
+    qtd_set_index(c, next);
+}
+
+/*
+ * An isochronous channel's descriptor for this (micro)frame: the list is
+ * indexed by the (micro)frame number. A descriptor not active skips the
+ * frame. Returns the bytes to move, or -1 for none.
+ */
+static int iso_qtd_fetch(DWC2OTGState *s, int ch)
+{
+    DWC2OTGHostChan *c = &s->hc[ch];
+    uint32_t q[2];
+
+    qtd_set_index(c, s->frnum % qtd_count(c));
+    if (!dwc2_otg_dma_read(s, qtd_addr(c, qtd_index(c)), q, sizeof(q))) {
+        chan_disable(s, ch, HCINTMSK_AHBERR | HCINTMSK_CHHLTD);
+        return -1;
+    }
+    c->qtd_status = le32_to_cpu(q[0]);
+    c->qtd_buf = le32_to_cpu(q[1]);
+    if (!(c->qtd_status & HOST_DMA_A)) {
+        c->frame_done = true;
+        return -1;
+    }
+    c->qtd_open = true;
+    c->qtd_done = 0;
+    c->hcdmab = c->qtd_buf;
+    return c->qtd_status & HOST_DMA_ISOC_NBYTES_MASK;
+}
+
+/*
+ * The end of an isochronous transaction: the descriptor written back with
+ * the bytes not received (IN) and its status, IOC raising XferCompl. EOL
+ * halts the channel after it (ESP-IDF's host stack ends each transfer so);
+ * without one the channel runs on until software halts it.
+ */
+/* [spec:nuos:req:emu.esp32p4.usb] */
+static void iso_ddma_result(DWC2OTGState *s, int ch, int result,
+                            uint32_t actual)
+{
+    DWC2OTGHostChan *c = &s->hc[ch];
+    uint32_t nbytes = c->qtd_status & HOST_DMA_ISOC_NBYTES_MASK;
+    bool ok = result == XACT_ACK && actual <= nbytes;
+    uint32_t q;
+
+    c->frame_done = true;
+    c->qtd_open = false;
+    if (ok && s->xact_token == DWC2_TOKEN_IN &&
+        !dwc2_otg_dma_write(s, c->qtd_buf, s->xfer_buf, actual)) {
+        chan_disable(s, ch, HCINTMSK_AHBERR | HCINTMSK_CHHLTD);
+        return;
+    }
+    q = c->qtd_status & ~(HOST_DMA_A | HOST_DMA_STS_MASK |
+                          HOST_DMA_ISOC_NBYTES_MASK);
+    if (s->xact_token == DWC2_TOKEN_IN) {
+        q |= nbytes - (ok ? actual : 0);
+    }
+    /* A packet larger than the descriptor's buffer is an error. */
+    q |= (ok ? QTD_STS_SUCCESS : QTD_STS_PKTERR) << HOST_DMA_STS_SHIFT;
+    q = cpu_to_le32(q);
+    if (!dwc2_otg_dma_write(s, qtd_addr(c, qtd_index(c)), &q, 4)) {
+        chan_disable(s, ch, HCINTMSK_AHBERR | HCINTMSK_CHHLTD);
+        return;
+    }
+    if (c->qtd_status & HOST_DMA_IOC) {
+        c->hcint |= HCINTMSK_XFERCOMPL;
+    }
+    if (c->qtd_status & HOST_DMA_EOL) {
+        chan_disable(s, ch, HCINTMSK_CHHLTD);
+        return;
+    }
+    dwc2_otg_update_irq(s);
 }
 
 /* [spec:nuos:req:emu.esp32p4.usb] */
@@ -1208,7 +1289,22 @@ static bool chan_start(DWC2OTGState *s, int ch)
     }
     if (host_ddma(s)) {
         if (chan_type(c) == USB_ENDPOINT_XFER_ISOC) {
-            return false;
+            int n = iso_qtd_fetch(s, ch);
+
+            if (n < 0) {
+                return false;
+            }
+            if (chan_is_in(c)) {
+                host_issue(s, ch, DWC2_TOKEN_IN, NULL, 0);
+                return true;
+            }
+            n = MIN(n, sizeof(buf));
+            if (!dwc2_otg_dma_read(s, c->qtd_buf, buf, n)) {
+                chan_disable(s, ch, HCINTMSK_AHBERR | HCINTMSK_CHHLTD);
+                return false;
+            }
+            host_issue(s, ch, DWC2_TOKEN_OUT, buf, n);
+            return true;
         }
         if (!qtd_fetch(s, ch)) {
             return false;
@@ -1320,7 +1416,9 @@ static void host_bus(void *opaque)
         }
         s->xact_busy = false;
         ch = s->xact_chan;
-        if (host_ddma(s)) {
+        if (host_ddma(s) && chan_type(&s->hc[ch]) == USB_ENDPOINT_XFER_ISOC) {
+            iso_ddma_result(s, ch, s->xact_result, s->xact_actual);
+        } else if (host_ddma(s)) {
             ddma_result(s, ch, s->xact_result, s->xact_actual);
         } else {
             chan_result(s, ch, s->xact_result, s->xact_actual);

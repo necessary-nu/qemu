@@ -25,9 +25,17 @@
 #define HCINT_XCS_XACT_ERR          BIT(12)
 #define HCINT_DESC_LST_ROLL         BIT(13)
 #define DXEPINT_BNA                 BIT(9)
+/*
+ * HCDMA in scatter/gather mode: the list's base and the current
+ * descriptor, 6 bits of it for a list of up to 64 descriptors on a 512-byte
+ * boundary, 8 bits for a high-speed isochronous list of up to 256 on a
+ * 2 KiB one.
+ */
 #define HCDMA_CTD_SHIFT             3
 #define HCDMA_CTD_MASK              (0x3f << 3)
 #define HCDMA_BASE_MASK             0xfffffe00
+#define HCDMA_CTD_MASK_256          (0xff << 3)
+#define HCDMA_BASE_MASK_256         0xfffff800
 
 /* Request queue entry types (GNPTXSTS.NPTxQTop's token). */
 enum {

@@ -38,11 +38,17 @@
  *     bus and memory at DxEPDMA itself, and a SETUP is written to control
  *     OUT endpoint 0's buffer once software enables it, closing the buffer
  *     (STUPPktRcvd, the endpoint disabled) as cores from 3.00a do.
+ *   - In scatter/gather DMA mode (DCFG.DescDMA) each endpoint works
+ *     through its list of descriptors from DxEPDMA: a descriptor not Host
+ *     Ready disables it with BNA; each is written back DMA Done with the
+ *     bytes it has left (OUT), SR for a SETUP and SP for a short packet;
+ *     IOC raises XferCompl, and L or a short packet ends the transfer. A
+ *     control write's status stage raises DOEPINT0.StsPhseRcvd.
  *
  * The hosts are full-speed hosts, so a high-speed core enumerates at full
- * speed (DSTS.EnumSpd). Not modelled, and logged as unimplemented:
- * scatter/gather DMA in device mode (DCFG.DescDMA), the frame parity of
- * isochronous endpoints, and the incomplete isochronous interrupts.
+ * speed (DSTS.EnumSpd). Not modelled, and logged as unimplemented: the
+ * frame parity of isochronous endpoints, isochronous endpoints in
+ * scatter/gather DMA mode, and the incomplete isochronous interrupts.
  */
 
 #include "qemu/osdep.h"
@@ -271,6 +277,89 @@ static void dev_setup_reset(DWC2OTGState *s)
     s->setup_bufs = 0;
 }
 
+/* Scatter/gather DMA (DCFG.DescDMA) */
+
+static bool dev_ddma(DWC2OTGState *s)
+{
+    return dwc2_otg_dma_enabled(s) && (s->dcfg & DCFG_DESCDMA_EN);
+}
+
+/*
+ * Fetch the endpoint's current descriptor: one not ready for the core
+ * (BS other than Host Ready) disables the endpoint with BNA. The core
+ * marks the one it takes DMA Busy.
+ */
+static bool ep_desc_fetch(DWC2OTGState *s, DWC2OTGDevEp *e)
+{
+    uint32_t d[2], busy;
+
+    if (e->desc_open) {
+        return true;
+    }
+    if (!dwc2_otg_dma_read(s, e->desc_addr, d, sizeof(d))) {
+        e->intr |= DXEPINT_AHBERR;
+        e->ctl &= ~DXEPCTL_EPENA;
+        dwc2_otg_update_irq(s);
+        return false;
+    }
+    e->desc_status = le32_to_cpu(d[0]);
+    e->desc_buf = le32_to_cpu(d[1]);
+    if ((e->desc_status & DEV_DMA_BUFF_STS_MASK) !=
+        (DEV_DMA_BUFF_STS_HREADY << DEV_DMA_BUFF_STS_SHIFT)) {
+        e->intr |= DXEPINT_BNA;
+        e->ctl &= ~DXEPCTL_EPENA;
+        dwc2_otg_update_irq(s);
+        return false;
+    }
+    busy = cpu_to_le32((e->desc_status & ~DEV_DMA_BUFF_STS_MASK) |
+                       (DEV_DMA_BUFF_STS_DMABUSY << DEV_DMA_BUFF_STS_SHIFT));
+    dwc2_otg_dma_write(s, e->desc_addr, &busy, 4);
+    e->desc_open = true;
+    e->desc_done = 0;
+    e->dmab = e->desc_buf;
+    return true;
+}
+
+/*
+ * Close the current descriptor: DMA Done with its status and the bytes
+ * left (OUT) or none (IN), SR for a SETUP, SP for a short OUT packet.
+ * IOC raises XferCompl, as does a short packet, which like L ends the
+ * transfer and disables the endpoint.
+ */
+static void ep_desc_close(DWC2OTGState *s, DWC2OTGDevEp *e, bool in,
+                          bool setup, bool shrt)
+{
+    uint32_t nbytes = e->desc_status & DEV_DMA_NBYTES_MASK;
+    uint32_t st = e->desc_status & ~(DEV_DMA_BUFF_STS_MASK | DEV_DMA_STS_MASK |
+                                     DEV_DMA_NBYTES_MASK);
+    uint32_t le;
+
+    st |= DEV_DMA_BUFF_STS_DMADONE << DEV_DMA_BUFF_STS_SHIFT;
+    if (!in) {
+        st |= nbytes - MIN(e->desc_done, nbytes);
+    }
+    if (setup) {
+        st |= DEV_DMA_SR;
+    }
+    if (shrt) {
+        st |= DEV_DMA_SHORT;
+    }
+    le = cpu_to_le32(st);
+    dwc2_otg_dma_write(s, e->desc_addr, &le, 4);
+    e->desc_open = false;
+    if ((e->desc_status & DEV_DMA_IOC) || shrt) {
+        e->intr |= DXEPINT_XFERCOMPL;
+    }
+    if ((e->desc_status & DEV_DMA_L) || shrt || setup) {
+        e->ctl &= ~DXEPCTL_EPENA;
+        if (!in) {
+            e->ctl |= DXEPCTL_NAKSTS;
+        }
+    } else {
+        e->desc_addr += 8;
+    }
+}
+
 /*
  * Buffer DMA: control OUT endpoint 0, enabled, takes the oldest SETUP the
  * core holds into its buffer, which closes it: the endpoint disables
@@ -284,6 +373,23 @@ static void dev_deliver_setup(DWC2OTGState *s)
     if (!s->setup_bufs || !dwc2_otg_dma_enabled(s) ||
         !(e->ctl & DXEPCTL_EPENA)) {
         return;
+    }
+    if (dev_ddma(s)) {
+        /* Into the current descriptor's buffer, closed with SR. */
+        if (!ep_desc_fetch(s, e)) {
+            return;
+        }
+        if (!dwc2_otg_dma_write(s, e->desc_buf, s->setup_buf[0], 8)) {
+            e->intr |= DXEPINT_AHBERR;
+            e->ctl &= ~DXEPCTL_EPENA;
+            e->desc_open = false;
+            dwc2_otg_update_irq(s);
+            return;
+        }
+        e->desc_done = 8;
+        ep_desc_close(s, e, false, true, false);
+        e->intr &= ~DXEPINT_XFERCOMPL;
+        goto delivered;
     }
     if (!dwc2_otg_dma_write(s, e->dma, s->setup_buf[0], 8)) {
         e->intr |= DXEPINT_AHBERR;
@@ -299,6 +405,7 @@ static void dev_deliver_setup(DWC2OTGState *s)
                 0);
     e->ctl &= ~DXEPCTL_EPENA;
     e->ctl |= DXEPCTL_NAKSTS;
+delivered:
     e->intr |= DXEPINT_SETUP_RCVD;
     s->setup_bufs--;
     memmove(s->setup_buf[0], s->setup_buf[1], s->setup_bufs * 8);
@@ -485,11 +592,6 @@ static USBDevPortHandshake devport_setup(void *opaque, uint8_t addr,
     if (!dev_answers(s, addr)) {
         return USB_DEVPORT_NORESP;
     }
-    if (dwc2_otg_dma_enabled(s) && (s->dcfg & DCFG_DESCDMA_EN)) {
-        qemu_log_mask(LOG_UNIMP, "%s: scatter/gather DMA in device mode is "
-                      "not modelled\n", s->name);
-        return USB_DEVPORT_NORESP;
-    }
     if (!dwc2_otg_dma_enabled(s) && dwc2_otg_rx_free(s) < 3) {
         /* No room for the SETUP: the host sees no handshake. */
         return USB_DEVPORT_NORESP;
@@ -500,6 +602,7 @@ static USBDevPortHandshake devport_setup(void *opaque, uint8_t addr,
     s->dev_ep_toggle |= BIT(0) | BIT(16);
     s->ctrl_in = data[0] & USB_DIR_IN;
     s->ctrl_active = true;
+    s->sts_phase = false;
     supcnt = (e->tsiz >> DOEPTSIZ0_SUPCNT_SHIFT) & 3;
     if (s->setup_pending && !supcnt) {
         e->intr |= DXEPINT_BACK2BACKSETUP;
@@ -555,6 +658,12 @@ static USBDevPortHandshake devport_in(void *opaque, uint8_t addr,
     }
     if (ep == 0) {
         dev_setup_done(s);
+        if (dev_ddma(s) && s->ctrl_active && !s->ctrl_in && !s->sts_phase) {
+            /* A control write's status stage begins. */
+            s->sts_phase = true;
+            s->out[0].intr |= DXEPINT_STSPHSERCVD;
+            dwc2_otg_update_irq(s);
+        }
     }
     if ((e->ctl & DXEPCTL_STALL) && !iso) {
         return USB_DEVPORT_STALL;
@@ -566,12 +675,43 @@ static USBDevPortHandshake devport_in(void *opaque, uint8_t addr,
         dwc2_otg_update_irq(s);
         return iso ? USB_DEVPORT_NORESP : USB_DEVPORT_NAK;
     }
-    if (dwc2_otg_dma_enabled(s) && (s->dcfg & DCFG_DESCDMA_EN)) {
-        qemu_log_mask(LOG_UNIMP, "%s: scatter/gather DMA in device mode is "
-                      "not modelled\n", s->name);
-        return USB_DEVPORT_NAK;
-    }
     mps = MIN(ep_mps(s, e, ep), sizeof(data));
+    if (dev_ddma(s)) {
+        uint32_t nbytes;
+
+        if (iso) {
+            return USB_DEVPORT_NORESP;
+        }
+        if (!ep_desc_fetch(s, e)) {
+            return USB_DEVPORT_NAK;
+        }
+        nbytes = e->desc_status & DEV_DMA_NBYTES_MASK;
+        n = MIN(nbytes - MIN(e->desc_done, nbytes), mps);
+        if (!dwc2_otg_dma_read(s, e->desc_buf + e->desc_done, data, n)) {
+            e->intr |= DXEPINT_AHBERR;
+            e->ctl &= ~DXEPCTL_EPENA;
+            e->desc_open = false;
+            dwc2_otg_update_irq(s);
+            return USB_DEVPORT_NAK;
+        }
+        e->desc_done += n;
+        e->dmab = e->desc_buf + e->desc_done;
+        if (e->desc_done >= nbytes) {
+            ep_desc_close(s, e, true, false, false);
+        }
+        n = MIN(n, max);
+        if (buf) {
+            memcpy(buf, data, n);
+        }
+        *len = n;
+        *pid = ep_toggle(s, e, ep, true);
+        ep_flip(s, e, ep, true);
+        if (ep == 0 && !n && !s->ctrl_in && s->ctrl_active) {
+            dev_ctrl_end(s);
+        }
+        dwc2_otg_update_irq(s);
+        return USB_DEVPORT_ACK;
+    }
     size = ep_xfersize(e, ep);
     pkts = ep_pktcnt(e, ep, true);
     if (!pkts) {
@@ -677,13 +817,39 @@ static USBDevPortHandshake devport_out(void *opaque, uint8_t addr,
         dwc2_otg_update_irq(s);
         return iso ? USB_DEVPORT_NORESP : USB_DEVPORT_NAK;
     }
-    if (dma && (s->dcfg & DCFG_DESCDMA_EN)) {
-        qemu_log_mask(LOG_UNIMP, "%s: scatter/gather DMA in device mode is "
-                      "not modelled\n", s->name);
-        return USB_DEVPORT_NAK;
-    }
     if (!iso && pid != ep_toggle(s, e, ep, false)) {
         /* A retransmission of data already taken. */
+        return USB_DEVPORT_ACK;
+    }
+    if (dev_ddma(s)) {
+        uint32_t nbytes, room;
+
+        if (iso) {
+            return USB_DEVPORT_NORESP;
+        }
+        if (!ep_desc_fetch(s, e)) {
+            return USB_DEVPORT_NAK;
+        }
+        nbytes = e->desc_status & DEV_DMA_NBYTES_MASK;
+        room = nbytes - MIN(e->desc_done, nbytes);
+        if (!dwc2_otg_dma_write(s, e->desc_buf + e->desc_done, data,
+                                MIN(len, room))) {
+            e->intr |= DXEPINT_AHBERR;
+            e->ctl &= ~DXEPCTL_EPENA;
+            e->desc_open = false;
+            dwc2_otg_update_irq(s);
+            return USB_DEVPORT_NAK;
+        }
+        e->desc_done += MIN(len, room);
+        e->dmab = e->desc_buf + e->desc_done;
+        ep_flip(s, e, ep, false);
+        if (ep == 0 && !len && s->ctrl_in && s->ctrl_active) {
+            dev_ctrl_end(s);
+        }
+        if (len < mps || e->desc_done >= nbytes) {
+            ep_desc_close(s, e, false, false, len < mps);
+        }
+        dwc2_otg_update_irq(s);
         return USB_DEVPORT_ACK;
     }
     if (!dma && dwc2_otg_rx_free(s) < 2 + DIV_ROUND_UP(len, 4)) {
@@ -881,11 +1047,14 @@ static void ep_ctl_write(DWC2OTGState *s, DWC2OTGDevEp *e, int ep, bool in,
     } else if ((val & DXEPCTL_EPENA) && !(e->ctl & DXEPCTL_EPENA)) {
         e->ctl |= DXEPCTL_EPENA;
         e->pushed = 0;
-        if (s->dcfg & DCFG_DESCDMA_EN && dwc2_otg_dma_enabled(s)) {
-            qemu_log_mask(LOG_UNIMP, "%s: scatter/gather DMA in device mode "
-                          "is not modelled\n", s->name);
-        }
-        if (ep && ep_type(e) == USB_ENDPOINT_XFER_ISOC) {
+        /* Scatter/gather: the list starts at DxEPDMA. */
+        e->desc_addr = e->dma;
+        e->desc_open = false;
+        if (ep && ep_type(e) == USB_ENDPOINT_XFER_ISOC && dev_ddma(s)) {
+            qemu_log_mask(LOG_UNIMP, "%s: isochronous endpoints in "
+                          "scatter/gather DMA mode are not modelled\n",
+                          s->name);
+        } else if (ep && ep_type(e) == USB_ENDPOINT_XFER_ISOC) {
             qemu_log_mask(LOG_UNIMP, "%s: the frame parity of isochronous "
                           "endpoints is not modelled\n", s->name);
         }

@@ -1672,6 +1672,7 @@ static const VMStateDescription vmstate_dwc2_otg = {
         VMSTATE_BOOL(setup_pending, DWC2OTGState),
         VMSTATE_BOOL(ctrl_in, DWC2OTGState),
         VMSTATE_BOOL(ctrl_active, DWC2OTGState),
+        VMSTATE_BOOL(sts_phase, DWC2OTGState),
         VMSTATE_UINT8(dev_addr, DWC2OTGState),
         VMSTATE_UINT8(setup_bufs, DWC2OTGState),
         VMSTATE_UINT8_2DARRAY(setup_buf, DWC2OTGState, DWC2_OTG_SETUP_BUFS,

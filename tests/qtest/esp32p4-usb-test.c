@@ -628,6 +628,150 @@ static void test_fs_host_scatter_gather(void)
     qtest_quit(qts);
 }
 
+#define HFLBADDR                0x41c
+#define HCFG_PERSCHEDENA        (1u << 26)
+#define HCCHAR_EPNUM(n)         ((n) << 11)
+#define HCCHAR_MC(n)            ((n) << 20)
+#define HCCHAR_EPTYPE_ISOC      (1u << 18)
+#define TSIZ_NTD(n)             ((n) << 8)
+#define FRAME_LIST              0x4ff40600
+#define ISO_PACKET              192
+
+/*
+ * A control transfer without a data stage on OTG_FS's channel 0 in
+ * scatter/gather mode: the SETUP, then a zero-length IN status stage.
+ */
+static void sg_control_nodata(QTestState *qts, const uint8_t *setup)
+{
+    uint32_t hcchar = HCCHAR_MPS(8) | HCCHAR_DEVADDR(0);
+    uint32_t hcint;
+
+    qtest_memwrite(qts, BUF_SETUP, setup, 8);
+    qtest_writel(qts, QTD_LIST, QTD_ACTIVE | QTD_SUP | QTD_IOC | QTD_EOL | 8);
+    qtest_writel(qts, QTD_LIST + 4, BUF_SETUP);
+    wr(qts, OTG_FS, HCTSIZ(0), PID_DATA0 << 29);
+    wr(qts, OTG_FS, HCDMA(0), QTD_LIST);
+    hcint = run_chan(qts, OTG_FS, hcchar);
+    g_assert_cmphex(hcint & ~0x2000, ==, HCINT_XFERCOMPL | HCINT_CHHLTD);
+
+    qtest_writel(qts, QTD_LIST, QTD_ACTIVE | QTD_IOC | QTD_EOL);
+    qtest_writel(qts, QTD_LIST + 4, BUF_DATA);
+    wr(qts, OTG_FS, HCTSIZ(0), PID_DATA1 << 29);
+    wr(qts, OTG_FS, HCDMA(0), QTD_LIST);
+    hcint = run_chan(qts, OTG_FS, hcchar | HCCHAR_EPDIR_IN);
+    g_assert_cmphex(hcint & ~0x2000, ==, HCINT_XFERCOMPL | HCINT_CHHLTD);
+    g_assert_cmpint(QTD_STS(qtest_readl(qts, QTD_LIST)), ==, 0);
+}
+
+/*
+ * OTG_FS as a host in scatter/gather mode streaming to a usb-audio's
+ * isochronous OUT endpoint: the periodic frame list schedules channel 0 in
+ * every frame, the descriptor list is indexed by the frame number, each
+ * active descriptor sends one packet and is written back, inactive ones
+ * skip their frame, and the channel runs until it is disabled.
+ */
+/* [spec:nuos:req:emu.esp32p4.usb/test] */
+static void test_fs_host_iso_scatter_gather(void)
+{
+    static const uint8_t set_config[8] = { 0x00, 0x09, 1, 0, 0, 0, 0, 0 };
+    static const uint8_t set_alt[8] = { 0x01, 0x0b, 1, 0, 1, 0, 0, 0 };
+    QTestState *qts = qtest_init("-M esp32p4 -audiodev none,id=snd "
+                                 "-device usb-audio,audiodev=snd,"
+                                 "bus=usb-otg-fs.0,port=1");
+    uint8_t pcm[ISO_PACKET];
+    uint32_t hcint, frame, qtd;
+    int i;
+
+    fs_clock_on(qts);
+    qtest_writel(qts, USB_WRAP, 1u << 18);
+    g_assert_cmpint(HPRT_SPD(port_up(qts, OTG_FS)), ==, 1);
+    wr(qts, OTG_FS, GAHBCFG, GAHBCFG_DMA_EN);
+    wr(qts, OTG_FS, HCFG, HCFG_DESCDMA | HCFG_FSLSPCLKSEL_48);
+    wr(qts, OTG_FS, HFIR, 48000);
+    sg_control_nodata(qts, set_config);
+    sg_control_nodata(qts, set_alt);
+
+    /* Eight frame-list entries, all naming channel 0. */
+    for (i = 0; i < 8; i++) {
+        qtest_writel(qts, FRAME_LIST + 4 * i, 1u << 0);
+    }
+    wr(qts, OTG_FS, HFLBADDR, FRAME_LIST);
+    wr(qts, OTG_FS, HCFG, HCFG_DESCDMA | HCFG_FSLSPCLKSEL_48 |
+       HCFG_PERSCHEDENA);
+
+    /* Eight descriptors, the even ones active with a packet each. */
+    memset(pcm, 0x5a, sizeof(pcm));
+    qtest_memwrite(qts, BUF_DATA, pcm, sizeof(pcm));
+    for (i = 0; i < 8; i++) {
+        qtest_writel(qts, QTD_LIST + 8 * i,
+                     i & 1 ? 0 : QTD_ACTIVE | QTD_IOC | ISO_PACKET);
+        qtest_writel(qts, QTD_LIST + 8 * i + 4, BUF_DATA);
+    }
+    wr(qts, OTG_FS, HCINT(0), 0x3fff);
+    wr(qts, OTG_FS, HCTSIZ(0), TSIZ_NTD(7));
+    wr(qts, OTG_FS, HCDMA(0), QTD_LIST);
+    wr(qts, OTG_FS, HCCHAR(0), HCCHAR_CHENA | HCCHAR_EPTYPE_ISOC |
+       HCCHAR_MC(1) | HCCHAR_EPNUM(1) | HCCHAR_MPS(ISO_PACKET));
+    for (i = 0; i < 10; i++) {
+        qtest_clock_step(qts, 1000 * 1000);
+    }
+    frame = rd(qts, OTG_FS, HFNUM) & 0xffff;
+    g_assert_cmphex(rd(qts, OTG_FS, HCCHAR(0)) & HCCHAR_CHENA, ==,
+                    HCCHAR_CHENA);
+    hcint = rd(qts, OTG_FS, HCINT(0));
+    g_assert_cmphex(hcint & ~0x2000, ==, HCINT_XFERCOMPL);
+    for (i = 0; i < 8; i++) {
+        qtd = qtest_readl(qts, QTD_LIST + 8 * i);
+        if (i & 1) {
+            g_assert_cmphex(qtd, ==, 0);
+        } else {
+            g_assert_cmphex(qtd & QTD_ACTIVE, ==, 0);
+            g_assert_cmpint(QTD_STS(qtd), ==, 0);
+            g_assert_cmphex(qtd & QTD_IOC, ==, QTD_IOC);
+        }
+    }
+    /* The current descriptor follows the frame number. */
+    g_assert_cmpint((rd(qts, OTG_FS, HCDMA(0)) >> 3) & 0x3f, <=, 7);
+    g_assert_cmpint(frame, >, 8);
+
+    /* Disabling the channel halts it. */
+    wr(qts, OTG_FS, HCINT(0), hcint);
+    wr(qts, OTG_FS, HCCHAR(0), rd(qts, OTG_FS, HCCHAR(0)) | HCCHAR_CHDIS);
+    qtest_clock_step(qts, 1000 * 1000);
+    g_assert_cmphex(rd(qts, OTG_FS, HCCHAR(0)) & HCCHAR_CHENA, ==, 0);
+    g_assert_cmphex(rd(qts, OTG_FS, HCINT(0)), ==, HCINT_CHHLTD);
+
+    /*
+     * As ESP-IDF schedules a transfer: packets in the frames after the
+     * next, the last with EOL, which halts the channel after it.
+     */
+    frame = rd(qts, OTG_FS, HFNUM) & 0xffff;
+    for (i = 0; i < 8; i++) {
+        qtest_writel(qts, QTD_LIST + 8 * i, 0);
+    }
+    for (i = 2; i < 5; i++) {
+        qtest_writel(qts, QTD_LIST + 8 * ((frame + i) % 8),
+                     QTD_ACTIVE | (i == 4 ? QTD_IOC | QTD_EOL : 0) |
+                     ISO_PACKET);
+    }
+    wr(qts, OTG_FS, HCINT(0), 0x3fff);
+    wr(qts, OTG_FS, HCDMA(0), QTD_LIST);
+    wr(qts, OTG_FS, HCCHAR(0), HCCHAR_CHENA | HCCHAR_EPTYPE_ISOC |
+       HCCHAR_MC(1) | HCCHAR_EPNUM(1) | HCCHAR_MPS(ISO_PACKET));
+    for (i = 0; i < 6; i++) {
+        qtest_clock_step(qts, 1000 * 1000);
+    }
+    g_assert_cmphex(rd(qts, OTG_FS, HCCHAR(0)) & HCCHAR_CHENA, ==, 0);
+    g_assert_cmphex(rd(qts, OTG_FS, HCINT(0)) & ~0x2000, ==,
+                    HCINT_XFERCOMPL | HCINT_CHHLTD);
+    for (i = 2; i < 5; i++) {
+        qtd = qtest_readl(qts, QTD_LIST + 8 * ((frame + i) % 8));
+        g_assert_cmphex(qtd & QTD_ACTIVE, ==, 0);
+        g_assert_cmpint(QTD_STS(qtd), ==, 0);
+    }
+    qtest_quit(qts);
+}
+
 /* The token port: see hw/usb/usb-devport.h for the protocol. */
 
 static int tok_connect(const char *path)
@@ -937,6 +1081,152 @@ static void test_hs_device_token(void)
     rmdir(dir);
 }
 
+/* Device scatter/gather descriptor quadlet. */
+#define DESC_BS(v)              (((v) >> 30) & 3)
+#define DESC_BS_HOST_READY      0u
+#define DESC_BS_HOST_BUSY       (3u << 30)
+#define DESC_BS_DMA_DONE        2
+#define DESC_L                  (1u << 27)
+#define DESC_SP                 (1u << 26)
+#define DESC_IOC                (1u << 25)
+#define DESC_SR                 (1u << 24)
+#define DESC_NBYTES(v)          ((v) & 0xffff)
+#define DCFG_DESCDMA            (1u << 23)
+#define DEPINT_BNA              (1u << 9)
+#define DEPINT_STSPHSERCVD      (1u << 5)
+#define DEPINT_STUPPKTRCVD      (1u << 15)
+#define DIEPDMA(n)              (0x914 + 0x20 * (n))
+#define DOEPDMA(n)              (0xb14 + 0x20 * (n))
+#define DESC_OUT0               0x4ff40400
+#define DESC_IN0                0x4ff40500
+
+static void arm_desc(QTestState *qts, uint32_t desc, uint32_t status,
+                     uint32_t buf)
+{
+    qtest_writel(qts, desc, status);
+    qtest_writel(qts, desc + 4, buf);
+}
+
+/*
+ * OTG_HS in device mode with scatter/gather DMA: SETUPs into control OUT
+ * endpoint 0's descriptor (SR), IN data from a descriptor, short OUT
+ * packets closing theirs (SP), BNA for a descriptor not ready, and a
+ * control write's status stage (StsPhseRcvd).
+ */
+/* [spec:nuos:req:emu.esp32p4.usb/test] */
+static void test_hs_device_scatter_gather(void)
+{
+    g_autofree char *dir = g_dir_make_tmp("usbXXXXXX", NULL);
+    g_autofree char *path = g_strdup_printf("%s/tok", dir);
+    g_autofree char *args = g_strdup_printf(
+        "-M esp32p4 -chardev socket,id=tok,path=%s,server=on,wait=off "
+        "-global esp32p4-usb-otg-hs.token-chardev=tok", path);
+    static const uint8_t setup_get[8] = { 0x80, 6, 0, 1, 0, 0, 18, 0 };
+    static const uint8_t setup_write[8] = { 0x21, 0x20, 0, 0, 0, 0, 7, 0 };
+    static const uint8_t coding[7] = { 0x00, 0xc2, 0x01, 0x00, 0, 0, 8 };
+    QTestState *qts = qtest_init(args);
+    uint8_t buf[64], pid;
+    uint32_t st;
+    uint16_t n;
+    int fd = tok_connect(path);
+
+    qtest_clock_step(qts, 1000);
+    wr(qts, OTG_HS, GAHBCFG, GAHBCFG_DMA_EN);
+    wr(qts, OTG_HS, DCFG, rd(qts, OTG_HS, DCFG) | DCFG_DESCDMA);
+    wr(qts, OTG_HS, DCTL, 0);
+    g_assert_cmpint(tok_xact(fd, 'R', 0, 0, 0, 0, NULL, NULL, NULL, NULL),
+                    ==, 'A');
+
+    /* A SETUP lands in control OUT endpoint 0's descriptor. */
+    arm_desc(qts, DESC_OUT0, DESC_BS_HOST_READY | DESC_L | DESC_IOC | 8,
+             BUF_SETUP);
+    wr(qts, OTG_HS, DOEPDMA(0), DESC_OUT0);
+    wr(qts, OTG_HS, DOEPCTL(0), DEPCTL_CNAK | DEPCTL_EPENA);
+    g_assert_cmpint(tok_xact(fd, 'S', 0, 0, 0, 8, setup_get, NULL, NULL,
+                             NULL), ==, 'A');
+    st = qtest_readl(qts, DESC_OUT0);
+    g_assert_cmpint(DESC_BS(st), ==, DESC_BS_DMA_DONE);
+    g_assert_cmphex(st & DESC_SR, ==, DESC_SR);
+    g_assert_cmpint(DESC_NBYTES(st), ==, 0);
+    qtest_memread(qts, BUF_SETUP, buf, 8);
+    g_assert_cmpmem(buf, 8, setup_get, 8);
+    g_assert_cmphex(rd(qts, OTG_HS, DOEPINT(0)) & DEPINT_STUPPKTRCVD, ==,
+                    DEPINT_STUPPKTRCVD);
+    g_assert_cmphex(rd(qts, OTG_HS, DOEPCTL(0)) & DEPCTL_EPENA, ==, 0);
+
+    /* The data stage: NAKed until a descriptor is ready, then its data. */
+    g_assert_cmpint(tok_xact(fd, 'I', 0, 0, 0, 64, NULL, buf, NULL, NULL),
+                    ==, 'N');
+    g_assert_cmphex(rd(qts, OTG_HS, DOEPINT(0)) & DEPINT_SETUP, ==,
+                    DEPINT_SETUP);
+    wr(qts, OTG_HS, DOEPINT(0), 0xffff);
+    qtest_memset(qts, BUF_DATA, 0xa5, 18);
+    arm_desc(qts, DESC_IN0, DESC_BS_HOST_READY | DESC_L | DESC_IOC | 18,
+             BUF_DATA);
+    wr(qts, OTG_HS, DIEPDMA(0), DESC_IN0);
+    wr(qts, OTG_HS, DIEPCTL(0), DEPCTL_CNAK | DEPCTL_EPENA);
+    g_assert_cmpint(tok_xact(fd, 'I', 0, 0, 0, 64, NULL, buf, &n, &pid),
+                    ==, 'A');
+    g_assert_cmpint(n, ==, 18);
+    g_assert_cmpint(pid, ==, 1);
+    g_assert_cmphex(buf[17], ==, 0xa5);
+    g_assert_cmpint(DESC_BS(qtest_readl(qts, DESC_IN0)), ==,
+                    DESC_BS_DMA_DONE);
+    g_assert_cmphex(rd(qts, OTG_HS, DIEPINT(0)) & DEPINT_XFERCOMPL, ==,
+                    DEPINT_XFERCOMPL);
+    wr(qts, OTG_HS, DIEPINT(0), 0xffff);
+
+    /* The status stage's zero-length OUT: a short packet, SP. */
+    arm_desc(qts, DESC_OUT0, DESC_BS_HOST_READY | DESC_L | DESC_IOC | 8,
+             BUF_SETUP);
+    wr(qts, OTG_HS, DOEPCTL(0), DEPCTL_CNAK | DEPCTL_EPENA);
+    g_assert_cmpint(tok_xact(fd, 'O', 0, 0, 1, 0, NULL, NULL, NULL, NULL),
+                    ==, 'A');
+    st = qtest_readl(qts, DESC_OUT0);
+    g_assert_cmphex(st & (DESC_SP | DESC_SR), ==, DESC_SP);
+    g_assert_cmpint(DESC_NBYTES(st), ==, 8);
+    g_assert_cmphex(rd(qts, OTG_HS, DOEPINT(0)) & DEPINT_XFERCOMPL, ==,
+                    DEPINT_XFERCOMPL);
+    wr(qts, OTG_HS, DOEPINT(0), 0xffff);
+
+    /*
+     * A control write: its data into a descriptor, then the status
+     * stage's first IN raises StsPhseRcvd.
+     */
+    arm_desc(qts, DESC_OUT0, DESC_BS_HOST_READY | DESC_L | DESC_IOC | 8,
+             BUF_SETUP);
+    wr(qts, OTG_HS, DOEPCTL(0), DEPCTL_CNAK | DEPCTL_EPENA);
+    g_assert_cmpint(tok_xact(fd, 'S', 0, 0, 0, 8, setup_write, NULL, NULL,
+                             NULL), ==, 'A');
+    arm_desc(qts, DESC_OUT0, DESC_BS_HOST_READY | DESC_L | DESC_IOC | 64,
+             BUF_DATA);
+    wr(qts, OTG_HS, DOEPCTL(0), DEPCTL_CNAK | DEPCTL_EPENA);
+    g_assert_cmpint(tok_xact(fd, 'O', 0, 0, 1, 7, coding, NULL, NULL, NULL),
+                    ==, 'A');
+    st = qtest_readl(qts, DESC_OUT0);
+    g_assert_cmpint(DESC_NBYTES(st), ==, 64 - 7);
+    qtest_memread(qts, BUF_DATA, buf, 7);
+    g_assert_cmpmem(buf, 7, coding, 7);
+    g_assert_cmpint(tok_xact(fd, 'I', 0, 0, 0, 64, NULL, buf, NULL, NULL),
+                    ==, 'N');
+    g_assert_cmphex(rd(qts, OTG_HS, DOEPINT(0)) & DEPINT_STSPHSERCVD, ==,
+                    DEPINT_STSPHSERCVD);
+
+    /* A descriptor the core may not use: BNA, the endpoint disabled. */
+    arm_desc(qts, DESC_IN0, DESC_BS_HOST_BUSY | DESC_L | DESC_IOC, BUF_DATA);
+    wr(qts, OTG_HS, DIEPCTL(0), DEPCTL_CNAK | DEPCTL_EPENA);
+    g_assert_cmpint(tok_xact(fd, 'I', 0, 0, 0, 64, NULL, buf, NULL, NULL),
+                    ==, 'N');
+    g_assert_cmphex(rd(qts, OTG_HS, DIEPINT(0)) & DEPINT_BNA, ==,
+                    DEPINT_BNA);
+    g_assert_cmphex(rd(qts, OTG_HS, DIEPCTL(0)) & DEPCTL_EPENA, ==, 0);
+
+    close(fd);
+    qtest_quit(qts);
+    unlink(path);
+    rmdir(dir);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -950,7 +1240,13 @@ int main(int argc, char **argv)
                    test_hs_host_buffer_dma);
     qtest_add_func("/esp32p4/usb/fs-host-scatter-gather",
                    test_fs_host_scatter_gather);
+    if (qtest_has_device("usb-audio")) {
+        qtest_add_func("/esp32p4/usb/fs-host-iso-scatter-gather",
+                       test_fs_host_iso_scatter_gather);
+    }
     qtest_add_func("/esp32p4/usb/hs-device-token", test_hs_device_token);
+    qtest_add_func("/esp32p4/usb/hs-device-scatter-gather",
+                   test_hs_device_scatter_gather);
     qtest_add_func("/esp32p4/usb/fs-phy-select", test_fs_phy_select);
     qtest_add_func("/esp32p4/usb/fs-device-pads", test_fs_device_pads);
     return g_test_run();
