@@ -499,12 +499,16 @@ static void esp_load_and_run(QTestState *qts, int fd)
     g_assert_cmphex(qtest_readl(qts, MAGIC_ADDR), ==, MAGIC);
 }
 
-/* Read @fd for up to 30 s until its text holds @want. */
-static void await_text(int fd, const char *want)
+/*
+ * Read @fd for up to 30 s until the text received holds @want. @rx holds
+ * what has arrived and not yet been matched: what follows the match stays
+ * in it for the next call, as one read may bring several lines.
+ */
+static void await_text(int fd, GString *rx, const char *want)
 {
-    g_autoptr(GString) text = g_string_new(NULL);
+    const char *at;
 
-    for (int i = 0; i < 300 && !strstr(text->str, want); i++) {
+    for (int i = 0; i < 300 && !strstr(rx->str, want); i++) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
         char buf[256];
 
@@ -512,13 +516,16 @@ static void await_text(int fd, const char *want)
             ssize_t n = recv(fd, buf, sizeof(buf), 0);
 
             g_assert_cmpint(n, >, 0);
-            g_string_append_len(text, buf, n);
+            g_string_append_len(rx, buf, n);
         }
     }
-    if (!strstr(text->str, want)) {
-        g_test_message("'%s' not in: %s", want, text->str);
+    at = strstr(rx->str, want);
+    if (!at) {
+        g_test_message("'%s' not in: %s", want, rx->str);
         g_test_fail();
+        return;
     }
+    g_string_erase(rx, 0, at - rx->str + strlen(want));
 }
 
 /*
@@ -555,6 +562,7 @@ static void test_uart0_boot(void)
     QTestState *qts = qtest_init_with_serial(
         "-M esp32p4,strap-mode=0x02 -accel tcg -icount shift=0,sleep=off "
         "-global driver=esp32.uart-terminal,property=break,value=on", &fd);
+    g_autoptr(GString) rx = g_string_new(NULL);
     QDict *rsp;
 
     g_assert_cmphex(qtest_readl(qts, GPIO_STRAP), ==, 0x02);
@@ -563,8 +571,8 @@ static void test_uart0_boot(void)
                     "'value': false}}");
     g_assert(qdict_haskey(rsp, "return"));
     qobject_unref(rsp);
-    await_text(fd, "boot:0x2 (UART0_BOOT)");
-    await_text(fd, "wait uart0 download");
+    await_text(fd, rx, "boot:0x2 (UART0_BOOT)");
+    await_text(fd, rx, "wait uart0 download");
     esp_load_and_run(qts, fd);
     close(fd);
     qtest_quit(qts);
