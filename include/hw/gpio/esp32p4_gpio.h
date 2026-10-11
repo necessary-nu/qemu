@@ -62,6 +62,8 @@ enum {
 #define ESP32P4_GPIO_STRAP_PINS 5
 /* Bit 3, GPIO35, set: SPI boot, as GPIO35's internal pull-up gives. */
 #define ESP32P4_GPIO_STRAP_SPI_BOOT 0x08
+/* GPIO35 low and bit 2, GPIO36, set: joint download boot (TRM 12.2.2). */
+#define ESP32P4_GPIO_STRAP_JOINT_DOWNLOAD 0x04
 
 /*
  * How peripherals connect to the pads
@@ -187,7 +189,11 @@ enum {
  *     sleep configuration (TRM table 10.8-1).
  *   ESP32P4_GPIO_ANA_COMP, "ana-comp" (input, 2 lines): the analog
  *     voltage comparators' outputs, matrix output signals 244 and 245,
- *     whose edges GPIO_INT_RAW's COMP<n>_POS, _NEG and _ALL latch.
+ *     high while the source is above the reference; GPIO_INT_RAW latches
+ *     comparator n's rising edges in bit 3n, its falling edges in bit
+ *     3n + 1 and both in bit 3n + 2, as ESP-IDF's driver reads them
+ *     (the TRM's names for bits 3n and 3n + 1 are the other way round;
+ *     see esp32p4_gpio_set_ana_comp()).
  *   ESP32P4_GPIO_WAKEUP, "wakeup" (output): the HP GPIO wakeup from light
  *     sleep (TRM 10.4.6.1): a pad with GPIO_PINn_WAKEUP_ENABLE is at the
  *     level its INT_TYPE, 4 or 5, names.
@@ -207,8 +213,17 @@ enum {
  *   ESP32P4_GPIO_ETM_ZERO_DET, "etm-zero-det" (output, 4 lines): the
  *     analog comparators' ETM events GPIO_EVT_ZERO_DET_POS<n> (line 2n)
  *     and _NEG<n> (line 2n + 1), pulsed on the rising and falling edges
- *     that set COMP<n>_POS_INT_RAW and _NEG_INT_RAW, through the same
+ *     that latch GPIO_INT_RAW bits 3n and 3n + 1, through the same
  *     GPIO_ZERO_DET<n>_FILTER_CNT filter.
+ *   ESP32P4_GPIO_FORCE_DOWNLOAD, "force-download" (input): high while
+ *     LP_SYSTEM_FORCE_DOWNLOAD_BOOT, which EFUSE_DIS_FORCE_DOWNLOAD does
+ *     not disable, overrides the strapping (TRM 12.2.2): a chip strapped
+ *     for SPI boot boots in joint download boot mode, GPIO_STRAP reading
+ *     GPIO35's bit clear and GPIO36's set, as the boot ROM, which reads
+ *     only GPIO_STRAP, needs to see it to take that mode.
+ *   ESP32P4_GPIO_SPI_BOOT, "spi-boot" (output): high while the boot mode,
+ *     GPIO_STRAP's GPIO35 bit, is SPI boot, in which MWDT0's and the RTC
+ *     watchdog's flash boot protection run.
  *
  * The interrupts are the sysbus IRQs, in the order of ESP32P4GpioIrq,
  * each a source of the interrupt matrix; the LP GPIO interrupt reaches
@@ -239,6 +254,8 @@ enum {
 #define ESP32P4_GPIO_ETM_EVENT      "etm-event"
 #define ESP32P4_GPIO_ETM_TASK       "etm-task"
 #define ESP32P4_GPIO_ETM_ZERO_DET   "etm-zero-det"
+#define ESP32P4_GPIO_FORCE_DOWNLOAD "force-download"
+#define ESP32P4_GPIO_SPI_BOOT       "spi-boot"
 
 #define ESP32P4_GPIO_IOMUX_LINE(pad, func) \
     ((pad) * ESP32P4_IOMUX_FUNCS + (func))
@@ -328,6 +345,7 @@ struct ESP32P4GpioState {
     qemu_irq lp_wakeup_out;
     qemu_irq etm_event[ESP32P4_GPIO_ETM_LINES];
     qemu_irq etm_zero_det[ESP32P4_GPIO_ETM_ZERO_DET_LINES];
+    qemu_irq spi_boot_out;
     Notifier line_source;
     NotifierList route_notifiers;
 
@@ -337,7 +355,9 @@ struct ESP32P4GpioState {
     uint32_t bt_select;
     uint32_t out[2];
     uint32_t enable[2];
+    /* GPIO_STRAP as latched; the boot mode override, LP_SYSTEM's. */
     uint32_t strap;
+    bool force_download;
     uint32_t status[2];
     uint32_t pin[ESP32P4_GPIO_SLOTS];
     uint32_t func_in_sel[ESP32P4_GPIO_SIGS];
