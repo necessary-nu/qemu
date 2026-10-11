@@ -992,11 +992,27 @@ static void test_rng(void)
 
     g_assert_cmphex(qtest_readl(qts, RNG_CFG), ==, (255u << 1) | (1u << 9));
     g_assert_cmphex(qtest_readl(qts, RNG_DATE), ==, 2425091);
-    /* Until RNG_CLK_EN the generator does not run. */
-    g_assert_cmphex(qtest_readl(qts, RNG_DATA), ==, 0);
-    g_assert_cmphex(qtest_readl(qts, RNG_DATA), ==, 0);
 
+    /*
+     * From reset, RNG_CLK_EN clear, each read is a new number, as the boot
+     * ROM's stack guard set-up needs (RNG_SAMPLE_ENABLE set, two reads,
+     * non-zero and different).
+     */
+    qtest_writel(qts, RNG_CFG, qtest_readl(qts, RNG_CFG) | 1);
+    a = qtest_readl(qts, RNG_DATA);
+    b = qtest_readl(qts, RNG_DATA);
+    c = qtest_readl(qts, RNG_DATA);
+    g_assert_true(a != b || b != c);
+    g_assert_true(a || b || c);
+    qtest_writel(qts, RNG_CFG, qtest_readl(qts, RNG_CFG) & ~1u);
+
+    /* Without the BUF_CHAIN too; RNG_CLK_EN, the register clock gate, holds. */
+    a = qtest_readl(qts, RNG_DATA);
+    b = qtest_readl(qts, RNG_DATA);
+    c = qtest_readl(qts, RNG_DATA);
+    g_assert_true(a != b || b != c);
     qtest_writel(qts, RNG_DATE, qtest_readl(qts, RNG_DATE) | RNG_CLK_EN);
+    g_assert_cmphex(qtest_readl(qts, RNG_DATE), ==, 2425091 | RNG_CLK_EN);
     a = qtest_readl(qts, RNG_DATA);
     b = qtest_readl(qts, RNG_DATA);
     c = qtest_readl(qts, RNG_DATA);
