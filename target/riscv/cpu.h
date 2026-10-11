@@ -764,6 +764,16 @@ FIELD(EXT_TB_FLAGS, ESP32P4_HWLP_ARMED, 35, 1)
  */
 FIELD(EXT_TB_FLAGS, ESP32P4_PIE_EN, 36, 1)
 FIELD(EXT_TB_FLAGS, ESP32P4_PIE_DIRTY, 37, 1)
+/*
+ * ESP32-P4 HP core debug assistant: SP is monitored, so every write of SP
+ * compares it with the monitored bounds.
+ */
+FIELD(EXT_TB_FLAGS, ESP32P4_SPMON, 38, 1)
+/*
+ * ESP32-P4 HP core trace encoder: it traces the core, so every
+ * instruction reports its start to it.
+ */
+FIELD(EXT_TB_FLAGS, ESP32P4_TRACE, 39, 1)
 
 #ifdef TARGET_RISCV32
 #define riscv_cpu_mxl(env)  ((void)(env), MXL_RV32)

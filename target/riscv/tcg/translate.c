@@ -136,6 +136,10 @@ typedef struct DisasContext {
      */
     bool pie_en;
     bool pie_dirty;
+    /* ESP32-P4 HP core: the debug assistant monitors SP. */
+    bool spmon;
+    /* ESP32-P4 HP core: the trace encoder traces the core. */
+    bool trace;
 } DisasContext;
 
 static inline bool has_ext(DisasContext *ctx, uint32_t ext)
@@ -317,6 +321,8 @@ static void exit_tb(DisasContext *ctx)
 static void gen_esp32p4_hwlp_end(DisasContext *ctx, TCGv next,
                                  bool main_loop);
 static void gen_esp32p4_hwlp_check(DisasContext *ctx);
+static void gen_esp32p4_sp_check(DisasContext *ctx);
+static void gen_esp32p4_trace_insn(DisasContext *ctx, CPURISCVState *env);
 #endif
 
 /*
@@ -454,6 +460,11 @@ static void gen_set_gpr(DisasContext *ctx, int reg_num, TCGv t)
         if (get_xl_max(ctx) == MXL_RV128) {
             tcg_gen_sari_tl(cpu_gprh[reg_num], cpu_gpr[reg_num], 63);
         }
+#ifndef CONFIG_USER_ONLY
+        if (reg_num == xSP && ctx->spmon) {
+            gen_esp32p4_sp_check(ctx);
+        }
+#endif
     }
 }
 
@@ -475,6 +486,11 @@ static void gen_set_gpri(DisasContext *ctx, int reg_num, target_long imm)
         if (get_xl_max(ctx) == MXL_RV128) {
             tcg_gen_movi_tl(cpu_gprh[reg_num], -(imm < 0));
         }
+#ifndef CONFIG_USER_ONLY
+        if (reg_num == xSP && ctx->spmon) {
+            gen_esp32p4_sp_check(ctx);
+        }
+#endif
     }
 }
 
@@ -1429,6 +1445,8 @@ static void riscv_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->pie_en = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, ESP32P4_PIE_EN);
     ctx->pie_dirty = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS,
                                 ESP32P4_PIE_DIRTY);
+    ctx->spmon = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, ESP32P4_SPMON);
+    ctx->trace = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, ESP32P4_TRACE);
 }
 
 static void riscv_tr_tb_start(DisasContextBase *db, CPUState *cpu)
@@ -1453,6 +1471,11 @@ static void riscv_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
     CPURISCVState *env = cpu_env(cpu);
 
+#ifndef CONFIG_USER_ONLY
+    if (ctx->trace) {
+        gen_esp32p4_trace_insn(ctx, env);
+    }
+#endif
     decode_opc(env, ctx);
 #ifndef CONFIG_USER_ONLY
     if (ctx->hwlp_armed && ctx->base.is_jmp == DISAS_NEXT) {
