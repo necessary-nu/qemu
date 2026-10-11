@@ -48,6 +48,7 @@
 #include "hw/timer/esp32p4_systimer.h"
 #include "hw/timer/esp32p4_timg.h"
 #include "hw/ssi/esp32p4_mspi.h"
+#include "hw/ssi/esp32p4_spi.h"
 #include "hw/usb/dwc2-otg.h"
 #include "hw/usb/esp32p4_usb.h"
 #include "system/memory.h"
@@ -154,6 +155,8 @@ struct ESP32P4MachineState {
     /* GDMA-AHB, GDMA-AXI. */
     ESP32P4GdmaState gdma[2];
     ESP32P4DwGdmaState vdma;
+    /* GP-SPI2, GP-SPI3. */
+    ESP32P4SpiState spi[2];
     ESP32P4TwaiState twai;
     /* The QEMU CAN buses on TWAI0 to TWAI2's pads, or NULL. */
     CanBusState *canbus[ESP32P4_TWAI_NUM];
