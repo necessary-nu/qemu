@@ -54,8 +54,10 @@
  * than checking it part by part.
  *
  * QEMU's TLB caches a page's permissions only when one entry of each unit,
- * or none, decides the whole page; any other page is checked on every
- * access, and its code runs one instruction per translation.
+ * or none, decides the whole page, and the debug assistant watches no
+ * region of it; any other page is checked on every access, and its code
+ * runs one instruction per translation. The debug assistant sees each
+ * load and store the checks allow (esp32p4_assist_access()).
  *
  * An access the checks allow goes to the bus with the privilege mode it
  * is made in, MemTxAttrs.user set for user mode, and the core's identity
@@ -79,6 +81,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
 #include "qemu/log.h"
 #include "cpu.h"
 #include "exec/cputlb.h"
@@ -327,6 +330,7 @@ static int esp32p4_page_prot(int privs)
  * checks above alone decide an access, which carries its privilege mode.
  */
 /* [spec:nuos:req:emu.esp32p4.pmp] */
+/* [spec:nuos:req:emu.esp32p4.debug] */
 bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,
                          MMUAccessType access_type, int mmu_idx,
                          bool probe, uintptr_t retaddr)
@@ -355,7 +359,12 @@ bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,
     }
 
     if (part >= end) {
-        if (esp32p4_uniform(cpu, page, page + TARGET_PAGE_SIZE, priv)) {
+        if (!probe && access_type != MMU_INST_FETCH &&
+            qatomic_read(&cpu->assist_watch)) {
+            esp32p4_assist_access(cpu, address, size, access_type, retaddr);
+        }
+        if (esp32p4_uniform(cpu, page, page + TARGET_PAGE_SIZE, priv) &&
+            !esp32p4_assist_watches_page(cpu, page)) {
             tlb_set_page_with_attrs(cs, page, esp32p4_phys(cpu, page), attrs,
                                     esp32p4_page_prot(privs), mmu_idx,
                                     TARGET_PAGE_SIZE);

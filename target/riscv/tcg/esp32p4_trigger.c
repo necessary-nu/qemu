@@ -21,7 +21,7 @@
  * while tcontrol.MTE is set; a trap saves MTE in MPTE and clears it, and
  * MRET restores it. The debugger alone may set dmode and the debug-mode
  * action 1, which M-mode writes turn into action 0; the trace actions 2
- * to 4 are kept, but no trace is modelled.
+ * to 4 (trace on, off and notify) go to the core's trace encoder.
  *
  * The access size filter, sizelo, is kept but not applied: QEMU's
  * watchpoint check does not report the size of the access.
@@ -111,16 +111,20 @@ static bool trigger_live(ESP32P4CPU *cpu, int t)
 
 /*
  * A matching trigger fires: one with action 0 is taken as a breakpoint
- * exception while tcontrol.MTE allows; one with a trace action only sets
- * its hit bit.
+ * exception while tcontrol.MTE allows; one with a trace action sets its
+ * hit bit and goes to the core's trace encoder, which acts on it if its
+ * TRACE_DM_TRIGGER_ENA lets it.
  */
-static bool trigger_fire(ESP32P4CPU *cpu, int t)
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static bool trigger_fire(ESP32P4CPU *cpu, int t, bool execute)
 {
-    if (trigger_action(cpu->tdata1[t]) != 0) {
+    unsigned action = trigger_action(cpu->tdata1[t]);
+
+    if (action != 0) {
         cpu->tdata1[t] |= MCONTROL_HIT;
-        qemu_log_mask(LOG_UNIMP, "esp32p4: trigger %d fired with trace "
-                      "action %u, which is not modelled\n", t,
-                      trigger_action(cpu->tdata1[t]));
+        if (cpu->trace_ops) {
+            cpu->trace_ops->trigger(cpu->trace_opaque, action, execute);
+        }
         return false;
     }
     if (!(cpu->tcontrol & ESP32P4_TCONTROL_MTE)) {
@@ -256,7 +260,7 @@ bool esp32p4_debug_check_breakpoint(CPUState *cs)
     for (int t = 0; t < ESP32P4_TRIGGERS; t++) {
         if ((cpu->tdata1[t] & MCONTROL_EXECUTE) && trigger_live(cpu, t) &&
             trigger_covers(cpu, t, env->pc)) {
-            taken |= trigger_fire(cpu, t);
+            taken |= trigger_fire(cpu, t, true);
         }
     }
     if (taken) {
@@ -282,7 +286,7 @@ bool esp32p4_debug_check_watchpoint(CPUState *cs, CPUWatchpoint *wp)
 
         if ((ctrl & kind) && (ctrl & MCONTROL_TIMING) == timing &&
             trigger_live(cpu, t) && trigger_covers(cpu, t, wp->hitaddr)) {
-            taken |= trigger_fire(cpu, t);
+            taken |= trigger_fire(cpu, t, false);
         }
     }
     return taken;
