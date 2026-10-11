@@ -114,6 +114,10 @@ static uint64_t esp32p4_sdmmc_cclk_period(DWCSDMMCState *d)
 
 static void esp32p4_sdmmc_clock_update(void *opaque, ClockEvent event)
 {
+    if (event == ClockPreUpdate) {
+        dwc_sdmmc_catch_up(DWC_SDMMC(opaque));
+        return;
+    }
     dwc_sdmmc_clock_changed(DWC_SDMMC(opaque));
 }
 
@@ -124,10 +128,10 @@ static void esp32p4_sdmmc_init(Object *obj)
 
     s->drv_clk = qdev_init_clock_in(DEVICE(obj), "drv",
                                     esp32p4_sdmmc_clock_update, s,
-                                    ClockUpdate);
+                                    ClockPreUpdate | ClockUpdate);
     s->sam_clk = qdev_init_clock_in(DEVICE(obj), "sam",
                                     esp32p4_sdmmc_clock_update, s,
-                                    ClockUpdate);
+                                    ClockPreUpdate | ClockUpdate);
     d->num_slots = 2;
     d->fifo_depth = 512;
     d->cmd_mask = 0xb0ffffff;
