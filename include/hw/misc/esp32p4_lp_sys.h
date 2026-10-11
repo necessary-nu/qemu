@@ -17,6 +17,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
 
 #define ESP32P4_LP_SYS_SIZE 0x1000
 
+/*
+ * Named GPIO input "etm-task-ulp-int": the ETM's task ULP_TASK_INT_CPU,
+ * which sets ETM_TASK_ULP_INT_RAW as it rises.
+ */
+#define ESP32P4_LP_SYS_ETM_TASK_ULP_INT "etm-task-ulp-int"
+
 struct ESP32P4LPSysState {
     SysBusDevice parent_obj;
 

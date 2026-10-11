@@ -23,6 +23,7 @@
 #include "hw/misc/esp32p4_ana.h"
 #include "hw/misc/esp32p4_cache.h"
 #include "hw/misc/esp32p4_clkrst.h"
+#include "hw/misc/esp32p4_etm.h"
 #include "hw/misc/esp32p4_hp_sys.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_icm.h"
@@ -146,6 +147,7 @@ struct ESP32P4MachineState {
     SplitIRQ core_stall_split[ESP32P4_HP_CORES];
     /* The HP core reset, to the machine and the RTC timer. */
     SplitIRQ hp_core_reset_split;
+    ESP32P4EtmState etm;
 
     ESP32P4MSPIState flash_mspi;
     ESP32P4MSPIState psram_mspi;
