@@ -340,30 +340,31 @@
  * skip_lp_rom_boot does.
  *
  * The HP ROM image is the esp32p4-rev3-rom.bin firmware file, or the raw
- * image -bios names. With -kernel, an ELF's segments are loaded into
- * L2MEM (past the L2 cache), the TCM or LP SRAM, and core 0 starts at the
- * ELF's entry point rather than in the ROM, with the caches empty; core 1
- * is still held for software to release. The program finds the super
- * watchdog as the ROM leaves the program it boots: running since the
- * reset, unfed, its SWD_RESET_FLAG cleared (the ROM's main() clears it on
- * core 0 at every boot), and its reset not enabled by LP_SYSTEM's FIB
- * control until software enables it.
+ * image -bios names. From reset the ROM boots as the strapping pins and
+ * the eFuses select (TRM chapter 12): in SPI boot mode it loads the image
+ * at flash offset 0x2000 (ESP-IDF's second-stage bootloader, in esptool's
+ * image format) into memory and jumps to its entry point, or runs a
+ * direct-boot image from flash; in the download modes it waits for
+ * esptool on UART0, USB Serial/JTAG or the SPI slave. The strapping is the
+ * strap-mode property, as GPIO_STRAP latches it at reset, and
+ * LP_SYSTEM_FORCE_DOWNLOAD_BOOT, unless EFUSE_DIS_FORCE_DOWNLOAD is set,
+ * takes a chip strapped for SPI boot into joint download boot.
  *
- * The ELF stands for the program the ROM boots from flash, and takes the
- * ROM's place whenever the HP system starts: after an HP core reset that
- * selects the ROM (LP_CLKRST_HPCORE0_STAT_VECTOR_SEL), and so after a
- * deep sleep, core 0 starts at the entry point. The ROM on such a wakeup
- * (PMU HP power down reset, 0x05) takes LP_SYSTEM_LP_STORE8 bit 0 to tell
- * a deep sleep, after which it boots from flash as from power-on, from a
- * light sleep, after which it jumps to the address in the rest of the
- * word; it runs no deep-sleep wake stub itself, ESP-IDF's bootloader and
- * application doing that. As the deep sleep powered the HP memories down,
- * losing L2MEM and the TCM, the machine first loads the ELF's segments
- * there again, as the boot from flash would (leaving LP SRAM, which keeps
- * its contents, as ESP-IDF's bootloader leaves the LP memory on a deep
- * sleep wakeup); the HP pads stay held until the program releases them,
- * as the ROM does at boot (PMU_TIE_LOW_HP_PAD_HOLD_ALL). Without -kernel
- * the ROM runs again, as on the chip.
+ * With -kernel the ELF stands for the image the ROM boots from flash: its
+ * segments must be where the ROM loads segments to (L2MEM past the L2
+ * cache and the ROM's own stack and data, the TCM, LP SRAM), and whenever
+ * HP core 0 starts at the ROM with the ROM about to boot the image from
+ * flash, after power-on and after every reset that reruns the ROM (an HP
+ * core reset, a CPU reset of core 0, a deep sleep's wakeup), core 0
+ * starts at the ELF's entry point with the state the ROM leaves as it
+ * jumps there presented (hw/riscv/esp32p4_boot.c): the segments loaded
+ * again, the ROM's CPU, cache, flash controller, UART0 and RAM state,
+ * MWDT0's and the RTC watchdog's flash boot protection running and the
+ * super watchdog running unfed, as the ROM leaves them for the program to
+ * stop or feed. Where the ROM would not boot
+ * the image (another boot mode, a reset cause it refuses, a light sleep's
+ * wakeup, Secure Boot) core 0 runs the ROM, as on the chip. Core 1 is
+ * held for software to release, then runs the ROM.
  */
 
 #include "qemu/osdep.h"
@@ -682,20 +683,50 @@ static void esp32p4_init_cpus(ESP32P4MachineState *s)
 }
 
 /*
- * LP_CLKRST_HPCORE<n>_STAT_VECTOR_SEL: the HP ROM, where core 0 with
- * -kernel starts at the ELF's entry point instead, or LP SRAM.
+ * LP_CLKRST_HPCORE<n>_STAT_VECTOR_SEL: the HP ROM or LP SRAM. Core 0,
+ * starting at the ROM with -kernel, may start at the ELF's entry point
+ * (esp32p4_boot_core0()).
  */
 /* [spec:nuos:req:emu.esp32p4.clocks] */
 static void esp32p4_core_vector(void *opaque, int n, int level)
 {
     ESP32P4MachineState *s = opaque;
-    uint64_t vector = ESP32P4_LP_SRAM_BASE;
 
-    if (level) {
-        vector = n == 0 && s->kernel_entry ? s->kernel_entry
-                                           : ESP32P4_HP_RESET_VECTOR;
+    s->hp_cpu[n].parent_obj.env.resetvec = level ? ESP32P4_HP_RESET_VECTOR
+                                                 : ESP32P4_LP_SRAM_BASE;
+    if (n == 0) {
+        s->core0_rom_vector = level;
     }
-    s->hp_cpu[n].parent_obj.env.resetvec = vector;
+}
+
+/* Run on core 0 as it leaves a reset, after its own reset's work. */
+static void esp32p4_core0_started(CPUState *cs, run_on_cpu_data data)
+{
+    ESP32P4MachineState *s = data.host_ptr;
+
+    if (s->core0_boot_pending) {
+        s->core0_boot_pending = false;
+        esp32p4_boot_core0(s);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.boot]
+ * HP core 0's reset, from the reset and clock control: as it ends, core 0
+ * starts in the ROM, or with -kernel in the ROM's place
+ * (esp32p4_boot_core0()), on its own thread before it runs. A system reset
+ * starts it in esp32p4_machine_reset().
+ */
+static void esp32p4_core0_reset(void *opaque, int n, int level)
+{
+    ESP32P4MachineState *s = opaque;
+
+    if (s->core0_in_reset && !level) {
+        s->core0_boot_pending = true;
+        async_run_on_cpu(CPU(&s->hp_cpu[0]), esp32p4_core0_started,
+                         RUN_ON_CPU_HOST_PTR(s));
+    }
+    s->core0_in_reset = level;
 }
 
 /*
@@ -784,12 +815,13 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
 
         /*
          * A core's reset also resets its CLIC, stops its PC record in the
-         * debug assistant and is its trace encoder's reset sideband.
+         * debug assistant and is its trace encoder's reset sideband; core
+         * 0's ending starts it in the ROM or the ROM's place.
          */
         object_initialize_child(OBJECT(s), "core-reset-split[*]",
                                 &s->core_reset_split[i], TYPE_SPLIT_IRQ);
         qdev_prop_set_uint16(DEVICE(&s->core_reset_split[i]), "num-lines",
-                             4);
+                             5);
         qdev_realize(DEVICE(&s->core_reset_split[i]), NULL, &error_fatal);
         qdev_connect_gpio_out(DEVICE(&s->core_reset_split[i]), 0,
                               qdev_get_gpio_in_named(cpu, ESP32P4_CPU_RESET,
@@ -802,6 +834,11 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
                                         ESP32P4_CPU_CLOCK, 0));
         qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_CORE_VECTOR, i,
                                     s->core_vector[i]);
+        if (i == 0) {
+            qdev_connect_gpio_out(DEVICE(&s->core_reset_split[i]), 4,
+                                  qemu_allocate_irq(esp32p4_core0_reset, s,
+                                                    0));
+        }
         /*
          * Under icount a core executes an instruction per cycle of its
          * CPU_CLK, at its current frequency, alongside the other cores.
@@ -1020,22 +1057,17 @@ static void esp32p4_hp_core_reset(void *opaque, int n, int level)
  * go to the PMU (esp32p4_init_low_power()); the LP core's timer interrupt
  * is a named GPIO line (see the device's header) that nothing takes until
  * the LP core's interrupts are modelled.
- * MWDT0 and the RTC watchdog run their flash boot protection when the
- * chip boots from flash through the boot ROM in SPI boot mode: when the
- * board's strapping (the strap-mode property) has GPIO35 high and there
- * is no -kernel, which loads the program in the ROM's place, with no flash
- * boot to protect. Pads driven from outside at reset, which GPIO_STRAP
- * latches in place of the strapping, and LP_SYSTEM_FORCE_DOWNLOAD_BOOT do
- * not change it. LP_SYSTEM's FIB control enables the super watchdog's
- * reset (see esp32p4_init_debug()).
+ * MWDT0 and the RTC watchdog run their flash boot protection while the
+ * chip's boot mode is SPI boot, which the GPIO block gives them
+ * (esp32p4_init_gpio()); -kernel, standing for the ROM's boot from flash,
+ * leaves it running as the ROM does. LP_SYSTEM's FIB control enables the
+ * super watchdog's reset (see esp32p4_init_debug()).
  */
 /* [spec:nuos:req:emu.esp32p4.timers] */
 static void esp32p4_init_timers(ESP32P4MachineState *s)
 {
     DeviceState *clkrst = DEVICE(&s->clkrst);
     DeviceState *dev, *split;
-    bool spi_boot = !MACHINE(s)->kernel_filename &&
-                    (s->strap_mode & ESP32P4_GPIO_STRAP_SPI_BOOT);
     int i, n;
 
     for (n = 0; n < ESP32P4_HP_CORES; n++) {
@@ -1114,8 +1146,6 @@ static void esp32p4_init_timers(ESP32P4MachineState *s)
                                             ESP32P4_CLKRST_MWDT_LINE(i, n)));
         }
     }
-    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->timg[0]),
-                                        ESP32P4_TIMG_SPI_BOOT, 0), spi_boot);
 
     object_initialize_child(OBJECT(s), "lp-wdt", &s->lp_wdt,
                             TYPE_ESP32P4_LP_WDT);
@@ -1139,8 +1169,6 @@ static void esp32p4_init_timers(ESP32P4MachineState *s)
                                     qdev_get_gpio_in_named(clkrst,
                                         ESP32P4_CLKRST_RWDT_CORE_RESET, n));
     }
-    qemu_set_irq(qdev_get_gpio_in_named(dev, ESP32P4_LP_WDT_SPI_BOOT, 0),
-                 spi_boot);
 
     object_initialize_child(OBJECT(s), "lp-timer", &s->lp_timer,
                             TYPE_ESP32P4_LP_TIMER);
@@ -1344,6 +1372,22 @@ static void esp32p4_init_ext_memory(ESP32P4MachineState *s)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32p4.boot]
+ * LP_SYSTEM_FORCE_DOWNLOAD_BOOT overrides the strapping unless
+ * EFUSE_DIS_FORCE_DOWNLOAD (block 0, RD_REPEAT_DATA0 bit 12) disables it
+ * (TRM 12.2.2).
+ */
+static void esp32p4_force_download(void *opaque, int n, int level)
+{
+    ESP32P4MachineState *s = opaque;
+    bool disabled = esp32p4_efuse_word(&s->efuse, 0, 1) & BIT(12);
+
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->gpio),
+                                        ESP32P4_GPIO_FORCE_DOWNLOAD, 0),
+                 level && !disabled);
+}
+
+/*
  * The GPIO matrices and IO MUXes, HP and LP, their registers behind
  * IOMUX_APB_CLK and the LP IO MUX's clock, their resets taken directly
  * (the strapping latch survives them); their interrupts, sources 74 to 78
@@ -1352,6 +1396,10 @@ static void esp32p4_init_ext_memory(ESP32P4MachineState *s)
  * enable inverted: ESP-IDF's dedic_gpio_cpu_ll.h for the P4 enables an
  * output by clearing its bit ("the OEN register is active low"), where
  * the TRM's register description has 1 enable it.
+ *
+ * The boot mode: GPIO_STRAP, which LP_SYSTEM_FORCE_DOWNLOAD_BOOT
+ * overrides, gives it to MWDT0's and the RTC watchdog's flash boot
+ * protection.
  */
 /* [spec:nuos:req:emu.esp32p4.gpio] */
 /* [spec:nuos:req:emu.esp32p4.clocks] */
@@ -1403,6 +1451,24 @@ static void esp32p4_init_gpio(ESP32P4MachineState *s)
                        esp32p4_intr_source(s, ESP32P4_INTR_GPIO_PAD_COMP));
     sysbus_connect_irq(SYS_BUS_DEVICE(gpio), ESP32P4_GPIO_IRQ_LP,
                        esp32p4_intr_source(s, ESP32P4_INTR_LP_GPIO));
+
+    qdev_connect_gpio_out_named(DEVICE(&s->lp_sys),
+                                ESP32P4_LP_SYS_FORCE_DOWNLOAD, 0,
+                                qemu_allocate_irq(esp32p4_force_download, s,
+                                                  0));
+    object_initialize_child(OBJECT(s), "spi-boot-split", &s->spi_boot_split,
+                            TYPE_SPLIT_IRQ);
+    qdev_prop_set_uint16(DEVICE(&s->spi_boot_split), "num-lines", 2);
+    qdev_realize(DEVICE(&s->spi_boot_split), NULL, &error_fatal);
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SPI_BOOT, 0,
+                                qdev_get_gpio_in(DEVICE(&s->spi_boot_split),
+                                                 0));
+    qdev_connect_gpio_out(DEVICE(&s->spi_boot_split), 0,
+                          qdev_get_gpio_in_named(DEVICE(&s->timg[0]),
+                                                 ESP32P4_TIMG_SPI_BOOT, 0));
+    qdev_connect_gpio_out(DEVICE(&s->spi_boot_split), 1,
+                          qdev_get_gpio_in_named(DEVICE(&s->lp_wdt),
+                                                 ESP32P4_LP_WDT_SPI_BOOT, 0));
 
     for (core = 0; core < ESP32P4_HP_CORES; core++) {
         DeviceState *cpu = DEVICE(&s->hp_cpu[core]);
@@ -2038,7 +2104,9 @@ static void esp32p4_lose_memory(MemoryRegion *mr)
 /*
  * [spec:nuos:req:emu.esp32p4.low-power]
  * The PMU powers the HP memories down: L2MEM and the TCM lose their
- * contents (TRM 15.4.1.2; LP SRAM, in the LP system, keeps its own).
+ * contents (TRM 15.4.1.2; LP SRAM, in the LP system, keeps its own). As
+ * the HP cores start again the ROM reloads the image from flash, or with
+ * -kernel the ELF takes its place (esp32p4_boot_core0()).
  */
 static void esp32p4_hp_mem_power(void *opaque, int n, int level)
 {
@@ -2047,26 +2115,17 @@ static void esp32p4_hp_mem_power(void *opaque, int n, int level)
     if (!level) {
         esp32p4_lose_memory(&s->l2mem);
         esp32p4_lose_memory(&s->tcm);
-        s->hp_mem_lost = true;
     }
 }
 
-static void esp32p4_reload_kernel(ESP32P4MachineState *s);
-
 /*
  * [spec:nuos:req:emu.esp32p4.low-power]
- * The PMU powers PD_TOP, the HP system, down or up. As it comes back after
- * the HP memories were lost, -kernel's ELF is loaded again in place of the
- * ROM's boot from flash, before the HP cores start.
+ * The PMU powers PD_TOP, the HP system, down or up.
  */
 static void esp32p4_hp_top_power(void *opaque, int n, int level)
 {
     ESP32P4MachineState *s = opaque;
 
-    if (level && s->hp_mem_lost) {
-        esp32p4_reload_kernel(s);
-        s->hp_mem_lost = false;
-    }
     qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->clkrst),
                                         ESP32P4_CLKRST_PMU_POWER,
                                         ESP32P4_CLKRST_PD_TOP), level);
@@ -3947,7 +4006,11 @@ static void esp32p4_init_crypto(ESP32P4MachineState *s)
                                     ESP32P4_ECC_MEM_PD, 0));
 }
 
-/* The memories -kernel can load into: those the cores address directly. */
+/*
+ * The memories -kernel can load into: those the cores address directly,
+ * but for the part of L2MEM the L2 cache takes from reset, which the ROM
+ * leaves as it is and no store reaches.
+ */
 static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
 {
     static const struct {
@@ -3955,8 +4018,10 @@ static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
         hwaddr size;
     } ram[] = {
         { ESP32P4_TCM_BASE, ESP32P4_TCM_SIZE },
-        { ESP32P4_L2MEM_BASE, ESP32P4_L2MEM_SIZE },
-        { ESP32P4_L2MEM_DIRECT_BASE, ESP32P4_L2MEM_SIZE },
+        { ESP32P4_L2MEM_BASE + ESP32P4_L2_CACHE_RESET_SIZE,
+          ESP32P4_L2MEM_SIZE - ESP32P4_L2_CACHE_RESET_SIZE },
+        { ESP32P4_L2MEM_DIRECT_BASE + ESP32P4_L2_CACHE_RESET_SIZE,
+          ESP32P4_L2MEM_SIZE - ESP32P4_L2_CACHE_RESET_SIZE },
         { ESP32P4_LP_SRAM_BASE, ESP32P4_LP_SRAM_SIZE },
     };
     int i;
@@ -3970,19 +4035,15 @@ static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
     return false;
 }
 
-/* An ELF segment -kernel loaded outside LP SRAM, for its reload. */
-typedef struct ESP32P4KernelSegment {
-    uint32_t paddr;
-    uint32_t memsz;
-    GBytes *data;
-} ESP32P4KernelSegment;
-
 /*
- * Refuse an ELF with a segment outside those memories: the loader would
- * drop one in the flash or PSRAM windows without a word, as nothing maps
- * them, and one in the ROM would replace the ROM. Files that are not
- * 32-bit little-endian ELFs are left for the loader to reject. Keep the
- * segments outside LP SRAM, which a deep sleep loses.
+ * [spec:nuos:req:emu.esp32p4.boot]
+ * Refuse an ELF with a segment the boot ROM would not load: outside those
+ * memories (the loader would drop one in the flash or PSRAM windows
+ * without a word, as nothing maps them, and one in the ROM would replace
+ * the ROM), or over the ROM's own stack frame and data, which its loader
+ * refuses. Files that are not 32-bit little-endian ELFs are left for the
+ * loader to reject. Keep the segments, which the ROM's place takes on
+ * every boot (esp32p4_present_rom_handoff()).
  */
 static void esp32p4_check_kernel(ESP32P4MachineState *s,
                                  const char *filename)
@@ -4024,16 +4085,21 @@ static void esp32p4_check_kernel(ESP32P4MachineState *s,
         }
         if (!esp32p4_kernel_segment_fits(paddr, memsz)) {
             error_report("esp32p4: '%s' has a segment at 0x%08" PRIx32
-                         ", 0x%" PRIx32 " bytes, outside L2MEM, the TCM and "
-                         "LP SRAM; -kernel loads only into those, as the "
-                         "flash and PSRAM windows reach the memories only "
-                         "through the MMU software sets up", filename,
-                         paddr, memsz);
+                         ", 0x%" PRIx32 " bytes, outside L2MEM past the L2 "
+                         "cache, the TCM and LP SRAM; -kernel loads only "
+                         "into those, as the boot ROM does, the flash and "
+                         "PSRAM windows reaching the memories only through "
+                         "the MMU software sets up", filename, paddr, memsz);
             exit(1);
         }
-        if ((paddr >= ESP32P4_LP_SRAM_BASE &&
-             paddr - ESP32P4_LP_SRAM_BASE < ESP32P4_LP_SRAM_SIZE) ||
-            (uint64_t)offset + filesz > len) {
+        if (esp32p4_rom_refuses_segment(paddr, memsz)) {
+            error_report("esp32p4: '%s' has a segment at 0x%08" PRIx32
+                         ", 0x%" PRIx32 " bytes, over the boot ROM's stack "
+                         "and data, where the ROM does not load one",
+                         filename, paddr, memsz);
+            exit(1);
+        }
+        if ((uint64_t)offset + filesz > len) {
             continue;
         }
         seg.paddr = paddr;
@@ -4041,46 +4107,6 @@ static void esp32p4_check_kernel(ESP32P4MachineState *s,
         seg.data = g_bytes_new(data + offset, filesz);
         g_array_append_val(s->kernel_segments, seg);
     }
-}
-
-/*
- * [spec:nuos:req:emu.esp32p4.low-power]
- * Load the -kernel ELF's segments outside LP SRAM again, as the ROM's boot
- * from flash would once the HP memories have lost their contents.
- */
-static void esp32p4_reload_kernel(ESP32P4MachineState *s)
-{
-    guint i;
-
-    for (i = 0; s->kernel_segments && i < s->kernel_segments->len; i++) {
-        ESP32P4KernelSegment *seg = &g_array_index(s->kernel_segments,
-                                                   ESP32P4KernelSegment, i);
-        gsize filesz;
-        const void *bytes = g_bytes_get_data(seg->data, &filesz);
-        g_autofree uint8_t *zeros = g_malloc0(seg->memsz - filesz);
-
-        address_space_write(&address_space_memory, seg->paddr,
-                            MEMTXATTRS_UNSPECIFIED, bytes, filesz);
-        address_space_write(&address_space_memory, seg->paddr + filesz,
-                            MEMTXATTRS_UNSPECIFIED, zeros,
-                            seg->memsz - filesz);
-    }
-}
-
-/*
- * [spec:nuos:req:emu.esp32p4.boot]
- * What the boot ROM does at boot that a program -kernel starts in its
- * place finds done, as a system reset completes. Of the super watchdog,
- * the ROM's main() only clears SWD_RESET_FLAG on core 0
- * (clear_super_wdt_reset_flag()); it neither feeds the watchdog nor sets
- * SWD_AUTO_FEED_EN, nor writes LP_SYSTEM's FIB control, so the watchdog
- * runs on, unfed, as it does here.
- */
-static void esp32p4_rom_boot_state(void *opaque)
-{
-    ESP32P4MachineState *s = opaque;
-
-    esp32p4_lp_wdt_swd_rst_flag_clr(&s->lp_wdt);
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */
@@ -4116,8 +4142,6 @@ static void esp32p4_load(ESP32P4MachineState *s)
         exit(1);
     }
     s->kernel_entry = entry;
-    s->hp_cpu[0].parent_obj.env.resetvec = entry;
-    qemu_register_reset(esp32p4_rom_boot_state, s);
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */
@@ -4178,6 +4202,20 @@ static void esp32p4_init(MachineState *machine)
                   "published, so it is absent\n");
 
     esp32p4_load(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.boot]
+ * A system reset: every block resets, then core 0 starts in the ROM, or
+ * with -kernel in the ROM's place.
+ */
+static void esp32p4_machine_reset(MachineState *machine, ResetType type)
+{
+    ESP32P4MachineState *s = ESP32P4_MACHINE(machine);
+
+    qemu_devices_reset(type);
+    s->core0_boot_pending = false;
+    esp32p4_boot_core0(s);
 }
 
 static void esp32p4_get_flash_size(Object *obj, Visitor *v, const char *name,
@@ -4279,6 +4317,7 @@ static void esp32p4_machine_class_init(ObjectClass *oc, const void *data)
 
     mc->desc = "Espressif ESP32-P4NRW32X (2x HP RV32IMAFC, LP RV32IMAC)";
     mc->init = esp32p4_init;
+    mc->reset = esp32p4_machine_reset;
     mc->default_ram_size = ESP32P4_L2MEM_SIZE;
     mc->min_cpus = ESP32P4_HP_CORES + 1;
     mc->max_cpus = ESP32P4_HP_CORES + 1;
