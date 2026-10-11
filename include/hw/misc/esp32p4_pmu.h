@@ -262,6 +262,8 @@ struct ESP32P4PMUState {
     uint32_t last_state;
     uint32_t target_state;
     QEMUTimer seq_timer;
+    /* When the step @seq_timer ends falls due. */
+    int64_t seq_due_ns;
     /* The step's cycles, and whether it waits for its clock to run. */
     uint64_t seq_fast;
     uint64_t seq_slow;
@@ -286,6 +288,7 @@ struct ESP32P4PMUState {
     bool lp_cpu_masked;
     bool lp_sleep_waiting;
     QEMUTimer lp_sleep_timer;
+    int64_t lp_sleep_due_ns;
 
     ESP32P4PMULdo ldo[ESP32P4_PMU_EXT_LDOS];
 

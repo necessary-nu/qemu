@@ -106,7 +106,11 @@
  * as the crystal, the PLLs and the HP domains power up. The chip stays
  * asleep at least HP_MIN_SLP_VAL (LP_MIN_SLP_VAL in LP_SLEEP) cycles of
  * LP_DYN_SLOW_CLK. The TRM gives the waits but not their sequence; this
- * sums them. A wait whose clock is stopped waits for it to run.
+ * sums them. A wait whose clock is stopped waits for it to run. Each step
+ * ends at the time it falls due, however late the QEMU timer that runs
+ * it, and the next is timed from there; a switch PMU_TASK_SLEEP_REQ
+ * starts is timed from its event's time, and PMU_EVT_SLEEP_WAKEUP carries
+ * the time the chip woke (see esp32_line.h).
  *
  * The LP CPU (TRM 15.4.2.2, 5.10). Held in reset from power-on, it
  * starts when a wakeup source PMU_LP_CPU_WAKEUP_EN enables is active,
@@ -162,6 +166,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_pmu.h"
 #include "migration/vmstate.h"
 
@@ -913,10 +918,24 @@ static void pmu_raise_lp(ESP32P4PMUState *s, uint32_t bits)
     s->regs[R(A_LP_INT_RAW)] |= bits;
 }
 
+/* Pulse ETM event line @n, the event carrying the change's time. */
+static void pmu_etm_pulse(ESP32P4PMUState *s, int n)
+{
+    esp32_line_set_at(s->etm_event[n], 1, esp32_line_time());
+    esp32_line_set_at(s->etm_event[n], 0, esp32_line_time());
+}
+
+/* Arm the sequencer's timer for @when. */
+static void pmu_seq_at(ESP32P4PMUState *s, int64_t when)
+{
+    s->seq_due_ns = when;
+    timer_mod(&s->seq_timer, when);
+}
+
 /*
  * Time a step of a switch: @fast cycles of LP_DYN_FAST_CLK and @slow of
- * LP_DYN_SLOW_CLK from now, or, while a clock they need is stopped, when
- * it runs.
+ * LP_DYN_SLOW_CLK from the change that starts it (esp32_line_time()), or,
+ * while a clock they need is stopped, when it runs.
  */
 static void pmu_seq_arm(ESP32P4PMUState *s, uint64_t fast, uint64_t slow)
 {
@@ -937,8 +956,7 @@ static void pmu_seq_arm(ESP32P4PMUState *s, uint64_t fast, uint64_t slow)
     if (slow) {
         ns += clock_ticks_to_ns(s->slow, slow);
     }
-    timer_mod(&s->seq_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              MAX(ns, 1));
+    pmu_seq_at(s, esp32_line_time() + MAX(ns, 1));
 }
 
 /* The fast cycles a wake to HP_ACTIVE waits besides ANA_WAIT_TARGET. */
@@ -1024,7 +1042,7 @@ static void pmu_lp_cpu_wake(ESP32P4PMUState *s, uint32_t sources)
     s->lp_cpu_stalled = false;
     s->lp_cpu_masked = false;
     pmu_raise_lp(s, LP_INT_LP_CPU_WAKEUP);
-    qemu_irq_pulse(s->etm_event[ESP32P4_PMU_ETM_EVT_LP_CPU_START]);
+    pmu_etm_pulse(s, ESP32P4_PMU_ETM_EVT_LP_CPU_START);
 }
 
 /* Switch from HP_SLEEP to LP_SLEEP, the LP CPU being asleep. */
@@ -1055,7 +1073,7 @@ static void pmu_check(ESP32P4PMUState *s)
     uint32_t wake = src & s->regs[R(A_SLP_WAKEUP_CNTL2)];
     uint32_t lp_wake = src & s->regs[R(A_LP_CPU_PWR2)];
     uint32_t cntl3 = s->regs[R(A_SLP_WAKEUP_CNTL3)];
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
     int64_t earliest;
 
     if (!s->lp_cpu_on && lp_wake && s->state != ESP32P4_PMU_ST_LP_SLEEP &&
@@ -1075,7 +1093,7 @@ static void pmu_check(ESP32P4PMUState *s)
         } else if (!s->lp_cpu_on) {
             pmu_start_lp_sleep(s);
         } else if (wake) {
-            timer_mod(&s->seq_timer, earliest);
+            pmu_seq_at(s, earliest);
         }
         break;
     case ESP32P4_PMU_ST_LP_SLEEP:
@@ -1087,7 +1105,7 @@ static void pmu_check(ESP32P4PMUState *s)
                                                   LP_MIN_SLP_VAL(cntl3)));
             }
             if (now < earliest) {
-                timer_mod(&s->seq_timer, earliest);
+                pmu_seq_at(s, earliest);
                 return;
             }
             if (wake) {
@@ -1162,9 +1180,10 @@ static void pmu_sleep_request(ESP32P4PMUState *s)
 
 /*
  * [spec:nuos:req:emu.esp32p4.low-power]
- * A step of a switch ends, or, in a sleep state, the minimum sleep.
+ * A step of a switch ends, or, in a sleep state, the minimum sleep, at
+ * the time it falls due, esp32_line_time().
  */
-static void pmu_seq_cb(void *opaque)
+static void pmu_seq_step(void *opaque)
 {
     ESP32P4PMUState *s = opaque;
     uint32_t cause;
@@ -1181,7 +1200,7 @@ static void pmu_seq_cb(void *opaque)
             s->cur.hp_pad_hold_auto = true;
         }
         s->state = ESP32P4_PMU_ST_HP_SLEEP;
-        s->sleep_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->sleep_start_ns = esp32_line_time();
         pmu_raise_lp(s, LP_INT_ACTIVE_SWITCH_SLEEP_END);
         pmu_check(s);
         break;
@@ -1220,7 +1239,7 @@ static void pmu_seq_cb(void *opaque)
         s->state = ESP32P4_PMU_ST_HP_ACTIVE;
         pmu_raise_lp(s, LP_INT_SLEEP_SWITCH_ACTIVE_END);
         pmu_raise_hp(s, HP_INT_SOC_WAKEUP);
-        qemu_irq_pulse(s->etm_event[ESP32P4_PMU_ETM_EVT_SLEEP_WAKEUP]);
+        pmu_etm_pulse(s, ESP32P4_PMU_ETM_EVT_SLEEP_WAKEUP);
         pmu_check(s);
         break;
     default:
@@ -1230,9 +1249,18 @@ static void pmu_seq_cb(void *opaque)
     pmu_update_outputs(s);
 }
 
+/* The step falls due: end it at its time, which a late timer has passed. */
+static void pmu_seq_cb(void *opaque)
+{
+    ESP32P4PMUState *s = opaque;
+
+    esp32_line_run_at(s->seq_due_ns, pmu_seq_step, s);
+}
+
 /*
  * Time the LP CPU's sleep process: PMU_LP_CPU_SLP_STALL_WAIT cycles of its
- * clock, LP_DYN_FAST_CLK, or, while that is stopped, from when it runs.
+ * clock, LP_DYN_FAST_CLK, from the change that starts it
+ * (esp32_line_time()), or, while that clock is stopped, from when it runs.
  */
 static void pmu_lp_sleep_arm(ESP32P4PMUState *s)
 {
@@ -1243,8 +1271,9 @@ static void pmu_lp_sleep_arm(ESP32P4PMUState *s)
     if (s->lp_sleep_waiting) {
         return;
     }
-    timer_mod(&s->lp_sleep_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              MAX(clock_ticks_to_ns(s->fast, cycles), 1));
+    s->lp_sleep_due_ns = esp32_line_time() +
+                         MAX(clock_ticks_to_ns(s->fast, cycles), 1);
+    timer_mod(&s->lp_sleep_timer, s->lp_sleep_due_ns);
 }
 
 /*
@@ -1284,7 +1313,7 @@ static void pmu_lp_cpu_sleep_request(ESP32P4PMUState *s)
  * chip goes on to LP_SLEEP. A wakeup source already active wakes it at
  * once, after it has stopped, so that it starts again from its reset.
  */
-static void pmu_lp_sleep_cb(void *opaque)
+static void pmu_lp_sleep_step(void *opaque)
 {
     ESP32P4PMUState *s = opaque;
 
@@ -1295,10 +1324,18 @@ static void pmu_lp_sleep_cb(void *opaque)
         esp32p4_clkrst_record_reset(s->clkrst, ESP32P4_CLKRST_CORE_LP,
                                     ESP32P4_RESET_CAUSE_PMU_LP_CPU);
     }
-    qemu_irq_pulse(s->etm_event[ESP32P4_PMU_ETM_EVT_LP_CPU_HALT]);
+    pmu_etm_pulse(s, ESP32P4_PMU_ETM_EVT_LP_CPU_HALT);
     pmu_update_outputs(s);
     pmu_check(s);
     pmu_update_outputs(s);
+}
+
+/* The sleep process's wait ends at its due time. */
+static void pmu_lp_sleep_cb(void *opaque)
+{
+    ESP32P4PMUState *s = opaque;
+
+    esp32_line_run_at(s->lp_sleep_due_ns, pmu_lp_sleep_step, s);
 }
 
 /* [spec:nuos:req:emu.esp32p4.low-power] */
@@ -1767,6 +1804,10 @@ static void esp32p4_pmu_set_ext_pad(void *opaque, int n, int level)
     pmu_update_outputs(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
+ * PMU_TASK_SLEEP_REQ, at its event's time, which its pulse carries.
+ */
 static void esp32p4_pmu_etm_task(void *opaque, int n, int level)
 {
     if (level) {
@@ -2016,8 +2057,8 @@ static const VMStateDescription vmstate_esp32p4_pmu_levels = {
 
 static const VMStateDescription vmstate_esp32p4_pmu = {
     .name = TYPE_ESP32P4_PMU,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(fast, ESP32P4PMUState),
         VMSTATE_CLOCK(slow, ESP32P4PMUState),
@@ -2026,6 +2067,7 @@ static const VMStateDescription vmstate_esp32p4_pmu = {
         VMSTATE_UINT32(last_state, ESP32P4PMUState),
         VMSTATE_UINT32(target_state, ESP32P4PMUState),
         VMSTATE_TIMER(seq_timer, ESP32P4PMUState),
+        VMSTATE_INT64(seq_due_ns, ESP32P4PMUState),
         VMSTATE_BOOL(seq_waiting, ESP32P4PMUState),
         VMSTATE_UINT64(seq_fast, ESP32P4PMUState),
         VMSTATE_UINT64(seq_slow, ESP32P4PMUState),
@@ -2041,6 +2083,7 @@ static const VMStateDescription vmstate_esp32p4_pmu = {
         VMSTATE_BOOL(lp_cpu_masked, ESP32P4PMUState),
         VMSTATE_BOOL(lp_sleep_waiting, ESP32P4PMUState),
         VMSTATE_TIMER(lp_sleep_timer, ESP32P4PMUState),
+        VMSTATE_INT64(lp_sleep_due_ns, ESP32P4PMUState),
         VMSTATE_STRUCT_ARRAY(ldo, ESP32P4PMUState, ESP32P4_PMU_EXT_LDOS, 1,
                              vmstate_esp32p4_pmu_ldo, ESP32P4PMULdo),
         VMSTATE_BOOL_ARRAY(power_level, ESP32P4PMUState, ESP32P4_PMU_NUM_PD),

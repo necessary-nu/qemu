@@ -222,18 +222,32 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
 ))
 
 system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
+  'esp32p4_aes.c',
   'esp32p4_ana.c',
   'esp32p4_axi_perf_mon.c',
   'esp32p4_cache.c',
   'esp32p4_clkrst.c',
+  'esp32p4_crypto.c',
+  'esp32p4_ds.c',
+  'esp32p4_ecc.c',
+  'esp32p4_ecdsa.c',
   'esp32p4_etm.c',
+  'esp32p4_hmac.c',
   'esp32p4_hp_sys.c',
+  'esp32p4_huk.c',
   'esp32p4_i2c_ana_mst.c',
   'esp32p4_icm.c',
+  'esp32p4_keymng.c',
   'esp32p4_lp_ana.c',
   'esp32p4_lp_mailbox.c',
+  'esp32p4_parlio.c',
+  'esp32p4_pcnt.c',
   'esp32p4_pms.c',
   'esp32p4_pmu.c',
+  'esp32p4_rmt.c',
+  'esp32p4_rsa.c',
+  'esp32p4_sha.c',
+  'esp32p4_trng.c',
 ))
 # The blocks that reach into the cores.
 specific_ss.add(when: 'CONFIG_ESP32P4', if_true: files(

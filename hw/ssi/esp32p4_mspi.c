@@ -83,7 +83,11 @@
  * External memory encryption (TRM chapter 34): XTS-AES with 128-byte
  * data units, the tweak (type << 30) | (address & 0x3FFFFF80), type 0 for
  * flash and 1 for PSRAM, and each unit byte-reversed before and after the
- * cipher, as espsecure computes it. The key is the eFuses' (TRM table
+ * cipher, as espsecure computes it. The key is the Key Manager's
+ * (esp32p4_keymng.c, the "keymng" link) unless KEYMNG_USE_EFUSE_KEY
+ * selects the eFuses' for the flash or the PSRAM, as the boot ROM does
+ * for an encrypted flash; the Key Manager's is 256 or 512 bits as
+ * KEYMNG_FLASH_KEY_LEN or _PSRAM_KEY_LEN says. The eFuses' key (TRM table
  * 34.4-1): blocks of purpose XTS_AES_256_KEY_1 and _2 give a 512-bit key,
  * a missing one counting as zeros; else XTS_AES_128_KEY's block gives a
  * 256-bit key; else it is zero. Each block holds its half byte-reversed,
@@ -148,8 +152,7 @@
  * nothing as every setting reads correctly; the flash's busy time, which
  * QEMU's flash model does not have, so that suspend and resume find no
  * operation in progress and auto-suspend never acts; SPI0's own user
- * command (USR, which the headers mark reserved); and the key manager,
- * which can deploy the XTS keys: the eFuses' are used.
+ * command (USR, which the headers mark reserved).
  */
 
 #include "qemu/osdep.h"
@@ -860,7 +863,20 @@ static void xts_key(ESP32P4MSPIState *s, bool psram, ESP32P4XtsKey *k)
 {
     int a = -1, b = -1, c = -1;
     uint8_t key[64];
+    unsigned bits;
 
+    if (s->keymng && esp32p4_keymng_xts_key(s->keymng, psram, key, &bits)) {
+        if (bits == 512) {
+            AES_set_encrypt_key(key, 256, &k->data_enc);
+            AES_set_decrypt_key(key, 256, &k->data_dec);
+            AES_set_encrypt_key(key + 32, 256, &k->tweak_enc);
+        } else {
+            AES_set_encrypt_key(key, 128, &k->data_enc);
+            AES_set_decrypt_key(key, 128, &k->data_dec);
+            AES_set_encrypt_key(key + 16, 128, &k->tweak_enc);
+        }
+        return;
+    }
     if (psram) {
         a = esp32p4_efuse_find_purpose(s->efuse,
                                        PURPOSE_XTS_AES_256_PSRAM_KEY_1);
@@ -2455,6 +2471,8 @@ static const Property esp32p4_mspi_properties[] = {
     DEFINE_PROP_BOOL("psram", ESP32P4MSPIState, psram, false),
     DEFINE_PROP_LINK("psram-mr", ESP32P4MSPIState, psram_mr,
                      TYPE_MEMORY_REGION, MemoryRegion *),
+    DEFINE_PROP_LINK("keymng", ESP32P4MSPIState, keymng, TYPE_ESP32P4_KEYMNG,
+                     ESP32P4KeyMngState *),
     DEFINE_PROP_LINK("efuse", ESP32P4MSPIState, efuse, TYPE_ESP32P4_EFUSE,
                      ESP32P4EfuseState *),
 };

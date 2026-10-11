@@ -12,6 +12,7 @@
 #include "qemu/units.h"
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_keymng.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/ssi/ssi.h"
 #include "qemu/timer.h"
@@ -75,6 +76,8 @@ struct ESP32P4MSPIState {
     bool psram;
     MemoryRegion *psram_mr;
     ESP32P4EfuseState *efuse;
+    /* The Key Manager, whose encryption key it takes when selected. */
+    ESP32P4KeyMngState *keymng;
 
     SSIBus *bus;
     qemu_irq cs[2];

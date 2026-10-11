@@ -42,5 +42,8 @@ system_ss.add(when: 'CONFIG_GOLDFISH_TTY', if_true: files('goldfish_tty.c'))
 
 specific_ss.add(when: 'CONFIG_TERMINAL3270', if_true: files('terminal3270.c'))
 specific_ss.add(when: 'CONFIG_PSERIES', if_true: files('spapr_vty.c'))
-system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files('esp32_uart.c',
-                                                           'esp32_uart_terminal.c'))
+system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files('esp32_uart.c'))
+system_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_uart.c',
+                                                   'esp32p4_usb_serial_jtag.c'))
+system_ss.add(when: 'CONFIG_ESP32_UART_LINE', if_true: files('esp32_uart_line.c',
+                                                             'esp32_uart_terminal.c'))

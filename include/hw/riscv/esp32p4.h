@@ -10,12 +10,18 @@
 #define HW_RISCV_ESP32P4_H
 
 #include "qemu/units.h"
+#include "hw/audio/esp32p4_i2s.h"
 #include "hw/core/boards.h"
+#include "hw/char/esp32_uart_terminal.h"
+#include "hw/char/esp32p4_uart.h"
+#include "hw/char/esp32p4_usb_serial_jtag.h"
 #include "hw/cpu/cluster.h"
 #include "hw/core/or-irq.h"
 #include "hw/core/split-irq.h"
+#include "hw/dma/esp32p4_bitscrambler.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/dma/esp32p4_gdma.h"
+#include "hw/dma/esp32p4_uhci.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "hw/i2c/esp32p4_i2c.h"
 #include "hw/i3c/esp32p4_i3c.h"
@@ -24,21 +30,34 @@
 #include "hw/intc/esp32p4_intmatrix.h"
 #include "hw/intc/esp32p4_lp_intr.h"
 #include "hw/ssi/ssi.h"
+#include "hw/misc/esp32p4_aes.h"
 #include "hw/misc/esp32p4_ana.h"
 #include "hw/misc/esp32p4_assist_debug.h"
 #include "hw/misc/esp32p4_axi_perf_mon.h"
 #include "hw/misc/esp32p4_cache.h"
 #include "hw/misc/esp32p4_clkrst.h"
+#include "hw/misc/esp32p4_ds.h"
+#include "hw/misc/esp32p4_ecc.h"
+#include "hw/misc/esp32p4_ecdsa.h"
 #include "hw/misc/esp32p4_etm.h"
+#include "hw/misc/esp32p4_hmac.h"
 #include "hw/misc/esp32p4_hp_sys.h"
+#include "hw/misc/esp32p4_huk.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_icm.h"
+#include "hw/misc/esp32p4_keymng.h"
 #include "hw/misc/esp32p4_lp_ana.h"
 #include "hw/misc/esp32p4_lp_mailbox.h"
 #include "hw/misc/esp32p4_lp_sys.h"
+#include "hw/misc/esp32p4_parlio.h"
+#include "hw/misc/esp32p4_pcnt.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "hw/misc/esp32p4_pmu.h"
+#include "hw/misc/esp32p4_rmt.h"
+#include "hw/misc/esp32p4_rsa.h"
+#include "hw/misc/esp32p4_sha.h"
 #include "hw/misc/esp32p4_trace.h"
+#include "hw/misc/esp32p4_trng.h"
 #include "hw/net/esp32p4_emac.h"
 #include "hw/net/esp32p4_twai.h"
 #include "hw/net/ip101_phy.h"
@@ -49,6 +68,7 @@
 #include "hw/timer/esp32p4_systimer.h"
 #include "hw/timer/esp32p4_timg.h"
 #include "hw/ssi/esp32p4_mspi.h"
+#include "hw/ssi/esp32p4_spi.h"
 #include "hw/usb/dwc2-otg.h"
 #include "hw/usb/esp32p4_usb.h"
 #include "system/memory.h"
@@ -58,6 +78,9 @@
 OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 
 #define ESP32P4_HP_CORES 2
+
+/* The board's serial ports: UART0 to UART4, then the LP UART. */
+#define ESP32P4_SERIAL_PORTS (ESP32P4_UART_COUNT + 1)
 
 /* The internal memories (TRM table 9.3-1). */
 #define ESP32P4_TCM_BASE            0x30100000
@@ -111,6 +134,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 
 /* The board pad the IP101GRI's RESET_N is on */
 #define ESP32P4_BOARD_PHY_RESET_PAD 51
+
+/* The crypto block resets that hold more than their own block. */
+#define ESP32P4_CRYPTO_RST_SPLITS   4
 
 struct ESP32P4MachineState {
     MachineState parent_obj;
@@ -169,9 +195,15 @@ struct ESP32P4MachineState {
     /* GDMA-AHB, GDMA-AXI. */
     ESP32P4GdmaState gdma[2];
     ESP32P4DwGdmaState vdma;
+    /* GP-SPI2, GP-SPI3. */
+    ESP32P4SpiState spi[2];
+    ESP32P4BitScramblerState bitscrambler;
+    ESP32P4ParlioState parlio;
     ESP32P4TwaiState twai;
     /* The QEMU CAN buses on TWAI0 to TWAI2's pads, or NULL. */
     CanBusState *canbus[ESP32P4_TWAI_NUM];
+    ESP32P4RmtState rmt;
+    ESP32P4PcntState pcnt;
 
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];
@@ -215,11 +247,36 @@ struct ESP32P4MachineState {
     IP101PhyState phy;
     SplitIRQ pps_split;
 
+    ESP32P4UartState uart[ESP32P4_UART_COUNT];
+    ESP32P4UartState lp_uart;
+    SplitIRQ uart_wakeup_en_split;
+    SplitIRQ lp_uart_wakeup_split;
+    Esp32UartTerminalState terminal[ESP32P4_SERIAL_PORTS];
+    ESP32P4UhciState uhci;
+    ESP32P4UsjState usj;
+
     ESP32P4AssistDebugState assist_debug;
     ESP32P4AxiPerfMonState axi_perf_mon;
     ESP32P4TraceState trace[ESP32P4_HP_CORES];
     /* GPIO16 to GPIO54's holds: LP_SYSTEM's OR HP_SYSTEM's. */
     OrIRQState pad_hold_or[ESP32P4_GPIO_PADS - ESP32P4_HP_SYS_HOLD_FIRST];
+
+    /* I2S0 to I2S2, then the LP I2S */
+    ESP32P4I2sState i2s[ESP32P4_I2S_COUNT];
+
+    /* The cryptography blocks. */
+    ESP32P4AesState aes;
+    ESP32P4ShaDevState sha;
+    ESP32P4RsaState rsa;
+    ESP32P4EccState ecc;
+    ESP32P4HmacState hmac;
+    ESP32P4DsState ds;
+    ESP32P4EcdsaState ecdsa;
+    ESP32P4KeyMngState keymng;
+    ESP32P4HukState huk;
+    ESP32P4TrngState trng;
+    /* RST_EN_DS, _ECDSA, _KM and _HMAC, to the blocks each holds. */
+    SplitIRQ crypto_rst_split[ESP32P4_CRYPTO_RST_SPLITS];
 };
 
 /*
