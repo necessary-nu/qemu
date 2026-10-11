@@ -205,20 +205,20 @@ struct Esp32McpwmState {
     uint8_t irq_level;
     int64_t last_out_ns;
     uint32_t min_edge_ns;
-    /* When the timer is due, and whether its callback is running */
+    /* When the timer is due, and whether it is firing */
     int64_t due_ns;
     bool in_timer_cb;
+    /*
+     * The block has changed other than by running on since the timer was
+     * last set, which may now be due at another moment.
+     */
+    bool schedule_stale;
     /* The latest moment the block has acted at */
     int64_t seen_ns;
     bool updating;
     bool update_pending;
-    /*
-     * A register access is bringing the other line sources up to date;
-     * an access is under way, acting at access_ns.
-     */
+    /* The block is bringing the other line sources up to date. */
     bool syncing_others;
-    bool accessing;
-    int64_t access_ns;
 };
 
 #endif
