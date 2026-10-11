@@ -592,6 +592,9 @@ static void lp_ana_write(void *opaque, hwaddr addr, uint64_t value,
                       HWADDR_PRIx "\n", TYPE_ESP32P4_LP_ANA, addr);
         return;
     }
+    if (reg >= A_TOUCH_FIRST && reg <= A_TOUCH_LAST && s->touch) {
+        esp32p4_touch_sync(s->touch);
+    }
     r = &s->regs[R(reg)];
     old = *r;
     *r = (*r & ~(info->rw & lanes)) | (v & info->rw);

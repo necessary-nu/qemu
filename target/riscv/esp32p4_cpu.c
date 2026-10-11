@@ -59,7 +59,11 @@
  * clock restarts. Neither takes an interrupt meanwhile, not even to leave
  * WFI. Both act at the end of the code block the core is executing, so
  * when a core stops itself, the instructions after the store in the same
- * straight-line run complete first.
+ * straight-line run complete first. A core whose register write stops
+ * another core goes on, from the end of its own code block, only once the
+ * other has stopped: on the host's clock each core runs on a thread of
+ * its own, which the host may not run for a while, and the stopped core
+ * must not be seen to go on running.
  *
  * An HP core tells the interrupt matrix whether it is in machine mode,
  * through its ESP32P4_CPU_M_MODE output, as each trap and trap return
@@ -182,10 +186,20 @@ bool esp32p4_cpu_mid_block(void)
     return icount_enabled() && current_cpu && !current_cpu->neg.can_do_io;
 }
 
+/* Waiters for stops of cores on other threads: see esp32p4_cpu_await(). */
+static QemuCond esp32p4_cpu_stop_cond;
+
+static void esp32p4_cpu_stop_done(ESP32P4CPU *cpu)
+{
+    qatomic_dec(&cpu->stops_pending);
+    qemu_cond_broadcast(&esp32p4_cpu_stop_cond);
+}
+
 /* Run on the core when its reset input rises. */
 static void esp32p4_cpu_reset_asserted(CPUState *cs, run_on_cpu_data data)
 {
     cpu_reset(cs);
+    esp32p4_cpu_stop_done(ESP32P4_CPU(cs));
 }
 
 /*
@@ -219,12 +233,12 @@ static void esp32p4_cpu_clock_stop(CPUState *cs, run_on_cpu_data data)
 {
     ESP32P4CPU *cpu = ESP32P4_CPU(cs);
 
-    if (!esp32p4_cpu_clock_off(cpu) || qatomic_read(&cpu->reset) ||
-        cs->halted) {
-        return;
+    if (esp32p4_cpu_clock_off(cpu) && !qatomic_read(&cpu->reset) &&
+        !cs->halted) {
+        cs->halted = 1;
+        cpu->clock_halted = true;
     }
-    cs->halted = 1;
-    cpu->clock_halted = true;
+    esp32p4_cpu_stop_done(cpu);
 }
 
 /* Run on the core when its clock restarts. */
@@ -238,6 +252,44 @@ static void esp32p4_cpu_clock_start(CPUState *cs, run_on_cpu_data data)
     }
     cpu->clock_halted = false;
     cs->halted = 0;
+}
+
+/*
+ * Run on a core that stopped another, @data, on a thread of its own, at
+ * the end of the code block that did so: wait until the other has acted
+ * on its stops, taking any of its own the other has queued meanwhile, so
+ * that two cores stopping each other both stop.
+ */
+static void esp32p4_cpu_await(CPUState *cs, run_on_cpu_data data)
+{
+    ESP32P4CPU *other = data.host_ptr;
+
+    while (qatomic_read(&other->stops_pending)) {
+        process_queued_cpu_work(cs);
+        if (qatomic_read(&other->stops_pending)) {
+            qemu_cond_timedwait_bql(&esp32p4_cpu_stop_cond, 10);
+        }
+    }
+}
+
+/*
+ * Stop @cpu with @stop on its own thread. A core on another thread that
+ * stopped it waits for that at the end of its code block (see the top of
+ * the file); one sharing the thread (under icount, every core) runs only
+ * between the other's code blocks anyway, as does the main loop, which
+ * runs no guest code that could see the core go on.
+ */
+/* [spec:nuos:req:emu.esp32p4.machine] */
+static void esp32p4_cpu_stop(ESP32P4CPU *cpu, run_on_cpu_func stop)
+{
+    CPUState *cs = CPU(cpu);
+
+    qatomic_inc(&cpu->stops_pending);
+    async_run_on_cpu(cs, stop, RUN_ON_CPU_NULL);
+    if (current_cpu && current_cpu != cs && !qemu_cpu_is_self(cs)) {
+        async_run_on_cpu(current_cpu, esp32p4_cpu_await,
+                         RUN_ON_CPU_HOST_PTR(cpu));
+    }
 }
 
 /*
@@ -258,9 +310,12 @@ static void esp32p4_cpu_set_reset(void *opaque, int n, int level)
     esp32p4_counters_update(cpu);
 #endif
     qatomic_set(&cpu->reset, reset);
-    async_run_on_cpu(CPU(cpu), reset ? esp32p4_cpu_reset_asserted
-                                     : esp32p4_cpu_reset_released,
-                     RUN_ON_CPU_NULL);
+    if (reset) {
+        esp32p4_cpu_stop(cpu, esp32p4_cpu_reset_asserted);
+    } else {
+        async_run_on_cpu(CPU(cpu), esp32p4_cpu_reset_released,
+                         RUN_ON_CPU_NULL);
+    }
 }
 
 /*
@@ -271,10 +326,10 @@ static void esp32p4_cpu_clock_changed(ESP32P4CPU *cpu, bool was_off)
 {
     bool off = esp32p4_cpu_clock_off(cpu);
 
-    if (off != was_off) {
-        async_run_on_cpu(CPU(cpu), off ? esp32p4_cpu_clock_stop
-                                       : esp32p4_cpu_clock_start,
-                         RUN_ON_CPU_NULL);
+    if (off && !was_off) {
+        esp32p4_cpu_stop(cpu, esp32p4_cpu_clock_stop);
+    } else if (!off && was_off) {
+        async_run_on_cpu(CPU(cpu), esp32p4_cpu_clock_start, RUN_ON_CPU_NULL);
     }
 }
 
@@ -1049,6 +1104,7 @@ static void esp32p4_cpu_class_init(ObjectClass *oc, const void *data)
                                        esp32p4_cpu_reset_hold,
                                        esp32p4_cpu_reset_exit,
                                        &ecc->parent_phases);
+    qemu_cond_init(&esp32p4_cpu_stop_cond);
 
     esp32p4_sysemu_ops = *cc->sysemu_ops;
     esp32p4_sysemu_ops.has_work = esp32p4_cpu_has_work;
