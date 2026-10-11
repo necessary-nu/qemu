@@ -145,6 +145,12 @@ static bool trans_wfi(DisasContext *ctx, arg_wfi *a)
     decode_save_opc(ctx, 0);
     gen_update_pc(ctx, ctx->cur_insn_len);
     gen_helper_wfi(tcg_env);
+    /*
+     * The helper does not return: it halts the hart or raises an
+     * exception. Ending the TB here keeps icount from charging the
+     * instructions after WFI, which only execute once the hart wakes.
+     */
+    ctx->base.is_jmp = DISAS_NORETURN;
     return true;
 #else
     return false;
