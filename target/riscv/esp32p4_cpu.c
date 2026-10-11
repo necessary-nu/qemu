@@ -20,6 +20,19 @@
  * mode only, without PMP or PMA. The HP core takes its interrupts from its
  * CLIC (tcg/esp32p4_clic.c).
  *
+ * The LP core (TRM chapter 5) takes the interrupts of its interrupt
+ * controller as the levels of mip's bits 3, 7, 11 and 16 to 30, which mie
+ * enables, vectored through mtvec; the lowest pending ID is taken first.
+ * Its CSRs, counters and two triggers are in tcg/esp32p4_lp.c. As its
+ * reset is released it starts where the machine says (ESP32P4LPBootFn),
+ * from LP_SYSTEM_LP_CORE_BOOT_ADDR, with mtvec at the boot address's
+ * vector table, and its reset returns its CSRs to their reset values. An
+ * exception records the PC in LP_SYSTEM_LP_CPU_EXC_PC (interrupts do not)
+ * and is signalled to the PMU, as its LP CPU exception wakeup source, and
+ * to the ETM, as ULP_EVT_ERR_INTR. A trigger takes it into debug mode,
+ * where it halts. Misaligned loads and stores are handled by the core; a
+ * misaligned atomic instruction, LR.W included, raises cause 6.
+ *
  * misa on an HP core reads 0x40901127: RV32 with A, B, C, F, I, M, U and
  * X. The TRM's register table gives B and X but clears F, while the TRM
  * itself and the silicon describe an RV32IMAFC core, and earlier silicon
@@ -59,7 +72,10 @@
 #include "exec/icount.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/core/sysemu-cpu-ops.h"
+#include "qemu/timer.h"
+#include "qapi/error.h"
 #include "migration/vmstate.h"
 #include "target/riscv/esp32p4_cpu.h"
 #include "internals.h"
@@ -80,9 +96,17 @@
                                  ESP32P4_MEXSTATUS_NMFT |      \
                                  ESP32P4_MEXSTATUS_PPBEXE)
 
+ObjectClass *esp32p4_lp_cpu_class;
+
+/* The clock enable is low or, on the LP core, LP_CORE_DISABLE high. */
+static bool esp32p4_cpu_clock_off(ESP32P4CPU *cpu)
+{
+    return qatomic_read(&cpu->clock_stopped) || qatomic_read(&cpu->disabled);
+}
+
 static bool esp32p4_cpu_held(ESP32P4CPU *cpu)
 {
-    return qatomic_read(&cpu->reset) || qatomic_read(&cpu->clock_stopped);
+    return qatomic_read(&cpu->reset) || esp32p4_cpu_clock_off(cpu);
 }
 
 /*
@@ -94,7 +118,7 @@ static bool esp32p4_cpu_has_work(CPUState *cs)
 {
     ESP32P4CPU *cpu = container_of(cs, ESP32P4CPU, parent_obj.parent_obj);
 
-    if (esp32p4_cpu_held(cpu)) {
+    if (esp32p4_cpu_held(cpu) || qatomic_read(&cpu->lp_debug_mode)) {
         return false;
     }
     if (qatomic_read(&cpu->wakeup)) {
@@ -159,7 +183,11 @@ static void esp32p4_cpu_reset_asserted(CPUState *cs, run_on_cpu_data data)
     cpu_reset(cs);
 }
 
-/* Run on the core when its reset input falls. */
+/*
+ * Run on the core when its reset input falls. The LP core takes its start
+ * address and vector table base as it leaves reset.
+ */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
 static void esp32p4_cpu_reset_released(CPUState *cs, run_on_cpu_data data)
 {
     ESP32P4CPU *cpu = ESP32P4_CPU(cs);
@@ -167,7 +195,14 @@ static void esp32p4_cpu_reset_released(CPUState *cs, run_on_cpu_data data)
     if (qatomic_read(&cpu->reset)) {
         return;
     }
-    if (qatomic_read(&cpu->clock_stopped)) {
+    if (cpu->lp_boot) {
+        uint32_t pc, mtvec;
+
+        cpu->lp_boot(cpu->lp_boot_opaque, &pc, &mtvec);
+        cpu->parent_obj.env.pc = pc;
+        cpu->parent_obj.env.mtvec = mtvec;
+    }
+    if (esp32p4_cpu_clock_off(cpu)) {
         cpu->clock_halted = true;
         return;
     }
@@ -179,7 +214,7 @@ static void esp32p4_cpu_clock_stop(CPUState *cs, run_on_cpu_data data)
 {
     ESP32P4CPU *cpu = ESP32P4_CPU(cs);
 
-    if (!qatomic_read(&cpu->clock_stopped) || qatomic_read(&cpu->reset) ||
+    if (!esp32p4_cpu_clock_off(cpu) || qatomic_read(&cpu->reset) ||
         cs->halted) {
         return;
     }
@@ -192,7 +227,7 @@ static void esp32p4_cpu_clock_start(CPUState *cs, run_on_cpu_data data)
 {
     ESP32P4CPU *cpu = ESP32P4_CPU(cs);
 
-    if (qatomic_read(&cpu->clock_stopped) || qatomic_read(&cpu->reset) ||
+    if (esp32p4_cpu_clock_off(cpu) || qatomic_read(&cpu->reset) ||
         !cpu->clock_halted) {
         return;
     }
@@ -214,10 +249,30 @@ static void esp32p4_cpu_set_reset(void *opaque, int n, int level)
     if (cpu->reset == reset) {
         return;
     }
+#ifdef CONFIG_TCG
+    if (cpu->lp_clk) {
+        esp32p4_lp_counters_update(cpu);
+    }
+#endif
     qatomic_set(&cpu->reset, reset);
     async_run_on_cpu(CPU(cpu), reset ? esp32p4_cpu_reset_asserted
                                      : esp32p4_cpu_reset_released,
                      RUN_ON_CPU_NULL);
+}
+
+/*
+ * The clock enable, or the LP core's disable, changed from @was_off: the
+ * core stops or carries on if that stopped or restarted its clock.
+ */
+static void esp32p4_cpu_clock_changed(ESP32P4CPU *cpu, bool was_off)
+{
+    bool off = esp32p4_cpu_clock_off(cpu);
+
+    if (off != was_off) {
+        async_run_on_cpu(CPU(cpu), off ? esp32p4_cpu_clock_stop
+                                       : esp32p4_cpu_clock_start,
+                         RUN_ON_CPU_NULL);
+    }
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */
@@ -225,14 +280,18 @@ static void esp32p4_cpu_set_clock(void *opaque, int n, int level)
 {
     ESP32P4CPU *cpu = opaque;
     bool stopped = !level;
+    bool was_off = esp32p4_cpu_clock_off(cpu);
 
     if (cpu->clock_stopped == stopped) {
         return;
     }
+#ifdef CONFIG_TCG
+    if (cpu->lp_clk) {
+        esp32p4_lp_counters_update(cpu);
+    }
+#endif
     qatomic_set(&cpu->clock_stopped, stopped);
-    async_run_on_cpu(CPU(cpu), stopped ? esp32p4_cpu_clock_stop
-                                       : esp32p4_cpu_clock_start,
-                     RUN_ON_CPU_NULL);
+    esp32p4_cpu_clock_changed(cpu, was_off);
 }
 
 /* [spec:nuos:req:emu.esp32p4.debug] */
@@ -556,14 +615,15 @@ static void esp32p4_hp_do_transaction_failed(CPUState *cs, hwaddr physaddr,
 
 /*
  * The only load that must be aligned is LR.W, whose misaligned address
- * the core reports as cause 6, a store or AMO misaligned address.
+ * either core reports as cause 6, a store or AMO misaligned address (on
+ * the LP core, the misaligned atomic instruction exception).
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
-static G_NORETURN void esp32p4_hp_do_unaligned_access(CPUState *cs,
-                                                      vaddr addr,
-                                                      MMUAccessType access_type,
-                                                      int mmu_idx,
-                                                      uintptr_t retaddr)
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static G_NORETURN void esp32p4_do_unaligned_access(CPUState *cs, vaddr addr,
+                                                   MMUAccessType access_type,
+                                                   int mmu_idx,
+                                                   uintptr_t retaddr)
 {
     if (access_type == MMU_DATA_LOAD) {
         access_type = MMU_DATA_STORE;
@@ -643,6 +703,27 @@ static void esp32p4_hp_reset_hold(ESP32P4CPU *cpu)
     cpu_reset_interrupt(CPU(cpu), ESP32P4_CPU_INTERRUPT_BUS_ERROR);
     esp32p4_clic_cpu_reset(cpu);
 }
+
+/*
+ * The LP core's CSRs from reset (TRM 5.3.2), which QEMU's RISC-V reset
+ * leaves as they were: mstatus, mie, mscratch, mepc and mtval clear; mtvec
+ * at the reset boot address's vector table; the counters and triggers.
+ * mip follows the interrupt lines, which reset does not change.
+ */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void esp32p4_lp_reset_hold(ESP32P4CPU *cpu)
+{
+    CPURISCVState *env = &cpu->parent_obj.env;
+
+    env->mstatus &= ~(MSTATUS_MIE | MSTATUS_MPIE);
+    env->mie = 0;
+    env->mscratch = 0;
+    env->mepc = 0;
+    env->mtval = 0;
+    env->mtvec = (env->resetvec & ~(target_ulong)0xff) | 1;
+    esp32p4_lp_counters_reset(cpu);
+    esp32p4_lp_triggers_reset(cpu);
+}
 #endif
 
 /*
@@ -658,10 +739,12 @@ static void esp32p4_cpu_reset_hold(Object *obj, ResetType type)
         ecc->parent_phases.hold(obj, type);
     }
     CPU(obj)->halted = esp32p4_cpu_held(cpu);
-    cpu->clock_halted = !cpu->reset && cpu->clock_stopped;
+    cpu->clock_halted = !cpu->reset && esp32p4_cpu_clock_off(cpu);
 #ifdef CONFIG_TCG
     if (esp32p4_env_is_hp(&cpu->parent_obj.env)) {
         esp32p4_hp_reset_hold(cpu);
+    } else if (cpu->lp_clk) {
+        esp32p4_lp_reset_hold(cpu);
     }
 #endif
 }
@@ -701,6 +784,19 @@ static bool esp32p4_cpu_get_in_reset(Object *obj, Error **errp)
 static bool esp32p4_cpu_get_clock_running(Object *obj, Error **errp)
 {
     return !ESP32P4_CPU(obj)->clock_stopped;
+}
+
+/*
+ * The core waits for an interrupt in WFI: halted, but neither held, nor
+ * stopped by its clock, nor in debug mode.
+ */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static bool esp32p4_cpu_get_in_wfi(Object *obj, Error **errp)
+{
+    ESP32P4CPU *cpu = ESP32P4_CPU(obj);
+
+    return CPU(cpu)->halted && !esp32p4_cpu_held(cpu) &&
+           !cpu->clock_halted && !cpu->lp_debug_mode;
 }
 
 #ifdef CONFIG_TCG
@@ -804,6 +900,43 @@ static const VMStateDescription vmstate_esp32p4_hp_clic = {
         VMSTATE_END_OF_LIST()
     },
 };
+
+static bool esp32p4_lp_state_needed(void *opaque)
+{
+    return object_get_class(OBJECT(opaque)) == esp32p4_lp_cpu_class;
+}
+
+static int esp32p4_lp_state_post_load(void *opaque, int version_id)
+{
+    esp32p4_lp_triggers_rebuild(ESP32P4_CPU(opaque));
+    return 0;
+}
+
+static const VMStateDescription vmstate_esp32p4_lp_state = {
+    .name = "esp32p4-cpu/lp",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = esp32p4_lp_state_needed,
+    .post_load = esp32p4_lp_state_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(disabled, ESP32P4CPU),
+        VMSTATE_UINT32(tselect, ESP32P4CPU),
+        VMSTATE_UINT32_ARRAY(tdata1, ESP32P4CPU, ESP32P4_TRIGGERS),
+        VMSTATE_UINT32_ARRAY(tdata2, ESP32P4CPU, ESP32P4_TRIGGERS),
+        VMSTATE_BOOL(lp_debug_mode, ESP32P4CPU),
+        VMSTATE_UINT32(lp_dpc, ESP32P4CPU),
+        VMSTATE_UINT32(lp_dcsr, ESP32P4CPU),
+        VMSTATE_TIMER_PTR(lp_exc_timer, ESP32P4CPU),
+        VMSTATE_CLOCK(lp_clk, ESP32P4CPU),
+        VMSTATE_UINT64(lp_cycles, ESP32P4CPU),
+        VMSTATE_INT64(lp_cycles_ns, ESP32P4CPU),
+        VMSTATE_UINT64_ARRAY(lp_ctr_base, ESP32P4CPU, 2),
+        VMSTATE_UINT64_ARRAY(lp_ctr_ref, ESP32P4CPU, 2),
+        VMSTATE_UINT64_ARRAY(lp_hpm, ESP32P4CPU, ESP32P4_LP_HPM_COUNTERS),
+        VMSTATE_UINT32(lp_mcountinhibit, ESP32P4CPU),
+        VMSTATE_END_OF_LIST()
+    },
+};
 #endif
 
 /* The inputs from the system registers and the debug assistant's state. */
@@ -844,6 +977,7 @@ static const VMStateDescription vmstate_esp32p4_cpu = {
         &vmstate_esp32p4_hp_state,
         &vmstate_esp32p4_pie,
         &vmstate_esp32p4_hp_clic,
+        &vmstate_esp32p4_lp_state,
 #endif
         NULL
     },
@@ -886,6 +1020,10 @@ static void esp32p4_cpu_class_init(ObjectClass *oc, const void *data)
                                    esp32p4_cpu_get_clock_running, NULL);
     object_class_property_set_description(oc, "clock-running",
         "The core's clock enable is high");
+    object_class_property_add_bool(oc, "in-wfi", esp32p4_cpu_get_in_wfi,
+                                   NULL);
+    object_class_property_set_description(oc, "in-wfi",
+        "The core waits for an interrupt in WFI");
 }
 
 #ifdef CONFIG_TCG
@@ -934,7 +1072,7 @@ static void esp32p4_hp_cpu_class_init(ObjectClass *oc, const void *data)
     esp32p4_hp_tcg_ops.cpu_exec_interrupt = esp32p4_hp_cpu_exec_interrupt;
     esp32p4_hp_tcg_ops.do_transaction_failed =
         esp32p4_hp_do_transaction_failed;
-    esp32p4_hp_tcg_ops.do_unaligned_access = esp32p4_hp_do_unaligned_access;
+    esp32p4_hp_tcg_ops.do_unaligned_access = esp32p4_do_unaligned_access;
     esp32p4_hp_tcg_ops.tlb_fill = esp32p4_hp_tlb_fill;
     esp32p4_hp_tcg_ops.debug_excp_handler = esp32p4_debug_excp_handler;
     esp32p4_hp_tcg_ops.debug_check_breakpoint =
@@ -942,7 +1080,7 @@ static void esp32p4_hp_cpu_class_init(ObjectClass *oc, const void *data)
     esp32p4_hp_tcg_ops.debug_check_watchpoint =
         esp32p4_debug_check_watchpoint;
     cc->tcg_ops = &esp32p4_hp_tcg_ops;
-    esp32p4_hp_csr_class_init();
+    esp32p4_csr_class_init();
 #endif
 }
 
@@ -976,24 +1114,152 @@ static void esp32p4_lp_do_transaction_failed(CPUState *cs, hwaddr physaddr,
                                           response, retaddr);
 }
 
-/* A trap on the LP core: LP_SYSTEM_LP_CPU_EXC_PC takes the PC. */
+static void esp32p4_lp_exception_pulse(ESP32P4CPU *cpu)
+{
+    qemu_irq_pulse(cpu->lp_exception);
+    qemu_irq_pulse(cpu->lp_etm_event);
+}
+
+static void esp32p4_lp_exc_timer(void *opaque)
+{
+    esp32p4_lp_exception_pulse(opaque);
+}
+
+/*
+ * An exception on the LP core: LP_SYSTEM_LP_CPU_EXC_PC takes its PC, and
+ * the PMU and the ETM learn of it, after the end of the code block if the
+ * core is in one. An interrupt is not an exception and changes neither.
+ */
 /* [spec:nuos:req:emu.esp32p4.debug] */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
 static void esp32p4_lp_do_interrupt(CPUState *cs)
 {
     ESP32P4CPU *cpu = esp32p4_cpu_of(cs);
+    int32_t excp = cs->exception_index;
 
-    cpu->exc_pc = cpu->parent_obj.env.pc;
+    if (!(excp & RISCV_EXCP_INT_FLAG) && excp != RISCV_EXCP_SEMIHOST) {
+        cpu->exc_pc = cpu->parent_obj.env.pc;
+        if (esp32p4_cpu_mid_block()) {
+            timer_mod(cpu->lp_exc_timer, 0);
+        } else {
+            esp32p4_lp_exception_pulse(cpu);
+        }
+    }
     esp32p4_tcg_ops.do_interrupt(cs);
+}
+
+/* The LP core's interrupt lines, mip's bits. */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void esp32p4_lp_cpu_set_irq(void *opaque, int n, int level)
+{
+    ESP32P4CPU *cpu = opaque;
+    uint64_t bit = BIT_ULL(n);
+
+    if (ESP32P4_LP_IRQ_MASK & bit) {
+        riscv_cpu_update_mip(&cpu->parent_obj.env, bit, level ? bit : 0);
+    }
+}
+
+/* LP_CORE_DISABLE: the core stops while it is set. */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void esp32p4_lp_cpu_set_disable(void *opaque, int n, int level)
+{
+    ESP32P4CPU *cpu = opaque;
+    bool was_off = esp32p4_cpu_clock_off(cpu);
+
+    if (cpu->disabled == !!level) {
+        return;
+    }
+    esp32p4_lp_counters_update(cpu);
+    qatomic_set(&cpu->disabled, level != 0);
+    esp32p4_cpu_clock_changed(cpu, was_off);
+}
+
+/* The core's clock is about to change rate: count at the old one first. */
+static void esp32p4_lp_cpu_clk_update(void *opaque, ClockEvent event)
+{
+    esp32p4_lp_counters_update(opaque);
 }
 #endif
 
+void esp32p4_lp_cpu_set_boot(ESP32P4CPU *cpu, ESP32P4LPBootFn fn,
+                             void *opaque)
+{
+    cpu->lp_boot = fn;
+    cpu->lp_boot_opaque = opaque;
+}
+
+/*
+ * The LP core's own trigger module replaces QEMU's, and it has an
+ * interrupt controller's lines, LP_CORE_DISABLE, its exception outputs and
+ * the clock its counters count.
+ */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void esp32p4_lp_cpu_init(Object *obj)
+{
+#ifdef CONFIG_TCG
+    ESP32P4CPU *cpu = ESP32P4_CPU(obj);
+    DeviceState *dev = DEVICE(obj);
+
+    cpu->parent_obj.cfg.debug = false;
+    cpu->parent_obj.cfg.ext_sdtrig = false;
+    qdev_init_gpio_in_named(dev, esp32p4_lp_cpu_set_irq, ESP32P4_CPU_LP_IRQ,
+                            ESP32P4_LP_IRQS);
+    qdev_init_gpio_in_named(dev, esp32p4_lp_cpu_set_disable,
+                            ESP32P4_CPU_LP_DISABLE, 1);
+    qdev_init_gpio_out_named(dev, &cpu->lp_exception,
+                             ESP32P4_CPU_LP_EXCEPTION, 1);
+    qdev_init_gpio_out_named(dev, &cpu->lp_etm_event, ESP32P4_CPU_ETM_EVENT,
+                             1);
+    cpu->lp_clk = qdev_init_clock_in(dev, ESP32P4_CPU_LP_CLK,
+                                     esp32p4_lp_cpu_clk_update, cpu,
+                                     ClockPreUpdate);
+    cpu->lp_exc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32p4_lp_exc_timer,
+                                     cpu);
+#endif
+}
+
+static DeviceRealize esp32p4_lp_parent_realize;
+
+/*
+ * The LP core completes misaligned loads and stores itself (TRM 5.7
+ * counts an unaligned access as two), as QEMU's zicclsm has a core do.
+ * QEMU ties zicclsm to privileged architecture 1.11 and drops it from a
+ * core of 1.10 as it realizes it, so it is set once the core is realized.
+ */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void esp32p4_lp_cpu_realize(DeviceState *dev, Error **errp)
+{
+    Error *err = NULL;
+
+    esp32p4_lp_parent_realize(dev, &err);
+    if (err) {
+        error_propagate(errp, err);
+        return;
+    }
+    RISCV_CPU(dev)->cfg.ext_zicclsm = true;
+}
+
+static void esp32p4_lp_cpu_finalize(Object *obj)
+{
+    ESP32P4CPU *cpu = ESP32P4_CPU(obj);
+
+    if (cpu->lp_exc_timer) {
+        timer_free(cpu->lp_exc_timer);
+    }
+}
+
 /*
  * The LP core's TCG table: its accesses carry its identity to the access
- * permission managers.
+ * permission managers, and its traps and triggers are its own.
  */
 /* [spec:nuos:req:emu.esp32p4.pms] */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
 static void esp32p4_lp_cpu_class_init(ObjectClass *oc, const void *data)
 {
+    esp32p4_lp_cpu_class = oc;
+    device_class_set_parent_realize(DEVICE_CLASS(oc), esp32p4_lp_cpu_realize,
+                                    &esp32p4_lp_parent_realize);
 #ifdef CONFIG_TCG
     CPUClass *cc = CPU_CLASS(oc);
 
@@ -1002,7 +1268,12 @@ static void esp32p4_lp_cpu_class_init(ObjectClass *oc, const void *data)
     esp32p4_lp_tcg_ops.do_transaction_failed =
         esp32p4_lp_do_transaction_failed;
     esp32p4_lp_tcg_ops.do_interrupt = esp32p4_lp_do_interrupt;
+    esp32p4_lp_tcg_ops.do_unaligned_access = esp32p4_do_unaligned_access;
+    esp32p4_lp_tcg_ops.debug_check_breakpoint =
+        esp32p4_lp_debug_check_breakpoint;
+    esp32p4_lp_tcg_ops.debug_excp_handler = esp32p4_lp_debug_excp_handler;
     cc->tcg_ops = &esp32p4_lp_tcg_ops;
+    esp32p4_csr_class_init();
 #endif
 }
 
@@ -1047,13 +1318,15 @@ static const TypeInfo esp32p4_cpu_types[] = {
             .cfg.marchid = ESP32P4_HP_MARCHID,
             .cfg.mimpid = ESP32P4_HP_MIMPID,
 #ifdef CONFIG_TCG
-            .custom_csrs = esp32p4_hp_csr_list,
+            .custom_csrs = esp32p4_csr_list,
 #endif
         },
     },
     {
         .name = TYPE_ESP32P4_LP_CPU,
         .parent = TYPE_ESP32P4_CPU,
+        .instance_init = esp32p4_lp_cpu_init,
+        .instance_finalize = esp32p4_lp_cpu_finalize,
         .class_init = esp32p4_lp_cpu_class_init,
         .class_data = &(const RISCVCPUDef) {
             .misa_mxl_max = MXL_RV32,
@@ -1063,6 +1336,9 @@ static const TypeInfo esp32p4_cpu_types[] = {
             .cfg.max_satp_mode = VM_1_10_MBARE,
             .cfg.ext_zicsr = true,
             .cfg.ext_zifencei = true,
+#ifdef CONFIG_TCG
+            .custom_csrs = esp32p4_csr_list,
+#endif
         },
     },
 };

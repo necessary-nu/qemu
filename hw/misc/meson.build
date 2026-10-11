@@ -211,7 +211,6 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
   'esp32_ledc.c',
   'esp32_pcnt.c',
   'esp32_rmt.c',
-  'esp32_mcpwm.c',
   'esp32_rng.c',
   'esp32_rsa.c',
   'esp32_rtc_cntl.c',
@@ -221,18 +220,29 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
   'ssi_psram.c',
 ))
 
+system_ss.add(when: 'CONFIG_ESP32_MCPWM', if_true: files('esp32_mcpwm.c'))
+
 system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_adc.c',
+  'esp32p4_aes.c',
   'esp32p4_ana.c',
   'esp32p4_ana_cmpr.c',
   'esp32p4_axi_perf_mon.c',
   'esp32p4_cache.c',
   'esp32p4_clkrst.c',
   'esp32p4_clkwait.c',
+  'esp32p4_crypto.c',
+  'esp32p4_ds.c',
+  'esp32p4_ecc.c',
+  'esp32p4_ecdsa.c',
   'esp32p4_etm.c',
+  'esp32p4_hmac.c',
   'esp32p4_hp_sys.c',
+  'esp32p4_huk.c',
   'esp32p4_i2c_ana_mst.c',
   'esp32p4_icm.c',
+  'esp32p4_keymng.c',
+  'esp32p4_ledc.c',
   'esp32p4_lp_ana.c',
   'esp32p4_lp_mailbox.c',
   'esp32p4_parlio.c',
@@ -240,7 +250,10 @@ system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_pms.c',
   'esp32p4_pmu.c',
   'esp32p4_rmt.c',
+  'esp32p4_rsa.c',
+  'esp32p4_sha.c',
   'esp32p4_touch.c',
+  'esp32p4_trng.c',
   'esp32p4_tsens.c',
 ))
 # The blocks that reach into the cores.

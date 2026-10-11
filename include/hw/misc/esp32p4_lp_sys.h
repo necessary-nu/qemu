@@ -52,6 +52,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
  *   SW_USB_PHY_SEL, to USB_WRAP's "phy-sel" inputs.
  * ESP32P4_LP_SYS_PAD_COMP: line n, a pulse as software writes PAD_COMPn,
  *   for analog comparator n, which reads it with esp32p4_lp_sys_reg().
+ * ESP32P4_LP_SYS_ETM_WAKEUP_FLAG: LP_CORE_ETM_WAKEUP_FLAG, the PMU's ETM
+ *   wakeup source, high from the ETM's ULP_TASK_WAKEUP_CPU until software
+ *   clears the flag.
  *
  * Named GPIO inputs
  * =================
@@ -76,6 +79,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
 #define ESP32P4_LP_SYS_HP_ROOT_CLK      "hp-root-clk"
 #define ESP32P4_LP_SYS_USB_PHY_SEL      "usb-phy-sel"
 #define ESP32P4_LP_SYS_PAD_COMP         "pad-comp"
+#define ESP32P4_LP_SYS_ETM_WAKEUP_FLAG  "lp-core-etm-wakeup-flag"
 #define ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP "lp-core-etm-wakeup"
 #define ESP32P4_LP_SYS_ETM_TASK_ULP_INT "etm-task-ulp-int"
 #define ESP32P4_LP_SYS_SLOW_CLK_TICK    "slow-clk-tick"
@@ -101,6 +105,7 @@ struct ESP32P4LPSysState {
     qemu_irq hp_root_clk[2];
     qemu_irq usb_phy_sel[2];
     qemu_irq pad_comp[ESP32P4_LP_SYS_PAD_COMPS];
+    qemu_irq etm_wakeup_flag;
 };
 
 /*
@@ -118,8 +123,12 @@ void esp32p4_lp_sys_addrhole(ESP32P4LPSysState *s, uint32_t addr,
  */
 void esp32p4_lp_sys_ext_wakeup1(ESP32P4LPSysState *s, uint32_t pads);
 
-/* LP_CORE_BOOT_ADDR, the LP core's boot address, for the LP core. */
+/*
+ * LP_CORE_BOOT_ADDR, the LP core's boot address, and BOOT_ADDR_HP_LP, the
+ * address the LP ROM starts the application at, for the LP core's start.
+ */
 uint32_t esp32p4_lp_sys_lp_core_boot_addr(ESP32P4LPSysState *s);
+uint32_t esp32p4_lp_sys_lp_core_app_addr(ESP32P4LPSysState *s);
 
 /*
  * A register as software reads it, for the blocks whose configuration

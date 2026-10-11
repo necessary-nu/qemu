@@ -28,28 +28,41 @@
 #include "hw/intc/esp32p4_clic.h"
 #include "hw/intc/esp32p4_clint.h"
 #include "hw/intc/esp32p4_intmatrix.h"
+#include "hw/intc/esp32p4_lp_intr.h"
 #include "hw/ssi/ssi.h"
 #include "hw/misc/esp32p4_adc.h"
+#include "hw/misc/esp32p4_aes.h"
 #include "hw/misc/esp32p4_ana.h"
 #include "hw/misc/esp32p4_ana_cmpr.h"
 #include "hw/misc/esp32p4_assist_debug.h"
 #include "hw/misc/esp32p4_axi_perf_mon.h"
 #include "hw/misc/esp32p4_cache.h"
 #include "hw/misc/esp32p4_clkrst.h"
+#include "hw/misc/esp32p4_ds.h"
+#include "hw/misc/esp32p4_ecc.h"
+#include "hw/misc/esp32p4_ecdsa.h"
 #include "hw/misc/esp32p4_etm.h"
+#include "hw/misc/esp32p4_hmac.h"
 #include "hw/misc/esp32p4_hp_sys.h"
+#include "hw/misc/esp32p4_huk.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_icm.h"
+#include "hw/misc/esp32p4_keymng.h"
 #include "hw/misc/esp32p4_lp_ana.h"
 #include "hw/misc/esp32p4_lp_mailbox.h"
+#include "hw/misc/esp32p4_ledc.h"
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/misc/esp32p4_parlio.h"
 #include "hw/misc/esp32p4_pcnt.h"
+#include "hw/misc/esp32_mcpwm.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "hw/misc/esp32p4_pmu.h"
 #include "hw/misc/esp32p4_rmt.h"
+#include "hw/misc/esp32p4_rsa.h"
+#include "hw/misc/esp32p4_sha.h"
 #include "hw/misc/esp32p4_touch.h"
 #include "hw/misc/esp32p4_trace.h"
+#include "hw/misc/esp32p4_trng.h"
 #include "hw/misc/esp32p4_tsens.h"
 #include "hw/net/esp32p4_emac.h"
 #include "hw/net/esp32p4_twai.h"
@@ -112,15 +125,27 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 #define ESP32P4_LPPERI_BASE         0x50120000
 #define ESP32P4_I2C_ANA_MST_BASE    0x50124000
 #define ESP32P4_EFUSE_BASE          0x5012d000
+#define ESP32P4_MCPWM0_BASE         0x500c0000
+#define ESP32P4_MCPWM_STRIDE        0x1000
+#define ESP32P4_MCPWM_NUM           2
 
-/* Where each core starts from reset. */
+/*
+ * Where each core starts from reset: the LP core 0x80 into the vector
+ * table at its boot address, LP_SYSTEM_LP_CORE_BOOT_ADDR, whose reset value
+ * is the LP ROM's.
+ */
 #define ESP32P4_HP_RESET_VECTOR     ESP32P4_HP_ROM_BASE
-#define ESP32P4_LP_RESET_VECTOR     ESP32P4_LP_ROM_BASE
+#define ESP32P4_LP_BOOT_OFFSET      0x80
+#define ESP32P4_LP_RESET_VECTOR     (ESP32P4_LP_ROM_BASE + \
+                                     ESP32P4_LP_BOOT_OFFSET)
 
 #define ESP32P4_ROM_FILE            "esp32p4-rev3-rom.bin"
 
 /* The board pad the IP101GRI's RESET_N is on */
 #define ESP32P4_BOARD_PHY_RESET_PAD 51
+
+/* The crypto block resets that hold more than their own block. */
+#define ESP32P4_CRYPTO_RST_SPLITS   4
 
 struct ESP32P4MachineState {
     MachineState parent_obj;
@@ -136,6 +161,12 @@ struct ESP32P4MachineState {
     MemoryRegion l2mem;
     MemoryRegion l2mem_direct;
     MemoryRegion lp_sram;
+    /*
+     * The LP ROM, and whether it holds an image: the machine ships none,
+     * so it is absent and the LP core starts past it.
+     */
+    MemoryRegion lp_rom;
+    bool lp_rom_loaded;
     MemoryRegion psram;
     /* The HP cores' address space, and the bus in it. */
     MemoryRegion hp_mem;
@@ -147,6 +178,8 @@ struct ESP32P4MachineState {
     ESP32P4ClicState clic;
     ESP32P4IntMatrixState intmatrix;
     ESP32P4HPSysState hp_sys;
+    /* The LP core's interrupt controller. */
+    ESP32P4LPIntrState lp_intr;
 
     ESP32P4ClkRstState clkrst;
     ESP32P4AnaState ana;
@@ -180,6 +213,8 @@ struct ESP32P4MachineState {
     CanBusState *canbus[ESP32P4_TWAI_NUM];
     ESP32P4RmtState rmt;
     ESP32P4PcntState pcnt;
+    ESP32P4LedcState ledc;
+    Esp32McpwmState mcpwm[ESP32P4_MCPWM_NUM];
 
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];
@@ -239,6 +274,20 @@ struct ESP32P4MachineState {
 
     /* I2S0 to I2S2, then the LP I2S */
     ESP32P4I2sState i2s[ESP32P4_I2S_COUNT];
+
+    /* The cryptography blocks. */
+    ESP32P4AesState aes;
+    ESP32P4ShaDevState sha;
+    ESP32P4RsaState rsa;
+    ESP32P4EccState ecc;
+    ESP32P4HmacState hmac;
+    ESP32P4DsState ds;
+    ESP32P4EcdsaState ecdsa;
+    ESP32P4KeyMngState keymng;
+    ESP32P4HukState huk;
+    ESP32P4TrngState trng;
+    /* RST_EN_DS, _ECDSA, _KM and _HMAC, to the blocks each holds. */
+    SplitIRQ crypto_rst_split[ESP32P4_CRYPTO_RST_SPLITS];
 
     /* The analog blocks. */
     ESP32P4AdcState adc;

@@ -332,4 +332,7 @@ config AXIADO_CLK
 config K230_DECOMP_GZIP
     bool
 
+config ESP32_MCPWM
+    bool
+
 source macio/Kconfig

@@ -60,12 +60,14 @@ util_ss.add(files(
   'init.c',
   'sm4.c',
 ))
-system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
+sha_internal = files(
   'sha1-internal.c',
   'sha256-internal.c',
   'sha384-internal.c',
   'sha512-internal.c',
-))
+)
+system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: sha_internal)
+system_ss.add(when: 'CONFIG_ESP32P4', if_true: sha_internal)
 if gnutls.found()
   util_ss.add(gnutls)
 endif
