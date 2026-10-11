@@ -228,6 +228,9 @@ system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_hp_sys.c',
   'esp32p4_i2c_ana_mst.c',
   'esp32p4_icm.c',
+  'esp32p4_lp_ana.c',
+  'esp32p4_lp_mailbox.c',
   'esp32p4_lp_sys.c',
   'esp32p4_pms.c',
+  'esp32p4_pmu.c',
 ))

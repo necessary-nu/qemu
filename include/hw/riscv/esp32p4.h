@@ -26,8 +26,11 @@
 #include "hw/misc/esp32p4_hp_sys.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_icm.h"
+#include "hw/misc/esp32p4_lp_ana.h"
+#include "hw/misc/esp32p4_lp_mailbox.h"
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/misc/esp32p4_pms.h"
+#include "hw/misc/esp32p4_pmu.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/timer/esp32p4_lp_timer.h"
 #include "hw/timer/esp32p4_lp_wdt.h"
@@ -139,6 +142,18 @@ struct ESP32P4MachineState {
     SplitIRQ core_stall_split[ESP32P4_HP_CORES];
     /* The HP core reset, to the machine and the RTC timer. */
     SplitIRQ hp_core_reset_split;
+
+    /* Low-power management: the PMU, LP_ANALOG_PERI and the LP mailbox. */
+    ESP32P4PMUState pmu;
+    ESP32P4LPAnaState lp_ana;
+    ESP32P4LPMailboxState lp_mailbox;
+    /* The PMU's power of PD_TOP and of the HP memory, to the machine. */
+    qemu_irq hp_top_power;
+    qemu_irq hp_mem_power;
+    /* Whether the HP memories have lost their contents since PD_TOP rose. */
+    bool hp_mem_lost;
+    /* The -kernel ELF's segments outside LP SRAM, for its reload. */
+    GArray *kernel_segments;
 
     ESP32P4MSPIState flash_mspi;
     ESP32P4MSPIState psram_mspi;

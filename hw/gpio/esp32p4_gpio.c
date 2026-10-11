@@ -836,6 +836,13 @@ static void resolve(ESP32P4GpioState *s, uint64_t *pad_out,
     uint64_t pad = 0, raw = 0;
     uint64_t held = (s->ext_hold | s->lp_pad_hold) & PAD_MASK;
 
+    if (s->hold_all[ESP32P4_GPIO_HOLD_ALL_HP]) {
+        held |= PAD_MASK & ~LP_PAD_MASK;
+    }
+    if (s->hold_all[ESP32P4_GPIO_HOLD_ALL_LP]) {
+        held |= LP_PAD_MASK;
+    }
+
     for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
         bool drive, val, pu, ie, level;
 
@@ -2651,6 +2658,15 @@ static void esp32p4_gpio_set_hold(void *opaque, int n, int level)
     esp32p4_gpio_update(s);
 }
 
+/* [spec:nuos:req:emu.esp32p4.low-power] */
+static void esp32p4_gpio_set_hold_all(void *opaque, int n, int level)
+{
+    ESP32P4GpioState *s = opaque;
+
+    s->hold_all[n] = level != 0;
+    esp32p4_gpio_update(s);
+}
+
 static void esp32p4_gpio_set_light_sleep(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
@@ -3019,6 +3035,8 @@ static void esp32p4_gpio_init(Object *obj)
                             ESP32P4_GPIO_PADS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_light_sleep,
                             ESP32P4_GPIO_LIGHT_SLEEP, 1);
+    qdev_init_gpio_in_named(dev, esp32p4_gpio_set_hold_all,
+                            ESP32P4_GPIO_HOLD_ALL, ESP32P4_GPIO_HOLD_ALLS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_ana_comp,
                             ESP32P4_GPIO_ANA_COMP, ESP32P4_GPIO_ANA_COMPS);
     qdev_init_gpio_out_named(dev, &s->wakeup_out, ESP32P4_GPIO_WAKEUP, 1);
@@ -3085,8 +3103,8 @@ static const VMStateDescription vmstate_esp32p4_gpio_filter = {
 
 static const VMStateDescription vmstate_esp32p4_gpio = {
     .name = TYPE_ESP32P4_GPIO,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(iomux_clk, ESP32P4GpioState),
         VMSTATE_CLOCK(lp_clk, ESP32P4GpioState),
@@ -3161,6 +3179,8 @@ static const VMStateDescription vmstate_esp32p4_gpio = {
         VMSTATE_UINT64(ext_level, ESP32P4GpioState),
         VMSTATE_UINT64(ext_pull_up, ESP32P4GpioState),
         VMSTATE_UINT64(ext_hold, ESP32P4GpioState),
+        VMSTATE_BOOL_ARRAY(hold_all, ESP32P4GpioState,
+                           ESP32P4_GPIO_HOLD_ALLS),
         VMSTATE_BOOL(light_sleep, ESP32P4GpioState),
         VMSTATE_UINT8_ARRAY(sig_out, ESP32P4GpioState, ESP32P4_GPIO_SIGS),
         VMSTATE_UINT8_ARRAY(sig_oe, ESP32P4GpioState, ESP32P4_GPIO_SIGS),
