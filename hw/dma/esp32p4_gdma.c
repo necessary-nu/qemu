@@ -61,7 +61,10 @@
  * waits for the time slot (ARB_TIMEOUT bus cycles) to end, or for every
  * channel's tokens to be spent; a channel without requests holds its
  * tokens, and the slot, unless its ARB_WEIGH_OPT_DIR is clear (TRM 6.4.9).
- * A weight of 0 is never served while weighting is on.
+ * A weight of 0 is never served while weighting is on. Each round of the
+ * bus happens at the time it falls due, however late the QEMU timer that
+ * runs it: register accesses and ETM tasks first run the rounds due
+ * before them, in order.
  *
  * The FIFOs are 64 bytes. Moving bytes from a TX channel's FIFO to the
  * peripheral or the paired RX channel is outside the bus. OUT_DONE,
@@ -78,9 +81,11 @@
  * channel computes it over the bytes it reads, an RX channel over those
  * it writes.
  *
- * ETM: the events are pulsed on the "etm-event" lines, and the tasks on
- * "etm-task" start a channel whose *_ETM_EN is set; *_LINK_START is
- * ignored for such a channel (TRM 6.5).
+ * ETM: the events are pulsed on the "etm-event" lines, each carrying the
+ * time of the round, or of the peripheral's access, that raises it (see
+ * esp32_line.h), and the tasks on "etm-task" start a channel whose
+ * *_ETM_EN is set, at their events' time; *_LINK_START is ignored for
+ * such a channel (TRM 6.5).
  *
  * Restart (TRM 6.4.4): at the end of its list a channel re-reads the last
  * descriptor's DW2 if *LINK_RESTART was set while it ran; set after the
@@ -112,6 +117,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/dma/esp32p4_gdma.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "migration/vmstate.h"
 
@@ -500,9 +506,14 @@ static void gdma_raise(ESP32P4GdmaState *s, int dir, int ch, uint32_t bits)
     gdma_update_irq(s, dir, ch);
 }
 
+/* Pulse an ETM event, at the time of the round or access raising it. */
 static void gdma_event(ESP32P4GdmaState *s, int kind, int ch)
 {
-    qemu_irq_pulse(s->etm_event[ESP32P4_GDMA_ETM_EVT(kind, ch)]);
+    qemu_irq line = s->etm_event[ESP32P4_GDMA_ETM_EVT(kind, ch)];
+    int64_t t = esp32_line_time();
+
+    esp32_line_set_at(line, 1, t);
+    esp32_line_set_at(line, 0, t);
 }
 
 /* FIFOs */
@@ -1186,14 +1197,23 @@ static void gdma_notify(ESP32P4GdmaState *s)
     }
 }
 
+/* Arm the engine's timer for a round at @when. */
+static void gdma_arm(ESP32P4GdmaState *s, int64_t when)
+{
+    s->due_ns = when;
+    timer_mod(s->timer, when);
+}
+
 /*
- * One round of the bus: each arbiter grants a transaction, whose effects
- * are seen at once, and the engine comes back when it is over.
+ * One round of the bus, at the time it falls due, esp32_line_time(): each
+ * arbiter grants a transaction, whose effects are seen at once, and the
+ * engine comes back when it is over.
  */
 /* [spec:nuos:req:emu.esp32p4.dma] */
-static void gdma_run(ESP32P4GdmaState *s)
+static void gdma_run(void *opaque)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    ESP32P4GdmaState *s = opaque;
+    int64_t now = esp32_line_time();
     int narb = gdma_axi(s) ? 2 : 1;
     uint32_t cost = 0;
     int64_t wait = 0;
@@ -1223,31 +1243,57 @@ static void gdma_run(ESP32P4GdmaState *s)
         m2m_move(s, ch);
     }
     if (cost) {
-        timer_mod(s->timer, now + clock_ticks_to_ns(s->clk, cost));
+        gdma_arm(s, now + clock_ticks_to_ns(s->clk, cost));
     } else if (wait) {
-        timer_mod(s->timer, now + wait);
+        gdma_arm(s, now + wait);
     }
     gdma_notify(s);
 }
 
+/* The round falls due: run it at its time, which a late timer has passed. */
 static void gdma_timer_cb(void *opaque)
 {
-    gdma_run(opaque);
+    ESP32P4GdmaState *s = opaque;
+
+    esp32_line_run_at(s->due_ns, gdma_run, s);
 }
 
-/* Let the engine look for work at the next bus cycle. */
-static void gdma_kick(ESP32P4GdmaState *s)
+/*
+ * [spec:nuos:req:emu.esp32p4.dma]
+ * Run the rounds that fell due by @now, in order, each at its own time.
+ * Each comes back at least a bus cycle later, or not at all.
+ */
+static void gdma_catch_up(ESP32P4GdmaState *s, int64_t now)
 {
-    if (!timer_pending(s->timer) && clock_is_enabled(s->clk)) {
-        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                            clock_ticks_to_ns(s->clk, 1));
+    while (timer_pending(s->timer) && s->due_ns <= now) {
+        timer_del(s->timer);
+        esp32_line_run_at(s->due_ns, gdma_run, s);
     }
 }
 
+/*
+ * Let the engine look for work at the bus cycle after the change that
+ * calls for it, at esp32_line_time().
+ */
+static void gdma_kick(ESP32P4GdmaState *s)
+{
+    if (!timer_pending(s->timer) && clock_is_enabled(s->clk)) {
+        gdma_arm(s, esp32_line_time() + clock_ticks_to_ns(s->clk, 1));
+    }
+}
+
+/*
+ * The bus clock changes: the rounds due before run at the old rate, and
+ * the engine goes on at the new one, or stops.
+ */
 static void gdma_clk_update(void *opaque, ClockEvent event)
 {
     ESP32P4GdmaState *s = opaque;
 
+    if (event == ClockPreUpdate) {
+        gdma_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        return;
+    }
     if (clock_is_enabled(s->clk)) {
         gdma_kick(s);
     } else {
@@ -1563,6 +1609,7 @@ static uint64_t esp32p4_gdma_read(void *opaque, hwaddr addr, unsigned size)
     GdmaDecode d = gdma_axi(s) ? axi_decode(reg) : ahb_decode(reg);
     uint32_t v;
 
+    gdma_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     if (!gdma_reg_read(s, d, &v)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of reserved offset 0x%"
                       HWADDR_PRIx "\n", gdma_name(s), addr);
@@ -1816,6 +1863,7 @@ static void esp32p4_gdma_write(void *opaque, hwaddr addr, uint64_t value,
     GdmaDecode d = gdma_axi(s) ? axi_decode(reg) : ahb_decode(reg);
     uint32_t old = 0, v;
 
+    gdma_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     /*
      * A narrow write keeps the other bytes; the write-1 bits of the
      * interrupt clears and the link and push/pop commands act only in the
@@ -1852,7 +1900,10 @@ static const MemoryRegionOps esp32p4_gdma_ops = {
     .impl.max_access_size = 4,
 };
 
-/* ETM tasks: a rising edge starts the channel if its ETM_EN is set. */
+/*
+ * ETM tasks: a rising edge starts the channel if its ETM_EN is set, at
+ * the event's time, which the task's pulse carries.
+ */
 /* [spec:nuos:req:emu.esp32p4.dma] */
 static void esp32p4_gdma_etm_task(void *opaque, int n, int level)
 {
@@ -1863,6 +1914,7 @@ static void esp32p4_gdma_etm_task(void *opaque, int n, int level)
 
     s->etm_task_level[n] = level;
     if (rise && chan_etm_en(s, dir, &s->ch[dir][ch])) {
+        gdma_catch_up(s, esp32_line_time());
         chan_start(s, dir, ch);
     }
 }
@@ -1998,7 +2050,7 @@ static void esp32p4_gdma_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), esp32p4_gdma_etm_task,
                             ESP32P4_GDMA_ETM_TASK, ESP32P4_GDMA_ETM_TASKS);
     s->clk = qdev_init_clock_in(DEVICE(obj), "clk", gdma_clk_update, s,
-                                ClockUpdate);
+                                ClockPreUpdate | ClockUpdate);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gdma_timer_cb, s);
     object_property_add_str(obj, "periph", esp32p4_gdma_get_periph,
                             esp32p4_gdma_set_periph);
@@ -2094,8 +2146,8 @@ static const VMStateDescription vmstate_esp32p4_gdma_chan = {
 
 static const VMStateDescription vmstate_esp32p4_gdma = {
     .name = TYPE_ESP32P4_GDMA,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_2DARRAY(ch, ESP32P4GdmaState, 2, NCH, 1,
                                vmstate_esp32p4_gdma_chan, ESP32P4GdmaChan),
@@ -2125,6 +2177,7 @@ static const VMStateDescription vmstate_esp32p4_gdma = {
         VMSTATE_UINT32_ARRAY(rr_last, ESP32P4GdmaState, 2),
         VMSTATE_INT64_ARRAY(slot_start, ESP32P4GdmaState, 2),
         VMSTATE_CLOCK(clk, ESP32P4GdmaState),
+        VMSTATE_INT64(due_ns, ESP32P4GdmaState),
         VMSTATE_TIMER_PTR(timer, ESP32P4GdmaState),
         VMSTATE_END_OF_LIST()
     },
