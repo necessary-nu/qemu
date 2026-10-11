@@ -1,5 +1,5 @@
 /*
- * Espressif ESP32-P4 HP core control and status registers
+ * Espressif ESP32-P4 HP and LP core control and status registers
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -27,6 +27,15 @@
  * exception: QEMU's CSR access check covers the privilege the CSR number
  * encodes and writes to read-only numbers, and the functions here add the
  * rest, such as the hardware loop CSRs while the extension is off.
+ *
+ * The table serves the LP core too, which is a different core in the same
+ * machine. Every path of a CSR the table holds to the standard operations
+ * goes through std_predicate(), std_read(), std_write() or std_op(),
+ * which first ask esp32p4_lp_csr_kind() about the LP core: a CSR it lacks
+ * is illegal, one it implements its own way goes to esp32p4_lp.c, and the
+ * rest are standard. The table holds every CSR the LP core's configuration
+ * would otherwise offer beyond the TRM's list (5.3.1), so that the LP
+ * core lacks them.
  */
 
 #include "qemu/osdep.h"
@@ -158,18 +167,27 @@ static riscv_csr_operations *esp32p4_std_ops;
 
 static const riscv_csr_operations *esp32p4_std(int csrno)
 {
-    for (int i = 0; esp32p4_hp_csr_list[i].csr_ops.name; i++) {
-        if (esp32p4_hp_csr_list[i].csrno == csrno) {
+    for (int i = 0; esp32p4_csr_list[i].csr_ops.name; i++) {
+        if (esp32p4_csr_list[i].csrno == csrno) {
             return &esp32p4_std_ops[i];
         }
     }
     g_assert_not_reached();
 }
 
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
 static RISCVException std_predicate(CPURISCVState *env, int csrno)
 {
     const riscv_csr_operations *ops = esp32p4_std(csrno);
 
+    switch (esp32p4_lp_csr_kind(env, csrno)) {
+    case ESP32P4_LP_CSR_ABSENT:
+        return RISCV_EXCP_ILLEGAL_INST;
+    case ESP32P4_LP_CSR_OWN:
+        return RISCV_EXCP_NONE;
+    default:
+        break;
+    }
     if (!ops->predicate || env->priv_ver < ops->min_priv_ver) {
         return RISCV_EXCP_ILLEGAL_INST;
     }
@@ -181,6 +199,9 @@ static RISCVException std_read(CPURISCVState *env, int csrno,
 {
     const riscv_csr_operations *ops = esp32p4_std(csrno);
 
+    if (esp32p4_lp_csr_kind(env, csrno) == ESP32P4_LP_CSR_OWN) {
+        return esp32p4_lp_csr_read(env, csrno, val);
+    }
     if (!ops->read) {
         return RISCV_EXCP_ILLEGAL_INST;
     }
@@ -192,6 +213,9 @@ static RISCVException std_write(CPURISCVState *env, int csrno,
 {
     const riscv_csr_operations *ops = esp32p4_std(csrno);
 
+    if (esp32p4_lp_csr_kind(env, csrno) == ESP32P4_LP_CSR_OWN) {
+        return esp32p4_lp_csr_write(env, csrno, val);
+    }
     if (!ops->write) {
         return RISCV_EXCP_NONE;
     }
@@ -210,10 +234,10 @@ static RISCVException std_op(CPURISCVState *env, int csrno,
     target_ulong old_value = 0;
     RISCVException ret;
 
-    if (ops->op) {
+    if (ops->op && esp32p4_lp_csr_kind(env, csrno) != ESP32P4_LP_CSR_OWN) {
         return ops->op(env, csrno, ret_value, new_value, write_mask);
     }
-    if (ret_value) {
+    if (ret_value || write_mask) {
         ret = std_read(env, csrno, &old_value);
         if (ret != RISCV_EXCP_NONE) {
             return ret;
@@ -236,19 +260,19 @@ static RISCVException std_op(CPURISCVState *env, int csrno,
  * Save the standard operations of the CSRs the table below replaces,
  * before any HP core installs it.
  */
-void esp32p4_hp_csr_class_init(void)
+void esp32p4_csr_class_init(void)
 {
     int n = 0;
 
     if (esp32p4_std_ops) {
         return;
     }
-    while (esp32p4_hp_csr_list[n].csr_ops.name) {
+    while (esp32p4_csr_list[n].csr_ops.name) {
         n++;
     }
     esp32p4_std_ops = g_new(riscv_csr_operations, n);
     for (int i = 0; i < n; i++) {
-        riscv_get_csr_ops(esp32p4_hp_csr_list[i].csrno, &esp32p4_std_ops[i]);
+        riscv_get_csr_ops(esp32p4_csr_list[i].csrno, &esp32p4_std_ops[i]);
     }
 }
 
@@ -1327,11 +1351,23 @@ static RISCVException write_xclicbase(CPURISCVState *env, int csrno,
            write_absent)
 #define PMACFG(n) \
     HP_CSR(CSR_ESP_PMACFG0 + (n), "pma_cfg" #n, hp, read_pma, write_pma)
+
+/*
+ * A standard CSR the table holds for the LP core alone (see
+ * esp32p4_lp_csr_kind()), which every other core has unchanged.
+ */
+#define LP_CSR(no, name) \
+    HP_CSR((no), (name), std_predicate, std_read, std_write)
+#define LP_MHPM(n)  LP_CSR(CSR_MHPMCOUNTER3 + (n) - 3, "mhpmcounter" #n)
+#define LP_MHPMH(n) LP_CSR(CSR_MHPMCOUNTER3H + (n) - 3, "mhpmcounter" #n "h")
+#define LP_HPM(n)   LP_CSR(CSR_HPMCOUNTER3 + (n) - 3, "hpmcounter" #n)
+#define LP_HPMH(n)  LP_CSR(CSR_HPMCOUNTER3H + (n) - 3, "hpmcounter" #n "h")
 #define PMAADDR(n) \
     HP_CSR(CSR_ESP_PMAADDR0 + (n), "pma_addr" #n, hp, read_pma, write_pma)
 
 /* [spec:nuos:req:emu.esp32p4.cpu] */
-const RISCVCSR esp32p4_hp_csr_list[] = {
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+const RISCVCSR esp32p4_csr_list[] = {
     HP_CSR(CSR_MSTATUS, "mstatus", hp_std, read_mstatus, write_mstatus),
     HP_CSR(CSR_MSTATUSH, "mstatush", hp_absent, read_absent, write_absent),
     HP_CSR(CSR_MENVCFG, "menvcfg", hp_absent, read_absent, write_absent),
@@ -1462,5 +1498,41 @@ const RISCVCSR esp32p4_hp_csr_list[] = {
     HP_CSR(CSR_ESP_STTVAL0, "sttval0", hp, read_bus_error, write_bus_error),
     HP_CSR(CSR_ESP_STTVAL1, "sttval1", hp, read_bus_error, write_bus_error),
     HP_CSR(CSR_ESP_STTVAL2, "sttval2", hp, read_bus_error, write_bus_error),
+
+    LP_CSR(CSR_MVENDORID, "mvendorid"),
+    LP_CSR(CSR_MARCHID, "marchid"),
+    LP_CSR(CSR_MIMPID, "mimpid"),
+    LP_CSR(CSR_MCYCLE, "mcycle"),
+    LP_CSR(CSR_MINSTRET, "minstret"),
+    LP_CSR(CSR_MCYCLEH, "mcycleh"),
+    LP_CSR(CSR_MINSTRETH, "minstreth"),
+    LP_CSR(CSR_CYCLE, "cycle"),
+    LP_CSR(CSR_TIME, "time"),
+    LP_CSR(CSR_INSTRET, "instret"),
+    LP_CSR(CSR_CYCLEH, "cycleh"),
+    LP_CSR(CSR_INSTRETH, "instreth"),
+    LP_MHPM(3), LP_MHPM(4), LP_MHPM(5), LP_MHPM(6), LP_MHPM(7), LP_MHPM(8),
+    LP_MHPM(9), LP_MHPM(10), LP_MHPM(11), LP_MHPM(12), LP_MHPM(13),
+    LP_MHPM(14), LP_MHPM(15), LP_MHPM(16), LP_MHPM(17), LP_MHPM(18),
+    LP_MHPM(19), LP_MHPM(20), LP_MHPM(21), LP_MHPM(22), LP_MHPM(23),
+    LP_MHPM(24), LP_MHPM(25), LP_MHPM(26), LP_MHPM(27), LP_MHPM(28),
+    LP_MHPM(29), LP_MHPM(30), LP_MHPM(31),
+    LP_MHPMH(3), LP_MHPMH(4), LP_MHPMH(5), LP_MHPMH(6), LP_MHPMH(7),
+    LP_MHPMH(8), LP_MHPMH(9), LP_MHPMH(10), LP_MHPMH(11), LP_MHPMH(12),
+    LP_MHPMH(13), LP_MHPMH(14), LP_MHPMH(15), LP_MHPMH(16), LP_MHPMH(17),
+    LP_MHPMH(18), LP_MHPMH(19), LP_MHPMH(20), LP_MHPMH(21), LP_MHPMH(22),
+    LP_MHPMH(23), LP_MHPMH(24), LP_MHPMH(25), LP_MHPMH(26), LP_MHPMH(27),
+    LP_MHPMH(28), LP_MHPMH(29), LP_MHPMH(30), LP_MHPMH(31),
+    LP_HPM(3), LP_HPM(4), LP_HPM(5), LP_HPM(6), LP_HPM(7), LP_HPM(8),
+    LP_HPM(9), LP_HPM(10), LP_HPM(11), LP_HPM(12), LP_HPM(13), LP_HPM(14),
+    LP_HPM(15), LP_HPM(16), LP_HPM(17), LP_HPM(18), LP_HPM(19), LP_HPM(20),
+    LP_HPM(21), LP_HPM(22), LP_HPM(23), LP_HPM(24), LP_HPM(25), LP_HPM(26),
+    LP_HPM(27), LP_HPM(28), LP_HPM(29), LP_HPM(30), LP_HPM(31),
+    LP_HPMH(3), LP_HPMH(4), LP_HPMH(5), LP_HPMH(6), LP_HPMH(7), LP_HPMH(8),
+    LP_HPMH(9), LP_HPMH(10), LP_HPMH(11), LP_HPMH(12), LP_HPMH(13),
+    LP_HPMH(14), LP_HPMH(15), LP_HPMH(16), LP_HPMH(17), LP_HPMH(18),
+    LP_HPMH(19), LP_HPMH(20), LP_HPMH(21), LP_HPMH(22), LP_HPMH(23),
+    LP_HPMH(24), LP_HPMH(25), LP_HPMH(26), LP_HPMH(27), LP_HPMH(28),
+    LP_HPMH(29), LP_HPMH(30), LP_HPMH(31),
     { },
 };
