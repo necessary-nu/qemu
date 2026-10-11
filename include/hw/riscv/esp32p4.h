@@ -12,6 +12,7 @@
 #include "qemu/units.h"
 #include "hw/core/boards.h"
 #include "hw/cpu/cluster.h"
+#include "hw/dma/esp32p4_bitscrambler.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/dma/esp32p4_gdma.h"
 #include "hw/core/split-irq.h"
@@ -28,6 +29,7 @@
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_icm.h"
 #include "hw/misc/esp32p4_lp_sys.h"
+#include "hw/misc/esp32p4_parlio.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "hw/net/esp32p4_emac.h"
 #include "hw/net/ip101_phy.h"
@@ -138,6 +140,8 @@ struct ESP32P4MachineState {
     /* GDMA-AHB, GDMA-AXI. */
     ESP32P4GdmaState gdma[2];
     ESP32P4DwGdmaState vdma;
+    ESP32P4BitScramblerState bitscrambler;
+    ESP32P4ParlioState parlio;
 
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];

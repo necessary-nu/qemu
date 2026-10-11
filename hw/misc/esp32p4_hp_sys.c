@@ -44,6 +44,9 @@
  *     transmit and receive clock domains as the EMAC drives them
  *     ("gmac-status" inputs); and its system time, read from the EMAC.
  *     GMAC_MEM_CLK_FORCE_ON is held: the EMAC's FIFO memories always run.
+ *   - HP_SYSTEM_BITSCRAMBLER_PERI_SEL_REG (0x140): the peripherals whose
+ *     DMA paths the BitScrambler's RX and TX cores are attached to, to the
+ *     BitScrambler ("bitscrambler-peri-sel" outputs).
  *
  * The rest of the block's registers are logged as unimplemented and read
  * as zero.
@@ -84,6 +87,9 @@
 #define GMAC_CTRL0_RW           0x3e
 #define A_GMAC_CTRL1            0x150
 #define A_GMAC_CTRL2            0x154
+#define A_BITSCRAMBLER_PERI_SEL 0x140
+#define BITSCRAMBLER_PERI_SEL_MASK  0xff
+#define BITSCRAMBLER_PERI_SEL_RESET 0xff
 #define A_L2_MEM_ERR_RESP_CTRL  0x198
 #define L2_MEM_ERR_RESP_EN      BIT(0)
 
@@ -156,6 +162,8 @@ static uint32_t esp32p4_hp_sys_reg(ESP32P4HPSysState *s, hwaddr addr,
         return esp32p4_hp_sys_gmac_time(s);
     case A_GMAC_CTRL2:
         return esp32p4_hp_sys_gmac_time(s) >> 32;
+    case A_BITSCRAMBLER_PERI_SEL:
+        return s->bitscrambler_peri_sel;
     default:
         *known = false;
         return 0;
@@ -201,6 +209,15 @@ static void esp32p4_hp_sys_set_gmac_status(void *opaque, int n, int level)
         s->gmac_status |= bit[n];
     } else {
         s->gmac_status &= ~bit[n];
+    }
+}
+
+/* [spec:nuos:req:emu.esp32p4.parlio] */
+static void esp32p4_hp_sys_update_bs(ESP32P4HPSysState *s)
+{
+    for (int i = 0; i < ESP32P4_HP_SYS_BS_PERI_SEL_LINES; i++) {
+        qemu_set_irq(s->bs_peri_sel[i],
+                     extract32(s->bitscrambler_peri_sel, i, 1));
     }
 }
 
@@ -297,6 +314,11 @@ static void esp32p4_hp_sys_write(void *opaque, hwaddr addr, uint64_t value,
     case A_GMAC_CTRL1:
     case A_GMAC_CTRL2:
         break;
+    case A_BITSCRAMBLER_PERI_SEL:
+        s->bitscrambler_peri_sel = ((s->bitscrambler_peri_sel & ~mask) |
+                                    (v & mask)) & BITSCRAMBLER_PERI_SEL_MASK;
+        esp32p4_hp_sys_update_bs(s);
+        break;
     default:
         qemu_log_mask(LOG_UNIMP, "%s: unimplemented write of %u bytes at "
                       "0x%" HWADDR_PRIx " (value 0x%" PRIx64 ")\n",
@@ -329,6 +351,7 @@ static void esp32p4_hp_sys_reset_hold(Object *obj, ResetType type)
     s->l2_mem_int_record0 = 0;
     s->l2_mem_err_resp_ctrl = 0;
     s->gmac_ctrl0 = 0;
+    s->bitscrambler_peri_sel = BITSCRAMBLER_PERI_SEL_RESET;
 }
 
 static void esp32p4_hp_sys_reset_exit(Object *obj, ResetType type)
@@ -342,6 +365,7 @@ static void esp32p4_hp_sys_reset_exit(Object *obj, ResetType type)
     esp32p4_hp_sys_update_crypto(s);
     qemu_set_irq(s->l2mem_err_resp, s->l2_mem_err_resp_ctrl);
     esp32p4_hp_sys_update_gmac(s);
+    esp32p4_hp_sys_update_bs(s);
     esp32p4_hp_sys_update_irq(s);
 }
 
@@ -372,12 +396,15 @@ static void esp32p4_hp_sys_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), esp32p4_hp_sys_set_gmac_status,
                             ESP32P4_HP_SYS_GMAC_STATUS,
                             ESP32P4_HP_SYS_GMAC_STATUS_LINES);
+    qdev_init_gpio_out_named(DEVICE(obj), s->bs_peri_sel,
+                             ESP32P4_HP_SYS_BS_PERI_SEL,
+                             ESP32P4_HP_SYS_BS_PERI_SEL_LINES);
 }
 
 static const VMStateDescription vmstate_esp32p4_hp_sys = {
     .name = TYPE_ESP32P4_HP_SYS,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(cpu_int_from_cpu, ESP32P4HPSysState,
                              ESP32P4_HP_SYS_CPU_INTRS),
@@ -390,6 +417,7 @@ static const VMStateDescription vmstate_esp32p4_hp_sys = {
         VMSTATE_UINT32(l2_mem_err_resp_ctrl, ESP32P4HPSysState),
         VMSTATE_UINT32(gmac_ctrl0, ESP32P4HPSysState),
         VMSTATE_UINT32(gmac_status, ESP32P4HPSysState),
+        VMSTATE_UINT32(bitscrambler_peri_sel, ESP32P4HPSysState),
         VMSTATE_END_OF_LIST()
     },
 };

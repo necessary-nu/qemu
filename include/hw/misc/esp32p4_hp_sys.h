@@ -75,6 +75,14 @@ enum {
     ESP32P4_HP_SYS_GMAC_STATUS_LINES,
 };
 
+/*
+ * Named GPIO output ESP32P4_HP_SYS_BS_PERI_SEL: HP_SYSTEM_BITSCRAMBLER_
+ * PERI_SEL's eight bits, PERI_RX_SEL in lines 0 to 3 and PERI_TX_SEL in 4
+ * to 7, to the BitScrambler's "peri-sel" inputs.
+ */
+#define ESP32P4_HP_SYS_BS_PERI_SEL "bitscrambler-peri-sel"
+#define ESP32P4_HP_SYS_BS_PERI_SEL_LINES 8
+
 struct ESP32P4HPSysState {
     SysBusDevice parent_obj;
 
@@ -98,6 +106,8 @@ struct ESP32P4HPSysState {
     uint32_t gmac_status;
     qemu_irq gmac_phy_intf[ESP32P4_HP_SYS_GMAC_PHY_INTF_LINES];
     qemu_irq gmac_sbd_flowctrl;
+    uint32_t bitscrambler_peri_sel;
+    qemu_irq bs_peri_sel[ESP32P4_HP_SYS_BS_PERI_SEL_LINES];
     /* The EMAC's system time, which GMAC_CTRL1 and _CTRL2 read */
     uint64_t (*gmac_ptp_time)(void *opaque);
     void *gmac_ptp_opaque;
