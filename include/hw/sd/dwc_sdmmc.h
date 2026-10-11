@@ -77,6 +77,13 @@ struct DWCSDMMCClass {
      * where the integration divides it there.
      */
     uint64_t (*cclk_period)(DWCSDMMCState *s);
+    /*
+     * The first whole ns by which @cycles of @clk, "cclk-in" or "hclk",
+     * have elapsed, at least 1: by default from @clk's Clock period; an
+     * integration whose clocks carry exact periods of their own gives
+     * those.
+     */
+    int64_t (*clock_ns)(DWCSDMMCState *s, Clock *clk, uint64_t cycles);
 };
 
 /* The command the CIU has on the bus, or is about to take. */

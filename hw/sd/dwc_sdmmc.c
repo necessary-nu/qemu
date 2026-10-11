@@ -381,22 +381,29 @@ static int64_t dwc_cycles_ns(uint64_t period, uint64_t cycles)
     return MAX((lo >> 32 | hi << 32) + !!(uint32_t)lo, 1);
 }
 
-static int64_t dwc_after(uint64_t period, uint64_t cycles)
+/* @ns from now. */
+static int64_t dwc_after(int64_t ns)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    int64_t ns = dwc_cycles_ns(period, cycles);
 
     return ns > INT64_MAX - now ? INT64_MAX : now + ns;
 }
 
+static int64_t dwc_default_clock_ns(DWCSDMMCState *s, Clock *clk,
+                                    uint64_t cycles)
+{
+    return dwc_cycles_ns(clock_get(clk), cycles);
+}
+
+/* cclk_in's cycles in one of the CIU's clock. */
+static uint64_t dwc_ciu_div(DWCSDMMCState *s)
+{
+    return s->clk_edge_div ? CLK_EDGE_N(s->clk_edge_sel) + 1 : 1;
+}
+
 static uint64_t dwc_default_cclk_period(DWCSDMMCState *s)
 {
-    uint64_t period = clock_get(s->cclk);
-
-    if (s->clk_edge_div) {
-        period *= CLK_EDGE_N(s->clk_edge_sel) + 1;
-    }
-    return period;
+    return clock_get(s->cclk) * dwc_ciu_div(s);
 }
 
 static uint64_t dwc_cclk_period(DWCSDMMCState *s)
@@ -404,23 +411,45 @@ static uint64_t dwc_cclk_period(DWCSDMMCState *s)
     return DWC_SDMMC_GET_CLASS(s)->cclk_period(s);
 }
 
+/* @cycles of the CIU's clock in ns: the clock must be running. */
+static int64_t dwc_cclk_ns(DWCSDMMCState *s, uint64_t cycles)
+{
+    return DWC_SDMMC_GET_CLASS(s)->clock_ns(s, s->cclk,
+                                            cycles * dwc_ciu_div(s));
+}
+
 static uint64_t dwc_hclk_period(DWCSDMMCState *s)
 {
     return clock_get(s->hclk);
 }
 
-/* The card clock of @slot as the CIU has it configured; 0 if stopped. */
-static uint64_t dwc_card_period(DWCSDMMCState *s, unsigned slot)
+/* @cycles of the bus clock in ns: it must be running. */
+static int64_t dwc_hclk_ns(DWCSDMMCState *s, uint64_t cycles)
 {
-    uint64_t period = dwc_cclk_period(s);
+    return DWC_SDMMC_GET_CLASS(s)->clock_ns(s, s->hclk, cycles);
+}
+
+/*
+ * The card clock of @slot as the CIU has it configured, in cycles of the
+ * CIU's clock; 0 if stopped.
+ */
+static uint64_t dwc_card_div(DWCSDMMCState *s, unsigned slot)
+{
     unsigned src, div;
 
-    if (slot >= s->num_slots || !(s->ciu_clkena & BIT(slot)) || !period) {
+    if (slot >= s->num_slots || !(s->ciu_clkena & BIT(slot)) ||
+        !dwc_cclk_period(s)) {
         return 0;
     }
     src = extract32(s->ciu_clksrc, 2 * slot, 2);
     div = extract32(s->ciu_clkdiv, 8 * src, 8);
-    return div ? period * 2 * div : period;
+    return div ? 2 * div : 1;
+}
+
+/* @cycles of a card clock of @div from now. */
+static int64_t dwc_card_after(DWCSDMMCState *s, uint64_t div, uint64_t cycles)
+{
+    return dwc_after(dwc_cclk_ns(s, cycles * div));
 }
 
 static SDBus *dwc_bus(DWCSDMMCState *s, unsigned slot)
@@ -533,7 +562,7 @@ static void dwc_cmd_try_take(DWCSDMMCState *s)
         return;
     }
     s->cmd_phase = DWC_CMD_TAKING;
-    timer_mod(&s->cmd_timer, dwc_after(period, CIU_SYNC_CYCLES));
+    timer_mod(&s->cmd_timer, dwc_after(dwc_cclk_ns(s, CIU_SYNC_CYCLES)));
 }
 
 static void dwc_idmac_start(DWCSDMMCState *s);
@@ -588,7 +617,7 @@ static void dwc_cmd_issue(DWCSDMMCState *s, uint32_t cmd, uint32_t arg,
 {
     unsigned slot = CMD_CARD_NUM(cmd);
     unsigned index = CMD_INDEX(cmd);
-    uint64_t period = dwc_card_period(s, slot);
+    uint64_t div = dwc_card_div(s, slot);
     SDBus *bus = dwc_bus(s, slot);
     uint64_t cycles, sent;
     uint8_t resp[16];
@@ -605,7 +634,7 @@ static void dwc_cmd_issue(DWCSDMMCState *s, uint32_t cmd, uint32_t arg,
         s->cmd_phase = DWC_CMD_STALLED;
         return;
     }
-    if (!period) {
+    if (!div) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: CMD%u to card %u, whose clock "
                       "is stopped, goes nowhere\n", TYPE_DWC_SDMMC, index,
                       slot);
@@ -683,9 +712,9 @@ static void dwc_cmd_issue(DWCSDMMCState *s, uint32_t cmd, uint32_t arg,
         s->pend_rint |= INT_HTO;
     }
 
-    s->cmd_sent_ns = dwc_after(period, sent);
+    s->cmd_sent_ns = dwc_card_after(s, div, sent);
     s->cmd_phase = DWC_CMD_BUSY;
-    timer_mod(&s->cmd_timer, dwc_after(period, cycles));
+    timer_mod(&s->cmd_timer, dwc_card_after(s, div, cycles));
 
     if (!autostop && (cmd & CMD_DATA_EXPECTED)) {
         dwc_data_setup(s, cmd);
@@ -771,16 +800,16 @@ static void dwc_cmd_timer(void *opaque)
 
 static void dwc_timeout_arm(DWCSDMMCState *s, int kind)
 {
-    uint64_t period = dwc_card_period(s, s->data_slot);
+    uint64_t div = dwc_card_div(s, s->data_slot);
 
     if (s->timeout_kind == kind ||
         (kind == TIMEOUT_HTO && s->timeout_kind == TIMEOUT_HTO_RAISED)) {
         return;
     }
     s->timeout_kind = kind;
-    if (period) {
+    if (div) {
         timer_mod(&s->timeout_timer,
-                  dwc_after(period, extract32(s->tmout, 8, 24)));
+                  dwc_card_after(s, div, extract32(s->tmout, 8, 24)));
     } else {
         timer_del(&s->timeout_timer);
     }
@@ -835,7 +864,7 @@ static uint32_t dwc_block_remaining(DWCSDMMCState *s)
 static void dwc_data_kick(DWCSDMMCState *s)
 {
     uint32_t n, room, block_left;
-    uint64_t period, cycles;
+    uint64_t div, cycles;
     SDBus *bus = dwc_bus(s, s->data_slot);
     bool block_start, block_end, stalled;
 
@@ -846,8 +875,8 @@ static void dwc_data_kick(DWCSDMMCState *s)
         dwc_data_end(s, 0, true);
         return;
     }
-    period = dwc_card_period(s, s->data_slot);
-    if (!period) {
+    div = dwc_card_div(s, s->data_slot);
+    if (!div) {
         return;
     }
     block_left = dwc_block_remaining(s);
@@ -899,7 +928,7 @@ static void dwc_data_kick(DWCSDMMCState *s)
     }
     s->chunk_len = n;
     s->chunk_busy = true;
-    timer_mod(&s->data_timer, dwc_after(period, cycles));
+    timer_mod(&s->data_timer, dwc_card_after(s, div, cycles));
 }
 
 static void dwc_data_timer(void *opaque)
@@ -1186,10 +1215,10 @@ static void dwc_resets_schedule(DWCSDMMCState *s)
         timer_del(&s->reset_timer);
         return;
     }
-    delay = dwc_cycles_ns(hclk, RESET_CYCLES);
+    delay = dwc_hclk_ns(s, RESET_CYCLES);
     if ((s->resets_pending & (CTRL_CONTROLLER_RESET | CTRL_FIFO_RESET)) &&
         cclk) {
-        delay += dwc_cycles_ns(cclk, RESET_CYCLES);
+        delay += dwc_cclk_ns(s, RESET_CYCLES);
     }
     timer_mod(&s->reset_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay);
@@ -1805,7 +1834,7 @@ static void dwc_debounce_arm(DWCSDMMCState *s, unsigned slot)
     }
     if (hclk) {
         timer_mod(&s->debounce_timer[slot],
-                  dwc_after(hclk, extract32(s->debnce, 0, 24)));
+                  dwc_after(dwc_hclk_ns(s, extract32(s->debnce, 0, 24))));
     }
 }
 
@@ -2168,6 +2197,7 @@ static void dwc_sdmmc_class_init(ObjectClass *klass, const void *data)
     rc->phases.hold = dwc_sdmmc_reset_hold;
     rc->phases.exit = dwc_sdmmc_reset_exit;
     sc->cclk_period = dwc_default_cclk_period;
+    sc->clock_ns = dwc_default_clock_ns;
 }
 
 static void dwc_sdmmc_bus_class_init(ObjectClass *klass, const void *data)

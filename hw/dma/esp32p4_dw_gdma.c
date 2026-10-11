@@ -76,7 +76,9 @@
  * with AXI port 5 (master 1) or 6 (master 2) and the channel as unit.
  *
  * Timing: at AXI_DMAC_CORE_CLK, the controller's GDMA_SYS_CLK, each
- * transaction takes a bus cycle per 64-bit beat, an LLI fetch five. A
+ * transaction takes a bus cycle per 64-bit beat, an LLI fetch five; the
+ * rounds fall on the clock's edges, counted exactly from its last
+ * change. A
  * read arbiter (LLI fetches first, then source reads) and a write arbiter
  * (destination writes) each grant one transaction at a time, to the
  * highest CH_PRIOR, round robin among equals where the TRM says the
@@ -860,14 +862,21 @@ static int dw_grant(ESP32P4DwGdmaState *s, bool write, bool *lli)
     return best;
 }
 
+/* Arm the engine's timer for a round at bus cycle @cycle. */
+static void dw_arm(ESP32P4DwGdmaState *s, uint64_t cycle)
+{
+    s->due_cycle = cycle;
+    timer_mod(s->timer, esp32p4_clk_count_time(&s->bus_edges, cycle));
+}
+
 /*
- * One round of the bus: the read and the write arbiters each grant a
- * transaction, and the engine comes back when they are over.
+ * One round of the bus, on an edge of its clock: the read and the write
+ * arbiters each grant a transaction, and the engine comes back when they
+ * are over, as many cycles later.
  */
 /* [spec:nuos:req:emu.esp32p4.dma] */
 static void dw_run(ESP32P4DwGdmaState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t cost = 0;
     bool lli;
     int r, w;
@@ -894,7 +903,7 @@ static void dw_run(ESP32P4DwGdmaState *s)
         cost += ch_progress(s, n);
     }
     if (cost || r >= 0 || w >= 0) {
-        timer_mod(s->timer, now + clock_ticks_to_ns(s->clk, MAX(cost, 1)));
+        dw_arm(s, s->due_cycle + MAX(cost, 1));
     }
 }
 
@@ -903,22 +912,36 @@ static void dw_timer_cb(void *opaque)
     dw_run(opaque);
 }
 
+/* Look for work at the bus clock's next edge. */
 static void dw_kick(ESP32P4DwGdmaState *s)
 {
     if (!timer_pending(s->timer) && clock_is_enabled(s->clk)) {
-        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                            clock_ticks_to_ns(s->clk, 1));
+        dw_arm(s, esp32p4_clk_count_at(&s->bus_edges,
+                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) + 1);
     }
 }
 
+/*
+ * The bus clock changes: its cycles are counted afresh from the change,
+ * and a round under way takes the cycles it has left, at the new rate.
+ */
 static void dw_clk_update(void *opaque, ClockEvent event)
 {
     ESP32P4DwGdmaState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t done = esp32p4_clk_count_at(&s->bus_edges, now);
+    uint64_t left = 0;
 
-    if (clock_is_enabled(s->clk)) {
-        dw_kick(s);
-    } else {
+    if (timer_pending(s->timer)) {
+        left = s->due_cycle > done ? s->due_cycle - done : 1;
+    }
+    esp32p4_clk_count_start(&s->bus_edges, s->clk, now);
+    if (!clock_is_enabled(s->clk)) {
         timer_del(s->timer);
+    } else if (left) {
+        dw_arm(s, left);
+    } else {
+        dw_kick(s);
     }
 }
 
@@ -1459,6 +1482,10 @@ static void esp32p4_dw_gdma_reset_hold(Object *obj, ResetType type)
     ESP32P4DwGdmaState *s = ESP32P4_DW_GDMA(obj);
 
     timer_del(s->timer);
+    if (!esp32p4_clk_count_running(&s->bus_edges)) {
+        esp32p4_clk_count_start(&s->bus_edges, s->clk,
+                                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
     for (int n = 0; n < NCH; n++) {
         ESP32P4DwGdmaChan *c = &s->ch[n];
 
@@ -1586,8 +1613,8 @@ static const VMStateDescription vmstate_esp32p4_dw_gdma_chan = {
 
 static const VMStateDescription vmstate_esp32p4_dw_gdma = {
     .name = TYPE_ESP32P4_DW_GDMA,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(ch, ESP32P4DwGdmaState, NCH, 1,
                              vmstate_esp32p4_dw_gdma_chan,
@@ -1604,6 +1631,8 @@ static const VMStateDescription vmstate_esp32p4_dw_gdma = {
         VMSTATE_BOOL_ARRAY(hs_last, ESP32P4DwGdmaState, ESP32P4_DW_GDMA_HS),
         VMSTATE_UINT32_ARRAY(rr_last, ESP32P4DwGdmaState, 2),
         VMSTATE_CLOCK(clk, ESP32P4DwGdmaState),
+        VMSTATE_ESP32P4_CLK_COUNT(bus_edges, ESP32P4DwGdmaState),
+        VMSTATE_UINT64(due_cycle, ESP32P4DwGdmaState),
         VMSTATE_TIMER_PTR(timer, ESP32P4DwGdmaState),
         VMSTATE_END_OF_LIST()
     },

@@ -265,11 +265,19 @@ static bool core_takes_input(ESP32P4BsCore *c)
     return (c->ctrl & CTRL_ENA) && c->state == BS_RUN && !c->reset_held;
 }
 
+/* Arm the core's timer for its step at clock cycle @cycle. */
+static void core_arm(ESP32P4BsCore *c, uint64_t cycle)
+{
+    c->due_cycle = cycle;
+    timer_mod(c->timer, esp32p4_clk_count_time(&c->edges, cycle));
+}
+
+/* Step at the clock's next edge. */
 static void core_kick(ESP32P4BsCore *c)
 {
     if (core_active(c) && !timer_pending(c->timer)) {
-        timer_mod(c->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                            clock_ticks_to_ns(c->clk, 1));
+        core_arm(c, esp32p4_clk_count_at(&c->edges,
+                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) + 1);
     }
 }
 
@@ -862,19 +870,24 @@ static void core_timer_cb(void *opaque)
     progress = core_active(c) && core_step(c);
     core_exchange(c, out_had, in_full);
     if (progress && core_active(c)) {
-        timer_mod(c->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                            clock_ticks_to_ns(c->clk, 1));
+        core_arm(c, c->due_cycle + 1);
     }
 }
 
+/* The clock changes: its cycles are counted afresh from the change. */
 static void core_clk_update(void *opaque, ClockEvent event)
 {
     ESP32P4BsCore *c = opaque;
+    bool pending = timer_pending(c->timer);
 
-    if (clock_is_enabled(c->clk)) {
-        core_kick(c);
-    } else {
+    esp32p4_clk_count_start(&c->edges, c->clk,
+                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    if (!clock_is_enabled(c->clk)) {
         timer_del(c->timer);
+    } else if (pending) {
+        core_arm(c, 1);
+    } else {
+        core_kick(c);
     }
 }
 
@@ -1335,6 +1348,8 @@ static const VMStateDescription vmstate_bs_core = {
         VMSTATE_STRUCT(fifo_out, ESP32P4BsCore, 1, vmstate_bs_fifo,
                        ESP32P4BsFifo),
         VMSTATE_CLOCK(clk, ESP32P4BsCore),
+        VMSTATE_ESP32P4_CLK_COUNT(edges, ESP32P4BsCore),
+        VMSTATE_UINT64(due_cycle, ESP32P4BsCore),
         VMSTATE_TIMER_PTR(timer, ESP32P4BsCore),
         VMSTATE_END_OF_LIST()
     },
@@ -1342,8 +1357,8 @@ static const VMStateDescription vmstate_bs_core = {
 
 static const VMStateDescription vmstate_bs = {
     .name = TYPE_ESP32P4_BITSCRAMBLER,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = bs_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(core, ESP32P4BitScramblerState, 2, 1,

@@ -96,7 +96,13 @@ typedef struct ESP32P4BsCore {
     unsigned periph;
     bool loop_rx;           /* also interposed on the RX path, loopback */
 
+    /*
+     * The core's clock, its cycles counted from its last change, and the
+     * cycle of the step @timer runs: a step on each edge.
+     */
     Clock *clk;
+    ESP32P4ClkCount edges;
+    uint64_t due_cycle;
     QEMUTimer *timer;
 } ESP32P4BsCore;
 

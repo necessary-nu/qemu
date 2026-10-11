@@ -1724,8 +1724,8 @@ static void spi1_schedule(ESP32P4MSPIState *s)
     }
     s->spi1_waiting = false;
     timer_mod(&s->spi1_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              clock_ticks_to_ns(s->core_clk,
-                                s->spi1_cycles * spi1_clock_div(s)));
+              esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->core_clk),
+                                    s->spi1_cycles * spi1_clock_div(s)));
 }
 
 /* The cycles of the status read FLASH_WAITI_CTRL makes after an operation. */

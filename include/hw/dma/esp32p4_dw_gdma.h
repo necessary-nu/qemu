@@ -10,6 +10,7 @@
 #define HW_DMA_ESP32P4_DW_GDMA_H
 
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "hw/core/clock.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -128,6 +129,12 @@ struct ESP32P4DwGdmaState {
     qemu_irq hs_ack[ESP32P4_DW_GDMA_HS];
     Clock *clk;
     QEMUTimer *timer;
+    /*
+     * The bus clock's cycles, counted from its last change, and the cycle
+     * of the round @timer runs.
+     */
+    ESP32P4ClkCount bus_edges;
+    uint64_t due_cycle;
     AddressSpace *as;
     Object *pms;
 
