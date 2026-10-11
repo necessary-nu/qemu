@@ -71,6 +71,7 @@
 #define HP_RST_EN0          0x500e60c0
 #define LP_TIMER_UPDATE     0x50112010
 #define LP_TIMER_BUF0_LO    0x50112014
+#define UPDATE_SYS_RST      (1u << 31)
 #define INTMTX_STATUS0      0x500d6200
 #define SRC_LP_WDT          1
 
@@ -273,7 +274,8 @@ static void test_resets(void)
 
 /*
  * The RTC watchdog's system reset, cause 0x10 for every core: the LP_WDT
- * returns to its reset state; the RTC timer counts on through it.
+ * returns to its reset state; the RTC timer counts on through it, and logs
+ * the reset (MAIN_TIMER_SYS_RST) at its watchdog's timeout.
  */
 /* [spec:nuos:req:emu.esp32p4.timers/test] */
 static void test_system_reset(void)
@@ -283,10 +285,14 @@ static void test_system_reset(void)
 
     step(qts, 10 * MS);
     before = lp_time(qts);
+    qtest_writel(qts, LP_TIMER_UPDATE, UPDATE_SYS_RST);
     wr(qts, WPROTECT, WKEY);
     wr(qts, CONFIG(0), 75);
     wr(qts, CONFIG0, C0_STG(0, STG_SYS) | C0_EN);
-    await_reset(qts, 1 * MS);
+    step(qts, 1 * MS - 1);
+    g_assert_cmphex(LP_CAUSE(qtest_readl(qts, RESET_CAUSE)), ==, 0x01);
+    await_reset(qts, 1);
+    g_assert_cmpuint(qtest_readl(qts, LP_TIMER_BUF0_LO) - before, ==, 150);
     cause = qtest_readl(qts, RESET_CAUSE);
     g_assert_cmphex(CORE0_CAUSE(cause), ==, 0x10);
     g_assert_cmphex(CORE1_CAUSE(cause), ==, 0x10);
