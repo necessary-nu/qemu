@@ -28,7 +28,6 @@
 #define KM              0x50089000
 #define HUK             0x50114000
 #define TRNG            0x50126000
-#define LP_SYS_RNG_DATA 0x501101a4
 #define HP_SYS          0x500e5000
 #define MEM             0x4ff40000
 
@@ -951,7 +950,7 @@ static void test_rng(void)
     qtest_writel(qts, RNG_DATE, qtest_readl(qts, RNG_DATE) | RNG_CLK_EN);
     a = qtest_readl(qts, RNG_DATA);
     b = qtest_readl(qts, RNG_DATA);
-    c = qtest_readl(qts, LP_SYS_RNG_DATA);
+    c = qtest_readl(qts, RNG_DATA);
     g_assert_true(a != b || b != c);
     g_assert_true(a || b || c);
 

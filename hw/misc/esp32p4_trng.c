@@ -9,8 +9,7 @@
  * 35 (Random Number Generator), ESP-IDF's trng_reg.h for v3, rng_ll.h and
  * hw_random.c.
  *
- * Each read of RNG_DATA_REG (or of LP_SYSTEM_REG_RNG_DATA_REG, which
- * reads the same generator) gives a new 32-bit number from the host's
+ * Each read of RNG_DATA_REG gives a new 32-bit number from the host's
  * CSPRNG (qemu_guest_getrandom), while the generator runs: RNG_CLK_EN
  * (bit 31 of RNG_DATE_REG, clear from reset; ESP-IDF's rng_ll_enable()
  * sets it), RNG_RSTN set and its clock running. Otherwise the register
@@ -78,8 +77,9 @@ static void trng_settle(ESP32P4TrngState *s)
     s->sample_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
+/* RNG_DATA_REG: a new number while the generator runs. */
 /* [spec:nuos:req:emu.esp32p4.crypto] */
-uint32_t esp32p4_trng_read(ESP32P4TrngState *s)
+static uint32_t trng_data(ESP32P4TrngState *s)
 {
     if (trng_running(s)) {
         qemu_guest_getrandom_nofail(&s->data, sizeof(s->data));
@@ -97,7 +97,7 @@ static uint64_t trng_read(void *opaque, hwaddr addr, unsigned size)
         v = deposit32(s->cfg, 24, 8, s->samples + trng_new_samples(s));
         break;
     case A_DATA:
-        v = esp32p4_trng_read(s);
+        v = trng_data(s);
         break;
     case A_RSTN:
         v = s->rstn;

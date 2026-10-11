@@ -40,11 +40,4 @@ struct ESP32P4TrngState {
     int64_t sample_ns;
 };
 
-/*
- * The next random number, as RNG_DATA_REG gives it: the generator's
- * output, which only changes while it runs (RNG_CLK_EN set, RNG_RSTN
- * set, its clock running).
- */
-uint32_t esp32p4_trng_read(ESP32P4TrngState *s);
-
 #endif
