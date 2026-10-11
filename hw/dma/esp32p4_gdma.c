@@ -1294,6 +1294,37 @@ size_t esp32p4_gdma_rx_room(ESP32P4GdmaState *s, unsigned periph)
                                          : fifo_room(&s->ch[IN][ch].fifo);
 }
 
+bool esp32p4_gdma_tx_flowing(ESP32P4GdmaState *s, unsigned periph)
+{
+    int ch = periph_chan(s, periph, OUT);
+    ESP32P4GdmaChan *c;
+
+    if (ch < 0) {
+        return false;
+    }
+    c = &s->ch[OUT][ch];
+    if (c->fifo.num) {
+        return true;
+    }
+    return clock_is_enabled(s->clk) && c->active && !c->end &&
+           !chan_cmd_disabled(s, OUT, c);
+}
+
+bool esp32p4_gdma_rx_flowing(ESP32P4GdmaState *s, unsigned periph)
+{
+    int ch = periph_chan(s, periph, IN);
+    ESP32P4GdmaChan *c;
+
+    if (ch < 0 || !rx_accepts(s, ch)) {
+        return false;
+    }
+    c = &s->ch[IN][ch];
+    if (fifo_room(&c->fifo)) {
+        return true;
+    }
+    return clock_is_enabled(s->clk) && (c->has_desc || !c->end);
+}
+
 /* [spec:nuos:req:emu.esp32p4.dma] */
 size_t esp32p4_gdma_pull(ESP32P4GdmaState *s, unsigned periph,
                          uint8_t *buf, size_t len, bool *eof)
