@@ -70,9 +70,9 @@
  *     detector, its interrupt source 8; and the LP mailbox (0x50118000),
  *     its interrupts sources 4 and 5.
  *   - The event task matrix (TRM chapter 14) at 0x500D5000, mapping the
- *     events of the GPIO matrix, the timers, the RTC timer and GDMA to
- *     the tasks of the GPIO matrix, the timer groups, GDMA and the LP
- *     core.
+ *     events of the GPIO matrix, the timers, the RTC timer, GDMA, the LED
+ *     PWM controller and MCPWM to the tasks of the GPIO matrix, the timer
+ *     groups, GDMA, the LED PWM controller, MCPWM and the LP core.
  *   - Permission control (TRM chapter 20): the HP, LP and DMA access
  *     permission managers, through which every core (and DMA master)
  *     reaches the bus, each access carrying its master and privilege mode,
@@ -281,6 +281,15 @@
  *
  *       -global esp32p4-huk.puf-seed=0x1234
  *
+ *   - The LED PWM controller (TRM chapter 58) at 0x500D3000, behind
+ *     LEDC_APB_CLK and its reset, its timers on LEDC_CLK, its interrupt
+ *     LEDC_INTR (source 52) and its eight outputs matrix signals 126 to
+ *     133; and MCPWM0 and MCPWM1 (TRM chapter 59) at 0x500C0000 and
+ *     0x500C1000, each behind MCPWMn_APB_CLK and its reset, on MCPWMn_CLK,
+ *     its interrupt PWMn_INTR (sources 38 and 39), its six outputs, sync,
+ *     fault and capture inputs matrix signals 89 to 106. Their ETM events
+ *     and tasks are the ETM's.
+ *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
  * a file longer than 512 bytes. A blank, all-zero, file starts as a
@@ -379,9 +388,6 @@ static const struct {
     { "h264-dma",         0x500a7000, 4 * KiB },
 
     /* HP peripherals 1. */
-    { "mcpwm0",           0x500c0000, 4 * KiB },
-    { "mcpwm1",           0x500c1000, 4 * KiB },
-    { "ledc",             0x500d3000, 4 * KiB },
     { "lcd-cam",          0x500dc000, 4 * KiB },
     { "adc",              0x500de000, 4 * KiB },
     { "iomux-mspi-pin",   0x500e1200, 4 * KiB - 0x200 },
@@ -2424,6 +2430,83 @@ static void esp32p4_init_twai(ESP32P4MachineState *s)
 }
 
 /*
+ * The LED PWM controller and MCPWM0 and MCPWM1: each behind its bus clock
+ * and reset (RST_EN_LEDC, RST_EN_PWMn), timed by its function clock, its
+ * interrupt a source of the interrupt matrix, its pad signals through the
+ * GPIO matrix.
+ */
+/* [spec:nuos:req:emu.esp32p4.pwm] */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+static void esp32p4_init_pwm(ESP32P4MachineState *s)
+{
+    DeviceState *dev, *gpio = DEVICE(&s->gpio);
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    int i, n;
+
+    object_initialize_child(OBJECT(s), "ledc", &s->ledc, TYPE_ESP32P4_LEDC);
+    dev = DEVICE(&s->ledc);
+    qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, "ledc"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_LEDC_BASE, ESP32P4_CLK_LEDC_APB,
+                             ESP32P4_RST_LEDC, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LEDC));
+    for (n = 0; n < ESP32P4_LEDC_CHANNELS; n++) {
+        qdev_connect_gpio_out_named(dev, ESP32P4_LEDC_OUT, n,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                ESP32P4_SIG_LEDC_LS_SIG_OUT_PAD_OUT0 + n));
+    }
+
+    for (i = 0; i < ESP32P4_MCPWM_NUM; i++) {
+        static const struct {
+            int out, sync, fault, cap;
+        } sig[ESP32P4_MCPWM_NUM] = {
+            { ESP32P4_SIG_PWM0_CH0_A_PAD_OUT, ESP32P4_SIG_PWM0_SYNC0_PAD_IN,
+              ESP32P4_SIG_PWM0_F0_PAD_IN, ESP32P4_SIG_PWM0_CAP0_PAD_IN },
+            { ESP32P4_SIG_PWM1_CH0_A_PAD_OUT, ESP32P4_SIG_PWM1_SYNC0_PAD_IN,
+              ESP32P4_SIG_PWM1_F0_PAD_IN, ESP32P4_SIG_PWM1_CAP0_PAD_IN },
+        };
+        g_autofree char *name = g_strdup_printf("mcpwm%d", i);
+
+        object_initialize_child(OBJECT(s), name, &s->mcpwm[i],
+                                TYPE_ESP32P4_MCPWM);
+        dev = DEVICE(&s->mcpwm[i]);
+        qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, name));
+        sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+        esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                                 ESP32P4_MCPWM0_BASE +
+                                 i * ESP32P4_MCPWM_STRIDE,
+                                 ESP32P4_CLK_MCPWM0_APB + i,
+                                 ESP32P4_RST_PWM0 + i, 0);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           esp32p4_intr_source(s, ESP32P4_INTR_PWM0 + i));
+        for (n = 0; n < ESP32_MCPWM_OUTS; n++) {
+            qdev_connect_gpio_out_named(dev, ESP32_MCPWM_OUT, n,
+                qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                                       sig[i].out + n));
+        }
+        for (n = 0; n < ESP32_MCPWM_SYNCS; n++) {
+            qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                sig[i].sync + n,
+                qdev_get_gpio_in_named(dev, ESP32_MCPWM_SYNC_IN, n));
+        }
+        for (n = 0; n < ESP32_MCPWM_FAULTS; n++) {
+            qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                sig[i].fault + n,
+                qdev_get_gpio_in_named(dev, ESP32_MCPWM_FAULT_IN, n));
+        }
+        for (n = 0; n < ESP32_MCPWM_CAPS; n++) {
+            qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+                sig[i].cap + n,
+                qdev_get_gpio_in_named(dev, ESP32_MCPWM_CAP_IN, n));
+        }
+    }
+}
+
+/*
  * The BitScrambler, between GDMA and the peripherals HP_SYSTEM attaches it
  * to; and the parallel IO controller, served by GDMA-AXI, its pads through
  * the GPIO matrix.
@@ -2698,8 +2781,8 @@ static void esp32p4_init_rmt_pcnt(ESP32P4MachineState *s)
  *
  * The RMT and the PCNT have no events or tasks on the P4.
  *
- * Not connected, as their blocks are not modelled: the LED PWM, MCPWM,
- * ADC, REGDMA, temperature sensor and 2D-DMA events and tasks;
+ * Not connected, as their blocks are not modelled: the ADC, REGDMA,
+ * temperature sensor and 2D-DMA events and tasks;
  * the LP core's events (ULP_EVT_*) and ULP_TASK_WAKEUP_CPU, the PMU's LP
  * core wakeup, whose LP_CORE_ETM_WAKEUP_FLAG in LP_SYS is not modelled;
  * and the RTC timer's tasks (RTC_TASK_*), which the TRM says it does not
@@ -2811,6 +2894,41 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
         for (k = 0; k < ESP32P4_GDMA_ETM_TASKS; k++) {
             esp32p4_etm_connect_task(etm, task[g] + k, dev,
                                      ESP32P4_GDMA_ETM_TASK, k);
+        }
+    }
+
+    /* The LED PWM controller's channels and timers. */
+    dev = DEVICE(&s->ledc);
+    for (k = 0; k < ESP32P4_LEDC_ETM_EVENTS; k++) {
+        esp32p4_etm_connect_event(etm,
+                                  ESP32P4_ETM_LEDC_EVT_DUTY_CHNG_END_CH0 + k,
+                                  dev, ESP32P4_LEDC_ETM_EVENT, k);
+    }
+    for (k = 0; k < ESP32P4_LEDC_ETM_TASKS; k++) {
+        esp32p4_etm_connect_task(etm,
+                                 ESP32P4_ETM_LEDC_TASK_TIMER0_RES_UPDATE + k,
+                                 dev, ESP32P4_LEDC_ETM_TASK, k);
+    }
+
+    /* MCPWM0 and MCPWM1. */
+    for (g = 0; g < ESP32P4_MCPWM_NUM; g++) {
+        static const int evt[] = {
+            ESP32P4_ETM_MCPWM0_EVT_TIMER0_STOP,
+            ESP32P4_ETM_MCPWM1_EVT_TIMER0_STOP,
+        };
+        static const int task[] = {
+            ESP32P4_ETM_MCPWM0_TASK_CMPR0_A_UP,
+            ESP32P4_ETM_MCPWM1_TASK_CMPR0_A_UP,
+        };
+
+        dev = DEVICE(&s->mcpwm[g]);
+        for (k = 0; k < ESP32P4_MCPWM_ETM_EVENTS; k++) {
+            esp32p4_etm_connect_event(etm, evt[g] + k, dev,
+                                      ESP32_MCPWM_ETM_EVENT, k);
+        }
+        for (k = 0; k < ESP32P4_MCPWM_ETM_TASKS; k++) {
+            esp32p4_etm_connect_task(etm, task[g] + k, dev,
+                                     ESP32_MCPWM_ETM_TASK, k);
         }
     }
 
@@ -3653,6 +3771,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_i2s(s);
     esp32p4_init_i3c(s);
     esp32p4_init_twai(s);
+    esp32p4_init_pwm(s);
     esp32p4_init_rmt_pcnt(s);
     esp32p4_init_etm(s);
     esp32p4_init_usb(s);

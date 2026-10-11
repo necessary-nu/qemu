@@ -47,9 +47,11 @@
 #include "hw/misc/esp32p4_keymng.h"
 #include "hw/misc/esp32p4_lp_ana.h"
 #include "hw/misc/esp32p4_lp_mailbox.h"
+#include "hw/misc/esp32p4_ledc.h"
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/misc/esp32p4_parlio.h"
 #include "hw/misc/esp32p4_pcnt.h"
+#include "hw/misc/esp32_mcpwm.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "hw/misc/esp32p4_pmu.h"
 #include "hw/misc/esp32p4_rmt.h"
@@ -118,6 +120,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 #define ESP32P4_LPPERI_BASE         0x50120000
 #define ESP32P4_I2C_ANA_MST_BASE    0x50124000
 #define ESP32P4_EFUSE_BASE          0x5012d000
+#define ESP32P4_MCPWM0_BASE         0x500c0000
+#define ESP32P4_MCPWM_STRIDE        0x1000
+#define ESP32P4_MCPWM_NUM           2
 
 /* Where each core starts from reset. */
 #define ESP32P4_HP_RESET_VECTOR     ESP32P4_HP_ROM_BASE
@@ -189,6 +194,8 @@ struct ESP32P4MachineState {
     CanBusState *canbus[ESP32P4_TWAI_NUM];
     ESP32P4RmtState rmt;
     ESP32P4PcntState pcnt;
+    ESP32P4LedcState ledc;
+    Esp32McpwmState mcpwm[ESP32P4_MCPWM_NUM];
 
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];
