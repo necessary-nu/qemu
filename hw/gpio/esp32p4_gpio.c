@@ -396,7 +396,8 @@ static bool sig_in_default(unsigned sig)
  * Output signals of peripherals that hold them high out of reset, which
  * start high so that a peripheral not yet driving the line does not pull
  * its pad low: the UARTs' TXD, RTS and DTR, the SPI chip selects, the
- * I2C and I3C lines, the TWAIs' TX (recessive) and the LCD's CS.
+ * I2C and I3C lines, the TWAIs' TX (recessive), the LCD's CS and
+ * PARLIO's TX CS.
  */
 static bool sig_out_idle(unsigned sig)
 {
@@ -411,6 +412,7 @@ static bool sig_out_idle(unsigned sig)
     case 86:            /* TWAI2 TX */
     case 134 ... 137:   /* I3C master and slave SCL and SDA */
     case 144:           /* LCD CS */
+    case 242:           /* PARLIO TX CS */
         return true;
     default:
         return false;

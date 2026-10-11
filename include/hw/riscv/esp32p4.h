@@ -14,6 +14,7 @@
 #include "hw/cpu/cluster.h"
 #include "hw/core/or-irq.h"
 #include "hw/core/split-irq.h"
+#include "hw/dma/esp32p4_bitscrambler.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/dma/esp32p4_gdma.h"
 #include "hw/gpio/esp32p4_gpio.h"
@@ -35,6 +36,7 @@
 #include "hw/misc/esp32p4_lp_ana.h"
 #include "hw/misc/esp32p4_lp_mailbox.h"
 #include "hw/misc/esp32p4_lp_sys.h"
+#include "hw/misc/esp32p4_parlio.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "hw/misc/esp32p4_pmu.h"
 #include "hw/misc/esp32p4_trace.h"
@@ -157,6 +159,8 @@ struct ESP32P4MachineState {
     ESP32P4DwGdmaState vdma;
     /* GP-SPI2, GP-SPI3. */
     ESP32P4SpiState spi[2];
+    ESP32P4BitScramblerState bitscrambler;
+    ESP32P4ParlioState parlio;
     ESP32P4TwaiState twai;
     /* The QEMU CAN buses on TWAI0 to TWAI2's pads, or NULL. */
     CanBusState *canbus[ESP32P4_TWAI_NUM];

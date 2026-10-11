@@ -142,6 +142,16 @@
  *
  *       -device w25q32,bus=spi2,cs=0
  *
+ *   - The BitScrambler (TRM chapter 62) at 0x500A3000, behind
+ *     BITSCRAMBLER_SYS_CLK and its reset, its TX and RX cores on
+ *     BITSCRAMBLER_TX/RX_SYS_CLK with resets of their own, in the DMA
+ *     paths HP_SYSTEM_BITSCRAMBLER_PERI_SEL attaches them to.
+ *   - The parallel IO controller (TRM chapter 61) at 0x500CF000, behind
+ *     PARLIO_APB_CLK and the PARLIO reset, its units on PARLIO_TX_CLK and
+ *     PARLIO_RX_CLK (or their pads, through the GPIO matrix) with their
+ *     own resets and its DMA on PARLIO_SYS_CLK through GDMA-AXI, its pad
+ *     signals matrix signals 186 to 203 and 242 (TX CS), its interrupts
+ *     HP_PARLIO_RX_INTR and _TX_INTR (sources 113 and 114).
  *   - The debug blocks (TRM chapters 3, 22 and 23): the debug assistant at
  *     0x3FF06000, watching the HP cores' SP, their accesses to four
  *     regions and their PCs; each HP core's RISC-V trace encoder, at
@@ -293,7 +303,6 @@ static const struct {
     { "dsi-bridge",       0x500a0800, 2 * KiB },
     { "isp",              0x500a1000, 4 * KiB },
     { "rmt",              0x500a2000, 4 * KiB },
-    { "bitscrambler",     0x500a3000, 4 * KiB },
     /* The AXI ICM's QoS command interface, above its own registers. */
     { "axi-icm-qos",      0x500a4400, 3 * KiB },
     { "h264-dma",         0x500a7000, 4 * KiB },
@@ -310,7 +319,6 @@ static const struct {
     { "uart2",            0x500cc000, 4 * KiB },
     { "uart3",            0x500cd000, 4 * KiB },
     { "uart4",            0x500ce000, 4 * KiB },
-    { "parl-io",          0x500cf000, 4 * KiB },
     { "usb-serial-jtag",  0x500d2000, 4 * KiB },
     { "ledc",             0x500d3000, 4 * KiB },
     { "lcd-cam",          0x500dc000, 4 * KiB },
@@ -2346,6 +2354,104 @@ static void esp32p4_init_twai(ESP32P4MachineState *s)
 }
 
 /*
+ * The BitScrambler, between GDMA and the peripherals HP_SYSTEM attaches it
+ * to; and the parallel IO controller, served by GDMA-AXI, its pads through
+ * the GPIO matrix.
+ */
+/* [spec:nuos:req:emu.esp32p4.parlio] */
+static void esp32p4_init_parlio(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
+    DeviceState *hp_sys = DEVICE(&s->hp_sys);
+    DeviceState *dev;
+    SysBusDevice *sbd;
+    int i;
+
+    object_initialize_child(OBJECT(s), "bitscrambler", &s->bitscrambler,
+                            TYPE_ESP32P4_BITSCRAMBLER);
+    dev = DEVICE(&s->bitscrambler);
+    object_property_set_link(OBJECT(dev), "ahb-gdma", OBJECT(&s->gdma[0]),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "axi-gdma", OBJECT(&s->gdma[1]),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "tx-clk",
+                          qdev_get_clock_out(clkrst, "bitscrambler-tx-sys"));
+    qdev_connect_clock_in(dev, "rx-clk",
+                          qdev_get_clock_out(clkrst, "bitscrambler-rx-sys"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_BITSCRAMBLER_BASE,
+                             ESP32P4_CLK_BITSCRAMBLER_SYS,
+                             ESP32P4_RST_BITSCRAMBLER, 0);
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_BITSCRAMBLER_TX,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_BS_CORE_RESET, ESP32P4_BS_TX));
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_BITSCRAMBLER_RX,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_BS_CORE_RESET, ESP32P4_BS_RX));
+    for (i = 0; i < ESP32P4_HP_SYS_BS_PERI_SEL_LINES; i++) {
+        qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_BS_PERI_SEL, i,
+                                    qdev_get_gpio_in_named(dev,
+                                        ESP32P4_BS_PERI_SEL, i));
+    }
+
+    object_initialize_child(OBJECT(s), "parlio", &s->parlio,
+                            TYPE_ESP32P4_PARLIO);
+    dev = DEVICE(&s->parlio);
+    sbd = SYS_BUS_DEVICE(dev);
+    object_property_set_link(OBJECT(dev), "gdma", OBJECT(&s->gdma[1]),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "clkrst", OBJECT(&s->clkrst),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "tx", qdev_get_clock_out(clkrst, "parlio-tx"));
+    qdev_connect_clock_in(dev, "rx", qdev_get_clock_out(clkrst, "parlio-rx"));
+    qdev_connect_clock_in(dev, "sys", qdev_get_clock_out(clkrst, "parlio-sys"));
+    sysbus_realize(sbd, &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, sbd, 0, ESP32P4_PARLIO_BASE,
+                             ESP32P4_CLK_PARLIO_APB, ESP32P4_RST_PARLIO, 0);
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_PARLIO_TX,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_PARLIO_CORE_RESET,
+                                    ESP32P4_PARLIO_TX));
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_PARLIO_RX,
+                                qdev_get_gpio_in_named(dev,
+                                    ESP32P4_PARLIO_CORE_RESET,
+                                    ESP32P4_PARLIO_RX));
+    sysbus_connect_irq(sbd, 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_HP_PARLIO_RX));
+    sysbus_connect_irq(sbd, 1,
+                       esp32p4_intr_source(s, ESP32P4_INTR_HP_PARLIO_TX));
+
+    for (i = 0; i < ESP32P4_PARLIO_LINES; i++) {
+        qdev_connect_gpio_out_named(dev, ESP32P4_PARLIO_TXD, i,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                                   ESP32P4_SIG_PARLIO_TX_DATA0_PAD_OUT + i));
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+            ESP32P4_SIG_PARLIO_RX_DATA0_PAD_IN + i,
+            qdev_get_gpio_in_named(dev, ESP32P4_PARLIO_RXD, i));
+    }
+    qdev_connect_gpio_out_named(dev, ESP32P4_PARLIO_TX_CLK_OUT, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                               ESP32P4_SIG_PARLIO_TX_CLK_PAD_OUT));
+    qdev_connect_gpio_out_named(dev, ESP32P4_PARLIO_RX_CLK_OUT, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                               ESP32P4_SIG_PARLIO_RX_CLK_PAD_OUT));
+    qdev_connect_gpio_out_named(dev, ESP32P4_PARLIO_TX_CS, 0,
+        qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                               ESP32P4_SIG_PARLIO_TX_CS_PAD_OUT));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+        ESP32P4_SIG_PARLIO_TX_CLK_PAD_IN,
+        qdev_get_gpio_in_named(dev, ESP32P4_PARLIO_TX_CLK_IN, 0));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+        ESP32P4_SIG_PARLIO_RX_CLK_PAD_IN,
+        qdev_get_gpio_in_named(dev, ESP32P4_PARLIO_RX_CLK_IN, 0));
+}
+
+/*
  * The event task matrix (TRM chapter 14), its registers behind
  * ETM_APB_CLK, running on ETM_SYS_CLK, held by RST_EN_ETM; and every
  * modelled block's events and tasks, by their IDs, as its header
@@ -2858,6 +2964,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_emac(s);
     esp32p4_init_dma(s);
     esp32p4_init_spi(s);
+    esp32p4_init_parlio(s);
     esp32p4_init_low_power(s);
     esp32p4_init_i3c(s);
     esp32p4_init_twai(s);
