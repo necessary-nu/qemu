@@ -400,7 +400,8 @@ static bool sig_in_default(unsigned sig)
  * Output signals of peripherals that hold them high out of reset, which
  * start high so that a peripheral not yet driving the line does not pull
  * its pad low: the UARTs' TXD, RTS and DTR, the SPI chip selects, the
- * I2C and I3C lines, the TWAIs' TX (recessive) and the LCD's CS.
+ * I2C and I3C lines, the TWAIs' TX (recessive), the LCD's CS and
+ * PARLIO's TX CS.
  */
 static bool sig_out_idle(unsigned sig)
 {
@@ -415,6 +416,7 @@ static bool sig_out_idle(unsigned sig)
     case 86:            /* TWAI2 TX */
     case 134 ... 137:   /* I3C master and slave SCL and SDA */
     case 144:           /* LCD CS */
+    case 242:           /* PARLIO TX CS */
         return true;
     default:
         return false;
@@ -843,6 +845,13 @@ static void resolve(ESP32P4GpioState *s, uint64_t *pad_out,
     uint64_t pad = 0, raw = 0, ie_mask = 0;
     uint64_t drv_low = 0, drv_high = 0, pulled = 0;
     uint64_t held = (s->ext_hold | s->lp_pad_hold) & PAD_MASK;
+
+    if (s->hold_all[ESP32P4_GPIO_HOLD_ALL_HP]) {
+        held |= PAD_MASK & ~LP_PAD_MASK;
+    }
+    if (s->hold_all[ESP32P4_GPIO_HOLD_ALL_LP]) {
+        held |= LP_PAD_MASK;
+    }
 
     for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
         bool drive, val, pu, ie;
@@ -2782,6 +2791,15 @@ static void esp32p4_gpio_set_hold(void *opaque, int n, int level)
     esp32p4_gpio_update(s);
 }
 
+/* [spec:nuos:req:emu.esp32p4.low-power] */
+static void esp32p4_gpio_set_hold_all(void *opaque, int n, int level)
+{
+    ESP32P4GpioState *s = opaque;
+
+    s->hold_all[n] = level != 0;
+    esp32p4_gpio_update(s);
+}
+
 static void esp32p4_gpio_set_light_sleep(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
@@ -3234,6 +3252,8 @@ static void esp32p4_gpio_init(Object *obj)
                             ESP32P4_GPIO_PADS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_light_sleep,
                             ESP32P4_GPIO_LIGHT_SLEEP, 1);
+    qdev_init_gpio_in_named(dev, esp32p4_gpio_set_hold_all,
+                            ESP32P4_GPIO_HOLD_ALL, ESP32P4_GPIO_HOLD_ALLS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_ana_comp,
                             ESP32P4_GPIO_ANA_COMP, ESP32P4_GPIO_ANA_COMPS);
     qdev_init_gpio_out_named(dev, &s->wakeup_out, ESP32P4_GPIO_WAKEUP, 1);
@@ -3302,8 +3322,8 @@ static const VMStateDescription vmstate_esp32p4_gpio_filter = {
 
 static const VMStateDescription vmstate_esp32p4_gpio = {
     .name = TYPE_ESP32P4_GPIO,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(iomux_clk, ESP32P4GpioState),
         VMSTATE_CLOCK(lp_clk, ESP32P4GpioState),
@@ -3379,6 +3399,8 @@ static const VMStateDescription vmstate_esp32p4_gpio = {
         VMSTATE_UINT64(ext_pull_up, ESP32P4GpioState),
         VMSTATE_UINT8_ARRAY(pad_wire, ESP32P4GpioState, ESP32P4_GPIO_PADS),
         VMSTATE_UINT64(ext_hold, ESP32P4GpioState),
+        VMSTATE_BOOL_ARRAY(hold_all, ESP32P4GpioState,
+                           ESP32P4_GPIO_HOLD_ALLS),
         VMSTATE_BOOL(light_sleep, ESP32P4GpioState),
         VMSTATE_UINT8_ARRAY(sig_out, ESP32P4GpioState, ESP32P4_GPIO_SIGS),
         VMSTATE_UINT8_ARRAY(sig_oe, ESP32P4GpioState, ESP32P4_GPIO_SIGS),

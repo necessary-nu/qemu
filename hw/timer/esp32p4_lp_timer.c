@@ -30,9 +30,10 @@
  * once if it does already, and one already passed only after the counter
  * wraps, the comparison being an equality. A target fires once and is
  * then disabled; writing EN as 0 changes nothing. Target 0 sets
- * SOC_WAKEUP_INT_RAW (MAIN_TIMER_INT in the TRM), pulses the PMU's chip
- * wakeup and the ETM event RTC_EVT_CMP; target 1 sets
- * MAIN_TIMER_LP_INT_RAW and pulses the LP core's wakeup. The overflow sets
+ * SOC_WAKEUP_INT_RAW (MAIN_TIMER_INT in the TRM), which is the PMU's
+ * RTC_TIMER_TAR0 wakeup source while it holds, and pulses the ETM event
+ * RTC_EVT_CMP; target 1 sets MAIN_TIMER_LP_INT_RAW, the PMU's
+ * RTC_TIMER_TAR1 wakeup source while it holds. The overflow sets
  * OVERFLOW_RAW and MAIN_TIMER_OVERFLOW_LP_INT_RAW and pulses RTC_EVT_OVF.
  * The INT_* registers drive LP_TIMER_REG_0_INTR and the LP_INT_* ones
  * LP_TIMER_REG_1_INTR, which is also the LP core's interrupt; their raw
@@ -132,6 +133,12 @@ static void lp_timer_sync(ESP32P4LPTimerState *s, int64_t now)
     s->sync_ns += lp_timer_cycles_ns(s->slow, cycles);
 }
 
+/*
+ * The interrupts, and the PMU's wakeups: the targets' raw bits, which hold
+ * until software clears them (ESP-IDF's rtc_timer_ll_set_wakeup_time()
+ * clears the bit before it arms the target, so that no earlier alarm
+ * wakes the chip).
+ */
 static void lp_timer_update_irqs(ESP32P4LPTimerState *s)
 {
     bool lp = (s->lp_int_raw & s->lp_int_ena) != 0;
@@ -139,6 +146,8 @@ static void lp_timer_update_irqs(ESP32P4LPTimerState *s)
     qemu_set_irq(s->irq[0], (s->int_raw & s->int_ena) != 0);
     qemu_set_irq(s->irq[1], lp);
     qemu_set_irq(s->lp_core_int, lp);
+    qemu_set_irq(s->soc_wakeup, (s->int_raw & INT_TARGET) != 0);
+    qemu_set_irq(s->lp_wakeup, (s->lp_int_raw & INT_TARGET) != 0);
 }
 
 /* [spec:nuos:req:emu.esp32p4.timers] */
@@ -201,12 +210,10 @@ static void lp_timer_fire(ESP32P4LPTimerState *s, int n, int64_t when)
     if (n == 0) {
         s->int_raw |= INT_TARGET;
         lp_timer_update_irqs(s);
-        qemu_irq_pulse(s->soc_wakeup);
         lp_timer_etm_event(s, ESP32P4_LP_TIMER_EVT_CMP, when);
     } else {
         s->lp_int_raw |= INT_TARGET;
         lp_timer_update_irqs(s);
-        qemu_irq_pulse(s->lp_wakeup);
     }
 }
 

@@ -54,10 +54,14 @@
  * its coefficients clear, and everything else clear. The results of the
  * calibrations, OR_CAL_CAP, OR_CAL_UDF and OR_CAL_OVF, read 0.
  *
- * Until the PMU is modelled the CPU and system PLLs are powered, as
- * ESP-IDF relies on the system PLL without powering it up, and the
- * audio, MSPI and SDIO PLLs, which ESP-IDF powers up through the PMU, are
- * not.
+ * The PMU powers the PLLs ("xpd"). Until it drives them the CPU and
+ * system PLLs are powered, as the PMU's power-on has them (ESP-IDF relies
+ * on the system PLL without powering it up), and the audio, MSPI and SDIO
+ * PLLs, which ESP-IDF powers up through the PMU, are not.
+ *
+ * BIAS holds the brown-out detector's thresholds, which the detector
+ * (esp32p4_lp_ana.c) takes from it; their power-up values are the 2.4 V
+ * TRM 25.1 gives as the default.
  */
 
 #include "qemu/osdep.h"
@@ -156,6 +160,15 @@ static const struct {
     },
     [ESP32P4_ANA_SLAVE_BIAS] = {
         .addr = 0x6a, .name = "BIAS", .pll = -1,
+        .reset = {
+            /*
+             * The brown-out detector's thresholds for VDD_BAT and VDD_ANA,
+             * the under-voltage one in bits 4:2 and the release one in bits
+             * 7:5 (TRM 25.4), at the 2.4 V (code 4) TRM 25.1 gives.
+             */
+            [ESP32P4_ANA_BIAS_DREF_VBAT] = (4 << 5) | (4 << 2),
+            [ESP32P4_ANA_BIAS_DREF_VDDA] = (4 << 5) | (4 << 2),
+        },
     },
     [ESP32P4_ANA_SLAVE_DIG_REG] = {
         .addr = 0x6d, .name = "DIG_REG", .pll = -1,
@@ -176,7 +189,7 @@ static const int esp32p4_ana_pll_slave[ESP32P4_ANA_NUM_PLLS] = {
     [ESP32P4_ANA_PLL_MPLL] = ESP32P4_ANA_SLAVE_MSPI,
 };
 
-/* Whether each PLL is powered until the PMU, which powers it, is modelled. */
+/* Whether each PLL is powered until the PMU, which powers it, says. */
 static const bool esp32p4_ana_xpd_default[ESP32P4_ANA_NUM_PLLS] = {
     [ESP32P4_ANA_PLL_CPLL] = true,
     [ESP32P4_ANA_PLL_SPLL] = true,
@@ -423,6 +436,9 @@ bool esp32p4_ana_write(ESP32P4AnaState *s, int slave, uint8_t reg,
     pll = esp32p4_ana_slaves[slave].pll;
     if (pll < 0) {
         s->regs[slave][reg] = data;
+        if (slave == ESP32P4_ANA_SLAVE_BIAS) {
+            qemu_irq_pulse(s->bias_update);
+        }
         return true;
     }
 
@@ -533,6 +549,8 @@ static void esp32p4_ana_init(Object *obj)
                             ESP32P4_ANA_CAL_STOP, ESP32P4_ANA_NUM_PLLS);
     qdev_init_gpio_out_named(dev, s->cal_end_out, ESP32P4_ANA_CAL_END,
                              ESP32P4_ANA_NUM_PLLS);
+    qdev_init_gpio_out_named(dev, &s->bias_update, ESP32P4_ANA_BIAS_UPDATE,
+                             1);
 }
 
 static int esp32p4_ana_post_load(void *opaque, int version_id)

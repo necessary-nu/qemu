@@ -97,6 +97,11 @@
  * GDMA-AHB has memory-to-memory transfers on channels 1 and 2 only (TRM
  * 6.4.3); MEM_TRANS_EN on its channel 0 connects nothing.
  *
+ * The BitScrambler interposes on the paths it is attached to, between
+ * the channels and the peripheral, as include/hw/dma/esp32p4_gdma.h
+ * describes: the peripheral's pulls and pushes on such a path reach it,
+ * and it moves the bytes to and from the channel.
+ *
  * Not modelled: the FIFO push and pop registers' extra bits beyond the
  * data byte (bit 8 of OUTFIFO_WDATA is taken as a frame end, IN_POP's
  * RDATA reads 0x800 when the FIFO is empty); the module clock forcing,
@@ -1177,22 +1182,34 @@ static uint32_t arb_serve(ESP32P4GdmaState *s, int arb, int i)
     return dir == OUT ? tx_service(s, ch) : rx_service(s, ch);
 }
 
+/*
+ * Tell whoever takes the path of direction @dir of peripheral @periph of
+ * the channel's readiness: an interposer, or the peripheral.
+ */
+static void gdma_ready(ESP32P4GdmaState *s, unsigned periph, int dir)
+{
+    const ESP32P4GdmaInterposerOps *ip = s->ip_ops[dir][periph];
+
+    if (ip) {
+        if (ip->chan_ready) {
+            ip->chan_ready(s->ip_opaque[dir][periph], dir);
+        }
+        return;
+    }
+    esp32p4_gdma_periph_ready(s, periph, dir);
+}
+
 static void gdma_notify(ESP32P4GdmaState *s)
 {
     uint32_t pending = s->notify;
 
     s->notify = 0;
     for (int p = 0; p < ESP32P4_GDMA_PERIPHS; p++) {
-        const ESP32P4GdmaPeriphOps *ops = s->periph_ops[p];
-
-        if (!ops) {
-            continue;
+        if (pending & BIT(p)) {
+            gdma_ready(s, p, OUT);
         }
-        if ((pending & BIT(p)) && ops->tx_ready) {
-            ops->tx_ready(s->periph_opaque[p]);
-        }
-        if ((pending & BIT(16 + p)) && ops->rx_ready) {
-            ops->rx_ready(s->periph_opaque[p]);
+        if (pending & BIT(16 + p)) {
+            gdma_ready(s, p, IN);
         }
     }
 }
@@ -1325,14 +1342,42 @@ void esp32p4_gdma_attach(ESP32P4GdmaState *s, unsigned periph,
     s->periph_opaque[periph] = opaque;
 }
 
-size_t esp32p4_gdma_tx_pending(ESP32P4GdmaState *s, unsigned periph)
+/* [spec:nuos:req:emu.esp32p4.parlio] */
+void esp32p4_gdma_interpose(ESP32P4GdmaState *s, int dir, unsigned periph,
+                            const ESP32P4GdmaInterposerOps *ops,
+                            void *opaque)
+{
+    assert(periph < ESP32P4_GDMA_PERIPHS && (dir == IN || dir == OUT));
+    s->ip_ops[dir][periph] = ops;
+    s->ip_opaque[dir][periph] = ops ? opaque : NULL;
+}
+
+/* [spec:nuos:req:emu.esp32p4.parlio] */
+void esp32p4_gdma_periph_ready(ESP32P4GdmaState *s, unsigned periph,
+                               int dir)
+{
+    const ESP32P4GdmaPeriphOps *ops;
+
+    assert(periph < ESP32P4_GDMA_PERIPHS);
+    ops = s->periph_ops[periph];
+    if (!ops) {
+        return;
+    }
+    if (dir == OUT && ops->tx_ready) {
+        ops->tx_ready(s->periph_opaque[periph]);
+    } else if (dir == IN && ops->rx_ready) {
+        ops->rx_ready(s->periph_opaque[periph]);
+    }
+}
+
+size_t esp32p4_gdma_chan_tx_pending(ESP32P4GdmaState *s, unsigned periph)
 {
     int ch = periph_chan(s, periph, OUT);
 
     return ch < 0 ? 0 : s->ch[OUT][ch].fifo.num;
 }
 
-size_t esp32p4_gdma_rx_room(ESP32P4GdmaState *s, unsigned periph)
+size_t esp32p4_gdma_chan_rx_room(ESP32P4GdmaState *s, unsigned periph)
 {
     int ch = periph_chan(s, periph, IN);
 
@@ -1340,9 +1385,40 @@ size_t esp32p4_gdma_rx_room(ESP32P4GdmaState *s, unsigned periph)
                                          : fifo_room(&s->ch[IN][ch].fifo);
 }
 
+bool esp32p4_gdma_tx_flowing(ESP32P4GdmaState *s, unsigned periph)
+{
+    int ch = periph_chan(s, periph, OUT);
+    ESP32P4GdmaChan *c;
+
+    if (ch < 0) {
+        return false;
+    }
+    c = &s->ch[OUT][ch];
+    if (c->fifo.num) {
+        return true;
+    }
+    return clock_is_enabled(s->clk) && c->active && !c->end &&
+           !chan_cmd_disabled(s, OUT, c);
+}
+
+bool esp32p4_gdma_rx_flowing(ESP32P4GdmaState *s, unsigned periph)
+{
+    int ch = periph_chan(s, periph, IN);
+    ESP32P4GdmaChan *c;
+
+    if (ch < 0 || !rx_accepts(s, ch)) {
+        return false;
+    }
+    c = &s->ch[IN][ch];
+    if (fifo_room(&c->fifo)) {
+        return true;
+    }
+    return clock_is_enabled(s->clk) && (c->has_desc || !c->end);
+}
+
 /* [spec:nuos:req:emu.esp32p4.dma] */
-size_t esp32p4_gdma_pull(ESP32P4GdmaState *s, unsigned periph,
-                         uint8_t *buf, size_t len, bool *eof)
+size_t esp32p4_gdma_chan_pull(ESP32P4GdmaState *s, unsigned periph,
+                              uint8_t *buf, size_t len, bool *eof)
 {
     int ch = periph_chan(s, periph, OUT);
     ESP32P4GdmaChan *c;
@@ -1371,8 +1447,8 @@ size_t esp32p4_gdma_pull(ESP32P4GdmaState *s, unsigned periph,
 }
 
 /* [spec:nuos:req:emu.esp32p4.dma] */
-size_t esp32p4_gdma_push(ESP32P4GdmaState *s, unsigned periph,
-                         const uint8_t *buf, size_t len, unsigned flags)
+size_t esp32p4_gdma_chan_push(ESP32P4GdmaState *s, unsigned periph,
+                              const uint8_t *buf, size_t len, unsigned flags)
 {
     int ch = periph_chan(s, periph, IN);
     ESP32P4GdmaChan *c;
@@ -1398,6 +1474,49 @@ size_t esp32p4_gdma_push(ESP32P4GdmaState *s, unsigned periph,
     rx_check_empty(s, ch);
     gdma_kick(s);
     return len;
+}
+
+size_t esp32p4_gdma_tx_pending(ESP32P4GdmaState *s, unsigned periph)
+{
+    const ESP32P4GdmaInterposerOps *ip = s->ip_ops[OUT][periph];
+
+    if (ip) {
+        return ip->tx_pending(s->ip_opaque[OUT][periph]);
+    }
+    return esp32p4_gdma_chan_tx_pending(s, periph);
+}
+
+size_t esp32p4_gdma_rx_room(ESP32P4GdmaState *s, unsigned periph)
+{
+    const ESP32P4GdmaInterposerOps *ip = s->ip_ops[IN][periph];
+
+    if (ip) {
+        return ip->rx_room(s->ip_opaque[IN][periph]);
+    }
+    return esp32p4_gdma_chan_rx_room(s, periph);
+}
+
+size_t esp32p4_gdma_pull(ESP32P4GdmaState *s, unsigned periph,
+                         uint8_t *buf, size_t len, bool *eof)
+{
+    const ESP32P4GdmaInterposerOps *ip = s->ip_ops[OUT][periph];
+
+    if (ip) {
+        *eof = false;
+        return ip->pull(s->ip_opaque[OUT][periph], buf, len, eof);
+    }
+    return esp32p4_gdma_chan_pull(s, periph, buf, len, eof);
+}
+
+size_t esp32p4_gdma_push(ESP32P4GdmaState *s, unsigned periph,
+                         const uint8_t *buf, size_t len, unsigned flags)
+{
+    const ESP32P4GdmaInterposerOps *ip = s->ip_ops[IN][periph];
+
+    if (ip) {
+        return ip->push(s->ip_opaque[IN][periph], buf, len, flags);
+    }
+    return esp32p4_gdma_chan_push(s, periph, buf, len, flags);
 }
 
 /* Registers */
