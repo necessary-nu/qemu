@@ -1,5 +1,5 @@
 /*
- * A board-level serial terminal on an ESP32 UART's pads
+ * A board-level serial terminal on an Espressif UART's pads
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -14,7 +14,7 @@
 #include "qemu/fifo8.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
-#include "hw/char/esp32_uart.h"
+#include "hw/char/esp32_uart_line.h"
 
 #define TYPE_ESP32_UART_TERMINAL "esp32.uart-terminal"
 OBJECT_DECLARE_SIMPLE_TYPE(Esp32UartTerminalState, ESP32_UART_TERMINAL)
@@ -36,7 +36,7 @@ struct Esp32UartTerminalState {
 
     CharFrontend chr;
     /* The UART whose frame format and baud rate the terminal is set to */
-    ESP32UARTState *uart;
+    Object *uart;
 
     Esp32UartRx rx;
     Fifo8 out;

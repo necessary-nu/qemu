@@ -11,6 +11,8 @@
 
 #include "qemu/units.h"
 #include "hw/core/boards.h"
+#include "hw/char/esp32_uart_terminal.h"
+#include "hw/char/esp32p4_uart.h"
 #include "hw/cpu/cluster.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/dma/esp32p4_gdma.h"
@@ -45,6 +47,9 @@
 OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 
 #define ESP32P4_HP_CORES 2
+
+/* The board's serial ports: UART0 to UART4, then the LP UART. */
+#define ESP32P4_SERIAL_PORTS (ESP32P4_UART_COUNT + 1)
 
 /* The internal memories (TRM table 9.3-1). */
 #define ESP32P4_TCM_BASE            0x30100000
@@ -163,6 +168,10 @@ struct ESP32P4MachineState {
     ESP32P4EmacState emac;
     IP101PhyState phy;
     SplitIRQ pps_split;
+
+    ESP32P4UartState uart[ESP32P4_UART_COUNT];
+    ESP32P4UartState lp_uart;
+    Esp32UartTerminalState terminal[ESP32P4_SERIAL_PORTS];
 };
 
 #endif
