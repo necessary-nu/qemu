@@ -332,9 +332,10 @@ static bool trans_cm_jalt(DisasContext *ctx, arg_cm_jalt *a)
     TCGv addr = tcg_temp_new();
 
     /*
-     * Update pc to current for the non-unwinding exception
-     * that might come from cpu_ld*_code() in the helper.
+     * The helper's exceptions unwind to the instruction, giving mtval its
+     * encoding; the jump's record of its source takes pc.
      */
+    decode_save_opc(ctx, 0);
     gen_update_pc(ctx, 0);
     gen_helper_cm_jalt(addr, tcg_env, tcg_constant_i32(a->index));
 

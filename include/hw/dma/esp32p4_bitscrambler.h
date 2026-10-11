@@ -98,6 +98,8 @@ typedef struct ESP32P4BsCore {
 
     Clock *clk;
     QEMUTimer *timer;
+    /* When the cycle @timer runs falls due. */
+    int64_t due_ns;
 } ESP32P4BsCore;
 
 struct ESP32P4BitScramblerState {

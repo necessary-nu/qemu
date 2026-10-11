@@ -58,7 +58,10 @@ void helper_esp32p4_hwlp_set(CPURISCVState *env, uint32_t desc,
 /*
  * Going back to a loop's start leaves the TB after the loop's last
  * instruction, which need not be the TB's last, though icount charged
- * the whole TB on entry: give back the instructions after it.
+ * the whole TB on entry: give back the instructions after it. Restoring
+ * the state to the loop's last instruction gives it back too, and takes
+ * it out of the instructions the core has retired, though it completed:
+ * charge and count it again.
  */
 static void esp32p4_hwlp_charge(CPURISCVState *env, uintptr_t ra)
 {
@@ -66,6 +69,7 @@ static void esp32p4_hwlp_charge(CPURISCVState *env, uintptr_t ra)
 
     if (icount_enabled() && cpu_restore_state(cs, ra)) {
         cs->neg.icount_decr.u16.low--;
+        esp32p4_cpu_from_env(env)->insns++;
     }
 }
 

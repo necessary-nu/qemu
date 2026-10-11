@@ -54,6 +54,12 @@ typedef struct ESP32P4AssistDebugCore {
     uint32_t pdebug_pc;
     uint32_t pdebug_sp;
     bool in_reset;
+    /*
+     * What esp32p4_assist_debug_push() has queued for the core's thread
+     * and it has not yet done; transient, as a core does what is queued
+     * for it before it stops.
+     */
+    unsigned push_pending;
 } ESP32P4AssistDebugCore;
 
 struct ESP32P4AssistDebugState {

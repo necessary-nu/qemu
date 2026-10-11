@@ -64,7 +64,9 @@
  * A weight of 0 is never served while weighting is on. Each round of the
  * bus happens at the time it falls due, however late the QEMU timer that
  * runs it: register accesses and ETM tasks first run the rounds due
- * before them, in order.
+ * before them, in order, and register accesses and bus clock changes
+ * first let the attached peripherals that ask for it take their own
+ * events due before them (include/hw/dma/esp32p4_gdma.h).
  *
  * The FIFOs are 64 bytes. Moving bytes from a TX channel's FIFO to the
  * peripheral or the paired RX channel is outside the bus. OUT_DONE,
@@ -1288,6 +1290,45 @@ static void gdma_catch_up(ESP32P4GdmaState *s, int64_t now)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.dma] */
+void esp32p4_gdma_chan_sync(ESP32P4GdmaState *s, int64_t when)
+{
+    gdma_catch_up(s, when);
+}
+
+/* [spec:nuos:req:emu.esp32p4.dma] */
+void esp32p4_gdma_sync(ESP32P4GdmaState *s, int64_t when)
+{
+    for (int dir = 0; dir < 2; dir++) {
+        for (int p = 0; p < ESP32P4_GDMA_PERIPHS; p++) {
+            const ESP32P4GdmaInterposerOps *ip = s->ip_ops[dir][p];
+
+            if (ip && ip->sync) {
+                ip->sync(s->ip_opaque[dir][p], when);
+            }
+        }
+    }
+    gdma_catch_up(s, when);
+}
+
+/*
+ * Bring everything that moves data through the controller up to @now:
+ * the attached peripherals that take their own events late, each running
+ * the controller's rounds up to every event it takes, then the
+ * interposers' and the rounds left.
+ */
+static void gdma_catch_up_all(ESP32P4GdmaState *s, int64_t now)
+{
+    for (int p = 0; p < ESP32P4_GDMA_PERIPHS; p++) {
+        const ESP32P4GdmaPeriphOps *ops = s->periph_ops[p];
+
+        if (ops && ops->sync) {
+            ops->sync(s->periph_opaque[p], now);
+        }
+    }
+    esp32p4_gdma_sync(s, now);
+}
+
 /*
  * Let the engine look for work at the bus cycle after the change that
  * calls for it, at esp32_line_time().
@@ -1308,7 +1349,7 @@ static void gdma_clk_update(void *opaque, ClockEvent event)
     ESP32P4GdmaState *s = opaque;
 
     if (event == ClockPreUpdate) {
-        gdma_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        gdma_catch_up_all(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         return;
     }
     if (clock_is_enabled(s->clk)) {
@@ -1728,7 +1769,7 @@ static uint64_t esp32p4_gdma_read(void *opaque, hwaddr addr, unsigned size)
     GdmaDecode d = gdma_axi(s) ? axi_decode(reg) : ahb_decode(reg);
     uint32_t v;
 
-    gdma_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    gdma_catch_up_all(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     if (!gdma_reg_read(s, d, &v)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of reserved offset 0x%"
                       HWADDR_PRIx "\n", gdma_name(s), addr);
@@ -1982,7 +2023,7 @@ static void esp32p4_gdma_write(void *opaque, hwaddr addr, uint64_t value,
     GdmaDecode d = gdma_axi(s) ? axi_decode(reg) : ahb_decode(reg);
     uint32_t old = 0, v;
 
-    gdma_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    gdma_catch_up_all(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     /*
      * A narrow write keeps the other bytes; the write-1 bits of the
      * interrupt clears and the link and push/pop commands act only in the

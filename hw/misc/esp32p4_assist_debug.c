@@ -21,9 +21,10 @@
  *   SP out of bounds, as it leaves them. The core checks SP after every
  *   instruction that writes it while the monitor is on (a TB flag of the
  *   core's, so that code runs unchecked while it is off); a change of the
- *   bounds or enables compares the core's SP with them at once.
- *   Enabling the monitor takes effect from the end of the block of
- *   instructions the enabling store is in.
+ *   bounds or enables compares the core's SP with them at once, or, made
+ *   by the other core, at the end of this core's current block of
+ *   instructions. Enabling the monitor takes effect from the end of the
+ *   block of instructions the enabling store is in.
  *
  * - The region monitors: two regions of the data bus (DRAM0: the TCM, ROM,
  *   L2MEM and the external memory windows, 0x30000000 to 0x3FEFFFFF and
@@ -36,7 +37,9 @@
  *   which holds until INTR_CLR clears it; AREA_PC and AREA_SP take the
  *   accessing instruction's PC and the core's SP when a region bit sets
  *   with none set before. Instruction fetches are not watched. An AMO
- *   counts as a write.
+ *   counts as a write. A change of the regions or their enables takes
+ *   effect at once, or, made by the other core, at the end of this core's
+ *   current block of instructions.
  *
  * - The interrupt: as ESP-IDF's assist_debug_ll.h describes the hardware,
  *   each INTR_RAW bit that INTR_RLS (0x08, the TRM's INTR_ENA) enables
@@ -82,6 +85,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/esp32p4_assist_debug.h"
 #include "migration/vmstate.h"
+#include "system/tcg.h"
 #include "target/riscv/esp32p4_cpu.h"
 
 #define CORE_STRIDE             0x80
@@ -121,6 +125,10 @@
 #define LIMIT_CYCLE_MASK        0xfffff
 #define DATE_MASK               0x0fffffff
 #define DATE_RESET              0x2109130
+
+/* What esp32p4_assist_debug_push() gives a core. */
+#define PUSH_REGIONS            BIT(0)
+#define PUSH_SP                 BIT(1)
 
 /*
  * The latched interrupts: each raw bit RLS lets through sets one. A
@@ -197,19 +205,18 @@ static const ESP32P4AssistOps esp32p4_assist_debug_ops = {
  * holding them go back to being checked on every access.
  */
 /* [spec:nuos:req:emu.esp32p4.debug] */
-static void esp32p4_assist_debug_push_regions(ESP32P4AssistDebugCore *c)
+static void esp32p4_assist_debug_apply_regions(ESP32P4AssistDebugCore *c)
 {
     ESP32P4CPU *cpu = c->cpu;
 
-    if (!cpu) {
-        return;
-    }
     for (int r = 0; r < ESP32P4_ASSIST_REGIONS; r++) {
         cpu->assist_lo[r] = c->area[2 * r];
         cpu->assist_hi[r] = c->area[2 * r + 1];
     }
     qatomic_set(&cpu->assist_watch, c->ena & INTR_REGIONS);
-    tlb_flush(CPU(cpu));
+    if (tcg_enabled()) {
+        tlb_flush(CPU(cpu));
+    }
 }
 
 /*
@@ -219,14 +226,11 @@ static void esp32p4_assist_debug_push_regions(ESP32P4AssistDebugCore *c)
  * next block.
  */
 /* [spec:nuos:req:emu.esp32p4.debug] */
-static void esp32p4_assist_debug_push_sp(ESP32P4AssistDebugCore *c)
+static void esp32p4_assist_debug_apply_sp(ESP32P4AssistDebugCore *c)
 {
     ESP32P4CPU *cpu = c->cpu;
     bool en = c->ena & INTR_SP;
 
-    if (!cpu) {
-        return;
-    }
     qatomic_set(&cpu->spmon_min,
                 c->ena & ESP32P4_ASSIST_SP_MIN ? c->sp_min : 0);
     qatomic_set(&cpu->spmon_max,
@@ -238,6 +242,62 @@ static void esp32p4_assist_debug_push_sp(ESP32P4AssistDebugCore *c)
         qatomic_set(&cpu->spmon_en, false);
     }
     esp32p4_assist_sp_update(cpu);
+}
+
+static void esp32p4_assist_debug_apply(ESP32P4AssistDebugCore *c,
+                                       unsigned what)
+{
+    if (what & PUSH_REGIONS) {
+        esp32p4_assist_debug_apply_regions(c);
+    }
+    if (what & PUSH_SP) {
+        esp32p4_assist_debug_apply_sp(c);
+    }
+}
+
+/* On the core's thread: what is pending, as the registers are now. */
+static void esp32p4_assist_debug_push_work(CPUState *cs, run_on_cpu_data data)
+{
+    ESP32P4AssistDebugCore *c = data.host_ptr;
+    unsigned what = c->push_pending;
+
+    c->push_pending = 0;
+    esp32p4_assist_debug_apply(c, what);
+}
+
+/*
+ * Give the core its regions (PUSH_REGIONS) or SP bounds (PUSH_SP). Its
+ * TLB, and the SP it compares, are its own thread's: another thread
+ * flushing the TLB while the core runs frees and refills the tables its
+ * translated code is reading. So a push from elsewhere, another core's
+ * store to this core's registers or a reset of the block from the main
+ * loop (an HP core reset a watchdog's timer makes), is queued as work the
+ * core does before it executes again, with the registers as they are
+ * then. A push on the core's own thread (under icount, the one thread the
+ * cores take turns on) takes effect at once, as does one to a core that
+ * cannot be executing: one that is stopped (and stays so while the BQL,
+ * which every push holds, is held), or any without TCG (under qtest).
+ */
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static void esp32p4_assist_debug_push(ESP32P4AssistDebugCore *c,
+                                      unsigned what)
+{
+    CPUState *cs;
+
+    if (!c->cpu || !what) {
+        return;
+    }
+    cs = CPU(c->cpu);
+    if (!tcg_enabled() || !cs->created || qemu_cpu_is_self(cs) ||
+        cs->stopped) {
+        esp32p4_assist_debug_apply(c, what);
+        return;
+    }
+    if (!c->push_pending) {
+        async_run_on_cpu(cs, esp32p4_assist_debug_push_work,
+                         RUN_ON_CPU_HOST_PTR(c));
+    }
+    c->push_pending |= what;
 }
 
 /* PC logging: the core's PC and SP, while it sends them. */
@@ -343,12 +403,9 @@ static void esp32p4_assist_debug_core_write(ESP32P4AssistDebugState *s,
     case A_INTR_ENA:
         old = c->ena;
         c->ena = ((c->ena & ~bytes) | (v & bytes)) & INTR_MASK;
-        if ((old ^ c->ena) & INTR_REGIONS) {
-            esp32p4_assist_debug_push_regions(c);
-        }
-        if ((old ^ c->ena) & INTR_SP) {
-            esp32p4_assist_debug_push_sp(c);
-        }
+        esp32p4_assist_debug_push(c,
+            ((old ^ c->ena) & INTR_REGIONS ? PUSH_REGIONS : 0) |
+            ((old ^ c->ena) & INTR_SP ? PUSH_SP : 0));
         break;
     case A_INTR_RLS:
         c->rls = ((c->rls & ~bytes) | (v & bytes)) & INTR_MASK;
@@ -360,15 +417,15 @@ static void esp32p4_assist_debug_core_write(ESP32P4AssistDebugState *s,
     case A_AREA_FIRST ... A_AREA_LAST:
         old = (reg - A_AREA_FIRST) / 4;
         c->area[old] = (c->area[old] & ~bytes) | (v & bytes);
-        esp32p4_assist_debug_push_regions(c);
+        esp32p4_assist_debug_push(c, PUSH_REGIONS);
         break;
     case A_SP_MIN:
         c->sp_min = (c->sp_min & ~bytes) | (v & bytes);
-        esp32p4_assist_debug_push_sp(c);
+        esp32p4_assist_debug_push(c, PUSH_SP);
         break;
     case A_SP_MAX:
         c->sp_max = (c->sp_max & ~bytes) | (v & bytes);
-        esp32p4_assist_debug_push_sp(c);
+        esp32p4_assist_debug_push(c, PUSH_SP);
         break;
     case A_RCD_EN:
         /* A record that stops keeps the PC and SP it last had. */
@@ -504,8 +561,7 @@ static void esp32p4_assist_debug_reset_exit(Object *obj, ResetType type)
     ESP32P4AssistDebugState *s = ESP32P4_ASSIST_DEBUG(obj);
 
     for (int i = 0; i < ESP32P4_ASSIST_DEBUG_CORES; i++) {
-        esp32p4_assist_debug_push_regions(&s->core[i]);
-        esp32p4_assist_debug_push_sp(&s->core[i]);
+        esp32p4_assist_debug_push(&s->core[i], PUSH_REGIONS | PUSH_SP);
     }
     esp32p4_assist_debug_update(s);
 }

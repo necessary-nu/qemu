@@ -74,6 +74,9 @@
 #define SOURCE_MSPI         84
 #define SOURCE_PSRAM_MSPI   109
 
+#define HP_RST_EN0          0x500e60c0
+#define RST_MSPI_APB        (1u << 24)
+
 #define HP_SYSTEM_CRYPTO_CTRL   0x500e5070
 #define ENABLE_SPI_MANUAL       (1u << 0)
 
@@ -338,6 +341,38 @@ static void test_xts_manual(void)
     qtest_quit(qts);
 }
 
+/*
+ * SPI0's MOSI_DLEN and MISO_DLEN, in both controllers: bits 9:0 hold what
+ * is written, as the boot ROM's SPI_init() sets them (a read-modify-write
+ * of 0xFF into bits 9:0), and the controller's reset clears them.
+ */
+/* [spec:nuos:req:emu.esp32p4.memory/test] */
+static void test_spi0_data_lengths(void)
+{
+    static const uint32_t spi0[] = { SPI0_FLASH, SPI0_PSRAM };
+    QTestState *qts = start();
+
+    for (int i = 0; i < ARRAY_SIZE(spi0); i++) {
+        g_assert_cmphex(qtest_readl(qts, spi0[i] + MOSI_DLEN), ==, 0);
+        g_assert_cmphex(qtest_readl(qts, spi0[i] + MISO_DLEN), ==, 0);
+        qtest_writel(qts, spi0[i] + MISO_DLEN,
+                     (qtest_readl(qts, spi0[i] + MISO_DLEN) & ~0x3ffu) | 0xff);
+        qtest_writel(qts, spi0[i] + MOSI_DLEN,
+                     (qtest_readl(qts, spi0[i] + MOSI_DLEN) & ~0x3ffu) | 0xff);
+        g_assert_cmphex(qtest_readl(qts, spi0[i] + MISO_DLEN), ==, 0xff);
+        g_assert_cmphex(qtest_readl(qts, spi0[i] + MOSI_DLEN), ==, 0xff);
+        qtest_writel(qts, spi0[i] + MOSI_DLEN, 0xffffffff);
+        g_assert_cmphex(qtest_readl(qts, spi0[i] + MOSI_DLEN), ==, 0x3ff);
+    }
+
+    /* The flash controller's register reset (RST_EN_MSPI_APB) clears them. */
+    qtest_writel(qts, HP_RST_EN0, qtest_readl(qts, HP_RST_EN0) | RST_MSPI_APB);
+    qtest_writel(qts, HP_RST_EN0, qtest_readl(qts, HP_RST_EN0) & ~RST_MSPI_APB);
+    g_assert_cmphex(qtest_readl(qts, SPI0_FLASH + MOSI_DLEN), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, SPI0_FLASH + MISO_DLEN), ==, 0);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -346,5 +381,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/spimem/program-erase", test_program_erase);
     qtest_add_func("/esp32p4/spimem/psram", test_psram);
     qtest_add_func("/esp32p4/spimem/xts-manual", test_xts_manual);
+    qtest_add_func("/esp32p4/spimem/spi0-data-lengths",
+                   test_spi0_data_lengths);
     return g_test_run();
 }

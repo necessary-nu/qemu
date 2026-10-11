@@ -24,16 +24,21 @@
 #include "accel/tcg/probe.h"
 #include "exec/target_page.h"
 
+/*
+ * An exception the instruction raises, here or fetching its table entry,
+ * unwinds it: it does not retire, and icount does not charge it.
+ */
 target_ulong HELPER(cm_jalt)(CPURISCVState *env, uint32_t index)
 {
     unsigned mmu_index = cpu_mmu_index(env_cpu(env), true);
     MemOp endian = mo_endian_env(env);
+    uintptr_t ra = GETPC();
     MemOpIdx oi;
 
 #if !defined(CONFIG_USER_ONLY)
     RISCVException ret = smstateen_acc_ok(env, 0, SMSTATEEN0_JVT);
     if (ret != RISCV_EXCP_NONE) {
-        riscv_raise_exception(env, ret, 0);
+        riscv_raise_exception(env, ret, ra);
     }
 #endif
 
@@ -45,17 +50,17 @@ target_ulong HELPER(cm_jalt)(CPURISCVState *env, uint32_t index)
     target_ulong t0;
 
     if (mode != 0) {
-        riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, 0);
+        riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, ra);
     }
 
     if (xlen == 32) {
         oi = make_memop_idx(MO_UL | endian, mmu_index);
         t0 = base + (index << 2);
-        target = cpu_ldl_code_mmu(env, t0, oi, 0);
+        target = cpu_ldl_code_mmu(env, t0, oi, ra);
     } else {
         oi = make_memop_idx(MO_UQ | endian, mmu_index);
         t0 = base + (index << 3);
-        target = cpu_ldq_code_mmu(env, t0, oi, 0);
+        target = cpu_ldq_code_mmu(env, t0, oi, ra);
     }
 
     return target & ~0x1;

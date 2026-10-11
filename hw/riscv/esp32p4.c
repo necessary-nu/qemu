@@ -153,6 +153,13 @@
  *
  *       -serial stdio -serial null -serial file:uart2.log
  *
+ *     Port 0 thus holds the strapping pin GPIO38 high through a reset,
+ *     unless its terminal holds a break there (its "break" property), as
+ *     a host straps the pin low before letting the line go idle:
+ *
+ *       -global driver=esp32.uart-terminal,property=break,value=on
+ *       (QMP) qom-set /machine/terminal[0] break false
+ *
  *     UHCI0 (0x500DF000), behind UHCI_APB_CLK and its reset, its
  *     interrupt source 30, moves the data of the UART CONF0.UART_SEL
  *     names through GDMA-AHB as peripheral UHCI0.
@@ -985,9 +992,12 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
         }
         /*
          * Under icount a core executes an instruction per cycle of its
-         * CPU_CLK, at its current frequency, alongside the other cores.
+         * CPU_CLK, at its current frequency, alongside the other cores;
+         * its mcycle counts that clock.
          */
         icount_set_cpu_clock(CPU(cpu), qdev_get_clock_out(clkrst, clk));
+        clock_set_source(qdev_get_clock_in(cpu, ESP32P4_CPU_CLK),
+                         qdev_get_clock_out(clkrst, clk));
     }
     qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_LP_CORE_RESET, 0,
                                 qdev_get_gpio_in_named(DEVICE(&s->lp_cpu),
@@ -997,7 +1007,7 @@ static void esp32p4_init_clocks(ESP32P4MachineState *s)
                                     ESP32P4_CPU_CLOCK, 0));
     icount_set_cpu_clock(CPU(&s->lp_cpu), qdev_get_clock_out(clkrst,
                                                              "lp-core"));
-    clock_set_source(qdev_get_clock_in(DEVICE(&s->lp_cpu), ESP32P4_CPU_LP_CLK),
+    clock_set_source(qdev_get_clock_in(DEVICE(&s->lp_cpu), ESP32P4_CPU_CLK),
                      qdev_get_clock_out(clkrst, "lp-core"));
 
     object_initialize_child(OBJECT(s), "lp-sys", &s->lp_sys,
@@ -2622,6 +2632,12 @@ static void esp32p4_init_debug(ESP32P4MachineState *s)
         qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_CPU_WAKEUP, core,
                                     qdev_get_gpio_in_named(cpu,
                                         ESP32P4_CPU_WAKEUP, 0));
+        for (n = 0; n < ESP32P4_HP_SYS_WAITI_LINES; n++) {
+            qdev_connect_gpio_out_named(hp_sys, ESP32P4_HP_SYS_CPU_WAITI_CONF,
+                                        core * ESP32P4_HP_SYS_WAITI_LINES + n,
+                                        qdev_get_gpio_in_named(cpu,
+                                            ESP32P4_CPU_WAITI_CONF, n));
+        }
         qdev_connect_gpio_out(DEVICE(&s->core_stall_split[core]), 2,
                               qdev_get_gpio_in_named(hp_sys,
                                   ESP32P4_HP_SYS_CORE_STALLED, core));

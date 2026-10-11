@@ -16,6 +16,14 @@
  *
  * While its chardev is connected the terminal drives its TX pad, idle
  * high, as a bridge's TX output does.
+ *
+ * Its "break" property holds that line low, a break, as a host does with
+ * its serial port's break condition: a frame being sent is cut off, and
+ * the chardev's bytes wait until the break ends, the line then returning
+ * to idle before the next frame. Held through a reset, the break straps
+ * the pad low, the way the ESP32-P4's TRM (12.2.1) has a host set a
+ * strapping pin's level while the chip powers on: U0RXD, GPIO38, which
+ * the terminal on serial port 0 holds high otherwise, is one.
  */
 
 #include "qemu/osdep.h"
@@ -131,7 +139,7 @@ static bool term_tx_start(Esp32UartTerminalState *s, int64_t start_ns)
     Esp32UartFrameFmt fmt;
     bool was_full = fifo8_is_full(&s->in);
 
-    if (fifo8_is_empty(&s->in) ||
+    if (s->brk || fifo8_is_empty(&s->in) ||
         !esp32_uart_line_get_format(s->uart, &fmt)) {
         return false;
     }
@@ -218,6 +226,36 @@ static void term_event(void *opaque, QEMUChrEvent event)
 {
 }
 
+static bool term_get_break(Object *obj, Error **errp)
+{
+    return ESP32_UART_TERMINAL(obj)->brk;
+}
+
+/* The host's break condition on its TX line, the pad's level with it. */
+static void term_set_break(Object *obj, bool value, Error **errp)
+{
+    Esp32UartTerminalState *s = ESP32_UART_TERMINAL(obj);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (s->brk == value) {
+        return;
+    }
+    s->brk = value;
+    if (!DEVICE(obj)->realized || !qemu_chr_fe_backend_connected(&s->chr)) {
+        return;
+    }
+    if (value) {
+        s->tx_busy = false;
+        timer_del(&s->tx_timer);
+        esp32_line_set_at(s->tx_out, 0, now);
+    } else {
+        esp32_line_set_at(s->tx_out, 1, now);
+        if (term_tx_start(s, now)) {
+            term_tx_advance(s);
+        }
+    }
+}
+
 static void term_format_changed(Notifier *n, void *data)
 {
     Esp32UartTerminalState *s = container_of(n, Esp32UartTerminalState,
@@ -247,7 +285,7 @@ static void esp32_uart_terminal_realize(DeviceState *dev, Error **errp)
     qemu_chr_fe_set_handlers(&s->chr, term_can_receive, term_receive,
                              term_event, NULL, s, NULL, true);
     if (qemu_chr_fe_backend_connected(&s->chr)) {
-        qemu_set_irq(s->tx_out, 1);
+        qemu_set_irq(s->tx_out, !s->brk);
     }
 }
 
@@ -276,8 +314,8 @@ static const Property esp32_uart_terminal_properties[] = {
 
 static const VMStateDescription vmstate_esp32_uart_terminal = {
     .name = TYPE_ESP32_UART_TERMINAL,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT(rx, Esp32UartTerminalState, 1, vmstate_esp32_uart_rx,
                        Esp32UartRx),
@@ -291,6 +329,7 @@ static const VMStateDescription vmstate_esp32_uart_terminal = {
         VMSTATE_UINT8(tx_bit, Esp32UartTerminalState),
         VMSTATE_INT64(tx_start_ns, Esp32UartTerminalState),
         VMSTATE_UINT64(tx_q32, Esp32UartTerminalState),
+        VMSTATE_BOOL(brk, Esp32UartTerminalState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -303,6 +342,10 @@ static void esp32_uart_terminal_class_init(ObjectClass *klass,
     dc->realize = esp32_uart_terminal_realize;
     dc->vmsd = &vmstate_esp32_uart_terminal;
     device_class_set_props(dc, esp32_uart_terminal_properties);
+    object_class_property_add_bool(klass, "break", term_get_break,
+                                   term_set_break);
+    object_class_property_set_description(klass, "break",
+        "The host holds its TX line low, a break");
     dc->user_creatable = false;
 }
 

@@ -150,8 +150,7 @@ struct ESP32P4ParlioState {
     uint8_t rx_byte_bits;
     int64_t rx_last_data_ns;
     int64_t rx_timeout_from;
-    /* When a unit's internal clock last slipped behind virtual time. */
-    int64_t slip_ns;
+    bool lag_logged;
     ESP32P4ParlioFifo rx_fifo;
 
     ESP32P4GdmaState *gdma;
