@@ -353,8 +353,16 @@
  *
  *   -M esp32p4,lp-rom=lp-rom.bin
  *
- * The HP ROM image is the esp32p4-rev3-rom.bin firmware file, or the raw
- * image -bios names. From reset the ROM boots as the strapping pins and
+ * The HP ROM image is the esp32p4-rev3-rom.bin firmware file, v3.0's ROM
+ * (ESP-ROM esp32p4-eco5-20250430, the only v3.x ROM Espressif publishes),
+ * or the raw image -bios names, such as one the user has dumped from
+ * their own chip. Each v3.x revision has its own ROM, and the eFuses
+ * present the revision of the one that runs, by its ECO version: v3.0
+ * for the ROM the machine ships. v3.0's ROM has erratum ROM-764: its
+ * Secure Boot stages the image it verifies at 0x4FF00000, in the L2
+ * cache's part of L2MEM, which the CPU cannot write, and so refuses
+ * every image, signed or not, as the model does; v3.1's ROM (ECO6) has
+ * it fixed. From reset the ROM boots as the strapping pins and
  * the eFuses select (TRM chapter 12): in SPI boot mode it loads the image
  * at flash offset 0x2000 (ESP-IDF's second-stage bootloader, in esptool's
  * image format) into memory and jumps to its entry point, or runs a
@@ -1140,6 +1148,48 @@ static void esp32p4_init_intmatrix(ESP32P4MachineState *s)
                        esp32p4_intr_source(s, ESP32P4_INTR_HP_SYSREG));
 }
 
+/* The HP ROM image's file: -bios's, or the one the machine ships. */
+static char *esp32p4_rom_path(ESP32P4MachineState *s)
+{
+    MachineState *machine = MACHINE(s);
+
+    return qemu_find_file(QEMU_FILE_TYPE_BIOS,
+                          machine->firmware ? machine->firmware
+                                            : ESP32P4_ROM_FILE);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.efuse]
+ * The chip revision whose boot ROM the HP ROM image is, from the ECO
+ * version the ROM keeps at 0x4FC00014 (_rom_eco_version): each v3.x
+ * revision has its own ROM, ECO5 on v3.0, ECO6 on v3.1 and ECO7 on v3.2,
+ * as the ROMs' banners show on those chips. The eFuses present it, so that
+ * software sees the revision whose ROM runs; for an image whose ECO the
+ * machine does not know, they present v3.0, the revision of the ROM the
+ * machine ships.
+ */
+static uint32_t esp32p4_rom_revision(ESP32P4MachineState *s)
+{
+    static const uint32_t revisions[] = { [5] = 300, [6] = 301, [7] = 302 };
+    g_autofree char *path = esp32p4_rom_path(s);
+    g_autofree char *data = NULL;
+    gsize len;
+    uint32_t eco;
+
+    if (!path || !g_file_get_contents(path, &data, &len, NULL) ||
+        len < ESP32P4_ROM_ECO_VERSION + 4) {
+        return 300;
+    }
+    eco = ldl_le_p(data + ESP32P4_ROM_ECO_VERSION);
+    if (eco >= ARRAY_SIZE(revisions) || !revisions[eco]) {
+        warn_report("esp32p4: the HP ROM image is of ECO %u, whose chip "
+                    "revision the machine does not know; the eFuses "
+                    "present v3.0", eco);
+        return 300;
+    }
+    return revisions[eco];
+}
+
 /*
  * The eFuse controller, on its clock and reset from LPPERI, its registers
  * behind its bus clock. Its interrupt is LP_EFUSE_INTR, source 17 of the
@@ -1155,6 +1205,7 @@ static void esp32p4_init_efuse(ESP32P4MachineState *s)
     object_initialize_child(OBJECT(s), "efuse", &s->efuse,
                             TYPE_ESP32P4_EFUSE);
     efuse = DEVICE(&s->efuse);
+    qdev_prop_set_uint32(efuse, "chip-revision", esp32p4_rom_revision(s));
     qdev_connect_clock_in(efuse, "clk", qdev_get_clock_out(clkrst, "efuse"));
     sysbus_realize(SYS_BUS_DEVICE(efuse), &error_fatal);
     qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
@@ -4271,13 +4322,13 @@ static void esp32p4_check_kernel(ESP32P4MachineState *s,
 static void esp32p4_load(ESP32P4MachineState *s)
 {
     MachineState *machine = MACHINE(s);
-    const char *rom = machine->firmware ? machine->firmware
-                                        : ESP32P4_ROM_FILE;
-    g_autofree char *path = qemu_find_file(QEMU_FILE_TYPE_BIOS, rom);
+    g_autofree char *path = esp32p4_rom_path(s);
     uint64_t entry;
 
     if (!path) {
-        error_report("esp32p4: cannot find the HP ROM image '%s'", rom);
+        error_report("esp32p4: cannot find the HP ROM image '%s'",
+                     machine->firmware ? machine->firmware
+                                       : ESP32P4_ROM_FILE);
         exit(1);
     }
     if (load_image_targphys(path, ESP32P4_HP_ROM_BASE, ESP32P4_HP_ROM_SIZE,
