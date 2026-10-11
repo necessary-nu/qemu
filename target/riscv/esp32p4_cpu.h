@@ -384,6 +384,13 @@ struct ESP32P4CPU {
     /* The HP core's ESP32P4_CPU_WAKEUP input is high. */
     bool wakeup;
     /*
+     * The core waits on the bus for a device to take its access (see
+     * esp32p4_cpu_bus_hold()); a device has asked for that of the access
+     * in progress.
+     */
+    bool bus_wait;
+    bool bus_hold;
+    /*
      * The PC at the core's last trap: LP_SYSTEM_LP_CPU_EXC_PC on the LP
      * core, the debug assistant's LASTPC_BEFORE_EXCEPTION on an HP core.
      */
@@ -525,6 +532,23 @@ void esp32p4_cpu_set_mintthresh(ESP32P4CPU *cpu, uint8_t th);
  * instructions defer their interrupts while it holds.
  */
 bool esp32p4_cpu_mid_block(void);
+
+/*
+ * Bus wait states. A device that cannot take a core's access yet holds
+ * the access on the bus, as an APB slave holds PREADY low: from the
+ * access's handler, esp32p4_cpu_bus_waiter() of its attributes gives the
+ * core making it (NULL when no core is, for a qtest or DMA access, which
+ * no wait state holds), and the handler returns esp32p4_cpu_bus_hold() of
+ * it, not having taken the access. The core stops at the instruction
+ * making the access, which it has not made, and neither runs nor takes an
+ * interrupt until the device calls esp32p4_cpu_bus_release(); then it
+ * makes the access again, unless an interrupt pending by then comes
+ * first. Its clock, and its cycle counter, run on meanwhile. A reset of
+ * the core ends its wait.
+ */
+ESP32P4CPU *esp32p4_cpu_bus_waiter(MemTxAttrs attrs);
+MemTxResult esp32p4_cpu_bus_hold(ESP32P4CPU *cpu);
+void esp32p4_cpu_bus_release(ESP32P4CPU *cpu);
 
 /* The LP core's start, which the machine gives it. */
 void esp32p4_lp_cpu_set_boot(ESP32P4CPU *cpu, ESP32P4LPBootFn fn,

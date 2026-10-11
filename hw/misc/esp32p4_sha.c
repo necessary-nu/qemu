@@ -42,6 +42,22 @@
  * the next block into SHA_M_n_REG while the accelerator hashes this one;
  * the v3.x boot ROM's ets_sha_process() writes SHA_MODE_REG and the next
  * block before it waits for SHA_BUSY_REG, and only then starts the block.
+ *
+ * A write of 1 to SHA_START_REG, SHA_CONTINUE_REG, SHA_DMA_START_REG or
+ * SHA_DMA_CONTINUE_REG while the accelerator is busy waits on the bus
+ * until the operation in progress ends, holding the core that makes it
+ * (esp32p4_cpu_bus_hold()), then starts its operation. ESP-IDF's block
+ * mode, since v5.5 (commit fe78370ec9), writes each block and its
+ * SHA_CONTINUE_REG without waiting for SHA_BUSY_REG between blocks, on
+ * every chip of this accelerator, and its HAL test hashes 1030 bytes so
+ * with known digests on silicon; the TRM says nothing of such writes.
+ * Dropped, they would leave blocks unhashed; taken later without holding
+ * the core, they would let it overwrite SHA_M_n_REG with the next block
+ * before the operation took this one. A core held this way takes a
+ * pending interrupt before making the write again. A start written by
+ * another master (qtest), which no wait state holds, while the
+ * accelerator is busy is dropped and logged.
+ *
  * Other registers written while it is busy are dropped and logged, as are
  * writes while its clock is stopped or it is held in reset. While HMAC,
  * RSA_DS or ECDSA_DS occupies it its registers read as zero and take no
@@ -58,6 +74,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/esp32p4_sha.h"
 #include "migration/vmstate.h"
+#include "target/riscv/esp32p4_cpu.h"
 
 #define A_MODE          0x00
 #define A_T_STRING      0x04
@@ -101,6 +118,20 @@ static void sha_update_irq(ESP32P4ShaDevState *s)
     qemu_set_irq(s->irq, s->done_int && (s->irq_ena & 1));
 }
 
+/* The cores waiting to start an operation may make their writes again. */
+/* [spec:nuos:req:emu.esp32p4.crypto] */
+static void sha_release_waiters(ESP32P4ShaDevState *s)
+{
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        if (s->waiters & BIT(cs->cpu_index)) {
+            esp32p4_cpu_bus_release(ESP32P4_CPU(cs));
+        }
+    }
+    s->waiters = 0;
+}
+
 static uint64_t sha_block_cycles(uint32_t mode)
 {
     if (mode == ESP32P4_SHA1) {
@@ -141,6 +172,7 @@ static void sha_op_done(void *opaque)
     }
     s->op_kind = OP_NONE;
     s->busy = false;
+    sha_release_waiters(s);
 }
 
 /* [spec:nuos:req:emu.esp32p4.crypto] */
@@ -159,6 +191,7 @@ static void sha_pump(ESP32P4ShaDevState *s)
         s->busy = false;
         s->done_int = true;
         sha_update_irq(s);
+        sha_release_waiters(s);
         return;
     }
     if (s->in_len < bs) {
@@ -267,8 +300,8 @@ static uint64_t sha_read(void *opaque, hwaddr addr, unsigned size)
 }
 
 /* [spec:nuos:req:emu.esp32p4.crypto] */
-static void sha_write(void *opaque, hwaddr addr, uint64_t value,
-                      unsigned size)
+static MemTxResult sha_write(void *opaque, hwaddr addr, uint64_t value,
+                             unsigned size, MemTxAttrs attrs)
 {
     ESP32P4ShaDevState *s = opaque;
     hwaddr reg = addr & ~3;
@@ -281,14 +314,23 @@ static void sha_write(void *opaque, hwaddr addr, uint64_t value,
                       addr, s->occupied ? "occupied by another block"
                       : sha_in_reset(s) ? "held in reset"
                       : "not clocked (CRYPTO_SHA_CLK)");
-        return;
+        return MEMTX_OK;
+    }
+    if (s->busy && (v & 1) && (reg == A_START || reg == A_CONTINUE ||
+                               reg == A_DMA_START || reg == A_DMA_CONTINUE)) {
+        ESP32P4CPU *cpu = esp32p4_cpu_bus_waiter(attrs);
+
+        if (cpu) {
+            s->waiters |= BIT(CPU(cpu)->cpu_index);
+            return esp32p4_cpu_bus_hold(cpu);
+        }
     }
     if (s->busy && reg != A_CLEAR_IRQ && reg != A_IRQ_ENA &&
         reg != A_MODE && !(reg >= A_M_MEM && reg < SHA_REGS_END)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write at 0x%" HWADDR_PRIx
                       " while the accelerator is busy is dropped\n",
                       TYPE_ESP32P4_SHA, addr);
-        return;
+        return MEMTX_OK;
     }
 
 #define MERGE(old) deposit32((old), shift, size * 8, value)
@@ -361,11 +403,12 @@ static void sha_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     }
 #undef MERGE
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps sha_ops = {
     .read = sha_read,
-    .write = sha_write,
+    .write_with_attrs = sha_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
@@ -408,6 +451,7 @@ static void sha_reset_hold(Object *obj, ResetType type)
     ESP32P4ShaDevState *s = ESP32P4_SHA(obj);
 
     esp32p4_crypto_timer_cancel(&s->op);
+    sha_release_waiters(s);
     s->mode = 0;
     s->t_string = 0;
     s->t_length = 0;
@@ -473,8 +517,8 @@ static const VMStateDescription vmstate_esp32p4_sha_state = {
 
 static const VMStateDescription vmstate_esp32p4_sha = {
     .name = TYPE_ESP32P4_SHA,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_ESP32P4_CRYPTO_TIMER(op, ESP32P4ShaDevState),
         VMSTATE_BOOL_ARRAY(reset_in, ESP32P4ShaDevState, ESP32P4_SHA_RESETS),
@@ -494,6 +538,7 @@ static const VMStateDescription vmstate_esp32p4_sha = {
         VMSTATE_UINT32(left, ESP32P4ShaDevState),
         VMSTATE_UINT8_ARRAY(in_buf, ESP32P4ShaDevState, 128),
         VMSTATE_UINT32(in_len, ESP32P4ShaDevState),
+        VMSTATE_UINT32(waiters, ESP32P4ShaDevState),
         VMSTATE_STRUCT(state, ESP32P4ShaDevState, 1,
                        vmstate_esp32p4_sha_state, ESP32P4ShaState),
         VMSTATE_END_OF_LIST()

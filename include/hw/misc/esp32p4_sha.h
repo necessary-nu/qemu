@@ -68,6 +68,8 @@ struct ESP32P4ShaDevState {
     uint8_t in_buf[128];
     uint32_t in_len;
     ESP32P4ShaState state;
+    /* The cores whose start waits for the operation to end, by index. */
+    uint32_t waiters;
 };
 
 /*

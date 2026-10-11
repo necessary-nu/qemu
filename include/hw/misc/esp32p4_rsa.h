@@ -68,8 +68,13 @@ struct ESP32P4RsaState {
     bool clean;
     bool idle;
     bool done_int;
-    /* The operation in progress (RSA_OP_*). */
+    /*
+     * The operation in progress (RSA_OP_*), and the options it took: the
+     * top bit of Y it starts from, and CONSTANT_TIME.
+     */
     uint32_t op_kind;
+    uint32_t op_top;
+    bool op_constant_time;
 };
 
 /* As esp32p4_aes_occupy(): while the RSA_DS peripheral computes on it. */

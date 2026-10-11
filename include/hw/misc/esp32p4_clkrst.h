@@ -58,7 +58,9 @@ enum {
  *     e.g. "uart0-sclk", "i2c0", "timergrp0-t0", "gpspi2-mst".
  *   - "lp-<block>": the LP peripherals' bus clocks, LP_PERI_CLK as
  *     LPPERI_CLK_EN gates it, and their function clocks, e.g.
- *     "lp-uart-sclk".
+ *     "lp-uart-sclk"; but "lp-rng", RC_FAST_CLK as LPPERI_CK_EN_RNG gates
+ *     it into the RNG as an entropy source (TRM 35.4), the RNG's registers
+ *     being on "lp-peri".
  *   - The sources and SoC clocks, for blocks that take them directly:
  *     "xtal", "rc-fast", "rc-slow", "rc32k", "xtal32k", "pll-lp", "cpll",
  *     "spll", "mpll", "apll", "sdio-pll0..2" (as LP_CLKRST_HP_CLK_CTRL

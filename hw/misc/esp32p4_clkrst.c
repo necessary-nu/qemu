@@ -1021,7 +1021,12 @@ static const ClkDesc esp32p4_clk_desc[ESP32P4_NUM_CLOCKS] = {
                               .gate = { B(LP_HP_USB_CLKRST_CTRL1, 30) } },
     GATE(LP_RAM, LP_DYN_FAST, LP_CLK_EN, 27),
 
-    LPPERI_GATE(LP_RNG, 16),
+    /*
+     * The RNG's: RC_FAST_CLK, an entropy source, not a bus clock (TRM
+     * 35.4: "RC_FAST_CLK is gated by setting the LPPERI_CK_EN_RNG bit").
+     */
+    [C(LP_RNG)] = { PARENTS(C(OSC_RC_FAST)),
+                    .gate = { B(LPPERI_CLK_EN, 16) } },
     LPPERI_GATE(LP_TSENS, 17),
     LPPERI_GATE(LP_PMS, 18),
     LPPERI_GATE(LP_EFUSE, 19),
