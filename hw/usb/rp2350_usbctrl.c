@@ -960,12 +960,11 @@ static void host_kick(RP2350USBCtrlState *s, int64_t delay)
 /*
  * A connected device pulls DP (full speed) or DM (low speed) up against
  * the host's pull-downs; SPEED shows which, and HOST_CONN_DIS flags each
- * change.
+ * change. `dev` is the device on the port, or NULL for none.
  */
 /* [spec:nuos:req:emu.usb] */
-static void host_update_port(RP2350USBCtrlState *s)
+static void host_update_port_dev(RP2350USBCtrlState *s, USBDevice *dev)
 {
-    USBDevice *dev = host_root(s);
     uint8_t speed = 0;
 
     if (host_active(s) && (s->sie_ctrl & SIE_CTRL_PULLDOWN_EN) && dev) {
@@ -985,6 +984,11 @@ static void host_update_port(RP2350USBCtrlState *s)
     } else {
         timer_del(s->host_frame_timer);
     }
+}
+
+static void host_update_port(RP2350USBCtrlState *s)
+{
+    host_update_port_dev(s, host_root(s));
 }
 
 static void host_cancel(RP2350USBCtrlState *s)
@@ -1430,13 +1434,25 @@ static void host_attach(USBPort *port)
     usb_update_irq(s);
 }
 
+/*
+ * The device leaves the bus. QEMU calls this while the departing device
+ * is still on the port and marked attached, so the port is updated as
+ * empty rather than from what it holds. A transaction it had pending
+ * gets no handshake: it ends as the SIE's receive timeout, and the SIE
+ * goes on to whatever is scheduled next.
+ */
+/* [spec:nuos:req:emu.usb] */
 static void host_detach(USBPort *port)
 {
     RP2350USBCtrlState *s = port->opaque;
 
-    host_cancel(s);
+    if (s->xact_async) {
+        host_cancel(s);
+        host_xact_done(s, USB_RET_NODEV, 0);
+        host_kick(s, host_xact_ns(s, 0));
+    }
     host_reset_toggles(s);
-    host_update_port(s);
+    host_update_port_dev(s, NULL);
     usb_update_irq(s);
 }
 
