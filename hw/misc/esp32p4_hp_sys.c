@@ -64,10 +64,6 @@
  *   - CPU_WAKEUP_EVENT (0x1EC): each core's dedicated wakeup input (TRM
  *     2.13.6.2), which wakes the core from WFI; while the bit is set a WFI
  *     does not wait ("cpu-wakeup" outputs).
- *   - CPU_WAITI_CONF (0x118): whether the cores' clocks run on in WFI
- *     (WAIT_MODE_FORCE_ON) and, if not, for how many cycles before they
- *     stop (WAITI_DELAY_NUM), to both cores ("cpu-waiti-conf" outputs),
- *     whose mcycle stops with the clock.
  *   - L2_MEM_REFRESH (0x164) and TCM_INIT (0x168): the initialisation of
  *     L2MEM's ECC bits, unit by unit, and of the SPM's parity bits, before
  *     their checks are enabled (TRM 9.3.2). A unit's REFRESH_DONE, or
@@ -117,12 +113,16 @@
  *
  * Kept as written, with no effect the model can show: the memories' clock
  * force-ons, the other power controls (UART_PD_CTRL, SYS_VPU_CTRL, the
- * caches' power controls) and ECC and parity enables;
- * the bus timeouts' thresholds; the post-write enables; the arbitration
- * weights of TCM_RAM_WRR_CONFIG; the ECO and design-for-verification
- * registers; the debug run-stall between the HP and LP
- * cores, which have no debugger; SYS_GDMA_CTRL, for blocks not modelled
- * (esp32p4_hp_sys_reg() gives it to a block that needs it). The debug probe
+ * caches' power controls) and ECC and parity enables; the bus timeouts'
+ * thresholds; the post-write enables; the arbitration weights of
+ * TCM_RAM_WRR_CONFIG; the ECO and design-for-verification registers;
+ * CPU_WAITI_CONF, which lets each HP core's clock (cpu_waiti_clk) stop
+ * WAITI_DELAY_NUM cycles into a WFI unless WAIT_MODE_FORCE_ON keeps it
+ * running: the core does nothing meanwhile, and its cycle counter stops
+ * in WFI either way (target/riscv/tcg/esp32p4_counters.c); the debug
+ * run-stall between the HP and LP cores, which have no debugger;
+ * SYS_GDMA_CTRL, for blocks not modelled (esp32p4_hp_sys_reg() gives it
+ * to a block that needs it). The debug probe
  * (PROBEA_CTRL, PROBEB_CTRL) selects internal signals that are not
  * modelled: PROBE_OUT reads 0, logged as unimplemented once the probe is
  * enabled.
@@ -517,19 +517,6 @@ static void esp32p4_hp_sys_update_wakeup(ESP32P4HPSysState *s)
     }
 }
 
-/* CPU_WAITI_CONF, which both HP cores' clocks in WFI follow. */
-/* [spec:nuos:req:emu.esp32p4.cpu] */
-static void esp32p4_hp_sys_update_waiti(ESP32P4HPSysState *s)
-{
-    for (int core = 0; core < ESP32P4_HP_SYS_CORES; core++) {
-        for (int n = 0; n < ESP32P4_HP_SYS_WAITI_LINES; n++) {
-            qemu_set_irq(s->cpu_waiti_conf[core * ESP32P4_HP_SYS_WAITI_LINES +
-                                           n],
-                         extract32(s->regs[R(A_CPU_WAITI_CONF)], n, 1));
-        }
-    }
-}
-
 /* [spec:nuos:req:emu.esp32p4.emac] */
 static void esp32p4_hp_sys_update_gmac(ESP32P4HPSysState *s)
 {
@@ -741,9 +728,6 @@ static void esp32p4_hp_sys_write(void *opaque, hwaddr addr, uint64_t value,
     case A_CPU_WAKEUP_EVENT:
         esp32p4_hp_sys_update_wakeup(s);
         break;
-    case A_CPU_WAITI_CONF:
-        esp32p4_hp_sys_update_waiti(s);
-        break;
     case A_RSA_PD_CTRL:
     case A_ECC_PD_CTRL:
         esp32p4_hp_sys_update_mem_pd(s);
@@ -860,7 +844,6 @@ static void esp32p4_hp_sys_reset_exit(Object *obj, ResetType type)
     esp32p4_hp_sys_update_hold(s);
     esp32p4_hp_sys_update_err_resp(s);
     esp32p4_hp_sys_update_wakeup(s);
-    esp32p4_hp_sys_update_waiti(s);
     esp32p4_hp_sys_update_hp2lp(s);
     esp32p4_hp_sys_update_misc(s);
     esp32p4_hp_sys_update_gmac(s);
@@ -897,10 +880,6 @@ static void esp32p4_hp_sys_init(Object *obj)
     qdev_init_gpio_out_named(dev, &s->hp_wakeup, ESP32P4_HP_SYS_HP_WAKEUP, 1);
     qdev_init_gpio_out_named(dev, s->cpu_wakeup, ESP32P4_HP_SYS_CPU_WAKEUP,
                              ESP32P4_HP_SYS_CORES);
-    qdev_init_gpio_out_named(dev, s->cpu_waiti_conf,
-                             ESP32P4_HP_SYS_CPU_WAITI_CONF,
-                             ESP32P4_HP_SYS_CORES *
-                             ESP32P4_HP_SYS_WAITI_LINES);
     qdev_init_gpio_out_named(dev, &s->dma_addr_sel,
                              ESP32P4_HP_SYS_DMA_ADDR_SEL, 1);
     qdev_init_gpio_out_named(dev, s->addr_interchange,

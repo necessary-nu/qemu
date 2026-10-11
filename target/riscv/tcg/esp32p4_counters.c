@@ -7,7 +7,8 @@
  *
  * Reference: ESP32-P4 Technical Reference Manual (v3.x silicon), 2.5
  * (the HP core's CSRs), 5.3 and 5.7 (the LP core's CSRs and performance
- * counters) and 21.43 (HP_SYSTEM_CPU_WAITI_CONF).
+ * counters); ESP32-C6 Technical Reference Manual v1.2, register 1.22
+ * (mpcer).
  *
  * Each core counts for itself:
  *
@@ -15,12 +16,15 @@
  *     cycle and cycleh) count the cycles of the core's clock
  *     (ESP32P4_CPU_CLK) at its current frequency, while it runs: not while
  *     the core is held in reset, nor while its clock enable is low (a
- *     stalled HP core, a disabled LP core), nor once the clock stops in
- *     WFI. An HP core's clock in WFI, cpu_waiti_clk, runs on while
- *     HP_SYSTEM_CPU_WAIT_MODE_FORCE_ON forces it on, as it does from
- *     reset; otherwise it stops WAITI_DELAY_NUM cycles after the core
- *     enters WFI, until the core leaves it. The LP core's clock runs in
- *     WFI.
+ *     stalled HP core, a disabled LP core), nor while an HP core waits in
+ *     WFI. The P4's TRM says nothing of the cycle counter in WFI; the
+ *     ESP32-C6's, of the HP core before this one, says its cycle count
+ *     does not increment during WFI, with the core's clock in WFI
+ *     (cpu_waiti_clk) forced on from reset by a CPU_WAITI_CONF register
+ *     the P4's HP_SYSTEM repeats bit for bit: the count stops with the
+ *     core rather than with that clock, which therefore changes nothing
+ *     software sees. The LP core's mcycle, of which neither TRM says
+ *     more than that it counts clock cycles, counts on in WFI.
  *   - minstret and minstreth (instret and instreth) count the
  *     instructions the core retires: not one that raises an exception.
  *   - mcountinhibit stops a counter where it is and restarts it from
@@ -48,11 +52,11 @@
  * (icount_set_cpu_period_frac()), so that a core running alone counts one
  * cycle for each instruction it executes, at any frequency. That time is
  * the instructions' exact time rounded down to a 2^-32 ns unit, so the
- * count allows for a unit more. Cores running together
- * take turns of at most a quantum of virtual time (icount_set_cpu_clock()),
- * through which each one's mcycle follows virtual time, as the chip's
- * timers do, and so its own instructions to within that quantum. Without
- * icount virtual time follows the host's clock, as do the cycles.
+ * count allows for a unit more. Cores running together take turns of at
+ * most a quantum of virtual time (icount_set_cpu_clock()), through which
+ * each one's mcycle follows virtual time, as the chip's timers do, and so
+ * its own instructions to within that quantum. Without icount virtual
+ * time follows the host's clock, as do the cycles.
  *
  * The instructions are counted by the code QEMU translates for the core,
  * which adds one to the core's count as each instruction starts. One that
@@ -155,11 +159,15 @@ static bool ctr_is_hp(ESP32P4CPU *cpu)
     return esp32p4_env_is_hp(&cpu->parent_obj.env);
 }
 
-/* The core's clock runs: the core is out of reset and its clock enabled. */
+/*
+ * mcycle counts: the core is out of reset, its clock enabled, and, on an
+ * HP core, not waiting in WFI.
+ */
 static bool ctr_clock_runs(ESP32P4CPU *cpu)
 {
     return cpu->clk && clock_get(cpu->clk) && !qatomic_read(&cpu->reset) &&
-           !qatomic_read(&cpu->clock_stopped) && !qatomic_read(&cpu->disabled);
+           !qatomic_read(&cpu->clock_stopped) &&
+           !qatomic_read(&cpu->disabled) && !cpu->ctr_wfi;
 }
 
 /* The clock starts a run at @now, from its first cycle. */
@@ -172,8 +180,8 @@ static void ctr_restart(ESP32P4CPU *cpu, CtrTime now)
 
 /*
  * Count the cycles of the core's clock up to @now: the whole exact periods
- * since its run began, while the clock runs, and in WFI up to where it
- * stops, from where the run restarts as the clock does.
+ * since its run began, while mcycle counts; the run restarts as mcycle
+ * counts again.
  */
 static void ctr_cycles_sync(ESP32P4CPU *cpu, CtrTime now)
 {
@@ -190,22 +198,10 @@ static void ctr_cycles_sync(ESP32P4CPU *cpu, CtrTime now)
         hi += !lo;
     }
     n = esp32p4_clk_units_cycles(cpu->clk_period, hi, lo);
-    if (n <= cpu->cycles_synced) {
-        return;
+    if (n > cpu->cycles_synced) {
+        cpu->cycles += n - cpu->cycles_synced;
+        cpu->cycles_synced = n;
     }
-    n -= cpu->cycles_synced;
-    if (cpu->ctr_wfi && !cpu->waiti_force_on && n >= cpu->wfi_left) {
-        /* cpu_waiti_clk has stopped: nothing more until the core wakes. */
-        cpu->cycles += cpu->wfi_left;
-        cpu->wfi_left = 0;
-        ctr_restart(cpu, now);
-        return;
-    }
-    if (cpu->ctr_wfi && !cpu->waiti_force_on) {
-        cpu->wfi_left -= n;
-    }
-    cpu->cycles += n;
-    cpu->cycles_synced += n;
 }
 
 /* The count a counter counts: cycles, or instructions started. */
@@ -454,33 +450,18 @@ void esp32p4_counters_clock_changed(ESP32P4CPU *cpu)
 }
 
 /*
- * An HP core enters WFI, or leaves it. Its clock, unless forced on, runs
- * on for WAITI_DELAY_NUM cycles from the WFI and stops; as the core
- * leaves WFI it restarts.
+ * An HP core enters WFI, after the WFI's own cycle, or leaves it: mcycle
+ * stops, or counts again from the next cycle.
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
 void esp32p4_counters_wfi(ESP32P4CPU *cpu, bool wfi)
 {
-    ctr_cycles_sync(cpu, ctr_now());
-    cpu->ctr_wfi = wfi;
-    cpu->wfi_left = cpu->waiti_delay;
-}
+    CtrTime now = ctr_now();
 
-/*
- * HP_SYSTEM_CPU_WAITI_CONF changes. A core already in WFI whose clock is
- * no longer forced on runs it on for WAITI_DELAY_NUM cycles from then; one
- * whose clock is forced on again restarts it.
- */
-/* [spec:nuos:req:emu.esp32p4.cpu] */
-void esp32p4_counters_set_waiti(ESP32P4CPU *cpu, bool force_on,
-                                uint8_t delay)
-{
-    ctr_cycles_sync(cpu, ctr_now());
-    if (cpu->waiti_force_on && !force_on) {
-        cpu->wfi_left = delay;
-    }
-    cpu->waiti_force_on = force_on;
-    cpu->waiti_delay = delay;
+    ctr_cycles_sync(cpu, now);
+    cpu->ctr_wfi = wfi;
+    cpu->cycles_ns = now.ns;
+    cpu->cycles_frac = now.frac;
 }
 
 /* The counters' reset values: 0, all counting. */
@@ -497,5 +478,4 @@ void esp32p4_counters_reset(ESP32P4CPU *cpu)
     memset(cpu->hpm, 0, sizeof(cpu->hpm));
     cpu->mcountinhibit = 0;
     cpu->ctr_wfi = false;
-    cpu->wfi_left = 0;
 }
