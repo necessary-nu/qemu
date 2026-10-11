@@ -95,10 +95,14 @@
  *   - The debug assistant: its clock on, both cores' PC and SP recording
  *     restarted (CORE_n_RCD_EN 3) once the ROM has saved the PCs recorded
  *     up to the reset.
- *   - LP_SYSTEM_LP_RST_CTRL 0 (main() clears the reset bypasses); the
- *     super watchdog's reset flag cleared; PMU_IMM_PAD_HOLD_ALL's
- *     unhold (pmu_enable_unhold_pads()) releasing the pads a deep sleep
- *     held.
+ *   - LP_SYSTEM_LP_RST_CTRL 0 (main() clears the reset bypasses);
+ *     PMU_IMM_PAD_HOLD_ALL's unhold (pmu_enable_unhold_pads()) releasing
+ *     the pads a deep sleep held.
+ *   - The super watchdog: running since the reset, unfed, its
+ *     SWD_RESET_FLAG cleared (main()'s clear_super_wdt_reset_flag(), on
+ *     core 0 at every boot), and its reset not enabled by LP_SYSTEM's FIB
+ *     control until software enables it; the ROM neither feeds it nor sets
+ *     SWD_AUTO_FEED_EN nor writes the FIB control.
  *   - The watchdogs: MWDT0's and the RTC watchdog's flash boot protection
  *     running, as they do from reset in SPI boot mode (the GPIO block
  *     gives them the boot mode); the ROM does not stop them. They count
@@ -247,8 +251,6 @@
 #define LP_CLKRST_RESET_CAUSE       0x50111010
 #define PMU_IMM_PAD_HOLD_ALL        0x501150e4
 #define PMU_TIE_LOW_HP_PAD_HOLD_ALL BIT(31)
-#define LP_WDT_SWD_CONFIG           0x5011601c
-#define SWD_RST_FLAG_CLR            BIT(19)
 
 /* The ROM's entry and data. */
 #define ROM_VECTOR_TABLE            0x4fc00b00
@@ -385,7 +387,8 @@ static void rom_main(ESP32P4MachineState *s, uint32_t saved_pc[2])
     rom_clr(CACHE_L1_BYPASS_CACHE_CONF, 0x13);
     rom_set(CACHE_L1_CACHE_ACS_FAIL_CTRL, 0x13);
 
-    rom_set(LP_WDT_SWD_CONFIG, SWD_RST_FLAG_CLR);
+    /* clear_super_wdt_reset_flag(): SWD_RST_FLAG_CLR, without the key. */
+    esp32p4_lp_wdt_swd_rst_flag_clr(&s->lp_wdt);
     rom_set(CACHE_L2_CACHE_CTRL, L2_CACHE_SHUT_DMA);
     rom_set(PMU_IMM_PAD_HOLD_ALL, PMU_TIE_LOW_HP_PAD_HOLD_ALL);
 

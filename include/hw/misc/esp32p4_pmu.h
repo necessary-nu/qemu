@@ -114,7 +114,9 @@ enum {
  *     "etm-event", per ESP32P4_PMU_ETM_EVT_*, the ETM events
  *     PMU_EVT_SLEEP_WAKEUP, pulsed as the chip wakes, ULP_EVT_START_INTR,
  *     as the LP CPU's clock starts on its wakeup, and ULP_EVT_HALT, as
- *     the LP CPU's sleep process ends.
+ *     the LP CPU's sleep process ends; "touch-pwr", a pulse as software
+ *     writes PMU_TOUCH_PWR_CNTL, for the touch sensor's timer, which reads
+ *     it with esp32p4_pmu_touch_pwr_cntl().
  */
 #define ESP32P4_PMU_WAKEUP          "wakeup"
 #define ESP32P4_PMU_EXT_PAD         "ext-pad"
@@ -138,6 +140,7 @@ enum {
 #define ESP32P4_PMU_UART_WAKEUP_EN  "uart-wakeup-en"
 #define ESP32P4_PMU_LP_CORE_INTR_MASK "lp-core-intr-mask"
 #define ESP32P4_PMU_ETM_EVENT       "etm-event"
+#define ESP32P4_PMU_TOUCH_PWR       "touch-pwr"
 
 enum {
     ESP32P4_PMU_ETM_EVT_SLEEP_WAKEUP,
@@ -249,6 +252,7 @@ struct ESP32P4PMUState {
     qemu_irq uart_wakeup_en;
     qemu_irq lp_core_intr_mask;
     qemu_irq etm_event[ESP32P4_PMU_ETM_EVTS];
+    qemu_irq touch_pwr;
     Clock *fast;
     Clock *slow;
     ESP32P4ClkRstState *clkrst;
@@ -295,5 +299,11 @@ struct ESP32P4PMUState {
     bool power_level[ESP32P4_PMU_NUM_PD];
     ESP32P4PMULevels out;
 };
+
+/*
+ * PMU_TOUCH_PWR_CNTL, the touch sensor's timer: its wait and sleep
+ * cycles, FORCE_DONE and SLEEP_TIMER_EN, for the touch sensor.
+ */
+uint32_t esp32p4_pmu_touch_pwr_cntl(ESP32P4PMUState *s);
 
 #endif

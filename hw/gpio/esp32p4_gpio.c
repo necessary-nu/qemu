@@ -81,7 +81,11 @@
  * Everything is recomputed whenever a register, a peripheral signal, an
  * outside driver or a filter changes, and whenever software samples the
  * pads, so that the modulators' bitstreams are read at the virtual time
- * of the access.
+ * of the access. A recomputation drives every line it changes at one
+ * time (see esp32_line.h): that of the change it propagates, and for a
+ * register access the moment the access began, so that every block an
+ * edge reaches, through the matrix, the IO MUX or the ETM, sees it at the
+ * same moment.
  */
 
 #include "qemu/osdep.h"
@@ -840,7 +844,8 @@ static bool pad_driven_by_chip(ESP32P4GpioState *s, unsigned n, bool *level)
  * by its own driver; else high while any is driven high or pulled up.
  */
 static void resolve(ESP32P4GpioState *s, uint64_t *pad_out,
-                    uint64_t *raw_out)
+                    uint64_t *raw_out, uint64_t *drv_high_out,
+                    uint64_t *drv_low_out)
 {
     uint64_t pad = 0, raw = 0, ie_mask = 0;
     uint64_t drv_low = 0, drv_high = 0, pulled = 0;
@@ -928,6 +933,8 @@ static void resolve(ESP32P4GpioState *s, uint64_t *pad_out,
     s->held = held;
     *pad_out = pad;
     *raw_out = raw;
+    *drv_high_out = drv_high;
+    *drv_low_out = drv_low;
 }
 
 /* Filters */
@@ -1529,7 +1536,7 @@ static void propagate(ESP32P4GpioState *s)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t t = esp32_line_time();
     int8_t iomux_src[ESP32P4_GPIO_SIGS];
-    uint64_t pad, raw, pf, hp, changed;
+    uint64_t pad, raw, pf, hp, changed, drv_high, drv_low;
     uint32_t lp;
     bool resync = s->resync;
     bool irq[ESP32P4_GPIO_IRQS], wakeup;
@@ -1539,7 +1546,7 @@ static void propagate(ESP32P4GpioState *s)
         sdm_advance(s, ch, now);
     }
 
-    resolve(s, &pad, &raw);
+    resolve(s, &pad, &raw, &drv_high, &drv_low);
     run_chains(s, raw, t, &pf, &hp, &lp);
     etm_events(s, pf, t);
     latch_interrupts(s, hp, lp);
@@ -1564,6 +1571,15 @@ static void propagate(ESP32P4GpioState *s)
     for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
         if (resync || bit64(changed, n)) {
             qemu_set_irq(s->pad_out[n], bit64(pad, n));
+        }
+    }
+    changed = (drv_high ^ s->drive_high) | (drv_low ^ s->drive_low);
+    s->drive_high = drv_high;
+    s->drive_low = drv_low;
+    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
+        if (resync || bit64(changed, n)) {
+            qemu_set_irq(s->drive_high_out[n], bit64(drv_high, n));
+            qemu_set_irq(s->drive_low_out[n], bit64(drv_low, n));
         }
     }
     for (unsigned sig = 0; sig < ESP32P4_GPIO_SIGS; sig++) {
@@ -1655,15 +1671,11 @@ static void esp32p4_gpio_update_boot_mode(ESP32P4GpioState *s)
  */
 #define GPIO_SETTLE_LIMIT 16
 
-static void esp32p4_gpio_update(ESP32P4GpioState *s)
+static void esp32p4_gpio_settle(void *opaque)
 {
+    ESP32P4GpioState *s = opaque;
     unsigned rounds = 0;
 
-    if (s->updating) {
-        s->update_pending = true;
-        return;
-    }
-    s->updating = true;
     do {
         s->update_pending = false;
         propagate(s);
@@ -1674,6 +1686,25 @@ static void esp32p4_gpio_update(ESP32P4GpioState *s)
             break;
         }
     } while (s->update_pending);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * Resolve the pads until the routing settles. Every line this drives
+ * carries one time, the change's (esp32_line_time()): a stamped change's
+ * own, and for one that carries none, such as a property or a clock, the
+ * moment the resolution began. Every receiver of an edge, and every block
+ * the edge reaches through others, times it alike, rather than each
+ * reading the clock as it happens to run.
+ */
+static void esp32p4_gpio_update(ESP32P4GpioState *s)
+{
+    if (s->updating) {
+        s->update_pending = true;
+        return;
+    }
+    s->updating = true;
+    esp32_line_run_at(esp32_line_time(), esp32p4_gpio_settle, s);
     s->update_pending = false;
     s->updating = false;
     filters_schedule(s);
@@ -2663,43 +2694,74 @@ static const struct {
         ESP32P4_GPIO_RESET_LP },
 };
 
-/*
- * The other offsets of each block have no register: they read as zero and
- * ignore writes. Byte and halfword accesses read and write their bytes of
- * a register.
- */
-static uint64_t esp32p4_gpio_read(void *opaque, hwaddr addr, unsigned size)
-{
-    ESP32P4GpioRegion *r = opaque;
-    uint32_t v;
+/* A register access under way, which acts at one moment throughout. */
+typedef struct GpioAccess {
+    ESP32P4GpioRegion *r;
+    hwaddr addr;
+    uint32_t value;
+    uint32_t mask;
+} GpioAccess;
 
-    filters_catch_up(r->s, esp32_line_time());
-    if (!blocks[r->block].read(r->s, addr & ~3, &v)) {
+static void esp32p4_gpio_do_read(void *opaque)
+{
+    GpioAccess *a = opaque;
+    ESP32P4GpioRegion *r = a->r;
+
+    if (!blocks[r->block].read(r->s, a->addr & ~3, &a->value)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: %s read at 0x%" HWADDR_PRIx ", which has no "
                       "register\n", TYPE_ESP32P4_GPIO, blocks[r->block].name,
-                      addr);
-        v = 0;
+                      a->addr);
+        a->value = 0;
     }
-    return extract32(v, (addr & 3) * 8, size * 8);
+}
+
+static void esp32p4_gpio_do_write(void *opaque)
+{
+    GpioAccess *a = opaque;
+
+    blocks[a->r->block].write(a->r->s, a->addr & ~3, a->value, a->mask);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * The other offsets of each block have no register: they read as zero and
+ * ignore writes. Byte and halfword accesses read and write their bytes of
+ * a register. An access acts at the moment it began: the pad changes it
+ * makes (GPIO_OUT, GPIO_ENABLE, the IO MUX, the routing) and the samples
+ * of the line sources it takes all carry that time (see esp32_line.h), so
+ * that every block an edge reaches sees it at the same moment however its
+ * handlers are ordered, and without icount however long they take.
+ */
+static uint64_t esp32p4_gpio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    GpioAccess a = { .r = opaque, .addr = addr };
+    int64_t t = esp32_line_time();
+
+    filters_catch_up(a.r->s, t);
+    esp32_line_run_at(t, esp32p4_gpio_do_read, &a);
+    return extract32(a.value, (addr & 3) * 8, size * 8);
 }
 
 static void esp32p4_gpio_write(void *opaque, hwaddr addr, uint64_t value,
                                unsigned size)
 {
-    ESP32P4GpioRegion *r = opaque;
     unsigned shift = (addr & 3) * 8;
+    GpioAccess a = {
+        .r = opaque, .addr = addr, .value = value << shift,
+        .mask = MAKE_64BIT_MASK(shift, size * 8),
+    };
+    int64_t t = esp32_line_time();
 
-    filters_catch_up(r->s, esp32_line_time());
-    if (r->s->in_reset[blocks[r->block].reset]) {
+    filters_catch_up(a.r->s, t);
+    if (a.r->s->in_reset[blocks[a.r->block].reset]) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: write to the %s block at 0x%" HWADDR_PRIx
                       " while it is held in reset\n", TYPE_ESP32P4_GPIO,
-                      blocks[r->block].name, addr);
+                      blocks[a.r->block].name, addr);
         return;
     }
-    blocks[r->block].write(r->s, addr & ~3, value << shift,
-                           MAKE_64BIT_MASK(shift, size * 8));
+    esp32_line_run_at(t, esp32p4_gpio_do_write, &a);
 }
 
 static const MemoryRegionOps esp32p4_gpio_ops = {
@@ -3264,6 +3326,10 @@ static void esp32p4_gpio_init(Object *obj)
                             ESP32P4_GPIO_PAD_RELEASE, ESP32P4_GPIO_PADS);
     qdev_init_gpio_out_named(dev, s->pad_out, ESP32P4_GPIO_PAD_OUT,
                              ESP32P4_GPIO_PADS);
+    qdev_init_gpio_out_named(dev, s->drive_high_out,
+                             ESP32P4_GPIO_PAD_DRIVE_HIGH, ESP32P4_GPIO_PADS);
+    qdev_init_gpio_out_named(dev, s->drive_low_out,
+                             ESP32P4_GPIO_PAD_DRIVE_LOW, ESP32P4_GPIO_PADS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_sig_out,
                             ESP32P4_GPIO_SIG_OUT, ESP32P4_GPIO_SIGS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_sig_oe,
@@ -3461,6 +3527,8 @@ static const VMStateDescription vmstate_esp32p4_gpio = {
         VMSTATE_UINT64(hold_ie, ESP32P4GpioState),
         VMSTATE_UINT32(lp_wakeup_edge, ESP32P4GpioState),
         VMSTATE_UINT64(pad_level, ESP32P4GpioState),
+        VMSTATE_UINT64(drive_high, ESP32P4GpioState),
+        VMSTATE_UINT64(drive_low, ESP32P4GpioState),
         VMSTATE_UINT64(raw_in, ESP32P4GpioState),
         VMSTATE_UINT64(pf_in, ESP32P4GpioState),
         VMSTATE_UINT64(hp_in, ESP32P4GpioState),

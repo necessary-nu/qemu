@@ -141,6 +141,11 @@ enum {
  *   ESP32P4_GPIO_PAD_RELEASE, "pad-release" (input): a high level stops
  *     driving pad n from outside.
  *   ESP32P4_GPIO_PAD_OUT, "pad" (output): the level on pad n.
+ *   ESP32P4_GPIO_PAD_DRIVE_HIGH, "pad-drive-high", and _PAD_DRIVE_LOW,
+ *     "pad-drive-low" (outputs): high while a digital driver, from outside
+ *     or the pad's own (esp32p4_gpio_pad_driven()), holds pad n high, or
+ *     low: for the analog blocks, which see such a pad at the supply or
+ *     ground.
  *   Properties "pad-ext-driven" and "pad-ext-level", masks with bit n for
  *     pad n: the pads driven from outside and their levels, settable
  *     with -global before the machine starts and with qom-set while it
@@ -232,6 +237,8 @@ enum {
 #define ESP32P4_GPIO_PAD_IN         "pad-in"
 #define ESP32P4_GPIO_PAD_RELEASE    "pad-release"
 #define ESP32P4_GPIO_PAD_OUT        "pad"
+#define ESP32P4_GPIO_PAD_DRIVE_HIGH "pad-drive-high"
+#define ESP32P4_GPIO_PAD_DRIVE_LOW  "pad-drive-low"
 #define ESP32P4_GPIO_RESET          "reset"
 #define ESP32P4_GPIO_PAD_PULL_UP    "pad-pull-up"
 #define ESP32P4_GPIO_PAD_HOLD       "pad-hold"
@@ -325,6 +332,8 @@ struct ESP32P4GpioState {
     QEMUTimer filter_timer;
     qemu_irq irq[ESP32P4_GPIO_IRQS];
     qemu_irq pad_out[ESP32P4_GPIO_PADS];
+    qemu_irq drive_high_out[ESP32P4_GPIO_PADS];
+    qemu_irq drive_low_out[ESP32P4_GPIO_PADS];
     qemu_irq sig_in_out[ESP32P4_GPIO_SIGS];
     qemu_irq lp_sig_in_out[ESP32P4_GPIO_LP_SIGS];
     qemu_irq iomux_in_out[ESP32P4_GPIO_IOMUX_LINES];
@@ -446,6 +455,9 @@ struct ESP32P4GpioState {
 
     /* Levels the block computes, as last driven */
     uint64_t pad_level;
+    /* The pads a digital driver holds high, and low */
+    uint64_t drive_high;
+    uint64_t drive_low;
     /* Each pad's input buffer: its level while its input is enabled */
     uint64_t raw_in;
     /* The HP chain: the pin filters' outputs, then the glitch filters' */

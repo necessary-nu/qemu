@@ -82,7 +82,12 @@
  *
  * Every clock is a clock output of this device, at its current
  * frequency, and the header gives the convention by which a block takes
- * its clocks and reset. The PMU, in the states that give it control,
+ * its clocks and reset. Each clock's period is computed exactly from its
+ * sources' frequencies (RC_FAST_CLK's as the fraction of Hz its trim
+ * gives, the PLLs' as the analog blocks give them) through every divider
+ * on its way, and rounded down to its Clock's unit once
+ * (esp32p4_clk_period.h): the rounding of one clock never reaches those
+ * divided from it. The PMU, in the states that give it control,
  * gates the clocks PMU_n1_DIG_ICG_FUNC_EN lists (TRM table 15.4-2) and
  * selects and gates ROOT_CLK's source in place of HP_ROOT_CLK_SRC_SEL and
  * HP_ROOT_CLK_EN. FORCE_ON bits bypass automatic clock gating,
@@ -1274,38 +1279,68 @@ static uint32_t fld(ESP32P4ClkRstState *s, ClkField f)
     return f.width ? extract32(s->regs[f.reg], f.shift, f.width) : 0;
 }
 
-/* a * num / den in clock period units, saturating at "too slow to run". */
-static uint64_t period_scale(uint64_t a, uint64_t num, uint64_t den)
+/* The analog block's PLL behind clock input @in, or -1. */
+static int esp32p4_clkin_pll(int in)
 {
-    uint64_t lo, hi;
-
-    if (!den) {
-        return 0;
+    switch (in) {
+    case ESP32P4_CLKIN_CPLL_IN:
+        return ESP32P4_ANA_PLL_CPLL;
+    case ESP32P4_CLKIN_SPLL_IN:
+        return ESP32P4_ANA_PLL_SPLL;
+    case ESP32P4_CLKIN_MPLL_IN:
+        return ESP32P4_ANA_PLL_MPLL;
+    case ESP32P4_CLKIN_APLL_IN:
+        return ESP32P4_ANA_PLL_APLL;
+    case ESP32P4_CLKIN_SDIO_PLL_IN:
+        return ESP32P4_ANA_PLL_SDIO;
+    default:
+        return -1;
     }
-    mulu64(&lo, &hi, a, num);
-    divu128(&lo, &hi, den);
-    return hi ? UINT64_MAX : lo;
 }
 
-static uint64_t esp32p4_clkrst_parent(ESP32P4ClkRstState *s, int16_t p)
+/*
+ * [spec:nuos:req:emu.esp32p4.clocks]
+ * Clock input @in's period: a PLL's exactly from the analog block, while
+ * its Clock shows that period; any other input's, a whole number of
+ * Clock units, as exact.
+ */
+static ESP32P4ClkPeriod esp32p4_clkrst_input(ESP32P4ClkRstState *s, int in)
+{
+    uint64_t period = clock_get(s->clk_in[in]);
+    int pll = esp32p4_clkin_pll(in);
+    ESP32P4ClkPeriod p;
+
+    if (s->ana && pll >= 0) {
+        p = esp32p4_ana_pll_period(s->ana, pll);
+        if (esp32p4_clk_period_clock(p) == period) {
+            return p;
+        }
+    }
+    return esp32p4_clk_period_exact(period);
+}
+
+static ESP32P4ClkPeriod esp32p4_clkrst_parent(ESP32P4ClkRstState *s,
+                                              int16_t p)
 {
     if (p == PARENT_NONE) {
-        return 0;
+        return esp32p4_clk_period_stopped();
     }
     if (p & PARENT_IN) {
-        return clock_get(s->clk_in[p & ~PARENT_IN]);
+        return esp32p4_clkrst_input(s, p & ~PARENT_IN);
     }
-    return s->period[p];
+    return s->exact[p];
 }
 
 /* The period divided by (int + 1) + num / den; den 0 drops the fraction. */
-static uint64_t esp32p4_clkrst_frac(uint64_t p, uint32_t intpart,
-                                    uint32_t num, uint32_t den)
+static ESP32P4ClkPeriod esp32p4_clkrst_frac(ESP32P4ClkPeriod p,
+                                            uint32_t intpart, uint32_t num,
+                                            uint32_t den)
 {
     if (!den) {
-        return period_scale(p, intpart + 1, 1);
+        return esp32p4_clk_period_scale(p, intpart + 1ull, 1);
     }
-    return period_scale(p, (uint64_t)(intpart + 1) * den + num, den);
+    return esp32p4_clk_period_scale(p, (uint64_t)(intpart + 1) * den + num,
+                                    den);
 }
 
 /*
@@ -1313,8 +1348,9 @@ static uint64_t esp32p4_clkrst_frac(uint64_t p, uint32_t intpart,
  * (TRM section 49.6): with YN1 clear, b = Z and a = (X + 1) Z + Y; with
  * it set, a - b = Z and a = (X + 1) Z + Y.
  */
-static uint64_t esp32p4_clkrst_i2s(uint64_t p, uint32_t n, uint32_t x,
-                                   uint32_t y, uint32_t z, uint32_t yn1)
+static ESP32P4ClkPeriod esp32p4_clkrst_i2s(ESP32P4ClkPeriod p, uint32_t n,
+                                           uint32_t x, uint32_t y, uint32_t z,
+                                           uint32_t yn1)
 {
     uint64_t a = (uint64_t)(x + 1) * z + y;
     uint64_t b = yn1 ? a - MIN(z, a) : z;
@@ -1323,100 +1359,102 @@ static uint64_t esp32p4_clkrst_i2s(uint64_t p, uint32_t n, uint32_t x,
         b = 0;
         a = 1;
     }
-    if (!n && !b) {
-        return 0;
-    }
-    return period_scale(p, n * a + b, a);
+    return esp32p4_clk_period_scale(p, n * a + b, a);
 }
 
-static uint64_t esp32p4_clkrst_rc_fast(ESP32P4ClkRstState *s)
+/*
+ * RC_FAST_CLK, linear in FOSC_DFREQ through the two settings whose
+ * frequencies are known, as the exact fraction of Hz that gives.
+ */
+static ESP32P4ClkPeriod esp32p4_clkrst_rc_fast(ESP32P4ClkRstState *s)
 {
     int64_t dfreq = extract32(s->regs[R_LP_FOSC_CNTL], 22, 10);
-    int64_t hz = RC_FAST_LO_HZ + (dfreq - RC_FAST_LO_DFREQ) *
-                 (RC_FAST_HI_HZ - RC_FAST_LO_HZ) /
-                 (RC_FAST_HI_DFREQ - RC_FAST_LO_DFREQ);
+    int64_t den = RC_FAST_HI_DFREQ - RC_FAST_LO_DFREQ;
+    int64_t num = RC_FAST_LO_HZ * den +
+                  (dfreq - RC_FAST_LO_DFREQ) * (RC_FAST_HI_HZ - RC_FAST_LO_HZ);
 
-    return CLOCK_PERIOD_FROM_HZ(hz);
+    return esp32p4_clk_period_of_hz(num, den);
 }
 
-static uint64_t esp32p4_clkrst_special(ESP32P4ClkRstState *s, int id)
+static ESP32P4ClkPeriod esp32p4_clkrst_special(ESP32P4ClkRstState *s, int id)
 {
+    ESP32P4ClkPeriod stopped = esp32p4_clk_period_stopped();
     uint32_t v, sel;
     int i, src;
 
     switch (id) {
     case C(OSC_XTAL):
         return s->pmu_xpd[ESP32P4_CLKRST_XPD_XTAL] ?
-               CLOCK_PERIOD_FROM_HZ(XTAL_HZ) : 0;
+               esp32p4_clk_period_of_hz(XTAL_HZ, 1) : stopped;
     case C(OSC_RC_FAST):
         return s->pmu_xpd[ESP32P4_CLKRST_XPD_RC_FAST] ?
-               esp32p4_clkrst_rc_fast(s) : 0;
+               esp32p4_clkrst_rc_fast(s) : stopped;
     case C(OSC_RC_SLOW):
-        return CLOCK_PERIOD_FROM_HZ(RC_SLOW_HZ);
+        return esp32p4_clk_period_of_hz(RC_SLOW_HZ, 1);
     case C(OSC_RC32K):
         return s->pmu_xpd[ESP32P4_CLKRST_XPD_RC32K] ?
-               CLOCK_PERIOD_FROM_HZ(RC32K_HZ) : 0;
+               esp32p4_clk_period_of_hz(RC32K_HZ, 1) : stopped;
     case C(OSC_XTAL32K):
-        return s->pmu_xpd[ESP32P4_CLKRST_XPD_XTAL32K] && s->xtal32k_hz ?
-               CLOCK_PERIOD_FROM_HZ(s->xtal32k_hz) : 0;
+        return s->pmu_xpd[ESP32P4_CLKRST_XPD_XTAL32K] ?
+               esp32p4_clk_period_of_hz(s->xtal32k_hz, 1) : stopped;
     case C(OSC_PLL_LP):
         src = extract32(s->regs[R_LP_CLK_CONF], 10, 1) ? C(OSC_XTAL32K) :
                                                          C(OSC_RC32K);
         return s->pmu_xpd[ESP32P4_CLKRST_XPD_LP_PLL] && s->period[src] ?
-               CLOCK_PERIOD_FROM_HZ(PLL_LP_HZ) : 0;
+               esp32p4_clk_period_of_hz(PLL_LP_HZ, 1) : stopped;
     case C(CPU):
     case C(MEM):
     case C(SYS):
     case C(APB):
         i = id - C(CPU);
-        return esp32p4_clkrst_frac(s->period[id - 1], s->soc_div[i][0],
+        return esp32p4_clkrst_frac(s->exact[id - 1], s->soc_div[i][0],
                                    s->soc_div[i][1], s->soc_div[i][2]);
     case C(SDIO_LS):
         v = s->regs[R_PERI_CLK_CTRL01];
         if (!extract32(v, 24, 1)) {
-            return 0;
+            return stopped;
         }
         src = extract32(v, 23, 1) ? C(APLL) : C(PLL_F160M);
-        return period_scale(s->period[src],
-                            (uint64_t)(extract32(s->regs[R_PERI_CLK_CTRL02],
-                                                 0, 8) + 1) *
-                            (s->sdio_edge[2] + 1), 1);
+        return esp32p4_clk_period_scale(
+            s->exact[src],
+            (uint64_t)(extract32(s->regs[R_PERI_CLK_CTRL02], 0, 8) + 1) *
+            (s->sdio_edge[2] + 1), 1);
     case C(SDIO_SLF):
     case C(SDIO_DRV):
     case C(SDIO_SAM):
         i = id - C(SDIO_SLF);
         if (!extract32(s->regs[R_PERI_CLK_CTRL02], 27 + i, 1)) {
-            return 0;
+            return stopped;
         }
         if (extract32(s->regs[R_PERI_CLK_CTRL01], 22, 1)) {
-            return s->period[C(SDIO_PLL0) + i];
+            return s->exact[C(SDIO_PLL0) + i];
         }
-        return s->period[C(SDIO_LS)];
+        return s->exact[C(SDIO_LS)];
     case C(CLKOUT0):
     case C(CLKOUT1):
     case C(CLKOUT2):
         i = id - C(CLKOUT0);
         if (!extract32(s->regs[R_DBG_CLK_CTRL1], 16 + i, 1)) {
-            return 0;
+            return stopped;
         }
         sel = extract32(s->regs[R_DBG_CLK_CTRL0], 8 * i, 8);
         v = i == 0 ? extract32(s->regs[R_DBG_CLK_CTRL0], 24, 8) :
                      extract32(s->regs[R_DBG_CLK_CTRL1], 8 * (i - 1), 8);
         for (src = 0; src < ARRAY_SIZE(esp32p4_clkout_sigs); src++) {
             if (esp32p4_clkout_sigs[src].sig == sel) {
-                return period_scale(
-                    s->period[esp32p4_clkout_sigs[src].clk], v + 1, 1);
+                return esp32p4_clk_period_scale(
+                    s->exact[esp32p4_clkout_sigs[src].clk], v + 1, 1);
             }
         }
-        return 0;
+        return stopped;
     case C(LP_DYN_FAST):
-        return s->period[s->pmu_lp_sleep ? C(LP_SLOW) : C(LP_FAST)];
+        return s->exact[s->pmu_lp_sleep ? C(LP_SLOW) : C(LP_FAST)];
     case C(LP_CORE):
         if (!(s->regs[R_LPPERI_CLK_EN] & CK_EN_LP_CORE) &&
             !s->pmu_lp_core_clock) {
-            return 0;
+            return stopped;
         }
-        return s->period[C(LP_DYN_FAST)];
+        return s->exact[C(LP_DYN_FAST)];
     default:
         g_assert_not_reached();
     }
@@ -1453,11 +1491,15 @@ static bool esp32p4_clkrst_pmu_gated(ESP32P4ClkRstState *s, int id)
     return false;
 }
 
-/* [spec:nuos:req:emu.esp32p4.clocks] */
-static uint64_t esp32p4_clkrst_compute(ESP32P4ClkRstState *s, int id)
+/*
+ * [spec:nuos:req:emu.esp32p4.clocks]
+ * Clock @id's period, exactly, from its parent's: each divider scales the
+ * exact period, so that only the Clock's rounding is ever lost.
+ */
+static ESP32P4ClkPeriod esp32p4_clkrst_compute(ESP32P4ClkRstState *s, int id)
 {
     const ClkDesc *d = &esp32p4_clk_desc[id];
-    uint64_t p;
+    ESP32P4ClkPeriod p;
     uint32_t sel;
     int i;
 
@@ -1469,18 +1511,19 @@ static uint64_t esp32p4_clkrst_compute(ESP32P4ClkRstState *s, int id)
         sel = s->pmu_sysclk[ESP32P4_CLKRST_SYSCLK_SEL0] |
               s->pmu_sysclk[ESP32P4_CLKRST_SYSCLK_SEL1] << 1;
     }
-    p = sel < d->nparents ? esp32p4_clkrst_parent(s, d->parent[sel]) : 0;
+    p = sel < d->nparents ? esp32p4_clkrst_parent(s, d->parent[sel]) :
+                            esp32p4_clk_period_stopped();
     for (i = 0; i < ARRAY_SIZE(d->gate); i++) {
         if (d->gate[i].width && !fld(s, d->gate[i])) {
-            return 0;
+            return esp32p4_clk_period_stopped();
         }
     }
-    if (!p || esp32p4_clkrst_pmu_gated(s, id)) {
-        return 0;
+    if (esp32p4_clkrst_pmu_gated(s, id)) {
+        return esp32p4_clk_period_stopped();
     }
     switch (d->kind) {
     case DIV_INT:
-        return period_scale(p, fld(s, d->div[0]) + 1ull, 1);
+        return esp32p4_clk_period_scale(p, fld(s, d->div[0]) + 1ull, 1);
     case DIV_FRAC:
         return esp32p4_clkrst_frac(p, fld(s, d->div[0]), fld(s, d->div[1]),
                                    fld(s, d->div[2]));
@@ -1489,7 +1532,7 @@ static uint64_t esp32p4_clkrst_compute(ESP32P4ClkRstState *s, int id)
                                   fld(s, d->div[2]), fld(s, d->div[3]),
                                   fld(s, d->div[4]));
     case DIV_FIXED:
-        return period_scale(p, d->fixed, 1);
+        return esp32p4_clk_period_scale(p, d->fixed, 1);
     default:
         return p;
     }
@@ -1703,7 +1746,8 @@ static void esp32p4_clkrst_update(ESP32P4ClkRstState *s, bool force)
     do {
         s->recompute_again = false;
         for (i = 0; i < ESP32P4_NUM_CLOCKS; i++) {
-            s->period[i] = esp32p4_clkrst_compute(s, i);
+            s->exact[i] = esp32p4_clkrst_compute(s, i);
+            s->period[i] = esp32p4_clk_period_clock(s->exact[i]);
         }
         esp32p4_clkrst_check_soc(s);
         for (i = 0; i < ESP32P4_NUM_CLOCKS; i++) {
@@ -1966,8 +2010,8 @@ static uint32_t esp32p4_clkrst_value(ESP32P4ClkRstState *s, unsigned idx)
         if (src >= esp32p4_clk_desc[C(ROOT)].nparents) {
             return 0;
         }
-        hz = esp32p4_clkrst_parent(s, esp32p4_clk_desc[C(ROOT)].parent[src]);
-        hz = hz ? CLOCK_PERIOD_TO_HZ(hz) : 0;
+        hz = CLOCK_PERIOD_TO_HZ(esp32p4_clk_period_clock(
+            esp32p4_clkrst_parent(s, esp32p4_clk_desc[C(ROOT)].parent[src])));
         return (hz * 4 + 500000) / 1000000;
     case R_CPU_CLK_STATUS0:
         v = (s->soc_div[0][0] || (s->soc_div[0][2] && s->soc_div[0][1])) << 1;
@@ -2689,7 +2733,8 @@ static int esp32p4_clkrst_post_load(void *opaque, int version_id)
     int i;
 
     for (i = 0; i < ESP32P4_NUM_CLOCKS; i++) {
-        s->period[i] = esp32p4_clkrst_compute(s, i);
+        s->exact[i] = esp32p4_clkrst_compute(s, i);
+        s->period[i] = esp32p4_clk_period_clock(s->exact[i]);
         clock_set(s->clk[i], s->period[i]);
     }
     for (i = 0; i < ESP32P4_NUM_RESETS; i++) {
@@ -2762,6 +2807,8 @@ static const VMStateDescription vmstate_esp32p4_clkrst = {
 
 static const Property esp32p4_clkrst_properties[] = {
     DEFINE_PROP_UINT32("xtal32k-hz", ESP32P4ClkRstState, xtal32k_hz, 32768),
+    DEFINE_PROP_LINK("ana", ESP32P4ClkRstState, ana, TYPE_ESP32P4_ANA,
+                     ESP32P4AnaState *),
 };
 
 static void esp32p4_clkrst_class_init(ObjectClass *klass, const void *data)

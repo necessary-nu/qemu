@@ -11,6 +11,8 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_ana.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/queue.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -72,7 +74,14 @@ enum {
  *
  * Clocks from pads are clock inputs, "pad-<signal>-in" (unconnected, a
  * stopped clock), and the PLLs' outputs come in from the analog block as
- * "cpll-in", "spll-in", "mpll-in", "apll-in" and "sdio-pll-in".
+ * "cpll-in", "spll-in", "mpll-in", "apll-in" and "sdio-pll-in". With the
+ * analog block as its "ana" link, the tree takes the PLLs' periods from
+ * it exactly (esp32p4_ana_pll_period()), and every clock's period is
+ * computed exactly from its sources' frequencies through all the
+ * dividers between, then rounded down once for its Clock (see
+ * esp32p4_clk_period.h): a clock whose period is a whole number of Clock
+ * units, such as the 6.25 ns of PLL_F160M_CLK, has exactly that period,
+ * and any other is less than a unit short of its own.
  *
  * Resets. Each block reset of HP_SYS_CLKRST_HP_RST_EN*, LP_CLKRST and
  * LPPERI_RESET_EN is a line of the named GPIO output ESP32P4_CLKRST_RESET,
@@ -748,7 +757,10 @@ struct ESP32P4ClkRstState {
 
     Clock *clk_in[ESP32P4_NUM_CLKIN];
     Clock *clk[ESP32P4_NUM_CLOCKS];
-    /* The periods the tree last computed, in Clock units. */
+    /* The analog block, whose PLLs' periods the tree takes exactly. */
+    ESP32P4AnaState *ana;
+    /* The periods the tree last computed, exactly and in Clock units. */
+    ESP32P4ClkPeriod exact[ESP32P4_NUM_CLOCKS];
     uint64_t period[ESP32P4_NUM_CLOCKS];
     bool recomputing;
     bool recompute_again;
