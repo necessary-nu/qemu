@@ -1980,8 +1980,10 @@ static uint32_t esp32p4_clkrst_value(ESP32P4ClkRstState *s, unsigned idx)
         if (src >= esp32p4_clk_desc[C(ROOT)].nparents) {
             return 0;
         }
-        hz = CLOCK_PERIOD_TO_HZ(esp32p4_clk_period_clock(
-            esp32p4_clkrst_parent(s, esp32p4_clk_desc[C(ROOT)].parent[src])));
+        /* The source's whole cycles a second, at its exact period. */
+        hz = esp32p4_clk_ns_cycles(
+            esp32p4_clkrst_parent(s, esp32p4_clk_desc[C(ROOT)].parent[src]),
+            NANOSECONDS_PER_SECOND);
         return (hz * 4 + 500000) / 1000000;
     case R_CPU_CLK_STATUS0:
         v = (s->soc_div[0][0] || (s->soc_div[0][2] && s->soc_div[0][1])) << 1;
