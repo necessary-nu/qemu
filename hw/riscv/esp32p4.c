@@ -4087,7 +4087,7 @@ static void esp32p4_init_crypto(ESP32P4MachineState *s)
     qdev_connect_clock_in(trng, "clk", qdev_get_clock_out(clkrst, "lp-rng"));
     sysbus_realize(SYS_BUS_DEVICE(trng), &error_fatal);
     gate = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(trng), 0,
-                                    ESP32P4_TRNG_BASE, ESP32P4_CLK_LP_RNG,
+                                    ESP32P4_TRNG_BASE, ESP32P4_CLK_LP_PERI,
                                     ESP32P4_RST_LP_RNG, 0);
     esp32p4_clkrst_gate_volatile(gate, ESP32P4_TRNG_DATA, 4);
 

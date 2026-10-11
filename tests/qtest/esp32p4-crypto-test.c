@@ -184,6 +184,8 @@
 #define RNG_RSTN            (TRNG + 0x08)
 #define RNG_DATE            (TRNG + 0x0c)
 #define RNG_CLK_EN          (1u << 31)
+#define LPPERI_CLK_EN       0x50120000
+#define LPPERI_CK_EN_RNG    (1u << 16)
 
 static QTestState *start(void)
 {
@@ -1031,6 +1033,42 @@ static void test_rng(void)
     qtest_quit(qts);
 }
 
+/*
+ * LPPERI_CK_EN_RNG gates RC_FAST_CLK into the generator as an entropy
+ * source, not its registers' clock: cleared, the registers still answer
+ * and each read of RNG_DATA is still a new number (pseudo-random, the TRM
+ * says), but RNG_SAMPLE_CNT, which RC_FAST_CLK paces, stops where it is
+ * until the source is back.
+ */
+/* [spec:nuos:req:emu.esp32p4.crypto/test] */
+static void test_rng_source(void)
+{
+    QTestState *qts = start();
+    uint32_t a, b, c, n;
+
+    qtest_writel(qts, RNG_CFG, qtest_readl(qts, RNG_CFG) | 1);
+    qtest_clock_step(qts, 1000 * 1000);
+    g_assert_cmpuint(qtest_readl(qts, RNG_CFG) >> 24, !=, 0);
+
+    qtest_writel(qts, LPPERI_CLK_EN,
+                 qtest_readl(qts, LPPERI_CLK_EN) & ~LPPERI_CK_EN_RNG);
+    g_assert_cmphex(qtest_readl(qts, RNG_DATE), ==, 2425091);
+    a = qtest_readl(qts, RNG_DATA);
+    b = qtest_readl(qts, RNG_DATA);
+    c = qtest_readl(qts, RNG_DATA);
+    g_assert_true(a != b || b != c);
+    g_assert_true(a || b || c);
+    n = qtest_readl(qts, RNG_CFG) >> 24;
+    qtest_clock_step(qts, 1000 * 1000);
+    g_assert_cmpuint(qtest_readl(qts, RNG_CFG) >> 24, ==, n);
+
+    qtest_writel(qts, LPPERI_CLK_EN,
+                 qtest_readl(qts, LPPERI_CLK_EN) | LPPERI_CK_EN_RNG);
+    qtest_clock_step(qts, 100 * 1000);
+    g_assert_cmpuint(qtest_readl(qts, RNG_CFG) >> 24, !=, n);
+    qtest_quit(qts);
+}
+
 /* The HUK Generator and the Key Manager */
 
 static void huk_continue(QTestState *qts, uint32_t state)
@@ -1214,6 +1252,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4-crypto/rsa", test_rsa);
     qtest_add_func("/esp32p4-crypto/ecc", test_ecc);
     qtest_add_func("/esp32p4-crypto/rng", test_rng);
+    qtest_add_func("/esp32p4-crypto/rng-source", test_rng_source);
     qtest_add_func("/esp32p4-crypto/huk-km", test_huk_km);
     qtest_add_func("/esp32p4-crypto/ds-no-key", test_ds_no_key);
     return g_test_run();
