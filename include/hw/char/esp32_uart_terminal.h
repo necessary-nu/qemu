@@ -57,6 +57,8 @@ struct Esp32UartTerminalState {
     uint8_t tx_bit;
     int64_t tx_start_ns;
     uint64_t tx_q32;
+    /* The host holds its TX line low, a break ("break" property). */
+    bool brk;
 
     Notifier format_notifier;
     Notifier line_source;

@@ -371,34 +371,27 @@ static RISCVException write_absent(CPURISCVState *env, int csrno,
 /* Counters */
 
 /*
- * mcountinhibit.TM is writable on the HP core, but the time the core reads
- * through the time CSR is not its own to stop.
+ * mcountinhibit, the cycle and instruction counters and the event
+ * counters: each core's own (esp32p4_counters.c). Which of them a core
+ * has, and who may read them, is as the standard predicates and the LP
+ * core's CSR list say.
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
-static RISCVException read_mcountinhibit(CPURISCVState *env, int csrno,
-                                         target_ulong *val)
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static RISCVException read_counter(CPURISCVState *env, int csrno,
+                                   target_ulong *val)
 {
-    RISCVException ret = std_read(env, csrno, val);
-
-    if (ret == RISCV_EXCP_NONE && esp32p4_env_is_hp(env) &&
-        esp32p4_cpu_from_env(env)->mcountinhibit_tm) {
-        *val |= COUNTEREN_TM;
+    if (esp32p4_env_is_hp(env) || esp32p4_env_is_lp(env)) {
+        return esp32p4_counters_read(env, csrno, val);
     }
-    return ret;
+    return std_read(env, csrno, val);
 }
 
-/* [spec:nuos:req:emu.esp32p4.cpu] */
-static RISCVException write_mcountinhibit(CPURISCVState *env, int csrno,
-                                          target_ulong val, uintptr_t ra)
+static RISCVException write_counter(CPURISCVState *env, int csrno,
+                                    target_ulong val, uintptr_t ra)
 {
-    if (esp32p4_env_is_hp(env)) {
-        ESP32P4CPU *cpu = esp32p4_cpu_from_env(env);
-
-        cpu->mcountinhibit_tm = val & COUNTEREN_TM;
-        if (cpu->mcountinhibit_tm) {
-            qemu_log_mask(LOG_UNIMP, "esp32p4: mcountinhibit.TM does not "
-                          "stop the CLINT time the time CSR reads\n");
-        }
+    if (esp32p4_env_is_hp(env) || esp32p4_env_is_lp(env)) {
+        return esp32p4_counters_write(env, csrno, val);
     }
     return std_write(env, csrno, val, ra);
 }
@@ -1358,10 +1351,14 @@ static RISCVException write_xclicbase(CPURISCVState *env, int csrno,
  */
 #define LP_CSR(no, name) \
     HP_CSR((no), (name), std_predicate, std_read, std_write)
-#define LP_MHPM(n)  LP_CSR(CSR_MHPMCOUNTER3 + (n) - 3, "mhpmcounter" #n)
-#define LP_MHPMH(n) LP_CSR(CSR_MHPMCOUNTER3H + (n) - 3, "mhpmcounter" #n "h")
-#define LP_HPM(n)   LP_CSR(CSR_HPMCOUNTER3 + (n) - 3, "hpmcounter" #n)
-#define LP_HPMH(n)  LP_CSR(CSR_HPMCOUNTER3H + (n) - 3, "hpmcounter" #n "h")
+
+/* A counter CSR, which both cores keep their own way. */
+#define CTR_CSR(no, name) \
+    HP_CSR((no), (name), std_predicate, read_counter, write_counter)
+#define MHPMCTR(n)  CTR_CSR(CSR_MHPMCOUNTER3 + (n) - 3, "mhpmcounter" #n)
+#define MHPMCTRH(n) CTR_CSR(CSR_MHPMCOUNTER3H + (n) - 3, "mhpmcounter" #n "h")
+#define HPMCTR(n)   CTR_CSR(CSR_HPMCOUNTER3 + (n) - 3, "hpmcounter" #n)
+#define HPMCTRH(n)  CTR_CSR(CSR_HPMCOUNTER3H + (n) - 3, "hpmcounter" #n "h")
 #define PMAADDR(n) \
     HP_CSR(CSR_ESP_PMAADDR0 + (n), "pma_addr" #n, hp, read_pma, write_pma)
 
@@ -1403,8 +1400,7 @@ const RISCVCSR esp32p4_csr_list[] = {
            write_xclicbase),
     HP_CSR(CSR_TIMEH, "timeh", hp_absent, read_absent, write_absent),
 
-    HP_CSR(CSR_MCOUNTINHIBIT, "mcountinhibit", hp_std, read_mcountinhibit,
-           write_mcountinhibit),
+    CTR_CSR(CSR_MCOUNTINHIBIT, "mcountinhibit"),
     MHPMEVENT(3), MHPMEVENT(4), MHPMEVENT(5), MHPMEVENT(6), MHPMEVENT(7),
     MHPMEVENT(8), MHPMEVENT(9), MHPMEVENT(10), MHPMEVENT(11), MHPMEVENT(12),
     MHPMEVENT(13), MHPMEVENT(14), MHPMEVENT(15), MHPMEVENT(16),
@@ -1502,37 +1498,37 @@ const RISCVCSR esp32p4_csr_list[] = {
     LP_CSR(CSR_MVENDORID, "mvendorid"),
     LP_CSR(CSR_MARCHID, "marchid"),
     LP_CSR(CSR_MIMPID, "mimpid"),
-    LP_CSR(CSR_MCYCLE, "mcycle"),
-    LP_CSR(CSR_MINSTRET, "minstret"),
-    LP_CSR(CSR_MCYCLEH, "mcycleh"),
-    LP_CSR(CSR_MINSTRETH, "minstreth"),
-    LP_CSR(CSR_CYCLE, "cycle"),
+    CTR_CSR(CSR_MCYCLE, "mcycle"),
+    CTR_CSR(CSR_MINSTRET, "minstret"),
+    CTR_CSR(CSR_MCYCLEH, "mcycleh"),
+    CTR_CSR(CSR_MINSTRETH, "minstreth"),
+    CTR_CSR(CSR_CYCLE, "cycle"),
     LP_CSR(CSR_TIME, "time"),
-    LP_CSR(CSR_INSTRET, "instret"),
-    LP_CSR(CSR_CYCLEH, "cycleh"),
-    LP_CSR(CSR_INSTRETH, "instreth"),
-    LP_MHPM(3), LP_MHPM(4), LP_MHPM(5), LP_MHPM(6), LP_MHPM(7), LP_MHPM(8),
-    LP_MHPM(9), LP_MHPM(10), LP_MHPM(11), LP_MHPM(12), LP_MHPM(13),
-    LP_MHPM(14), LP_MHPM(15), LP_MHPM(16), LP_MHPM(17), LP_MHPM(18),
-    LP_MHPM(19), LP_MHPM(20), LP_MHPM(21), LP_MHPM(22), LP_MHPM(23),
-    LP_MHPM(24), LP_MHPM(25), LP_MHPM(26), LP_MHPM(27), LP_MHPM(28),
-    LP_MHPM(29), LP_MHPM(30), LP_MHPM(31),
-    LP_MHPMH(3), LP_MHPMH(4), LP_MHPMH(5), LP_MHPMH(6), LP_MHPMH(7),
-    LP_MHPMH(8), LP_MHPMH(9), LP_MHPMH(10), LP_MHPMH(11), LP_MHPMH(12),
-    LP_MHPMH(13), LP_MHPMH(14), LP_MHPMH(15), LP_MHPMH(16), LP_MHPMH(17),
-    LP_MHPMH(18), LP_MHPMH(19), LP_MHPMH(20), LP_MHPMH(21), LP_MHPMH(22),
-    LP_MHPMH(23), LP_MHPMH(24), LP_MHPMH(25), LP_MHPMH(26), LP_MHPMH(27),
-    LP_MHPMH(28), LP_MHPMH(29), LP_MHPMH(30), LP_MHPMH(31),
-    LP_HPM(3), LP_HPM(4), LP_HPM(5), LP_HPM(6), LP_HPM(7), LP_HPM(8),
-    LP_HPM(9), LP_HPM(10), LP_HPM(11), LP_HPM(12), LP_HPM(13), LP_HPM(14),
-    LP_HPM(15), LP_HPM(16), LP_HPM(17), LP_HPM(18), LP_HPM(19), LP_HPM(20),
-    LP_HPM(21), LP_HPM(22), LP_HPM(23), LP_HPM(24), LP_HPM(25), LP_HPM(26),
-    LP_HPM(27), LP_HPM(28), LP_HPM(29), LP_HPM(30), LP_HPM(31),
-    LP_HPMH(3), LP_HPMH(4), LP_HPMH(5), LP_HPMH(6), LP_HPMH(7), LP_HPMH(8),
-    LP_HPMH(9), LP_HPMH(10), LP_HPMH(11), LP_HPMH(12), LP_HPMH(13),
-    LP_HPMH(14), LP_HPMH(15), LP_HPMH(16), LP_HPMH(17), LP_HPMH(18),
-    LP_HPMH(19), LP_HPMH(20), LP_HPMH(21), LP_HPMH(22), LP_HPMH(23),
-    LP_HPMH(24), LP_HPMH(25), LP_HPMH(26), LP_HPMH(27), LP_HPMH(28),
-    LP_HPMH(29), LP_HPMH(30), LP_HPMH(31),
+    CTR_CSR(CSR_INSTRET, "instret"),
+    CTR_CSR(CSR_CYCLEH, "cycleh"),
+    CTR_CSR(CSR_INSTRETH, "instreth"),
+    MHPMCTR(3), MHPMCTR(4), MHPMCTR(5), MHPMCTR(6), MHPMCTR(7), MHPMCTR(8),
+    MHPMCTR(9), MHPMCTR(10), MHPMCTR(11), MHPMCTR(12), MHPMCTR(13),
+    MHPMCTR(14), MHPMCTR(15), MHPMCTR(16), MHPMCTR(17), MHPMCTR(18),
+    MHPMCTR(19), MHPMCTR(20), MHPMCTR(21), MHPMCTR(22), MHPMCTR(23),
+    MHPMCTR(24), MHPMCTR(25), MHPMCTR(26), MHPMCTR(27), MHPMCTR(28),
+    MHPMCTR(29), MHPMCTR(30), MHPMCTR(31),
+    MHPMCTRH(3), MHPMCTRH(4), MHPMCTRH(5), MHPMCTRH(6), MHPMCTRH(7),
+    MHPMCTRH(8), MHPMCTRH(9), MHPMCTRH(10), MHPMCTRH(11), MHPMCTRH(12),
+    MHPMCTRH(13), MHPMCTRH(14), MHPMCTRH(15), MHPMCTRH(16), MHPMCTRH(17),
+    MHPMCTRH(18), MHPMCTRH(19), MHPMCTRH(20), MHPMCTRH(21), MHPMCTRH(22),
+    MHPMCTRH(23), MHPMCTRH(24), MHPMCTRH(25), MHPMCTRH(26), MHPMCTRH(27),
+    MHPMCTRH(28), MHPMCTRH(29), MHPMCTRH(30), MHPMCTRH(31),
+    HPMCTR(3), HPMCTR(4), HPMCTR(5), HPMCTR(6), HPMCTR(7), HPMCTR(8),
+    HPMCTR(9), HPMCTR(10), HPMCTR(11), HPMCTR(12), HPMCTR(13), HPMCTR(14),
+    HPMCTR(15), HPMCTR(16), HPMCTR(17), HPMCTR(18), HPMCTR(19), HPMCTR(20),
+    HPMCTR(21), HPMCTR(22), HPMCTR(23), HPMCTR(24), HPMCTR(25), HPMCTR(26),
+    HPMCTR(27), HPMCTR(28), HPMCTR(29), HPMCTR(30), HPMCTR(31),
+    HPMCTRH(3), HPMCTRH(4), HPMCTRH(5), HPMCTRH(6), HPMCTRH(7), HPMCTRH(8),
+    HPMCTRH(9), HPMCTRH(10), HPMCTRH(11), HPMCTRH(12), HPMCTRH(13),
+    HPMCTRH(14), HPMCTRH(15), HPMCTRH(16), HPMCTRH(17), HPMCTRH(18),
+    HPMCTRH(19), HPMCTRH(20), HPMCTRH(21), HPMCTRH(22), HPMCTRH(23),
+    HPMCTRH(24), HPMCTRH(25), HPMCTRH(26), HPMCTRH(27), HPMCTRH(28),
+    HPMCTRH(29), HPMCTRH(30), HPMCTRH(31),
     { },
 };

@@ -28,15 +28,8 @@
  *   - misa is hard-wired (RV32IMAC), mhartid reads 0, and mstatus, mscratch,
  *     mepc and mtval are the standard registers of a machine-mode-only
  *     core of privileged architecture 1.10.
- *   - mcycle counts the core's clock cycles while its clock runs, at the
- *     clock's current frequency; mcountinhibit's CY stops it. The model
- *     executes an instruction a cycle (as icount times the core), so
- *     minstret counts the same cycles, IR stopping it, including those in
- *     which the core waits for an interrupt; no instruction retirement is
- *     tracked apart from them. mhpmcounter3 to 12, 40 bits wide, hold
- *     what is written but do not count their events (wait cycles, memory
- *     reads and writes, jumps, branches, compressed instructions, multiply
- *     and divide waits), which is logged as unimplemented.
+ *   - mcycle, minstret, the event counters mhpmcounter3 to 12 and
+ *     mcountinhibit are both cores' counters, in esp32p4_counters.c.
  *   - The two triggers (tselect, tdata1 as mcontrol, tdata2 as maddress):
  *     only the execute bit of mcontrol is writable. The type reads 2, the
  *     action 1 (enter debug mode) and M 1, the core running in machine mode
@@ -50,25 +43,14 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
-#include "qemu/main-loop.h"
-#include "qemu/timer.h"
 #include "cpu.h"
 #include "accel/tcg/cpu-loop.h"
 #include "exec/breakpoint.h"
-#include "hw/core/clock.h"
 #include "target/riscv/esp32p4_cpu.h"
 
 #define LP_MTVEC_BASE           (~(target_ulong)0xff)
 #define LP_MTVEC_VECTORED       1
 #define LP_MCAUSE_MASK          (BIT(31) | 0x1f)
-
-/* mcountinhibit: CY, IR and HPM3 to 12. */
-#define LP_COUNTINHIBIT_CY      BIT(0)
-#define LP_COUNTINHIBIT_IR      BIT(2)
-#define LP_COUNTINHIBIT_MASK    (LP_COUNTINHIBIT_CY | LP_COUNTINHIBIT_IR | \
-                                 MAKE_64BIT_MASK(ESP32P4_LP_HPM_FIRST, \
-                                                 ESP32P4_LP_HPM_COUNTERS))
-#define LP_HPM_BITS             40
 
 /* mcontrol (TRM register 5.25). */
 #define LP_MCONTROL_TYPE2       (2u << 28)
@@ -83,25 +65,6 @@
 #define LP_DCSR_CAUSE_SHIFT     6
 #define LP_DCSR_CAUSE_TRIGGER   2
 #define LP_DCSR_PRV_M           3
-
-/* The counters mcycle and minstret, by their place in lp_ctr_base[]. */
-enum {
-    LP_CTR_CYCLE,
-    LP_CTR_INSTRET,
-};
-
-static const char *const esp32p4_lp_hpm_events[ESP32P4_LP_HPM_COUNTERS] = {
-    "memory access wait cycles",
-    "instruction fetch wait cycles",
-    "memory reads",
-    "memory writes",
-    "unconditional jumps",
-    "branches",
-    "taken branches",
-    "compressed instructions",
-    "multiplication wait cycles",
-    "division wait cycles",
-};
 
 /* [spec:nuos:req:emu.esp32p4.lp-core] */
 ESP32P4LPCsrKind esp32p4_lp_csr_kind(CPURISCVState *env, int csrno)
@@ -135,98 +98,6 @@ ESP32P4LPCsrKind esp32p4_lp_csr_kind(CPURISCVState *env, int csrno)
     default:
         return ESP32P4_LP_CSR_ABSENT;
     }
-}
-
-/* Counters */
-
-static bool esp32p4_lp_running(ESP32P4CPU *cpu)
-{
-    return !cpu->reset && !cpu->clock_stopped && !cpu->disabled;
-}
-
-/*
- * Bring lp_cycles up to the present: the cycles of the core's clock since
- * lp_cycles_ns while the core runs. Called with the BQL held, before the
- * core starts or stops running and before its clock changes rate.
- */
-/* [spec:nuos:req:emu.esp32p4.lp-core] */
-static uint64_t esp32p4_lp_cycles(ESP32P4CPU *cpu)
-{
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint64_t ticks;
-
-    if (!cpu->lp_clk || !esp32p4_lp_running(cpu) ||
-        !clock_is_enabled(cpu->lp_clk) || now <= cpu->lp_cycles_ns) {
-        cpu->lp_cycles_ns = MAX(now, cpu->lp_cycles_ns);
-        return cpu->lp_cycles;
-    }
-    ticks = clock_ns_to_ticks(cpu->lp_clk, now - cpu->lp_cycles_ns);
-    cpu->lp_cycles += ticks;
-    cpu->lp_cycles_ns += clock_ticks_to_ns(cpu->lp_clk, ticks);
-    return cpu->lp_cycles;
-}
-
-void esp32p4_lp_counters_update(ESP32P4CPU *cpu)
-{
-    esp32p4_lp_cycles(cpu);
-}
-
-static uint64_t esp32p4_lp_ctr(ESP32P4CPU *cpu, int c, uint32_t inhibit)
-{
-    uint64_t cycles = esp32p4_lp_cycles(cpu);
-
-    if (cpu->lp_mcountinhibit & inhibit) {
-        return cpu->lp_ctr_base[c];
-    }
-    return cpu->lp_ctr_base[c] + cycles - cpu->lp_ctr_ref[c];
-}
-
-static void esp32p4_lp_ctr_set(ESP32P4CPU *cpu, int c, uint64_t val)
-{
-    cpu->lp_ctr_base[c] = val;
-    cpu->lp_ctr_ref[c] = esp32p4_lp_cycles(cpu);
-}
-
-void esp32p4_lp_counters_reset(ESP32P4CPU *cpu)
-{
-    cpu->lp_mcountinhibit = 0;
-    esp32p4_lp_ctr_set(cpu, LP_CTR_CYCLE, 0);
-    esp32p4_lp_ctr_set(cpu, LP_CTR_INSTRET, 0);
-    memset(cpu->lp_hpm, 0, sizeof(cpu->lp_hpm));
-}
-
-/* mcountinhibit: a counter stops and restarts where it was. */
-/* [spec:nuos:req:emu.esp32p4.lp-core] */
-static void esp32p4_lp_set_countinhibit(ESP32P4CPU *cpu, uint32_t val)
-{
-    static const uint32_t bit[] = {
-        [LP_CTR_CYCLE] = LP_COUNTINHIBIT_CY,
-        [LP_CTR_INSTRET] = LP_COUNTINHIBIT_IR,
-    };
-    uint64_t now[2];
-
-    for (int c = 0; c < 2; c++) {
-        now[c] = esp32p4_lp_ctr(cpu, c, bit[c]);
-    }
-    cpu->lp_mcountinhibit = val & LP_COUNTINHIBIT_MASK;
-    for (int c = 0; c < 2; c++) {
-        esp32p4_lp_ctr_set(cpu, c, now[c]);
-    }
-}
-
-/* [spec:nuos:req:emu.esp32p4.lp-core] */
-static uint64_t *esp32p4_lp_hpm(ESP32P4CPU *cpu, int n)
-{
-    static bool logged[ESP32P4_LP_HPM_COUNTERS];
-
-    if (!(cpu->lp_mcountinhibit & BIT(ESP32P4_LP_HPM_FIRST + n)) &&
-        !logged[n]) {
-        logged[n] = true;
-        qemu_log_mask(LOG_UNIMP, "esp32p4: the LP core's mhpmcounter%d does "
-                      "not count %s\n", ESP32P4_LP_HPM_FIRST + n,
-                      esp32p4_lp_hpm_events[n]);
-    }
-    return &cpu->lp_hpm[n];
 }
 
 /* Triggers */
@@ -301,7 +172,6 @@ RISCVException esp32p4_lp_csr_read(CPURISCVState *env, int csrno,
                                    target_ulong *val)
 {
     ESP32P4CPU *cpu = esp32p4_cpu_from_env(env);
-    int n;
 
     switch (csrno) {
     case CSR_MIE:
@@ -326,36 +196,8 @@ RISCVException esp32p4_lp_csr_read(CPURISCVState *env, int csrno,
         *val = cpu->tdata2[cpu->tselect];
         return RISCV_EXCP_NONE;
     default:
-        break;
+        return esp32p4_counters_read(env, csrno, val);
     }
-
-    BQL_LOCK_GUARD();
-    switch (csrno) {
-    case CSR_MCOUNTINHIBIT:
-        *val = cpu->lp_mcountinhibit;
-        break;
-    case CSR_MCYCLE:
-        *val = esp32p4_lp_ctr(cpu, LP_CTR_CYCLE, LP_COUNTINHIBIT_CY);
-        break;
-    case CSR_MCYCLEH:
-        *val = esp32p4_lp_ctr(cpu, LP_CTR_CYCLE, LP_COUNTINHIBIT_CY) >> 32;
-        break;
-    case CSR_MINSTRET:
-        *val = esp32p4_lp_ctr(cpu, LP_CTR_INSTRET, LP_COUNTINHIBIT_IR);
-        break;
-    case CSR_MINSTRETH:
-        *val = esp32p4_lp_ctr(cpu, LP_CTR_INSTRET, LP_COUNTINHIBIT_IR) >> 32;
-        break;
-    case CSR_MHPMCOUNTER3H ... CSR_MHPMCOUNTER3H + ESP32P4_LP_HPM_COUNTERS - 1:
-        n = csrno - CSR_MHPMCOUNTER3H;
-        *val = *esp32p4_lp_hpm(cpu, n) >> 32;
-        break;
-    default:
-        n = csrno - CSR_MHPMCOUNTER3;
-        *val = *esp32p4_lp_hpm(cpu, n);
-        break;
-    }
-    return RISCV_EXCP_NONE;
 }
 
 /* [spec:nuos:req:emu.esp32p4.lp-core] */
@@ -363,9 +205,6 @@ RISCVException esp32p4_lp_csr_write(CPURISCVState *env, int csrno,
                                     target_ulong val)
 {
     ESP32P4CPU *cpu = esp32p4_cpu_from_env(env);
-    uint64_t *hpm;
-    uint64_t v;
-    int n;
 
     switch (csrno) {
     case CSR_MIE:
@@ -393,37 +232,6 @@ RISCVException esp32p4_lp_csr_write(CPURISCVState *env, int csrno,
         esp32p4_lp_triggers_rebuild(cpu);
         return RISCV_EXCP_NONE;
     default:
-        break;
+        return esp32p4_counters_write(env, csrno, val);
     }
-
-    BQL_LOCK_GUARD();
-    switch (csrno) {
-    case CSR_MCOUNTINHIBIT:
-        esp32p4_lp_set_countinhibit(cpu, val);
-        break;
-    case CSR_MCYCLE:
-    case CSR_MCYCLEH:
-        v = esp32p4_lp_ctr(cpu, LP_CTR_CYCLE, LP_COUNTINHIBIT_CY);
-        v = csrno == CSR_MCYCLE ? deposit64(v, 0, 32, val)
-                                : deposit64(v, 32, 32, val);
-        esp32p4_lp_ctr_set(cpu, LP_CTR_CYCLE, v);
-        break;
-    case CSR_MINSTRET:
-    case CSR_MINSTRETH:
-        v = esp32p4_lp_ctr(cpu, LP_CTR_INSTRET, LP_COUNTINHIBIT_IR);
-        v = csrno == CSR_MINSTRET ? deposit64(v, 0, 32, val)
-                                  : deposit64(v, 32, 32, val);
-        esp32p4_lp_ctr_set(cpu, LP_CTR_INSTRET, v);
-        break;
-    case CSR_MHPMCOUNTER3H ... CSR_MHPMCOUNTER3H + ESP32P4_LP_HPM_COUNTERS - 1:
-        hpm = esp32p4_lp_hpm(cpu, csrno - CSR_MHPMCOUNTER3H);
-        *hpm = deposit64(*hpm, 32, LP_HPM_BITS - 32, val);
-        break;
-    default:
-        n = csrno - CSR_MHPMCOUNTER3;
-        hpm = esp32p4_lp_hpm(cpu, n);
-        *hpm = deposit64(*hpm, 0, 32, val);
-        break;
-    }
-    return RISCV_EXCP_NONE;
 }

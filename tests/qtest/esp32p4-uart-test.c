@@ -1075,7 +1075,8 @@ static void test_serial_port(void)
 /*
  * The boot ROM, run from reset with a blank 16 MiB flash, prints its
  * banner on UART0, through GPIO37 to serial port 0, and reports the
- * flash's invalid image header.
+ * flash's invalid image header. The log is read while the ROM prints, a
+ * character a frame, so the wait is for the whole report.
  */
 /* [spec:nuos:req:emu.esp32p4.uart/test] */
 static void test_rom_banner(void)
@@ -1095,7 +1096,7 @@ static void test_rom_banner(void)
         g_free(text);
         text = NULL;
         g_assert(g_file_get_contents(log, &text, NULL, NULL));
-        if (strstr(text, "invalid header")) {
+        if (strstr(text, "invalid header: 0xffffffff")) {
             break;
         }
         g_usleep(100000);
