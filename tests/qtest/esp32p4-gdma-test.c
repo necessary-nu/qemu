@@ -14,6 +14,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qobject/qdict.h"
 
 #define AHB             0x50085000
 #define AXI             0x5008a000
@@ -849,6 +850,136 @@ static void test_etm_tasks(void)
     qtest_quit(qts);
 }
 
+/* Play peripheral @periph through the controller's "periph" hook. */
+static char *periph_cmd(QTestState *qts, const char *dev, const char *cmd)
+{
+    QDict *rsp;
+    char *r;
+
+    rsp = qtest_qmp(qts, "{'execute': 'qom-set', 'arguments': "
+                    "{'path': %s, 'property': 'periph', 'value': %s}}",
+                    dev, cmd);
+    g_assert(qdict_haskey(rsp, "return"));
+    qobject_unref(rsp);
+    rsp = qtest_qmp(qts, "{'execute': 'qom-get', 'arguments': "
+                    "{'path': %s, 'property': 'periph'}}", dev);
+    g_assert(qdict_haskey(rsp, "return"));
+    r = g_strdup(qdict_get_str(rsp, "return"));
+    qobject_unref(rsp);
+    return r;
+}
+
+static unsigned periph_push(QTestState *qts, unsigned periph,
+                            const uint8_t *b, unsigned len, unsigned flags)
+{
+    g_autoptr(GString) cmd = g_string_new(NULL);
+    g_autofree char *r = NULL;
+
+    g_string_printf(cmd, "push %u ", periph);
+    for (unsigned i = 0; i < len; i++) {
+        g_string_append_printf(cmd, "%02x", b[i]);
+    }
+    g_string_append_printf(cmd, " %u", flags);
+    r = periph_cmd(qts, "/machine/ahb-gdma", cmd->str);
+    return atoi(r);
+}
+
+/* Pull up to @len bytes into @b: the count, and in *eof the frame's end. */
+static unsigned periph_pull(QTestState *qts, unsigned periph, uint8_t *b,
+                            unsigned len, bool *eof)
+{
+    g_autofree char *cmd = g_strdup_printf("pull %u %u", periph, len);
+    g_autofree char *r = periph_cmd(qts, "/machine/ahb-gdma", cmd);
+    unsigned n, e;
+    char *hex;
+
+    g_assert_cmpint(sscanf(r, "%u %u", &n, &e), ==, 2);
+    hex = strrchr(r, ' ') + 1;
+    for (unsigned i = 0; i < n; i++) {
+        char byte[3] = { hex[2 * i], hex[2 * i + 1], 0 };
+
+        b[i] = strtoul(byte, NULL, 16);
+    }
+    *eof = e;
+    return n;
+}
+
+#define I2S0            3
+#define DMA_I2S0_W      (DMA_PMS + 0x134)
+
+/*
+ * A peripheral on GDMA-AHB, I2S0, as a peripheral model drives it: the TX
+ * channel selecting it fills its FIFO and waits; the peripheral pulls the
+ * bytes, up to each frame's end, and taking the last completes the
+ * descriptors; what it pushes the RX channel selecting it writes into its
+ * buffers, closing the descriptor at the frame's end. Its accesses are
+ * AHB_PDMA_I2S0's, recorded as master 16 + 3 when the DMA APM refuses
+ * them.
+ */
+/* [spec:nuos:req:emu.esp32p4.dma/test] */
+static void test_periph(void)
+{
+    QTestState *qts = start();
+    uint32_t tx = MEM, rx = MEM + 0x100, src = MEM + 0x1000;
+    uint32_t dst = MEM + 0x4000;
+    uint8_t want[150], got[150], b[64];
+    unsigned n = 0;
+    bool eof = false;
+
+    /* No running channel selects it: nothing to pull, no room. */
+    g_assert_cmpuint(periph_pull(qts, I2S0, b, 64, &eof), ==, 0);
+    g_assert_cmpuint(periph_push(qts, I2S0, b, 4, 0), ==, 0);
+
+    fill(qts, src, 150, 7);
+    qtest_memread(qts, src, want, 150);
+    desc(qts, tx, OWNER | DW0(100, 100), src, tx + 12);
+    desc(qts, tx + 12, OWNER | SUC_EOF | DW0(50, 50), src + 100, 0);
+    qtest_writel(qts, AHB_OUT(0) + PERI_SEL, I2S0);
+    qtest_writel(qts, AHB_OUT_LINK_ADDR(0), tx);
+    qtest_writel(qts, AHB_OUT(0) + LINK, OUT_LINK_START);
+    qtest_clock_step(qts, 100000);
+    /* The FIFO is full and nothing is sent until the peripheral takes. */
+    g_assert_cmphex(qtest_readl(qts, AHB_OUT(0) + FIFO_STATUS) & 0x7f01, ==,
+                    0x4001);
+    g_assert_cmphex(qtest_readl(qts, AHB_OUT_INT(0) + RAW), ==, 0);
+    while (!eof && n < 150) {
+        n += periph_pull(qts, I2S0, got + n, 150 - n, &eof);
+        qtest_clock_step(qts, 10000);
+    }
+    g_assert_true(eof);
+    g_assert_cmpuint(n, ==, 150);
+    g_assert_cmpmem(want, 150, got, 150);
+    g_assert_cmphex(qtest_readl(qts, AHB_OUT_INT(0) + RAW), ==,
+                    OUT_DONE | OUT_EOF | OUT_TOTAL_EOF);
+    g_assert_cmphex(qtest_readl(qts, AHB_OUT(0) + EOF_DES), ==, tx + 12);
+
+    desc(qts, rx, OWNER | DW0(100, 0), dst, 0);
+    qtest_writel(qts, AHB_IN(0) + PERI_SEL, I2S0);
+    qtest_writel(qts, AHB_IN_LINK_ADDR(0), rx);
+    qtest_writel(qts, AHB_IN(0) + LINK, IN_LINK_START | 1);
+    g_assert_cmpuint(periph_push(qts, I2S0, want, 40, 0), ==, 40);
+    qtest_clock_step(qts, 100000);
+    g_assert_cmpuint(periph_push(qts, I2S0, want + 40, 30, 1), ==, 30);
+    qtest_clock_step(qts, 100000);
+    g_assert_cmphex(qtest_readl(qts, rx), ==, SUC_EOF | DW0(100, 70));
+    g_assert_cmphex(qtest_readl(qts, AHB_IN_INT(0) + RAW), ==,
+                    IN_DONE | IN_SUC_EOF);
+    check_copy(qts, dst, src, 70);
+
+    /* AHB_PDMA_I2S0 may not write: the APM refuses the next frame. */
+    qtest_writel(qts, DMA_I2S0_W, 0);
+    qtest_writel(qts, AHB_IN_INT(0) + CLR, 0xff);
+    desc(qts, rx, OWNER | DW0(100, 0), dst + 0x100, 0);
+    qtest_writel(qts, AHB_IN(0) + LINK, IN_LINK_START | 1);
+    g_assert_cmpuint(periph_push(qts, I2S0, want, 8, 1), ==, 8);
+    qtest_clock_step(qts, 100000);
+    g_assert_cmphex(qtest_readl(qts, AHB_IN_INT(0) + RAW), ==,
+                    IN_DONE | IN_SUC_EOF | IN_RESP_ERR);
+    g_assert_cmphex(qtest_readl(qts, ICM_CPU_ADDR), ==, dst + 0x100);
+    g_assert_cmphex(qtest_readl(qts, ICM_CPU_INFO), ==, ICM_WR | (16 + I2S0));
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -863,5 +994,6 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/gdma/clock-and-fifo", test_clock_and_fifo);
     qtest_add_func("/esp32p4/gdma/axi-link-switch", test_axi_link_switch);
     qtest_add_func("/esp32p4/gdma/etm-tasks", test_etm_tasks);
+    qtest_add_func("/esp32p4/gdma/periph", test_periph);
     return g_test_run();
 }

@@ -256,6 +256,9 @@ struct ESP32P4GdmaState {
 
     const ESP32P4GdmaPeriphOps *periph_ops[ESP32P4_GDMA_PERIPHS];
     void *periph_opaque[ESP32P4_GDMA_PERIPHS];
+
+    /* The qtest hook's last result. */
+    char *periph_probe;
 };
 
 struct ESP32P4GdmaClass {

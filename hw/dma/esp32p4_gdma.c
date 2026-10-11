@@ -105,6 +105,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/bitops.h"
+#include "qemu/cutils.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/core/irq.h"
@@ -843,8 +844,7 @@ static uint32_t tx_service(ESP32P4GdmaState *s, int ch)
     for (i = 0; i < n || (n == 0 && i == 0); i++) {
         flags = n ? 0 : F_NODATA;
         if (c->pos == len && (n == 0 || i == n - 1)) {
-            flags |= F_DESC_END | (eof ? F_EOF : 0) |
-                     (c->desc_next ? 0 : F_LIST_END);
+            flags |= F_DESC_END | (eof ? F_EOF : 0);
         }
         fifo_put(s, OUT, ch, n ? buf[i] : 0, flags, c->desc_addr);
     }
@@ -862,6 +862,11 @@ static uint32_t tx_service(ESP32P4GdmaState *s, int ch)
             cycles++;
         }
         cycles += chan_advance(s, OUT, ch);
+        /* The list's last byte, unless a RESTART has carried it on. */
+        if (c->end) {
+            c->fifo.flags[(c->fifo.head + c->fifo.num - 1) % FIFO_SIZE] |=
+                F_LIST_END;
+        }
     }
     if (was_empty && c->fifo.num && !chan_m2m(s, ch) &&
         c->peri_sel < ESP32P4_GDMA_PERIPHS) {
@@ -1858,6 +1863,65 @@ static void esp32p4_gdma_etm_task(void *opaque, int n, int level)
     }
 }
 
+/*
+ * The qtest hook through which a test plays a peripheral, for those with
+ * no model yet: setting "periph" to "push <periph> <hex bytes> <flags>"
+ * pushes the bytes as esp32p4_gdma_push() does, and reading it back gives
+ * how many were taken; "pull <periph> <count>" pulls as
+ * esp32p4_gdma_pull() does, and reading back gives "<count> <eof> <hex
+ * bytes>".
+ */
+static char *esp32p4_gdma_get_periph(Object *obj, Error **errp)
+{
+    ESP32P4GdmaState *s = ESP32P4_GDMA(obj);
+
+    return g_strdup(s->periph_probe ? s->periph_probe : "");
+}
+
+static void esp32p4_gdma_set_periph(Object *obj, const char *value,
+                                    Error **errp)
+{
+    ESP32P4GdmaState *s = ESP32P4_GDMA(obj);
+    g_auto(GStrv) f = g_strsplit(value, " ", 0);
+    unsigned int periph, n, flags;
+    g_autofree uint8_t *buf = NULL;
+    GString *out;
+    bool eof;
+    size_t len;
+
+    if (g_strv_length(f) < 3 || qemu_strtoui(f[1], NULL, 0, &periph) ||
+        periph >= ESP32P4_GDMA_PERIPHS) {
+        error_setg(errp, "periph: want \"push <periph> <hex> <flags>\" or "
+                   "\"pull <periph> <count>\"");
+        return;
+    }
+    g_free(s->periph_probe);
+    s->periph_probe = NULL;
+    if (!strcmp(f[0], "push") && g_strv_length(f) >= 4 &&
+        !qemu_strtoui(f[3], NULL, 0, &flags)) {
+        len = strlen(f[2]) / 2;
+        buf = g_malloc(len + 1);
+        for (size_t i = 0; i < len; i++) {
+            char byte[3] = { f[2][2 * i], f[2][2 * i + 1], 0 };
+
+            buf[i] = strtoul(byte, NULL, 16);
+        }
+        s->periph_probe = g_strdup_printf("%zu", esp32p4_gdma_push(s, periph,
+                                          buf, len, flags));
+    } else if (!strcmp(f[0], "pull") && !qemu_strtoui(f[2], NULL, 0, &n)) {
+        buf = g_malloc(n + 1);
+        len = esp32p4_gdma_pull(s, periph, buf, n, &eof);
+        out = g_string_new(NULL);
+        g_string_printf(out, "%zu %d ", len, eof);
+        for (size_t i = 0; i < len; i++) {
+            g_string_append_printf(out, "%02x", buf[i]);
+        }
+        s->periph_probe = g_string_free(out, false);
+    } else {
+        error_setg(errp, "periph: unknown command '%s'", value);
+    }
+}
+
 static void esp32p4_gdma_reset_hold(Object *obj, ResetType type)
 {
     ESP32P4GdmaState *s = ESP32P4_GDMA(obj);
@@ -1932,6 +1996,8 @@ static void esp32p4_gdma_init(Object *obj)
     s->clk = qdev_init_clock_in(DEVICE(obj), "clk", gdma_clk_update, s,
                                 ClockUpdate);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gdma_timer_cb, s);
+    object_property_add_str(obj, "periph", esp32p4_gdma_get_periph,
+                            esp32p4_gdma_set_periph);
 }
 
 static void esp32p4_gdma_realize(DeviceState *dev, Error **errp)
@@ -1949,6 +2015,7 @@ static void esp32p4_gdma_realize(DeviceState *dev, Error **errp)
 static void esp32p4_gdma_finalize(Object *obj)
 {
     timer_free(ESP32P4_GDMA(obj)->timer);
+    g_free(ESP32P4_GDMA(obj)->periph_probe);
 }
 
 static const Property esp32p4_gdma_properties[] = {
