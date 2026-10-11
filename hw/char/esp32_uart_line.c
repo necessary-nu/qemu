@@ -198,16 +198,39 @@ void esp32_uart_rx_line(Esp32UartRx *rx, bool level, int64_t when_ns)
     }
 }
 
+/* Whether the frame in progress is to be decoded by t. */
+static bool rx_due(const Esp32UartRx *rx, int64_t t)
+{
+    return rx->busy &&
+           (t >= rx_sample_ns(rx, rx_stop_bit(rx)) ||
+            (rx->glitch && t >= rx_sample_ns(rx, 0) &&
+             rx_level_at(rx, rx_sample_ns(rx, 0))));
+}
+
+static void rx_sync_sources(void *opaque)
+{
+    esp32_line_sync();
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * [spec:nuos:req:emu.esp32p4.uart]
+ * Decode every frame whose stop bit's sample time has passed by now
+ * (esp32_line_time()). Every change up to then must be in first: the
+ * sources of line changes are brought up to that one moment before a
+ * frame is decoded, not to a moment read afresh afterwards, which without
+ * icount lies later and would decode a frame whose last bits a source has
+ * yet to send. A change after it belongs to a later frame.
+ */
 void esp32_uart_rx_flush(Esp32UartRx *rx)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t t = esp32_line_time();
 
-    if (!rx->busy) {
-        return;
+    if (rx->busy && (t >= rx_sample_ns(rx, rx_stop_bit(rx)) ||
+                     (rx->glitch && t >= rx_sample_ns(rx, 0)))) {
+        esp32_line_run_at(t, rx_sync_sources, NULL);
     }
-    if (now >= rx_sample_ns(rx, rx_stop_bit(rx)) ||
-        (rx->glitch && now >= rx_sample_ns(rx, 0) &&
-         rx_level_at(rx, rx_sample_ns(rx, 0)))) {
+    while (rx_due(rx, t)) {
         rx_finish(rx);
     }
 }
@@ -216,11 +239,6 @@ static void rx_timer_cb(void *opaque)
 {
     Esp32UartRx *rx = opaque;
 
-    /*
-     * Every change up to now must be in before the frame is sampled; one
-     * that started while the sources caught up is not due yet.
-     */
-    esp32_line_sync();
     esp32_uart_rx_flush(rx);
     if (rx->busy) {
         timer_mod_ns(&rx->timer, rx_sample_ns(rx, rx_stop_bit(rx)));
