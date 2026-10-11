@@ -141,9 +141,12 @@
  * read their reset values; PMU_POR_DONE reads 1. PMU_VDDBAT_CFG's
  * ANA_VDDBAT_MODE is the current state's VDDBAT_MODE.
  *
+ * PMU_TOUCH_PWR_CNTL, the touch sensor's timer, is the touch sensor's
+ * (esp32p4_pmu_touch_pwr_cntl()), told of each write ("touch-pwr").
+ *
  * Kept as written, as nothing documents an effect the model could show:
- * the SDIO idle and touch sensor power controls (no SDIO_IDLE_INT is
- * raised), the DCDC requests, ECO and calibration controls.
+ * the SDIO idle controls (no SDIO_IDLE_INT is raised), the DCDC
+ * requests, ECO and calibration controls.
  *
  * The PMU is in the LP always-on domain: only a chip or system reset
  * resets it, which brings the chip up in HP_ACTIVE with every domain
@@ -1510,6 +1513,12 @@ static uint32_t pmu_value(ESP32P4PMUState *s, hwaddr reg)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.analog] */
+uint32_t esp32p4_pmu_touch_pwr_cntl(ESP32P4PMUState *s)
+{
+    return s->regs[R(A_TOUCH_PWR_CNTL)];
+}
+
 static uint64_t esp32p4_pmu_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4PMUState *s = opaque;
@@ -1560,12 +1569,6 @@ static void pmu_log_unmodelled(ESP32P4PMUState *s, hwaddr reg, uint32_t v)
         if (v & EXT_FILTER) {
             qemu_log_mask(LOG_UNIMP, "%s: the EXT wakeup's filter is not "
                           "modelled\n", TYPE_ESP32P4_PMU);
-        }
-        break;
-    case A_TOUCH_PWR_CNTL:
-        if (v & TOUCH_SLEEP_TIMER_EN) {
-            qemu_log_mask(LOG_UNIMP, "%s: the touch sensor's sleep timer is "
-                          "not modelled\n", TYPE_ESP32P4_PMU);
         }
         break;
     default:
@@ -1652,6 +1655,9 @@ static void esp32p4_pmu_write(void *opaque, hwaddr addr, uint64_t value,
         if (wt & SLEEP_REQ) {
             pmu_sleep_request(s);
         }
+        break;
+    case A_TOUCH_PWR_CNTL:
+        qemu_irq_pulse(s->touch_pwr);
         break;
     case A_SLP_WAKEUP_CNTL4:
         if (wt & SLP_REJECT_CAUSE_CLR) {
@@ -1810,6 +1816,7 @@ static void esp32p4_pmu_reset_exit(Object *obj, ResetType type)
         pmu_ldo_update(s, i, true);
     }
     pmu_drive_outputs(s, true);
+    qemu_irq_pulse(s->touch_pwr);
 }
 
 static void esp32p4_pmu_init(Object *obj)
@@ -1871,6 +1878,7 @@ static void esp32p4_pmu_init(Object *obj)
     qdev_init_gpio_out_named(dev, &s->uart_wakeup_en,
                              ESP32P4_PMU_UART_WAKEUP_EN, 1);
     qdev_init_gpio_out_named(dev, &s->etm_event, ESP32P4_PMU_ETM_EVENT, 1);
+    qdev_init_gpio_out_named(dev, &s->touch_pwr, ESP32P4_PMU_TOUCH_PWR, 1);
 }
 
 static void esp32p4_pmu_realize(DeviceState *dev, Error **errp)

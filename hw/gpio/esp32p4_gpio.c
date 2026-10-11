@@ -840,7 +840,8 @@ static bool pad_driven_by_chip(ESP32P4GpioState *s, unsigned n, bool *level)
  * by its own driver; else high while any is driven high or pulled up.
  */
 static void resolve(ESP32P4GpioState *s, uint64_t *pad_out,
-                    uint64_t *raw_out)
+                    uint64_t *raw_out, uint64_t *drv_high_out,
+                    uint64_t *drv_low_out)
 {
     uint64_t pad = 0, raw = 0, ie_mask = 0;
     uint64_t drv_low = 0, drv_high = 0, pulled = 0;
@@ -928,6 +929,8 @@ static void resolve(ESP32P4GpioState *s, uint64_t *pad_out,
     s->held = held;
     *pad_out = pad;
     *raw_out = raw;
+    *drv_high_out = drv_high;
+    *drv_low_out = drv_low;
 }
 
 /* Filters */
@@ -1529,7 +1532,7 @@ static void propagate(ESP32P4GpioState *s)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t t = esp32_line_time();
     int8_t iomux_src[ESP32P4_GPIO_SIGS];
-    uint64_t pad, raw, pf, hp, changed;
+    uint64_t pad, raw, pf, hp, changed, drv_high, drv_low;
     uint32_t lp;
     bool resync = s->resync;
     bool irq[ESP32P4_GPIO_IRQS], wakeup;
@@ -1539,7 +1542,7 @@ static void propagate(ESP32P4GpioState *s)
         sdm_advance(s, ch, now);
     }
 
-    resolve(s, &pad, &raw);
+    resolve(s, &pad, &raw, &drv_high, &drv_low);
     run_chains(s, raw, t, &pf, &hp, &lp);
     etm_events(s, pf, t);
     latch_interrupts(s, hp, lp);
@@ -1564,6 +1567,15 @@ static void propagate(ESP32P4GpioState *s)
     for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
         if (resync || bit64(changed, n)) {
             qemu_set_irq(s->pad_out[n], bit64(pad, n));
+        }
+    }
+    changed = (drv_high ^ s->drive_high) | (drv_low ^ s->drive_low);
+    s->drive_high = drv_high;
+    s->drive_low = drv_low;
+    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
+        if (resync || bit64(changed, n)) {
+            qemu_set_irq(s->drive_high_out[n], bit64(drv_high, n));
+            qemu_set_irq(s->drive_low_out[n], bit64(drv_low, n));
         }
     }
     for (unsigned sig = 0; sig < ESP32P4_GPIO_SIGS; sig++) {
@@ -3226,6 +3238,10 @@ static void esp32p4_gpio_init(Object *obj)
                             ESP32P4_GPIO_PAD_RELEASE, ESP32P4_GPIO_PADS);
     qdev_init_gpio_out_named(dev, s->pad_out, ESP32P4_GPIO_PAD_OUT,
                              ESP32P4_GPIO_PADS);
+    qdev_init_gpio_out_named(dev, s->drive_high_out,
+                             ESP32P4_GPIO_PAD_DRIVE_HIGH, ESP32P4_GPIO_PADS);
+    qdev_init_gpio_out_named(dev, s->drive_low_out,
+                             ESP32P4_GPIO_PAD_DRIVE_LOW, ESP32P4_GPIO_PADS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_sig_out,
                             ESP32P4_GPIO_SIG_OUT, ESP32P4_GPIO_SIGS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_sig_oe,
@@ -3322,8 +3338,8 @@ static const VMStateDescription vmstate_esp32p4_gpio_filter = {
 
 static const VMStateDescription vmstate_esp32p4_gpio = {
     .name = TYPE_ESP32P4_GPIO,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(iomux_clk, ESP32P4GpioState),
         VMSTATE_CLOCK(lp_clk, ESP32P4GpioState),
@@ -3419,6 +3435,8 @@ static const VMStateDescription vmstate_esp32p4_gpio = {
         VMSTATE_UINT64(hold_ie, ESP32P4GpioState),
         VMSTATE_UINT32(lp_wakeup_edge, ESP32P4GpioState),
         VMSTATE_UINT64(pad_level, ESP32P4GpioState),
+        VMSTATE_UINT64(drive_high, ESP32P4GpioState),
+        VMSTATE_UINT64(drive_low, ESP32P4GpioState),
         VMSTATE_UINT64(raw_in, ESP32P4GpioState),
         VMSTATE_UINT64(pf_in, ESP32P4GpioState),
         VMSTATE_UINT64(hp_in, ESP32P4GpioState),

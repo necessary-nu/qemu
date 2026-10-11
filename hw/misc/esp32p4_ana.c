@@ -438,6 +438,8 @@ bool esp32p4_ana_write(ESP32P4AnaState *s, int slave, uint8_t reg,
         s->regs[slave][reg] = data;
         if (slave == ESP32P4_ANA_SLAVE_BIAS) {
             qemu_irq_pulse(s->bias_update);
+        } else if (slave == ESP32P4_ANA_SLAVE_SAR) {
+            qemu_irq_pulse(s->sar_update);
         }
         return true;
     }
@@ -551,6 +553,7 @@ static void esp32p4_ana_init(Object *obj)
                              ESP32P4_ANA_NUM_PLLS);
     qdev_init_gpio_out_named(dev, &s->bias_update, ESP32P4_ANA_BIAS_UPDATE,
                              1);
+    qdev_init_gpio_out_named(dev, &s->sar_update, ESP32P4_ANA_SAR_UPDATE, 1);
 }
 
 static int esp32p4_ana_post_load(void *opaque, int version_id)

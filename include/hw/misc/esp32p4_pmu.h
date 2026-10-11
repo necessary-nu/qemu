@@ -109,7 +109,9 @@ enum {
  *     RTC watchdog's pause; "xtal-off", high while the crystal is powered
  *     down; "bod-vbat-sel", BOD_SOURCE_SEL in the current state;
  *     "uart-wakeup-en", the UARTs' wakeup enable; "etm-event", the ETM
- *     event PMU_EVT_SLEEP_WAKEUP, pulsed as the chip wakes.
+ *     event PMU_EVT_SLEEP_WAKEUP, pulsed as the chip wakes; "touch-pwr",
+ *     a pulse as software writes PMU_TOUCH_PWR_CNTL, for the touch
+ *     sensor's timer, which reads it with esp32p4_pmu_touch_pwr_cntl().
  */
 #define ESP32P4_PMU_WAKEUP          "wakeup"
 #define ESP32P4_PMU_EXT_PAD         "ext-pad"
@@ -132,6 +134,7 @@ enum {
 #define ESP32P4_PMU_BOD_VBAT_SEL    "bod-vbat-sel"
 #define ESP32P4_PMU_UART_WAKEUP_EN  "uart-wakeup-en"
 #define ESP32P4_PMU_ETM_EVENT       "etm-event"
+#define ESP32P4_PMU_TOUCH_PWR       "touch-pwr"
 
 #define ESP32P4_PMU_EXT_PADS        16
 
@@ -234,6 +237,7 @@ struct ESP32P4PMUState {
     qemu_irq bod_vbat_sel;
     qemu_irq uart_wakeup_en;
     qemu_irq etm_event;
+    qemu_irq touch_pwr;
     Clock *fast;
     Clock *slow;
     ESP32P4ClkRstState *clkrst;
@@ -271,5 +275,11 @@ struct ESP32P4PMUState {
     bool power_level[ESP32P4_PMU_NUM_PD];
     ESP32P4PMULevels out;
 };
+
+/*
+ * PMU_TOUCH_PWR_CNTL, the touch sensor's timer: its wait and sleep
+ * cycles, FORCE_DONE and SLEEP_TIMER_EN, for the touch sensor.
+ */
+uint32_t esp32p4_pmu_touch_pwr_cntl(ESP32P4PMUState *s);
 
 #endif

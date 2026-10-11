@@ -92,14 +92,18 @@
  *   discharge, holds what software writes: the model does not take the
  *   bus's electrical state from it.
  *
+ * - PAD_COMP0 and PAD_COMP1 configure the analog comparators
+ *   (esp32p4_ana_cmpr.c), which read them with esp32p4_lp_sys_reg() and
+ *   are told of each write ("pad-comp").
+ *
  * Kept as written for the blocks that would act on them, none of which is
  * modelled, and given to them by esp32p4_lp_sys_reg(): the reset bypasses
  * (LP_RST_CTRL, HP_POR_RST_BYPASS_CTRL), the boot mode override
  * FORCE_DOWNLOAD_BOOT, the IO MUX reset disable, the PAU's
  * BACKUP_DMA_CFG0 to 2, the memories' and ROMs' aux and power controls,
- * the analog comparators (PAD_COMP0/1), the pad groups' power, the discharge controls, the bus
- * timeouts' thresholds, the ECO registers and BOOT_ADDR_HP_LP. The debug
- * probe's signals are not modelled: LP_PROBE_OUT reads 0.
+ * the pad groups' power, the discharge controls, the bus timeouts'
+ * thresholds, the ECO registers and BOOT_ADDR_HP_LP. The debug probe's
+ * signals are not modelled: LP_PROBE_OUT reads 0.
  */
 
 #include "qemu/osdep.h"
@@ -489,6 +493,10 @@ static void esp32p4_lp_sys_write(void *opaque, hwaddr addr, uint64_t value,
     case A_USB_CTRL:
         esp32p4_lp_sys_update_outputs(s);
         break;
+    case A_PAD_COMP0:
+    case A_PAD_COMP1:
+        qemu_irq_pulse(s->pad_comp[(reg - A_PAD_COMP0) / 4]);
+        break;
     default:
         break;
     }
@@ -542,6 +550,9 @@ static void esp32p4_lp_sys_reset_exit(Object *obj, ResetType type)
 
     esp32p4_lp_sys_update(s);
     esp32p4_lp_sys_update_outputs(s);
+    for (int i = 0; i < ESP32P4_LP_SYS_PAD_COMPS; i++) {
+        qemu_irq_pulse(s->pad_comp[i]);
+    }
 }
 
 static void esp32p4_lp_sys_init(Object *obj)
@@ -569,6 +580,8 @@ static void esp32p4_lp_sys_init(Object *obj)
                              2);
     qdev_init_gpio_out_named(dev, s->usb_phy_sel, ESP32P4_LP_SYS_USB_PHY_SEL,
                              2);
+    qdev_init_gpio_out_named(dev, s->pad_comp, ESP32P4_LP_SYS_PAD_COMP,
+                             ESP32P4_LP_SYS_PAD_COMPS);
     qdev_init_gpio_in_named(dev, esp32p4_lp_sys_set_etm_wakeup,
                             ESP32P4_LP_SYS_LP_CORE_ETM_WAKEUP, 1);
     qdev_init_gpio_in_named(dev, esp32p4_lp_sys_set_etm_task_ulp,
