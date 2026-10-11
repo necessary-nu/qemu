@@ -96,8 +96,10 @@
  *     channels' interrupts sources 56 to 67; and VDMA, a DesignWare AXI DMA
  *     controller, at 0x50081000, behind GDMA_SYS_CLK and the GDMA reset,
  *     its interrupt source 24. Their accesses go through the DMA APM as
- *     the DMA masters they are, to memory directly, past the caches. No
- *     peripheral that uses them is modelled yet.
+ *     the DMA masters they are, to memory directly, past the caches. A
+ *     peripheral served by GDMA attaches to its controller as
+ *     include/hw/dma/esp32p4_gdma.h describes; VDMA's handshaking
+ *     interfaces, for MIPI DSI and the ISP, are its named GPIOs.
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
  * a file longer than 512 bytes. A blank, all-zero, file starts as a
