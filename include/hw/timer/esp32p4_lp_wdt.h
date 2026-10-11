@@ -54,9 +54,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPWdtState, ESP32P4_LP_WDT)
 
 typedef struct ESP32P4LPWdtCounter {
     QEMUTimer timer;
-    /* The count at @sync_ns, whether it counts since then, and when due. */
+    /*
+     * The count as of cycle @synced of its clock, counted from when it last
+     * started or the clock changed (@edges); whether it counts, and when it
+     * is due.
+     */
     uint64_t count;
-    int64_t sync_ns;
+    ESP32P4ClkCount edges;
+    uint64_t synced;
     bool running;
     int64_t due_ns;
 } ESP32P4LPWdtCounter;

@@ -990,7 +990,7 @@ static int64_t i2s_hung_ns(ESP32P4I2sState *s)
     uint64_t cycles = (uint64_t)HUNG_TIMEOUT(s->lc_hung_conf) *
                       (HUNG_TICK_CYCLES >> HUNG_SHIFT(s->lc_hung_conf));
 
-    return clock_ticks_to_ns(s->apb_clk, cycles);
+    return esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->apb_clk), cycles);
 }
 
 /*
@@ -2202,11 +2202,17 @@ static void i2s_bus_run(ESP32P4I2sState *m, bool m_tx)
 
 /* ---- Unit timing ---- */
 
-/* The time of a master's event n. */
+/*
+ * The time of a master's event n: the first nanosecond its unit clock has
+ * made n frames' cycles from the anchor, at the clock's exact period.
+ */
 static int64_t unit_event_time(ESP32P4I2sState *s, ESP32P4I2sUnit *u,
                                uint64_t n)
 {
-    return u->anchor + clock_ticks_to_ns(unit_clk(s, u), n * u->frame_ticks);
+    int64_t ns = esp32p4_clk_cycles_ns(esp32p4_clk_exact(unit_clk(s, u)),
+                                       n * u->frame_ticks);
+
+    return ns >= INT64_MAX - u->anchor ? INT64_MAX : u->anchor + ns;
 }
 
 /* Whether the unit is a master running on its own clock. */
@@ -2608,14 +2614,16 @@ static void i2s_sig_in(void *opaque, int n, int level)
 /*
  * [spec:nuos:req:emu.esp32p4.i2s]
  * The clock on I2Sn_MCLK_in: another controller's I2Sn_MCLK_out that the
- * pads connect to it, for HP_SYS_CLKRST's PAD_I2Sn_MCLK. A controller's
- * own MCLK_out fed back is no clock: the loop has no source.
+ * pads connect to it, for HP_SYS_CLKRST's PAD_I2Sn_MCLK, at that clock's
+ * exact period, which the controller gives the clock tree as the
+ * TYPE_ESP32P4_CLK_SOURCE of "pad-mclk". A controller's own MCLK_out fed
+ * back is no clock: the loop has no source.
  */
 static void i2s_update_pad_mclk(ESP32P4I2sState *s)
 {
+    ESP32P4ClkPeriod period = esp32p4_clk_period_stopped();
     ESP32P4I2sState *src;
     unsigned line;
-    uint64_t period = 0;
     bool inv;
 
     if (i2s_is_lp(s) || s->mclk_busy) {
@@ -2623,13 +2631,26 @@ static void i2s_update_pad_mclk(ESP32P4I2sState *s)
     }
     if (i2s_route(s, ESP32P4_I2S_IN_MCLK, &src, &line, &inv) &&
         line == ESP32P4_I2S_OUT_MCLK && src != s) {
-        period = clock_get(src->mst_clk);
+        period = esp32p4_clk_exact(src->mst_clk);
     }
-    if (clock_get(s->pad_mclk) != period) {
+    if (!esp32p4_clk_period_eq(s->pad_mclk_period, period)) {
+        s->pad_mclk_period = period;
         s->mclk_busy = true;
-        clock_update(s->pad_mclk, period);
+        clock_update(s->pad_mclk, esp32p4_clk_period_clock(period));
         s->mclk_busy = false;
     }
+}
+
+static bool esp32p4_i2s_exact_period(Object *obj, Clock *out,
+                                     ESP32P4ClkPeriod *p)
+{
+    ESP32P4I2sState *s = ESP32P4_I2S(obj);
+
+    if (out != s->pad_mclk) {
+        return false;
+    }
+    *p = s->pad_mclk_period;
+    return true;
 }
 
 static void i2s_route_changed(Notifier *n, void *data)
@@ -3424,6 +3445,7 @@ static void esp32p4_i2s_init(Object *obj)
         s->mst_clk = qdev_init_clock_in(dev, "mst", esp32p4_i2s_mst_clock, s,
                                         ClockUpdate);
         s->pad_mclk = qdev_init_clock_out(dev, "pad-mclk");
+        s->pad_mclk_period = esp32p4_clk_period_stopped();
         qdev_init_gpio_out_named(dev, s->etm_event, ESP32P4_I2S_ETM_EVENT,
                                  ESP32P4_I2S_ETM_EVENTS);
         qdev_init_gpio_in_named(dev, i2s_etm_task, ESP32P4_I2S_ETM_TASK,
@@ -3541,13 +3563,14 @@ static const VMStateDescription vmstate_esp32p4_i2s_vad = {
 
 static const VMStateDescription vmstate_esp32p4_i2s = {
     .name = TYPE_ESP32P4_I2S,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(apb_clk, ESP32P4I2sState),
         VMSTATE_CLOCK(tx_clk, ESP32P4I2sState),
         VMSTATE_CLOCK(rx_clk, ESP32P4I2sState),
         VMSTATE_CLOCK(mst_clk, ESP32P4I2sState),
+        VMSTATE_ESP32P4_CLK_PERIOD(pad_mclk_period, ESP32P4I2sState),
         VMSTATE_UINT32(int_raw, ESP32P4I2sState),
         VMSTATE_UINT32(int_ena, ESP32P4I2sState),
         VMSTATE_UINT32(rx_conf, ESP32P4I2sState),
@@ -3618,11 +3641,14 @@ static void esp32p4_i2s_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
+    ESP32P4ClkSourceClass *csc = ESP32P4_CLK_SOURCE_CLASS(klass);
+
     rc->phases.hold = esp32p4_i2s_reset_hold;
     rc->phases.exit = esp32p4_i2s_reset_exit;
     dc->realize = esp32p4_i2s_realize;
     dc->vmsd = &vmstate_esp32p4_i2s;
     device_class_set_props(dc, esp32p4_i2s_properties);
+    csc->exact_period = esp32p4_i2s_exact_period;
 }
 
 static void esp32p4_lp_i2s_class_init(ObjectClass *klass, const void *data)
@@ -3639,6 +3665,10 @@ static const TypeInfo esp32p4_i2s_types[] = {
         .instance_init = esp32p4_i2s_init,
         .class_size = sizeof(ESP32P4I2sClass),
         .class_init = esp32p4_i2s_class_init,
+        .interfaces = (const InterfaceInfo[]) {
+            { TYPE_ESP32P4_CLK_SOURCE },
+            { }
+        },
     },
     {
         .name = TYPE_ESP32P4_LP_I2S,

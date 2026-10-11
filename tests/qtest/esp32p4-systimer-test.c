@@ -54,6 +54,8 @@
 #define SYSTIMER_SRC_RC_FAST (1u << 29)
 #define SYSTIMER_CLK_EN     (1u << 30)
 #define RST_EN_STIMER       (1u << 5)
+#define FOSC_CNTL           0x5011101c
+#define FOSC_DFREQ_SHIFT    22
 
 #define INTMTX_STATUS1      0x500d6204
 #define SRC_TARGET0_BIT     (53 - 32)
@@ -377,6 +379,41 @@ static void test_clocks(void)
     qtest_quit(qts);
 }
 
+/*
+ * A long count on a clock whose period is not a whole number of
+ * nanoseconds: at FOSC_DFREQ 258, RC_FAST_CLK runs at 5645/300 MHz, a
+ * period of 60000/1129 ns. CNT_CLK edge 1523435 after the switch to it is
+ * RC_FAST_CLK cycle 3808588, which ends at 228515280000/1129 ns, 1/1129 ns
+ * past 202405031 ns: the alarm comes at 202405032 ns.
+ */
+/* [spec:nuos:req:emu.esp32p4.timers/test] */
+static void test_exact_period(void)
+{
+    QTestState *qts = start();
+    uint32_t ctrl21 = qtest_readl(qts, PERI_CLK_CTRL21);
+    uint64_t target;
+    int64_t t0;
+
+    step(qts, 1000);
+    qtest_writel(qts, FOSC_CNTL, 258u << FOSC_DFREQ_SHIFT);
+    qtest_writel(qts, PERI_CLK_CTRL21, ctrl21 | SYSTIMER_SRC_RC_FAST);
+    t0 = now;
+    target = unit_value(qts, 0) + 1523435;
+    wr(qts, TARGET_HI(0), target >> 32);
+    wr(qts, TARGET_LO(0), (uint32_t)target);
+    wr(qts, TARGET_CONF(0), 0);
+    wr(qts, COMP_LOAD(0), 1);
+    wr(qts, CONF, CONF_RESET | CONF_TARGET_EN(0));
+
+    step(qts, t0 + 202405031 - now);
+    g_assert_cmphex(rd(qts, INT_RAW), ==, 0);
+    g_assert_cmpuint(unit_value(qts, 0), ==, target - 1);
+    step(qts, 1);
+    g_assert_cmphex(rd(qts, INT_RAW), ==, 1);
+    g_assert_cmpuint(unit_value(qts, 0), ==, target);
+    qtest_quit(qts);
+}
+
 /* Byte and halfword accesses read and write their bytes of a register. */
 /* [spec:nuos:req:emu.esp32p4.timers/test] */
 static void test_byte_access(void)
@@ -404,6 +441,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/systimer/period", test_period);
     qtest_add_func("/esp32p4/systimer/stall", test_stall);
     qtest_add_func("/esp32p4/systimer/clocks", test_clocks);
+    qtest_add_func("/esp32p4/systimer/exact-period", test_exact_period);
     qtest_add_func("/esp32p4/systimer/byte-access", test_byte_access);
     return g_test_run();
 }

@@ -97,6 +97,15 @@
  * completes, as ESP-IDF's on_scan_done has it, or each software or
  * sleep-channel measurement.
  *
+ * Every timed event (the timer's phases, a channel's power-up wait and
+ * a measurement's end or timeout) happens at its own time, however late
+ * the QEMU timer that runs it: it runs as of that time
+ * (esp32_line_run_at()), so that the lines it changes, the PMU's wakeup
+ * among them, carry it, and what it times from there it times from that.
+ * Register accesses (RTC_TOUCH's, LP_ANALOG_PERI's TOUCH_* and the touch
+ * timer's PMU_TOUCH_PWR_CNTL), clock changes, the PMU's sleep and the
+ * reset first take the events that fell due before them, in time order.
+ *
  * Not modelled, and without effect here: the shield's drive
  * (TOUCH_BUF_DRV), the guard ring (TOUCH_OUT_RING), whose water rejection
  * ESP-IDF does in software, idle channels' connection, and
@@ -112,6 +121,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_lp_ana.h"
 #include "hw/misc/esp32p4_pmu.h"
 #include "hw/misc/esp32p4_touch.h"
@@ -492,10 +502,7 @@ static bool touch_counting(ESP32P4TouchState *s)
 /* The cycles of LP_DYN_FAST_CLK counted up to @t. */
 static uint64_t touch_count_at(ESP32P4TouchState *s, int64_t t)
 {
-    if (!clock_is_enabled(s->fast) || t <= s->meas_base_ns) {
-        return s->meas_count;
-    }
-    return s->meas_count + clock_ns_to_ticks(s->fast, t - s->meas_base_ns);
+    return s->meas_count + esp32p4_clk_count_at(&s->meas_edges, t);
 }
 
 
@@ -507,10 +514,11 @@ static void touch_meas_arm(ESP32P4TouchState *s)
 
     if ((c2 & SCAN2_TIMEOUT_EN) && clock_is_enabled(s->fast)) {
         uint64_t limit = SCAN2_TIMEOUT_NUM(c2);
-        int64_t t = s->meas_base_ns;
+        int64_t t = s->meas_edges.origin_ns;
 
         if (s->meas_count < limit) {
-            t += clock_ticks_to_ns(s->fast, limit - s->meas_count);
+            t = esp32p4_clk_count_time(&s->meas_edges,
+                                       limit - s->meas_count);
         }
         due = MIN(due, t);
     }
@@ -584,7 +592,7 @@ static void touch_meas_begin(ESP32P4TouchState *s, int64_t when)
 
     s->cur_para = para;
     s->fsm_phase = ESP32P4_TOUCH_FSM_MEAS;
-    s->meas_base_ns = when;
+    esp32p4_clk_count_start(&s->meas_edges, s->fast, when);
     s->meas_count = 0;
     if (!(work & WORK_OUT_GATE)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: TOUCH_OUT_GATE stops the touch "
@@ -602,7 +610,7 @@ static void touch_meas_begin(ESP32P4TouchState *s, int64_t when)
     touch_meas_arm(s);
 }
 
-static void touch_xpd_done(void *opaque)
+static void touch_xpd_run(void *opaque)
 {
     ESP32P4TouchState *s = opaque;
 
@@ -655,7 +663,7 @@ static void touch_finish(ESP32P4TouchState *s, int64_t when)
  * [spec:nuos:req:emu.esp32p4.analog]
  * The counter has reached its end: a mode measured, or the timeout.
  */
-static void touch_meas_cb(void *opaque)
+static void touch_meas_run(void *opaque)
 {
     ESP32P4TouchState *s = opaque;
     int64_t when = s->meas_due_ns;
@@ -760,7 +768,7 @@ static void touch_start(ESP32P4TouchState *s, bool by_timer, int64_t when)
 }
 
 /* [spec:nuos:req:emu.esp32p4.analog] */
-static void touch_timer_cb(void *opaque)
+static void touch_timer_run(void *opaque)
 {
     ESP32P4TouchState *s = opaque;
     int64_t when = esp32p4_clkwait_expire(&s->timer_wait);
@@ -784,6 +792,84 @@ static void touch_timer_cb(void *opaque)
     }
 }
 
+/* Take the timed event @fn at @when, its changes catching up nothing. */
+static void touch_run_event(ESP32P4TouchState *s, int64_t when,
+                            void (*fn)(void *opaque))
+{
+    bool was = s->in_event;
+
+    s->in_event = true;
+    esp32_line_run_at(when, fn, s);
+    s->in_event = was;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.analog]
+ * Take the events that fell due by @now, in time order, each at its own
+ * time, before a change at @now.
+ */
+static void touch_catch_up(ESP32P4TouchState *s, int64_t now)
+{
+    if (s->in_event) {
+        return;
+    }
+    for (;;) {
+        QEMUTimer *timer = NULL;
+        void (*run)(void *opaque) = NULL;
+        int64_t due = INT64_MAX, t;
+
+        if (timer_pending(&s->meas_timer) && s->meas_due_ns < due) {
+            timer = &s->meas_timer;
+            due = s->meas_due_ns;
+            run = touch_meas_run;
+        }
+        t = esp32p4_clkwait_end(&s->xpd_wait);
+        if (timer_pending(&s->xpd_wait.timer) && t < due) {
+            timer = &s->xpd_wait.timer;
+            due = t;
+            run = touch_xpd_run;
+        }
+        t = esp32p4_clkwait_end(&s->timer_wait);
+        if (timer_pending(&s->timer_wait.timer) && t < due) {
+            timer = &s->timer_wait.timer;
+            due = t;
+            run = touch_timer_run;
+        }
+        if (!timer || due > now) {
+            return;
+        }
+        timer_del(timer);
+        touch_run_event(s, due, run);
+    }
+}
+
+void esp32p4_touch_sync(ESP32P4TouchState *s)
+{
+    touch_catch_up(s, esp32_line_time());
+}
+
+/* An event falls due: take it at its time, which a late timer has passed. */
+static void touch_meas_cb(void *opaque)
+{
+    ESP32P4TouchState *s = opaque;
+
+    touch_run_event(s, s->meas_due_ns, touch_meas_run);
+}
+
+static void touch_xpd_done(void *opaque)
+{
+    ESP32P4TouchState *s = opaque;
+
+    touch_run_event(s, esp32p4_clkwait_end(&s->xpd_wait), touch_xpd_run);
+}
+
+static void touch_timer_cb(void *opaque)
+{
+    ESP32P4TouchState *s = opaque;
+
+    touch_run_event(s, esp32p4_clkwait_end(&s->timer_wait), touch_timer_run);
+}
+
 /*
  * [spec:nuos:req:emu.esp32p4.analog]
  * PMU_TOUCH_PWR_CNTL written: start or stop the timer, or force its done,
@@ -793,11 +879,12 @@ static void touch_timer_update(void *opaque, int n, int level)
 {
     ESP32P4TouchState *s = opaque;
     uint32_t old = s->pwr_cntl;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
 
     if (!level) {
         return;
     }
+    touch_catch_up(s, now);
     s->pwr_cntl = esp32p4_pmu_touch_pwr_cntl(s->pmu);
     if ((s->pwr_cntl & PWR_SLEEP_TIMER_EN) && !(old & PWR_SLEEP_TIMER_EN)) {
         touch_timer_set(s, ESP32P4_TOUCH_TIMER_WAIT,
@@ -827,7 +914,7 @@ static void touch_clear_chan(ESP32P4TouchChan *c)
 void esp32p4_touch_ana_write(ESP32P4TouchState *s, hwaddr offset,
                              uint32_t old, uint32_t val, uint32_t wt)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
 
     switch (offset) {
     case A_MUX0:
@@ -927,6 +1014,7 @@ static uint64_t touch_read(void *opaque, hwaddr addr, unsigned size)
     uint32_t ap = touch_ana(s, A_APPROACH);
     uint32_t v = 0;
 
+    touch_catch_up(s, esp32_line_time());
     if (reg >= A_STATUS(0) && reg < A_STATUS(ESP32P4_TOUCH_SLOTS)) {
         v = touch_status(&s->chan[(reg - A_STATUS(0)) / 4], sel, fsel);
         return extract32(v, (addr & 3) * 8, size * 8);
@@ -988,6 +1076,7 @@ static void touch_write(void *opaque, hwaddr addr, uint64_t value,
     uint32_t lanes = MAKE_64BIT_MASK(shift, size * 8);
     uint32_t v = ((uint32_t)value << shift) & lanes;
 
+    touch_catch_up(s, esp32_line_time());
     if (s->in_reset) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write to offset 0x%" HWADDR_PRIx
                       " while RST_EN_LP_TOUCH holds the sensor in reset\n",
@@ -1076,6 +1165,7 @@ static void touch_set_reset(void *opaque, int n, int level)
     if (s->in_reset == !!level) {
         return;
     }
+    touch_catch_up(s, esp32_line_time());
     touch_reset_state(s);
     s->in_reset = level;
     touch_update_irq(s);
@@ -1086,23 +1176,26 @@ static void touch_set_sleep(void *opaque, int n, int level)
 {
     ESP32P4TouchState *s = opaque;
 
+    touch_catch_up(s, esp32_line_time());
     s->sleeping = level;
 }
 
 static void touch_fast_update(void *opaque, ClockEvent event)
 {
     ESP32P4TouchState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
 
     if (event == ClockPreUpdate) {
+        touch_catch_up(s, now);
         esp32p4_clkwait_fold(&s->xpd_wait, now);
         if (touch_counting(s)) {
             s->meas_count = touch_count_at(s, now);
-            s->meas_base_ns = MAX(now, s->meas_base_ns);
+            s->meas_edges.origin_ns = MAX(now, s->meas_edges.origin_ns);
         }
         return;
     }
     esp32p4_clkwait_resched(&s->xpd_wait);
+    s->meas_edges.period = esp32p4_clk_exact(s->fast);
     if (touch_counting(s)) {
         touch_meas_arm(s);
     }
@@ -1113,8 +1206,8 @@ static void touch_slow_update(void *opaque, ClockEvent event)
     ESP32P4TouchState *s = opaque;
 
     if (event == ClockPreUpdate) {
-        esp32p4_clkwait_fold(&s->timer_wait,
-                             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        touch_catch_up(s, esp32_line_time());
+        esp32p4_clkwait_fold(&s->timer_wait, esp32_line_time());
     } else {
         esp32p4_clkwait_resched(&s->timer_wait);
     }
@@ -1154,6 +1247,7 @@ static void esp32p4_touch_reset_hold(Object *obj, ResetType type)
     esp32p4_clkwait_stop(&s->timer_wait);
     s->pwr_cntl = 0;
     s->in_reset = false;
+    s->in_event = false;
 }
 
 static void esp32p4_touch_reset_exit(Object *obj, ResetType type)
@@ -1231,8 +1325,8 @@ static const VMStateDescription vmstate_esp32p4_touch_chan = {
 
 static const VMStateDescription vmstate_esp32p4_touch = {
     .name = TYPE_ESP32P4_TOUCH,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(int_raw, ESP32P4TouchState),
         VMSTATE_UINT32(int_ena, ESP32P4TouchState),
@@ -1256,7 +1350,7 @@ static const VMStateDescription vmstate_esp32p4_touch = {
         VMSTATE_UINT8(scan_last, ESP32P4TouchState),
         VMSTATE_ESP32P4_CLKWAIT(xpd_wait, ESP32P4TouchState),
         VMSTATE_TIMER(meas_timer, ESP32P4TouchState),
-        VMSTATE_INT64(meas_base_ns, ESP32P4TouchState),
+        VMSTATE_ESP32P4_CLK_COUNT(meas_edges, ESP32P4TouchState),
         VMSTATE_UINT64(meas_count, ESP32P4TouchState),
         VMSTATE_INT64(meas_end_ns, ESP32P4TouchState),
         VMSTATE_INT64(meas_due_ns, ESP32P4TouchState),

@@ -92,7 +92,7 @@ static void uart_format(ESP32UARTState *s, Esp32UartFrameFmt *fmt)
     fmt->parity_odd = FIELD_EX32(conf0, UART_CONF0, PARITY);
     fmt->stop_half_bits =
         stop_half_bits[FIELD_EX32(conf0, UART_CONF0, STOP_BIT_NUM)];
-    fmt->bit_q32 = uart_bit_q32(s);
+    fmt->bit = esp32p4_clk_period_exact(uart_bit_q32(s));
 }
 
 /*
@@ -104,7 +104,7 @@ static void uart_format(ESP32UARTState *s, Esp32UartFrameFmt *fmt)
 static bool uart_line_get_format(Object *obj, Esp32UartFrameFmt *fmt)
 {
     uart_format(ESP32_UART(obj), fmt);
-    return fmt->bit_q32 != 0;
+    return esp32_uart_fmt_runs(fmt);
 }
 
 static void uart_line_add_format_notifier(Object *obj, Notifier *n)
@@ -310,7 +310,7 @@ static void uart_tx_start_at(ESP32UARTState *s, int64_t start_ns)
     s->tx_nbits = esp32_uart_frame_levels(&fmt, fifo8_pop(&s->tx_fifo),
                                           &s->tx_levels);
     s->tx_half = s->tx_nbits * 2 + fmt.stop_half_bits;
-    s->tx_q32 = fmt.bit_q32;
+    s->tx_q32 = esp32p4_clk_period_floor(fmt.bit);
     s->tx_start_ns = start_ns;
     s->tx_bit = 0;
     s->tx_busy = true;
@@ -482,7 +482,7 @@ static bool uart_rx_format(void *opaque, Esp32UartFrameFmt *fmt)
     ESP32UARTState *s = ESP32_UART(opaque);
 
     uart_format(s, fmt);
-    return fmt->bit_q32 != 0;
+    return esp32_uart_fmt_runs(fmt);
 }
 
 /*

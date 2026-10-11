@@ -87,12 +87,13 @@
  * gives, the PLLs' as the analog blocks give them) through every divider
  * on its way, and rounded down to its Clock's unit once
  * (esp32p4_clk_period.h): the rounding of one clock never reaches those
- * divided from it. The PMU, in the states that give it control,
- * gates the clocks PMU_n1_DIG_ICG_FUNC_EN lists (TRM table 15.4-2) and
- * selects and gates ROOT_CLK's source in place of HP_ROOT_CLK_SRC_SEL and
- * HP_ROOT_CLK_EN. FORCE_ON bits bypass automatic clock gating,
- * which leaves a clock running while its block is busy, and have no
- * other effect; the WAITI gating of the cores' clocks and the DPA
+ * divided from it. The device is the TYPE_ESP32P4_CLK_SOURCE of its
+ * outputs, giving their exact periods to the blocks that count them. The
+ * PMU, in the states that give it control, gates the clocks
+ * PMU_n1_DIG_ICG_FUNC_EN lists (TRM table 15.4-2) and selects and gates
+ * ROOT_CLK's source in place of HP_ROOT_CLK_SRC_SEL and HP_ROOT_CLK_EN.
+ * FORCE_ON bits bypass automatic clock gating, which leaves a clock
+ * running while its block is busy, and have no other effect; the WAITI gating of the cores' clocks and the DPA
  * strategy's random divider of the crypto clock are not modelled.
  *
  * Resets. HP_RST_EN*, LP_CLKRST's resets and LPPERI_RESET_EN hold their
@@ -1279,44 +1280,15 @@ static uint32_t fld(ESP32P4ClkRstState *s, ClkField f)
     return f.width ? extract32(s->regs[f.reg], f.shift, f.width) : 0;
 }
 
-/* The analog block's PLL behind clock input @in, or -1. */
-static int esp32p4_clkin_pll(int in)
-{
-    switch (in) {
-    case ESP32P4_CLKIN_CPLL_IN:
-        return ESP32P4_ANA_PLL_CPLL;
-    case ESP32P4_CLKIN_SPLL_IN:
-        return ESP32P4_ANA_PLL_SPLL;
-    case ESP32P4_CLKIN_MPLL_IN:
-        return ESP32P4_ANA_PLL_MPLL;
-    case ESP32P4_CLKIN_APLL_IN:
-        return ESP32P4_ANA_PLL_APLL;
-    case ESP32P4_CLKIN_SDIO_PLL_IN:
-        return ESP32P4_ANA_PLL_SDIO;
-    default:
-        return -1;
-    }
-}
-
 /*
  * [spec:nuos:req:emu.esp32p4.clocks]
- * Clock input @in's period: a PLL's exactly from the analog block, while
- * its Clock shows that period; any other input's, a whole number of
- * Clock units, as exact.
+ * Clock input @in's period, exactly as the device driving it gives it: a
+ * PLL's from the analog block, a pad's from the block whose clock the
+ * pad carries (esp32p4_clk_exact()).
  */
 static ESP32P4ClkPeriod esp32p4_clkrst_input(ESP32P4ClkRstState *s, int in)
 {
-    uint64_t period = clock_get(s->clk_in[in]);
-    int pll = esp32p4_clkin_pll(in);
-    ESP32P4ClkPeriod p;
-
-    if (s->ana && pll >= 0) {
-        p = esp32p4_ana_pll_period(s->ana, pll);
-        if (esp32p4_clk_period_clock(p) == period) {
-            return p;
-        }
-    }
-    return esp32p4_clk_period_exact(period);
+    return esp32p4_clk_exact(s->clk_in[in]);
 }
 
 static ESP32P4ClkPeriod esp32p4_clkrst_parent(ESP32P4ClkRstState *s,
@@ -1862,18 +1834,16 @@ bool esp32p4_clkrst_pad_source(ESP32P4ClkRstState *s, unsigned clk,
  */
 static void esp32p4_clkrst_arm_pulse(ESP32P4ClkRstState *s, int n)
 {
-    uint64_t period = s->period[s->core_pulse_clk[n]];
-    uint64_t lo, hi;
+    unsigned clk = s->core_pulse_clk[n];
 
-    if (!period) {
+    if (!s->period[clk]) {
         s->core_pulse_waiting[n] = true;
         timer_del(s->core_timer[n]);
         return;
     }
     s->core_pulse_waiting[n] = false;
-    mulu64(&lo, &hi, s->core_pulse_cycles[n], period);
     timer_mod(s->core_timer[n], qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              (int64_t)((lo >> 32) | (hi << 32)));
+              esp32p4_clk_cycles_ns(s->exact[clk], s->core_pulse_cycles[n]));
 }
 
 /*
@@ -2010,8 +1980,10 @@ static uint32_t esp32p4_clkrst_value(ESP32P4ClkRstState *s, unsigned idx)
         if (src >= esp32p4_clk_desc[C(ROOT)].nparents) {
             return 0;
         }
-        hz = CLOCK_PERIOD_TO_HZ(esp32p4_clk_period_clock(
-            esp32p4_clkrst_parent(s, esp32p4_clk_desc[C(ROOT)].parent[src])));
+        /* The source's whole cycles a second, at its exact period. */
+        hz = esp32p4_clk_ns_cycles(
+            esp32p4_clkrst_parent(s, esp32p4_clk_desc[C(ROOT)].parent[src]),
+            NANOSECONDS_PER_SECOND);
         return (hz * 4 + 500000) / 1000000;
     case R_CPU_CLK_STATUS0:
         v = (s->soc_div[0][0] || (s->soc_div[0][2] && s->soc_div[0][1])) << 1;
@@ -2629,8 +2601,10 @@ static void esp32p4_clkrst_init(Object *obj)
                                           esp32p4_clkrst_clock_in_update, s,
                                           ClockUpdate);
     }
+    s->clk_ids = g_hash_table_new(NULL, NULL);
     for (i = 0; i < ESP32P4_NUM_CLOCKS; i++) {
         s->clk[i] = qdev_init_clock_out(dev, esp32p4_clock_names[i]);
+        g_hash_table_insert(s->clk_ids, s->clk[i], GINT_TO_POINTER(i + 1));
     }
 
     qdev_init_gpio_out_named(dev, s->reset_out, ESP32P4_CLKRST_RESET,
@@ -2708,6 +2682,11 @@ static void esp32p4_clkrst_init(Object *obj)
     }
 
     QTAILQ_INIT(&s->gates);
+}
+
+static void esp32p4_clkrst_finalize(Object *obj)
+{
+    g_hash_table_destroy(ESP32P4_CLKRST(obj)->clk_ids);
 }
 
 static void esp32p4_clkrst_realize(DeviceState *dev, Error **errp)
@@ -2807,19 +2786,33 @@ static const VMStateDescription vmstate_esp32p4_clkrst = {
 
 static const Property esp32p4_clkrst_properties[] = {
     DEFINE_PROP_UINT32("xtal32k-hz", ESP32P4ClkRstState, xtal32k_hz, 32768),
-    DEFINE_PROP_LINK("ana", ESP32P4ClkRstState, ana, TYPE_ESP32P4_ANA,
-                     ESP32P4AnaState *),
 };
+
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+static bool esp32p4_clkrst_exact_period(Object *obj, Clock *out,
+                                        ESP32P4ClkPeriod *p)
+{
+    ESP32P4ClkRstState *s = ESP32P4_CLKRST(obj);
+    gpointer id = g_hash_table_lookup(s->clk_ids, out);
+
+    if (!id) {
+        return false;
+    }
+    *p = s->exact[GPOINTER_TO_INT(id) - 1];
+    return true;
+}
 
 static void esp32p4_clkrst_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
+    ESP32P4ClkSourceClass *csc = ESP32P4_CLK_SOURCE_CLASS(klass);
 
     rc->phases.hold = esp32p4_clkrst_reset_hold;
     dc->realize = esp32p4_clkrst_realize;
     dc->vmsd = &vmstate_esp32p4_clkrst;
     device_class_set_props(dc, esp32p4_clkrst_properties);
+    csc->exact_period = esp32p4_clkrst_exact_period;
 }
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */
@@ -2828,7 +2821,12 @@ static const TypeInfo esp32p4_clkrst_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(ESP32P4ClkRstState),
     .instance_init = esp32p4_clkrst_init,
+    .instance_finalize = esp32p4_clkrst_finalize,
     .class_init    = esp32p4_clkrst_class_init,
+    .interfaces    = (const InterfaceInfo[]) {
+        { TYPE_ESP32P4_CLK_SOURCE },
+        { }
+    },
 };
 
 static void esp32p4_clkrst_register_types(void)

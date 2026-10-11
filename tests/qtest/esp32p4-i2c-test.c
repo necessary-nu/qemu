@@ -567,6 +567,41 @@ static void test_timing(void)
     qtest_quit(qts);
 }
 
+/*
+ * The same transfer from I2C_SCLK at XTAL_CLK / (2 + 1/3), 175/3 ns a
+ * cycle: its 1910 cycles take 111416 2/3 ns, every step counted from the
+ * start at the clock's exact period, and TRANS_COMPLETE comes at the
+ * first nanosecond after.
+ */
+/* [spec:nuos:req:emu.esp32p4.i2c/test] */
+static void test_exact_timing(void)
+{
+    QTestState *qts = start(NULL);
+    uint64_t cycles = START_CYCLES + 2 * 9 * BIT_CYCLES +
+                      (T_LOW + 1) + (T_WAIT + 1);
+    int64_t t0;
+
+    master0(qts);
+    /* Integer part 1 (a divider of 2), numerator 1, denominator 3. */
+    qtest_writel(qts, PERI_CLK_CTRL10,
+                 (qtest_readl(qts, PERI_CLK_CTRL10) & ~0x3fffffcu) |
+                 (1u << 2) | (1u << 10) | (3u << 18));
+    wr(qts, I2C0, DATA, TMP105_ADDR << 1);
+    wr(qts, I2C0, DATA, 0);
+    wr(qts, I2C0, COMD(0), CMD(CMD_RSTART, 0, 0, 0, 0));
+    wr(qts, I2C0, COMD(1), CMD(CMD_WRITE, 2, 1, 0, 0));
+    wr(qts, I2C0, COMD(2), CMD(CMD_STOP, 0, 0, 0, 0));
+    t0 = qtest_clock_step(qts, 1);
+    trans_start(qts, I2C0);
+    g_assert_cmpint(qtest_clock_step(qts, cycles * 175 / 3), ==,
+                    t0 + 111416);
+    g_assert_cmphex(rd(qts, I2C0, INT_RAW) & INT_TRANS_COMPLETE, ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(rd(qts, I2C0, INT_RAW) & INT_TRANS_COMPLETE, ==,
+                    INT_TRANS_COMPLETE);
+    qtest_quit(qts);
+}
+
 /* No device at the address: NACK_INT, then a STOP the master makes. */
 /* [spec:nuos:req:emu.esp32p4.i2c/test] */
 static void test_nack(void)
@@ -1263,6 +1298,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/i2c/tmp105", test_tmp105);
     qtest_add_func("esp32p4/i2c/eeprom", test_eeprom);
     qtest_add_func("esp32p4/i2c/timing", test_timing);
+    qtest_add_func("esp32p4/i2c/exact-timing", test_exact_timing);
     qtest_add_func("esp32p4/i2c/nack", test_nack);
     qtest_add_func("esp32p4/i2c/unrouted", test_unrouted);
     qtest_add_func("esp32p4/i2c/stretch-timeout", test_stretch_timeout);

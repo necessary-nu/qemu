@@ -16,6 +16,20 @@
  */
 extern int64_t icount_quantum;
 
+/*
+ * The window of virtual time the vCPUs with an icount clock run through
+ * together (icount-common.c). icount_window_start() starts one @units of
+ * 2^-32 ns long at the present virtual time for @cpus vCPUs, and returns
+ * how far its start is from the previous window's, or UINT64_MAX if
+ * there was none or it is far behind. icount_window_set_idle() tells it
+ * that @cpu, taking part, has gone idle or woken. icount_window_join()
+ * adds @cpu at the present virtual time, and ends the window at most
+ * @units on.
+ */
+uint64_t icount_window_start(uint64_t units, int cpus);
+void icount_window_set_idle(CPUState *cpu, bool idle);
+void icount_window_join(CPUState *cpu, uint64_t units);
+
 void icount_handle_deadline(void);
 void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget);
 int64_t icount_percpu_budget(int cpu_count);

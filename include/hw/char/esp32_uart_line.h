@@ -12,20 +12,35 @@
 #include "qemu/notify.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "migration/vmstate.h"
 
 /*
  * An asynchronous serial frame format: a start bit, data_bits data bits
  * LSB first, an optional parity bit and stop_half_bits / 2 stop bits, each
- * bit bit_q32 / 2^32 ns long. bit_q32 is 0 when the line can't run.
+ * bit exactly @bit long (an ESP32P4ClkPeriod, as the UART's clock and
+ * divider make it), stopped when the line can't run.
  */
 typedef struct Esp32UartFrameFmt {
     uint8_t data_bits;
     bool parity_en;
     bool parity_odd;
     uint8_t stop_half_bits;
-    uint64_t bit_q32;
+    ESP32P4ClkPeriod bit;
 } Esp32UartFrameFmt;
+
+/* Whether the line runs at @fmt's bit time. */
+static inline bool esp32_uart_fmt_runs(const Esp32UartFrameFmt *fmt)
+{
+    return esp32p4_clk_period_running(fmt->bit);
+}
+
+/*
+ * The first whole ns by which @half_bits half bits of @fmt have elapsed,
+ * from the start of a frame (esp32p4_clk_cycles_ns()).
+ */
+int64_t esp32_uart_half_bits_ns(const Esp32UartFrameFmt *fmt,
+                                uint64_t half_bits);
 
 /*
  * The line levels of a frame carrying data, from the start bit: bit i of

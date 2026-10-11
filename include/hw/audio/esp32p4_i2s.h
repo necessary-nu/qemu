@@ -12,6 +12,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/audio.h"
 #include "qemu/notify.h"
 #include "qemu/timer.h"
@@ -208,8 +209,8 @@ typedef struct ESP32P4I2sUnit {
     uint32_t words;
 
     /*
-     * A master's clock: frames (or PDM samples) end at anchor plus
-     * clock_ticks_to_ns() of (events + 1) frames' unit clock cycles.
+     * A master's clock: frames (or PDM samples) end (events + 1) frames'
+     * unit clock cycles after anchor, exactly.
      */
     int64_t anchor;
     uint64_t events;
@@ -258,6 +259,8 @@ struct ESP32P4I2sState {
     Clock *rx_clk;
     Clock *mst_clk;
     Clock *pad_mclk;
+    /* The exact period of the clock on "pad-mclk". */
+    ESP32P4ClkPeriod pad_mclk_period;
     ESP32P4GdmaState *gdma;
     ESP32P4GpioState *gpio;
     ESP32P4I2sState *bus[ESP32P4_I2S_COUNT];

@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -67,6 +68,11 @@ struct ESP32P4EfuseState {
     uint32_t rs_check[ESP32P4_EFUSE_BLOCKS][ESP32P4_EFUSE_RS_CHECK_WORDS];
     /* The file has room for the copies and parity, not only the data. */
     bool blk_has_raw;
+    /*
+     * The "chip-revision" property: the wafer version a factory-fresh
+     * array holds, major * 100 + minor (300 for v3.0).
+     */
+    uint32_t chip_revision;
 
     /*
      * What the last read operation loaded: the decoded parameters, before
@@ -102,12 +108,12 @@ struct ESP32P4EfuseState {
     /*
      * The running operation, timed in eFuse clock cycles: its length, the
      * cycles run up to the start of the current stretch of constant clock,
-     * and when that stretch began.
+     * and the clock's cycles counted from when that stretch began.
      */
     uint32_t op;
     uint64_t op_cycles;
     uint64_t op_cycles_done;
-    int64_t op_stretch_ns;
+    ESP32P4ClkCount op_edges;
     uint32_t op_pgm[ESP32P4_EFUSE_RS_WORDS + ESP32P4_EFUSE_RS_CHECK_WORDS];
     uint32_t op_blk;
     bool in_reset;

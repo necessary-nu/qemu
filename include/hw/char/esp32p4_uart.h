@@ -160,9 +160,14 @@ struct ESP32P4UartState {
 
     /*
      * Transmitter: the current phase's waveform, its edges at tx_t16[]
-     * sixteenths of a bit from tx_start_ns, the phase lasting tx_end16;
-     * bits tx_q32 / 2^32 ns long, or 0 while the transmitter's clock is
-     * stopped, the phase having then reached tx_pos16 / 2^16 sixteenths.
+     * sixteenths of a bit from its start, the phase lasting tx_end16. Its
+     * sixteenth t16 comes exactly (t16 * 4096 + tx_shift) * tx_unit after
+     * tx_start_ns: tx_unit is 2^-16 of a bit, stopped while the
+     * transmitter's clock is, the phase having then reached tx_pos16
+     * 2^-16 bits; tx_shift is where the phase began, after the phases of
+     * a run before it, or before tx_start_ns when the bit time changed
+     * in it. The last phase to end ended at tx_chain_ns, tx_chain_pos
+     * units from tx_start_ns, where the next follows it at once.
      */
     QEMUTimer tx_timer;
     uint8_t tx_phase;
@@ -172,8 +177,11 @@ struct ESP32P4UartState {
     uint8_t tx_lvl[ESP32P4_UART_TX_EDGES];
     uint32_t tx_end16;
     int64_t tx_start_ns;
-    uint64_t tx_q32;
+    ESP32P4ClkPeriod tx_unit;
+    int64_t tx_shift;
     uint64_t tx_pos16;
+    int64_t tx_chain_ns;
+    int64_t tx_chain_pos;
     /* When the transmitter last went idle. */
     int64_t tx_free_ns;
     /* The frame on the line: its byte, bit count, and its stop bits. */

@@ -106,7 +106,10 @@ static void term_rx_in(void *opaque, int n, int level)
 
 static int64_t term_tx_time(Esp32UartTerminalState *s, unsigned half_bits)
 {
-    return s->tx_start_ns + esp32_uart_mul_shr(half_bits, s->tx_q32, 33);
+    Esp32UartFrameFmt fmt = { .bit = s->tx_bit_time };
+
+    return s->tx_start_ns +
+           esp32_uart_half_bits_ns(&fmt, s->tx_off + half_bits);
 }
 
 static bool term_tx_level(Esp32UartTerminalState *s, unsigned bit)
@@ -143,9 +146,17 @@ static bool term_tx_start(Esp32UartTerminalState *s, int64_t start_ns)
     if (was_full) {
         qemu_chr_fe_accept_input(&s->chr);
     }
+    if (s->tx_chained && start_ns == term_tx_time(s, s->tx_half) &&
+        esp32p4_clk_period_eq(fmt.bit, s->tx_bit_time)) {
+        /* Back to back, from the exact end of the frame before. */
+        s->tx_off += s->tx_half;
+    } else {
+        s->tx_start_ns = start_ns;
+        s->tx_off = 0;
+    }
     s->tx_half = s->tx_nbits * 2 + fmt.stop_half_bits;
-    s->tx_q32 = fmt.bit_q32;
-    s->tx_start_ns = start_ns;
+    s->tx_bit_time = fmt.bit;
+    s->tx_chained = false;
     s->tx_bit = 0;
     s->tx_busy = true;
     esp32_line_set_at(s->tx_out, 0, start_ns);
@@ -183,6 +194,7 @@ static void term_tx_advance(Esp32UartTerminalState *s)
         }
         s->tx_busy = false;
         /* The next byte follows the stop bits without a gap */
+        s->tx_chained = true;
         term_tx_start(s, t);
     }
     if (s->tx_busy) {
@@ -259,6 +271,7 @@ static void term_set_break(Object *obj, bool value, Error **errp)
     }
     if (value) {
         s->tx_busy = false;
+        s->tx_chained = false;
         timer_del(&s->tx_timer);
         esp32_line_set_at(s->tx_out, 0, now);
     } else {
@@ -327,8 +340,8 @@ static const Property esp32_uart_terminal_properties[] = {
 
 static const VMStateDescription vmstate_esp32_uart_terminal = {
     .name = TYPE_ESP32_UART_TERMINAL,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT(rx, Esp32UartTerminalState, 1, vmstate_esp32_uart_rx,
                        Esp32UartRx),
@@ -341,7 +354,11 @@ static const VMStateDescription vmstate_esp32_uart_terminal = {
         VMSTATE_UINT8(tx_half, Esp32UartTerminalState),
         VMSTATE_UINT8(tx_bit, Esp32UartTerminalState),
         VMSTATE_INT64(tx_start_ns, Esp32UartTerminalState),
-        VMSTATE_UINT64(tx_q32, Esp32UartTerminalState),
+        VMSTATE_UINT64(tx_off, Esp32UartTerminalState),
+        VMSTATE_UINT64(tx_bit_time.num_hi, Esp32UartTerminalState),
+        VMSTATE_UINT64(tx_bit_time.num_lo, Esp32UartTerminalState),
+        VMSTATE_UINT64(tx_bit_time.den, Esp32UartTerminalState),
+        VMSTATE_BOOL(tx_chained, Esp32UartTerminalState),
         VMSTATE_BOOL(brk, Esp32UartTerminalState),
         VMSTATE_END_OF_LIST()
     }

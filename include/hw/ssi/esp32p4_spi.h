@@ -248,7 +248,7 @@ struct ESP32P4SpiState {
     uint8_t nph;
     uint8_t cur;            /* the state being consumed */
     uint32_t cur_beat;
-    uint64_t half_units;    /* half an SPI_CLK cycle, 2^-32 ns */
+    ESP32P4ClkPeriod half;  /* half an SPI_CLK cycle, exactly */
     int64_t t0;             /* when half cycle 0 began */
     uint64_t h;             /* half cycles from t0 to the next step */
     /* The generator, ahead of the consumer. */

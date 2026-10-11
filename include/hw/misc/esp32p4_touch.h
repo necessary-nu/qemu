@@ -129,7 +129,8 @@ struct ESP32P4TouchState {
      * the scan's or software's, and whether the touch timer started it,
      * the frequency mode and modes to
      * measure, and the measurement's counter: the cycles counted up to
-     * meas_base_ns and when the pulses it waits for will have come.
+     * the origin of meas_edges, from which LP_DYN_FAST_CLK's cycles are
+     * counted since, and when the pulses it waits for will have come.
      */
     uint8_t fsm_phase;
     uint8_t cur_ch;
@@ -141,7 +142,7 @@ struct ESP32P4TouchState {
     uint8_t scan_last;
     ESP32P4ClkWait xpd_wait;
     QEMUTimer meas_timer;
-    int64_t meas_base_ns;
+    ESP32P4ClkCount meas_edges;
     uint64_t meas_count;
     int64_t meas_end_ns;
     /* When the timer is due: the end, or the timeout. */
@@ -155,6 +156,8 @@ struct ESP32P4TouchState {
     bool sleeping;
     bool in_reset;
     bool wakeup_level;
+    /* A timed event is being taken: a change it makes catches up none. */
+    bool in_event;
 
     uint32_t cap_ff[ESP32P4_TOUCH_SLOTS];
 };
@@ -167,5 +170,11 @@ void esp32p4_touch_ana_write(ESP32P4TouchState *s, hwaddr offset,
                              uint32_t old, uint32_t val, uint32_t wt);
 /* LP_ANALOG_PERI has been reset, and the TOUCH_* registers with it. */
 void esp32p4_touch_ana_reset(ESP32P4TouchState *s);
+/*
+ * A TOUCH_* register is about to be written: the sensor first takes the
+ * events that fell due before the write, under the configuration they
+ * fell due under.
+ */
+void esp32p4_touch_sync(ESP32P4TouchState *s);
 
 #endif

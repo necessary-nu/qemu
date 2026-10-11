@@ -35,6 +35,15 @@ uint64_t esp32_uart_mul_shr(uint64_t a, uint64_t b, unsigned shift)
 
 /* [spec:nuos:req:emu.esp32.gpio] */
 /* [spec:nuos:req:emu.esp32p4.uart] */
+int64_t esp32_uart_half_bits_ns(const Esp32UartFrameFmt *fmt,
+                                uint64_t half_bits)
+{
+    return esp32p4_clk_cycles_ns(esp32p4_clk_period_scale(fmt->bit, 1, 2),
+                                 half_bits);
+}
+
+/* [spec:nuos:req:emu.esp32.gpio] */
+/* [spec:nuos:req:emu.esp32p4.uart] */
 unsigned esp32_uart_frame_levels(const Esp32UartFrameFmt *fmt, unsigned data,
                                  uint16_t *levels)
 {
@@ -57,11 +66,13 @@ unsigned esp32_uart_frame_levels(const Esp32UartFrameFmt *fmt, unsigned data,
     return n;
 }
 
-/* The middle of bit `bit` of the frame being received, from its start bit */
+/*
+ * The middle of bit `bit` of the frame being received, from its start bit:
+ * the first nanosecond at or after it.
+ */
 static int64_t rx_sample_ns(const Esp32UartRx *rx, unsigned bit)
 {
-    return rx->edge_ns[0] +
-           esp32_uart_mul_shr(2 * bit + 1, rx->fmt.bit_q32, 33);
+    return rx->edge_ns[0] + esp32_uart_half_bits_ns(&rx->fmt, 2 * bit + 1);
 }
 
 static unsigned rx_stop_bit(const Esp32UartRx *rx)
@@ -172,7 +183,8 @@ void esp32_uart_rx_line(Esp32UartRx *rx, bool level, int64_t when_ns)
         }
         return;
     }
-    if (level || !rx->format(rx->opaque, &rx->fmt) || !rx->fmt.bit_q32) {
+    if (level || !rx->format(rx->opaque, &rx->fmt) ||
+        !esp32_uart_fmt_runs(&rx->fmt)) {
         return;
     }
     rx->busy = true;
@@ -254,8 +266,8 @@ void esp32_uart_rx_reset(Esp32UartRx *rx, bool level)
 
 const VMStateDescription vmstate_esp32_uart_rx = {
     .name = "esp32-uart-rx",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER(timer, Esp32UartRx),
         VMSTATE_BOOL(level, Esp32UartRx),
@@ -265,7 +277,9 @@ const VMStateDescription vmstate_esp32_uart_rx = {
         VMSTATE_BOOL(fmt.parity_en, Esp32UartRx),
         VMSTATE_BOOL(fmt.parity_odd, Esp32UartRx),
         VMSTATE_UINT8(fmt.stop_half_bits, Esp32UartRx),
-        VMSTATE_UINT64(fmt.bit_q32, Esp32UartRx),
+        VMSTATE_UINT64(fmt.bit.num_hi, Esp32UartRx),
+        VMSTATE_UINT64(fmt.bit.num_lo, Esp32UartRx),
+        VMSTATE_UINT64(fmt.bit.den, Esp32UartRx),
         VMSTATE_UINT8(n_edges, Esp32UartRx),
         VMSTATE_INT64_ARRAY(edge_ns, Esp32UartRx, ESP32_UART_RX_EDGES),
         VMSTATE_END_OF_LIST()

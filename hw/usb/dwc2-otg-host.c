@@ -187,25 +187,25 @@ uint32_t dwc2_otg_haint(DWC2OTGState *s)
 
 /* Bus timing */
 
-static int64_t host_bit_ns(DWC2OTGState *s)
+/* The bus's bit rate below high speed. */
+static uint32_t host_bit_rate(DWC2OTGState *s)
 {
-    switch (s->port_speed) {
-    case DWC2_SPEED_HIGH:
-        return 0;
-    case DWC2_SPEED_LOW:
-        return NANOSECONDS_PER_SECOND / 1500000;
-    default:
-        return NANOSECONDS_PER_SECOND / 12000000;
-    }
+    return s->port_speed == DWC2_SPEED_LOW ? 1500000 : 12000000;
 }
 
+/*
+ * A transaction of @len bytes on the bus, at the first nanosecond its
+ * bits have taken.
+ */
 static int64_t host_xact_ns(DWC2OTGState *s, uint32_t len)
 {
     if (s->port_speed == DWC2_SPEED_HIGH) {
         /* 480 Mb/s: 60 bytes a microsecond. */
-        return (int64_t)(len + HS_XACT_OVERHEAD_BYTES) * SCALE_US / 60;
+        return DIV_ROUND_UP((int64_t)(len + HS_XACT_OVERHEAD_BYTES) *
+                            SCALE_US, 60);
     }
-    return (int64_t)(len + XACT_OVERHEAD_BYTES) * 8 * host_bit_ns(s);
+    return muldiv64_round_up((uint64_t)(len + XACT_OVERHEAD_BYTES) * 8,
+                             NANOSECONDS_PER_SECOND, host_bit_rate(s));
 }
 
 /* One (micro)frame: HFIR.FrInt PHY clocks. */
@@ -246,6 +246,9 @@ static void host_frames_update(DWC2OTGState *s)
 
             s->frame_ns = host_frame_len_ns(s);
             s->frame_start_ns = now - s->frame_ns;
+            s->frame_origin_ns = now;
+            s->frame_ticks = 0;
+            s->frame_hz = dwc2_otg_phy_hz(s);
             timer_mod(s->frame_timer, now);
         }
     } else {
@@ -1457,6 +1460,34 @@ static void host_bus(void *opaque)
     }
 }
 
+/*
+ * Begin the next (micro)frame where the last ended. The frames end at the
+ * first nanosecond their PHY clocks have elapsed, counted from the first
+ * at the same PHY clock, so that they keep to the clock however many
+ * there are.
+ */
+static void host_frame_next(DWC2OTGState *s)
+{
+    uint64_t hz = dwc2_otg_phy_hz(s);
+    uint32_t len = s->hfir & HFIR_FRINT_MASK;
+
+    s->frame_start_ns += s->frame_ns;
+    if (hz != s->frame_hz) {
+        s->frame_hz = hz;
+        s->frame_origin_ns = s->frame_start_ns;
+        s->frame_ticks = 0;
+    }
+    if (!hz || !len) {
+        s->frame_ns = host_frame_len_ns(s);
+        s->frame_hz = 0;
+        return;
+    }
+    s->frame_ticks += len;
+    s->frame_ns = s->frame_origin_ns +
+                  muldiv64_round_up(s->frame_ticks, NANOSECONDS_PER_SECOND,
+                                    hz) - s->frame_start_ns;
+}
+
 /* A (micro)frame boundary: the SOF, and a new round of transactions. */
 /* [spec:nuos:req:emu.esp32p4.usb] */
 static void host_frame(void *opaque)
@@ -1467,8 +1498,7 @@ static void host_frame(void *opaque)
     if (!host_running(s)) {
         return;
     }
-    s->frame_start_ns += s->frame_ns;
-    s->frame_ns = host_frame_len_ns(s);
+    host_frame_next(s);
     timer_mod(s->frame_timer, s->frame_start_ns + s->frame_ns);
     s->frnum = (s->frnum + 1) & HFNUM_MAX_FRNUM;
     s->gintsts |= GINTSTS_SOF;
@@ -1588,6 +1618,9 @@ void dwc2_otg_host_reset(DWC2OTGState *s)
     s->frnum = HFNUM_MAX_FRNUM;
     s->frame_ns = 0;
     s->frame_start_ns = 0;
+    s->frame_origin_ns = 0;
+    s->frame_ticks = 0;
+    s->frame_hz = 0;
     s->np_next = 0;
     host_reset_toggles(s);
     qemu_set_irq(s->suspended_out, 0);
