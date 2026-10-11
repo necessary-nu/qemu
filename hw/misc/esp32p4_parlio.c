@@ -85,8 +85,9 @@
  * the unit is busy (TX with a frame to send, RX with RX_START set), so a
  * device on the pads clocked by an idle unit sees no edges, and RX in
  * software enable mode clocked by the TX unit's idle clock samples
- * nothing between TX's frames; the TX/RX_CNT fields count the bytes the
- * core side takes from or puts in the FIFO; PARL_IO_CLK_EN is kept as
+ * nothing between TX's frames; TX_CNT and RX_CNT, the TRM's "cycle
+ * number of reading" each FIFO, count the bytes read from it (by the TX
+ * core, by GDMA), wrapping at their widths; PARL_IO_CLK_EN is kept as
  * written.
  */
 
