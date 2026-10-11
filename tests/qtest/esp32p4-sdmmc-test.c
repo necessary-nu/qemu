@@ -576,6 +576,32 @@ static void test_card_init_and_fifo(void)
         g_assert_cmphex(got[i], ==, image_byte(0x11, 3 * 512 + i));
     }
     g_assert_cmphex(qtest_readl(qts, SD_TBBCNT), ==, 512);
+
+    /*
+     * The bus width sets the data's clocks: 512 in 8-bit mode, 256 more
+     * halved in DDR mode. (A QEMU card takes any width.)
+     */
+    qtest_writel(qts, SD_RINTSTS, 0xffffffff);
+    qtest_writel(qts, SD_CTYPE, 1u << 16);
+    qtest_writel(qts, SD_CMD, CMD_START | CMD_HOLD | CMD_WAIT | R1 |
+                 CMD_DATA | 17);
+    qtest_clock_step(qts, t + (2 + 1 + 512 + 16 + 1) * DATA_CLK_NS - 1);
+    g_assert_cmphex(qtest_readl(qts, SD_RINTSTS) & INT_DTO, ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readl(qts, SD_RINTSTS) & INT_DTO, ==, INT_DTO);
+    qtest_writel(qts, SD_CTRL, CTRL_FIFO_RESET);
+    qtest_writel(qts, SD_RINTSTS, 0xffffffff);
+    qtest_writel(qts, SD_UHS, 1u << 16);
+    qtest_writel(qts, SD_CMD, CMD_START | CMD_HOLD | CMD_WAIT | R1 |
+                 CMD_DATA | 17);
+    qtest_clock_step(qts, t + (2 + 1 + 256 + 16 + 1) * DATA_CLK_NS - 1);
+    g_assert_cmphex(qtest_readl(qts, SD_RINTSTS) & INT_DTO, ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readl(qts, SD_RINTSTS) & INT_DTO, ==, INT_DTO);
+    qtest_writel(qts, SD_UHS, 0);
+    qtest_writel(qts, SD_CTYPE, 1);
+    qtest_writel(qts, SD_CTRL, CTRL_FIFO_RESET);
+    qtest_clock_step(qts, 1000);
     /* Reading it empty is an underrun. */
     qtest_writel(qts, SD_RINTSTS, 0xffffffff);
     qtest_readl(qts, SD_BUFFIFO);
