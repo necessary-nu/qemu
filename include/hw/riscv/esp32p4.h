@@ -29,6 +29,7 @@
 #include "hw/misc/esp32p4_lp_sys.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "hw/nvram/esp32p4_efuse.h"
+#include "hw/sd/esp32p4_sdmmc.h"
 #include "hw/timer/esp32p4_lp_timer.h"
 #include "hw/timer/esp32p4_lp_wdt.h"
 #include "hw/timer/esp32p4_systimer.h"
@@ -127,6 +128,7 @@ struct ESP32P4MachineState {
     /* The access permission managers, every master's way onto the bus. */
     ESP32P4PmsState pms;
     ESP32P4IcmState icm;
+    ESP32P4SdmmcState sdmmc;
     /* GDMA-AHB, GDMA-AXI. */
     ESP32P4GdmaState gdma[2];
     ESP32P4DwGdmaState vdma;
