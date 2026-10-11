@@ -22,8 +22,8 @@
  *     ESP-IDF and the ROM's own entry point contradict), or at LP SRAM
  *     once software clears it; core 1 is held in reset with its clock
  *     gated until software releases it through HP_SYS_CLKRST. The LP core,
- *     which starts at the LP ROM, is held in reset: the PMU, which starts
- *     it, is not modelled. Each core executes at the clock that drives it,
+ *     which starts at the LP ROM, is held in reset until the PMU starts
+ *     it. Each core executes at the clock that drives it,
  *     the HP cores at CPU_CLK and the LP core at LP_DYN_FAST_CLK, and
  *     under icount an instruction takes a cycle of it.
  *   - The HP ROM (128 KiB) at 0x4FC00000, and at 0x8FC00000 for direct
@@ -60,6 +60,15 @@
  *     watchdogs reset the HP cores, the HP core (the HP blocks and both
  *     cores, the LP system running on) or the whole system, each with its
  *     reset cause in LP_CLKRST.
+ *   - Low-power management (TRM chapters 15, 24 to 26): the PMU
+ *     (0x50115000), its state machine taking the chip between HP_ACTIVE,
+ *     HP_SLEEP and LP_SLEEP, powering the domains, the oscillators and the
+ *     PLLs, gating the HP system's clocks, stalling the HP cores and
+ *     starting and stopping the LP core, its interrupts sources 6 and 7;
+ *     LP_ANALOG_PERI (0x50113000), the brown-out detector on the board's
+ *     VDD_ANA and VDD_BAT, with the glitch detectors and the power supply
+ *     detector, its interrupt source 8; and the LP mailbox (0x50118000),
+ *     its interrupts sources 4 and 5.
  *   - The event task matrix (TRM chapter 14) at 0x500D5000, mapping the
  *     events of the GPIO matrix, the timers, the RTC timer and GDMA to
  *     the tasks of the GPIO matrix, the timer groups, GDMA and the LP
@@ -235,6 +244,22 @@
  * L2MEM (past the L2 cache), the TCM or LP SRAM, and core 0 starts at the
  * ELF's entry point rather than in the ROM, with the caches empty; core 1
  * is still held for software to release.
+ *
+ * The ELF stands for the program the ROM boots from flash, and takes the
+ * ROM's place whenever the HP system starts: after an HP core reset that
+ * selects the ROM (LP_CLKRST_HPCORE0_STAT_VECTOR_SEL), and so after a
+ * deep sleep, core 0 starts at the entry point. The ROM on such a wakeup
+ * (PMU HP power down reset, 0x05) takes LP_SYSTEM_LP_STORE8 bit 0 to tell
+ * a deep sleep, after which it boots from flash as from power-on, from a
+ * light sleep, after which it jumps to the address in the rest of the
+ * word; it runs no deep-sleep wake stub itself, ESP-IDF's bootloader and
+ * application doing that. As the deep sleep powered the HP memories down,
+ * losing L2MEM and the TCM, the machine first loads the ELF's segments
+ * there again, as the boot from flash would (leaving LP SRAM, which keeps
+ * its contents, as ESP-IDF's bootloader leaves the LP memory on a deep
+ * sleep wakeup); the HP pads stay held until the program releases them,
+ * as the ROM does at boot (PMU_TIE_LOW_HP_PAD_HOLD_ALL). Without -kernel
+ * the ROM runs again, as on the chip.
  */
 
 #include "qemu/osdep.h"
@@ -259,6 +284,8 @@
 #include "system/blockdev.h"
 #include "system/reset.h"
 #include "system/system.h"
+#include "system/tcg.h"
+#include "exec/translation-block.h"
 
 /*
  * The blocks of the address map that are not modelled, each an
@@ -326,10 +353,7 @@ static const struct {
     { "mipi-dsi-mem",     0x50105000, 4 * KiB },
 
     /* LP always-on peripherals. */
-    { "lp-analog-peri",   0x50113000, 4 * KiB },
     { "lp-huk",           0x50114000, 4 * KiB },
-    { "pmu",              0x50115000, 4 * KiB },
-    { "lp-mailbox",       0x50118000, 4 * KiB },
     { "rtc-cali",         0x50119000, 4 * KiB },
 
     /* LP peripherals. */
@@ -841,9 +865,9 @@ static void esp32p4_hp_core_reset(void *opaque, int n, int level)
  *
  * Their interrupts are sources of the interrupt matrix, and their ETM
  * events and tasks the ETM's (esp32p4_init_etm()). The RTC timer's wakeups
- * and the LP core's timer interrupt are named GPIO lines (see the devices'
- * headers) that nothing takes until the PMU and the LP core's interrupts
- * are modelled.
+ * go to the PMU (esp32p4_init_low_power()); the LP core's timer interrupt
+ * is a named GPIO line (see the device's header) that nothing takes until
+ * the LP core's interrupts are modelled.
  * MWDT0 and the RTC watchdog run their flash boot protection when the
  * chip boots from flash through the boot ROM in SPI boot mode: when the
  * board's strapping (the strap-mode property) has GPIO35 high and there
@@ -1769,6 +1793,269 @@ static void esp32p4_init_dma(ESP32P4MachineState *s)
                        esp32p4_intr_source(s, ESP32P4_INTR_DW_GDMA));
 }
 
+/* What the HP memories hold as they come back from a power-down. */
+#define ESP32P4_LOST_MEM_PATTERN 0xa5
+
+/* Fill RAM region @mr as a powered-down memory comes back. */
+static void esp32p4_lose_memory(MemoryRegion *mr)
+{
+    uint64_t size = memory_region_size(mr);
+    ram_addr_t ra = memory_region_get_ram_addr(mr);
+
+    memset(memory_region_get_ram_ptr(mr), ESP32P4_LOST_MEM_PATTERN, size);
+    memory_region_set_dirty(mr, 0, size);
+    if (tcg_enabled()) {
+        tb_invalidate_phys_range(NULL, ra, ra + size - 1);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
+ * The PMU powers the HP memories down: L2MEM and the TCM lose their
+ * contents (TRM 15.4.1.2; LP SRAM, in the LP system, keeps its own).
+ */
+static void esp32p4_hp_mem_power(void *opaque, int n, int level)
+{
+    ESP32P4MachineState *s = opaque;
+
+    if (!level) {
+        esp32p4_lose_memory(&s->l2mem);
+        esp32p4_lose_memory(&s->tcm);
+        s->hp_mem_lost = true;
+    }
+}
+
+static void esp32p4_reload_kernel(ESP32P4MachineState *s);
+
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
+ * The PMU powers PD_TOP, the HP system, down or up. As it comes back after
+ * the HP memories were lost, -kernel's ELF is loaded again in place of the
+ * ROM's boot from flash, before the HP cores start.
+ */
+static void esp32p4_hp_top_power(void *opaque, int n, int level)
+{
+    ESP32P4MachineState *s = opaque;
+
+    if (level && s->hp_mem_lost) {
+        esp32p4_reload_kernel(s);
+        s->hp_mem_lost = false;
+    }
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->clkrst),
+                                        ESP32P4_CLKRST_PMU_POWER,
+                                        ESP32P4_CLKRST_PD_TOP), level);
+}
+
+/*
+ * Low-power management (TRM chapters 15, 24 to 26), in the LP always-on
+ * domain, its registers behind LP_DYN_FAST_CLK:
+ *
+ *   - The PMU, timed by LP_DYN_FAST_CLK and LP_DYN_SLOW_CLK, its PMU_INTR
+ *     and LP interrupts sources 6 and 7: it powers the domains (PD_TOP and
+ *     the HP memories through the machine, which keeps the memories' loss),
+ *     the oscillators, the crystal and the PLLs, gates the HP system's
+ *     clocks and ROOT_CLK, stalls the HP cores, starts and stops the LP
+ *     core, holds the pads and switches them to their sleep configuration,
+ *     pauses the RTC watchdog and lets the brown-out detector see VDD_BAT.
+ *     Its wakeup sources: the GPIO and LP GPIO wakeups, the RTC timer's
+ *     targets, the brown-out detector and VDD_BAT's under-voltage,
+ *     HP_SYSTEM's interrupt wakeup (the TRM's "HP CPU" source) and the EXT
+ *     wakeup on pads GPIO0 to GPIO15, which LP_SYSTEM records too. Its ETM
+ *     task, PMU_TASK_SLEEP_REQ, and event, PMU_EVT_SLEEP_WAKEUP, are the
+ *     ETM's (esp32p4_init_etm()). The other sources' "wakeup" lines,
+ *     UART_WAKEUP_EN and the LP interrupt wait for the blocks that take
+ *     them (UARTs, USB, SDIO, touch, LP I2S, EMAC, the LP core's
+ *     interrupts).
+ *   - LP_ANALOG_PERI, behind its LP_CLKRST reset, its interrupt source 8:
+ *     the brown-out detector, on BIAS's thresholds, and the glitch and
+ *     power supply detectors. The detector's "bod-en" is left at the
+ *     analog default, enabled, rather than taken from LP_SYSTEM's
+ *     "bod-reset-en", which reads a set FIB bit as disabling the detector
+ *     and so, from its reset value, would disable it, where TRM 21.2.2.2
+ *     has a set bit enable it.
+ *   - The LP mailbox, behind its LP_CLKRST reset, MB_HP_INTR and MB_LP_INTR
+ *     sources 4 and 5.
+ */
+/* [spec:nuos:req:emu.esp32p4.low-power] */
+static void esp32p4_init_low_power(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    DeviceState *gpio = DEVICE(&s->gpio);
+    DeviceState *pmu, *ana, *mb;
+    int i;
+
+    object_initialize_child(OBJECT(s), "pmu", &s->pmu, TYPE_ESP32P4_PMU);
+    pmu = DEVICE(&s->pmu);
+    object_property_set_link(OBJECT(pmu), "clkrst", OBJECT(&s->clkrst),
+                             &error_abort);
+    object_property_set_link(OBJECT(pmu), "lp-cpu", OBJECT(&s->lp_cpu),
+                             &error_abort);
+    object_property_set_link(OBJECT(pmu), "lp-sys", OBJECT(&s->lp_sys),
+                             &error_abort);
+    qdev_connect_clock_in(pmu, "fast", qdev_get_clock_out(clkrst,
+                                                          "lp-dyn-fast"));
+    qdev_connect_clock_in(pmu, "slow", qdev_get_clock_out(clkrst,
+                                                          "lp-dyn-slow"));
+    sysbus_realize(SYS_BUS_DEVICE(pmu), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(pmu), 0,
+                             ESP32P4_PMU_BASE, ESP32P4_CLK_LP_DYN_FAST,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(pmu), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_PMU_0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(pmu), 1,
+                       esp32p4_intr_source(s, ESP32P4_INTR_PMU_1));
+
+    s->hp_top_power = qemu_allocate_irq(esp32p4_hp_top_power, s, 0);
+    s->hp_mem_power = qemu_allocate_irq(esp32p4_hp_mem_power, s, 0);
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_POWER, ESP32P4_PMU_PD_TOP,
+                                s->hp_top_power);
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_POWER,
+                                ESP32P4_PMU_PD_HP_MEM, s->hp_mem_power);
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_POWER,
+                                ESP32P4_PMU_PD_HP_CPU,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_POWER,
+                                    ESP32P4_CLKRST_PD_HP_CPU));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_POWER,
+                                ESP32P4_PMU_PD_HP_CNNT,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_POWER,
+                                    ESP32P4_CLKRST_PD_HP_CNNT));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_POWER,
+                                ESP32P4_PMU_PD_LP_PERI,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_POWER,
+                                    ESP32P4_CLKRST_PD_LP_PERI));
+    for (i = 0; i < ESP32P4_CLKRST_NUM_XPD; i++) {
+        qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_XPD, i,
+                                    qdev_get_gpio_in_named(clkrst,
+                                        ESP32P4_CLKRST_PMU_XPD, i));
+    }
+    for (i = 0; i < ESP32P4_ANA_NUM_PLLS; i++) {
+        qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_PLL_XPD, i,
+                                    qdev_get_gpio_in_named(DEVICE(&s->ana),
+                                        ESP32P4_ANA_XPD, i));
+    }
+    for (i = 0; i < ESP32P4_HP_CORES; i++) {
+        qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_CORE_STALL, i,
+                                    qdev_get_gpio_in_named(clkrst,
+                                        ESP32P4_CLKRST_PMU_CORE_STALL, i));
+    }
+    for (i = 0; i < ESP32P4_CLKRST_NUM_PMU_ICG; i++) {
+        qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_ICG, i,
+                                    qdev_get_gpio_in_named(clkrst,
+                                        ESP32P4_CLKRST_PMU_ICG, i));
+    }
+    for (i = 0; i < ESP32P4_CLKRST_NUM_SYSCLK; i++) {
+        qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_SYSCLK, i,
+                                    qdev_get_gpio_in_named(clkrst,
+                                        ESP32P4_CLKRST_PMU_SYSCLK, i));
+    }
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LP_SLEEP, 0,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_LP_SLEEP, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LP_CORE_RESET, 0,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_LP_CORE_RESET, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LP_CORE_CLOCK, 0,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_LP_CORE_CLOCK, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LP_CORE_STALL, 0,
+                                qdev_get_gpio_in_named(clkrst,
+                                    ESP32P4_CLKRST_PMU_LP_CORE_STALL, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_HOLD_ALL,
+                                ESP32P4_PMU_HOLD_HP,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_HOLD_ALL,
+                                    ESP32P4_GPIO_HOLD_ALL_HP));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_HOLD_ALL,
+                                ESP32P4_PMU_HOLD_LP,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_HOLD_ALL,
+                                    ESP32P4_GPIO_HOLD_ALL_LP));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_PAD_SLEEP, 0,
+                                qdev_get_gpio_in_named(gpio,
+                                    ESP32P4_GPIO_LIGHT_SLEEP, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_PAUSE_WDT, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->lp_wdt),
+                                    ESP32P4_LP_WDT_SLEEP, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_XTAL_OFF, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->lp_timer),
+                                    ESP32P4_LP_TIMER_XTAL_OFF, 0));
+
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_WAKEUP, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_GPIO));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_LP_WAKEUP, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_LP_GPIO));
+    qdev_connect_gpio_out_named(DEVICE(&s->hp_sys), ESP32P4_HP_SYS_HP_WAKEUP,
+                                0, qdev_get_gpio_in_named(pmu,
+                                       ESP32P4_PMU_WAKEUP,
+                                       ESP32P4_PMU_WAKE_HP_CPU));
+    qdev_connect_gpio_out_named(DEVICE(&s->lp_timer),
+                                ESP32P4_LP_TIMER_SOC_WAKEUP, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_RTC_TIMER0));
+    qdev_connect_gpio_out_named(DEVICE(&s->lp_timer),
+                                ESP32P4_LP_TIMER_LP_WAKEUP, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_RTC_TIMER1));
+    for (i = 0; i < ESP32P4_PMU_EXT_PADS; i++) {
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_OUT, i,
+                                    qdev_get_gpio_in_named(pmu,
+                                        ESP32P4_PMU_EXT_PAD, i));
+    }
+
+    object_initialize_child(OBJECT(s), "lp-ana", &s->lp_ana,
+                            TYPE_ESP32P4_LP_ANA);
+    ana = DEVICE(&s->lp_ana);
+    object_property_set_link(OBJECT(ana), "clkrst", OBJECT(&s->clkrst),
+                             &error_abort);
+    object_property_set_link(OBJECT(ana), "ana", OBJECT(&s->ana),
+                             &error_abort);
+    object_property_set_link(OBJECT(ana), "efuse", OBJECT(&s->efuse),
+                             &error_abort);
+    qdev_connect_clock_in(ana, "fast", qdev_get_clock_out(clkrst,
+                                                          "lp-dyn-fast"));
+    sysbus_realize(SYS_BUS_DEVICE(ana), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(ana), 0,
+                             ESP32P4_LP_ANA_BASE, ESP32P4_CLK_LP_DYN_FAST,
+                             ESP32P4_RST_LP_ANAPERI, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(ana), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LP_ANAPERI));
+    qdev_connect_gpio_out_named(DEVICE(&s->ana), ESP32P4_ANA_BIAS_UPDATE, 0,
+                                qdev_get_gpio_in_named(ana,
+                                    ESP32P4_LP_ANA_BIAS_UPDATE, 0));
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_BOD_VBAT_SEL, 0,
+                                qdev_get_gpio_in_named(ana,
+                                    ESP32P4_LP_ANA_VBAT_SEL, 0));
+    qdev_connect_gpio_out_named(ana, ESP32P4_LP_ANA_BROWNOUT, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_BROWNOUT));
+    qdev_connect_gpio_out_named(ana, ESP32P4_LP_ANA_VBAT_UNDERVOLTAGE, 0,
+                                qdev_get_gpio_in_named(pmu,
+                                    ESP32P4_PMU_WAKEUP,
+                                    ESP32P4_PMU_WAKE_VBAT));
+
+    object_initialize_child(OBJECT(s), "lp-mailbox", &s->lp_mailbox,
+                            TYPE_ESP32P4_LP_MAILBOX);
+    mb = DEVICE(&s->lp_mailbox);
+    sysbus_realize(SYS_BUS_DEVICE(mb), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(mb), 0,
+                             ESP32P4_LP_MAILBOX_BASE, ESP32P4_CLK_LP_DYN_FAST,
+                             ESP32P4_RST_LP_MAILBOX, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(mb), ESP32P4_LP_MAILBOX_IRQ_HP,
+                       esp32p4_intr_source(s, ESP32P4_INTR_MB_HP));
+    sysbus_connect_irq(SYS_BUS_DEVICE(mb), ESP32P4_LP_MAILBOX_IRQ_LP,
+                       esp32p4_intr_source(s, ESP32P4_INTR_MB_LP));
+}
+
 /* LP_SYSTEM_SYS_SW_RST: the software system reset, an HP core reset. */
 /* [spec:nuos:req:emu.esp32p4.debug] */
 static void esp32p4_sw_sys_reset(void *opaque, int n, int level)
@@ -1789,17 +2076,18 @@ static void esp32p4_sw_sys_reset(void *opaque, int n, int level)
  *     cores and the LP core; HP_SYSTEM's WFI wakeup events to the HP cores;
  *     its HP2LP interrupt groups over sources 21 to 130 of the interrupt
  *     matrix, whose HP_INTR waits for the LP core's interrupt controller
- *     and whose HP wakeup for the PMU; and the HP cores' stalls for
- *     CPU_CORESTALLED_ST.
+ *     and whose HP wakeup is the PMU's (esp32p4_init_low_power()); and the
+ *     HP cores' stalls for CPU_CORESTALLED_ST.
  *   - The pads' holds: each pad's GPIO block "pad-hold" input is the OR of
  *     LP_SYSTEM_PAD_RTC_HOLD_CTRL's bit for it and, for GPIO16 to GPIO54,
- *     HP_SYSTEM_GPIO_O_HOLD_CTRL's (the PMU's hold-all is not modelled).
+ *     HP_SYSTEM_GPIO_O_HOLD_CTRL's (the PMU's holds of all the HP or LP
+ *     pads are the GPIO block's "hold-all", esp32p4_init_low_power()).
  *   - LP_SYSTEM's software system reset, an HP core reset with cause 0x03
  *     (TRM table 11.1-1), its choice of the core whose stall the RTC
  *     timer follows, and its FIB control of the super watchdog's reset,
- *     to the RTC watchdog. Its brownout reset enable and LP core disable
- *     are not connected, as the brownout detector and the PMU, which
- *     would act on them, are not modelled.
+ *     to the RTC watchdog. Its LP core disable is not connected, as the
+ *     PMU does not act on it, nor its brownout reset enable (see
+ *     esp32p4_init_low_power()).
  *   - The debug assistant (0x3FF06000), not gated by BUSMON_CPU_CLK_EN, its
  *     interrupt ASSIST_DEBUG_INTR (source 127), watching the HP cores and
  *     taking their resets for its PC records.
@@ -2017,7 +2305,7 @@ static void esp32p4_init_twai(ESP32P4MachineState *s)
  * takes tasks adds a line here for each.
  *
  * Not connected, as their blocks are not modelled: the LED PWM, MCPWM,
- * ADC, REGDMA, temperature sensor, I2S, 2D-DMA and PMU events and tasks;
+ * ADC, REGDMA, temperature sensor, I2S and 2D-DMA events and tasks;
  * the LP core's events (ULP_EVT_*) and ULP_TASK_WAKEUP_CPU, the PMU's LP
  * core wakeup, whose LP_CORE_ETM_WAKEUP_FLAG in LP_SYS is not modelled;
  * and the RTC timer's tasks (RTC_TASK_*), which the TRM says it does not
@@ -2131,6 +2419,12 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
                                      ESP32P4_GDMA_ETM_TASK, k);
         }
     }
+
+    /* The PMU's sleep request and its wakeup to HP_ACTIVE. */
+    esp32p4_etm_connect_event(etm, ESP32P4_ETM_PMU_EVT_SLEEP_WEEKUP,
+                              DEVICE(&s->pmu), ESP32P4_PMU_ETM_EVENT, 0);
+    esp32p4_etm_connect_task(etm, ESP32P4_ETM_PMU_TASK_SLEEP_REQ,
+                             DEVICE(&s->pmu), ESP32P4_PMU_ETM_TASK, 0);
 
     /*
      * The LP core's interrupt, through LP_SYS's ETM_TASK_ULP_INT, and its
@@ -2539,13 +2833,22 @@ static bool esp32p4_kernel_segment_fits(uint32_t addr, uint32_t size)
     return false;
 }
 
+/* An ELF segment -kernel loaded outside LP SRAM, for its reload. */
+typedef struct ESP32P4KernelSegment {
+    uint32_t paddr;
+    uint32_t memsz;
+    GBytes *data;
+} ESP32P4KernelSegment;
+
 /*
  * Refuse an ELF with a segment outside those memories: the loader would
  * drop one in the flash or PSRAM windows without a word, as nothing maps
  * them, and one in the ROM would replace the ROM. Files that are not
- * 32-bit little-endian ELFs are left for the loader to reject.
+ * 32-bit little-endian ELFs are left for the loader to reject. Keep the
+ * segments outside LP SRAM, which a deep sleep loses.
  */
-static void esp32p4_check_kernel(const char *filename)
+static void esp32p4_check_kernel(ESP32P4MachineState *s,
+                                 const char *filename)
 {
     g_autofree char *data = NULL;
     gsize len;
@@ -2568,7 +2871,8 @@ static void esp32p4_check_kernel(const char *filename)
     }
     for (i = 0; i < phnum; i++) {
         Elf32_Phdr ph;
-        uint32_t paddr, memsz;
+        ESP32P4KernelSegment seg;
+        uint32_t paddr, memsz, offset, filesz;
 
         if (phoff + (uint64_t)(i + 1) * phentsize > len) {
             return;
@@ -2576,6 +2880,8 @@ static void esp32p4_check_kernel(const char *filename)
         memcpy(&ph, data + phoff + i * phentsize, sizeof(ph));
         paddr = le32_to_cpu(ph.p_paddr);
         memsz = le32_to_cpu(ph.p_memsz);
+        offset = le32_to_cpu(ph.p_offset);
+        filesz = MIN(le32_to_cpu(ph.p_filesz), memsz);
         if (le32_to_cpu(ph.p_type) != PT_LOAD || !memsz) {
             continue;
         }
@@ -2588,6 +2894,39 @@ static void esp32p4_check_kernel(const char *filename)
                          paddr, memsz);
             exit(1);
         }
+        if ((paddr >= ESP32P4_LP_SRAM_BASE &&
+             paddr - ESP32P4_LP_SRAM_BASE < ESP32P4_LP_SRAM_SIZE) ||
+            (uint64_t)offset + filesz > len) {
+            continue;
+        }
+        seg.paddr = paddr;
+        seg.memsz = memsz;
+        seg.data = g_bytes_new(data + offset, filesz);
+        g_array_append_val(s->kernel_segments, seg);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
+ * Load the -kernel ELF's segments outside LP SRAM again, as the ROM's boot
+ * from flash would once the HP memories have lost their contents.
+ */
+static void esp32p4_reload_kernel(ESP32P4MachineState *s)
+{
+    guint i;
+
+    for (i = 0; s->kernel_segments && i < s->kernel_segments->len; i++) {
+        ESP32P4KernelSegment *seg = &g_array_index(s->kernel_segments,
+                                                   ESP32P4KernelSegment, i);
+        gsize filesz;
+        const void *bytes = g_bytes_get_data(seg->data, &filesz);
+        g_autofree uint8_t *zeros = g_malloc0(seg->memsz - filesz);
+
+        address_space_write(&address_space_memory, seg->paddr,
+                            MEMTXATTRS_UNSPECIFIED, bytes, filesz);
+        address_space_write(&address_space_memory, seg->paddr + filesz,
+                            MEMTXATTRS_UNSPECIFIED, zeros,
+                            seg->memsz - filesz);
     }
 }
 
@@ -2614,7 +2953,9 @@ static void esp32p4_load(ESP32P4MachineState *s)
     if (!machine->kernel_filename) {
         return;
     }
-    esp32p4_check_kernel(machine->kernel_filename);
+    s->kernel_segments = g_array_new(false, false,
+                                     sizeof(ESP32P4KernelSegment));
+    esp32p4_check_kernel(s, machine->kernel_filename);
     if (load_elf(machine->kernel_filename, NULL, NULL, NULL, &entry, NULL,
                  NULL, NULL, ELFDATA2LSB, EM_RISCV, 1, 0) < 0) {
         error_report("esp32p4: cannot load the ELF file '%s'",
@@ -2659,6 +3000,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_dma(s);
     esp32p4_init_uart(s);
     esp32p4_init_usb_serial_jtag(s);
+    esp32p4_init_low_power(s);
     esp32p4_init_i3c(s);
     esp32p4_init_twai(s);
     esp32p4_init_etm(s);
