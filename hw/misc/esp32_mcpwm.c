@@ -48,8 +48,12 @@
  * counters to one moment and drive the edges it found at another. An
  * output edge is stamped with the moment it is due, however late the
  * timer's callback runs: whatever brings the block to a moment first does
- * all that fell due before it, edge by edge, each at its own time, and
- * never skips any. An input acts at the time its change is stamped with,
+ * all that fell due before it, edge by edge, each at its own time. Only
+ * when that work is more than 10 ms behind (a host slower than the edges
+ * it is to drive, which would never catch up) does the block skip ahead,
+ * the edges in between lost; each output it then drives is stamped with
+ * the moment it last changed, so that no edge carries a time other than
+ * its own. An input acts at the time its change is stamped with,
  * so that a capture of an edge another block drives through the GPIO
  * matrix, or this block's own output coming back, reads the capture timer
  * at that edge. Whenever software samples the pads the outputs are
@@ -330,6 +334,13 @@ enum {
 #define SNAP_AFTER              8
 #define SNAP_WINDOW             4096
 #define SNAP_WINDOW_MAX         (1u << 20)
+/*
+ * How far behind virtual time the timer's work may fall before the block
+ * skips ahead (mcpwm_skip()) rather than drive every edge on the way.
+ */
+#define CATCHUP_NS              (10 * 1000 * 1000)
+/* The PWM_clk cycles a skip first looks back over for the last changes */
+#define SKIP_WINDOW             1024
 /* The most events a look-ahead run takes before giving up for now. */
 #define WATCH_MAX_EVENTS        65536
 
@@ -1731,20 +1742,35 @@ static void mcpwm_etm_emit(Esp32McpwmState *s, int64_t when)
 }
 
 static void mcpwm_timer_fire(Esp32McpwmState *s);
+static void mcpwm_skip(Esp32McpwmState *s, int64_t t);
+
+/*
+ * The timer's work, due at due_ns, done by `limit`: a firing at its due
+ * time, or, more than CATCHUP_NS behind, a skip to CATCHUP_NS before
+ * `limit`.
+ */
+static void mcpwm_due(Esp32McpwmState *s, int64_t limit)
+{
+    if (s->due_ns < limit - CATCHUP_NS) {
+        mcpwm_skip(s, limit - CATCHUP_NS);
+    } else {
+        mcpwm_timer_fire(s);
+    }
+}
 
 /*
  * Do everything the timer was due to do by `limit`, each firing at its own
- * due time, however far behind: each firing drives the edges and raises
- * the interrupts of its moment, and sets the timer for the next, strictly
- * later one, so that this ends. Nothing is skipped: a block that ran its
- * counters to `limit` at once would drive the edges it passed at `limit`.
+ * due time: each firing drives the edges and raises the interrupts of its
+ * moment, and sets the timer for the next, strictly later one, so that
+ * this ends. A block that ran its counters to `limit` at once would drive
+ * the edges it passed at `limit`.
  */
 static void mcpwm_catch_up(Esp32McpwmState *s, int64_t limit)
 {
     while (!s->in_timer_cb && timer_pending(s->timer) &&
            s->due_ns <= limit) {
         timer_del(s->timer);
-        mcpwm_timer_fire(s);
+        mcpwm_due(s, limit);
     }
 }
 
@@ -1872,6 +1898,118 @@ static void mcpwm_timer_fire(Esp32McpwmState *s)
 }
 
 /*
+ * Run a copy of core c to cycle `to` (no earlier than its own), into
+ * *end, and find each output's level there, level[n], and the cycle at
+ * which it last changed, last[n] (NO_EVENT if not since c's cycle). Only
+ * the last stretch is walked change by change, long enough to find the
+ * last change of every output whose level at `to` differs from
+ * driven[n]; the rest runs at once.
+ */
+static void core_last_changes(const Esp32McpwmCore *c, uint64_t to,
+                              const uint8_t *driven, Esp32McpwmCore *end,
+                              uint8_t *level, uint64_t *last)
+{
+    for (uint64_t w = SKIP_WINDOW;; w *= 2) {
+        uint64_t start = to - c->now > w ? to - w : c->now;
+        bool found = true;
+
+        memcpy(end, c, sizeof(*end));
+        core_run(end, start);
+        for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+            level[n] = op_out(end, n / 2, n % 2);
+            last[n] = NO_EVENT;
+        }
+        for (;;) {
+            McpwmWatch watch = { .driven = level, .floor = end->now };
+            uint64_t when;
+
+            if (core_look_ahead(end, &watch, &when) == SEEN_NOTHING ||
+                when > to) {
+                break;
+            }
+            core_run(end, when);
+            for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+                uint8_t v = op_out(end, n / 2, n % 2);
+
+                if (v != level[n]) {
+                    level[n] = v;
+                    last[n] = when;
+                }
+            }
+        }
+        core_run(end, to);
+        for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+            if (level[n] != driven[n] && last[n] == NO_EVENT &&
+                start > c->now) {
+                found = false;
+            }
+        }
+        if (found) {
+            return;
+        }
+    }
+}
+
+/*
+ * The timer's work more than CATCHUP_NS behind: the host may be slower
+ * than the edges it is to drive, and catching up edge by edge would never
+ * finish. The block skips ahead to the present (esp32_line_time()): its
+ * counters run on to it at once, and each output whose level there
+ * differs from its line is driven stamped with the moment it last
+ * changed, in the order of those moments. The edges in between are lost,
+ * as coalesced ones are; every edge driven keeps its own time, so that a
+ * capture of it is exact still. The ETM events of the stretch pulse once,
+ * at the time of the latest.
+ */
+static void mcpwm_skip_run(void *opaque)
+{
+    Esp32McpwmState *s = opaque;
+    Esp32McpwmCore *c = &s->core;
+    Esp32McpwmCore end;
+    uint8_t level[ESP32_MCPWM_OUTS];
+    uint64_t last[ESP32_MCPWM_OUTS];
+    uint64_t to = MAX(mcpwm_cycle_at(s, mcpwm_now(s)), c->now);
+
+    core_last_changes(c, to, s->out_level, &end, level, last);
+    memcpy(c, &end, sizeof(*c));
+    mcpwm_cap_sync_hit(s);
+    if (c->etm_fired) {
+        mcpwm_etm_emit(s, mcpwm_ns_at(s, c->etm_cycle));
+    }
+    mcpwm_changed(s);
+    /* What the edges reach answers once they are all driven. */
+    s->updating = true;
+    for (;;) {
+        int first = -1;
+        int64_t when;
+
+        for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+            if (level[n] != s->out_level[n] &&
+                (first < 0 || last[n] < last[first])) {
+                first = n;
+            }
+        }
+        if (first < 0) {
+            break;
+        }
+        when = last[first] == NO_EVENT ? mcpwm_now(s)
+                                       : mcpwm_ns_at(s, last[first]);
+        s->out_level[first] = level[first];
+        s->last_out_ns = MAX(s->last_out_ns, when);
+        esp32_line_set_at(s->out[first], level[first], when);
+    }
+    s->updating = false;
+    mcpwm_update(s);
+}
+
+/* Skip to time t, the timer's work due before it undone (mcpwm_skip_run()) */
+static void mcpwm_skip(Esp32McpwmState *s, int64_t t)
+{
+    timer_del(s->timer);
+    esp32_line_run_at(t, mcpwm_skip_run, s);
+}
+
+/*
  * The timer's callback, at the moment it runs, does all the work due up
  * to that moment, each piece at its own due time, so that it leaves the
  * timer set after that moment: callbacks each due before the moment they
@@ -1880,9 +2018,10 @@ static void mcpwm_timer_fire(Esp32McpwmState *s)
 static void mcpwm_timer_run(void *opaque)
 {
     Esp32McpwmState *s = opaque;
+    int64_t limit = mcpwm_present(s);
 
-    mcpwm_timer_fire(s);
-    mcpwm_catch_up(s, mcpwm_present(s));
+    mcpwm_due(s, limit);
+    mcpwm_catch_up(s, limit);
 }
 
 static void mcpwm_timer_cb(void *opaque)
