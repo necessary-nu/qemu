@@ -23,6 +23,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LPSysState, ESP32P4_LP_SYS)
  */
 #define ESP32P4_LP_SYS_ETM_TASK_ULP_INT "etm-task-ulp-int"
 
+/*
+ * Named GPIO output ESP32P4_LP_SYS_USB_PHY_SEL: LP_SYSTEM_REG_USB_CTRL's
+ * SW_HW_USB_PHY_SEL and SW_USB_PHY_SEL, to USB_WRAP's "phy-sel" inputs.
+ */
+#define ESP32P4_LP_SYS_USB_PHY_SEL "usb-phy-sel"
+
 struct ESP32P4LPSysState {
     SysBusDevice parent_obj;
 
@@ -33,6 +39,9 @@ struct ESP32P4LPSysState {
     uint32_t lp_addrhole_info;
     uint32_t int_raw;
     uint32_t int_ena;
+    uint32_t usb_ctrl;
+    uint32_t hp_usb_otghs_phy_ctrl;
+    qemu_irq usb_phy_sel[2];
 };
 
 /*
