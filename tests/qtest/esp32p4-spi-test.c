@@ -887,6 +887,40 @@ static void test_cs_keep(void)
 }
 
 /*
+ * The two controllers on a bus the board wires between their pads
+ * ("pad-wires"): SPI2's signals on GPIO20 to GPIO23, SPI3's on GPIO44 to
+ * GPIO47.
+ */
+/* [spec:nuos:req:emu.esp32p4.spi/test] */
+static void test_pad_wires(void)
+{
+    QTestState *qts = qtest_init("-M esp32p4 -global "
+                                 "esp32p4-gpio.pad-wires=20:44,21:45,22:46,"
+                                 "23:47");
+
+    wire(qts, 20, SIG_SPI2_CK, -1);
+    wire(qts, 21, SIG_SPI2_D, -1);
+    wire(qts, 22, 0x100, SIG_SPI2_Q);
+    wire(qts, 23, SIG_SPI2_CS, -1);
+    wire(qts, 44, 0x100, SIG_SPI3_CK);
+    wire(qts, 45, 0x100, SIG_SPI3_D);
+    wire(qts, 46, SIG_SPI3_Q, -1);
+    wire(qts, 47, 0x100, SIG_SPI3_CS);
+    wr(qts, SPI3, SLAVE, SLAVE_MODE);
+    wr(qts, SPI3, USER, DOUTDIN);
+    wr(qts, SPI3, W(0), 0x13579bdf);
+    wr(qts, SPI2, W(0), 0x2468ace0);
+    wr(qts, SPI2, USER, DOUTDIN | USR_MOSI | USR_MISO | MISO_HIGHPART |
+       CS_SETUP | CS_HOLD);
+    wr(qts, SPI2, MS_DLEN, 31);
+    run(qts, SPI2);
+    g_assert_cmphex(rd(qts, SPI2, W(8)), ==, 0x13579bdf);
+    g_assert_cmphex(rd(qts, SPI3, W(0)), ==, 0x2468ace0);
+    g_assert_cmphex(rd(qts, SPI3, INT_RAW), ==, INT_TRANS_DONE);
+    qtest_quit(qts);
+}
+
+/*
  * Octal: in OPI mode every state is on eight lanes (the IO MUX's IO4 to
  * IO7 on GPIO34 to GPIO37), so the JEDEC ID takes a command cycle and
  * three data cycles, 8 cycles with the CS setup and hold.
@@ -1054,6 +1088,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/spi/slave-dma", test_slave_dma);
     qtest_add_func("/esp32p4/spi/sct", test_sct);
     qtest_add_func("/esp32p4/spi/cs-keep", test_cs_keep);
+    qtest_add_func("/esp32p4/spi/pad-wires", test_pad_wires);
     qtest_add_func("/esp32p4/spi/octal", test_octal);
     qtest_add_func("/esp32p4/spi/clock-reset", test_clock_reset);
     qtest_add_func("/esp32p4/spi/slave-hd-dma", test_slave_hd_dma);

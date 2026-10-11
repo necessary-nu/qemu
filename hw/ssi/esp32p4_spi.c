@@ -1051,14 +1051,60 @@ static void spi_drive_lines(ESP32P4SpiState *s)
 }
 
 /*
+ * The output signal of @s or @other that drives input signal @sig of @s:
+ * through the pad the matrix or IO MUX takes it from, or through a wire
+ * of the board's ("pad-wires") from another pad on that wire.
+ */
+static bool in_source(ESP32P4SpiState *s, ESP32P4SpiState *other,
+                      unsigned sig, unsigned *out, bool *inv)
+{
+    ESP32P4SpiState *who[2] = { s, other };
+    uint64_t wire = 0;
+    int pad;
+
+    if (esp32p4_gpio_sig_in_source(s->gpio, sig, out, inv)) {
+        return true;
+    }
+    pad = esp32p4_gpio_sig_in_pad(s->gpio, sig);
+    if (pad < 0 || !s->gpio->pad_wire[pad]) {
+        return false;
+    }
+    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
+        if (s->gpio->pad_wire[n] == s->gpio->pad_wire[pad]) {
+            wire |= 1ULL << n;
+        }
+    }
+    for (unsigned k = 0; k < 2; k++) {
+        for (unsigned line = 0; who[k] && line < ESP32P4_SPI_LINES; line++) {
+            int o = sig_of(who[k], line);
+
+            if (o >= 0 && (esp32p4_gpio_sig_out_pads(s->gpio, o) & wire)) {
+                *out = o;
+                *inv = false;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
  * [spec:nuos:req:emu.esp32p4.spi]
  * Where each data input of @s comes from, through the matrix or the IO
- * MUX: an output of its own, or of @other (the other controller), a pad
- * no signal of the chip drives (the board's SSI devices), or neither (the
- * level the matrix delivers).
+ * MUX (and the board's wires between pads): an output of its own, or of
+ * @other (the other controller), a pad no signal of the chip drives (the
+ * board's SSI devices), or neither (the level the matrix delivers); and
+ * whether @other's clock input comes from @s's clock output.
  */
 static void resolve(ESP32P4SpiState *s, ESP32P4SpiState *other)
 {
+    unsigned ck;
+    bool ck_inv;
+
+    s->clocks_peer = other &&
+        in_source(other, s, sig_of(other, ESP32P4_SPI_LINE_CK), &ck,
+                  &ck_inv) &&
+        ck == (unsigned)sig_of(s, ESP32P4_SPI_LINE_CK);
     s->ssi_out_lanes = 0;
     for (unsigned l = 0; l < ESP32P4_SPI_LANES; l++) {
         ESP32P4SpiLaneSrc *src = &s->src[l];
@@ -1076,7 +1122,7 @@ static void resolve(ESP32P4SpiState *s, ESP32P4SpiState *other)
         if (esp32p4_gpio_sig_out_pads(s->gpio, sig)) {
             s->ssi_out_lanes |= BIT(l);
         }
-        if (esp32p4_gpio_sig_in_source(s->gpio, sig, &out, &inv)) {
+        if (in_source(s, other, sig, &out, &inv)) {
             j = lane_of_signal(s, out);
             if (j >= 0) {
                 src->kind = SRC_SELF;
@@ -1135,17 +1181,8 @@ static uint8_t gather(ESP32P4SpiState *s, uint8_t own, uint8_t other,
 static ESP32P4SpiState *clocked_peer(ESP32P4SpiState *s)
 {
     ESP32P4SpiState *p = s->peer;
-    unsigned out;
-    bool inv;
 
-    if (!p || !slave_mode(p) || !sys_running(p) ||
-        !s->oe_level[ESP32P4_SPI_LINE_CK]) {
-        return NULL;
-    }
-    if (!esp32p4_gpio_sig_in_source(s->gpio,
-                                    sig_of(p, ESP32P4_SPI_LINE_CK), &out,
-                                    &inv) ||
-        out != (unsigned)sig_of(s, ESP32P4_SPI_LINE_CK)) {
+    if (!p || !s->clocks_peer || !slave_mode(p) || !sys_running(p)) {
         return NULL;
     }
     return p;
@@ -1866,8 +1903,6 @@ static bool gen_one(ESP32P4SpiState *s)
     b->phase = s->gen;
     b->out = out;
     b->ssi_bits = 0;
-    b->ssi_out = 0;
-    b->ssi_in = 0;
     b->ssi_pos = s->ssi_gen_bits;
     if (has_devices(s)) {
         unsigned bits = ph->ssi_lanes;
@@ -1880,7 +1915,6 @@ static bool gen_one(ESP32P4SpiState *s)
             ssi_out = 0;
         }
         b->ssi_bits = bits;
-        b->ssi_out = ssi_out;
         for (int i = bits - 1; i >= 0; i--) {
             s->ssi_acc = (s->ssi_acc << 1) | ((ssi_out >> i) & 1);
             if (++s->ssi_gen_bits % 8 == 0) {
@@ -2049,6 +2083,9 @@ static bool master_beat(ESP32P4SpiState *s)
     if (phase_has_dma_rx(s, ph) && completes_byte(ph, s->cur_beat) &&
         rx_waits(s)) {
         return false;
+    }
+    if (!s->src_valid) {
+        resolve(s, s->peer);
     }
     p = clocked_peer(s);
     if (p && !slave_ready(p)) {
@@ -3041,8 +3078,6 @@ static const VMStateDescription vmstate_esp32p4_spi_beat = {
         VMSTATE_UINT8(phase, ESP32P4SpiBeat),
         VMSTATE_UINT8(out, ESP32P4SpiBeat),
         VMSTATE_UINT8(ssi_bits, ESP32P4SpiBeat),
-        VMSTATE_UINT8(ssi_out, ESP32P4SpiBeat),
-        VMSTATE_UINT8(ssi_in, ESP32P4SpiBeat),
         VMSTATE_UINT32(ssi_pos, ESP32P4SpiBeat),
         VMSTATE_END_OF_LIST()
     },

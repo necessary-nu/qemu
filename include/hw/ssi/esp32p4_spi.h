@@ -84,8 +84,9 @@ enum {
  *
  * The two controllers reach each other through the pads as well: one in
  * slave mode is clocked by the other when its clock input comes, through
- * the matrix or the IO MUX, from the master's clock output, and each sees
- * on its data inputs whichever data outputs the routing connects to them.
+ * the matrix or the IO MUX (and the board's wires between pads, the GPIO
+ * block's "pad-wires"), from the master's clock output, and each sees on
+ * its data inputs whichever data outputs the routing connects to them.
  * The machine links each to the other through the "peer" property.
  *
  * Other links and clocks: "gdma" (GDMA-AXI, which serves both through
@@ -134,11 +135,11 @@ typedef struct ESP32P4SpiBeat {
     uint8_t phase;
     /* The master's output levels, bit n for data lane n. */
     uint8_t out;
-    /* The bits the cycle carries for QEMU SSI devices, and their answer. */
+    /*
+     * The bits the cycle carries in the stream to QEMU SSI devices, and
+     * the index in the stream of its first.
+     */
     uint8_t ssi_bits;
-    uint8_t ssi_out;
-    uint8_t ssi_in;
-    /* The index in the SSI bit stream of the cycle's first bit. */
     uint32_t ssi_pos;
 } ESP32P4SpiBeat;
 
@@ -271,6 +272,7 @@ struct ESP32P4SpiState {
     /* The input sources, as last resolved, and when. */
     ESP32P4SpiLaneSrc src[ESP32P4_SPI_LANES];
     bool src_valid;
+    bool clocks_peer;
     uint8_t ssi_out_lanes;
     bool ssi_selected;
     /* Configurable segmented transfer: the CONF state's progress. */
