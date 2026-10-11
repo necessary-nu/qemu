@@ -118,11 +118,6 @@ static unsigned term_tx_next_change(Esp32UartTerminalState *s)
     return b;
 }
 
-/*
- * [spec:nuos:req:emu.esp32.gpio]
- * Put every bit whose time has passed on the TX pad, stamped with its own
- * time; when the frame's stop bits are over, take the next byte.
- */
 static void term_tx_advance(Esp32UartTerminalState *s);
 
 /* Start sending the next byte waiting, at start_ns, if the UART can run. */
@@ -149,9 +144,17 @@ static bool term_tx_start(Esp32UartTerminalState *s, int64_t start_ns)
     return true;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * [spec:nuos:req:emu.esp32p4.uart]
+ * Put every bit whose time has passed by now (esp32_line_time()) on the TX
+ * pad, stamped with its own time; when the frame's stop bits are over,
+ * take the next byte. A receiver sampling the line brings the terminal up
+ * to the moment it samples at, however late the terminal's timer runs.
+ */
 static void term_tx_advance(Esp32UartTerminalState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
     unsigned b;
     int64_t t;
 
@@ -205,11 +208,17 @@ static void term_receive(void *opaque, const uint8_t *buf, int size)
 {
     Esp32UartTerminalState *s = ESP32_UART_TERMINAL(opaque);
 
+    /*
+     * The bytes arrive now: a frame whose stop bits ended before, which a
+     * late timer has not yet seen end, is not followed by them back to
+     * back.
+     */
+    term_tx_advance(s);
     for (int i = 0; i < size && !fifo8_is_full(&s->in); i++) {
         fifo8_push(&s->in, buf[i]);
     }
     if (!s->tx_busy) {
-        term_tx_start(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        term_tx_start(s, esp32_line_time());
     }
     term_tx_advance(s);
 }
@@ -223,8 +232,8 @@ static void term_format_changed(Notifier *n, void *data)
     Esp32UartTerminalState *s = container_of(n, Esp32UartTerminalState,
                                              format_notifier);
 
-    if (!s->tx_busy &&
-        term_tx_start(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL))) {
+    term_tx_advance(s);
+    if (!s->tx_busy && term_tx_start(s, esp32_line_time())) {
         term_tx_advance(s);
     }
 }
