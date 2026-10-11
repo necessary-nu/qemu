@@ -211,7 +211,6 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
   'esp32_ledc.c',
   'esp32_pcnt.c',
   'esp32_rmt.c',
-  'esp32_mcpwm.c',
   'esp32_rng.c',
   'esp32_rsa.c',
   'esp32_rtc_cntl.c',
@@ -220,6 +219,8 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
   'esp32_ulp.c',
   'ssi_psram.c',
 ))
+
+system_ss.add(when: 'CONFIG_ESP32_MCPWM', if_true: files('esp32_mcpwm.c'))
 
 system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_aes.c',
@@ -238,6 +239,7 @@ system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_i2c_ana_mst.c',
   'esp32p4_icm.c',
   'esp32p4_keymng.c',
+  'esp32p4_ledc.c',
   'esp32p4_lp_ana.c',
   'esp32p4_lp_mailbox.c',
   'esp32p4_parlio.c',
