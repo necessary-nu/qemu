@@ -8,6 +8,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/host-utils.h"
 #include "qobject/qdict.h"
 #include "libqtest.h"
 #include "hw/misc/esp32p4_clkrst.h"
@@ -269,6 +270,35 @@ static void assert_hz(QTestState *qts, const char *name, uint64_t want)
 
     if (got + slack < want || got > want + slack) {
         g_test_message("%s: %" PRIu64 " Hz, want %" PRIu64 " Hz", name, got,
+                       want);
+        g_test_fail();
+    }
+}
+
+/*
+ * The Clock period of a clock of @num / @den Hz: 2^32 * 10^9 * @den / @num
+ * units of 2^-32 ns, rounded down.
+ */
+static uint64_t period_of(uint64_t num, uint64_t den)
+{
+    uint64_t lo, hi;
+
+    mulu64(&lo, &hi, 1000000000ull << 32, den);
+    divu128(&lo, &hi, num);
+    g_assert_cmpuint(hi, ==, 0);
+    return lo;
+}
+
+/* The clock's period is that of a clock of @num / @den Hz. */
+static void assert_period(QTestState *qts, const char *name, uint64_t num,
+                          uint64_t den)
+{
+    g_autofree char *path = g_strdup_printf(CLKRST "/%s", name);
+    uint64_t got = clock_period(qts, path);
+    uint64_t want = period_of(num, den);
+
+    if (got != want) {
+        g_test_message("%s: period %" PRIu64 ", want %" PRIu64, name, got,
                        want);
         g_test_fail();
     }
@@ -771,6 +801,96 @@ static void test_other_plls(void)
     qtest_quit(qts);
 }
 
+/*
+ * Every clock's period is its exact one rounded down once, however many
+ * dividers lie between it and its source: PLL_F160M_CLK, three periods of
+ * the 480 MHz SPLL_CLK, is exactly 6.25 ns, 26843545600 units, and the
+ * others are their exact periods' whole units.
+ */
+/* [spec:nuos:req:emu.esp32p4.clocks/test] */
+static void test_exact_periods(void)
+{
+    QTestState *qts = qtest_init("-M esp32p4");
+
+    g_assert_cmpuint(clock_period(qts, CLKRST "/pll-f160m"), ==,
+                     26843545600ull);
+    assert_period(qts, "spll", 480 * MHZ, 1);
+    assert_period(qts, "pll-f240m", 240 * MHZ, 1);
+    assert_period(qts, "pll-f160m", 160 * MHZ, 1);
+    assert_period(qts, "pll-f120m", 120 * MHZ, 1);
+    assert_period(qts, "pll-f80m", 80 * MHZ, 1);
+    assert_period(qts, "pll-f20m", 20 * MHZ, 1);
+    assert_period(qts, "pll-f48m", 48 * MHZ, 1);
+    assert_period(qts, "pll-f12m", 12 * MHZ, 1);
+    assert_period(qts, "cpll", 360 * MHZ, 1);
+    assert_period(qts, "xtal", 40 * MHZ, 1);
+    assert_period(qts, "apb", 10 * MHZ, 1);
+    assert_period(qts, "rc-slow", 150000, 1);
+    assert_period(qts, "xtal-d2", 20 * MHZ, 1);
+
+    /* Through the PLLs' users' dividers. */
+    qtest_writel(qts, PERI_CLK_CTRL20, 2 | (1 << 2) | (1 << 3));
+    assert_period(qts, "mcpwm0", 80 * MHZ, 1);
+    qtest_writel(qts, PERI_CLK_CTRL110, (2 << 24) | (1 << 26));
+    qtest_writel(qts, PERI_CLK_CTRL111, 1 | (1 << 8) | (2 << 16) |
+                 0x04000000);
+    assert_period(qts, "uart0-sclk", 32 * MHZ, 1);
+    /* I2S0's TX clock from PLL_F160M_CLK, by 6 + 2/3: N 6, X 0, Y 1, Z 2. */
+    qtest_writel(qts, PERI_CLK_CTRL13, (1 << 10) | (3 << 11) | (6 << 13) |
+                 (0 << 21));
+    qtest_writel(qts, PERI_CLK_CTRL14, 1 | (2 << 9));
+    assert_period(qts, "i2s0-tx", 160 * MHZ * 3, 20);
+
+    /*
+     * CPU_CLK from the 360 MHz CPU PLL by 2 + 1/3, MEM_CLK from it by
+     * 1 + 1/2 and APB_CLK from SYS_CLK by 3: 1080/7, 720/7 and 240/7 MHz.
+     */
+    qtest_writel(qts, ROOT_CLK_CTRL0, (1 << 5) | (1 << 13) | (3 << 21));
+    qtest_writel(qts, ROOT_CLK_CTRL1, (1 << 8) | (2 << 16));
+    qtest_writel(qts, ROOT_CLK_CTRL2, 2 << 16);
+    qtest_writel(qts, ROOT_CLK_CTRL0, (1 << 5) | (1 << 13) | (3 << 21) |
+                 (1 << 4));
+    qtest_writel(qts, HP_CLK_CTRL, 0x1ffffffc | 1);
+    assert_period(qts, "cpu", 1080 * MHZ, 7);
+    assert_period(qts, "mem", 720 * MHZ, 7);
+    assert_period(qts, "sys", 720 * MHZ, 7);
+    assert_period(qts, "apb", 240 * MHZ, 7);
+    assert_period(qts, "uart0-apb", 240 * MHZ, 7);
+
+    /* RC_FAST_CLK at FOSC_DFREQ 101: 17.5 MHz + 1/300 of 2.5 MHz. */
+    qtest_writel(qts, FOSC_CNTL, 101 << 22);
+    assert_period(qts, "rc-fast", 17500000ull * 300 + 2500000, 300);
+
+    /* The MSPI, audio and SDIO PLLs and theirs. */
+    qtest_set_irq_in(qts, ANA, "xpd", 4, 1);
+    qtest_set_irq_in(qts, ANA, "xpd", 0, 1);
+    qtest_set_irq_in(qts, ANA, "xpd", 2, 1);
+    qtest_writel(qts, ANA_CONF2, CONF2_PLLA);
+    ana_write(qts, SLAVE_PLLA, 7, 6);
+    ana_write(qts, SLAVE_PLLA, 8, 128);
+    ana_write(qts, SLAVE_PLLA, 9, 1);
+    ana_write(qts, SLAVE_PLLA, 5, 0x49);
+    qtest_clock_step(qts, 11 * US);
+    assert_period(qts, "mpll", 500 * MHZ, 1);
+    assert_period(qts, "pll-f50m", 50 * MHZ, 1);
+    assert_period(qts, "pll-f25m", 25 * MHZ, 1);
+    /* 40 MHz * (4 + 6 + 128/256 + 1/65536) / 4 */
+    assert_period(qts, "apll", 40 * MHZ * ((10ull << 16) + (128 << 8) + 1),
+                  4 << 16);
+    /*
+     * I2S0's TX clock from it by 3 + 401/120708 (N 3, X 300, Y 7, Z 401):
+     * a period of denominator near 2^40.
+     */
+    qtest_writel(qts, PERI_CLK_CTRL13, (1 << 10) | (1 << 11) | (3 << 13) |
+                 (300u << 21));
+    qtest_writel(qts, PERI_CLK_CTRL14, 7 | (401 << 9));
+    assert_period(qts, "i2s0-tx",
+                  40 * MHZ * ((10ull << 16) + (128 << 8) + 1) * 120708,
+                  (4ull << 16) * (3 * 120708 + 401));
+    assert_period(qts, "sdio-pll0", 200 * MHZ, 1);
+    qtest_quit(qts);
+}
+
 /* [spec:nuos:req:emu.esp32p4.clocks/test] */
 static void test_ana_master(void)
 {
@@ -1070,6 +1190,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/clocks/block-clocks", test_block_clocks);
     qtest_add_func("/esp32p4/clocks/cpll", test_cpll);
     qtest_add_func("/esp32p4/clocks/other-plls", test_other_plls);
+    qtest_add_func("/esp32p4/clocks/exact-periods", test_exact_periods);
     qtest_add_func("/esp32p4/clocks/ana-master", test_ana_master);
     qtest_add_func("/esp32p4/clocks/block-resets", test_block_resets);
     qtest_add_func("/esp32p4/clocks/core-resets", test_core_resets);

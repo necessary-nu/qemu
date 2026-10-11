@@ -32,7 +32,9 @@
  *
  * The APLL's sigma-delta modulator adds the fraction, SDM1 and SDM0, only
  * while it runs: SDM_RSTB set and SDM_STOP clear. The SDIO PLL's register
- * layout is not published; it runs at the 200 MHz ESP-IDF gives it.
+ * layout is not published; it runs at the 200 MHz ESP-IDF gives it. Each
+ * output's period is kept exactly (esp32p4_clk_period.h) for the clock
+ * tree, which divides it; its Clock has it rounded down to a whole unit.
  *
  * Each PLL runs while the PMU powers it up ("xpd"). After power-up or a
  * change of its dividers it relocks, its output stopped meanwhile, and
@@ -207,60 +209,61 @@ int esp32p4_ana_slave(uint8_t addr)
     return -1;
 }
 
-/* a * num / den in clock period units, saturating at "too slow to run". */
-static uint64_t period_scale(uint64_t a, uint64_t num, uint64_t den)
-{
-    uint64_t lo, hi;
-
-    mulu64(&lo, &hi, a, num);
-    divu128(&lo, &hi, den);
-    return hi ? UINT64_MAX : lo;
-}
-
 /*
  * [spec:nuos:req:emu.esp32p4.clocks]
- * The period the PLL's registers configure, from XTAL_CLK's; 0 for none.
+ * The period the PLL's registers configure, from XTAL_CLK's, exactly; or
+ * stopped. XTAL_CLK's 25 ns is a whole number of Clock units, so its
+ * Clock's period is exact.
  */
-static uint64_t esp32p4_ana_target(ESP32P4AnaState *s, int pll)
+static ESP32P4ClkPeriod esp32p4_ana_target(ESP32P4AnaState *s, int pll)
 {
     const uint8_t *r = s->regs[esp32p4_ana_pll_slave[pll]];
-    uint64_t xtal = clock_get(s->xtal);
+    ESP32P4ClkPeriod xtal = esp32p4_clk_period_exact(clock_get(s->xtal));
     uint32_t div, ref, odiv, num;
 
-    if (!xtal) {
-        return 0;
-    }
     switch (pll) {
     case ESP32P4_ANA_PLL_CPLL:
     case ESP32P4_ANA_PLL_SPLL:
         div = r[XPLL_OC_DIV_7_0];
         ref = extract32(r[XPLL_OC_REF_DIV], 0, 4);
-        return div ? period_scale(xtal, ref + 1, div) : 0;
+        return esp32p4_clk_period_scale(xtal, ref + 1, div);
     case ESP32P4_ANA_PLL_MPLL:
         div = extract32(r[MPLL_DIV], 3, 5);
         ref = extract32(r[MPLL_DIV], 0, 3);
-        return period_scale(xtal, ref + 1, div + 1);
+        return esp32p4_clk_period_scale(xtal, ref + 1, div + 1);
     case ESP32P4_ANA_PLL_APLL:
         odiv = extract32(r[APLL_OR_OUTPUT_DIV], 0, 5);
         num = (4 + extract32(r[APLL_DSDM2], 0, 6)) << 16;
         if ((r[APLL_SDM] & APLL_SDM_RSTB) && !(r[APLL_SDM] & APLL_SDM_STOP)) {
             num += (r[APLL_DSDM1] << 8) | r[APLL_DSDM0];
         }
-        return period_scale(xtal, 2 * (odiv + 2) * 65536ull, num);
+        return esp32p4_clk_period_scale(xtal, 2 * (odiv + 2) * 65536ull,
+                                        num);
     case ESP32P4_ANA_PLL_SDIO:
     default:
-        return xtal / SDIO_PLL_MULT;
+        return esp32p4_clk_period_scale(xtal, 1, SDIO_PLL_MULT);
     }
+}
+
+/* The output's period: the target's while powered up and locked. */
+static ESP32P4ClkPeriod esp32p4_ana_out_period(ESP32P4AnaState *s, int pll)
+{
+    if (s->xpd[pll] && s->locked[pll]) {
+        return esp32p4_ana_target(s, pll);
+    }
+    return esp32p4_clk_period_stopped();
 }
 
 static void esp32p4_ana_update_out(ESP32P4AnaState *s, int pll)
 {
-    uint64_t period = 0;
+    s->out_period[pll] = esp32p4_ana_out_period(s, pll);
+    clock_update(s->out[pll], esp32p4_clk_period_clock(s->out_period[pll]));
+}
 
-    if (s->xpd[pll] && s->locked[pll]) {
-        period = esp32p4_ana_target(s, pll);
-    }
-    clock_update(s->out[pll], period);
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+ESP32P4ClkPeriod esp32p4_ana_pll_period(ESP32P4AnaState *s, int pll)
+{
+    return s->out_period[pll];
 }
 
 static void esp32p4_ana_set_cal_end(ESP32P4AnaState *s, int pll, bool end)
@@ -421,7 +424,7 @@ bool esp32p4_ana_write(ESP32P4AnaState *s, int slave, uint8_t reg,
 {
     int pll;
     uint8_t old, scratch;
-    uint64_t before;
+    ESP32P4ClkPeriod before;
 
     if (slave < 0 || slave >= ESP32P4_ANA_NUM_SLAVES ||
         reg >= ESP32P4_ANA_SLAVE_REGS) {
@@ -478,7 +481,7 @@ bool esp32p4_ana_write(ESP32P4AnaState *s, int slave, uint8_t reg,
         break;
     }
 
-    if (esp32p4_ana_target(s, pll) != before) {
+    if (!esp32p4_clk_period_eq(esp32p4_ana_target(s, pll), before)) {
         esp32p4_ana_relock(s, pll);
         if (!s->cal_stop[pll]) {
             esp32p4_ana_start_cal(s, pll);
@@ -559,8 +562,8 @@ static int esp32p4_ana_post_load(void *opaque, int version_id)
     int i;
 
     for (i = 0; i < ESP32P4_ANA_NUM_PLLS; i++) {
-        clock_set(s->out[i], s->xpd[i] && s->locked[i] ?
-                             esp32p4_ana_target(s, i) : 0);
+        s->out_period[i] = esp32p4_ana_out_period(s, i);
+        clock_set(s->out[i], esp32p4_clk_period_clock(s->out_period[i]));
     }
     return 0;
 }

@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -48,7 +49,9 @@ enum {
 /*
  * Clock input "xtal", the PLLs' reference; clock outputs "apll", "cpll",
  * "sdio-pll", "spll" and "mpll", each PLL's output, stopped while it is
- * powered down or not locked.
+ * powered down or not locked. A Clock holds its period only to its unit,
+ * so esp32p4_ana_pll_period() gives each output's period exactly, for
+ * the clock tree to divide (see esp32p4_clk_period.h).
  *
  * Named GPIO inputs, per PLL: "xpd", its power-up by the PMU, and
  * "cal-stop", HP_SYS_CLKRST_ANA_PLL_CTRL0's *_CAL_STOP. Named GPIO output,
@@ -91,6 +94,8 @@ struct ESP32P4AnaState {
     bool cal_stop[ESP32P4_ANA_NUM_PLLS];
     bool locked[ESP32P4_ANA_NUM_PLLS];
     bool cal_end[ESP32P4_ANA_NUM_PLLS];
+    /* The period each output last took, exactly. */
+    ESP32P4ClkPeriod out_period[ESP32P4_ANA_NUM_PLLS];
     QEMUTimer *lock_timer[ESP32P4_ANA_NUM_PLLS];
     QEMUTimer *cal_timer[ESP32P4_ANA_NUM_PLLS];
     ESP32P4AnaPllTimer timer_ctx[ESP32P4_ANA_NUM_PLLS];
@@ -108,5 +113,12 @@ bool esp32p4_ana_write(ESP32P4AnaState *s, int slave, uint8_t reg,
                        uint8_t data);
 bool esp32p4_ana_read(ESP32P4AnaState *s, int slave, uint8_t reg,
                       uint8_t *data);
+
+/*
+ * The period of PLL @pll's output (ESP32P4_ANA_PLL_*) as its Clock last
+ * took it, exactly: the Clock's period is this rounded down to a whole
+ * unit (esp32p4_clk_period_clock()).
+ */
+ESP32P4ClkPeriod esp32p4_ana_pll_period(ESP32P4AnaState *s, int pll);
 
 #endif
