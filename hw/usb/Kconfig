@@ -154,3 +154,11 @@ config ASPEED_UDC
 config RP2350_USBCTRL
     bool
     select USB
+
+config USB_DEVPORT
+    bool
+
+config USB_DWC2_OTG
+    bool
+    select USB
+    select USB_DEVPORT
