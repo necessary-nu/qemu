@@ -55,6 +55,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/timer/esp32p4_lp_timer.h"
 #include "migration/vmstate.h"
 
@@ -175,14 +176,25 @@ static void lp_timer_schedule_all(ESP32P4LPTimerState *s)
     }
 }
 
-/* [spec:nuos:req:emu.esp32p4.timers] */
-static void lp_timer_fire(ESP32P4LPTimerState *s, int n)
+/* Pulse ETM event @evt, of an alarm at @when. */
+static void lp_timer_etm_event(ESP32P4LPTimerState *s, int evt, int64_t when)
+{
+    esp32_line_set_at(s->etm_event[evt], 1, when);
+    esp32_line_set_at(s->etm_event[evt], 0, when);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * Alarm @n happens at @when, which a QEMU timer running late, or an
+ * access catching up, has passed: its ETM event carries that time.
+ */
+static void lp_timer_fire(ESP32P4LPTimerState *s, int n, int64_t when)
 {
     if (n == ALARM_OVF) {
         s->int_raw |= INT_OVERFLOW;
         s->lp_int_raw |= INT_OVERFLOW;
         lp_timer_update_irqs(s);
-        qemu_irq_pulse(s->etm_event[ESP32P4_LP_TIMER_EVT_OVF]);
+        lp_timer_etm_event(s, ESP32P4_LP_TIMER_EVT_OVF, when);
         return;
     }
     s->armed[n] = false;
@@ -190,7 +202,7 @@ static void lp_timer_fire(ESP32P4LPTimerState *s, int n)
         s->int_raw |= INT_TARGET;
         lp_timer_update_irqs(s);
         qemu_irq_pulse(s->soc_wakeup);
-        qemu_irq_pulse(s->etm_event[ESP32P4_LP_TIMER_EVT_CMP]);
+        lp_timer_etm_event(s, ESP32P4_LP_TIMER_EVT_CMP, when);
     } else {
         s->lp_int_raw |= INT_TARGET;
         lp_timer_update_irqs(s);
@@ -205,7 +217,7 @@ static void lp_timer_due(ESP32P4LPTimerState *s, int n)
 
     timer_del(&a->timer);
     lp_timer_sync(s, a->due_ns);
-    lp_timer_fire(s, n);
+    lp_timer_fire(s, n, a->due_ns);
     lp_timer_schedule(s, n);
 }
 
@@ -398,7 +410,7 @@ static void lp_timer_write_reg(ESP32P4LPTimerState *s, hwaddr addr,
         if (ones & TAR_EN) {
             s->armed[n] = true;
             if (s->count == s->target[n] && clock_is_enabled(s->slow)) {
-                lp_timer_fire(s, n);
+                lp_timer_fire(s, n, now);
             }
         }
         lp_timer_schedule(s, n);
