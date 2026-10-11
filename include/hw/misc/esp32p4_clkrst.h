@@ -11,7 +11,6 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
-#include "hw/misc/esp32p4_ana.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/queue.h"
 #include "qemu/timer.h"
@@ -74,14 +73,17 @@ enum {
  *
  * Clocks from pads are clock inputs, "pad-<signal>-in" (unconnected, a
  * stopped clock), and the PLLs' outputs come in from the analog block as
- * "cpll-in", "spll-in", "mpll-in", "apll-in" and "sdio-pll-in". With the
- * analog block as its "ana" link, the tree takes the PLLs' periods from
- * it exactly (esp32p4_ana_pll_period()), and every clock's period is
- * computed exactly from its sources' frequencies through all the
- * dividers between, then rounded down once for its Clock (see
- * esp32p4_clk_period.h): a clock whose period is a whole number of Clock
- * units, such as the 6.25 ns of PLL_F160M_CLK, has exactly that period,
- * and any other is less than a unit short of its own.
+ * "cpll-in", "spll-in", "mpll-in", "apll-in" and "sdio-pll-in". The tree
+ * takes each input's period exactly from the device driving it (the
+ * analog block, or the block whose clock a pad carries; see
+ * esp32p4_clk_exact()), and every clock's period is computed exactly from
+ * its sources' through all the dividers between, then rounded down once
+ * for its Clock (see esp32p4_clk_period.h): a clock whose period is a
+ * whole number of Clock units, such as the 6.25 ns of PLL_F160M_CLK, has
+ * exactly that period, and any other is less than a unit short of its
+ * own. The device gives every output's exact period through
+ * esp32p4_clk_exact(), and a block that counts a clock's cycles takes it
+ * from there.
  *
  * Resets. Each block reset of HP_SYS_CLKRST_HP_RST_EN*, LP_CLKRST and
  * LPPERI_RESET_EN is a line of the named GPIO output ESP32P4_CLKRST_RESET,
@@ -757,8 +759,8 @@ struct ESP32P4ClkRstState {
 
     Clock *clk_in[ESP32P4_NUM_CLKIN];
     Clock *clk[ESP32P4_NUM_CLOCKS];
-    /* The analog block, whose PLLs' periods the tree takes exactly. */
-    ESP32P4AnaState *ana;
+    /* The index + 1 of each output Clock, for its exact period. */
+    GHashTable *clk_ids;
     /* The periods the tree last computed, exactly and in Clock units. */
     ESP32P4ClkPeriod exact[ESP32P4_NUM_CLOCKS];
     uint64_t period[ESP32P4_NUM_CLOCKS];

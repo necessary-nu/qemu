@@ -61,8 +61,11 @@
  * waits for the time slot (ARB_TIMEOUT bus cycles) to end, or for every
  * channel's tokens to be spent; a channel without requests holds its
  * tokens, and the slot, unless its ARB_WEIGH_OPT_DIR is clear (TRM 6.4.9).
- * A weight of 0 is never served while weighting is on. Each round of the
- * bus happens at the time it falls due, however late the QEMU timer that
+ * A weight of 0 is never served while weighting is on. The rounds of the
+ * bus fall on its clock's edges, counted exactly from its last change: a
+ * round starts at the edge after the change that calls for it, and the
+ * next comes as many cycles later as the round's transactions take. Each
+ * happens at the time it falls due, however late the QEMU timer that
  * runs it: register accesses and ETM tasks first run the rounds due
  * before them, in order, and register accesses and bus clock changes
  * first let the attached peripherals that ask for it take their own
@@ -1073,12 +1076,11 @@ static bool arb_weighted(ESP32P4GdmaState *s, int arb)
     return s->weight_en & 1;
 }
 
-static uint64_t arb_slot_ns(ESP32P4GdmaState *s, int arb)
+/* The weighted arbiter's time slot, in bus cycles. */
+static uint32_t arb_slot_cycles(ESP32P4GdmaState *s, int arb)
 {
-    uint32_t cycles = gdma_axi(s) ? extract32(s->arb_timeout, 16 * arb, 16)
-                                  : s->arb_timeout & 0xffff;
-
-    return clock_ticks_to_ns(s->clk, cycles);
+    return gdma_axi(s) ? extract32(s->arb_timeout, 16 * arb, 16)
+                       : s->arb_timeout & 0xffff;
 }
 
 /* Requester @i of arbiter @arb: GDMA-AHB's are all six channels. */
@@ -1099,7 +1101,7 @@ static int arb_members(ESP32P4GdmaState *s)
     return gdma_axi(s) ? NCH : 2 * NCH;
 }
 
-static void arb_refill(ESP32P4GdmaState *s, int arb, int64_t now)
+static void arb_refill(ESP32P4GdmaState *s, int arb, int64_t cycle)
 {
     int dir, ch;
 
@@ -1107,15 +1109,16 @@ static void arb_refill(ESP32P4GdmaState *s, int arb, int64_t now)
         arb_member(s, arb, i, &dir, &ch);
         s->ch[dir][ch].tokens = chan_weight(s, &s->ch[dir][ch]);
     }
-    s->slot_start[arb] = now;
+    s->slot_start[arb] = cycle;
 }
 
 /*
- * The requester arbiter @arb grants at time @now, or -1; *hold is set
- * when a weighted slot holds the bus for a channel without requests.
+ * The requester arbiter @arb grants at bus cycle @now, or -1; *hold is
+ * set when a weighted slot holds the bus for a channel without requests.
  */
 /* [spec:nuos:req:emu.esp32p4.dma] */
-static int arb_grant(ESP32P4GdmaState *s, int arb, int64_t now, bool *hold)
+static int arb_grant(ESP32P4GdmaState *s, int arb, int64_t cycle,
+                     bool *hold)
 {
     int n = arb_members(s);
     bool weighted = arb_weighted(s, arb);
@@ -1127,8 +1130,8 @@ static int arb_grant(ESP32P4GdmaState *s, int arb, int64_t now, bool *hold)
     if (weighted) {
         bool any = false, held = false;
 
-        if (now - s->slot_start[arb] >= (int64_t)arb_slot_ns(s, arb)) {
-            arb_refill(s, arb, now);
+        if (cycle - s->slot_start[arb] >= arb_slot_cycles(s, arb)) {
+            arb_refill(s, arb, cycle);
         }
         for (int i = 0; i < n; i++) {
             ESP32P4GdmaChan *c;
@@ -1149,7 +1152,7 @@ static int arb_grant(ESP32P4GdmaState *s, int arb, int64_t now, bool *hold)
                 *hold = true;
                 return -1;
             }
-            arb_refill(s, arb, now);
+            arb_refill(s, arb, cycle);
         }
     }
     for (int k = 1; k <= n; k++) {
@@ -1216,23 +1219,24 @@ static void gdma_notify(ESP32P4GdmaState *s)
     }
 }
 
-/* Arm the engine's timer for a round at @when. */
-static void gdma_arm(ESP32P4GdmaState *s, int64_t when)
+/* Arm the engine's timer for a round at bus cycle @cycle. */
+static void gdma_arm(ESP32P4GdmaState *s, int64_t cycle)
 {
-    s->due_ns = when;
-    timer_mod(s->timer, when);
+    s->due_cycle = cycle;
+    s->due_ns = esp32p4_clk_count_time(&s->bus_edges, cycle);
+    timer_mod(s->timer, s->due_ns);
 }
 
 /*
- * One round of the bus, at the time it falls due, esp32_line_time(): each
- * arbiter grants a transaction, whose effects are seen at once, and the
- * engine comes back when it is over.
+ * One round of the bus, at the bus cycle it falls due, at
+ * esp32_line_time(): each arbiter grants a transaction, whose effects are
+ * seen at once, and the engine comes back when it is over.
  */
 /* [spec:nuos:req:emu.esp32p4.dma] */
 static void gdma_run(void *opaque)
 {
     ESP32P4GdmaState *s = opaque;
-    int64_t now = esp32_line_time();
+    int64_t cycle = s->due_cycle;
     int narb = gdma_axi(s) ? 2 : 1;
     uint32_t cost = 0;
     int64_t wait = 0;
@@ -1245,16 +1249,16 @@ static void gdma_run(void *opaque)
     }
     for (int arb = 0; arb < narb; arb++) {
         bool hold;
-        int g = arb_grant(s, arb, now, &hold);
+        int g = arb_grant(s, arb, cycle, &hold);
 
         if (g >= 0) {
             cost = MAX(cost, MAX(1, arb_serve(s, arb, g)));
         } else if (hold) {
             /* Wait for the weighted time slot to end. */
-            int64_t end = s->slot_start[arb] + arb_slot_ns(s, arb);
+            int64_t end = s->slot_start[arb] + arb_slot_cycles(s, arb);
 
-            if (end > now && (!wait || end - now < wait)) {
-                wait = end - now;
+            if (end > cycle && (!wait || end - cycle < wait)) {
+                wait = end - cycle;
             }
         }
     }
@@ -1262,9 +1266,9 @@ static void gdma_run(void *opaque)
         m2m_move(s, ch);
     }
     if (cost) {
-        gdma_arm(s, now + clock_ticks_to_ns(s->clk, cost));
+        gdma_arm(s, cycle + cost);
     } else if (wait) {
-        gdma_arm(s, now + wait);
+        gdma_arm(s, cycle + wait);
     }
     gdma_notify(s);
 }
@@ -1336,26 +1340,37 @@ static void gdma_catch_up_all(ESP32P4GdmaState *s, int64_t now)
 static void gdma_kick(ESP32P4GdmaState *s)
 {
     if (!timer_pending(s->timer) && clock_is_enabled(s->clk)) {
-        gdma_arm(s, esp32_line_time() + clock_ticks_to_ns(s->clk, 1));
+        gdma_arm(s, esp32p4_clk_count_at(&s->bus_edges,
+                                         esp32_line_time()) + 1);
     }
 }
 
 /*
  * The bus clock changes: the rounds due before run at the old rate, and
- * the engine goes on at the new one, or stops.
+ * the engine goes on at the new one, or stops, its cycles counted afresh
+ * from the change; a round under way takes the cycles it has left.
  */
 static void gdma_clk_update(void *opaque, ClockEvent event)
 {
     ESP32P4GdmaState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t cycles;
 
     if (event == ClockPreUpdate) {
-        gdma_catch_up_all(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        gdma_catch_up_all(s, now);
         return;
     }
-    if (clock_is_enabled(s->clk)) {
-        gdma_kick(s);
-    } else {
+    cycles = esp32p4_clk_count_at(&s->bus_edges, now);
+    s->slot_start[0] -= cycles;
+    s->slot_start[1] -= cycles;
+    s->due_cycle -= cycles;
+    esp32p4_clk_count_start(&s->bus_edges, s->clk, now);
+    if (!clock_is_enabled(s->clk)) {
         timer_del(s->timer);
+    } else if (timer_pending(s->timer)) {
+        gdma_arm(s, MAX(s->due_cycle, 1));
+    } else {
+        gdma_kick(s);
     }
 }
 
@@ -2179,6 +2194,10 @@ static void esp32p4_gdma_reset_hold(Object *obj, ResetType type)
     s->link_switch_state = 0;
     s->rr_last[0] = s->rr_last[1] = 0;
     s->slot_start[0] = s->slot_start[1] = 0;
+    if (!esp32p4_clk_count_running(&s->bus_edges)) {
+        esp32p4_clk_count_start(&s->bus_edges, s->clk,
+                                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
     s->notify = 0;
 }
 
@@ -2306,8 +2325,8 @@ static const VMStateDescription vmstate_esp32p4_gdma_chan = {
 
 static const VMStateDescription vmstate_esp32p4_gdma = {
     .name = TYPE_ESP32P4_GDMA,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_2DARRAY(ch, ESP32P4GdmaState, 2, NCH, 1,
                                vmstate_esp32p4_gdma_chan, ESP32P4GdmaChan),
@@ -2337,6 +2356,8 @@ static const VMStateDescription vmstate_esp32p4_gdma = {
         VMSTATE_UINT32_ARRAY(rr_last, ESP32P4GdmaState, 2),
         VMSTATE_INT64_ARRAY(slot_start, ESP32P4GdmaState, 2),
         VMSTATE_CLOCK(clk, ESP32P4GdmaState),
+        VMSTATE_ESP32P4_CLK_COUNT(bus_edges, ESP32P4GdmaState),
+        VMSTATE_INT64(due_cycle, ESP32P4GdmaState),
         VMSTATE_INT64(due_ns, ESP32P4GdmaState),
         VMSTATE_TIMER_PTR(timer, ESP32P4GdmaState),
         VMSTATE_END_OF_LIST()

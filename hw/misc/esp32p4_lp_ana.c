@@ -241,24 +241,10 @@ static const LPAnaReg *esp32p4_lp_ana_reg_info(hwaddr reg)
     return &lp_ana_regs[R(reg)];
 }
 
-/* The least time in which @clk makes @n cycles, capped for timer_mod(). */
-static int64_t lp_ana_cycles_ns(Clock *clk, uint64_t n)
+/* The first ns by which cycle @n of @c has come, capped for timer_mod(). */
+static int64_t lp_ana_count_time(ESP32P4ClkCount *c, uint64_t n)
 {
-    uint64_t ns = clock_ticks_to_ns(clk, n);
-
-    while (ns < INT64_MAX / 4 && clock_ns_to_ticks(clk, ns) < n) {
-        ns++;
-    }
-    return MIN(ns, INT64_MAX / 4);
-}
-
-static uint64_t lp_ana_cycles_since(ESP32P4LPAnaState *s, int64_t from,
-                                    int64_t now)
-{
-    if (!clock_is_enabled(s->fast) || now <= from) {
-        return 0;
-    }
-    return clock_ns_to_ticks(s->fast, now - from);
+    return MIN(esp32p4_clk_count_time(c, n), INT64_MAX / 4);
 }
 
 /* A threshold of BIAS register @reg: its release one or under-voltage. */
@@ -319,19 +305,28 @@ static uint32_t lp_ana_filter_cntl(ESP32P4LPAnaState *s, int f)
                                                       : A_VDDBAT_CHARGE_CNTL)];
 }
 
-/* Bring filter @f's count up to @now. */
+/*
+ * Bring filter @f's count up to @now; while it does not count, it counts
+ * LP_DYN_FAST_CLK's cycles afresh from @now, where it starts.
+ */
 static void lp_ana_filter_sync(ESP32P4LPAnaState *s, int f, int64_t now)
 {
     ESP32P4LPAnaFilter *fl = &s->filter[f];
     uint32_t cntl = lp_ana_filter_cntl(s, f);
-    uint64_t n = lp_ana_cycles_since(s, fl->sync_ns, now);
+    uint64_t cycles = esp32p4_clk_count_at(&fl->edges, now);
+    uint64_t n = cycles > fl->synced ? cycles - fl->synced : 0;
 
+    if (!fl->dir) {
+        esp32p4_clk_count_start(&fl->edges, s->fast, now);
+        fl->synced = 0;
+        return;
+    }
     if (fl->dir > 0) {
         fl->count = MIN(fl->count + n, FILTER_UNDER_TARGET(cntl));
-    } else if (fl->dir < 0 && fl->count > FILTER_UP_TARGET(cntl)) {
+    } else if (fl->count > FILTER_UP_TARGET(cntl)) {
         fl->count -= MIN(n, fl->count - FILTER_UP_TARGET(cntl));
     }
-    fl->sync_ns = now;
+    fl->synced += n;
 }
 
 /*
@@ -386,7 +381,8 @@ static void lp_ana_filter_eval(ESP32P4LPAnaState *s, int f, bool low)
         ahead = fl->count - up;
     }
     if (fl->dir && clock_is_enabled(s->fast)) {
-        timer_mod(&fl->timer, fl->sync_ns + lp_ana_cycles_ns(s->fast, ahead));
+        timer_mod(&fl->timer, lp_ana_count_time(&fl->edges,
+                                                fl->synced + ahead));
     }
 }
 
@@ -394,7 +390,7 @@ static void lp_ana_filter_eval(ESP32P4LPAnaState *s, int f, bool low)
 static uint64_t lp_ana_bod_count(ESP32P4LPAnaState *s, int64_t now)
 {
     return s->bod_counting ?
-           s->bod_base + lp_ana_cycles_since(s, s->bod_start_ns, now) : 0;
+           s->bod_base + esp32p4_clk_count_at(&s->bod_edges, now) : 0;
 }
 
 /* Whether mode 1's reset is enabled: by the analog default or software. */
@@ -452,7 +448,7 @@ static void lp_ana_update(ESP32P4LPAnaState *s)
                !(mode0 & MODE0_CNT_CLR);
     if (counting && !s->bod_counting) {
         s->bod_base = 0;
-        s->bod_start_ns = now;
+        esp32p4_clk_count_start(&s->bod_edges, s->fast, now);
     }
     s->bod_counting = counting;
     count = lp_ana_bod_count(s, now);
@@ -482,14 +478,16 @@ static void lp_ana_update(ESP32P4LPAnaState *s)
         }
         if (next != UINT64_MAX) {
             timer_mod(&s->bod_timer,
-                      now + lp_ana_cycles_ns(s->fast, next - count));
+                      lp_ana_count_time(&s->bod_edges, next - s->bod_base));
         }
     }
 
     /* Mode 1. */
     if (s->brownout && lp_ana_mode1_enabled(s)) {
         if (!timer_pending(&s->mode1_timer) && clock_is_enabled(s->fast)) {
-            timer_mod(&s->mode1_timer, now + lp_ana_cycles_ns(s->fast, 1));
+            timer_mod(&s->mode1_timer,
+                      now + esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->fast),
+                                                  1));
         }
     } else {
         timer_del(&s->mode1_timer);
@@ -594,6 +592,9 @@ static void lp_ana_write(void *opaque, hwaddr addr, uint64_t value,
                       HWADDR_PRIx "\n", TYPE_ESP32P4_LP_ANA, addr);
         return;
     }
+    if (reg >= A_TOUCH_FIRST && reg <= A_TOUCH_LAST && s->touch) {
+        esp32p4_touch_sync(s->touch);
+    }
     r = &s->regs[R(reg)];
     old = *r;
     *r = (*r & ~(info->rw & lanes)) | (v & info->rw);
@@ -656,9 +657,13 @@ static void lp_ana_fast_update(void *opaque, ClockEvent event)
             lp_ana_filter_sync(s, f, now);
         }
         s->bod_base = lp_ana_bod_count(s, now);
-        s->bod_start_ns = now;
         return;
     }
+    for (f = 0; f < ESP32P4_LP_ANA_FILTERS; f++) {
+        esp32p4_clk_count_start(&s->filter[f].edges, s->fast, now);
+        s->filter[f].synced = 0;
+    }
+    esp32p4_clk_count_start(&s->bod_edges, s->fast, now);
     lp_ana_update(s);
 }
 
@@ -766,7 +771,8 @@ static void esp32p4_lp_ana_reset_hold(Object *obj, ResetType type)
     s->brownout = false;
     s->bod_counting = false;
     s->bod_base = 0;
-    s->bod_start_ns = 0;
+    esp32p4_clk_count_start(&s->bod_edges, s->fast,
+                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     s->bod_int = false;
     s->bod_reset = false;
     timer_del(&s->bod_timer);
@@ -777,7 +783,9 @@ static void esp32p4_lp_ana_reset_hold(Object *obj, ResetType type)
         s->filter[i].count = 0;
         s->filter[i].dir = 0;
         s->filter[i].flag = false;
-        s->filter[i].sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        esp32p4_clk_count_start(&s->filter[i].edges, s->fast,
+                                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        s->filter[i].synced = 0;
     }
 }
 
@@ -875,7 +883,8 @@ static const VMStateDescription vmstate_esp32p4_lp_ana_filter = {
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER(timer, ESP32P4LPAnaFilter),
         VMSTATE_UINT32(count, ESP32P4LPAnaFilter),
-        VMSTATE_INT64(sync_ns, ESP32P4LPAnaFilter),
+        VMSTATE_ESP32P4_CLK_COUNT(edges, ESP32P4LPAnaFilter),
+        VMSTATE_UINT64(synced, ESP32P4LPAnaFilter),
         VMSTATE_INT32(dir, ESP32P4LPAnaFilter),
         VMSTATE_BOOL(flag, ESP32P4LPAnaFilter),
         VMSTATE_END_OF_LIST()
@@ -884,8 +893,8 @@ static const VMStateDescription vmstate_esp32p4_lp_ana_filter = {
 
 static const VMStateDescription vmstate_esp32p4_lp_ana = {
     .name = TYPE_ESP32P4_LP_ANA,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(fast, ESP32P4LPAnaState),
         VMSTATE_UINT32_ARRAY(regs, ESP32P4LPAnaState, ESP32P4_LP_ANA_NREGS),
@@ -899,7 +908,7 @@ static const VMStateDescription vmstate_esp32p4_lp_ana = {
         VMSTATE_BOOL(brownout, ESP32P4LPAnaState),
         VMSTATE_BOOL(bod_counting, ESP32P4LPAnaState),
         VMSTATE_UINT64(bod_base, ESP32P4LPAnaState),
-        VMSTATE_INT64(bod_start_ns, ESP32P4LPAnaState),
+        VMSTATE_ESP32P4_CLK_COUNT(bod_edges, ESP32P4LPAnaState),
         VMSTATE_TIMER(bod_timer, ESP32P4LPAnaState),
         VMSTATE_BOOL(bod_int, ESP32P4LPAnaState),
         VMSTATE_BOOL(bod_reset, ESP32P4LPAnaState),

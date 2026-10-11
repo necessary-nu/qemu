@@ -10,6 +10,7 @@
 #define HW_MISC_ESP32P4_TRNG_H
 
 #include "hw/core/sysbus.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qom/object.h"
 
 #define TYPE_ESP32P4_TRNG "esp32p4-trng"
@@ -35,9 +36,14 @@ struct ESP32P4TrngState {
     uint32_t data;
     uint32_t rstn;
     uint32_t date;
-    /* SAMPLE_CNT's count, and since when it has counted at the clock. */
+    /*
+     * SAMPLE_CNT's count, as of the clock's cycle @synced, counted from
+     * its last change (@edges), @pre cycles into the next sample's.
+     */
     uint32_t samples;
-    int64_t sample_ns;
+    uint32_t pre;
+    ESP32P4ClkCount edges;
+    uint64_t synced;
 };
 
 #endif

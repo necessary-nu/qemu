@@ -58,6 +58,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/gpio/esp32_line.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "hw/misc/esp32p4_pcnt.h"
 #include "migration/vmstate.h"
 
@@ -283,7 +284,7 @@ static bool pcnt_pending(ESP32P4PcntState *s, unsigned i, int64_t *due)
     }
     *due = s->raw_since_ns[i];
     if (conf0 & CONF0_FILTER_EN) {
-        *due += clock_ticks_to_ns(s->apb_clk, thres);
+        *due += esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->apb_clk), thres);
     }
     return true;
 }

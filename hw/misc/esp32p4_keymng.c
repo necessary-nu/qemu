@@ -861,8 +861,8 @@ static const Property km_properties[] = {
 
 static const VMStateDescription vmstate_esp32p4_keymng = {
     .name = TYPE_ESP32P4_KEYMNG,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_ESP32P4_CRYPTO_TIMER(op, ESP32P4KeyMngState),
         VMSTATE_BOOL(in_reset, ESP32P4KeyMngState),

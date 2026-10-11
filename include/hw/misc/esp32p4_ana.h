@@ -50,8 +50,9 @@ enum {
  * Clock input "xtal", the PLLs' reference; clock outputs "apll", "cpll",
  * "sdio-pll", "spll" and "mpll", each PLL's output, stopped while it is
  * powered down or not locked. A Clock holds its period only to its unit,
- * so esp32p4_ana_pll_period() gives each output's period exactly, for
- * the clock tree to divide (see esp32p4_clk_period.h).
+ * so the device, as the TYPE_ESP32P4_CLK_SOURCE of its outputs, gives
+ * each output's period exactly (esp32p4_clk_exact()), for the clock tree
+ * to divide (see esp32p4_clk_period.h).
  *
  * Named GPIO inputs, per PLL: "xpd", its power-up by the PMU, and
  * "cal-stop", HP_SYS_CLKRST_ANA_PLL_CTRL0's *_CAL_STOP. Named GPIO output,
@@ -116,12 +117,5 @@ bool esp32p4_ana_write(ESP32P4AnaState *s, int slave, uint8_t reg,
                        uint8_t data);
 bool esp32p4_ana_read(ESP32P4AnaState *s, int slave, uint8_t reg,
                       uint8_t *data);
-
-/*
- * The period of PLL @pll's output (ESP32P4_ANA_PLL_*) as its Clock last
- * took it, exactly: the Clock's period is this rounded down to a whole
- * unit (esp32p4_clk_period_clock()).
- */
-ESP32P4ClkPeriod esp32p4_ana_pll_period(ESP32P4AnaState *s, int pll);
 
 #endif

@@ -30,6 +30,8 @@
 #include "qemu/guest-random.h"
 #include "hw/core/cpu.h"
 #include "system/cpus.h"
+#include "qemu/seqlock.h"
+#include "system/cpu-timers-internal.h"
 
 #include "tcg-accel-ops.h"
 #include "tcg-accel-ops-icount.h"
@@ -37,14 +39,6 @@
 
 /* The quantum of CPUs with an icount clock, unless the option sets one. */
 #define ICOUNT_CLOCKED_QUANTUM_NS 1000
-
-/*
- * The round of the vCPUs icount_percpu_budget() starts: how many CPUs with
- * an icount clock take turns in it, and how much of its own time (in ns)
- * each of those runs for at most.
- */
-static int icount_round_cpus = 1;
-static int64_t icount_round_slice;
 
 /* Virtual time, in ns, to the next timer deadline. */
 static int64_t icount_get_deadline(void)
@@ -115,19 +109,115 @@ void icount_handle_deadline(void)
 }
 
 /*
+ * The CPUs with an icount clock run through windows of virtual time
+ * together, as parallel cores would. Each CPU not idle as a window starts
+ * takes part in it, and runs until its own time, a period of its clock an
+ * instruction, reaches the window's end, in as many turns as that takes
+ * (a turn ends early at an exit request, or where virtual time reaches a
+ * timer's deadline, which runs the timers in the window). Virtual time
+ * follows their own times (icount_window_x()), so that when the window
+ * ends it is at the end, and each CPU's own time within a period of it,
+ * whatever turns they took and whenever one went idle or woke: each CPU's
+ * instructions take exactly its clock's periods of virtual time from one
+ * window to another. Within a window they take turns, so that a CPU sees
+ * virtual time ahead of, or behind, its own by up to the window's length:
+ * a quantum while more than one runs (1 us unless the option says
+ * otherwise), the time to the next deadline while one does. A CPU that
+ * comes out of idle, in or outside the window, joins it at the present
+ * virtual time, the others' turns making way for it at once, and the
+ * window then ends at most a quantum on.
+ */
+
+/* Some CPU wants to join the window or wakes in it. */
+static bool icount_window_waiting;
+
+/* Whether @cpu is taking part in its window and has not run to its end. */
+static bool icount_window_running(CPUState *cpu)
+{
+    return timers_state.window_cpus && cpu->icount_in_window &&
+           !cpu->icount_window_idle &&
+           cpu->icount_own < (int64_t)timers_state.window_units;
+}
+
+/* @cpu takes no part in a window. */
+static void icount_window_leave(CPUState *cpu)
+{
+    cpu->icount_in_window = false;
+    cpu->icount_window_idle = false;
+    cpu->icount_own = 0;
+}
+
+static void icount_window_update(int64_t quantum)
+{
+    uint64_t quantum_units, moved;
+    bool done = true;
+    int runnable = 0;
+    int64_t width;
+    CPUState *cpu;
+
+    if (quantum < 0) {
+        quantum = ICOUNT_CLOCKED_QUANTUM_NS;
+    }
+    quantum_units = quantum > 0 ? (uint64_t)quantum << 32 : UINT64_MAX;
+    icount_window_waiting = false;
+
+    CPU_FOREACH(cpu) {
+        bool idle;
+
+        if (!icount_cpu_clocked(cpu)) {
+            icount_window_leave(cpu);
+            continue;
+        }
+        idle = cpu_thread_is_idle(cpu);
+        if (cpu->icount_in_window && idle != cpu->icount_window_idle) {
+            icount_window_set_idle(cpu, idle);
+        }
+        if (!idle) {
+            runnable++;
+            if (icount_window_running(cpu)) {
+                done = false;
+            }
+        }
+    }
+    if (!done && timers_state.window_cpus) {
+        CPU_FOREACH(cpu) {
+            if (icount_cpu_clocked(cpu) && !cpu->icount_in_window &&
+                !cpu_thread_is_idle(cpu)) {
+                icount_window_join(cpu, quantum_units);
+            }
+        }
+        return;
+    }
+
+    width = icount_get_deadline();
+    if (runnable > 1 && quantum > 0) {
+        width = MIN(width, quantum);
+    }
+    width = MIN(width, INT32_MAX / MAX(runnable, 1));
+    moved = icount_window_start((uint64_t)width << 32, runnable);
+    CPU_FOREACH(cpu) {
+        if (!icount_cpu_clocked(cpu) || cpu_thread_is_idle(cpu)) {
+            icount_window_leave(cpu);
+        } else if (cpu->icount_in_window && !cpu->icount_window_idle &&
+                   moved != UINT64_MAX) {
+            cpu->icount_own -= moved;
+        } else {
+            icount_window_leave(cpu);
+            cpu->icount_in_window = true;
+        }
+    }
+}
+
+/*
  * Start a round of the vCPUs. CPUs without an icount clock share the
  * instructions to the next deadline evenly; this returns each one's share.
- * CPUs with one each run up to the deadline in their own time, or for a
- * quantum while others with a clock are not idle, so that they move on
- * together.
+ * CPUs with one go on through their window, or start the next.
  */
 int64_t icount_percpu_budget(int cpu_count)
 {
     int64_t limit = icount_get_limit();
     int64_t timeslice = limit / cpu_count;
     int64_t quantum = icount_quantum;
-    CPUState *cpu;
-    int clocked = 0;
 
     if (timeslice == 0) {
         timeslice = limit;
@@ -135,23 +225,10 @@ int64_t icount_percpu_budget(int cpu_count)
     if (cpu_count > 1 && quantum > 0) {
         timeslice = MIN(timeslice, icount_round(quantum));
     }
-
-    CPU_FOREACH(cpu) {
-        if (icount_cpu_clocked(cpu) && !cpu_thread_is_idle(cpu)) {
-            clocked++;
-        }
+    if (icount_enabled() == ICOUNT_PRECISE &&
+        replay_mode == REPLAY_MODE_NONE) {
+        icount_window_update(quantum);
     }
-    icount_round_cpus = MAX(clocked, 1);
-    if (replay_mode == REPLAY_MODE_NONE) {
-        icount_round_slice = icount_get_deadline();
-        if (quantum < 0) {
-            quantum = ICOUNT_CLOCKED_QUANTUM_NS;
-        }
-        if (clocked > 1 && quantum > 0) {
-            icount_round_slice = MIN(icount_round_slice, quantum);
-        }
-    }
-
     return timeslice;
 }
 
@@ -172,17 +249,28 @@ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
     if (icount_cpu_clocked(cpu)) {
         /*
          * Each instruction takes a period of the CPU's clock of its own
-         * time, which is 1/N of that of virtual time while N CPUs take
-         * turns. The CPU runs for the round's slice of its own time but
-         * stops at the next deadline, rounded up to a whole instruction
-         * as without a clock.
+         * time. The CPU runs to the end of its window in its own time, but
+         * stops where virtual time reaches the next deadline, which its
+         * own time moves on by at least 1/N of while N CPUs run in the
+         * window, rounded up to a whole instruction as without a clock. A
+         * CPU outside the window, or idle in it, runs once it has joined
+         * or woken in it (icount_window_update()), which the others' turns
+         * wait for meanwhile.
          */
         uint64_t period = qatomic_read(&cpu->icount_period);
-        int64_t own = MIN(icount_round_slice,
-                          icount_get_deadline() * icount_round_cpus);
+        uint64_t left = 0;
 
-        cpu->icount_insn_time = period / icount_round_cpus;
-        cpu->icount_budget = (((uint64_t)own << 32) + period - 1) / period;
+        if (icount_window_running(cpu) && !icount_window_waiting) {
+            uint64_t n = MAX(timers_state.window_running, 1);
+            uint64_t deadline = (uint64_t)icount_get_deadline() << 32;
+
+            left = timers_state.window_units - cpu->icount_own;
+            if (deadline <= (left - 1) / n) {
+                left = deadline * n;
+            }
+        }
+        cpu->icount_insn_time = period;
+        cpu->icount_budget = (left + period - 1) / period;
     } else {
         cpu->icount_insn_time = 0;
         cpu->icount_budget = MIN(icount_get_limit(), cpu_budget);
@@ -207,6 +295,26 @@ void icount_process_data(CPUState *cpu)
     /* Account for executed instructions */
     icount_update(cpu);
 
+    /*
+     * A CPU running in its window that has gone idle (in WFI, stopped)
+     * stays where it stopped. One outside the window, or idle in it, that
+     * has come out of its halt is to join it: the others' turns end until
+     * it has.
+     */
+    if (icount_cpu_clocked(cpu)) {
+        if (cpu->icount_in_window && !cpu->icount_window_idle) {
+            if (cpu->halted) {
+                bql_lock();
+                if (cpu_thread_is_idle(cpu)) {
+                    icount_window_set_idle(cpu, true);
+                }
+                bql_unlock();
+            }
+        } else if (!cpu->halted) {
+            icount_window_waiting = true;
+        }
+    }
+
     /* Reset the counters */
     cpu->neg.icount_decr.u16.low = 0;
     cpu->icount_extra = 0;
@@ -222,6 +330,16 @@ void icount_handle_interrupt(CPUState *cpu, int mask)
     int old_mask = cpu->interrupt_request;
 
     tcg_handle_interrupt(cpu, mask);
+    /*
+     * A CPU with an icount clock interrupting another (an inter-processor
+     * interrupt from its register write) ends its turn, so that the other
+     * gets its turn at once, as a parallel core would take the interrupt,
+     * rather than when the round comes back to it.
+     */
+    if (current_cpu && current_cpu != cpu && current_cpu->running &&
+        icount_cpu_clocked(current_cpu) && icount_cpu_clocked(cpu)) {
+        cpu_exit(current_cpu);
+    }
     if (qemu_cpu_is_self(cpu) &&
         !cpu->neg.can_do_io
         && (mask & ~old_mask) != 0) {

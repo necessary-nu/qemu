@@ -988,13 +988,10 @@ static int pad_glitch(ESP32P4GpioState *s, unsigned n)
     return -1;
 }
 
-/* Cycles of clk from its anchor to t. */
-static uint64_t clk_cycles(Clock *clk, int64_t anchor, int64_t t)
+/* Cycles of a clock from its anchor to t. */
+static uint64_t clk_cycles(ESP32P4ClkCount *edges, int64_t t)
 {
-    if (!clock_is_enabled(clk) || t <= anchor) {
-        return 0;
-    }
-    return clock_ns_to_ticks(clk, t - anchor);
+    return esp32p4_clk_count_at(edges, t);
 }
 
 /*
@@ -1087,8 +1084,8 @@ static bool lp_filter_on(ESP32P4GpioState *s, unsigned n)
 /* Take every enabled filter's samples up to time t. */
 static void filters_advance(ESP32P4GpioState *s, int64_t t)
 {
-    uint64_t k = clk_cycles(s->iomux_clk, s->iomux_anchor_ns, t);
-    uint64_t lk = clk_cycles(s->lp_clk, s->lp_anchor_ns, t);
+    uint64_t k = clk_cycles(&s->iomux_edges, t);
+    uint64_t lk = clk_cycles(&s->lp_edges, t);
 
     for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
         if (hp_filter_on(s, n)) {
@@ -1107,30 +1104,14 @@ static void filters_advance(ESP32P4GpioState *s, int64_t t)
     }
 }
 
-/*
- * The time cycle k of clk falls at, rounded up to the nanosecond, so that
- * clk_cycles() counts the cycle at that time.
- */
-static int64_t clk_cycle_time(Clock *clk, int64_t anchor, uint64_t k)
-{
-    uint64_t lo, hi;
-
-    mulu64(&lo, &hi, clock_get(clk), k);
-    if (hi >> 31) {
-        return INT64_MAX;
-    }
-    return anchor + (int64_t)((hi << 32) | (lo >> 32)) +
-           ((lo & UINT32_MAX) != 0);
-}
-
 /* The earlier of *next and when filter f's output change is due. */
-static void filter_next(int64_t *next, Clock *clk, int64_t anchor,
+static void filter_next(int64_t *next, ESP32P4ClkCount *edges,
                         ESP32P4GpioFilter *f, FilterParams p)
 {
     uint64_t k = filter_due(f, p);
 
     if (k) {
-        *next = MIN(*next, clk_cycle_time(clk, anchor, k));
+        *next = MIN(*next, esp32p4_clk_count_time(edges, k));
     }
 }
 
@@ -1142,22 +1123,22 @@ static int64_t filters_next(ESP32P4GpioState *s)
     if (clock_is_enabled(s->iomux_clk)) {
         for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
             if (hp_filter_on(s, n)) {
-                filter_next(&next, s->iomux_clk, s->iomux_anchor_ns,
-                            &s->pin_filter[n], pin_filter_params);
+                filter_next(&next, &s->iomux_edges, &s->pin_filter[n],
+                            pin_filter_params);
             }
         }
         for (unsigned ch = 0; ch < ESP32P4_GPIO_GLITCH_FILTERS; ch++) {
             if (glitch_pad(s, ch) >= 0) {
-                filter_next(&next, s->iomux_clk, s->iomux_anchor_ns,
-                            &s->glitch_filter[ch], glitch_params(s, ch));
+                filter_next(&next, &s->iomux_edges, &s->glitch_filter[ch],
+                            glitch_params(s, ch));
             }
         }
     }
     if (clock_is_enabled(s->lp_clk)) {
         for (unsigned n = 0; n < ESP32P4_GPIO_LP_PADS; n++) {
             if (lp_filter_on(s, n)) {
-                filter_next(&next, s->lp_clk, s->lp_anchor_ns,
-                            &s->lp_pin_filter[n], pin_filter_params);
+                filter_next(&next, &s->lp_edges, &s->lp_pin_filter[n],
+                            pin_filter_params);
             }
         }
     }
@@ -1185,8 +1166,8 @@ static void filters_schedule(ESP32P4GpioState *s)
 static void run_chains(ESP32P4GpioState *s, uint64_t raw, int64_t t,
                        uint64_t *pf_out, uint64_t *hp_out, uint32_t *lp_out)
 {
-    uint64_t k = clk_cycles(s->iomux_clk, s->iomux_anchor_ns, t);
-    uint64_t lk = clk_cycles(s->lp_clk, s->lp_anchor_ns, t);
+    uint64_t k = clk_cycles(&s->iomux_edges, t);
+    uint64_t lk = clk_cycles(&s->lp_edges, t);
     uint64_t pf = 0, hp;
     uint32_t lp = 0;
 
@@ -1254,7 +1235,8 @@ static void sdm_advance(ESP32P4GpioState *s, unsigned ch, int64_t now)
     if (!sdm_clock_on(s) || now <= s->sdm_anchor_ns[ch]) {
         return;
     }
-    total = clock_ns_to_ticks(s->iomux_clk, now - s->sdm_anchor_ns[ch]) / div;
+    total = esp32p4_clk_ns_cycles(s->iomux_edges.period,
+                                  now - s->sdm_anchor_ns[ch]) / div;
     if (total <= s->sdm_ticks[ch]) {
         return;
     }
@@ -2140,7 +2122,7 @@ static void check_in_sel(unsigned sig, uint32_t cfg)
 static void pin_filter_enabled(ESP32P4GpioState *s, unsigned n)
 {
     filter_start(&s->pin_filter[n], bit64(s->raw_in, n),
-                 clk_cycles(s->iomux_clk, s->iomux_anchor_ns,
+                 clk_cycles(&s->iomux_edges,
                             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)));
 }
 
@@ -2171,7 +2153,7 @@ static void glitch_written(ESP32P4GpioState *s, unsigned ch, uint32_t old)
     }
     if (v != old && n < ESP32P4_GPIO_PADS) {
         filter_start(&s->glitch_filter[ch], bit64(s->pf_in, n),
-                     clk_cycles(s->iomux_clk, s->iomux_anchor_ns,
+                     clk_cycles(&s->iomux_edges,
                                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)));
     }
 }
@@ -2648,7 +2630,7 @@ static void lp_iomux_write_reg(ESP32P4GpioState *s, hwaddr addr, uint32_t v,
         put(&s->lp_pad[n], v, mask & LP_PAD_WRITABLE);
         if (lp_filter_on(s, n) && !FIELD_EX32(old, LP_PAD, FILTER_EN)) {
             filter_start(&s->lp_pin_filter[n], bit64(s->raw_in, n),
-                         clk_cycles(s->lp_clk, s->lp_anchor_ns,
+                         clk_cycles(&s->lp_edges,
                                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)));
         }
         if (FIELD_EX32(s->lp_pad[n], LP_PAD, FUN_SEL) >= 2) {
@@ -2970,7 +2952,8 @@ static void esp32p4_gpio_set_ana_comp(void *opaque, int n, int level)
     }
     filters_catch_up(s, now);
     s->ana_comp[n] = level != 0;
-    quiet = clock_ticks_to_ns(s->iomux_clk, s->zero_det[n]);
+    quiet = esp32p4_clk_count_running(&s->iomux_edges) ?
+            esp32p4_clk_cycles_ns(s->iomux_edges.period, s->zero_det[n]) : 0;
     if (s->ana_comp_int_ns[n] == INT64_MIN ||
         now - s->ana_comp_int_ns[n] >= quiet) {
         s->int_raw |= (level ? INT_COMP_RISE(n) : INT_COMP_FALL(n)) |
@@ -3199,8 +3182,9 @@ static void esp32p4_gpio_iomux_clk_update(void *opaque, ClockEvent event)
         for (unsigned ch = 0; ch < ESP32P4_GPIO_GLITCH_FILTERS; ch++) {
             s->glitch_filter[ch].tick = 0;
         }
-        s->iomux_anchor_ns = now;
+        s->iomux_edges.origin_ns = now;
     } else {
+        esp32p4_clk_count_start(&s->iomux_edges, s->iomux_clk, now);
         esp32p4_gpio_update(s);
     }
 }
@@ -3216,8 +3200,9 @@ static void esp32p4_gpio_lp_clk_update(void *opaque, ClockEvent event)
         for (unsigned n = 0; n < ESP32P4_GPIO_LP_PADS; n++) {
             s->lp_pin_filter[n].tick = 0;
         }
-        s->lp_anchor_ns = now;
+        s->lp_edges.origin_ns = now;
     } else {
+        esp32p4_clk_count_start(&s->lp_edges, s->lp_clk, now);
         esp32p4_gpio_update(s);
     }
 }
@@ -3471,8 +3456,8 @@ static const VMStateDescription vmstate_esp32p4_gpio_filter = {
 
 static const VMStateDescription vmstate_esp32p4_gpio = {
     .name = TYPE_ESP32P4_GPIO,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(iomux_clk, ESP32P4GpioState),
         VMSTATE_CLOCK(lp_clk, ESP32P4GpioState),
@@ -3538,8 +3523,8 @@ static const VMStateDescription vmstate_esp32p4_gpio = {
         VMSTATE_STRUCT_ARRAY(lp_pin_filter, ESP32P4GpioState,
                              ESP32P4_GPIO_LP_PADS, 1,
                              vmstate_esp32p4_gpio_filter, ESP32P4GpioFilter),
-        VMSTATE_INT64(iomux_anchor_ns, ESP32P4GpioState),
-        VMSTATE_INT64(lp_anchor_ns, ESP32P4GpioState),
+        VMSTATE_ESP32P4_CLK_COUNT(iomux_edges, ESP32P4GpioState),
+        VMSTATE_ESP32P4_CLK_COUNT(lp_edges, ESP32P4GpioState),
         VMSTATE_UINT8_ARRAY(ana_comp, ESP32P4GpioState,
                             ESP32P4_GPIO_ANA_COMPS),
         VMSTATE_INT64_ARRAY(ana_comp_int_ns, ESP32P4GpioState,
