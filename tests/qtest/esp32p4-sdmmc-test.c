@@ -174,7 +174,8 @@ static uint8_t image_byte(uint8_t seed, uint32_t offset)
     return (uint8_t)(offset / 512 * 7 + offset + seed);
 }
 
-static QTestState *start(const char *img0, const char *img1)
+static QTestState *start_opts(const char *img0, const char *img1,
+                              const char *opts)
 {
     g_autofree char *d0 = img0 ?
         g_strdup_printf("-drive if=sd,index=0,format=raw,file=%s", img0) :
@@ -183,7 +184,12 @@ static QTestState *start(const char *img0, const char *img1)
         g_strdup_printf("-drive if=sd,index=1,format=raw,file=%s", img1) :
         g_strdup("");
 
-    return qtest_initf("-M esp32p4 %s %s", d0, d1);
+    return qtest_initf("-M esp32p4 %s %s %s", d0, d1, opts);
+}
+
+static QTestState *start(const char *img0, const char *img1)
+{
+    return start_opts(img0, img1, "");
 }
 
 /* SDMMC_SYS_CLK, and the SDIO_LS clocks at 40 MHz. */
@@ -513,7 +519,8 @@ static void test_empty_slot(void)
 static void test_card_init_and_fifo(void)
 {
     g_autofree char *img = make_image(0x11);
-    QTestState *qts = start(img, NULL);
+    /* The controller's own cycles, with a card that takes no time. */
+    QTestState *qts = start_opts(img, NULL, "-global sd-card.timing=off");
     uint32_t st, rca, word;
     uint8_t got[512];
     int64_t t;
