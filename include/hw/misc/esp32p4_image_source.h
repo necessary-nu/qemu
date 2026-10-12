@@ -367,6 +367,13 @@ const ESP32P4ImageTiming *esp32p4_image_source_timing(ESP32P4ImageSource *s);
 bool esp32p4_image_source_streaming(ESP32P4ImageSource *s);
 
 /*
+ * CSI: whether the data lanes are out of LP-11 now (from a burst's SoT to
+ * its EoT), for the D-PHY's stop state; a packet reaches the receivers
+ * only as it ends.
+ */
+bool esp32p4_image_source_csi_in_burst(ESP32P4ImageSource *s);
+
+/*
  * The sensor's software stream on and off, for an SCCB model: off ends
  * the stream after the frame in progress, on starts it now.
  */

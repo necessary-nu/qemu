@@ -1215,6 +1215,34 @@ bool esp32p4_image_source_streaming(ESP32P4ImageSource *s)
     return s->running;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.mipi]
+ * Bursts do not overlap and the events are in order of their ends, so a
+ * burst in progress is the next event's, or in its trail the last run's.
+ */
+bool esp32p4_image_source_csi_in_burst(ESP32P4ImageSource *s)
+{
+    int64_t now = esp32_line_time();
+    guint i;
+
+    if (!s->in_run) {
+        run_until(s, now);
+        arm(s);
+    }
+    if (!s->running || s->timing.port != ESP32P4_IMAGE_PORT_CSI) {
+        return false;
+    }
+    for (i = MAX(s->next_ev, 1) - 1; i <= s->next_ev && i < s->events->len;
+         i++) {
+        const ImageEvent *ev = &g_array_index(s->events, ImageEvent, i);
+
+        if (ev->kind == EV_CSI_PACKET && ev->t[0] <= now && now < ev->t[3]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 /* [spec:nuos:req:emu.esp32p4.mipi] */
 void esp32p4_image_source_set_streaming(ESP32P4ImageSource *s, bool on)

@@ -23,7 +23,8 @@
  *          data=NS end=NS eot=NS now=NS payload=HH...
  *
  * (each on one line), "data" a line's samples as 4 hex digits each and
- * "payload" a long packet's bytes as 2, both left out with data=off.
+ * "payload" a long packet's bytes as 2, both left out with data=off. Its
+ * "in-burst" property reads esp32p4_image_source_csi_in_burst() now.
  */
 
 #include "qemu/osdep.h"
@@ -179,6 +180,13 @@ static void probe_set_log(Object *obj, const char *value, Error **errp)
     p->log = g_strdup(value);
 }
 
+static bool probe_get_in_burst(Object *obj, Error **errp)
+{
+    ESP32P4ImageProbe *p = ESP32P4_IMAGE_PROBE(obj);
+
+    return p->attached && esp32p4_image_source_csi_in_burst(p->attached);
+}
+
 static bool probe_get_data(Object *obj, Error **errp)
 {
     return ESP32P4_IMAGE_PROBE(obj)->data;
@@ -231,6 +239,9 @@ static void probe_class_init(ObjectClass *oc, const void *data)
                                    probe_set_data);
     object_class_property_set_description(oc, "data",
         "Record the lines' samples and the packets' payloads (default on)");
+    object_class_property_add_bool(oc, "in-burst", probe_get_in_burst, NULL);
+    object_class_property_set_description(oc, "in-burst",
+        "CSI: the data lanes are in a high-speed burst now");
 }
 
 static const TypeInfo probe_types[] = {

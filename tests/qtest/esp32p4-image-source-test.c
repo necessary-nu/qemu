@@ -885,6 +885,56 @@ static void test_csi_packets(void)
     cam_stop(&c);
 }
 
+static bool in_burst(QTestState *qts)
+{
+    QDict *r = qtest_qmp(qts, "{ 'execute': 'qom-get', 'arguments': "
+                         "{ 'path': '/objects/probe0', "
+                         "'property': 'in-burst' } }");
+    bool v;
+
+    g_assert(qdict_haskey(r, "return"));
+    v = qdict_get_bool(r, "return");
+    qobject_unref(r);
+    return v;
+}
+
+/*
+ * The data lanes leave LP-11 at each burst's SoT and are back at its EoT:
+ * what a receiver's D-PHY stop state shows, even before the packet,
+ * which reaches it only as it ends.
+ */
+static void test_csi_in_burst(void)
+{
+    const uint64_t bps = 100000000, pixel_hz = 30 * 80 * 8;
+    Cam c = { 0 };
+    int64_t fs[4], ln[4];
+
+    cam_start1(&c, "format=raw8,width=64,height=4,hblank=16,vblank=4,"
+               "vsync=1,vbp=2,lanes=2,lane-rate=100000000", "csi");
+    burst(0, bps, 2, 4, fs);
+    burst(ceil_ns(3 * 80, pixel_hz), bps, 2, 70, ln);
+    g_assert(in_burst(c.qts));
+    qtest_clock_set(c.qts, fs[2]);
+    g_assert(in_burst(c.qts));
+    qtest_clock_set(c.qts, fs[3] - 1);
+    g_assert(in_burst(c.qts));
+    qtest_clock_set(c.qts, fs[3]);
+    g_assert(!in_burst(c.qts));
+    qtest_clock_set(c.qts, ln[0] - 1);
+    g_assert(!in_burst(c.qts));
+    qtest_clock_set(c.qts, ln[0]);
+    g_assert(in_burst(c.qts));
+    qtest_clock_set(c.qts, ln[2] - 1);
+    g_assert(in_burst(c.qts));
+    qtest_clock_set(c.qts, ln[2]);
+    g_assert(in_burst(c.qts));
+    qtest_clock_set(c.qts, ln[3] - 1);
+    g_assert(in_burst(c.qts));
+    qtest_clock_set(c.qts, ln[3]);
+    g_assert(!in_burst(c.qts));
+    cam_stop(&c);
+}
+
 /*
  * The lane rate a mode gets with none given: the lowest multiple of
  * 10 Mbit/s from 80 Mbit/s at which a line's burst ends, with the LP-11
@@ -1808,6 +1858,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/image-source/dvp-timing", test_dvp_timing);
     qtest_add_func("esp32p4/image-source/dvp-bars", test_dvp_bars);
     qtest_add_func("esp32p4/image-source/csi-packets", test_csi_packets);
+    qtest_add_func("esp32p4/image-source/csi-in-burst", test_csi_in_burst);
     qtest_add_func("esp32p4/image-source/csi-lane-rate", test_csi_lane_rate);
     qtest_add_func("esp32p4/image-source/still-formats", test_still_formats);
     qtest_add_func("esp32p4/image-source/still-pnm", test_still_pnm);
