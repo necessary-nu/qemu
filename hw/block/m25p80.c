@@ -39,6 +39,7 @@
 #include "qom/object.h"
 #include "system/memory.h"
 #include "m25p80_sfdp.h"
+#include "m25p80_chip.h"
 
 /* 16 MiB max in 3 byte address mode */
 #define MAX_3BYTES_SIZE 0x1000000
@@ -78,6 +79,11 @@ typedef struct FlashPartInfo {
      */
     uint8_t die_cnt;
     uint8_t (*sfdp_read)(uint32_t sfdp_addr);
+    /*
+     * A part modelled from its datasheet (m25p80_chip.c), which then
+     * decodes its commands in place of the generic code below.
+     */
+    const M25ChipInfo *chip;
 } FlashPartInfo;
 
 /* adapted from linux */
@@ -356,6 +362,12 @@ static const FlashPartInfo known_devices[] = {
     { INFO("w25x32",      0xef3016,      0,  64 << 10,  64, ER_4K) },
     { INFO("w25q16",      0xef4015,      0,  64 << 10,  32, ER_4K) },
     { INFO("w25q32",      0xef4016,      0,  64 << 10,  64, ER_4K) },
+    /* [spec:nuos:req:emu.flash-chip] */
+    { INFO("w25q16jv",    0xef4015,      0,  64 << 10,  32, ER_4K | ER_32K),
+      .chip = &m25chip_w25q16jv },
+    /* [spec:nuos:req:emu.flash-chip] */
+    { INFO("w25q32rv",    0xef4016,      0,  64 << 10,  64, ER_4K | ER_32K),
+      .chip = &m25chip_w25q32rv },
     { INFO("w25q32dw",    0xef6016,      0,  64 << 10,  64, ER_4K) },
     { INFO("w25x64",      0xef3017,      0,  64 << 10, 128, ER_4K) },
     { INFO("w25q64",      0xef4017,      0,  64 << 10, 128, ER_4K) },
@@ -543,6 +555,9 @@ struct Flash {
 
     const FlashPartInfo *pi;
 
+    /* A datasheet part's state, when pi->chip names one. */
+    M25Chip chip;
+    qemu_irq array_mapped;
 };
 
 struct M25P80Class {
@@ -1635,6 +1650,10 @@ static int m25p80_cs(SSIPeripheral *ss, bool select)
 {
     Flash *s = M25P80(ss);
 
+    if (s->pi->chip) {
+        m25chip_set_cs(&s->chip, select);
+        return 0;
+    }
     if (select) {
         if (s->state == STATE_COLLECTING_VAR_LEN_DATA) {
             complete_collecting_data(s);
@@ -1664,6 +1683,9 @@ static uint32_t m25p80_transfer8(SSIPeripheral *ss, uint32_t tx)
     Flash *s = M25P80(ss);
     uint32_t r = 0;
 
+    if (s->pi->chip) {
+        return m25chip_transfer(&s->chip, tx);
+    }
     trace_m25p80_transfer(s, s->state, s->len, s->needed_bytes, s->pos,
                           s->cur_addr, (uint8_t)tx);
 
@@ -1757,6 +1779,7 @@ static void m25p80_write_protect_pin_irq_handler(void *opaque, int n, int level)
     /* WP# is just a single pin. */
     assert(n == 0);
     s->wp_level = !!level;
+    s->chip.wp_level = s->wp_level;
 }
 
 static void m25p80_realize(SSIPeripheral *ss, Error **errp)
@@ -1807,6 +1830,33 @@ static void m25p80_realize(SSIPeripheral *ss, Error **errp)
 
     qdev_init_gpio_in_named(DEVICE(s),
                             m25p80_write_protect_pin_irq_handler, "WP#", 1);
+    /*
+     * "array-mapped": with a "memory" region, whether a datasheet part
+     * leaves it in ROMD mode, the array readable directly; low while the
+     * part would ignore a read (busy, powered down).
+     */
+    qdev_init_gpio_out_named(DEVICE(s), &s->array_mapped, "array-mapped", 1);
+
+    if (s->pi->chip) {
+        assert(m25chip_size(s->pi->chip) == s->size);
+        s->chip.info = s->pi->chip;
+        s->chip.dev = DEVICE(s);
+        s->chip.storage = s->storage;
+        s->chip.mem = s->mem;
+        s->chip.mapped = s->array_mapped;
+        s->chip.blk = s->blk;
+        s->chip.wp_level = true;
+        m25chip_realize(&s->chip, errp);
+    }
+}
+
+static void m25p80_unrealize(DeviceState *dev)
+{
+    Flash *s = M25P80(dev);
+
+    if (s->pi->chip) {
+        m25chip_unrealize(&s->chip);
+    }
 }
 
 static void m25p80_reset(DeviceState *d)
@@ -1821,6 +1871,11 @@ static void m25p80_reset(DeviceState *d)
     s->block_protect3 = false;
     s->top_bottom_bit = false;
 
+    if (s->pi->chip) {
+        s->chip.wp_level = true;
+        m25chip_reset(&s->chip);
+        return;
+    }
     reset_memory(s);
 }
 
@@ -1843,6 +1898,12 @@ static const Property m25p80_properties[] = {
     DEFINE_PROP_LINK("memory", Flash, mem, TYPE_MEMORY_REGION,
                      MemoryRegion *),
     DEFINE_PROP_BOOL("write-enable-autoclear", Flash, wel_autoclear, false),
+    /*
+     * Datasheet parts only: the maximum program and erase times rather than
+     * the typical ones, and the factory unique ID as hex digits.
+     */
+    DEFINE_PROP_BOOL("max-timing", Flash, chip.max_timing, false),
+    DEFINE_PROP_STRING("unique-id", Flash, chip.uid_prop),
 };
 
 static int m25p80_pre_load(void *opaque)
@@ -1934,6 +1995,24 @@ static const VMStateDescription vmstate_m25p80_block_protect = {
     }
 };
 
+static bool m25p80_chip_needed(void *opaque)
+{
+    Flash *s = (Flash *)opaque;
+
+    return s->pi->chip;
+}
+
+static const VMStateDescription vmstate_m25p80_chip = {
+    .name = "m25p80/chip",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = m25p80_chip_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT(chip, Flash, 1, vmstate_m25chip, M25Chip),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_m25p80 = {
     .name = "m25p80",
     .version_id = 0,
@@ -1967,6 +2046,7 @@ static const VMStateDescription vmstate_m25p80 = {
         &vmstate_m25p80_aai_enable,
         &vmstate_m25p80_write_protect,
         &vmstate_m25p80_block_protect,
+        &vmstate_m25p80_chip,
         NULL
     }
 };
@@ -1978,6 +2058,7 @@ static void m25p80_class_init(ObjectClass *klass, const void *data)
     M25P80Class *mc = M25P80_CLASS(klass);
 
     k->realize = m25p80_realize;
+    dc->unrealize = m25p80_unrealize;
     k->transfer = m25p80_transfer8;
     k->set_cs = m25p80_cs;
     k->cs_polarity = SSI_CS_LOW;
@@ -2018,4 +2099,15 @@ type_init(m25p80_register_types)
 BlockBackend *m25p80_get_blk(DeviceState *dev)
 {
     return M25P80(dev)->blk;
+}
+
+/* [spec:nuos:req:emu.flash-timing] */
+int64_t m25p80_busy_until(DeviceState *dev)
+{
+    Flash *s = (Flash *)object_dynamic_cast(OBJECT(dev), TYPE_M25P80);
+
+    if (!s || !s->pi->chip) {
+        return 0;
+    }
+    return m25chip_busy_until(&s->chip);
 }
