@@ -85,6 +85,9 @@ static bool trans_fsw(DisasContext *ctx, arg_fsw *a)
     decode_save_opc(ctx, 0);
     addr = get_address(ctx, a->rs1, a->imm);
     tcg_gen_qemu_st_i64(cpu_fpr[a->rs2], addr, ctx->mem_idx, memop);
+#ifndef CONFIG_USER_ONLY
+    gen_esp32p4_store_insn(ctx);
+#endif
     return true;
 }
 

@@ -205,11 +205,23 @@ static void icount_window_sync(void)
 static void icount_account_time(CPUState *cpu, int64_t executed)
 {
     uint64_t insn_time = cpu->icount_insn_time;
-    uint64_t lo, hi;
+    uint64_t lo, hi, carry = 0;
 
+    if (cpu->icount_insn_frac && executed > 0) {
+        /*
+         * A period that is not a whole number of units: the fractions
+         * run up in the CPU's remainder and carry whole units as they
+         * make them.
+         */
+        mulu64(&lo, &hi, executed, cpu->icount_insn_frac);
+        lo += cpu->icount_time_rem;
+        hi += lo < cpu->icount_time_rem;
+        cpu->icount_time_rem = divu128(&lo, &hi, cpu->icount_insn_den);
+        carry = lo;
+    }
     if (insn_time && cpu->icount_in_window && !cpu->icount_window_idle &&
         timers_state.window_cpus) {
-        cpu->icount_own += executed * insn_time;
+        cpu->icount_own += executed * insn_time + carry;
         icount_window_sync();
         return;
     }
@@ -217,6 +229,8 @@ static void icount_account_time(CPUState *cpu, int64_t executed)
         insn_time = (uint64_t)1 << (32 + timers_state.icount_time_shift);
     }
     mulu64(&lo, &hi, executed, insn_time);
+    lo += carry;
+    hi += lo < carry;
     icount_time_add(&timers_state.qemu_icount_time,
                     &timers_state.qemu_icount_time_frac, lo, hi);
     if (timers_state.window_cpus) {
@@ -756,6 +770,14 @@ static void icount_cpu_clock_update(void *opaque, ClockEvent event)
     }
 }
 
+void icount_set_cpu_period_frac(CPUState *cpu, uint64_t frac, uint64_t den)
+{
+    assert(den && frac < den);
+    qatomic_set(&cpu->icount_period_den, den);
+    qatomic_set(&cpu->icount_period_frac, frac);
+    cpu->icount_time_rem = 0;
+}
+
 void icount_set_cpu_clock(CPUState *cpu, Clock *clk)
 {
     assert(!cpu->icount_clock);
@@ -764,6 +786,7 @@ void icount_set_cpu_clock(CPUState *cpu, Clock *clk)
                        ClockUpdate);
     clock_set_source(cpu->icount_clock, clk);
     qatomic_set(&cpu->icount_period, clock_get(cpu->icount_clock));
+    cpu->icount_period_den = 1;
 }
 
 void icount_notify_exit(void)

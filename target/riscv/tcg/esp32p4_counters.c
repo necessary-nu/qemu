@@ -6,9 +6,9 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * Reference: ESP32-P4 Technical Reference Manual (v3.x silicon), 2.5
- * (the HP core's CSRs), 5.3 and 5.7 (the LP core's CSRs and performance
- * counters); ESP32-C6 Technical Reference Manual v1.2, register 1.22
- * (mpcer).
+ * (the HP core's CSRs), 2.12.1 (branch prediction), 5.3 and 5.7 (the LP
+ * core's CSRs and performance counters); ESP32-C6 Technical Reference
+ * Manual v1.2, register 1.22 (mpcer).
  *
  * Each core counts for itself:
  *
@@ -30,29 +30,94 @@
  *   - mcountinhibit stops a counter where it is and restarts it from
  *     there. TM stops nothing: the time the HP core's time CSR reads is
  *     the CLINT's.
- *   - The event counters, mhpmcounter8, 9 and 13 on an HP core
- *     (conditional branch mispredictions, conditional branches and stores,
- *     each counting as mhpmevent8, 9 and 13 select) and mhpmcounter3 to
- *     12 on the LP core (40 bits each), hold what is written: the events
- *     they count are of the cores' pipelines, which are not modelled. That
- *     is logged as unimplemented.
+ *   - The event counters count events of the core's own instructions as
+ *     they retire, as listed below: mhpmcounter8, 9 and 13 on an HP core,
+ *     64 bits each, each while its mhpmevent8, 9 or 13 holds the one event
+ *     the TRM gives it (0x6, 0x7, 0xB) and holding its value under any
+ *     other, 0 from reset included; mhpmcounter3 to 12 on the LP core, 40
+ *     bits each, each counting its own event from reset. mcountinhibit
+ *     stops and restarts each, as it does mcycle. A counter wraps to 0 at
+ *     its width, and nothing is raised as it does: the TRM gives neither
+ *     core an overflow interrupt.
+ *
+ * The HP core's events:
+ *
+ *   - mhpmcounter9 (0x7), conditional branches: BEQ, BNE, BLT, BGE, BLTU,
+ *     BGEU, C.BEQZ and C.BNEZ, taken or not.
+ *   - mhpmcounter13 (0xB), store instructions: those of the STORE and
+ *     STORE-FP major opcodes (SB, SH, SW, FSW) and their compressed forms
+ *     (C.SW, C.SWSP, C.FSW, C.FSWSP, and Zcb's C.SB and C.SH), Zcmp's
+ *     CM.PUSH, and the PIE stores (ESP.VST.*, ESP.ST.* and the fused
+ *     instructions that store), each one store instruction however many
+ *     bytes or words it stores. The A extension's SC.W and AMOs are of an
+ *     opcode of their own, and are not counted.
+ *   - mhpmcounter8 (0x6), conditional branch mispredictions: the
+ *     conditional branches whose outcome is not the one the core
+ *     predicted. With mhcr.BPE clear (from reset) the core predicts every
+ *     conditional branch not taken, so each one taken is mispredicted.
+ *     With it set, the core predicts as TRM 2.12.1 describes: a two-bit
+ *     saturating counter, of a branch history table indexed by the outcomes
+ *     of the last 13 conditional branches (the global history), predicts
+ *     taken when weakly or strongly taken, and moves one step towards the
+ *     outcome after the branch, strongly taken and strongly not taken
+ *     being the ends (figure 2.12-1); the history then takes the outcome.
+ *     The TRM's encoding makes weakly not taken 0, which the table is
+ *     taken to hold from the core's reset, with a history of not taken
+ *     branches. The TRM's BHT of 512 16-bit words holds half the 8192
+ *     counters 13 outcomes index; the model follows the 13. The branch
+ *     target buffer and the return address stack predict where branches
+ *     and jumps go, not whether conditional branches are taken, and are
+ *     not modelled: a misprediction is one of direction. The predictor
+ *     runs, and learns, only while mhpmcounter8 counts its event: its
+ *     table and history are those of the branches executed meanwhile.
+ *
+ * The LP core's events (TRM table 5.7-1):
+ *
+ *   - mhpmcounter5 and 6, memory reads and writes: each load, LR.W and
+ *     AMO reads once, each store, AMO and SC.W that stores (one that fails
+ *     stores nothing) writes once; an unaligned load or store, one at an
+ *     address not a multiple of its size, counts twice, as the TRM says.
+ *   - mhpmcounter7, unconditional jumps: JAL, JALR, C.J, C.JAL, C.JR and
+ *     C.JALR.
+ *   - mhpmcounter8 and 9, conditional branches and those taken: BEQ to
+ *     BGEU, C.BEQZ and C.BNEZ.
+ *   - mhpmcounter10, compressed instructions.
+ *   - mhpmcounter3, wait cycles for memory access: the cycles of the
+ *     core's clock it waits while a device holds its load or store on the
+ *     bus (esp32p4_cpu_bus_hold()), such as a start of the SHA accelerator
+ *     while it is busy. The model's memories answer at once, so the
+ *     latency TRM 5.8.1 gives the LP core's accesses to L2MEM is not among
+ *     them.
+ *   - mhpmcounter4, 11 and 12, wait cycles for instruction fetches,
+ *     multiplications and divisions: the model's core fetches and
+ *     executes each instruction in one cycle, waiting for none, so these
+ *     hold their values.
+ *
+ * An instruction's events count once it retires, so one that raises an
+ * exception counts none, nor does a load or store held on the bus until
+ * it completes. They count with the instruction: a counter read by an
+ * instruction counts the events of those before it.
  *
  * A read of a counter gives its value before the reading instruction
  * retires; a write takes effect after the writing instruction, which
  * the next one reads. A counter's reset value is 0.
  *
- * The cycles of a clock over an interval are the whole periods of it gone
- * by, at the period of its Clock, as every block of the chip counts them
- * (see esp32p4_clk_period.h); a clock that starts, or changes rate,
- * starts its first cycle there. Virtual time is taken to the fraction of a
- * nanosecond icount leaves when CPUs execute at their clocks' rate
- * (icount_get_precise()): under icount, a core executes an instruction a
- * cycle of its clock, so that a core running alone counts one cycle for
- * each instruction it executes, at any frequency. Cores running together
- * take turns of at most a quantum of virtual time (icount_set_cpu_clock()),
- * through which each one's mcycle follows virtual time, as the chip's
- * timers do, and so its own instructions to within that quantum. Without
- * icount virtual time follows the host's clock, as do the cycles.
+ * The cycles of a clock are the whole periods of it gone by since it
+ * started its current run, at its exact period, as every block of the
+ * chip counts them (see esp32p4_clk_period.h), so that cycle n of a run
+ * ends n exact periods after its start however large n is; a clock that
+ * starts, or changes rate, starts its first cycle there. Virtual time is
+ * taken to the fraction of a nanosecond icount leaves when CPUs execute
+ * at their clocks' rate (icount_get_precise()): under icount, a core
+ * executes an instruction a cycle of its clock, its exact period each
+ * (icount_set_cpu_period_frac()), so that a core running alone counts one
+ * cycle for each instruction it executes, at any frequency. That time is
+ * the instructions' exact time rounded down to a 2^-32 ns unit, so the
+ * count allows for a unit more. Cores running together take turns of at
+ * most a quantum of virtual time (icount_set_cpu_clock()), through which
+ * each one's mcycle follows virtual time, as the chip's timers do, and so
+ * its own instructions to within that quantum. Without icount virtual
+ * time follows the host's clock, as do the cycles.
  *
  * The instructions are counted by the code QEMU translates for the core,
  * which adds one to the core's count as each instruction starts. One that
@@ -68,6 +133,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "cpu.h"
+#include "exec/helper-proto.h"
 #include "exec/icount.h"
 #include "hw/core/clock.h"
 #include "target/riscv/esp32p4_cpu.h"
@@ -92,20 +158,30 @@ static const uint32_t ctr_inhibit[] = {
                                                  ESP32P4_LP_HPM_COUNTERS))
 #define LP_HPM_BITS             40
 
-/* The HP core's event counters, in the order of hpm[]. */
+/*
+ * The HP core's event counters, in the order of hpm_base[]: each one's
+ * number, the event mhpmevent selects for it, and the event it counts.
+ */
 static const int hp_hpm_counters[ESP32P4_HP_HPM_COUNTERS] = { 8, 9, 13 };
+static const uint32_t hp_hpm_select[ESP32P4_HP_HPM_COUNTERS] = {
+    0x6, 0x7, 0xb,
+};
+static const int hp_hpm_events[ESP32P4_HP_HPM_COUNTERS] = {
+    ESP32P4_EV_MISPREDICT, ESP32P4_EV_BRANCH, ESP32P4_EV_STORE,
+};
 
-static const char *const lp_hpm_events[ESP32P4_LP_HPM_COUNTERS] = {
-    "memory access wait cycles",
-    "instruction fetch wait cycles",
-    "memory reads",
-    "memory writes",
-    "unconditional jumps",
-    "branches",
-    "taken branches",
-    "compressed instructions",
-    "multiplication wait cycles",
-    "division wait cycles",
+/* The LP core's mhpmcounter3 to 12: their events, -1 for none. */
+static const int lp_hpm_events[ESP32P4_LP_HPM_COUNTERS] = {
+    ESP32P4_EV_BUS_WAIT,
+    -1,
+    ESP32P4_EV_MEM_READ,
+    ESP32P4_EV_MEM_WRITE,
+    ESP32P4_EV_JUMP,
+    ESP32P4_EV_BRANCH,
+    ESP32P4_EV_TAKEN,
+    ESP32P4_EV_COMPRESSED,
+    -1,
+    -1,
 };
 
 /* A virtual time: nanoseconds and the fraction of one, in 2^-32 ns. */
@@ -131,37 +207,23 @@ static bool ctr_before(CtrTime a, CtrTime b)
     return a.ns < b.ns || (a.ns == b.ns && a.frac < b.frac);
 }
 
-/* The whole periods of @period units from @from to @to, @to later. */
-static uint64_t ctr_periods(CtrTime from, CtrTime to, uint64_t period)
+/* @to - @from, @to later, in Clock units (2^-32 ns), as *@hi:*@lo. */
+static void ctr_elapsed(CtrTime from, CtrTime to, uint64_t *hi, uint64_t *lo)
 {
     uint64_t ns = to.ns - from.ns;
-    uint64_t hi = ns >> 32, lo = ns << 32;
+    uint64_t d;
 
+    *hi = ns >> 32;
+    *lo = ns << 32;
     if (to.frac >= from.frac) {
-        uint64_t d = to.frac - from.frac;
-
-        lo += d;
-        hi += lo < d;
+        d = to.frac - from.frac;
+        *lo += d;
+        *hi += *lo < d;
     } else {
-        uint64_t d = from.frac - to.frac;
-
-        hi -= lo < d;
-        lo -= d;
+        d = from.frac - to.frac;
+        *hi -= *lo < d;
+        *lo -= d;
     }
-    divu128(&lo, &hi, period);
-    return hi ? UINT64_MAX : lo;
-}
-
-/* @t plus @n periods of @period units. */
-static CtrTime ctr_advance(CtrTime t, uint64_t n, uint64_t period)
-{
-    uint64_t lo, hi, frac;
-
-    mulu64(&lo, &hi, n, period);
-    frac = (uint64_t)t.frac + (uint32_t)lo;
-    t.ns += (int64_t)((hi << 32) | (lo >> 32)) + (int64_t)(frac >> 32);
-    t.frac = (uint32_t)frac;
-    return t;
 }
 
 static bool ctr_is_hp(ESP32P4CPU *cpu)
@@ -180,35 +242,38 @@ static bool ctr_clock_runs(ESP32P4CPU *cpu)
            !qatomic_read(&cpu->disabled) && !cpu->ctr_wfi;
 }
 
+/* The clock starts a run at @now, from its first cycle. */
+static void ctr_restart(ESP32P4CPU *cpu, CtrTime now)
+{
+    cpu->cycles_ns = now.ns;
+    cpu->cycles_frac = now.frac;
+    cpu->cycles_synced = 0;
+}
+
 /*
- * Count the cycles of the core's clock up to @now: the whole periods
- * since the end of the last cycle counted, while mcycle counts.
- * cycles_ns and cycles_frac stay at the end of the last whole cycle
- * counted while it counts, and follow @now while it does not.
+ * Count the cycles of the core's clock up to @now: the whole exact periods
+ * since its run began, while mcycle counts; the run restarts as mcycle
+ * counts again.
  */
 static void ctr_cycles_sync(ESP32P4CPU *cpu, CtrTime now)
 {
     CtrTime from = { cpu->cycles_ns, cpu->cycles_frac };
-    uint64_t period, n;
+    uint64_t hi, lo, n;
 
-    if (!ctr_before(from, now)) {
-        if (ctr_before(now, from)) {
-            cpu->cycles_ns = now.ns;
-            cpu->cycles_frac = now.frac;
-        }
+    if (ctr_before(now, from) || !ctr_clock_runs(cpu)) {
+        ctr_restart(cpu, now);
         return;
     }
-    if (!ctr_clock_runs(cpu)) {
-        cpu->cycles_ns = now.ns;
-        cpu->cycles_frac = now.frac;
-        return;
+    ctr_elapsed(from, now, &hi, &lo);
+    if (icount_enabled()) {
+        lo++;
+        hi += !lo;
     }
-    period = clock_get(cpu->clk);
-    n = ctr_periods(from, now, period);
-    cpu->cycles += n;
-    from = ctr_advance(from, n, period);
-    cpu->cycles_ns = from.ns;
-    cpu->cycles_frac = from.frac;
+    n = esp32p4_clk_units_cycles(cpu->clk_period, hi, lo);
+    if (n > cpu->cycles_synced) {
+        cpu->cycles += n - cpu->cycles_synced;
+        cpu->cycles_synced = n;
+    }
 }
 
 /* The count a counter counts: cycles, or instructions started. */
@@ -259,6 +324,66 @@ static void ctr_set(ESP32P4CPU *cpu, int c, uint64_t v)
     cpu->ctr_ref[c] = ctr_raw(cpu, c);
 }
 
+/* An event counter's number, by its place in hpm_base[]. */
+static int hpm_number(ESP32P4CPU *cpu, int n)
+{
+    return ctr_is_hp(cpu) ? hp_hpm_counters[n] : ESP32P4_LP_HPM_FIRST + n;
+}
+
+/* The event an event counter counts, or -1 while it counts none. */
+static int hpm_event(ESP32P4CPU *cpu, int n)
+{
+    if (ctr_is_hp(cpu)) {
+        return cpu->mhpmevent[n] == hp_hpm_select[n] ? hp_hpm_events[n] : -1;
+    }
+    return lp_hpm_events[n];
+}
+
+static int hpm_count(ESP32P4CPU *cpu)
+{
+    return ctr_is_hp(cpu) ? ESP32P4_HP_HPM_COUNTERS
+                          : ESP32P4_LP_HPM_COUNTERS;
+}
+
+/* An event counter's value, at its width. */
+static uint64_t hpm_value(ESP32P4CPU *cpu, int n)
+{
+    int e = hpm_event(cpu, n);
+    uint64_t v = cpu->hpm_base[n];
+
+    if (e >= 0 && !(cpu->mcountinhibit & BIT(hpm_number(cpu, n)))) {
+        v += cpu->ev[e] - cpu->hpm_ref[n];
+    }
+    return ctr_is_hp(cpu) ? v : extract64(v, 0, LP_HPM_BITS);
+}
+
+/* An event counter written: it counts on from @v. */
+static void hpm_set(ESP32P4CPU *cpu, int n, uint64_t v)
+{
+    int e = hpm_event(cpu, n);
+
+    cpu->hpm_base[n] = v;
+    cpu->hpm_ref[n] = e >= 0 ? cpu->ev[e] : 0;
+}
+
+/*
+ * The event counters' values before a change of what they count, and
+ * the same values for them to count on from after it.
+ */
+static void hpm_snapshot(ESP32P4CPU *cpu, uint64_t *v)
+{
+    for (int n = 0; n < hpm_count(cpu); n++) {
+        v[n] = hpm_value(cpu, n);
+    }
+}
+
+static void hpm_restore(ESP32P4CPU *cpu, const uint64_t *v)
+{
+    for (int n = 0; n < hpm_count(cpu); n++) {
+        hpm_set(cpu, n, v[n]);
+    }
+}
+
 /*
  * mcountinhibit: a counter stops at its value after the writing
  * instruction, and restarts from where it stopped with the instruction
@@ -270,12 +395,13 @@ static void ctr_set_countinhibit(ESP32P4CPU *cpu, uint32_t val)
 {
     uint32_t mask = ctr_is_hp(cpu) ? HP_COUNTINHIBIT_MASK
                                    : LP_COUNTINHIBIT_MASK;
-    uint64_t now[2];
+    uint64_t now[2], hpm[ESP32P4_LP_HPM_COUNTERS];
 
     val &= mask;
     for (int c = 0; c < ARRAY_SIZE(now); c++) {
         now[c] = ctr_value(cpu, c);
     }
+    hpm_snapshot(cpu, hpm);
     if ((val & COUNTEREN_TM) && !(cpu->mcountinhibit & COUNTEREN_TM)) {
         qemu_log_mask(LOG_UNIMP, "esp32p4: mcountinhibit.TM does not stop "
                       "the CLINT time the time CSR reads\n");
@@ -284,13 +410,81 @@ static void ctr_set_countinhibit(ESP32P4CPU *cpu, uint32_t val)
     for (int c = 0; c < ARRAY_SIZE(now); c++) {
         ctr_set(cpu, c, now[c]);
     }
+    hpm_restore(cpu, hpm);
 }
 
 /*
- * The event counter a CSR addresses, as its place in hpm[], or -1; and
- * the counter's number.
+ * mhpmevent8, 9 or 13 (@n of hpm_base[]) written: its counter counts
+ * from its value after the writing instruction while @val selects its
+ * event, and holds it otherwise.
  */
-static int ctr_hpm(ESP32P4CPU *cpu, int csrno, int *counter)
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+void esp32p4_counters_set_mhpmevent(ESP32P4CPU *cpu, int n, uint32_t val)
+{
+    uint64_t hpm[ESP32P4_LP_HPM_COUNTERS];
+
+    BQL_LOCK_GUARD();
+    hpm_snapshot(cpu, hpm);
+    cpu->mhpmevent[n] = val;
+    hpm_restore(cpu, hpm);
+}
+
+/* The HP core's code runs the branch predictor (ESP32P4_BPRED). */
+bool esp32p4_counters_predicting(ESP32P4CPU *cpu)
+{
+    return ctr_is_hp(cpu) && hpm_event(cpu, 0) >= 0 &&
+           !(cpu->mcountinhibit & BIT(hp_hpm_counters[0]));
+}
+
+/*
+ * A conditional branch of the HP core, @taken or not, while mhpmcounter8
+ * counts mispredictions: whether the core predicted it, and the
+ * predictor's update.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+void HELPER(esp32p4_branch)(CPURISCVState *env, uint32_t taken)
+{
+    /* The BHT's counters after a branch taken and not, by their state. */
+    static const uint8_t bht_taken[4] = { 2, 0, 3, 3 };
+    static const uint8_t bht_not_taken[4] = { 1, 1, 0, 2 };
+    ESP32P4CPU *cpu = esp32p4_cpu_from_env(env);
+    bool predicted = false;
+
+    if (cpu->mhcr & ESP32P4_MHCR_BPE) {
+        uint32_t i = cpu->bp_history & (ESP32P4_BHT_ENTRIES - 1);
+        uint8_t c = cpu->bht[i];
+
+        predicted = c >= 2;
+        cpu->bht[i] = taken ? bht_taken[c] : bht_not_taken[c];
+        cpu->bp_history = ((cpu->bp_history << 1) | taken) &
+                          (ESP32P4_BHT_ENTRIES - 1);
+    }
+    if (predicted != taken) {
+        cpu->ev[ESP32P4_EV_MISPREDICT]++;
+    }
+}
+
+/*
+ * The core begins to wait on the bus, or ends its wait: the cycles of
+ * its clock between are the LP core's memory access wait cycles.
+ */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+void esp32p4_counters_bus_wait(ESP32P4CPU *cpu, bool wait)
+{
+    uint64_t now;
+
+    BQL_LOCK_GUARD();
+    now = ctr_raw(cpu, CTR_CYCLE);
+
+    if (wait) {
+        cpu->bus_wait_from = now;
+    } else {
+        cpu->ev[ESP32P4_EV_BUS_WAIT] += now - cpu->bus_wait_from;
+    }
+}
+
+/* The event counter a CSR addresses, as its place in hpm_base[], or -1. */
+static int ctr_hpm(ESP32P4CPU *cpu, int csrno)
 {
     int n;
 
@@ -310,7 +504,6 @@ static int ctr_hpm(ESP32P4CPU *cpu, int csrno, int *counter)
     default:
         return -1;
     }
-    *counter = n;
     if (!ctr_is_hp(cpu)) {
         n -= ESP32P4_LP_HPM_FIRST;
         return n >= 0 && n < ESP32P4_LP_HPM_COUNTERS ? n : -1;
@@ -321,20 +514,6 @@ static int ctr_hpm(ESP32P4CPU *cpu, int csrno, int *counter)
         }
     }
     return -1;
-}
-
-/* The LP core's event counters do not count their events. */
-static void ctr_hpm_unimp(ESP32P4CPU *cpu, int counter)
-{
-    static bool logged[ESP32P4_LP_HPM_COUNTERS];
-    int n = counter - ESP32P4_LP_HPM_FIRST;
-
-    if (!ctr_is_hp(cpu) && !(cpu->mcountinhibit & BIT(counter)) &&
-        !logged[n]) {
-        logged[n] = true;
-        qemu_log_mask(LOG_UNIMP, "esp32p4: the LP core's mhpmcounter%d does "
-                      "not count %s\n", counter, lp_hpm_events[n]);
-    }
 }
 
 static bool ctr_csr_high(int csrno)
@@ -351,7 +530,7 @@ RISCVException esp32p4_counters_read(CPURISCVState *env, int csrno,
     ESP32P4CPU *cpu = esp32p4_cpu_from_env(env);
     bool high = ctr_csr_high(csrno);
     uint64_t v;
-    int n, counter;
+    int n;
 
     BQL_LOCK_GUARD();
     switch (csrno) {
@@ -371,12 +550,11 @@ RISCVException esp32p4_counters_read(CPURISCVState *env, int csrno,
         v = ctr_read(env, cpu, CTR_INSTRET);
         break;
     default:
-        n = ctr_hpm(cpu, csrno, &counter);
+        n = ctr_hpm(cpu, csrno);
         if (n < 0) {
             return RISCV_EXCP_ILLEGAL_INST;
         }
-        ctr_hpm_unimp(cpu, counter);
-        v = cpu->hpm[n];
+        v = hpm_value(cpu, n);
         break;
     }
     *val = high ? v >> 32 : (uint32_t)v;
@@ -391,7 +569,7 @@ RISCVException esp32p4_counters_write(CPURISCVState *env, int csrno,
     ESP32P4CPU *cpu = esp32p4_cpu_from_env(env);
     bool high = ctr_csr_high(csrno);
     uint64_t v;
-    int c, n, counter;
+    int c, n;
 
     BQL_LOCK_GUARD();
     switch (csrno) {
@@ -407,16 +585,15 @@ RISCVException esp32p4_counters_write(CPURISCVState *env, int csrno,
         c = CTR_INSTRET;
         break;
     default:
-        n = ctr_hpm(cpu, csrno, &counter);
+        n = ctr_hpm(cpu, csrno);
         if (n < 0) {
             return RISCV_EXCP_ILLEGAL_INST;
         }
-        ctr_hpm_unimp(cpu, counter);
-        v = deposit64(cpu->hpm[n], high ? 32 : 0, 32, val);
+        v = deposit64(hpm_value(cpu, n), high ? 32 : 0, 32, val);
         if (!ctr_is_hp(cpu)) {
             v = extract64(v, 0, LP_HPM_BITS);
         }
-        cpu->hpm[n] = v;
+        hpm_set(cpu, n, v);
         return RISCV_EXCP_NONE;
     }
     v = deposit64(ctr_value(cpu, c), high ? 32 : 0, 32, val);
@@ -435,8 +612,25 @@ void esp32p4_counters_update(ESP32P4CPU *cpu)
     CtrTime now = ctr_now();
 
     ctr_cycles_sync(cpu, now);
-    cpu->cycles_ns = now.ns;
-    cpu->cycles_frac = now.frac;
+    ctr_restart(cpu, now);
+}
+
+/*
+ * The core's clock has changed: count at its new exact period, and
+ * execute at it under icount. The run restarted as the change began.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+void esp32p4_counters_clock_changed(ESP32P4CPU *cpu)
+{
+    ESP32P4ClkPeriod p = esp32p4_clk_exact(cpu->clk);
+    uint64_t lo = p.num_lo, hi = p.num_hi, frac;
+
+    cpu->clk_period = p;
+    if (esp32p4_clk_period_running(p)) {
+        frac = divu128(&lo, &hi, p.den);
+        icount_set_cpu_period_frac(CPU(cpu), frac, p.den);
+    }
 }
 
 /*
@@ -459,15 +653,18 @@ void esp32p4_counters_wfi(ESP32P4CPU *cpu, bool wfi)
 /* [spec:nuos:req:emu.esp32p4.lp-core] */
 void esp32p4_counters_reset(ESP32P4CPU *cpu)
 {
-    CtrTime now = ctr_now();
-
     cpu->cycles = 0;
-    cpu->cycles_ns = now.ns;
-    cpu->cycles_frac = now.frac;
+    esp32p4_counters_clock_changed(cpu);
+    ctr_restart(cpu, ctr_now());
     cpu->insns = 0;
     memset(cpu->ctr_base, 0, sizeof(cpu->ctr_base));
     memset(cpu->ctr_ref, 0, sizeof(cpu->ctr_ref));
-    memset(cpu->hpm, 0, sizeof(cpu->hpm));
+    memset(cpu->ev, 0, sizeof(cpu->ev));
+    memset(cpu->hpm_base, 0, sizeof(cpu->hpm_base));
+    memset(cpu->hpm_ref, 0, sizeof(cpu->hpm_ref));
+    memset(cpu->bht, 0, sizeof(cpu->bht));
+    cpu->bp_history = 0;
+    cpu->bus_wait_from = 0;
     cpu->mcountinhibit = 0;
     cpu->ctr_wfi = false;
 }

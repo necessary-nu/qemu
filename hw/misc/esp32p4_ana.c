@@ -255,8 +255,10 @@ static ESP32P4ClkPeriod esp32p4_ana_out_period(ESP32P4AnaState *s, int pll)
 
 static void esp32p4_ana_update_out(ESP32P4AnaState *s, int pll)
 {
+    ESP32P4ClkPeriod old = s->out_period[pll];
+
     s->out_period[pll] = esp32p4_ana_out_period(s, pll);
-    clock_update(s->out[pll], esp32p4_clk_period_clock(s->out_period[pll]));
+    esp32p4_clk_update(s->out[pll], old, s->out_period[pll]);
 }
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */

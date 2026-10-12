@@ -1678,6 +1678,18 @@ static void esp32p4_gpio_settle(void *opaque)
     } while (s->update_pending);
 }
 
+/* The changes held back at the time of the round, then their round. */
+static void esp32p4_gpio_settle_deferred(void *opaque)
+{
+    ESP32P4GpioState *s = opaque;
+
+    s->update_pending = false;
+    esp32_line_deferred_replay(&s->deferred, s->round_ns);
+    if (s->update_pending) {
+        esp32p4_gpio_settle(s);
+    }
+}
+
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
  * Resolve the pads until the routing settles. Every line this drives
@@ -1685,19 +1697,46 @@ static void esp32p4_gpio_settle(void *opaque)
  * own, and for one that carries none, such as a property or a clock, the
  * moment the resolution began. Every receiver of an edge, and every block
  * the edge reaches through others, times it alike, rather than each
- * reading the clock as it happens to run.
+ * reading the clock as it happens to run. A change that comes in while a
+ * round resolves, at that round's time, joins it; one at another time is
+ * held back (esp32p4_gpio_held_back()) and resolved after, the earliest
+ * first, in a round at its own time.
  */
 static void esp32p4_gpio_update(ESP32P4GpioState *s)
 {
+    int64_t when;
+
     if (s->updating) {
         s->update_pending = true;
         return;
     }
     s->updating = true;
-    esp32_line_run_at(esp32_line_time(), esp32p4_gpio_settle, s);
+    s->round_ns = esp32_line_time();
+    esp32_line_run_at(s->round_ns, esp32p4_gpio_settle, s);
+    while (esp32_line_deferred_next(&s->deferred, &when)) {
+        s->round_ns = when;
+        esp32_line_run_at(when, esp32p4_gpio_settle_deferred, s);
+    }
     s->update_pending = false;
     s->updating = false;
     filters_schedule(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * Whether a change to an input, which fn(s, n, level) takes, comes in
+ * while a round resolves at another time: it is then held back, to be
+ * resolved at its own time. Such a change is, for one, the edge of a
+ * source that was behind and catches up as it takes the round's change.
+ */
+static bool esp32p4_gpio_held_back(ESP32P4GpioState *s, Esp32LineInput *fn,
+                                   int n, int level)
+{
+    if (!s->updating || esp32_line_time() == s->round_ns) {
+        return false;
+    }
+    esp32_line_defer(&s->deferred, fn, s, n, level);
+    return true;
 }
 
 static void notify_route(ESP32P4GpioState *s)
@@ -2786,6 +2825,9 @@ static void esp32p4_gpio_pad_in(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_pad_in, n, level)) {
+        return;
+    }
     filters_catch_up(s, esp32_line_time());
     s->ext_driven |= 1ULL << n;
     s->ext_level = deposit64(s->ext_level, n, 1, level != 0);
@@ -2796,6 +2838,9 @@ static void esp32p4_gpio_pad_release(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_pad_release, n, level)) {
+        return;
+    }
     if (level) {
         filters_catch_up(s, esp32_line_time());
         s->ext_driven &= ~(1ULL << n);
@@ -2807,6 +2852,9 @@ static void esp32p4_gpio_set_sig_out(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_sig_out, n, level)) {
+        return;
+    }
     if (s->sig_out[n] == (level != 0)) {
         return;
     }
@@ -2819,6 +2867,9 @@ static void esp32p4_gpio_set_sig_oe(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_sig_oe, n, level)) {
+        return;
+    }
     filters_catch_up(s, esp32_line_time());
     s->sig_oe[n] = level != 0;
     esp32p4_gpio_update(s);
@@ -2828,6 +2879,9 @@ static void esp32p4_gpio_set_lp_sig_out(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_lp_sig_out, n, level)) {
+        return;
+    }
     if (s->lp_sig_out[n] == (level != 0)) {
         return;
     }
@@ -2840,6 +2894,9 @@ static void esp32p4_gpio_set_lp_sig_oe(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_lp_sig_oe, n, level)) {
+        return;
+    }
     filters_catch_up(s, esp32_line_time());
     s->lp_sig_oe[n] = level != 0;
     esp32p4_gpio_update(s);
@@ -2849,6 +2906,9 @@ static void esp32p4_gpio_set_iomux_out(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_iomux_out, n, level)) {
+        return;
+    }
     filters_catch_up(s, esp32_line_time());
     s->iomux_func_out[n] = level != 0;
     esp32p4_gpio_update(s);
@@ -2858,6 +2918,9 @@ static void esp32p4_gpio_set_iomux_oe(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_iomux_oe, n, level)) {
+        return;
+    }
     filters_catch_up(s, esp32_line_time());
     s->iomux_func_oe[n] = level != 0;
     esp32p4_gpio_update(s);
@@ -2867,6 +2930,9 @@ static void esp32p4_gpio_set_pull_up(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_pull_up, n, level)) {
+        return;
+    }
     filters_catch_up(s, esp32_line_time());
     s->ext_pull_up = deposit64(s->ext_pull_up, n, 1, level != 0);
     esp32p4_gpio_update(s);
@@ -2876,6 +2942,9 @@ static void esp32p4_gpio_set_hold(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_hold, n, level)) {
+        return;
+    }
     filters_catch_up(s, esp32_line_time());
     s->ext_hold = deposit64(s->ext_hold, n, 1, level != 0);
     esp32p4_gpio_update(s);
@@ -2886,6 +2955,9 @@ static void esp32p4_gpio_set_hold_all(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_hold_all, n, level)) {
+        return;
+    }
     s->hold_all[n] = level != 0;
     esp32p4_gpio_update(s);
 }
@@ -2894,6 +2966,9 @@ static void esp32p4_gpio_set_light_sleep(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_light_sleep, n, level)) {
+        return;
+    }
     filters_catch_up(s, esp32_line_time());
     s->light_sleep = level != 0;
     esp32p4_gpio_update(s);
@@ -2963,6 +3038,9 @@ static void esp32p4_gpio_set_ana_comp(void *opaque, int n, int level)
     int64_t quiet;
     qemu_irq etm = NULL;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_ana_comp, n, level)) {
+        return;
+    }
     if (s->ana_comp[n] == (level != 0)) {
         return;
     }
@@ -2995,6 +3073,9 @@ static void esp32p4_gpio_etm_task(void *opaque, int line, int level)
     unsigned ch = line / 3, kind = line % 3;
     uint64_t pads = 0, out;
 
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_etm_task, line, level)) {
+        return;
+    }
     if (!level) {
         return;
     }
@@ -3343,6 +3424,7 @@ static void esp32p4_gpio_init(Object *obj)
         ESP32P4_LP_IOMUX_SIZE,
     };
 
+    esp32_line_deferred_init(&s->deferred);
     for (unsigned i = 0; i < ARRAY_SIZE(s->iomem); i++) {
         s->region[i].s = s;
         s->region[i].block = i;
@@ -3617,12 +3699,18 @@ static void esp32p4_gpio_class_init(ObjectClass *klass, const void *data)
         "':', separated by ',' (e.g. \"7:9,8:10\")");
 }
 
+static void esp32p4_gpio_finalize(Object *obj)
+{
+    esp32_line_deferred_finalize(&ESP32P4_GPIO(obj)->deferred);
+}
+
 /* [spec:nuos:req:emu.esp32p4.gpio] */
 static const TypeInfo esp32p4_gpio_info = {
     .name = TYPE_ESP32P4_GPIO,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(ESP32P4GpioState),
     .instance_init = esp32p4_gpio_init,
+    .instance_finalize = esp32p4_gpio_finalize,
     .class_init = esp32p4_gpio_class_init,
 };
 

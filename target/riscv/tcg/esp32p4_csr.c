@@ -131,7 +131,8 @@
 #define ESP32P4_XTVEC_MODE_CLIC 3
 
 /* mhcr: the return stack, branch prediction and branch target buffer. */
-#define ESP32P4_MHCR_MASK (BIT(4) | BIT(5) | BIT(12))
+#define ESP32P4_MHCR_MASK \
+    (ESP32P4_MHCR_RS | ESP32P4_MHCR_BPE | ESP32P4_MHCR_BTB)
 
 /* mhint.SBE: load and store bus errors raise synchronous exceptions. */
 #define ESP32P4_MHINT_MASK BIT(20)
@@ -147,16 +148,10 @@
 #define ESP32P4_FXCR_DQNAN   BIT(23)
 #define ESP32P4_FXCR_RM_SHIFT 24
 
-/* mhpmevent8, 9 and 13: the event selector and the event each counts. */
+/* mhpmevent8, 9 and 13: the event selector of each one's counter. */
 #define ESP32P4_MHPMEVENT_MASK 0x1f
-static const struct {
-    int counter;
-    uint32_t event;
-    const char *what;
-} esp32p4_hpm_events[] = {
-    { 8, 0x6, "conditional branch mispredictions" },
-    { 9, 0x7, "conditional branch instructions" },
-    { 13, 0xb, "store instructions" },
+static const int esp32p4_hpm_counters[ESP32P4_HP_HPM_COUNTERS] = {
+    8, 9, 13,
 };
 
 /*
@@ -398,8 +393,8 @@ static RISCVException write_counter(CPURISCVState *env, int csrno,
 
 static int esp32p4_hpm_event_index(int csrno)
 {
-    for (int i = 0; i < ARRAY_SIZE(esp32p4_hpm_events); i++) {
-        if (csrno == CSR_MCOUNTINHIBIT + esp32p4_hpm_events[i].counter) {
+    for (int i = 0; i < ARRAY_SIZE(esp32p4_hpm_counters); i++) {
+        if (csrno == CSR_MCOUNTINHIBIT + esp32p4_hpm_counters[i]) {
             return i;
         }
     }
@@ -408,7 +403,7 @@ static int esp32p4_hpm_event_index(int csrno)
 
 /*
  * Only mhpmevent8, 9 and 13 exist on the HP core, each with a five-bit
- * selector of which one value is a valid event.
+ * selector of which one value is a valid event (esp32p4_counters.c).
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
 static RISCVException mhpmevent_predicate(CPURISCVState *env, int csrno)
@@ -435,15 +430,9 @@ static RISCVException write_mhpmevent(CPURISCVState *env, int csrno,
                                       target_ulong val, uintptr_t ra)
 {
     if (esp32p4_env_is_hp(env)) {
-        int i = esp32p4_hpm_event_index(csrno);
-
-        val &= ESP32P4_MHPMEVENT_MASK;
-        esp32p4_cpu_from_env(env)->mhpmevent[i] = val;
-        if (val == esp32p4_hpm_events[i].event) {
-            qemu_log_mask(LOG_UNIMP, "esp32p4: mhpmcounter%d does not count "
-                          "%s\n", esp32p4_hpm_events[i].counter,
-                          esp32p4_hpm_events[i].what);
-        }
+        esp32p4_counters_set_mhpmevent(esp32p4_cpu_from_env(env),
+                                       esp32p4_hpm_event_index(csrno),
+                                       val & ESP32P4_MHPMEVENT_MASK);
         return RISCV_EXCP_NONE;
     }
     return std_write(env, csrno, val, ra);
@@ -819,8 +808,8 @@ static RISCVException write_mhint(CPURISCVState *env, int csrno,
 }
 
 /*
- * mhcr only steers the branch predictor, which has no architectural
- * effect beyond the register itself.
+ * mhcr steers the branch predictor, which software sees only through
+ * mhpmcounter8's count of mispredictions (esp32p4_counters.c).
  */
 static RISCVException read_mhcr(CPURISCVState *env, int csrno,
                                 target_ulong *val)

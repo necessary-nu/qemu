@@ -10,6 +10,7 @@
 #define TARGET_RISCV_ESP32P4_CPU_H
 
 #include "target/riscv/cpu.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "target/riscv/esp32p4_pie.h"
 #include "qom/object.h"
 
@@ -114,6 +115,38 @@ typedef void (*ESP32P4LPBootFn)(void *opaque, uint32_t *pc,
 
 /* The HP core's event counters, mhpmcounter8, 9 and 13 (TRM 2.5). */
 #define ESP32P4_HP_HPM_COUNTERS 3
+
+/*
+ * The events the cores' event counters count (tcg/esp32p4_counters.c),
+ * by their place in ESP32P4CPU's ev[]: memory reads and writes, an
+ * unaligned one counted twice; store instructions; unconditional jumps;
+ * conditional branches, those taken, and those mispredicted; compressed
+ * instructions; and cycles waiting on the bus.
+ */
+enum {
+    ESP32P4_EV_MEM_READ,
+    ESP32P4_EV_MEM_WRITE,
+    ESP32P4_EV_STORE,
+    ESP32P4_EV_JUMP,
+    ESP32P4_EV_BRANCH,
+    ESP32P4_EV_TAKEN,
+    ESP32P4_EV_MISPREDICT,
+    ESP32P4_EV_COMPRESSED,
+    ESP32P4_EV_BUS_WAIT,
+    ESP32P4_EVENTS,
+};
+
+/* mhcr (TRM register 2.134): the return stack, BHT and BTB enables. */
+#define ESP32P4_MHCR_RS  BIT(4)
+#define ESP32P4_MHCR_BPE BIT(5)
+#define ESP32P4_MHCR_BTB BIT(12)
+
+/*
+ * The HP core's branch history table (TRM 2.12.1): a two-bit counter for
+ * each pattern of the last 13 conditional branches' outcomes.
+ */
+#define ESP32P4_BHT_HISTORY 13
+#define ESP32P4_BHT_ENTRIES (1 << ESP32P4_BHT_HISTORY)
 
 /* The HP core's PMP and PMA checker entries (TRM 2.10). */
 #define ESP32P4_PMP_ENTRIES 32
@@ -443,24 +476,40 @@ struct ESP32P4CPU {
 
     /*
      * Both cores' counters (tcg/esp32p4_counters.c). The core's clock
-     * (ESP32P4_CPU_CLK), and the cycles of it counted up to the virtual
-     * time cycles_ns plus cycles_frac 2^-32 ns, the end of the last whole
-     * cycle counted while the clock runs. insns counts the instructions
+     * (ESP32P4_CPU_CLK) at its exact period as it last changed
+     * (clk_period), and the cycles of it counted: cycles_synced of them
+     * since the clock's current run began at the virtual time cycles_ns
+     * plus cycles_frac 2^-32 ns, its last change, start or restart, or
+     * the present while it is stopped. insns counts the instructions
      * the core has started, less those that did not retire; the code
      * QEMU translates for the core adds to it. mcycle and minstret are
      * ctr_base[] plus the cycles or instructions since ctr_ref[] while
-     * they count, and ctr_base[] while mcountinhibit stops them; the
-     * event counters (mhpmcounter8, 9 and 13 on the HP core, 3 to 12 on
-     * the LP core) hold what is written.
+     * they count, and ctr_base[] while mcountinhibit stops them. ev[]
+     * counts the events (ESP32P4_EV_*) since the core's reset; the event
+     * counters (mhpmcounter8, 9 and 13 on the HP core, in that order, 3 to
+     * 12 on the LP core) are hpm_base[] plus the events since hpm_ref[]
+     * while they count, and hpm_base[] while they do not. The HP core's
+     * branch predictor: its branch history table, in the TRM's encoding
+     * (0 weakly not taken, 1 strongly not taken, 2 weakly taken, 3
+     * strongly taken), and the outcomes of the last conditional branches,
+     * the newest in bit 0. The cycle count at which the core began to
+     * wait on the bus.
      */
     Clock *clk;
+    ESP32P4ClkPeriod clk_period;
     uint64_t cycles;
+    uint64_t cycles_synced;
     int64_t cycles_ns;
     uint32_t cycles_frac;
     uint64_t insns;
     uint64_t ctr_base[2];
     uint64_t ctr_ref[2];
-    uint64_t hpm[ESP32P4_LP_HPM_COUNTERS];
+    uint64_t ev[ESP32P4_EVENTS];
+    uint64_t hpm_base[ESP32P4_LP_HPM_COUNTERS];
+    uint64_t hpm_ref[ESP32P4_LP_HPM_COUNTERS];
+    uint8_t bht[ESP32P4_BHT_ENTRIES];
+    uint32_t bp_history;
+    uint64_t bus_wait_from;
     uint32_t mcountinhibit;
     /* The counters have seen the HP core enter WFI, and not yet leave. */
     bool ctr_wfi;
@@ -537,9 +586,10 @@ bool esp32p4_cpu_mid_block(void);
  * it, not having taken the access. The core stops at the instruction
  * making the access, which it has not made, and neither runs nor takes an
  * interrupt until the device calls esp32p4_cpu_bus_release(); then it
- * makes the access again, unless an interrupt pending by then comes
- * first. Its clock, and its cycle counter, run on meanwhile. A reset of
- * the core ends its wait.
+ * makes the access again, and only then takes an interrupt pending by
+ * then, as the access completes before the instruction after it. Its
+ * clock, and its cycle counter, run on meanwhile. A reset of the core
+ * ends its wait.
  */
 ESP32P4CPU *esp32p4_cpu_bus_waiter(MemTxAttrs attrs);
 MemTxResult esp32p4_cpu_bus_hold(ESP32P4CPU *cpu);
@@ -603,17 +653,27 @@ void esp32p4_trace_trap(ESP32P4CPU *cpu, uint32_t epc, uint32_t cause,
 
 /*
  * esp32p4_counters.c: both cores' counters. The counters' CSRs, which the
- * chip's CSR table hands over; the core's state changing, with the BQL
- * held: before its reset or clock enable changes or its clock changes
- * rate (esp32p4_counters_update()), and as an HP core enters WFI and
- * as it leaves; and its reset.
+ * chip's CSR table hands over, and mhpmevent8, 9 and 13 as they are
+ * written (esp32p4_counters_set_mhpmevent()); the core's state changing,
+ * with the BQL held: before its reset or clock enable changes or its
+ * clock changes rate (esp32p4_counters_update()), once its clock has
+ * changed (esp32p4_counters_clock_changed()), as an HP core enters WFI
+ * and as it leaves, and as the core begins and ends a wait on the bus
+ * (esp32p4_counters_bus_wait()); and its reset. Whether the HP core's
+ * code is to run the branch predictor, which it does while mhpmcounter8
+ * counts mispredictions (esp32p4_counters_predicting()), and
+ * helper_esp32p4_branch() for each conditional branch it then executes.
  */
 RISCVException esp32p4_counters_read(CPURISCVState *env, int csrno,
                                      target_ulong *val);
 RISCVException esp32p4_counters_write(CPURISCVState *env, int csrno,
                                       target_ulong val);
 void esp32p4_counters_update(ESP32P4CPU *cpu);
+void esp32p4_counters_clock_changed(ESP32P4CPU *cpu);
 void esp32p4_counters_wfi(ESP32P4CPU *cpu, bool wfi);
+void esp32p4_counters_set_mhpmevent(ESP32P4CPU *cpu, int n, uint32_t val);
+bool esp32p4_counters_predicting(ESP32P4CPU *cpu);
+void esp32p4_counters_bus_wait(ESP32P4CPU *cpu, bool wait);
 void esp32p4_counters_reset(ESP32P4CPU *cpu);
 
 /* esp32p4_pie.c */

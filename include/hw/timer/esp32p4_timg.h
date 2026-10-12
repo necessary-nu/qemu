@@ -134,18 +134,19 @@ typedef struct ESP32P4TimgCal {
     /*
      * The measurement under way: one-shot or cycling, whether the measured
      * clock's first edge has come, the cycles to count, the measured
-     * clock's cycles and XTAL_CLK's counted since it did, up to the
-     * measured clock's cycle @first (of the timer group's @cal_edges; the
-     * first edge's, before it comes), and the time of its next event; and
-     * for its timeout, XTAL_CLK's cycles since it began, up to XTAL_CLK's
-     * cycle @xtal_first (of @xtal_edges).
+     * clock's cycles counted since it did, up to the measured clock's
+     * cycle @first (of the timer group's @cal_edges; the first edge's,
+     * before it comes), XTAL_CLK's edges by that first edge (of the timer
+     * group's @xtal_base on), and the time of its next event; and for its
+     * timeout, XTAL_CLK's cycles since it began, up to XTAL_CLK's cycle
+     * @xtal_first (of @xtal_edges).
      */
     bool active;
     bool oneshot;
     bool counting;
     uint32_t target;
     uint64_t cycles;
-    uint64_t xtal;
+    uint64_t xtal_at_first;
     uint64_t first;
     int64_t event_ns;
     uint64_t since_start;
@@ -163,9 +164,13 @@ struct ESP32P4TimgState {
 
     Clock *xtal;
     Clock *cal_clk;
-    /* XTAL_CLK's and the measured clock's cycles since their last change. */
+    /*
+     * XTAL_CLK's and the measured clock's cycles since their last change,
+     * and XTAL_CLK's before it, since the timer group's reset.
+     */
     ESP32P4ClkCount xtal_edges;
     ESP32P4ClkCount cal_edges;
+    uint64_t xtal_base;
     qemu_irq irq[ESP32P4_TIMG_TIMERS + 1];
     qemu_irq etm_event[ESP32P4_TIMG_TIMERS];
     qemu_irq cpu_reset[ESP32P4_CLKRST_HP_CORES];

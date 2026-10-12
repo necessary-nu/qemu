@@ -100,6 +100,22 @@ int64_t icount_round(int64_t count);
  */
 void icount_set_cpu_clock(CPUState *cpu, Clock *clk);
 
+/**
+ * icount_set_cpu_period_frac: give the exact period of a CPU's clock
+ * @cpu: the CPU, with a clock from icount_set_cpu_clock()
+ * @frac: the fraction of a Clock unit the exact period has beyond the
+ *   clock's period, @frac / @den, below 1
+ * @den: its denominator, not 0
+ *
+ * A Clock holds its period as a whole number of 2^-32 ns units. For a
+ * clock whose period is not one, the machine that knows it exactly gives
+ * the fraction of a unit beyond, after each change of the clock: @cpu's
+ * instructions then take the exact period each of its own time, the
+ * fractions carried from one to the next, so that n of them take n exact
+ * periods to within a unit however large n is.
+ */
+void icount_set_cpu_period_frac(CPUState *cpu, uint64_t frac, uint64_t den);
+
 /* if the CPUs are idle, start accounting real time to virtual clock. */
 void icount_start_warp_timer(void);
 void icount_account_warp_timer(void);

@@ -446,10 +446,20 @@ struct qemu_work_item;
  *   per cycle of, or NULL to execute one every 2^shift ns. Set with
  *   icount_set_cpu_clock().
  * @icount_period: The period of @icount_clock, in Clock units (2^-32 ns).
+ * @icount_period_frac: The fraction of a Clock unit by which the clock's
+ *   exact period exceeds @icount_period, @icount_period_frac /
+ *   @icount_period_den; 0 for a whole number of units. Set with
+ *   icount_set_cpu_period_frac().
+ * @icount_period_den: The denominator of @icount_period_frac.
+ * @icount_time_rem: The CPU's instructions' time beyond what they have
+ *   accounted for, in 1/@icount_insn_den of a Clock unit.
  * @icount_insn_time: The time one instruction of the current run takes,
  *   in Clock units: of the CPU's own time if it has an icount clock (and
  *   of virtual time as its icount window says), or 0 for 2^shift ns of
  *   virtual time. Written only by the vCPU thread when it prepares a run.
+ * @icount_insn_frac: The fraction of a unit each instruction of the
+ *   current run takes beyond @icount_insn_time, in 1/@icount_insn_den.
+ * @icount_insn_den: The denominator of @icount_insn_frac.
  * @icount_in_window: Under icount, the CPU takes part in the window of
  *   virtual time the CPUs with an icount clock run through together.
  * @icount_window_idle: It went idle in that window, which counts it as
@@ -522,7 +532,12 @@ struct CPUState {
     int64_t icount_extra;
     Clock *icount_clock;
     uint64_t icount_period;
+    uint64_t icount_period_frac;
+    uint64_t icount_period_den;
+    uint64_t icount_time_rem;
     uint64_t icount_insn_time;
+    uint64_t icount_insn_frac;
+    uint64_t icount_insn_den;
     bool icount_in_window;
     bool icount_window_idle;
     int64_t icount_own;

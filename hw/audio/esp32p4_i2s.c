@@ -2634,9 +2634,11 @@ static void i2s_update_pad_mclk(ESP32P4I2sState *s)
         period = esp32p4_clk_exact(src->mst_clk);
     }
     if (!esp32p4_clk_period_eq(s->pad_mclk_period, period)) {
+        ESP32P4ClkPeriod old = s->pad_mclk_period;
+
         s->pad_mclk_period = period;
         s->mclk_busy = true;
-        clock_update(s->pad_mclk, esp32p4_clk_period_clock(period));
+        esp32p4_clk_update(s->pad_mclk, old, period);
         s->mclk_busy = false;
     }
 }

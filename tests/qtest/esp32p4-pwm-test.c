@@ -28,6 +28,7 @@
 #define ETM_SYS_CLK_EN      (1u << 24)
 #define MCPWM0_CLK_EN       (1u << 2)
 #define MCPWM0_DIV(d)       ((uint32_t)(d) << 3)
+#define PCNT_APB_CLK_EN     (1u << 30)
 #define MCPWM1_CLK_EN       (1u << 13)
 #define MCPWM_CLK_MASK      0x003fffffu
 #define LEDC_CLK_EN         (1u << 2)
@@ -150,7 +151,15 @@
 #define SIG_PWM0_OUT(k, b)  (89 + 2 * (k) + (b))
 #define SIG_PWM0_F(n)       (92 + (n))
 #define SIG_PWM1_CAP(n)     (104 + (n))
+#define SIG_PCNT_CH0(u)     (141 + (u))
 #define GPIO_PATH           "/machine/gpio"
+
+#define PCNT                0x500c9000
+#define PCNT_CONF0(u)       (PCNT + 0x0c * (u))
+#define PCNT_CNT(u)         (PCNT + 0x30 + 4 * (u))
+#define PCNT_CTRL           (PCNT + 0x60)
+#define PCNT_POS_INC(ch)    (1u << (18 + 8 * (ch)))
+#define PCNT_CNT_RST(u)     (1u << (2 * (u)))
 
 #define INTMTX_STATUS1      0x500d6204
 #define SRC_PWM0            38
@@ -749,6 +758,156 @@ static void test_mcpwm_etm(void)
     qtest_quit(qts);
 }
 
+/*
+ * PWM_clk at 40 MHz, XTAL_CLK undivided: every edge comes at its own
+ * cycle however close it is to others. In a 1 us period, A is high from
+ * TEZ for 4 cycles and rises 2 cycles late (RED 1); B, its inverse, rises
+ * 3 cycles late (FED 2): B falls at TEZ, A rises 50 ns later and falls
+ * at 100 ns, and B rises at 175 ns. The pads show each edge at its
+ * nanosecond; MCPWM1's capture channels, counting XTAL_CLK, time them;
+ * PCNT unit 0 counts every rising edge of A.
+ */
+/* [spec:nuos:req:emu.esp32p4.pwm/test] */
+static void test_mcpwm_close_edges(void)
+{
+    QTestState *qts = start();
+    uint32_t c0, c1, c2;
+    int64_t t0, t;
+
+    qtest_irq_intercept_out_named(qts, GPIO_PATH, "pad");
+    pad_out(qts, 21, SIG_PWM0_OUT(0, 0));
+    pad_out(qts, 22, SIG_PWM0_OUT(0, 1));
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_PWM1_CAP(0)), IN_SIG_IN_SEL | 21);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_PWM1_CAP(1)), IN_SIG_IN_SEL | 21);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_PWM1_CAP(2)), IN_SIG_IN_SEL | 22);
+    pwr(qts, 1, CAP_TIMER_CFG, 1);
+    pwr(qts, 1, CAP_CH_CFG(0), 1 | (1 << 2));
+    pwr(qts, 1, CAP_CH_CFG(1), 1 | (1 << 1));
+    pwr(qts, 1, CAP_CH_CFG(2), 1 | (1 << 2));
+    qtest_writel(qts, SOC_CLK_CTRL2, qtest_readl(qts, SOC_CLK_CTRL2) |
+                 PCNT_APB_CLK_EN);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_PCNT_CH0(0)), IN_SIG_IN_SEL | 21);
+    /* Rising edges counted up, unfiltered */
+    qtest_writel(qts, PCNT_CONF0(0), PCNT_POS_INC(0));
+    qtest_writel(qts, PCNT_CTRL, PCNT_CNT_RST(0));
+    qtest_writel(qts, PCNT_CTRL, 0);
+
+    pwr(qts, 0, CLK_CFG, 0);
+    pwr(qts, 0, OP(0, TSTMP_A), 4);
+    pwr(qts, 0, OP(0, GEN_A), ACT(UTEZ, HIGH) | ACT(UTEA, LOW));
+    pwr(qts, 0, OP(0, DT_RED), 1);
+    pwr(qts, 0, OP(0, DT_FED), 2);
+    pwr(qts, 0, OP(0, DT_CFG), 1u << 14);
+    pwr(qts, 0, TIMER_CFG0(0), CFG0(0, 39, 0));
+    pwr(qts, 0, TIMER_CFG1(0), CFG1(START_RUN, MOD_UP));
+    t0 = now;
+
+    for (int m = 1; m <= 3; m++) {
+        t = t0 + m * US;
+        step_to(qts, t - 1);
+        g_assert_true(qtest_get_irq(qts, 22));
+        g_assert_false(qtest_get_irq(qts, 21));
+        step_to(qts, t);
+        g_assert_false(qtest_get_irq(qts, 22));
+        step_to(qts, t + 49);
+        g_assert_false(qtest_get_irq(qts, 21));
+        step_to(qts, t + 50);
+        g_assert_true(qtest_get_irq(qts, 21));
+        step_to(qts, t + 99);
+        g_assert_true(qtest_get_irq(qts, 21));
+        step_to(qts, t + 100);
+        g_assert_false(qtest_get_irq(qts, 21));
+        step_to(qts, t + 174);
+        g_assert_false(qtest_get_irq(qts, 22));
+        step_to(qts, t + 175);
+        g_assert_true(qtest_get_irq(qts, 22));
+    }
+    c0 = prd(qts, 1, CAP_CH(0));
+    c1 = prd(qts, 1, CAP_CH(1));
+    c2 = prd(qts, 1, CAP_CH(2));
+    g_assert_cmpuint(c1 - c0, ==, 2);
+    g_assert_cmpuint(c2 - c1, ==, 3);
+
+    /* A thousand periods on: a thousand and three rising edges of A */
+    step_to(qts, t0 + 1003 * US + 500);
+    g_assert_cmpuint(qtest_readl(qts, PCNT_CNT(0)), ==, 1003);
+    g_assert_cmpuint(prd(qts, 1, CAP_CH(1)) - prd(qts, 1, CAP_CH(0)), ==, 2);
+
+    qtest_quit(qts);
+}
+
+/*
+ * A change of PWM_clk's rate keeps the PWM_clk cycle in progress: the
+ * divider keeps the MCPWM0_CLK cycles it has counted into it, and counts
+ * the rest at the new rate. MCPWM0_CLK at 10 MHz (XTAL_CLK by 4), by
+ * CLK_PRESCALE + 1 = 10: PWM_clk 1 MHz, timer 0 counting it.
+ */
+/* [spec:nuos:req:emu.esp32p4.pwm/test] */
+static void test_mcpwm_rate_change(void)
+{
+    QTestState *qts = start();
+    uint32_t v = qtest_readl(qts, PERI_CLK_CTRL20) & ~MCPWM_CLK_MASK;
+    int64_t t0, tc;
+
+    qtest_writel(qts, PERI_CLK_CTRL20, v | MCPWM0_CLK_EN | MCPWM0_DIV(3));
+    pwr(qts, 0, CLK_CFG, 9);
+    pwr(qts, 0, TIMER_CFG0(0), CFG0(0, 999, 0));
+    pwr(qts, 0, TIMER_CFG1(0), CFG1(START_RUN, MOD_UP));
+    t0 = now;
+    step_to(qts, t0 + 13 * US - 1);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 12);
+    step_to(qts, t0 + 13 * US);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 13);
+
+    /*
+     * 250 ns into PWM_clk cycle 14, two and a half MCPWM0_CLK cycles,
+     * MCPWM0_CLK doubles to 20 MHz: the two whole cycles stay counted,
+     * the eight left take 400 ns, and the clock's own cycles start afresh
+     * from the change, as every block counting it takes them.
+     */
+    tc = t0 + 13 * US + 250;
+    step_to(qts, tc);
+    qtest_writel(qts, PERI_CLK_CTRL20, v | MCPWM0_CLK_EN | MCPWM0_DIV(1));
+    step_to(qts, tc + 399);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 13);
+    step_to(qts, tc + 400);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 14);
+    step_to(qts, tc + 900);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 15);
+
+    /*
+     * 175 ns into cycle 18 (at tc + 1900), three and a half 50 ns cycles,
+     * CLK_PRESCALE becomes 4: MCPWM0_CLK runs on as it was, and the cycle
+     * ends at its fifth, 250 ns in; from there every 250 ns.
+     */
+    step_to(qts, tc + 2075);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 17);
+    pwr(qts, 0, CLK_CFG, 4);
+    step_to(qts, tc + 2149);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 17);
+    step_to(qts, tc + 2150);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 18);
+    step_to(qts, tc + 2400);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 19);
+
+    /*
+     * Three cycles into the next (175 ns after tc + 2650), CLK_PRESCALE
+     * becomes 1, a division by 2 that those three cycles already exceed:
+     * the cycle ends at the next MCPWM0_CLK cycle, then every 100 ns.
+     */
+    step_to(qts, tc + 2825);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 20);
+    pwr(qts, 0, CLK_CFG, 1);
+    step_to(qts, tc + 2849);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 20);
+    step_to(qts, tc + 2850);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 21);
+    step_to(qts, tc + 2950);
+    g_assert_cmpuint(prd(qts, 0, TIMER_STATUS(0)), ==, 22);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -763,6 +922,8 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4-pwm/mcpwm/deadtime", test_mcpwm_deadtime);
     qtest_add_func("esp32p4-pwm/mcpwm/capture-ledc", test_mcpwm_capture_ledc);
     qtest_add_func("esp32p4-pwm/mcpwm/etm", test_mcpwm_etm);
+    qtest_add_func("esp32p4-pwm/mcpwm/close-edges", test_mcpwm_close_edges);
+    qtest_add_func("esp32p4-pwm/mcpwm/rate-change", test_mcpwm_rate_change);
 
     return g_test_run();
 }

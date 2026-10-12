@@ -87,6 +87,7 @@
 #include "qapi/error.h"
 #include "migration/vmstate.h"
 #include "system/tcg.h"
+#include "exec/translation-block.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "target/riscv/esp32p4_cpu.h"
 #include "internals.h"
@@ -237,7 +238,8 @@ MemTxResult esp32p4_cpu_bus_hold(ESP32P4CPU *cpu)
  * A failed access that a device holds: the core unwinds to the start of
  * the instruction, which has not retired (esp32p4_restore_state_to_opc())
  * and executes again when the core goes on, as QEMU's MIPS ITC storage
- * blocks a core.
+ * blocks a core. Its wait begins once it has given back the
+ * instruction's cycle.
  */
 static void esp32p4_cpu_bus_wait_check(CPUState *cs, uintptr_t retaddr)
 {
@@ -248,13 +250,22 @@ static void esp32p4_cpu_bus_wait_check(CPUState *cs, uintptr_t retaddr)
     }
     cpu->bus_hold = false;
     qatomic_set(&cpu->bus_wait, true);
+    cpu_restore_state(cs, retaddr);
+    esp32p4_counters_bus_wait(cpu, true);
     cs->halted = 1;
     cs->exception_index = EXCP_HLT;
-    cpu_loop_exit_restore(cs, retaddr);
+    cpu_loop_exit(cs);
 }
 #endif
 
-/* Run on the core: its access may go through now. */
+/*
+ * Run on the core: its access may go through now. The access completes
+ * before the core takes an interrupt, one pending by now included: the
+ * core makes it again in a block of that one instruction, translated not
+ * to take interrupts first (CF_NOIRQ), as cpu_io_recompile() replays an
+ * instruction.
+ */
+/* [spec:nuos:req:emu.esp32p4.machine] */
 static void esp32p4_cpu_bus_go(CPUState *cs, run_on_cpu_data data)
 {
     ESP32P4CPU *cpu = ESP32P4_CPU(cs);
@@ -263,6 +274,10 @@ static void esp32p4_cpu_bus_go(CPUState *cs, run_on_cpu_data data)
         return;
     }
     qatomic_set(&cpu->bus_wait, false);
+#ifdef CONFIG_TCG
+    esp32p4_counters_bus_wait(cpu, false);
+    cs->cflags_next_tb = cs->tcg_cflags | CF_NOIRQ | 1;
+#endif
     if (!esp32p4_cpu_held(cpu) && !cpu->clock_halted) {
         cs->halted = 0;
     }
@@ -783,8 +798,8 @@ static G_NORETURN void esp32p4_do_unaligned_access(CPUState *cs, vaddr addr,
  * The hardware loop and PIE state the translation of a block depends on:
  * whether the loop instructions may be used, and whether a loop counts;
  * whether the PIE instructions may be used, and whether the PIE state is
- * already dirty; whether the debug assistant monitors SP; and whether the
- * trace encoder traces the core.
+ * already dirty; whether the debug assistant monitors SP; whether the
+ * trace encoder traces the core; and whether the branch predictor runs.
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
 /* [spec:nuos:req:emu.esp32p4.pie] */
@@ -816,6 +831,9 @@ static TCGTBCPUState esp32p4_hp_get_tb_cpu_state(CPUState *cs)
     }
     if (qatomic_read(&cpu->trace_en)) {
         s.cs_base = FIELD_DP64(s.cs_base, EXT_TB_FLAGS, ESP32P4_TRACE, 1);
+    }
+    if (esp32p4_counters_predicting(cpu)) {
+        s.cs_base = FIELD_DP64(s.cs_base, EXT_TB_FLAGS, ESP32P4_BPRED, 1);
     }
     return s;
 }
@@ -915,10 +933,17 @@ static void esp32p4_cpu_reset_exit(Object *obj, ResetType type)
 }
 
 #ifdef CONFIG_TCG
-/* The core's clock is about to change rate: count at the old one first. */
+/*
+ * The core's clock is about to change rate: count at the old one first;
+ * then count, and execute, at the new one.
+ */
 static void esp32p4_cpu_clk_update(void *opaque, ClockEvent event)
 {
-    esp32p4_counters_update(opaque);
+    if (event == ClockPreUpdate) {
+        esp32p4_counters_update(opaque);
+    } else {
+        esp32p4_counters_clock_changed(opaque);
+    }
 }
 #endif
 
@@ -933,7 +958,7 @@ static void esp32p4_cpu_init(Object *obj)
 #ifdef CONFIG_TCG
     ESP32P4_CPU(obj)->clk = qdev_init_clock_in(DEVICE(obj), ESP32P4_CPU_CLK,
                                                esp32p4_cpu_clk_update, obj,
-                                               ClockPreUpdate);
+                                               ClockPreUpdate | ClockUpdate);
 #endif
 }
 
@@ -1091,19 +1116,42 @@ static const VMStateDescription vmstate_esp32p4_lp_state = {
     },
 };
 
+/* The exact period the core executes at under icount, as it counts. */
+static int esp32p4_counters_post_load(void *opaque, int version_id)
+{
+    ESP32P4CPU *cpu = opaque;
+    ESP32P4ClkPeriod p = cpu->clk_period;
+    uint64_t lo = p.num_lo, hi = p.num_hi;
+
+    if (esp32p4_clk_period_running(p)) {
+        icount_set_cpu_period_frac(CPU(cpu), divu128(&lo, &hi, p.den), p.den);
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_esp32p4_counters = {
     .name = "esp32p4-cpu/counters",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 3,
+    .minimum_version_id = 3,
+    .post_load = esp32p4_counters_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4CPU),
+        VMSTATE_UINT64(clk_period.num_hi, ESP32P4CPU),
+        VMSTATE_UINT64(clk_period.num_lo, ESP32P4CPU),
+        VMSTATE_UINT64(clk_period.den, ESP32P4CPU),
         VMSTATE_UINT64(cycles, ESP32P4CPU),
+        VMSTATE_UINT64(cycles_synced, ESP32P4CPU),
         VMSTATE_INT64(cycles_ns, ESP32P4CPU),
         VMSTATE_UINT32(cycles_frac, ESP32P4CPU),
         VMSTATE_UINT64(insns, ESP32P4CPU),
         VMSTATE_UINT64_ARRAY(ctr_base, ESP32P4CPU, 2),
         VMSTATE_UINT64_ARRAY(ctr_ref, ESP32P4CPU, 2),
-        VMSTATE_UINT64_ARRAY(hpm, ESP32P4CPU, ESP32P4_LP_HPM_COUNTERS),
+        VMSTATE_UINT64_ARRAY(ev, ESP32P4CPU, ESP32P4_EVENTS),
+        VMSTATE_UINT64_ARRAY(hpm_base, ESP32P4CPU, ESP32P4_LP_HPM_COUNTERS),
+        VMSTATE_UINT64_ARRAY(hpm_ref, ESP32P4CPU, ESP32P4_LP_HPM_COUNTERS),
+        VMSTATE_UINT8_ARRAY(bht, ESP32P4CPU, ESP32P4_BHT_ENTRIES),
+        VMSTATE_UINT32(bp_history, ESP32P4CPU),
+        VMSTATE_UINT64(bus_wait_from, ESP32P4CPU),
         VMSTATE_UINT32(mcountinhibit, ESP32P4CPU),
         VMSTATE_BOOL(ctr_wfi, ESP32P4CPU),
         VMSTATE_END_OF_LIST()
