@@ -865,6 +865,8 @@ static void esp32_uart_reset_exit(Object *obj, ResetType type)
 
     uart_update_lines(s, false);
     esp32_uart_update_irq(s);
+    /* A terminal sees the reset's baud rate and the emptied RX FIFO. */
+    notifier_list_notify(&s->format_notifiers, s);
 }
 
 static void esp32_uart_realize(DeviceState *dev, Error **errp)
