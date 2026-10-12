@@ -273,6 +273,9 @@ static bool trans_cm_push(DisasContext *ctx, arg_cm_push *a)
             tcg_gen_subi_tl(addr, addr, reg_size);
         }
     }
+#ifndef CONFIG_USER_ONLY
+    gen_esp32p4_store_insn(ctx);
+#endif
 
     tcg_gen_subi_tl(sp, sp, stack_adj);
     gen_set_gpr(ctx, xSP, sp);

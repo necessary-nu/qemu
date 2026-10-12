@@ -150,6 +150,14 @@ typedef struct DisasContext {
     bool trace;
     /* An ESP32-P4 core: it counts the instructions it retires. */
     bool esp32p4_insns;
+    /*
+     * An ESP32-P4 HP core, or the LP core, whose event counters count the
+     * events its code reports; and an HP core whose conditional branches
+     * run the branch predictor.
+     */
+    bool esp32p4_hp;
+    bool esp32p4_lp;
+    bool esp32p4_bpred;
 } DisasContext;
 
 static inline bool has_ext(DisasContext *ctx, uint32_t ext)
@@ -283,6 +291,15 @@ static void gen_update_pc(DisasContext *ctx, target_long diff)
 
 #ifndef CONFIG_USER_ONLY
 static void gen_esp32p4_count_insn(DisasContext *ctx, int n);
+static void gen_esp32p4_mem_event(DisasContext *ctx, bool write, TCGv addr,
+                                  MemOp memop);
+static void gen_esp32p4_amo_event(DisasContext *ctx);
+static void gen_esp32p4_sc_event(DisasContext *ctx, TCGv failed);
+static void gen_esp32p4_store_insn(DisasContext *ctx);
+static void gen_esp32p4_jump_event(DisasContext *ctx);
+static void gen_esp32p4_branch_event(DisasContext *ctx);
+static void gen_esp32p4_branch_outcome(DisasContext *ctx, bool taken);
+static void gen_esp32p4_insn_done(DisasContext *ctx);
 #endif
 
 static void generate_exception(DisasContext *ctx, RISCVException excp)
@@ -709,6 +726,7 @@ static void gen_jal(DisasContext *ctx, int rd, target_ulong imm)
     if (ctx->cfg_ptr->ext_smctr || ctx->cfg_ptr->ext_ssctr) {
         gen_ctr_jal(ctx, rd, imm);
     }
+    gen_esp32p4_jump_event(ctx);
 #endif
 
     gen_pc_plus_diff(succ_pc, ctx, ctx->cur_insn_len);
@@ -1258,6 +1276,8 @@ static bool gen_amo(DisasContext *ctx, arg_atomic *a,
     func(dest, src1, src2, ctx->mem_idx, mop);
 #ifdef CONFIG_USER_ONLY
     gen_riscv_invalidate_reservations(src1, mop);
+#else
+    gen_esp32p4_amo_event(ctx);
 #endif
 
     gen_set_gpr(ctx, a->rd, dest);
@@ -1468,7 +1488,11 @@ static void riscv_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->spmon = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, ESP32P4_SPMON);
     ctx->trace = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, ESP32P4_TRACE);
 #ifndef CONFIG_USER_ONLY
-    ctx->esp32p4_insns = esp32p4_env_is_hp(env) || esp32p4_env_is_lp(env);
+    ctx->esp32p4_hp = esp32p4_env_is_hp(env);
+    ctx->esp32p4_lp = esp32p4_env_is_lp(env);
+    ctx->esp32p4_insns = ctx->esp32p4_hp || ctx->esp32p4_lp;
+    ctx->esp32p4_bpred = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS,
+                                    ESP32P4_BPRED);
 #endif
 }
 
@@ -1504,6 +1528,9 @@ static void riscv_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 #endif
     decode_opc(env, ctx);
 #ifndef CONFIG_USER_ONLY
+    if (ctx->base.is_jmp != DISAS_NORETURN) {
+        gen_esp32p4_insn_done(ctx);
+    }
     if (ctx->hwlp_armed && ctx->base.is_jmp == DISAS_NEXT) {
         gen_esp32p4_hwlp_check(ctx);
     }

@@ -168,6 +168,7 @@ static bool trans_jalr(DisasContext *ctx, arg_jalr *a)
     if (ctx->cfg_ptr->ext_smctr || ctx->cfg_ptr->ext_ssctr) {
         gen_ctr_jalr(ctx, a, target_pc);
     }
+    gen_esp32p4_jump_event(ctx);
 #endif
 
     tcg_gen_mov_tl(cpu_pc, target_pc);
@@ -273,6 +274,9 @@ static bool gen_branch(DisasContext *ctx, arg_b *a, TCGCond cond)
     TCGv src2 = get_gpr(ctx, a->rs2, EXT_SIGN);
     target_ulong orig_pc_save = ctx->pc_save;
 
+#ifndef CONFIG_USER_ONLY
+    gen_esp32p4_branch_event(ctx);
+#endif
     if (get_xl(ctx) == MXL_RV128) {
         TCGv src1h = get_gprh(ctx, a->rs1);
         TCGv src2h = get_gprh(ctx, a->rs2);
@@ -295,6 +299,7 @@ static bool gen_branch(DisasContext *ctx, arg_b *a, TCGCond cond)
         gen_pc_plus_diff(dest, ctx, ctx->cur_insn_len);
         gen_helper_ctr_add_entry(tcg_env, src, dest, type);
     }
+    gen_esp32p4_branch_outcome(ctx, false);
 #endif
 
     gen_goto_tb(ctx, 1, ctx->cur_insn_len);
@@ -321,6 +326,7 @@ static bool gen_branch(DisasContext *ctx, arg_b *a, TCGCond cond)
             gen_pc_plus_diff(dest, ctx, a->imm);
             gen_helper_ctr_add_entry(tcg_env, src, dest, type);
         }
+        gen_esp32p4_branch_outcome(ctx, true);
 #endif
         gen_goto_tb(ctx, 0, a->imm);
     }
@@ -366,6 +372,9 @@ static bool gen_load_tl(DisasContext *ctx, arg_lb *a, MemOp memop)
     TCGv addr = get_address(ctx, a->rs1, a->imm);
 
     tcg_gen_qemu_ld_tl(dest, addr, ctx->mem_idx, memop);
+#ifndef CONFIG_USER_ONLY
+    gen_esp32p4_mem_event(ctx, false, addr, memop);
+#endif
     gen_set_gpr(ctx, a->rd, dest);
     return true;
 }
@@ -491,6 +500,9 @@ static bool gen_store_tl(DisasContext *ctx, arg_sb *a, MemOp memop)
     tcg_gen_qemu_st_tl(data, addr, ctx->mem_idx, memop);
 #ifdef CONFIG_USER_ONLY
     gen_riscv_invalidate_reservations(addr, memop);
+#else
+    gen_esp32p4_mem_event(ctx, true, addr, memop);
+    gen_esp32p4_store_insn(ctx);
 #endif
     return true;
 }
