@@ -327,7 +327,8 @@
  *   - The 2D-DMA controller (TRM chapter 8) at 0x50088000, behind
  *     DMA2D_SYS_CLK, which also clocks its transfers, and its reset, four
  *     TX and three RX channels, their interrupts sources 104 to 108, 128
- *     and 129, its ETM events and tasks the ETM's; its accesses go
+ *     and 129 (ESP-IDF's 133 and 134, by their mapping registers at 0x214
+ *     and 0x218), its ETM events and tasks the ETM's; its accesses go
  *     through the DMA APM as the 2D-DMA masters, to memory directly, past
  *     the caches. A peripheral served by it attaches as
  *     include/hw/dma/esp32p4_dma2d.h describes. The pixel-processing
@@ -2744,7 +2745,7 @@ static void esp32p4_sw_sys_reset(void *opaque, int n, int level)
  *     taking their resets for its PC records.
  *   - The AXI performance monitor (0x500A8000), behind AXI_PERF_MON_SYS_CLK
  *     and its reset, counting SYS_CLK, the AXI matrix's clock, its
- *     interrupt AXI_PERF_MON_INTR (source 130).
+ *     interrupt AXI_PERF_MON_INTR (source 130, ESP-IDF's 135).
  *   - Each HP core's trace encoder (0x3FF04000, 0x3FF05000), behind
  *     TRACE_CPU_CLK and its RST_EN_CORETRACE<n> reset, its AHB master on
  *     TRACE_SYS_CLK writing the trace memory through the access permission
