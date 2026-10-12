@@ -383,7 +383,8 @@ qtests_riscv32 = \
      'esp32p4-boot-uart-test', 'esp32p4-boot-esptool-test',
      'esp32p4-boot-usb-test', 'esp32p4-adc-test',
      'esp32p4-tsens-test', 'esp32p4-touch-test',
-     'esp32p4-ana-cmpr-test', 'esp32p4-lp-rom-test'] :
+     'esp32p4-ana-cmpr-test', 'esp32p4-lp-rom-test',
+     'esp32p4-image-source-test'] :
     [])
 
 qtests_riscv64 = ['riscv-csr-test'] + \
@@ -507,6 +508,7 @@ qtests = {
   'esp32p4-boot-uart-test': files('esp32p4-boot-utils.c'),
   'esp32p4-boot-esptool-test': files('esp32p4-boot-utils.c'),
   'esp32p4-boot-usb-test': files('esp32p4-boot-utils.c'),
+  'esp32p4-image-source-test': [zlib],
   'ivshmem-test': [rt, '../../contrib/ivshmem-server/ivshmem-server.c'],
   'migration-test': test_migration_files + migration_tls_files + migration_colo_files,
   'pxe-test': files('boot-sector.c'),
