@@ -33,6 +33,13 @@
  * of up to 64 bytes, one each time software has read the last one out
  * (SERIAL_OUT_RECV_PKT, SERIAL_OUT_EP_DATA_AVAIL).
  *
+ * Every transaction and frame happens at its own virtual time: a register
+ * access, and the chardev's traffic, first complete what fell due before
+ * them, so that without icount software polling SERIAL_IN_EP_DATA_FREE
+ * sees the IN buffer free once its transaction is over however late the
+ * host runs the model's timers, as the boot ROM's 5 ms wait for it
+ * (usb_serial_device_tx_one_char) needs.
+ *
  * The host never changes DTR and RTS in the sequences of TRM table 54.3-2
  * that reset the chip or set the download flag, so neither happens. The
  * JTAG function (its endpoints, command processor and response capture)
@@ -181,6 +188,7 @@ static const UsjRegInfo usj_regs[ESP32P4_USJ_NREGS] = {
 
 static void usj_host_update(ESP32P4UsjState *s);
 static void usj_xfer_try(ESP32P4UsjState *s);
+static void usj_catch_up(ESP32P4UsjState *s);
 
 static int64_t now_ns(void)
 {
@@ -481,6 +489,7 @@ static gboolean usj_chr_writable(void *do_not_use, GIOCondition cond,
     ESP32P4UsjState *s = opaque;
 
     s->watch = 0;
+    usj_catch_up(s);
     usj_to_host_flush(s);
     usj_xfer_try(s);
     return G_SOURCE_REMOVE;
@@ -488,11 +497,11 @@ static gboolean usj_chr_writable(void *do_not_use, GIOCondition cond,
 
 /*
  * [spec:nuos:req:emu.esp32p4.uart]
- * Start the next bulk transaction if the bus is free: the flushed IN
+ * Start the next bulk transaction at @t if the bus is free: the flushed IN
  * buffer to a host with room for it, else, once software has read the
  * last OUT packet, the host's next bytes as an OUT packet.
  */
-static void usj_xfer_try(ESP32P4UsjState *s)
+static void usj_xfer_try_at(ESP32P4UsjState *s, int64_t t)
 {
     if (s->xfer_busy || !usj_port_open(s) || !usj_usb_running(s)) {
         return;
@@ -502,7 +511,7 @@ static void usj_xfer_try(ESP32P4UsjState *s)
         s->xfer_busy = true;
         s->xfer_in = true;
         s->xfer_len = s->in_len;
-        s->xfer_end = now_ns() + xact_ns(s->in_len);
+        s->xfer_end = t + xact_ns(s->in_len);
         s->int_raw |= INT_IN_TOKEN_EP1;
     } else if (!usj_out_avail(s) && !fifo8_is_empty(&s->from_host)) {
         uint32_t n = MIN(fifo8_num_used(&s->from_host), ESP32P4_USJ_EP_SIZE);
@@ -513,7 +522,7 @@ static void usj_xfer_try(ESP32P4UsjState *s)
         for (uint32_t i = 0; i < n; i++) {
             s->xfer_buf[i] = fifo8_pop(&s->from_host);
         }
-        s->xfer_end = now_ns() + xact_ns(n);
+        s->xfer_end = t + xact_ns(n);
         qemu_chr_fe_accept_input(&s->chr);
     } else {
         return;
@@ -522,13 +531,20 @@ static void usj_xfer_try(ESP32P4UsjState *s)
     usj_update_irq(s);
 }
 
-static void usj_xfer_timer_cb(void *opaque)
+static void usj_xfer_try(ESP32P4UsjState *s)
 {
-    ESP32P4UsjState *s = opaque;
+    usj_xfer_try_at(s, now_ns());
+}
 
-    if (!s->xfer_busy) {
-        return;
-    }
+/*
+ * The transaction under way ends at xfer_end. The next starts then: every
+ * change since that could start one (a flush, the host's bytes) came
+ * through usj_catch_up(), which ends this one first.
+ */
+static void usj_xfer_end(ESP32P4UsjState *s)
+{
+    int64_t end = s->xfer_end;
+
     s->xfer_busy = false;
     if (s->xfer_in) {
         fifo8_push_all(&s->to_host, s->in_buf, s->xfer_len);
@@ -541,8 +557,35 @@ static void usj_xfer_timer_cb(void *opaque)
         s->out_rd = 0;
         s->int_raw |= s->xfer_len ? INT_OUT_RECV_PKT : INT_OUT_EP1_ZERO;
     }
-    usj_xfer_try(s);
+    usj_xfer_try_at(s, end);
     usj_update_irq(s);
+}
+
+static void usj_xfer_timer_cb(void *opaque)
+{
+    ESP32P4UsjState *s = opaque;
+
+    usj_catch_up(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.uart]
+ * Complete every transaction, and run the host's frame, that fell due by
+ * now, each at its own time, however late the host has run their timers.
+ */
+static void usj_catch_up(ESP32P4UsjState *s)
+{
+    int64_t now = now_ns();
+
+    while (s->xfer_busy && s->xfer_end <= now) {
+        timer_del(&s->xfer_timer);
+        usj_xfer_end(s);
+    }
+    if (timer_pending(&s->host_timer) &&
+        timer_expire_time_ns(&s->host_timer) <= now) {
+        timer_del(&s->host_timer);
+        usj_host_timer_cb(s);
+    }
 }
 
 static int usj_chr_can_receive(void *opaque)
@@ -556,6 +599,7 @@ static void usj_chr_receive(void *opaque, const uint8_t *buf, int size)
 {
     ESP32P4UsjState *s = opaque;
 
+    usj_catch_up(s);
     for (int i = 0; i < size && !fifo8_is_full(&s->from_host); i++) {
         fifo8_push(&s->from_host, buf[i]);
     }
@@ -568,6 +612,7 @@ static void usj_chr_event(void *opaque, QEMUChrEvent event)
     ESP32P4UsjState *s = opaque;
 
     if (event == CHR_EVENT_OPENED || event == CHR_EVENT_CLOSED) {
+        usj_catch_up(s);
         s->line_state_pending = true;
         usj_host_update(s);
         usj_xfer_try(s);
@@ -595,6 +640,7 @@ static uint64_t usj_read(void *opaque, hwaddr addr, unsigned size)
                       "reserved offset 0x%" HWADDR_PRIx "\n", addr);
         return 0;
     }
+    usj_catch_up(s);
     switch (addr) {
     case A_EP1:
         if (!usj_out_avail(s)) {
@@ -678,6 +724,7 @@ static void usj_write(void *opaque, hwaddr addr, uint64_t value,
                       "reserved offset 0x%" HWADDR_PRIx "\n", addr);
         return;
     }
+    usj_catch_up(s);
     switch (addr) {
     case A_EP1:
         if (s->in_flushed) {
@@ -770,6 +817,7 @@ static void usj_usb48_update(void *opaque, ClockEvent event)
 {
     ESP32P4UsjState *s = opaque;
 
+    usj_catch_up(s);
     usj_host_update(s);
     usj_xfer_try(s);
 }

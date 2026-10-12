@@ -1,5 +1,6 @@
 /*
- * QTest testcase for the ESP32-P4 boot ROM's download over the USB OTG
+ * QTest testcase for the ESP32-P4 boot ROM's download over the USB OTG,
+ * and its loader's commands over USB Serial/JTAG as esptool drives them
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -10,6 +11,9 @@
 #include <sys/un.h>
 #include "libqtest.h"
 #include "esp32p4-boot-utils.h"
+
+#define USJ_CHIP_RST        0x500d204c
+#define CHIP_RST_DTR        (1u << 1)
 
 /*
  * A unix socket the test listens on, for a chardev QEMU connects as a
@@ -93,10 +97,63 @@ static void test_usb_otg_download(void)
     }
 }
 
+/*
+ * The ROM's loader in joint download boot over USB Serial/JTAG
+ * (esp_port_check_loader()), under icount or on the host's clock, where
+ * the models' timers run as late as the host makes them: 4 KiB, 1024
+ * READ_REG round trips, each response a bulk IN transfer the ROM waits
+ * at most 5 ms to send. The host enumerates the port and opens it (DTR)
+ * before esptool sends anything, as on a computer.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+/* [spec:nuos:req:emu.esp32p4.boot/test] */
+static void run_usj_loader(bool icount)
+{
+    g_autofree char *dir = g_dir_make_tmp("esp32p4-boot-XXXXXX", NULL);
+    g_autofree char *path = g_strdup_printf("%s/sock", dir);
+    int srv = qtest_socket_server(path);
+    EspPort p = { .rx = g_byte_array_new() };
+    int i;
+
+    p.qts = qtest_initf("-M esp32p4,strap-mode=0x04 %s -serial none "
+                        "-chardev socket,id=usj,path=%s "
+                        "-global esp32p4-usb-serial-jtag.chardev=usj",
+                        esp_timing(icount), path);
+    p.fd = accept(srv, NULL, NULL);
+    g_assert_cmpint(p.fd, >=, 0);
+    close(srv);
+    unlink(path);
+    rmdir(dir);
+    for (i = 0; i < 300; i++) {
+        if (qtest_readl(p.qts, USJ_CHIP_RST) & CHIP_RST_DTR) {
+            break;
+        }
+        g_usleep(100 * 1000);
+    }
+    g_assert_cmpint(i, <, 300);
+    esp_port_check_loader(&p, 4);
+    close(p.fd);
+    qtest_quit(p.qts);
+    g_byte_array_free(p.rx, true);
+}
+
+static void test_usj_loader_icount(void)
+{
+    run_usj_loader(true);
+}
+
+static void test_usj_loader_host_clock(void)
+{
+    run_usj_loader(false);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
 
     qtest_add_func("/esp32p4/boot/usb-otg-download", test_usb_otg_download);
+    qtest_add_func("/esp32p4/boot/usj-loader/icount", test_usj_loader_icount);
+    qtest_add_func("/esp32p4/boot/usj-loader/host-clock",
+                   test_usj_loader_host_clock);
     return g_test_run();
 }
