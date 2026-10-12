@@ -103,6 +103,7 @@
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "hw/core/irq.h"
+#include "hw/block/power_cut.h"
 #include "migration/vmstate.h"
 #include "system/block-backend.h"
 #include "system/runstate.h"
@@ -533,19 +534,10 @@ static void cells_changed(M25Chip *c, uint32_t off, uint32_t len, bool now)
     }
 }
 
-static uint32_t cell_hash(uint32_t h)
-{
-    h ^= h >> 16;
-    h *= 0x85ebca6b;
-    h ^= h >> 13;
-    h *= 0xc2b2ae35;
-    h ^= h >> 16;
-    return h;
-}
-
 /*
  * Leave `op`'s cells as they are `done` ns into it: each cell done once
- * the fraction of the cycle passed exceeds its hash's fraction of 2^32.
+ * the fraction of the cycle passed exceeds its hash's fraction of 2^32
+ * (hw/block/power_cut.h).
  */
 /* [spec:nuos:req:emu.flash-timing] */
 /* [spec:nuos:req:emu.flash-power-cut] */
@@ -560,17 +552,10 @@ static void op_partial(M25Chip *c, const M25ChipOp *op, int64_t done,
     if (done <= 0) {
         return;
     }
-    thr = done >= op->total ? UINT32_MAX
-                            : ((uint64_t)done << 32) / op->total;
+    thr = power_cut_threshold(done, op->total);
     for (i = 0; i < op->len; i++) {
-        uint8_t mask = 0;
-        int b;
+        uint8_t mask = power_cut_done_mask(bit0 + i * 8, thr);
 
-        for (b = 0; b < 8; b++) {
-            if (cell_hash(bit0 + i * 8 + b) < thr) {
-                mask |= 1 << b;
-            }
-        }
         if (erase_kind(op->kind)) {
             cells[i] |= mask;
         } else {
