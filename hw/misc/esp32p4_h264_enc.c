@@ -434,6 +434,7 @@ static void alloc_planes(H264Enc *e, int mb_w, int mb_h)
     e->alloc_h = mb_h;
 }
 
+/* [spec:nuos:req:emu.esp32p4.h264] */
 void h264e_begin(H264Enc *e, const H264EncConfig *cfg, const uint8_t *hdr,
                  int hdr_len, uint8_t rem, int rem_len)
 {
@@ -460,6 +461,7 @@ void h264e_begin(H264Enc *e, const H264EncConfig *cfg, const uint8_t *hdr,
     e->mvm_total = 0;
 }
 
+/* [spec:nuos:req:emu.esp32p4.h264] */
 void h264e_finish(H264Enc *e)
 {
     if (!e->cfg.intra && e->skip_run) {
@@ -2509,6 +2511,7 @@ static void deblock_row(H264Enc *e, int r)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.h264] */
 void h264e_code_row(H264Enc *e, int r)
 {
     e->mvm_n = 0;

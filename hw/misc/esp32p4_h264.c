@@ -1232,6 +1232,7 @@ static void h264_frame_done(ESP32P4H264State *s, int64_t now)
  * The end of a row: its results to the RX channels, or held back while
  * one they need is not running.
  */
+/* [spec:nuos:req:emu.esp32p4.h264] */
 static void h264_row_write(ESP32P4H264State *s, int64_t now)
 {
     H264Enc *e = &s->enc;
@@ -1330,6 +1331,7 @@ static void h264_row_write(ESP32P4H264State *s, int64_t now)
 }
 
 /* The start of a row: its inputs, read only when all are there. */
+/* [spec:nuos:req:emu.esp32p4.h264] */
 static void h264_row_read(ESP32P4H264State *s, int64_t now)
 {
     H264Enc *e = &s->enc;
@@ -1444,6 +1446,7 @@ static void h264_seq_config(ESP32P4H264State *s, int seq, H264EncConfig *c)
 }
 
 /* FRAME_START */
+/* [spec:nuos:req:emu.esp32p4.h264] */
 static void h264_frame_start(ESP32P4H264State *s, int64_t now)
 {
     bool dual = s->gop_conf & GOP_DUAL;
