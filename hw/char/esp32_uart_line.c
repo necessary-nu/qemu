@@ -296,6 +296,13 @@ void esp32_uart_line_add_format_notifier(Object *uart, Notifier *n)
     ESP32_UART_LINE_IF_GET_CLASS(uart)->add_format_notifier(uart, n);
 }
 
+unsigned esp32_uart_line_rx_room(Object *uart)
+{
+    Esp32UartLineIfClass *lc = ESP32_UART_LINE_IF_GET_CLASS(uart);
+
+    return lc->rx_room ? lc->rx_room(uart) : UINT_MAX;
+}
+
 /* [spec:nuos:req:emu.esp32.gpio] */
 /* [spec:nuos:req:emu.esp32p4.uart] */
 static const TypeInfo esp32_uart_line_if_info = {

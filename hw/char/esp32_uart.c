@@ -112,6 +112,23 @@ static void uart_line_add_format_notifier(Object *obj, Notifier *n)
     notifier_list_add(&ESP32_UART(obj)->format_notifiers, n);
 }
 
+/* The frames the RX FIFO can take (see esp32_uart_line_rx_room()). */
+static unsigned uart_line_rx_room(Object *obj)
+{
+    return fifo8_num_free(&ESP32_UART(obj)->rx_fifo);
+}
+
+/*
+ * Software took bytes from the RX FIFO, @was the room before: a terminal
+ * holding the host's bytes for want of room can send them now.
+ */
+static void uart_rx_room_made(ESP32UARTState *s, unsigned was)
+{
+    if (was < 2 && fifo8_num_free(&s->rx_fifo) >= 2) {
+        notifier_list_notify(&s->format_notifiers, s);
+    }
+}
+
 /*
  * [spec:nuos:req:emu.esp32.clock-gating]
  * Baud rate = baud clock * 16 / (CLKDIV * 16 + CLKDIV_FRAG), with the baud
@@ -514,7 +531,10 @@ static uint64_t uart_reg_read(ESP32UARTState *s, hwaddr addr)
             r = 0xEE;
             error_report("esp_uart: read UART FIFO while it is empty");
         } else {
+            unsigned was = fifo8_num_free(&s->rx_fifo);
+
             r = fifo8_pop(&s->rx_fifo);
+            uart_rx_room_made(s, was);
             uart_update_lines(s, true);
             esp32_uart_update_irq(s);
         }
@@ -756,12 +776,14 @@ unsigned esp32_uart_dma_rx_count(ESP32UARTState *s)
 /* [spec:nuos:req:emu.esp32.uhci] Take a byte from the RX FIFO for the UHCI. */
 uint8_t esp32_uart_dma_rx_pop(ESP32UARTState *s)
 {
+    unsigned was = fifo8_num_free(&s->rx_fifo);
     uint8_t byte;
 
     if (fifo8_is_empty(&s->rx_fifo)) {
         return 0;
     }
     byte = fifo8_pop(&s->rx_fifo);
+    uart_rx_room_made(s, was);
     uart_update_lines(s, true);
     esp32_uart_update_irq(s);
     return byte;
@@ -952,6 +974,7 @@ static void esp32_uart_class_init(ObjectClass *klass, const void *data)
     dc->vmsd = &vmstate_esp32_uart;
     lc->get_format = uart_line_get_format;
     lc->add_format_notifier = uart_line_add_format_notifier;
+    lc->rx_room = uart_line_rx_room;
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] */
