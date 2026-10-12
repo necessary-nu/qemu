@@ -60,6 +60,11 @@ struct RP2350ClkRegsClass {
                   uint32_t value);
     /* Resets state beyond the register file. */
     void (*reset_hold)(RP2350ClkRegsState *s);
+    /*
+     * Takes the block's events due by the present, before a register
+     * access: without icount their timers run late.
+     */
+    void (*catch_up)(RP2350ClkRegsState *s);
 };
 
 /*
