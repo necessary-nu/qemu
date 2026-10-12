@@ -29,8 +29,9 @@
  * them (and 80 more for SEND_INITIALIZATION), the card answers after 2,
  * its response is 48 or 136; a data block is its bits over the bus width
  * (halved in DDR mode), with a start bit, 16 CRC bits and an end bit, and
- * 2 clocks of access time before it; a written block is followed by the
- * card's CRC status, 8 clocks. A card's response timeout (TMOUT's
+ * the card's access time before it (2 clocks for a card that does not
+ * time its data); a written block is followed by the card's CRC status,
+ * 8 clocks. A card's response timeout (TMOUT's
  * RESPONSE_TIMEOUT) and data timeout (DATA_TIMEOUT) count its clock. The
  * register writes software makes, the IDMAC's descriptor and buffer
  * accesses and the FIFO's moves take no time: the bus clock is many times
@@ -82,7 +83,17 @@
  * (ACD). A command with STOP_ABORT_CMD ends the transfer in progress.
  * With CARDTHRCTL's CARDRDTHREN, a read block starts only when the FIFO
  * has CARDTHRESHOLD bytes free; with BUSY_CLR_INT_EN a write raises the
- * busy clear interrupt (BCI) as it ends.
+ * busy clear interrupt (BCI) once the card releases DAT0 after it.
+ *
+ * Cards that take time (hw/sd/sd.c). A card that holds DAT0 low while it
+ * programs or erases is busy: STATUS.DATA_BUSY shows it, a command with
+ * WAIT_PRVDATA_COMPLETE waits for it to end, and a write's next block
+ * goes out only once the card takes it. A read's block starts when the
+ * card's access time says; a data timeout that runs out first ends the
+ * read with DRTO, and a start bit that comes as it runs out is taken. A
+ * read block's bytes leave the card as they cross the bus, so that it
+ * counts its next block's access time from that block's end. The card
+ * takes the present on the bus and its clock's edges from the controller.
  *
  * The FIFO is FIFO_DEPTH words. With CTRL.DMA_ENABLE clear, software
  * moves the data through BUFFIFO (0x200): the receive data request (RXDR)
@@ -343,6 +354,7 @@ enum {
 };
 
 static void dwc_sdmmc_update(DWCSDMMCState *s);
+static void dwc_card_watch(DWCSDMMCState *s);
 
 static uint32_t dwc_fifo_cap(DWCSDMMCState *s)
 {
@@ -900,6 +912,16 @@ static void dwc_cmd_issue(DWCSDMMCState *s, uint32_t cmd, uint32_t arg,
                       s->data_slot);
     }
 
+    /*
+     * The bytes of a read chunk on the bus are the card's before a
+     * command reaches it: one that stops or resets it must not take them.
+     */
+    if (bus && slot == s->data_slot && s->chunk_busy && !s->data_write &&
+        !s->chunk_fetched) {
+        sdbus_read_data(bus, s->chunk, s->chunk_len);
+        s->chunk_fetched = true;
+    }
+
     req.cmd = index;
     req.arg = arg;
     req.crc = 0;
@@ -1109,7 +1131,8 @@ static void dwc_data_end(DWCSDMMCState *s, uint32_t rint, bool normal)
         s->blk_fault = 0;
     }
     if (s->data_write && (s->cardthrctl & CARDTHRCTL_BUSY_CLR_EN)) {
-        rint |= INT_SBE_BCI;
+        /* Busy clear: once the card releases DAT0 after the last block. */
+        s->bci_pending = true;
     }
     dwc_raise(s, rint | INT_DTO);
     if (normal && s->data_autostop) {
@@ -1159,8 +1182,8 @@ static uint32_t dwc_rx_fault(DWCSDMMCState *s)
 /*
  * [spec:nuos:req:emu.esp32p4.sd-uhs]
  * The @n bytes read into chunk as the host sampled them, by dwc_rx_fault()
- * @fault: all 0 (their CRC matching, the end bit not) or a bit late on
- * each line.
+ * @fault as it stood when they started: all 0 (their CRC matching, the end
+ * bit not) or a bit late on each line.
  */
 static void dwc_rx_sampled(DWCSDMMCState *s, bool block_start, uint32_t n,
                            uint32_t fault)
@@ -1217,11 +1240,12 @@ static void dwc_block_end(DWCSDMMCState *s)
 }
 
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */
+/* [spec:nuos:req:emu.sd-card-timing] */
 /* Start the next chunk on the card bus, or wait for what it needs. */
 static void dwc_data_kick(DWCSDMMCState *s)
 {
-    uint32_t n, room, block_left, fault;
-    uint64_t div, cycles;
+    uint32_t n, room, block_left;
+    uint64_t div, cycles, nac = 0;
     SDBus *bus = dwc_bus(s, s->data_slot);
     bool block_start, block_end, stalled;
 
@@ -1245,6 +1269,8 @@ static void dwc_data_kick(DWCSDMMCState *s)
             dwc_timeout_arm(s, TIMEOUT_DRTO);
             return;
         }
+        /* A card that times its data starts it as it is ready. */
+        nac = sdbus_data_ready_time(bus) ? 0 : NAC_CYCLES;
         room = dwc_fifo_free(s);
         stalled = room < MIN(n, 4) ||
                   (block_start && (s->cardthrctl & CARDTHRCTL_RD_EN) &&
@@ -1257,17 +1283,25 @@ static void dwc_data_kick(DWCSDMMCState *s)
         if (n > 4 && n < block_left) {
             n &= ~3;
         }
-        fault = dwc_rx_fault(s);
+        s->chunk_fault = dwc_rx_fault(s);
         if (!block_start && !sdbus_data_ready(bus)) {
             /* The card stopped mid-block: the host samples idle lines. */
             memset(s->chunk, 0xff, n);
             s->card_error = true;
             dwc_raise(s, INT_DCRC);
+            s->chunk_fetched = true;
         } else {
-            sdbus_read_data(bus, s->chunk, n);
+            /* The card gives the bytes as they cross the bus, at the end. */
+            s->chunk_fetched = false;
         }
-        dwc_rx_sampled(s, block_start, n, fault);
     } else {
+        /*
+         * The card programs the block before: DAT0 is low until it can
+         * take the next.
+         */
+        if (block_start && bus && sdbus_busy_end_time(bus) > dwc_now()) {
+            return;
+        }
         if (!s->fifo_count) {
             dwc_timeout_arm(s, TIMEOUT_HTO);
             return;
@@ -1280,7 +1314,7 @@ static void dwc_data_kick(DWCSDMMCState *s)
     block_end = n == block_left;
     cycles = dwc_data_cycles(s, s->data_slot, n);
     if (block_start) {
-        cycles += (s->data_write ? NWR_CYCLES : NAC_CYCLES) + 1;
+        cycles += (s->data_write ? NWR_CYCLES : nac) + 1;
     }
     if (block_end && !s->data_stream) {
         cycles += CRC_CYCLES + 1 + (s->data_write ? CRC_STATUS_CYCLES : 0);
@@ -1302,6 +1336,11 @@ static void dwc_data_run(void *opaque)
     }
     s->chunk_busy = false;
     if (!s->data_write) {
+        if (!s->chunk_fetched && bus) {
+            sdbus_read_data(bus, s->chunk, n);
+        }
+        s->chunk_fetched = true;
+        dwc_rx_sampled(s, s->data_block_pos == 0, n, s->chunk_fault);
         dwc_fifo_push(s, s->chunk, n);
     } else {
         if (s->data_block_pos == 0 && !(bus && sdbus_receive_ready(bus))) {
@@ -1345,7 +1384,12 @@ static void dwc_timeout_run(void *opaque)
         return;
     }
     if (kind == TIMEOUT_DRTO) {
-        dwc_data_end(s, INT_DRTO, false);
+        SDBus *bus = dwc_bus(s, s->data_slot);
+
+        /* A start bit as the count runs out is taken: the data comes. */
+        if (!(bus && sdbus_data_ready(bus))) {
+            dwc_data_end(s, INT_DRTO, false);
+        }
     } else if (kind == TIMEOUT_HTO) {
         /* Once per stall: the FIFO's next move ends it. */
         s->timeout_kind = TIMEOUT_HTO_RAISED;
@@ -1549,6 +1593,73 @@ static void dwc_fifo_requests(DWCSDMMCState *s)
     }
 }
 
+/* [spec:nuos:req:emu.sd-card-timing] */
+/* A write's busy clear, raised once its card is no longer busy */
+static void dwc_bci_check(DWCSDMMCState *s)
+{
+    SDBus *bus = dwc_bus(s, s->data_slot);
+
+    if (s->bci_pending &&
+        !(bus && sdbus_busy_end_time(bus) > dwc_now())) {
+        s->bci_pending = false;
+        s->rintsts |= INT_SBE_BCI;
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.sd-card-timing]
+ * A card that takes time: wake when what waits on it can go on, a read
+ * block when the card starts it, a written block, a command waiting for
+ * the previous data (WAIT_PRVDATA) or a busy clear when the card releases
+ * DAT0. A timeout or anything else that happens first takes its turn.
+ */
+static void dwc_card_watch(DWCSDMMCState *s)
+{
+    int64_t now = dwc_now(), when = INT64_MAX, t;
+    SDBus *bus;
+
+    bus = dwc_bus(s, s->data_slot);
+    if (bus && s->data_active && s->data_started && !s->chunk_busy &&
+        s->data_block_pos == 0) {
+        t = s->data_write ? sdbus_busy_end_time(bus)
+                          : sdbus_data_ready_time(bus);
+        if (t > now) {
+            when = MIN(when, t);
+        }
+    }
+    if (bus && s->bci_pending) {
+        t = sdbus_busy_end_time(bus);
+        if (t > now) {
+            when = MIN(when, t);
+        }
+    }
+    bus = dwc_bus(s, CMD_CARD_NUM(s->cmd));
+    if (bus && s->cmd_phase == DWC_CMD_IDLE && (s->cmd & CMD_START) &&
+        !(s->cmd & CMD_UPDATE_CLK) && (s->cmd & CMD_WAIT_PRVDATA)) {
+        t = sdbus_busy_end_time(bus);
+        if (t > now) {
+            when = MIN(when, t);
+        }
+    }
+    if (when == INT64_MAX) {
+        timer_del(&s->card_timer);
+    } else {
+        dwc_arm(&s->card_timer, &s->card_due, when);
+    }
+}
+
+static void dwc_card_run(void *opaque)
+{
+    dwc_sdmmc_update(opaque);
+}
+
+static void dwc_card_timer(void *opaque)
+{
+    DWCSDMMCState *s = opaque;
+
+    dwc_run_event(s, s->card_due, dwc_card_run, s);
+}
+
 /*
  * Bring every path up to date after a change: the command waiting for
  * the CIU, the data path, the IDMAC and the FIFO requests, until none of
@@ -1577,6 +1688,8 @@ static void dwc_sdmmc_update(DWCSDMMCState *s)
     dwc_fifo_requests(s);
     dwc_volt_check(s);
     dwc_cmd_try_take(s);
+    dwc_bci_check(s);
+    dwc_card_watch(s);
     dwc_sdio_irq_update(s);
     dwc_sdmmc_update_irq(s);
 }
@@ -1639,6 +1752,7 @@ static void dwc_controller_reset(DWCSDMMCState *s)
     s->autostop_busy = false;
     s->data_active = false;
     s->chunk_busy = false;
+    s->bci_pending = false;
     s->xfer_dir = XFER_NONE;
     s->blk_fault = 0;
     s->volt_wait = 0;
@@ -2297,6 +2411,7 @@ static void dwc_catch_up(DWCSDMMCState *s, int64_t now)
         DWC_EARLIEST(&s->reset_timer, s->reset_due, dwc_reset_run);
         DWC_EARLIEST(&s->cmd_timer, s->cmd_due, dwc_cmd_run);
         DWC_EARLIEST(&s->data_timer, s->data_due, dwc_data_run);
+        DWC_EARLIEST(&s->card_timer, s->card_due, dwc_card_run);
         DWC_EARLIEST(&s->timeout_timer, s->timeout_due, dwc_timeout_run);
         for (unsigned slot = 0; slot < DWC_SDMMC_MAX_SLOTS; slot++) {
             DWC_EARLIEST(&s->debounce_timer[slot], s->debounce_due[slot],
@@ -2350,6 +2465,44 @@ static void dwc_card_irq(DeviceState *dev, unsigned slot, bool level)
     s->card_irq = deposit32(s->card_irq, slot, 1, level);
     dwc_sdio_irq_update(s);
     dwc_sdmmc_update_irq(s);
+}
+
+/* [spec:nuos:req:emu.sd-card-power-cut] */
+void dwc_sdmmc_set_card_power(DWCSDMMCState *s, unsigned slot, bool on)
+{
+    dwc_catch_up(s, dwc_now());
+    sdbus_set_power(&s->sdbus[slot], on);
+    dwc_sdmmc_update(s);
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/* The present for a card on the bus: this model's, dwc_now(). */
+static int64_t dwc_bus_get_time(DeviceState *dev)
+{
+    return dwc_now();
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/* @cycles of @slot's card clock, as the CIU has it, from @from */
+static int64_t dwc_bus_clock_after(DeviceState *dev, unsigned slot,
+                                   int64_t from, uint64_t cycles)
+{
+    DWCSDMMCState *s = DWC_SDMMC(dev);
+    uint64_t div = dwc_card_div(s, slot);
+
+    return div ? dwc_cclk_after(s, from, cycles * div) : INT64_MAX;
+}
+
+static int64_t dwc_bus_clock_after0(DeviceState *dev, int64_t from,
+                                    uint64_t cycles)
+{
+    return dwc_bus_clock_after(dev, 0, from, cycles);
+}
+
+static int64_t dwc_bus_clock_after1(DeviceState *dev, int64_t from,
+                                    uint64_t cycles)
+{
+    return dwc_bus_clock_after(dev, 1, from, cycles);
 }
 
 static void dwc_card_irq0(DeviceState *dev, bool level)
@@ -2469,6 +2622,7 @@ static void dwc_sdmmc_init(Object *obj)
                   dwc_debounce_timer0, s);
     timer_init_ns(&s->debounce_timer[1], QEMU_CLOCK_VIRTUAL,
                   dwc_debounce_timer1, s);
+    timer_init_ns(&s->card_timer, QEMU_CLOCK_VIRTUAL, dwc_card_timer, s);
     /*
      * Inputs no one drives: card present, writable, no SDIO interrupt,
      * pads at 3.3 V.
@@ -2514,6 +2668,7 @@ static void dwc_sdmmc_reset_hold(Object *obj, ResetType type)
     for (unsigned slot = 0; slot < DWC_SDMMC_MAX_SLOTS; slot++) {
         timer_del(&s->debounce_timer[slot]);
     }
+    timer_del(&s->card_timer);
     s->in_event = false;
 
     s->ctrl = s->ctrl_reset;
@@ -2570,6 +2725,8 @@ static void dwc_sdmmc_reset_hold(Object *obj, ResetType type)
     s->data_active = false;
     s->data_started = false;
     s->chunk_busy = false;
+    s->chunk_fetched = false;
+    s->bci_pending = false;
     s->timeout_kind = TIMEOUT_NONE;
     s->xfer_dir = XFER_NONE;
     s->card_error = false;
@@ -2601,8 +2758,8 @@ static void dwc_sdmmc_reset_exit(Object *obj, ResetType type)
 
 const VMStateDescription vmstate_dwc_sdmmc = {
     .name = TYPE_DWC_SDMMC,
-    .version_id = 4,
-    .minimum_version_id = 4,
+    .version_id = 5,
+    .minimum_version_id = 5,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER(cmd_timer, DWCSDMMCState),
         VMSTATE_TIMER(data_timer, DWCSDMMCState),
@@ -2616,6 +2773,8 @@ const VMStateDescription vmstate_dwc_sdmmc = {
         VMSTATE_INT64(reset_due, DWCSDMMCState),
         VMSTATE_INT64_ARRAY(debounce_due, DWCSDMMCState,
                             DWC_SDMMC_MAX_SLOTS),
+        VMSTATE_TIMER(card_timer, DWCSDMMCState),
+        VMSTATE_INT64(card_due, DWCSDMMCState),
         VMSTATE_UINT32(ctrl, DWCSDMMCState),
         VMSTATE_UINT32(pwren, DWCSDMMCState),
         VMSTATE_UINT32(clkdiv, DWCSDMMCState),
@@ -2684,11 +2843,14 @@ const VMStateDescription vmstate_dwc_sdmmc = {
         VMSTATE_BOOL(chunk_busy, DWCSDMMCState),
         VMSTATE_UINT32(chunk_len, DWCSDMMCState),
         VMSTATE_UINT8_ARRAY(chunk, DWCSDMMCState, 512),
+        VMSTATE_BOOL(chunk_fetched, DWCSDMMCState),
+        VMSTATE_BOOL(bci_pending, DWCSDMMCState),
         VMSTATE_UINT32(timeout_kind, DWCSDMMCState),
         VMSTATE_UINT32(xfer_dir, DWCSDMMCState),
         VMSTATE_BOOL(card_error, DWCSDMMCState),
         VMSTATE_UINT32(blk_fault, DWCSDMMCState),
         VMSTATE_UINT8(shift_carry, DWCSDMMCState),
+        VMSTATE_UINT32(chunk_fault, DWCSDMMCState),
         VMSTATE_UINT8_ARRAY(fifo, DWCSDMMCState,
                             DWC_SDMMC_MAX_FIFO_WORDS * 4),
         VMSTATE_UINT32(fifo_head, DWCSDMMCState),
@@ -2742,6 +2904,8 @@ static void dwc_sdmmc_bus_class_init(ObjectClass *klass, const void *data)
 
     sbc->set_irq = data ? dwc_card_irq1 : dwc_card_irq0;
     sbc->lines_changed = dwc_card_lines;
+    sbc->get_time = dwc_bus_get_time;
+    sbc->card_clock_after = data ? dwc_bus_clock_after1 : dwc_bus_clock_after0;
 }
 
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */

@@ -138,12 +138,15 @@ struct DWCSDMMCState {
     QEMUTimer timeout_timer;
     QEMUTimer reset_timer;
     QEMUTimer debounce_timer[DWC_SDMMC_MAX_SLOTS];
+    /* A card that takes time: its data coming, or its busy ending. */
+    QEMUTimer card_timer;
     /* When the event each timer runs falls due. */
     int64_t cmd_due;
     int64_t data_due;
     int64_t timeout_due;
     int64_t reset_due;
     int64_t debounce_due[DWC_SDMMC_MAX_SLOTS];
+    int64_t card_due;
     /* A timed event is being taken: a change it makes catches up none. */
     bool in_event;
 
@@ -263,6 +266,10 @@ struct DWCSDMMCState {
     bool chunk_busy;
     uint32_t chunk_len;
     uint8_t chunk[512];
+    /* A read chunk's bytes are in chunk[], taken from the card. */
+    bool chunk_fetched;
+    /* A write is over; BCI waits for its card's busy to end. */
+    bool bci_pending;
     /* What the timeout timer waits for: DRTO, HTO or nothing */
     uint32_t timeout_kind;
     /* The host side of the transfer: none, a read or a write */
@@ -273,6 +280,8 @@ struct DWCSDMMCState {
     uint32_t blk_fault;
     /* The last bit, nibble or byte of each line's data, for a shift */
     uint8_t shift_carry;
+    /* How the host samples the read chunk on the bus (dwc_rx_fault()) */
+    uint32_t chunk_fault;
 
     /* The FIFO, a byte ring */
     uint8_t fifo[DWC_SDMMC_MAX_FIFO_WORDS * 4];
@@ -306,5 +315,11 @@ void dwc_sdmmc_clock_changed(DWCSDMMCState *s);
  * (the card interface clock); 0 while it is stopped.
  */
 uint64_t dwc_sdmmc_card_div(DWCSDMMCState *s, unsigned slot);
+
+/*
+ * The board switches the supply of the card in @slot (sdbus_set_power()),
+ * at the present: the controller sees the card as it was up to then.
+ */
+void dwc_sdmmc_set_card_power(DWCSDMMCState *s, unsigned slot, bool on);
 
 #endif /* DWC_SDMMC_H */

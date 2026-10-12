@@ -158,6 +158,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 /* The PMU regulator, VO<n>, that supplies the microSD slot's pads */
 #define ESP32P4_BOARD_SD_PAD_LDO    4
 
+/* The board pad whose high level switches the microSD socket's supply off */
+#define ESP32P4_BOARD_SD_POWER_PAD  45
+
 /* The crypto block resets that hold more than their own block. */
 #define ESP32P4_CRYPTO_RST_SPLITS   4
 

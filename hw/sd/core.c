@@ -25,6 +25,7 @@
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
+#include "qemu/timer.h"
 #include "sdmmc-internal.h"
 #include "trace.h"
 
@@ -283,6 +284,71 @@ bool sdbus_get_readonly(SDBus *sdbus)
     }
 
     return false;
+}
+
+int64_t sdbus_data_ready_time(SDBus *sdbus)
+{
+    SDState *card = get_card(sdbus);
+
+    if (card) {
+        SDCardClass *sc = SDMMC_COMMON_GET_CLASS(card);
+
+        if (sc->data_ready_time) {
+            return sc->data_ready_time(card);
+        }
+    }
+
+    return 0;
+}
+
+int64_t sdbus_busy_end_time(SDBus *sdbus)
+{
+    SDState *card = get_card(sdbus);
+
+    if (card) {
+        SDCardClass *sc = SDMMC_COMMON_GET_CLASS(card);
+
+        if (sc->busy_end_time) {
+            return sc->busy_end_time(card);
+        }
+    }
+
+    return 0;
+}
+
+void sdbus_set_power(SDBus *sdbus, bool on)
+{
+    SDState *card = get_card(sdbus);
+
+    if (card) {
+        SDCardClass *sc = SDMMC_COMMON_GET_CLASS(card);
+
+        if (sc->set_power) {
+            sc->set_power(card, on);
+        }
+    }
+}
+
+int64_t sdbus_get_time(SDBus *sdbus)
+{
+    SDBusClass *sbc = SD_BUS_GET_CLASS(sdbus);
+    BusState *qbus = BUS(sdbus);
+
+    if (sbc->get_time) {
+        return sbc->get_time(qbus->parent);
+    }
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+int64_t sdbus_card_clock_after(SDBus *sdbus, int64_t from, uint64_t cycles)
+{
+    SDBusClass *sbc = SD_BUS_GET_CLASS(sdbus);
+    BusState *qbus = BUS(sdbus);
+
+    if (sbc->card_clock_after) {
+        return sbc->card_clock_after(qbus->parent, from, cycles);
+    }
+    return from;
 }
 
 void sdbus_set_inserted(SDBus *sdbus, bool inserted)

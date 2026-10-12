@@ -54,6 +54,8 @@
 #include "sdmmc-internal.h"
 #include "trace.h"
 #include "crypto/hmac.h"
+#include "hw/block/power_cut.h"
+#include "system/runstate.h"
 
 //#define DEBUG_SD 1
 
@@ -141,6 +143,64 @@ typedef struct QEMU_PACKED {
 QEMU_BUILD_BUG_MSG(sizeof(RPMBDataFrame) != 512,
                    "invalid RPMBDataFrame size");
 
+/* What a card that takes time has in hand while busy (see "Timing"). */
+enum {
+    SD_OP_NONE,
+    /* A block's programming: its new contents go to the card at the end. */
+    SD_OP_WRITE,
+    /* An erase of [addr, addr + len): erased at the end. */
+    SD_OP_ERASE,
+    /* Busy with nothing left to store: a register's write, a flush. */
+    SD_OP_BUSY,
+};
+
+typedef struct SDTimedOp {
+    uint8_t kind;
+    uint64_t addr;
+    uint64_t len;
+    /* Its time on the card, ns: busy from when it is taken until end. */
+    int64_t start;
+    int64_t end;
+    uint8_t data[512];
+} SDTimedOp;
+
+typedef struct SDTiming {
+    /* Properties */
+    bool on;
+    bool max;
+    uint8_t speed_class_prop;
+    uint8_t uhs_grade_prop;
+    uint64_t au_size_prop;
+    uint8_t taac_prop;
+    int32_t nsac_prop;
+    uint8_t r2w_prop;
+    int32_t erase_size_prop;
+    int32_t erase_timeout_prop;
+    int32_t erase_offset_prop;
+
+    /* The registers, as the medium's capacity and the properties give them */
+    uint8_t kind;
+    uint8_t taac;
+    uint8_t nsac;
+    uint8_t r2w;
+    uint8_t speed_class;
+    uint8_t uhs_grade;
+    uint64_t au_size;
+    uint16_t erase_size;
+    uint8_t erase_timeout;
+    uint8_t erase_offset;
+    /* The speed class's and grade's bounds on a block's access and write */
+    int64_t t_read;
+    int64_t t_prog;
+
+    /* The card's supply is off: it holds no state and answers nothing. */
+    bool unpowered;
+    /* When the read block the card is sending can start on DAT */
+    int64_t data_ready;
+    SDTimedOp op;
+    Notifier shutdown;
+} SDTiming;
+
 struct SDState {
     DeviceState parent_obj;
 
@@ -224,9 +284,15 @@ struct SDState {
     /* The functions a CMD6 switch selects, taken at its status data's end */
     uint8_t function_group_new[6];
     bool function_switch_pending;
+
+    /* Timing: see "Timing" below. */
+    SDTiming tm;
 };
 
 static void sd_realize(DeviceState *dev, Error **errp);
+static uint8_t sd_timed_dat_lines(SDState *sd, uint8_t lines);
+static void sd_timing_cut(SDState *sd);
+static void sd_timing_reset(SDState *sd);
 
 static const SDProto sd_proto_spi;
 static const SDProto sd_proto_emmc;
@@ -340,6 +406,9 @@ static const char *sd_acmd_name(SDState *sd, uint8_t cmd)
 
 static uint8_t sd_get_dat_lines(SDState *sd)
 {
+    if (sd->tm.on) {
+        return sd_timed_dat_lines(sd, sd->dat_lines);
+    }
     return sd->dat_lines;
 }
 
@@ -1134,6 +1203,9 @@ static void sd_reset(DeviceState *dev)
     uint64_t sect;
 
     trace_sdcard_reset();
+    if (sd->tm.on) {
+        sd_timing_cut(sd);
+    }
     if (sd->blk) {
         blk_get_geometry(sd->blk, &sect);
     } else {
@@ -1175,6 +1247,9 @@ static void sd_reset(DeviceState *dev)
     sd->dat_lines = 0xf;
     sd->cmd_line = true;
     sd->multi_blk_cnt = 0;
+    if (sd->tm.on) {
+        sd_timing_reset(sd);
+    }
 }
 
 static bool sd_get_inserted(SDState *sd)
@@ -1195,6 +1270,8 @@ static void sd_cardchange(void *opaque, bool load, Error **errp)
     bool inserted = sd_get_inserted(sd);
     bool readonly = sd_get_readonly(sd);
 
+    /* What the card had in hand belongs to the medium that left. */
+    sd->tm.op.kind = SD_OP_NONE;
     if (inserted) {
         trace_sdcard_inserted(readonly);
         sd_reset(dev);
@@ -1309,6 +1386,33 @@ static const VMStateDescription sd_uhs_vmstate = {
     },
 };
 
+static bool sd_timing_vmstate_needed(void *opaque)
+{
+    SDState *sd = opaque;
+
+    return sd->tm.on;
+}
+
+static const VMStateDescription sd_timing_vmstate = {
+    .name = "sd-card/timing",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sd_timing_vmstate_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(tm.unpowered, SDState),
+        VMSTATE_INT64(tm.data_ready, SDState),
+        VMSTATE_UINT8(tm.op.kind, SDState),
+        VMSTATE_UINT64(tm.op.addr, SDState),
+        VMSTATE_UINT64(tm.op.len, SDState),
+        VMSTATE_INT64(tm.op.start, SDState),
+        VMSTATE_INT64(tm.op.end, SDState),
+        VMSTATE_UINT8_ARRAY(tm.op.data, SDState, 512),
+        VMSTATE_UINT8_ARRAY(sd_status, SDState, 64),
+        VMSTATE_UINT8_ARRAY(scr, SDState, 8),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static int sd_vmstate_pre_load(void *opaque)
 {
     SDState *sd = opaque;
@@ -1359,6 +1463,7 @@ static const VMStateDescription sd_vmstate = {
         &sd_uhs_vmstate,
         &emmc_extcsd_vmstate,
         &emmc_rpmb_vmstate,
+        &sd_timing_vmstate,
         NULL
     },
 };
@@ -1378,6 +1483,784 @@ static void sd_blk_write(SDState *sd, uint64_t addr, uint32_t len)
     addr += sd_part_offset(sd);
     if (!sd->blk || blk_pwrite(sd->blk, addr, len, sd->data, 0) < 0) {
         fprintf(stderr, "sd_blk_write: write error on host side\n");
+    }
+}
+
+/*
+ * Timing
+ * ======
+ *
+ * A card with the "timing" property takes time in virtual time, as a card
+ * that just meets what its registers state (SD Physical Layer Simplified
+ * Specification v9.10, cited by section); the ESP32 and ESP32-P4 machines
+ * set the property for every SD card. A card without it behaves as it
+ * always has: never busy, its data at once. SPI mode is not timed.
+ *
+ * The registers. The card is SDSC up to 2 GiB, SDHC up to 32 GiB and SDXC
+ * above. Its timing registers, each settable by a property:
+ *
+ *   speed-class      SPEED_CLASS: 4 for SDSC, 10 for SDHC and SDXC; 0, 2,
+ *                    4, 6 or 10, but 10 not for SDSC (4.13.1.8.1).
+ *   uhs-speed-grade  UHS_SPEED_GRADE: 0, as the card is no UHS-I card; 1
+ *                    or 3 for SDHC and SDXC (though an SDXC card with a
+ *                    grade must support CMD20, which this card does not,
+ *                    4.13.3.2).
+ *   au-size          AU_SIZE, and UHS_AU_SIZE with a grade: the largest
+ *                    Table 4-48 allows for the capacity, 4 MiB for SDXC.
+ *   erase-size, erase-timeout, erase-offset
+ *                    ERASE_SIZE (AUs), ERASE_TIMEOUT and ERASE_OFFSET
+ *                    (s): 128, 1 and 1; erase-size 0 says the card gives no
+ *                    erase timeout (4.10.2.5 to 4.10.2.7).
+ *   taac, nsac, r2w-factor
+ *                    The CSD's TAAC (as its byte), NSAC (its byte, in 100
+ *                    clocks) and R2W_FACTOR (the multiple, 1 to 32), SDSC
+ *                    only: by default NSAC 0, R2W_FACTOR 1 and the largest
+ *                    TAAC the speed class allows, so that the CSD's times
+ *                    are the card's; for Class 0, TAAC 1.5 ms and
+ *                    R2W_FACTOR 16. SDHC and SDXC have the fixed TAAC
+ *                    1 ms, NSAC 0 and R2W_FACTOR 4 (5.3.3).
+ *
+ * PERFORMANCE_MOVE reads FFh, infinity, for Classes 2 to 6 on SDSC and
+ * SDHC, as the card never moves a used RU, and 0 for Class 0, Class 10 and
+ * SDXC (4.10.2.3); SCR's DATA_STAT_AFTER_ERASE is 1, as the card erases to
+ * 1s. DISCARD and FULE are not supported (SD Status bits 313 and 312 are
+ * 0), so CMD38 erases whatever its argument (4.3.5).
+ *
+ * The times. A card that just meets its registers takes, for each thing it
+ * times, the longest time that every register bounding it allows:
+ *
+ *   - A read's access time, from the end bit of the read command to the
+ *     start bit of its first block and from the end bit of each block to
+ *     the start bit of the next (Nac, 4.6.2.1): at most TAAC + NSAC * 100
+ *     clocks; and at most what lets reads of whole RUs, each a CMD18 and a
+ *     CMD12, meet Pr, the class's Pw, under the class's measurement
+ *     conditions (4.13.1.8, 4.13.2.7: the class's clock, 4 bits wide, the
+ *     bus never idle), and the grade's under its own (4.13.3.3). Every
+ *     read takes it but the tuning block's (CMD19).
+ *   - A block's programming, busy on DAT0 from its CRC status: at most
+ *     R2W_FACTOR times TAAC + NSAC * 100 clocks, the typical program time
+ *     (4.6.2.2); and at most what lets writes of whole RUs, each a CMD25
+ *     and a CMD12, meet Pw under the class's and the grade's conditions.
+ *     A class or grade bounds both under the conditions of every lower one
+ *     too (4.13.1.8.2, 4.13.3.1.1).
+ *   - An erase: ERASE_TIMEOUT / ERASE_SIZE seconds for each AU its range
+ *     reaches into, the slope of Equation 9 (4.14); without ERASE_SIZE, a
+ *     block's programming for each block (4.6.2.3).
+ *
+ * So a Class 4 SDSC card's access and programming are both 70 us (its
+ * TAAC; Class 4 allows 75.7 and 75.1 us), and a Class 10 SDHC card's
+ * 25.1 and 24.9 us. With "max-timing" each takes the specification's
+ * maximum instead: an access 100 ms (SDSC: 100 times TAAC + NSAC, if
+ * less); a block's programming 250 ms (SDSC: 100 times the typical program
+ * time, if less), and the last busy of an SDXC write 500 ms (4.6.2.2); an
+ * erase its timeout, Equation 9 with TOFFSET but at least 1 s, plus 250 ms
+ * for each end of the range that falls inside an AU (4.14.4), or 250 ms a
+ * block without ERASE_SIZE.
+ *
+ * Where the specification leaves the card latitude:
+ *
+ *   - Busy is spread evenly over a multiple block write: the card buffers
+ *     one block, programs each alone, busy from its CRC status, and takes
+ *     the next when it is done.
+ *   - No write costs more for being the first in an AU (the preparation
+ *     time of 4.13.3.4 is an allowance outside Pw), and none moves used
+ *     RUs: the card writes every AU as a free one.
+ *   - CMD12 ending a write is busy for what is left of its last block's
+ *     programming, none if that is done; with "max-timing", until 250 ms
+ *     (500 ms for SDXC) after its response, the last block taking that long.
+ *   - An erase's TOFFSET and the 250 ms for each partial AU are the host's
+ *     margin, which only "max-timing" takes; the slope counts each AU the
+ *     range reaches into, whole or not.
+ *   - SET_WRITE_PROT, CLR_WRITE_PROT, PROGRAM_CSD and LOCK_UNLOCK, "write
+ *     commands" too (4.6.2.2), are busy a block's programming time after
+ *     their response or data, their effect made at once.
+ *
+ * Busy. While it programs or erases, the card holds DAT0 low and clears
+ * READY_FOR_DATA, in the programming state or, between the blocks of a
+ * multiple block write, the receive-data state; it answers only the
+ * commands Table 4-35 allows there (CMD13; CMD55; CMD7 for another card,
+ * which moves it to the disconnect state and releases DAT0 while it works
+ * on; CMD12 between blocks; CMD15 and CMD0, 4.3) and refuses the rest as
+ * illegal commands, unanswered. Data sent while it is busy is not taken.
+ * Done, it is in the transfer state, or standby if it was deselected. A
+ * block's new contents reach the drive as its programming ends, an
+ * erase's when the erase ends.
+ */
+
+#define SD_NS_PER_S     1000000000LL
+#define SD_NS_PER_MS    1000000LL
+#define SD_AUTO         0xff
+
+enum {
+    SD_KIND_SDSC,
+    SD_KIND_SDHC,
+    SD_KIND_SDXC,
+};
+
+/* TAAC's time values, in tenths (Table 5-5) */
+static const uint8_t sd_taac_value[16] = {
+    0, 10, 12, 13, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80,
+};
+
+static int64_t sd_taac_ns(uint8_t taac)
+{
+    int64_t ns = sd_taac_value[extract32(taac, 3, 4)];
+
+    for (unsigned i = 0; i < extract32(taac, 0, 3); i++) {
+        ns *= 10;
+    }
+    return ns / 10;
+}
+
+/* AU_SIZE's sizes (Table 4-47), UHS_AU_SIZE's from code 7 up */
+static const uint64_t sd_au_sizes[16] = {
+    0, 16 * KiB, 32 * KiB, 64 * KiB, 128 * KiB, 256 * KiB, 512 * KiB,
+    1 * MiB, 2 * MiB, 4 * MiB, 8 * MiB, 12 * MiB, 16 * MiB, 24 * MiB,
+    32 * MiB, 64 * MiB,
+};
+
+static unsigned sd_au_code(uint64_t size)
+{
+    for (unsigned i = 1; i < ARRAY_SIZE(sd_au_sizes); i++) {
+        if (sd_au_sizes[i] == size) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+/* The largest AU a card of @size bytes may have (Table 4-48) */
+static uint64_t sd_au_max(uint64_t size)
+{
+    if (size <= 64 * MiB) {
+        return 512 * KiB;
+    } else if (size <= 256 * MiB) {
+        return 1 * MiB;
+    } else if (size <= 512 * MiB) {
+        return 2 * MiB;
+    } else if (size <= 32 * GiB) {
+        return 4 * MiB;
+    }
+    return 64 * MiB;
+}
+
+/*
+ * The speed classes' Pw (bytes/s, 1 MB/s being 10^6 bytes/s), measurement
+ * clocks and RU sizes for SDSC, SDHC and SDXC, 0 where a class is not
+ * defined (Tables 4-61 to 4-64).
+ */
+static const struct {
+    uint8_t class;
+    uint8_t code;
+    uint32_t pw;
+    uint32_t hz;
+    uint32_t ru[3];
+} sd_speed_classes[] = {
+    { 2, 1, 2000000, 20000000, { 16 * KiB, 32 * KiB, 256 * KiB } },
+    { 4, 2, 4000000, 20000000, { 16 * KiB, 32 * KiB, 256 * KiB } },
+    { 6, 3, 6000000, 20000000, { 64 * KiB, 64 * KiB, 256 * KiB } },
+    { 10, 4, 10000000, 40000000, { 0, 512 * KiB, 512 * KiB } },
+};
+
+/* The UHS speed grades' Pw and SDR clocks, their RU 512 KiB (4.13.3) */
+static const struct {
+    uint8_t grade;
+    uint32_t pw;
+    uint32_t hz;
+} sd_uhs_grades[] = {
+    { 1, 10000000, 80000000 },
+    { 3, 30000000, 90000000 },
+};
+#define SD_UHS_RU       (512 * KiB)
+
+/*
+ * Card clocks on a 4-bit bus: a written block (Nwr, start bit, data, CRC,
+ * end bit, CRC status), a read block (start bit, data, CRC, end bit); a
+ * written RU's commands, CMD25 and CMD12 with their responses, and a read
+ * RU's, CMD18 (its first block's access counting from its end bit) and
+ * CMD12 with its response.
+ */
+#define SD_W_BLOCK_CLK  (2 + 1 + 1024 + 16 + 1 + 8)
+#define SD_R_BLOCK_CLK  (1 + 1024 + 16 + 1)
+#define SD_W_RU_CLK     (2 * (48 + 2 + 48))
+#define SD_R_RU_CLK     (48 + 48 + 2 + 48)
+
+/* The card clocks of a command and of one with its short response */
+#define SD_CMD_CLK      48
+#define SD_CMD_RESP_CLK (48 + 2 + 48)
+
+/* An erase is stored a chunk at a time, within a write protect group. */
+#define SD_ERASE_CHUNK  (64 * KiB)
+QEMU_BUILD_BUG_ON(WPGROUP_SIZE % SD_ERASE_CHUNK);
+
+/* Bound the access and programming times by a performance of @pw. */
+static void sd_perf_bound(SDTiming *tm, uint64_t pw, uint64_t hz, uint64_t ru)
+{
+    uint64_t n = ru / 512;
+    int64_t whole = ru * SD_NS_PER_S / pw;
+    int64_t w = whole - (SD_W_RU_CLK + SD_W_BLOCK_CLK * n) * SD_NS_PER_S / hz;
+    int64_t r = whole - (SD_R_RU_CLK + SD_R_BLOCK_CLK * n) * SD_NS_PER_S / hz;
+
+    tm->t_prog = MIN(tm->t_prog, MAX(w, 0) / (int64_t)n);
+    tm->t_read = MIN(tm->t_read, MAX(r, 0) / (int64_t)n);
+}
+
+static SDBus *sd_bus(SDState *sd)
+{
+    return SD_BUS(qdev_get_parent_bus(DEVICE(sd)));
+}
+
+/* The present on the card's bus */
+static int64_t sd_now(SDState *sd)
+{
+    return sdbus_get_time(sd_bus(sd));
+}
+
+static int64_t sd_add_ns(int64_t t, int64_t ns)
+{
+    return ns > INT64_MAX - t ? INT64_MAX : t + ns;
+}
+
+/* @ns after @t, then @cycles of the card clock */
+static int64_t sd_after(SDState *sd, int64_t t, int64_t ns, uint64_t cycles)
+{
+    t = sd_add_ns(t, ns);
+    if (cycles && t != INT64_MAX) {
+        t = sdbus_card_clock_after(sd_bus(sd), t, cycles);
+    }
+    return t;
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/* When a read block can start, its access time counted from @t */
+static int64_t sd_read_ready(SDState *sd, int64_t t)
+{
+    SDTiming *tm = &sd->tm;
+    int64_t taac = sd_taac_ns(tm->taac);
+    uint64_t nsac = tm->nsac * 100ULL;
+    int64_t ready;
+
+    if (tm->max) {
+        ready = sd_add_ns(t, 100 * SD_NS_PER_MS);
+        if (tm->kind == SD_KIND_SDSC) {
+            ready = MIN(ready, sd_after(sd, t, 100 * taac, 100 * nsac));
+        }
+        return ready;
+    }
+    return MIN(sd_add_ns(t, tm->t_read), sd_after(sd, t, taac, nsac));
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/*
+ * When a block's programming begun at @t ends: @last, the last busy of a
+ * write.
+ */
+static int64_t sd_prog_end(SDState *sd, int64_t t, bool last)
+{
+    SDTiming *tm = &sd->tm;
+    int64_t typ = tm->r2w * sd_taac_ns(tm->taac);
+    uint64_t nsac = tm->r2w * tm->nsac * 100ULL;
+    int64_t end;
+
+    if (tm->max) {
+        end = sd_add_ns(t, (last && tm->kind == SD_KIND_SDXC ? 500 : 250) *
+                           SD_NS_PER_MS);
+        if (tm->kind == SD_KIND_SDSC) {
+            end = MIN(end, sd_after(sd, t, 100 * typ, 100 * nsac));
+        }
+        return end;
+    }
+    return MIN(sd_add_ns(t, tm->t_prog), sd_after(sd, t, typ, nsac));
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/* When an erase of [@addr, @addr + @len) begun at @t ends */
+static int64_t sd_erase_end(SDState *sd, int64_t t, uint64_t addr,
+                            uint64_t len)
+{
+    SDTiming *tm = &sd->tm;
+    uint64_t au = tm->au_size;
+    uint64_t aus = (addr + len - 1) / au - addr / au + 1;
+    unsigned partial = (addr % au != 0) + ((addr + len) % au != 0);
+    int64_t ns;
+
+    if (!tm->erase_size) {
+        uint64_t blocks = DIV_ROUND_UP(len, 512);
+        int64_t block = tm->max ? 250 * SD_NS_PER_MS
+                                : sd_prog_end(sd, t, false) - t;
+
+        if (block && blocks > INT64_MAX / block) {
+            return INT64_MAX;
+        }
+        return sd_add_ns(t, blocks * block);
+    }
+    ns = aus * tm->erase_timeout * SD_NS_PER_S / tm->erase_size;
+    if (tm->max) {
+        ns = MAX(ns + tm->erase_offset * SD_NS_PER_S, SD_NS_PER_S) +
+             partial * 250 * SD_NS_PER_MS;
+    }
+    return sd_add_ns(t, ns);
+}
+
+static void sd_load(SDState *sd, uint64_t addr, void *buf, uint64_t len)
+{
+    if (!sd->blk || blk_pread(sd->blk, addr + sd_part_offset(sd), len, buf,
+                              0) < 0) {
+        error_report("sd: reading the card's drive failed");
+    }
+}
+
+static void sd_store(SDState *sd, uint64_t addr, const void *buf,
+                     uint64_t len)
+{
+    if (!sd->blk || blk_pwrite(sd->blk, addr + sd_part_offset(sd), len, buf,
+                               0) < 0) {
+        error_report("sd: writing the card's drive failed");
+    }
+}
+
+/*
+ * Erase [@addr, @addr + @len): every cell (@thr UINT32_MAX and @whole),
+ * or those a cut leaves done. An SDSC card skips its write protected
+ * groups.
+ */
+static void sd_erase_cells(SDState *sd, uint64_t addr, uint64_t len,
+                           uint32_t thr, bool whole)
+{
+    g_autofree uint8_t *buf = g_malloc(SD_ERASE_CHUNK);
+    uint64_t end = addr + len;
+
+    while (addr < end) {
+        uint64_t n = MIN(end - addr, SD_ERASE_CHUNK - addr % SD_ERASE_CHUNK);
+
+        if (sd->tm.kind != SD_KIND_SDSC ||
+            !test_bit(sd_addr_to_wpnum(addr), sd->wp_group_bmap)) {
+            if (whole) {
+                memset(buf, 0xff, n);
+            } else {
+                sd_load(sd, addr, buf, n);
+                for (uint64_t i = 0; i < n; i++) {
+                    buf[i] |= power_cut_done_mask((addr + i) * 8, thr);
+                }
+            }
+            sd_store(sd, addr, buf, n);
+        }
+        addr += n;
+    }
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/* Take an operation: busy, DAT0 low, until @end. */
+static void sd_op_start(SDState *sd, uint8_t kind, uint64_t addr,
+                        uint64_t len, int64_t start, int64_t end)
+{
+    SDTimedOp *op = &sd->tm.op;
+
+    op->kind = kind;
+    op->addr = addr;
+    op->len = len;
+    op->start = start;
+    op->end = end;
+    sd->card_status &= ~READY_FOR_DATA;
+    trace_sdcard_busy(kind, addr, len, start, end);
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/* The operation's time has run: its effect, and the card ready. */
+static void sd_op_finish(SDState *sd)
+{
+    SDTimedOp *op = &sd->tm.op;
+
+    trace_sdcard_busy_end(op->kind, op->addr);
+    switch (op->kind) {
+    case SD_OP_WRITE:
+        sd_store(sd, op->addr, op->data, op->len);
+        sd->blk_written++;
+        break;
+    case SD_OP_ERASE:
+        sd_erase_cells(sd, op->addr, op->len, UINT32_MAX, true);
+        break;
+    default:
+        break;
+    }
+    op->kind = SD_OP_NONE;
+    sd->card_status |= READY_FOR_DATA;
+    if (sd->state == sd_programming_state) {
+        sd->state = sd_transfer_state;
+    } else if (sd->state == sd_disconnect_state) {
+        sd->state = sd_standby_state;
+    }
+}
+
+/* Bring the card up to the present on its bus. */
+static void sd_timing_sync(SDState *sd)
+{
+    if (sd->tm.op.kind != SD_OP_NONE && sd_now(sd) >= sd->tm.op.end) {
+        sd_op_finish(sd);
+    }
+}
+
+/* Busy: holding DAT0 low, as it does but while deselected. */
+static bool sd_busy(SDState *sd)
+{
+    return sd->tm.op.kind != SD_OP_NONE &&
+           sd->state != sd_disconnect_state;
+}
+
+/*
+ * [spec:nuos:req:emu.sd-card-power-cut]
+ * Cut what the card has in hand short, at the present. A block's
+ * programming or an erase cut short leaves its cells as
+ * hw/block/power_cut.h gives them, by the fraction of its time that has
+ * passed, each cell (bit address: card byte address * 8 + bit) new,
+ * written or erased to 1, or as it was; blocks a write finished keep their
+ * new contents and blocks it never sent their old. The cuts: a power cycle
+ * (a reset of the card, which the machines give it with QEMU's system
+ * reset only), the board switching the card's supply off (sdbus_set_power),
+ * QEMU's shutdown, and CMD0 and CMD15, which terminate any programming
+ * ("This may destroy the data contents on the card", 4.3). A reset of the
+ * controller does not reach the card: what it programs goes on.
+ */
+static void sd_timing_cut(SDState *sd)
+{
+    SDTimedOp *op = &sd->tm.op;
+    int64_t now, done;
+    uint32_t thr;
+
+    if (op->kind == SD_OP_NONE) {
+        return;
+    }
+    now = sd_now(sd);
+    if (now >= op->end) {
+        sd_op_finish(sd);
+        return;
+    }
+    done = now - op->start;
+    trace_sdcard_cut(op->kind, op->addr, done, op->end - op->start);
+    thr = power_cut_threshold(done, op->end - op->start);
+    if (op->kind == SD_OP_WRITE) {
+        uint8_t old[512];
+
+        sd_load(sd, op->addr, old, op->len);
+        for (uint64_t i = 0; i < op->len; i++) {
+            uint8_t done_mask = power_cut_done_mask((op->addr + i) * 8, thr);
+
+            old[i] = (old[i] & ~done_mask) | (op->data[i] & done_mask);
+        }
+        sd_store(sd, op->addr, old, op->len);
+    } else if (op->kind == SD_OP_ERASE && thr) {
+        sd_erase_cells(sd, op->addr, op->len, thr, false);
+    }
+    op->kind = SD_OP_NONE;
+    sd->card_status |= READY_FOR_DATA;
+}
+
+/* [spec:nuos:req:emu.sd-card-power-cut] */
+/* QEMU shuts down: the card loses power. */
+static void sd_timing_shutdown(Notifier *n, void *opaque)
+{
+    SDState *sd = container_of(n, SDState, tm.shutdown);
+
+    if (!sd->tm.unpowered) {
+        sd_timing_cut(sd);
+    }
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/*
+ * Power-up: the timing registers for the medium's capacity, the CSD's,
+ * the SD Status's and the SCR's fields set from them.
+ */
+static void sd_timing_reset(SDState *sd)
+{
+    SDTiming *tm = &sd->tm;
+    uint64_t size = sd->size;
+    uint8_t *st = sd->sd_status;
+    unsigned au;
+
+    tm->kind = size <= SDSC_MAX_CAPACITY ? SD_KIND_SDSC :
+               size <= 32 * GiB ? SD_KIND_SDHC : SD_KIND_SDXC;
+    tm->speed_class = tm->speed_class_prop != SD_AUTO ? tm->speed_class_prop
+                      : tm->kind == SD_KIND_SDSC ? 4 : 10;
+    if (tm->kind == SD_KIND_SDSC && tm->speed_class == 10) {
+        tm->speed_class = 6;
+    }
+    tm->uhs_grade = tm->uhs_grade_prop != SD_AUTO ? tm->uhs_grade_prop : 0;
+    tm->au_size = tm->au_size_prop ? tm->au_size_prop
+                  : tm->kind == SD_KIND_SDXC ? 4 * MiB : sd_au_max(size);
+    tm->au_size = MIN(tm->au_size, sd_au_max(size));
+    if (tm->kind == SD_KIND_SDSC || tm->au_size < 1 * MiB) {
+        tm->uhs_grade = 0;
+    }
+    tm->erase_size = tm->erase_size_prop >= 0 ? tm->erase_size_prop : 128;
+    tm->erase_timeout = tm->erase_timeout_prop >= 0 ? tm->erase_timeout_prop
+                        : !!tm->erase_size;
+    tm->erase_offset = tm->erase_offset_prop >= 0 ? tm->erase_offset_prop
+                       : !!tm->erase_size;
+
+    tm->t_read = INT64_MAX;
+    tm->t_prog = INT64_MAX;
+    for (unsigned i = 0; i < ARRAY_SIZE(sd_speed_classes); i++) {
+        uint32_t ru = sd_speed_classes[i].ru[tm->kind];
+
+        if (sd_speed_classes[i].class <= tm->speed_class && ru) {
+            sd_perf_bound(tm, sd_speed_classes[i].pw,
+                          sd_speed_classes[i].hz, ru);
+        }
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(sd_uhs_grades); i++) {
+        if (sd_uhs_grades[i].grade <= tm->uhs_grade) {
+            sd_perf_bound(tm, sd_uhs_grades[i].pw, sd_uhs_grades[i].hz,
+                          SD_UHS_RU);
+        }
+    }
+
+    if (tm->kind != SD_KIND_SDSC) {
+        tm->taac = 0x0e;
+        tm->nsac = 0;
+        tm->r2w = 4;
+    } else {
+        tm->r2w = tm->r2w_prop ? tm->r2w_prop : tm->speed_class ? 1 : 16;
+        tm->nsac = tm->nsac_prop >= 0 ? tm->nsac_prop : 0;
+        if (tm->taac_prop) {
+            tm->taac = tm->taac_prop;
+        } else if (!tm->speed_class) {
+            tm->taac = 0x26;
+        } else {
+            /* The largest TAAC within the class's bounds, or the least. */
+            int64_t bound = MIN(tm->t_read, tm->t_prog / tm->r2w);
+
+            tm->taac = 0x08;
+            for (unsigned code = 0x08; code < 0x80; code++) {
+                if (extract32(code, 3, 4) &&
+                    sd_taac_ns(code) <= bound &&
+                    sd_taac_ns(code) > sd_taac_ns(tm->taac)) {
+                    tm->taac = code;
+                }
+            }
+        }
+        sd->csd[1] = tm->taac;
+        sd->csd[2] = tm->nsac;
+        sd->csd[12] = (sd->csd[12] & ~0x1c) | (ctz32(tm->r2w) << 2);
+        sd->csd[15] = (sd_crc7(sd->csd, 15) << 1) | 1;
+    }
+
+    au = sd_au_code(tm->au_size);
+    for (unsigned i = 0; i < ARRAY_SIZE(sd_speed_classes); i++) {
+        if (sd_speed_classes[i].class == tm->speed_class) {
+            st[8] = sd_speed_classes[i].code;
+        }
+    }
+    st[9] = tm->speed_class && tm->speed_class < 10 &&
+            tm->kind != SD_KIND_SDXC ? 0xff : 0;
+    st[10] = au << 4;
+    stw_be_p(&st[11], tm->erase_size);
+    st[13] = tm->erase_timeout << 2 | tm->erase_offset;
+    st[14] = tm->uhs_grade << 4 | (tm->uhs_grade ? au : 0);
+    sd->scr[1] |= 0x80;
+
+    tm->unpowered = false;
+    tm->data_ready = 0;
+    tm->op.kind = SD_OP_NONE;
+}
+
+/*
+ * [spec:nuos:req:emu.sd-card-timing]
+ * Check the timing properties for a medium of @size bytes, 0 for none.
+ */
+static bool sd_timing_check(SDState *sd, uint64_t size, Error **errp)
+{
+    SDTiming *tm = &sd->tm;
+    unsigned kind = size <= SDSC_MAX_CAPACITY ? SD_KIND_SDSC :
+                    size <= 32 * GiB ? SD_KIND_SDHC : SD_KIND_SDXC;
+    uint8_t c = tm->speed_class_prop;
+    uint8_t g = tm->uhs_grade_prop;
+
+    if (c != SD_AUTO && c != 0 && c != 2 && c != 4 && c != 6 && c != 10) {
+        error_setg(errp, "speed-class must be 0, 2, 4, 6 or 10");
+    } else if (g != SD_AUTO && g != 0 && g != 1 && g != 3) {
+        error_setg(errp, "uhs-speed-grade must be 0, 1 or 3");
+    } else if (tm->au_size_prop && !sd_au_code(tm->au_size_prop)) {
+        error_setg(errp, "au-size must be 16 KiB to 4 MiB, a power of 2, or "
+                   "8, 12, 16, 24, 32 or 64 MiB");
+    } else if (tm->taac_prop &&
+               ((tm->taac_prop & 0x80) || !extract32(tm->taac_prop, 3, 4))) {
+        error_setg(errp, "taac must be a TAAC byte: bit 7 clear, a time "
+                   "value in bits 6:3 and a unit in bits 2:0");
+    } else if (tm->nsac_prop > 255) {
+        error_setg(errp, "nsac must be 0 to 255");
+    } else if (tm->r2w_prop && (!is_power_of_2(tm->r2w_prop) ||
+                                tm->r2w_prop > 32)) {
+        error_setg(errp, "r2w-factor must be 1, 2, 4, 8, 16 or 32");
+    } else if (tm->erase_size_prop > 0xffff || tm->erase_timeout_prop > 63 ||
+               tm->erase_offset_prop > 3) {
+        error_setg(errp, "erase-size must be at most 65535, erase-timeout "
+                   "63 and erase-offset 3");
+    } else if (!tm->erase_size_prop &&
+               (tm->erase_timeout_prop > 0 || tm->erase_offset_prop > 0)) {
+        error_setg(errp, "erase-timeout and erase-offset must be 0 with "
+                   "erase-size 0");
+    } else if (!size) {
+        return true;
+    } else if (kind == SD_KIND_SDSC && c == 10) {
+        error_setg(errp, "an SDSC card has no Class 10");
+    } else if (kind == SD_KIND_SDSC && g != SD_AUTO && g) {
+        error_setg(errp, "an SDSC card has no UHS speed grade");
+    } else if (kind != SD_KIND_SDSC &&
+               (tm->taac_prop || tm->nsac_prop >= 0 || tm->r2w_prop)) {
+        error_setg(errp, "an SDHC or SDXC card's TAAC, NSAC and R2W_FACTOR "
+                   "are fixed");
+    } else if (tm->au_size_prop > sd_au_max(size)) {
+        error_setg(errp, "au-size is larger than a card of this capacity "
+                   "may have");
+    } else if (g != SD_AUTO && g && tm->au_size_prop &&
+               tm->au_size_prop < 1 * MiB) {
+        error_setg(errp, "a card with a UHS speed grade has an AU of at "
+                   "least 1 MiB");
+    } else {
+        return true;
+    }
+    return false;
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/*
+ * A read command taken: its first block comes its access time after the
+ * command's end bit, the tuning block at once.
+ */
+static void sd_timing_read_start(SDState *sd, SDRequest req)
+{
+    int64_t cmd_end;
+
+    if (!sd->tm.on) {
+        return;
+    }
+    cmd_end = sd_after(sd, sd_now(sd), 0, SD_CMD_CLK);
+    sd->tm.data_ready = req.cmd == 19 ? cmd_end : sd_read_ready(sd, cmd_end);
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/*
+ * A block of a write received, its CRC status sent: its programming
+ * begins, @last the write's last.
+ */
+static void sd_timing_block_written(SDState *sd, uint64_t addr, uint32_t len,
+                                    bool last)
+{
+    int64_t now = sd_now(sd);
+
+    sd_op_start(sd, SD_OP_WRITE, addr, len, now, sd_prog_end(sd, now, last));
+    memcpy(sd->tm.op.data, sd->data, len);
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/*
+ * A register written (@after_resp: by a command, busy from its response;
+ * otherwise by its data, busy from now): busy for a block's programming.
+ */
+static void sd_timing_reg_busy(SDState *sd, bool after_resp)
+{
+    int64_t from = after_resp ? sd_after(sd, sd_now(sd), 0, SD_CMD_RESP_CLK)
+                              : sd_now(sd);
+
+    sd_op_start(sd, SD_OP_BUSY, 0, 0, from, sd_prog_end(sd, from, false));
+    sd->state = sd_programming_state;
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/* CMD12 ends a write: the programming state while it is busy. */
+static sd_rsp_type_t sd_timing_stop_write(SDState *sd)
+{
+    SDTimedOp *op = &sd->tm.op;
+    int64_t resp_end = sd_after(sd, sd_now(sd), 0, SD_CMD_RESP_CLK);
+
+    if (sd->tm.max) {
+        int64_t end = sd_prog_end(sd, resp_end, true);
+
+        if (op->kind != SD_OP_NONE) {
+            op->end = MAX(op->end, end);
+        } else {
+            sd_op_start(sd, SD_OP_BUSY, 0, 0, resp_end, end);
+        }
+    }
+    sd->state = op->kind != SD_OP_NONE ? sd_programming_state
+                                       : sd_transfer_state;
+    return sd_r1b;
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+/* CMD38's erase of [@addr, @addr + @len), busy from its response */
+static void sd_timing_erase(SDState *sd, uint64_t addr, uint64_t len)
+{
+    int64_t from = sd_after(sd, sd_now(sd), 0, SD_CMD_RESP_CLK);
+
+    if (sd->tm.kind == SD_KIND_SDSC) {
+        for (uint64_t a = addr; a < addr + len; a += WPGROUP_SIZE) {
+            if (test_bit(sd_addr_to_wpnum(a), sd->wp_group_bmap)) {
+                sd->card_status |= WP_ERASE_SKIP;
+            }
+        }
+    }
+    sd_op_start(sd, SD_OP_ERASE, addr, len, from,
+                sd_erase_end(sd, from, addr, len));
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+static uint8_t sd_timed_dat_lines(SDState *sd, uint8_t lines)
+{
+    if (sd->tm.unpowered) {
+        /* The board's pull-ups */
+        return 0xf;
+    }
+    sd_timing_sync(sd);
+    return sd_busy(sd) ? lines & ~1 : lines;
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+static int64_t sd_data_ready_time(SDState *sd)
+{
+    if (sd->tm.unpowered) {
+        return INT64_MAX;
+    }
+    if (!sd->tm.on) {
+        return 0;
+    }
+    sd_timing_sync(sd);
+    return sd->state == sd_sendingdata_state ? sd->tm.data_ready : INT64_MAX;
+}
+
+/* [spec:nuos:req:emu.sd-card-timing] */
+static int64_t sd_busy_end_time(SDState *sd)
+{
+    if (!sd->tm.on || sd->tm.unpowered) {
+        return 0;
+    }
+    sd_timing_sync(sd);
+    return sd_busy(sd) ? sd->tm.op.end : 0;
+}
+
+/* [spec:nuos:req:emu.sd-card-power-cut] */
+/*
+ * The board switches the card's supply: off, it loses what it had in hand
+ * and its state, and answers nothing, its lines left to the board's
+ * pull-ups; on, it starts from power-up.
+ */
+static void sd_set_power(SDState *sd, bool on)
+{
+    SDTiming *tm = &sd->tm;
+
+    if (on == !tm->unpowered) {
+        return;
+    }
+    trace_sdcard_power(on);
+    if (!on) {
+        if (tm->on) {
+            sd_timing_cut(sd);
+        }
+        tm->unpowered = true;
+    } else {
+        tm->unpowered = false;
+        sd_reset(DEVICE(sd));
     }
 }
 
@@ -1602,6 +2485,13 @@ static void sd_erase(SDState *sd)
     sd->erase_end = INVALID_ADDRESS;
     sd->csd[14] |= 0x40;
 
+    if (sd->tm.on) {
+        if (erase_end >= erase_start) {
+            sd_timing_erase(sd, erase_start,
+                            erase_end + erase_len - erase_start);
+        }
+        return;
+    }
     memset(sd->data, 0xff, erase_len);
     for (erase_addr = erase_start; erase_addr <= erase_end;
          erase_addr += erase_len) {
@@ -1969,6 +2859,7 @@ static sd_rsp_type_t sd_cmd_to_sendingdata(SDState *sd, SDRequest req,
     sd->state = sd_sendingdata_state;
     sd->data_start = start;
     sd->data_offset = 0;
+    sd_timing_read_start(sd, req);
     if (data) {
         assert(size > 0 && size <= sizeof(sd->data));
         memcpy(sd->data, data, size);
@@ -2262,6 +3153,9 @@ static sd_rsp_type_t sd_cmd_STOP_TRANSMISSION(SDState *sd, SDRequest req)
         sd->state = sd_transfer_state;
         return sd_r1b;
     case sd_receivingdata_state:
+        if (sd->tm.on) {
+            return sd_timing_stop_write(sd);
+        }
         sd->state = sd_programming_state;
         /* Bzzzzzzztt .... Operation complete.  */
         sd->state = sd_transfer_state;
@@ -2315,6 +3209,9 @@ static sd_rsp_type_t sd_cmd_GO_INACTIVE_STATE(SDState *sd, SDRequest req)
         return sd_invalid_state_for_cmd(sd, req);
     }
     if (sd_req_rca_same(sd, req)) {
+        if (sd->tm.on) {
+            sd_timing_cut(sd);
+        }
         sd->state = sd_inactive_state;
     }
 
@@ -2461,6 +3358,10 @@ static sd_rsp_type_t sd_cmd_SET_CLR_WRITE_PROT(SDState *sd, SDRequest req,
     } else {
         clear_bit(sd_addr_to_wpnum(addr), sd->wp_group_bmap);
     }
+    if (sd->tm.on) {
+        sd_timing_reg_busy(sd, true);
+        return sd_r1b;
+    }
     /* Bzzzzzzztt .... Operation complete.  */
     sd->state = sd_transfer_state;
     return sd_r1;
@@ -2534,6 +3435,9 @@ static sd_rsp_type_t sd_cmd_ERASE(SDState *sd, SDRequest req)
 
     sd->state = sd_programming_state;
     sd_erase(sd);
+    if (sd->tm.on && sd->tm.op.kind != SD_OP_NONE) {
+        return sd_r1b;
+    }
     /* Bzzzzzzztt .... Operation complete.  */
     sd->state = sd_transfer_state;
     return sd_r1b;
@@ -2767,6 +3671,7 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
             sd->state = sd_sendingdata_state;
             sd->data_start = addr;
             sd->data_offset = 0;
+            sd_timing_read_start(sd, req);
             return sd_r1;
 
         default:
@@ -2883,6 +3788,12 @@ static size_t sd_do_command(SDState *sd, SDRequest *req,
 
     if (!sd->blk || !blk_is_inserted(sd->blk)) {
         return 0;
+    }
+    if (sd->tm.unpowered) {
+        return 0;
+    }
+    if (sd->tm.on) {
+        sd_timing_sync(sd);
     }
 
     if (sd->state == sd_inactive_state) {
@@ -3067,9 +3978,20 @@ static size_t sd_write_data(SDState *sd, const void *buf, size_t length)
         return length;
     }
 
+    if (sd->tm.unpowered) {
+        return length;
+    }
+    if (sd->tm.on) {
+        sd_timing_sync(sd);
+    }
     if (sd->state != sd_receivingdata_state) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: not in Receiving-Data state\n", __func__);
+        return length;
+    }
+    if (sd->tm.on && sd_busy(sd)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: data sent while the card is busy\n", __func__);
         return length;
     }
 
@@ -3084,6 +4006,12 @@ static size_t sd_write_data(SDState *sd, const void *buf, size_t length)
         if (sd_generic_write_data(sd, buf, &length)) {
             /* TODO: Check CRC before committing */
             sd->state = sd_programming_state;
+            if (sd->tm.on) {
+                sd_timing_block_written(sd, sd->data_start, sd->data_offset,
+                                        true);
+                sd->csd[14] |= 0x40;
+                break;
+            }
             sd_blk_write(sd, sd->data_start, sd->data_offset);
             sd->blk_written ++;
             sd->csd[14] |= 0x40;
@@ -3120,10 +4048,15 @@ static size_t sd_write_data(SDState *sd, const void *buf, size_t length)
                     & EXT_CSD_PART_CONFIG_ACC_MASK;
             if (partition_access == EXT_CSD_PART_CONFIG_ACC_RPMB) {
                 emmc_rpmb_blk_write(sd, sd->data_start, sd->data_offset);
+            } else if (sd->tm.on) {
+                sd_timing_block_written(sd, sd->data_start, sd->data_offset,
+                                        sd->multi_blk_cnt == 1);
             } else {
                 sd_blk_write(sd, sd->data_start, sd->data_offset);
             }
-            sd->blk_written++;
+            if (!sd->tm.on) {
+                sd->blk_written++;
+            }
             sd->data_start += sd->blk_len;
             sd->data_offset = 0;
             sd->csd[14] |= 0x40;
@@ -3132,7 +4065,8 @@ static size_t sd_write_data(SDState *sd, const void *buf, size_t length)
             if (sd->multi_blk_cnt != 0) {
                 if (--sd->multi_blk_cnt == 0) {
                     /* Stop! */
-                    sd->state = sd_transfer_state;
+                    sd->state = sd->tm.on ? sd_programming_state
+                                          : sd_transfer_state;
                     break;
                 }
             }
@@ -3177,6 +4111,10 @@ static size_t sd_write_data(SDState *sd, const void *buf, size_t length)
                     sd->csd[i] |= sd_csd_rw_mask[i];
                     sd->csd[i] &= sd->data[i];
                 }
+            if (sd->tm.on) {
+                sd_timing_reg_busy(sd, false);
+                break;
+            }
             /* Bzzzzzzztt .... Operation complete.  */
             sd->state = sd_transfer_state;
         }
@@ -3187,6 +4125,10 @@ static size_t sd_write_data(SDState *sd, const void *buf, size_t length)
             /* TODO: Check CRC before committing */
             sd->state = sd_programming_state;
             sd_lock_command(sd);
+            if (sd->tm.on) {
+                sd_timing_reg_busy(sd, false);
+                break;
+            }
             /* Bzzzzzzztt .... Operation complete.  */
             sd->state = sd_transfer_state;
         }
@@ -3211,9 +4153,12 @@ static size_t sd_read_data(SDState *sd, void *buf, size_t length)
     uint32_t io_len;
     uint8_t *value = buf;
 
-    if (!sd->blk || !blk_is_inserted(sd->blk)) {
+    if (!sd->blk || !blk_is_inserted(sd->blk) || sd->tm.unpowered) {
         memset(buf, dummy_byte, length);
         return length;
+    }
+    if (sd->tm.on) {
+        sd_timing_sync(sd);
     }
 
     if (sd->state != sd_sendingdata_state) {
@@ -3279,6 +4224,9 @@ static size_t sd_read_data(SDState *sd, void *buf, size_t length)
         if (sd->data_offset >= io_len) {
             sd->data_start += io_len;
             sd->data_offset = 0;
+            if (sd->tm.on) {
+                sd->tm.data_ready = sd_read_ready(sd, sd_now(sd));
+            }
 
             if (sd->multi_blk_cnt != 0) {
                 if (--sd->multi_blk_cnt == 0) {
@@ -3301,11 +4249,30 @@ static size_t sd_read_data(SDState *sd, void *buf, size_t length)
 
 static bool sd_receive_ready(SDState *sd)
 {
+    if (sd->tm.unpowered) {
+        return false;
+    }
+    if (sd->tm.on) {
+        sd_timing_sync(sd);
+        if (sd_busy(sd)) {
+            return false;
+        }
+    }
     return sd->state == sd_receivingdata_state;
 }
 
 static bool sd_data_ready(SDState *sd)
 {
+    if (sd->tm.unpowered) {
+        return false;
+    }
+    if (sd->tm.on) {
+        sd_timing_sync(sd);
+        if (sd->state == sd_sendingdata_state &&
+            sd_now(sd) < sd->tm.data_ready) {
+            return false;
+        }
+    }
     return sd->state == sd_sendingdata_state;
 }
 
@@ -3479,6 +4446,9 @@ static void sd_instance_finalize(Object *obj)
 
     timer_free(sd->ocr_power_timer);
     timer_free(sd->vsw_timer);
+    if (sd->tm.shutdown.notify) {
+        notifier_remove(&sd->tm.shutdown);
+    }
 }
 
 static void sd_blk_size_error(SDState *sd, int64_t blk_size,
@@ -3602,6 +4572,19 @@ static void sd_realize(DeviceState *dev, Error **errp)
         }
         sd->rpmb.key_set = 1;
     }
+
+    if (sd_is_spi(sd)) {
+        sd->tm.on = false;
+    }
+    if (sd->tm.on) {
+        int64_t size = sd->blk ? blk_getlength(sd->blk) : 0;
+
+        if (!sd_timing_check(sd, MAX(size, 0), errp)) {
+            return;
+        }
+        sd->tm.shutdown.notify = sd_timing_shutdown;
+        qemu_register_shutdown_notifier(&sd->tm.shutdown);
+    }
 }
 
 static void emmc_realize(DeviceState *dev, Error **errp)
@@ -3622,6 +4605,19 @@ static const Property sd_properties[] = {
                       spec_version, SD_PHY_SPECv3_01_VERS),
     /* [spec:nuos:req:emu.esp32p4.sd-uhs] */
     DEFINE_PROP_UINT8("uhs", SDState, uhs_mode, UHS_NOT_SUPPORTED),
+    /* [spec:nuos:req:emu.sd-card-timing] */
+    DEFINE_PROP_BOOL("timing", SDState, tm.on, false),
+    DEFINE_PROP_BOOL("max-timing", SDState, tm.max, false),
+    DEFINE_PROP_UINT8("speed-class", SDState, tm.speed_class_prop, SD_AUTO),
+    DEFINE_PROP_UINT8("uhs-speed-grade", SDState, tm.uhs_grade_prop,
+                      SD_AUTO),
+    DEFINE_PROP_SIZE("au-size", SDState, tm.au_size_prop, 0),
+    DEFINE_PROP_UINT8("taac", SDState, tm.taac_prop, 0),
+    DEFINE_PROP_INT32("nsac", SDState, tm.nsac_prop, -1),
+    DEFINE_PROP_UINT8("r2w-factor", SDState, tm.r2w_prop, 0),
+    DEFINE_PROP_INT32("erase-size", SDState, tm.erase_size_prop, -1),
+    DEFINE_PROP_INT32("erase-timeout", SDState, tm.erase_timeout_prop, -1),
+    DEFINE_PROP_INT32("erase-offset", SDState, tm.erase_offset_prop, -1),
 };
 
 static const Property emmc_properties[] = {
@@ -3655,6 +4651,9 @@ static void sdmmc_common_class_init(ObjectClass *klass, const void *data)
     sc->data_ready = sd_data_ready;
     sc->get_inserted = sd_get_inserted;
     sc->get_readonly = sd_get_readonly;
+    sc->data_ready_time = sd_data_ready_time;
+    sc->busy_end_time = sd_busy_end_time;
+    sc->set_power = sd_set_power;
 }
 
 static void sd_class_init(ObjectClass *klass, const void *data)

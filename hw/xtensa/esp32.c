@@ -2217,9 +2217,13 @@ static void esp32_machine_init_i2c(Esp32SocState *s)
 }
 
 /*
- * The board's SD card, -drive if=sd, in the SD/MMC host's slot 1: slot
- * 0's pads (GPIO6 to GPIO11) carry the flash on a module, so a board's
- * card socket is on slot 1, where ESP-IDF looks for it by default.
+ * The board's SD card, -drive if=sd, in the SD/MMC host's slot 1 (or
+ * -device sd-card,bus=sd-bus1): slot 0's pads (GPIO6 to GPIO11) carry the
+ * flash on a module, so a board's card socket is on slot 1, where ESP-IDF
+ * looks for it by default. Every SD card takes time as one that just
+ * meets its registers (hw/sd/sd.c, the sd-card "timing" property, which
+ * the machine sets). The socket's supply is the board's 3.3 V, not
+ * switched.
  */
 static void esp32_machine_init_sd(Esp32SocState *ss)
 {
@@ -2392,6 +2396,16 @@ static void esp32_machine_set_sdio_host(Object *obj, bool value, Error **errp)
     ESP32_MACHINE(obj)->sdio_host = value;
 }
 
+/*
+ * [spec:nuos:req:emu.sd-card-timing]
+ * Every SD card in the machine, from -drive if=sd or -device sd-card,
+ * takes time (hw/sd/sd.c); -global sd-card.timing=off or a card's own
+ * timing=off makes one that does not.
+ */
+static GlobalProperty esp32_sd_card_timing[] = {
+    { TYPE_SD_CARD, "timing", "on" },
+};
+
 /* Initialize machine type */
 static void esp32_machine_class_init(ObjectClass *oc, const void *data)
 {
@@ -2408,6 +2422,8 @@ static void esp32_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "sdio-host",
         "Add an SDHCI at 0x22000000 as the SDIO slave's host");
     machine_add_audiodev_property(mc);
+    compat_props_add(mc->compat_props, esp32_sd_card_timing,
+                     ARRAY_SIZE(esp32_sd_card_timing));
 }
 
 static const TypeInfo esp32_info = {

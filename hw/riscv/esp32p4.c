@@ -119,14 +119,18 @@
  *     DMA master SDMMC, its interrupt SDIO_HOST_INTR (source 23), and its
  *     card detect, write protect and SDIO interrupt inputs and card reset
  *     outputs matrix signals 126 to 131 and 146 to 148. A card on slot N
- *     is -drive if=sd,index=N: the board's microSD socket is slot 0, on
- *     the IO MUX pads GPIO39 to GPIO44; slot 1 is where the board's
- *     ESP32-C6 sits, as an SDIO slave, and has no card unless given one:
+ *     is -drive if=sd,index=N, or -device sd-card,bus=sd-busN: the
+ *     board's microSD socket is slot 0, on the IO MUX pads GPIO39 to
+ *     GPIO44; slot 1 is where the board's ESP32-C6 sits, as an SDIO
+ *     slave, and has no card unless given one:
  *
  *       -drive if=sd,index=0,format=raw,file=sd.img
  *
+ *     Every SD card takes time as one that just meets its registers
+ *     (hw/sd/sd.c, the sd-card "timing" property, which the machine sets).
  *     A card is on the board, not the chip: no reset of the chip or the
- *     controller reaches it, only a power cycle (QEMU's system reset).
+ *     controller reaches it, only a power cycle (QEMU's system reset) and
+ *     the board's switch of the socket's supply, SD1_VDD, by GPIO45.
  *     The socket's card is UHS-I (if of high capacity): slot 0's pads
  *     are on VDD_IO_5, which the board takes from the PMU's regulator VO4
  *     (ESP_LDO_VO4), off until software powers it, and signal at its
@@ -2186,19 +2190,44 @@ static void esp32p4_init_emac(ESP32P4MachineState *s)
  * the regulators' mode inputs SDMMC_0 and SDMMC_1. Slot 1's pads, which
  * the GPIO matrix routes, are on the board's 3.3 V.
  */
+static void esp32p4_sd_pads(void *opaque, int n, int mv)
+{
+    ESP32P4MachineState *s = opaque;
+
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->sdmmc), DWC_SDMMC_PAD_MV,
+                                        0), mv);
+}
+
 static void esp32p4_init_sd_power(ESP32P4MachineState *s)
 {
     DeviceState *pmu = DEVICE(&s->pmu), *sd = DEVICE(&s->sdmmc);
 
     qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LDO_MV,
                                 ESP32P4_BOARD_SD_PAD_LDO - 1,
-                                qdev_get_gpio_in_named(sd, DWC_SDMMC_PAD_MV,
-                                                       0));
+                                qemu_allocate_irq(esp32p4_sd_pads, s, 0));
     for (int i = 0; i < DWC_SDMMC_MAX_SLOTS; i++) {
         qdev_connect_gpio_out_named(sd, DWC_SDMMC_VOLT_REG, i,
                                     qdev_get_gpio_in_named(pmu,
                                         ESP32P4_PMU_SDMMC_VOLT, i));
     }
+}
+
+/*
+ * [spec:nuos:req:emu.sd-card-power-cut]
+ * The microSD socket's supply, SD1_VDD: ESP_3V3 through Q1, an AO3401
+ * P-channel MOSFET whose gate is GPIO45, pulled down by R27 (10K; R23, a
+ * 10K pull-up to ESP_3V3, is not fitted) (the board's schematic, "MicroSD
+ * Card"). The socket is powered unless GPIO45 is driven high: undriven, as
+ * from any reset of the chip, or driven low, Q1 conducts; the pad's own
+ * weak pull-up loses to R27. Waveshare's documentation for its ESP32-P4
+ * boards names GPIO45 the TF card's power control, low to enable. Switched
+ * off, the card loses its state; switched on, it powers up afresh.
+ */
+static void esp32p4_sd_supply(void *opaque, int n, int level)
+{
+    ESP32P4MachineState *s = opaque;
+
+    dwc_sdmmc_set_card_power(DWC_SDMMC(&s->sdmmc), 0, !level);
 }
 
 /*
@@ -2277,6 +2306,9 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
     qdev_connect_gpio_out_named(dev, DWC_SDMMC_CCMD_OD_PULLUP_EN_N, 0,
         qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
                                ESP32P4_SIG_SD_CCMD_OD_PULLUP_EN_N_PAD_OUT));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_DRIVE_HIGH,
+                                ESP32P4_BOARD_SD_POWER_PAD,
+                                qemu_allocate_irq(esp32p4_sd_supply, s, 0));
 }
 
 /*
@@ -5056,6 +5088,16 @@ static void esp32p4_machine_instance_finalize(Object *obj)
     g_free(ESP32P4_MACHINE(obj)->lp_rom_file);
 }
 
+/*
+ * [spec:nuos:req:emu.sd-card-timing]
+ * Every SD card in the machine, from -drive if=sd or -device sd-card,
+ * takes time (hw/sd/sd.c); -global sd-card.timing=off or a card's own
+ * timing=off makes one that does not.
+ */
+static GlobalProperty esp32p4_sd_card_timing[] = {
+    { TYPE_SD_CARD, "timing", "on" },
+};
+
 /* [spec:nuos:req:emu.esp32p4.machine] */
 static void esp32p4_machine_class_init(ObjectClass *oc, const void *data)
 {
@@ -5087,6 +5129,8 @@ static void esp32p4_machine_class_init(ObjectClass *oc, const void *data)
     mc->max_cpus = ESP32P4_HP_CORES + 1;
     mc->default_cpus = ESP32P4_HP_CORES + 1;
     machine_add_audiodev_property(mc);
+    compat_props_add(mc->compat_props, esp32p4_sd_card_timing,
+                     ARRAY_SIZE(esp32p4_sd_card_timing));
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */

@@ -165,6 +165,17 @@ struct SDCardClass {
     bool (*get_readonly)(SDState *sd);
     void (*set_cid)(SDState *sd);
     void (*set_csd)(SDState *sd, uint64_t size);
+    /*
+     * For a card that takes time (sd-card's "timing" property), at the
+     * present on its bus (SDBusClass's get_time): when its next read
+     * block's start bit can be on DAT, INT64_MAX while it sends none (0:
+     * the card does not time its data); and when it releases DAT0 from
+     * busy, 0 if it is not busy.
+     */
+    int64_t (*data_ready_time)(SDState *sd);
+    int64_t (*busy_end_time)(SDState *sd);
+    /* The board switches the card's supply on or off. */
+    void (*set_power)(SDState *sd, bool on);
 
     const struct SDProto *proto;
 };
@@ -198,6 +209,15 @@ struct SDBusClass {
      * line_time() gives (hw/core/line-time.h).
      */
     void (*lines_changed)(DeviceState *dev);
+    /*
+     * For a card that takes time: the present on the bus, as the
+     * controller times its events (by default, the virtual clock); and
+     * when @cycles of the card clock from @from have passed (INT64_MAX
+     * while it is stopped; by default @from: no clock is known).
+     */
+    int64_t (*get_time)(DeviceState *dev);
+    int64_t (*card_clock_after)(DeviceState *dev, int64_t from,
+                                uint64_t cycles);
 };
 
 /* Functions to be used by qdevified callers (working via
@@ -277,6 +297,32 @@ bool sdbus_data_ready(SDBus *sd);
 bool sdbus_get_inserted(SDBus *sd);
 bool sdbus_get_readonly(SDBus *sd);
 /**
+ * sdbus_data_ready_time: When the card's read data comes
+ * @sd: bus
+ *
+ * Return: the time the card's next read block can start, at or before
+ * the present once it can; INT64_MAX while the card sends none; 0 for a
+ * card that does not time its data, or no card.
+ */
+int64_t sdbus_data_ready_time(SDBus *sd);
+/**
+ * sdbus_busy_end_time: When the card releases DAT0
+ * @sd: bus
+ *
+ * Return: the time the card's busy (DAT0 held low while it programs or
+ * erases) ends; 0 while it is not busy, or for no card.
+ */
+int64_t sdbus_busy_end_time(SDBus *sd);
+/**
+ * sdbus_set_power: The board switches the supply of the card on @sd
+ * @sd: bus
+ * @on: true to power the card
+ *
+ * A card switched off loses its state and does not answer; switched on,
+ * it starts from power-up.
+ */
+void sdbus_set_power(SDBus *sd, bool on);
+/**
  * sdbus_reparent_card: Reparent an SD card from one controller to another
  * @from: controller bus to remove card from
  * @to: controller bus to move card to
@@ -302,5 +348,20 @@ void sdbus_set_irq(SDBus *sd, bool level);
  * @sd: bus
  */
 void sdbus_lines_changed(SDBus *sd);
+/**
+ * sdbus_get_time: The present on the bus, for a card that takes time
+ * @sd: bus
+ */
+int64_t sdbus_get_time(SDBus *sd);
+/**
+ * sdbus_card_clock_after: When @cycles of the card clock have passed
+ * @sd: bus
+ * @from: from when, in ns
+ * @cycles: card clock cycles
+ *
+ * Return: the time, INT64_MAX while the clock is stopped, or @from when
+ * the controller does not say.
+ */
+int64_t sdbus_card_clock_after(SDBus *sd, int64_t from, uint64_t cycles);
 
 #endif /* HW_SD_H */
