@@ -1,7 +1,8 @@
 /*
  * QTest testcase for the ESP32-P4 boot ROM's download over serial port 0
  * (UART0): esptool's SYNC, then a program into L2MEM that the ROM runs, in
- * joint download boot and in UART0_BOOT
+ * joint download boot and in UART0_BOOT; and the loader's commands as
+ * esptool drives them, under icount and on the host's clock
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -63,11 +64,48 @@ static void test_uart0_boot(void)
     qtest_quit(qts);
 }
 
+/*
+ * The ROM's loader in joint download boot over serial port 0, through the
+ * board's terminal (esp_port_check_loader()), under icount or on the
+ * host's clock, where the models' timers run as late as the host makes
+ * them: 2 KiB, which at 115200 baud is two MEM_DATA blocks of 90 ms each
+ * and 512 READ_REG round trips of about 3 ms.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+/* [spec:nuos:req:emu.esp32p4.boot/test] */
+static void run_uart0_loader(bool icount)
+{
+    g_autofree char *args = g_strdup_printf("-M esp32p4,strap-mode=0x04 %s",
+                                            esp_timing(icount));
+    EspPort p = { .rx = g_byte_array_new() };
+
+    p.qts = qtest_init_with_serial(args, &p.fd);
+    esp_port_await_banner(&p);
+    esp_port_check_loader(&p, 2);
+    close(p.fd);
+    qtest_quit(p.qts);
+    g_byte_array_free(p.rx, true);
+}
+
+static void test_uart0_loader_icount(void)
+{
+    run_uart0_loader(true);
+}
+
+static void test_uart0_loader_host_clock(void)
+{
+    run_uart0_loader(false);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
 
     qtest_add_func("/esp32p4/boot/uart-download", test_uart_download);
     qtest_add_func("/esp32p4/boot/uart0-boot", test_uart0_boot);
+    qtest_add_func("/esp32p4/boot/uart0-loader/icount",
+                   test_uart0_loader_icount);
+    qtest_add_func("/esp32p4/boot/uart0-loader/host-clock",
+                   test_uart0_loader_host_clock);
     return g_test_run();
 }

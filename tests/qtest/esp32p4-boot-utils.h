@@ -40,6 +40,16 @@
 /* Writes MAGIC to MAGIC_ADDR, then loops. */
 extern const uint32_t prog_magic[6];
 
+/*
+ * A serial port esptool has open to the ROM: the bytes received on it and
+ * not yet taken as a frame
+ */
+typedef struct EspPort {
+    QTestState *qts;
+    int fd;
+    GByteArray *rx;
+} EspPort;
+
 typedef struct Boot {
     QTestState *qts;
     char *log;
@@ -81,5 +91,9 @@ EspReply esp_command(int fd, uint8_t cmd, const uint8_t *data, size_t len,
                      uint32_t checksum);
 uint32_t esp_read_reg(int fd, uint32_t addr);
 void esp_write_reg(int fd, uint32_t addr, uint32_t value);
+
+const char *esp_timing(bool icount);
+void esp_port_await_banner(EspPort *p);
+void esp_port_check_loader(EspPort *p, unsigned kib);
 
 #endif
