@@ -763,9 +763,18 @@ struct ESP32P4ClkRstState {
     Clock *clk[ESP32P4_NUM_CLOCKS];
     /* The index + 1 of each output Clock, for its exact period. */
     GHashTable *clk_ids;
-    /* The periods the tree last computed, exactly and in Clock units. */
+    /*
+     * The periods the tree last computed, exactly and in Clock units, and
+     * the clocks' edges; for each, the clock its edges come from and that
+     * clock's edges when it took them (esp32p4_clkrst_compute_edges()); the
+     * inputs' edges.
+     */
     ESP32P4ClkPeriod exact[ESP32P4_NUM_CLOCKS];
     uint64_t period[ESP32P4_NUM_CLOCKS];
+    ESP32P4ClkEdges edges[ESP32P4_NUM_CLOCKS];
+    int16_t edge_from[ESP32P4_NUM_CLOCKS];
+    ESP32P4ClkEdges edge_from_edges[ESP32P4_NUM_CLOCKS];
+    ESP32P4ClkEdges in_edges[ESP32P4_NUM_CLKIN];
     bool recomputing;
     bool recompute_again;
 

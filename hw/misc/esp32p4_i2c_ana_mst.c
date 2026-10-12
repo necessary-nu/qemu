@@ -110,14 +110,19 @@ static const uint8_t esp32p4_i2c_ana_mst_conf2_bit[ESP32P4_ANA_NUM_SLAVES] = {
     [ESP32P4_ANA_SLAVE_BIAS]     = 12,
 };
 
-/* The exact period of the clock the masters count; stopped, stopped. */
-static ESP32P4ClkPeriod esp32p4_i2c_ana_mst_period(ESP32P4I2CAnaMstState *s)
+/*
+ * The edges of the clock the masters count, from @now if they are not
+ * given; stopped while the bus clock is.
+ */
+static ESP32P4ClkEdges esp32p4_i2c_ana_mst_edges(ESP32P4I2CAnaMstState *s,
+                                                 int64_t now)
 {
     if (!clock_is_enabled(s->bus)) {
-        return esp32p4_clk_period_stopped();
+        return esp32p4_clk_edges_stopped();
     }
-    return esp32p4_clk_exact((s->regs[R_CLK160M] & 1) ? s->pll_f160m
-                                                       : s->lp_fast);
+    return esp32p4_clk_edges_or_at((s->regs[R_CLK160M] & 1) ? s->pll_f160m
+                                                             : s->lp_fast,
+                                   now);
 }
 
 /*
@@ -135,8 +140,8 @@ static void esp32p4_i2c_ana_mst_schedule(ESP32P4I2CAnaMstState *s, int n)
     }
     done = esp32p4_clk_count_at(&s->xfer[n], now);
     s->xfer_left[n] -= MIN(done, s->xfer_left[n]);
-    s->xfer[n].period = esp32p4_i2c_ana_mst_period(s);
-    s->xfer[n].origin_ns = now;
+    s->xfer[n].edges = esp32p4_i2c_ana_mst_edges(s, now);
+    esp32p4_clk_count_rebase(&s->xfer[n], now);
     if (!esp32p4_clk_count_running(&s->xfer[n])) {
         timer_del(s->timer[n]);
         return;
@@ -199,8 +204,9 @@ static void esp32p4_i2c_ana_mst_start(ESP32P4I2CAnaMstState *s, int n)
 
     s->busy[n] = true;
     s->xfer_left[n] = (uint64_t)MAX(bit, 1) * (write ? WRITE_BITS : READ_BITS);
-    s->xfer[n].origin_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    s->xfer[n].period = esp32p4_clk_period_stopped();
+    s->xfer[n].edges = esp32p4_clk_edges_stopped();
+    esp32p4_clk_count_rebase(&s->xfer[n],
+                             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     esp32p4_i2c_ana_mst_schedule(s, n);
 }
 
@@ -305,7 +311,7 @@ static void esp32p4_i2c_ana_mst_reset_hold(Object *obj, ResetType type)
         s->busy[n] = false;
         timer_del(s->timer[n]);
         s->xfer_left[n] = 0;
-        s->xfer[n].period = esp32p4_clk_period_stopped();
+        s->xfer[n].edges = esp32p4_clk_edges_stopped();
     }
 }
 

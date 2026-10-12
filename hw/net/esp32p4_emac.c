@@ -289,11 +289,19 @@ static void p4_emac_update_pad_ref(ESP32P4EmacState *s)
                    (p4_emac_pad(s->pad_ref_clk) &&
                     esp32p4_gpio_iomux_in_selected(s->gpio, s->pad_ref_clk,
                         ESP32P4_EMAC_RMII_CLK_FUNC));
-    ESP32P4ClkPeriod old = s->pad_txrx_period;
+    ESP32P4ClkEdges old = s->pad_txrx_edges, e = esp32p4_clk_edges_stopped();
 
-    s->pad_txrx_period = through ? esp32p4_clk_exact(s->phy_ref_clk)
-                                 : esp32p4_clk_period_stopped();
-    esp32p4_clk_update(s->pad_txrx_clk, old, s->pad_txrx_period);
+    if (through && !esp32p4_clk_exact_edges(s->phy_ref_clk, &e)) {
+        /*
+         * The PHY gives no edges: its clock keeps those it had while its
+         * period does, and otherwise has its first edge now.
+         */
+        e = esp32p4_clk_period_eq(e.period, old.period) ? old :
+            esp32p4_clk_edges_at(e.period,
+                                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+    s->pad_txrx_edges = e;
+    esp32p4_clk_update(s->pad_txrx_clk, &old, &s->pad_txrx_edges);
 }
 
 /*
@@ -301,15 +309,15 @@ static void p4_emac_update_pad_ref(ESP32P4EmacState *s)
  * PAD_EMAC_TXRX_CLK carries the PHY's reference clock at its exact
  * period, as the TYPE_ESP32P4_CLK_SOURCE of "pad-txrx".
  */
-static bool p4_emac_exact_period(Object *obj, Clock *out,
-                                 ESP32P4ClkPeriod *p)
+static bool p4_emac_exact_edges(Object *obj, Clock *out,
+                                ESP32P4ClkEdges *e)
 {
     ESP32P4EmacState *s = ESP32P4_EMAC(obj);
 
     if (out != s->pad_txrx_clk) {
         return false;
     }
-    *p = s->pad_txrx_period;
+    *e = s->pad_txrx_edges;
     return true;
 }
 
@@ -491,7 +499,7 @@ static void p4_emac_init(Object *obj)
                                         p4_emac_phy_ref_update, s,
                                         ClockUpdate);
     s->pad_txrx_clk = qdev_init_clock_out(dev, "pad-txrx");
-    s->pad_txrx_period = esp32p4_clk_period_stopped();
+    s->pad_txrx_edges = esp32p4_clk_edges_stopped();
     qdev_init_gpio_in_named(dev, p4_emac_set_reset, ESP32P4_EMAC_RESET, 1);
     qdev_init_gpio_in_named(dev, p4_emac_set_phy_intf, ESP32P4_EMAC_PHY_INTF,
                             ESP32P4_EMAC_PHY_INTF_LINES);
@@ -544,8 +552,8 @@ static const Property p4_emac_properties[] = {
 
 static const VMStateDescription vmstate_p4_emac = {
     .name = TYPE_ESP32P4_EMAC,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT(parent_obj, ESP32P4EmacState, 1, vmstate_esp32_dwmac,
                        Esp32DwmacState),
@@ -557,7 +565,7 @@ static const VMStateDescription vmstate_p4_emac = {
         VMSTATE_CLOCK(rx_clk, ESP32P4EmacState),
         VMSTATE_CLOCK(tx_clk, ESP32P4EmacState),
         VMSTATE_CLOCK(phy_ref_clk, ESP32P4EmacState),
-        VMSTATE_ESP32P4_CLK_PERIOD(pad_txrx_period, ESP32P4EmacState),
+        VMSTATE_ESP32P4_CLK_EDGES(pad_txrx_edges, ESP32P4EmacState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -600,7 +608,7 @@ static void p4_emac_class_init(ObjectClass *klass, const void *data)
     dk->reset_changed = p4_emac_reset_changed;
     dk->clock_edges = p4_emac_clock_edges;
     dk->clock_edge_ns = p4_emac_clock_edge_ns;
-    csc->exact_period = p4_emac_exact_period;
+    csc->exact_edges = p4_emac_exact_edges;
 
     resettable_class_set_parent_phases(rc, NULL, p4_emac_reset_hold,
                                        p4_emac_reset_exit, &k->parent_phases);

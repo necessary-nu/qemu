@@ -256,7 +256,9 @@ static void timg_timer_sync(ESP32P4TimgTimer *t, int64_t now)
 
     t->count = timg_timer_count(t, now);
     if (!t->running) {
-        t->edges.origin_ns = MAX(now, t->edges.origin_ns);
+        if (now > t->edges.origin_ns) {
+            esp32p4_clk_count_rebase(&t->edges, now);
+        }
         return;
     }
     t->pre = (t->pre + cycles) % timg_divisor(t->config);

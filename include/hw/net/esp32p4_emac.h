@@ -86,8 +86,8 @@ struct ESP32P4EmacState {
     Clock *tx_clk;
     Clock *phy_ref_clk;
     Clock *pad_txrx_clk;
-    /* The exact period of the clock on "pad-txrx". */
-    ESP32P4ClkPeriod pad_txrx_period;
+    /* The edges, exact period and phase, of the clock on "pad-txrx". */
+    ESP32P4ClkEdges pad_txrx_edges;
 
     /* PHY_INTF_SEL as HP_SYSTEM drives it, and as the last reset took it */
     uint8_t phy_intf_sel;

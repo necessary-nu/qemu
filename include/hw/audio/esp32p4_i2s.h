@@ -259,8 +259,8 @@ struct ESP32P4I2sState {
     Clock *rx_clk;
     Clock *mst_clk;
     Clock *pad_mclk;
-    /* The exact period of the clock on "pad-mclk". */
-    ESP32P4ClkPeriod pad_mclk_period;
+    /* The edges, exact period and phase, of the clock on "pad-mclk". */
+    ESP32P4ClkEdges pad_mclk_edges;
     ESP32P4GdmaState *gdma;
     ESP32P4GpioState *gpio;
     ESP32P4I2sState *bus[ESP32P4_I2S_COUNT];
