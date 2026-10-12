@@ -378,8 +378,9 @@ qtests_riscv32 = \
      'esp32p4-uart-test', 'esp32p4-spi-test', 'esp32p4-parlio-test',
      'esp32p4-bitscrambler-test', 'esp32p4-i2s-test', 'esp32p4-rmt-test',
      'esp32p4-pcnt-test', 'esp32p4-crypto-test', 'esp32p4-pwm-test',
-     'esp32p4-lp-core-test', 'esp32p4-boot-test', 'esp32p4-boot-uart-test',
-     'esp32p4-boot-esptool-test', 'esp32p4-boot-usb-test', 'esp32p4-adc-test',
+     'esp32p4-lp-core-test', 'esp32p4-boot-test', 'esp32p4-boot-secure-test',
+     'esp32p4-boot-uart-test', 'esp32p4-boot-esptool-test',
+     'esp32p4-boot-usb-test', 'esp32p4-adc-test',
      'esp32p4-tsens-test', 'esp32p4-touch-test',
      'esp32p4-ana-cmpr-test', 'esp32p4-lp-rom-test'] :
     [])
@@ -501,6 +502,7 @@ qtests = {
                        [gio],
   'erst-test': files('erst-test.c'),
   'esp32p4-boot-test': files('esp32p4-boot-utils.c'),
+  'esp32p4-boot-secure-test': files('esp32p4-boot-utils.c'),
   'esp32p4-boot-uart-test': files('esp32p4-boot-utils.c'),
   'esp32p4-boot-esptool-test': files('esp32p4-boot-utils.c'),
   'esp32p4-boot-usb-test': files('esp32p4-boot-utils.c'),
