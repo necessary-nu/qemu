@@ -70,6 +70,9 @@ enum {
  */
 #define ESP32P4_PMU_EXT_LDOS    6
 
+/* The output regulators VO1 to VO4, by channel - 1, for "ldo-mv". */
+#define ESP32P4_PMU_LDO_CHANNELS 4
+
 /* The PMU's states: those of the main state machine and its switches. */
 enum {
     ESP32P4_PMU_ST_HP_ACTIVE,
@@ -116,7 +119,13 @@ enum {
  *     as the LP CPU's clock starts on its wakeup, and ULP_EVT_HALT, as
  *     the LP CPU's sleep process ends; "touch-pwr", a pulse as software
  *     writes PMU_TOUCH_PWR_CNTL, for the touch sensor's timer, which reads
- *     it with esp32p4_pmu_touch_pwr_cntl().
+ *     it with esp32p4_pmu_touch_pwr_cntl(); "ldo-mv", per regulator VO1
+ *     to VO4 (channel - 1), its output in mV, 0 while off (VO1's not
+ *     driven).
+ *   - Named GPIO input "sdmmc-volt", two lines: the SD/MMC host's
+ *     UHS_REG.VOLT_REG bits for cards 0 and 1, the regulators' mode
+ *     inputs SDMMC_0 and SDMMC_1.
+ *   - Property "vdd-ldo-mv": VDD_LDO, the regulators' supply (3300).
  */
 #define ESP32P4_PMU_WAKEUP          "wakeup"
 #define ESP32P4_PMU_EXT_PAD         "ext-pad"
@@ -141,6 +150,8 @@ enum {
 #define ESP32P4_PMU_LP_CORE_INTR_MASK "lp-core-intr-mask"
 #define ESP32P4_PMU_ETM_EVENT       "etm-event"
 #define ESP32P4_PMU_TOUCH_PWR       "touch-pwr"
+#define ESP32P4_PMU_LDO_MV          "ldo-mv"
+#define ESP32P4_PMU_SDMMC_VOLT      "sdmmc-volt"
 
 enum {
     ESP32P4_PMU_ETM_EVT_SLEEP_WAKEUP,
@@ -253,6 +264,7 @@ struct ESP32P4PMUState {
     qemu_irq lp_core_intr_mask;
     qemu_irq etm_event[ESP32P4_PMU_ETM_EVTS];
     qemu_irq touch_pwr;
+    qemu_irq ldo_mv[ESP32P4_PMU_LDO_CHANNELS];
     Clock *fast;
     Clock *slow;
     ESP32P4ClkRstState *clkrst;
@@ -295,6 +307,10 @@ struct ESP32P4PMUState {
     int64_t lp_sleep_due_ns;
 
     ESP32P4PMULdo ldo[ESP32P4_PMU_EXT_LDOS];
+    /* VDD_LDO, the SD/MMC host's VOLT_REG bits, the voltages driven */
+    uint32_t vdd_ldo_mv;
+    uint8_t sdmmc_volt;
+    uint32_t vo_mv[ESP32P4_PMU_LDO_CHANNELS];
 
     bool power_level[ESP32P4_PMU_NUM_PD];
     ESP32P4PMULevels out;

@@ -138,7 +138,26 @@
  * count reaches TARGET0 and TARGET1; CNT_CLR restarts it, as bit 7 of
  * VO1's TARGET0 holds it clear (its target is the 7 bits below).
  * LDO_CNT_PRESCALER_SEL, which the TRM does not describe, is logged as not
- * modelled. The regulators' voltages have no effect the model can show.
+ * modelled.
+ *
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * The output regulators' voltages (TRM 15.4.2.9.1, figure 15.4-4): VO2,
+ * VO3 and VO4 (P1_0P1A, P0_0P2A, P1_0P2A, ESP-IDF's ldo_ll.h order) give
+ * nothing while their XPD is clear, and otherwise, in bypass mode,
+ * VDD_LDO (the "vdd-ldo-mv" property, 3.3 V on the board), in LDO mode
+ * VREF x MUL from their ANA register: VREF 0.5 V + 50 mV x DREF up to
+ * DREF 8, then 1.0 V + 100 mV x (DREF - 9); MUL 1 + MUL / 4 (TRM, and
+ * ldo_ll.h's ideal formula, the eFuse calibration constants describing
+ * silicon's departure from it), no more than VDD_LDO. The mode is
+ * TIEH_SEL's input of the figure's mux, its select FORCE_TIEH_SEL ?
+ * TIEH_SEL : 0: 0, the regulator's TIEH (1: bypass); 2, bypass; 1 and 3,
+ * the SD/MMC host's card 0 and card 1 signals, which the model takes as
+ * bypass while the host's UHS_REG.VOLT_REG bit for the card is clear and
+ * LDO mode while it is set (the host asking 1.8 V of the card's pads).
+ * TIEH_SEL's values 4 to 7 select as their low two bits do (logged).
+ * Each voltage is the "ldo-mv" output line of its channel, in mV, as
+ * soon as software sets it; VO1, the flash supply, which the state machine
+ * and eFuses control, is not modelled and its line not driven.
  *
  * Status: PMU_MAIN_STATE gives the states in one-hot codes, which the TRM
  * does not give but its reset values (HP_ACTIVE 0x01, HP_SLEEP 0x04 the
@@ -409,7 +428,14 @@
 #define LDO_XPD                 BIT(8)
 #define LDO_TARGET1(v)          extract32((v), 15, 8)
 #define LDO_TARGET0(v)          extract32((v), 23, 8)
+#define LDO_FORCE_TIEH_SEL      BIT(7)
+#define LDO_TIEH_SEL(v)         extract32((v), 9, 3)
+#define LDO_TIEH                BIT(14)
 #define LDO_VO1_CNT_HOLD        BIT(30)
+/* EXT_LDO_*_ANA */
+#define LDO_ANA_MUL(v)          extract32((v), 23, 3)
+#define LDO_ANA_DREF(v)         extract32((v), 28, 4)
+#define LDO_MODE_MAX_MV         2700
 #define LDO_PRESCALER_SEL       BIT(31)
 #define LDO_CYCLES_PER_COUNT    16
 /* EXT_WAKEUP_CNTL */
@@ -1515,6 +1541,82 @@ static void pmu_ldo_cb(void *opaque)
     pmu_ldo_schedule(l->s, l - l->s->ldo);
 }
 
+/* The EXT_LDO register pair of regulator VO@ch + 1 (ldo_ll.h's order) */
+static const int8_t pmu_vo_ldo[ESP32P4_PMU_LDO_CHANNELS] = { -1, 3, 1, 4 };
+
+/* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+/* Regulator VO@ch + 1's output, mV; whether in LDO mode in *@ldo_mode. */
+static uint32_t pmu_vo_mv(ESP32P4PMUState *s, unsigned ch, bool *ldo_mode)
+{
+    int n = pmu_vo_ldo[ch];
+    uint32_t v = s->regs[R(A_EXT_LDO(n))];
+    uint32_t ana = s->regs[R(A_EXT_LDO(n) + 4)];
+    unsigned sel = (v & LDO_FORCE_TIEH_SEL) ? LDO_TIEH_SEL(v) & 3 : 0;
+    uint32_t dref = LDO_ANA_DREF(ana), vref;
+    bool bypass;
+
+    *ldo_mode = false;
+    if (!(v & LDO_XPD)) {
+        return 0;
+    }
+    switch (sel) {
+    case 0:
+        bypass = v & LDO_TIEH;
+        break;
+    case 1:
+        bypass = !(s->sdmmc_volt & 1);
+        break;
+    case 2:
+        bypass = true;
+        break;
+    default:
+        bypass = !(s->sdmmc_volt & 2);
+        break;
+    }
+    if (bypass) {
+        return s->vdd_ldo_mv;
+    }
+    *ldo_mode = true;
+    vref = dref < 9 ? 500 + 50 * dref : 1000 + 100 * (dref - 9);
+    return MIN(vref * (4 + LDO_ANA_MUL(ana)) / 4, s->vdd_ldo_mv);
+}
+
+/* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+static void pmu_vo_drive(ESP32P4PMUState *s, bool force)
+{
+    for (unsigned ch = 1; ch < ESP32P4_PMU_LDO_CHANNELS; ch++) {
+        uint32_t v = s->regs[R(A_EXT_LDO(pmu_vo_ldo[ch]))];
+        bool ldo_mode;
+        uint32_t mv = pmu_vo_mv(s, ch, &ldo_mode);
+
+        if (mv == s->vo_mv[ch] && !force) {
+            continue;
+        }
+        if ((v & LDO_FORCE_TIEH_SEL) && LDO_TIEH_SEL(v) > 3) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: VO%u's TIEH_SEL %u, which "
+                          "the mux does not have: taken as %u\n",
+                          TYPE_ESP32P4_PMU, ch + 1, LDO_TIEH_SEL(v),
+                          LDO_TIEH_SEL(v) & 3);
+        }
+        if (ldo_mode && mv > LDO_MODE_MAX_MV) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: VO%u set to %u mV in LDO "
+                          "mode, beyond its 2.7 V\n", TYPE_ESP32P4_PMU,
+                          ch + 1, mv);
+        }
+        s->vo_mv[ch] = mv;
+        qemu_set_irq(s->ldo_mv[ch], mv);
+    }
+}
+
+/* The SD/MMC host's UHS_REG.VOLT_REG bit for card @n. */
+static void esp32p4_pmu_sdmmc_volt(void *opaque, int n, int level)
+{
+    ESP32P4PMUState *s = opaque;
+
+    s->sdmmc_volt = deposit32(s->sdmmc_volt, n, 1, level != 0);
+    pmu_vo_drive(s, false);
+}
+
 /* The value a read of register @reg gives. */
 static uint32_t pmu_value(ESP32P4PMUState *s, hwaddr reg)
 {
@@ -1782,6 +1884,7 @@ static void esp32p4_pmu_write(void *opaque, hwaddr addr, uint64_t value,
     }
     pmu_check(s);
     pmu_update_outputs(s);
+    pmu_vo_drive(s, false);
 }
 
 static const MemoryRegionOps esp32p4_pmu_ops = {
@@ -1907,6 +2010,7 @@ static void esp32p4_pmu_reset_exit(Object *obj, ResetType type)
         pmu_ldo_update(s, i, true);
     }
     pmu_drive_outputs(s, true);
+    pmu_vo_drive(s, true);
     qemu_irq_pulse(s->touch_pwr);
 }
 
@@ -1974,6 +2078,16 @@ static void esp32p4_pmu_init(Object *obj)
     qdev_init_gpio_out_named(dev, s->etm_event, ESP32P4_PMU_ETM_EVENT,
                              ESP32P4_PMU_ETM_EVTS);
     qdev_init_gpio_out_named(dev, &s->touch_pwr, ESP32P4_PMU_TOUCH_PWR, 1);
+    qdev_init_gpio_out_named(dev, s->ldo_mv, ESP32P4_PMU_LDO_MV,
+                             ESP32P4_PMU_LDO_CHANNELS);
+    qdev_init_gpio_in_named(dev, esp32p4_pmu_sdmmc_volt,
+                            ESP32P4_PMU_SDMMC_VOLT, 2);
+    for (i = 1; i < ESP32P4_PMU_LDO_CHANNELS; i++) {
+        g_autofree char *name = g_strdup_printf("vo%d-mv", i + 1);
+
+        object_property_add_uint32_ptr(obj, name, &s->vo_mv[i],
+                                       OBJ_PROP_FLAG_READ);
+    }
 }
 
 static void esp32p4_pmu_realize(DeviceState *dev, Error **errp)
@@ -2076,8 +2190,8 @@ static const VMStateDescription vmstate_esp32p4_pmu_levels = {
 
 static const VMStateDescription vmstate_esp32p4_pmu = {
     .name = TYPE_ESP32P4_PMU,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(fast, ESP32P4PMUState),
         VMSTATE_CLOCK(slow, ESP32P4PMUState),
@@ -2108,6 +2222,9 @@ static const VMStateDescription vmstate_esp32p4_pmu = {
         VMSTATE_BOOL_ARRAY(power_level, ESP32P4PMUState, ESP32P4_PMU_NUM_PD),
         VMSTATE_STRUCT(out, ESP32P4PMUState, 2, vmstate_esp32p4_pmu_levels,
                        ESP32P4PMULevels),
+        VMSTATE_UINT8(sdmmc_volt, ESP32P4PMUState),
+        VMSTATE_UINT32_ARRAY(vo_mv, ESP32P4PMUState,
+                             ESP32P4_PMU_LDO_CHANNELS),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -2119,6 +2236,7 @@ static const Property esp32p4_pmu_properties[] = {
                      CPUState *),
     DEFINE_PROP_LINK("lp-sys", ESP32P4PMUState, lp_sys, TYPE_ESP32P4_LP_SYS,
                      ESP32P4LPSysState *),
+    DEFINE_PROP_UINT32("vdd-ldo-mv", ESP32P4PMUState, vdd_ldo_mv, 3300),
 };
 
 static void esp32p4_pmu_class_init(ObjectClass *klass, const void *data)
