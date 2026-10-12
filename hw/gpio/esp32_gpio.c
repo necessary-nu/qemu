@@ -818,6 +818,18 @@ static void esp32_gpio_settle(void *opaque)
     } while (s->update_pending);
 }
 
+/* The changes held back at the time of the round, then their round. */
+static void esp32_gpio_settle_deferred(void *opaque)
+{
+    Esp32GpioState *s = opaque;
+
+    s->update_pending = false;
+    esp32_line_deferred_replay(&s->deferred, s->round_ns);
+    if (s->update_pending) {
+        esp32_gpio_settle(s);
+    }
+}
+
 /*
  * [spec:nuos:req:emu.esp32.gpio]
  * Resolve the pads until the routing settles. Every line this drives
@@ -826,17 +838,44 @@ static void esp32_gpio_settle(void *opaque)
  * or a peripheral's untimed output, the moment the resolution began. Every
  * receiver of an edge, and every block the edge reaches through others,
  * times it alike, rather than each reading the clock as it happens to run.
+ * A change that comes in while a round resolves, at that round's time,
+ * joins it; one at another time is held back (esp32_gpio_held_back()) and
+ * resolved after, the earliest first, in a round at its own time.
  */
 static void esp32_gpio_update(Esp32GpioState *s)
 {
+    int64_t when;
+
     if (s->updating) {
         s->update_pending = true;
         return;
     }
     s->updating = true;
-    esp32_line_run_at(esp32_line_time(), esp32_gpio_settle, s);
+    s->round_ns = esp32_line_time();
+    esp32_line_run_at(s->round_ns, esp32_gpio_settle, s);
+    while (esp32_line_deferred_next(&s->deferred, &when)) {
+        s->round_ns = when;
+        esp32_line_run_at(when, esp32_gpio_settle_deferred, s);
+    }
     s->update_pending = false;
     s->updating = false;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * Whether a change to an input, which fn(s, n, level) takes, comes in
+ * while a round resolves at another time: it is then held back, to be
+ * resolved at its own time. Such a change is, for one, the edge of a
+ * source that was behind and catches up as it takes the round's change.
+ */
+static bool esp32_gpio_held_back(Esp32GpioState *s, Esp32LineInput *fn,
+                                 int n, int level)
+{
+    if (!s->updating || esp32_line_time() == s->round_ns) {
+        return false;
+    }
+    esp32_line_defer(&s->deferred, fn, s, n, level);
+    return true;
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] */
@@ -1345,6 +1384,9 @@ static void esp32_gpio_pad_in(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (esp32_gpio_held_back(s, esp32_gpio_pad_in, n, level)) {
+        return;
+    }
     s->ext_driven |= 1ULL << n;
     if (level) {
         s->ext_level |= 1ULL << n;
@@ -1358,6 +1400,9 @@ static void esp32_gpio_pad_release(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (esp32_gpio_held_back(s, esp32_gpio_pad_release, n, level)) {
+        return;
+    }
     if (level) {
         s->ext_driven &= ~(1ULL << n);
         esp32_gpio_update(s);
@@ -1368,6 +1413,9 @@ static void esp32_gpio_set_sig_out(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (esp32_gpio_held_back(s, esp32_gpio_set_sig_out, n, level)) {
+        return;
+    }
     if (s->sig_out[n] == (level != 0)) {
         return;
     }
@@ -1379,6 +1427,9 @@ static void esp32_gpio_set_sig_oe(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (esp32_gpio_held_back(s, esp32_gpio_set_sig_oe, n, level)) {
+        return;
+    }
     s->sig_oe[n] = level != 0;
     esp32_gpio_update(s);
 }
@@ -1387,6 +1438,9 @@ static void esp32_gpio_set_iomux_out(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (esp32_gpio_held_back(s, esp32_gpio_set_iomux_out, n, level)) {
+        return;
+    }
     s->iomux_func_out[n] = level != 0;
     esp32_gpio_update(s);
 }
@@ -1395,6 +1449,9 @@ static void esp32_gpio_set_iomux_oe(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (esp32_gpio_held_back(s, esp32_gpio_set_iomux_oe, n, level)) {
+        return;
+    }
     s->iomux_func_oe[n] = level != 0;
     esp32_gpio_update(s);
 }
@@ -1410,6 +1467,9 @@ static void esp32_gpio_set_rtc_mux(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (esp32_gpio_held_back(s, esp32_gpio_set_rtc_mux, n, level)) {
+        return;
+    }
     esp32_gpio_set_rtc(&s->rtc_mux, s, n, level);
     notifier_list_notify(&s->route_notifiers, s);
 }
@@ -1418,6 +1478,9 @@ static void esp32_gpio_set_rtc_out(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (esp32_gpio_held_back(s, esp32_gpio_set_rtc_out, n, level)) {
+        return;
+    }
     esp32_gpio_set_rtc(&s->rtc_out, s, n, level);
 }
 
@@ -1425,6 +1488,9 @@ static void esp32_gpio_set_rtc_oe(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (esp32_gpio_held_back(s, esp32_gpio_set_rtc_oe, n, level)) {
+        return;
+    }
     esp32_gpio_set_rtc(&s->rtc_oe, s, n, level);
 }
 
@@ -1432,6 +1498,9 @@ static void esp32_gpio_set_rtc_pu(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (esp32_gpio_held_back(s, esp32_gpio_set_rtc_pu, n, level)) {
+        return;
+    }
     esp32_gpio_set_rtc(&s->rtc_pu, s, n, level);
 }
 
@@ -1439,6 +1508,9 @@ static void esp32_gpio_set_rtc_pd(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (esp32_gpio_held_back(s, esp32_gpio_set_rtc_pd, n, level)) {
+        return;
+    }
     esp32_gpio_set_rtc(&s->rtc_pd, s, n, level);
 }
 
@@ -1446,6 +1518,9 @@ static void esp32_gpio_set_rtc_ie(void *opaque, int n, int level)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
 
+    if (esp32_gpio_held_back(s, esp32_gpio_set_rtc_ie, n, level)) {
+        return;
+    }
     esp32_gpio_set_rtc(&s->rtc_ie, s, n, level);
 }
 
@@ -1529,6 +1604,7 @@ static void esp32_gpio_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
     DeviceState *dev = DEVICE(obj);
 
+    esp32_line_deferred_init(&s->deferred);
     memory_region_init_io(&s->iomem, obj, &esp32_gpio_ops, s,
                           TYPE_ESP32_GPIO, 0x1000);
     sysbus_init_mmio(sbd, &s->iomem);
@@ -1665,12 +1741,18 @@ static void esp32_gpio_class_init(ObjectClass *klass, const void *data)
     device_class_set_props(dc, esp32_gpio_properties);
 }
 
+static void esp32_gpio_finalize(Object *obj)
+{
+    esp32_line_deferred_finalize(&ESP32_GPIO(obj)->deferred);
+}
+
 /* [spec:nuos:req:emu.esp32.gpio] */
 static const TypeInfo esp32_gpio_info = {
     .name = TYPE_ESP32_GPIO,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(Esp32GpioState),
     .instance_init = esp32_gpio_init,
+    .instance_finalize = esp32_gpio_finalize,
     .class_init = esp32_gpio_class_init,
     .class_size = sizeof(Esp32GpioClass),
 };
