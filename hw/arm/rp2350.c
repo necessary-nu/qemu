@@ -43,6 +43,13 @@
  * another rate, -global uart-line.baud=RATE. Software sees the console
  * only once it selects the UART function on those pins.
  *
+ * A jumper wire on the board takes the level of one pin to another, as
+ * from an output to an input: -M rp2350,jumper=FROM:TO drives bank 0 GPIO
+ * TO from outside the chip with the level on GPIO FROM, whoever drives
+ * that. With it, one block's output reaches another's input that only a
+ * pin's function select can give it, such as PIO driving a PWM slice's B
+ * input.
+ *
  * OTP starts as a blank chip and lives in RAM. To keep programmed rows
  * across runs, back it with a 16 KiB raw image:
  *
@@ -74,6 +81,7 @@ struct RP2350MachineState {
     RP2350State soc;
     uint64_t flash_size;
     uint64_t psram_size;
+    char *jumper;
 };
 
 #define TYPE_RP2350_MACHINE MACHINE_TYPE_NAME("rp2350")
@@ -134,6 +142,41 @@ static void rp2350_attach_serial(RP2350MachineState *s, int i)
                                     rp2350_serial_pins[i].rx_pin));
 }
 
+/*
+ * The board's jumper wire, if any: the level on pin `from` drives pin
+ * `to` from outside, through the pads' external connections.
+ */
+static void rp2350_attach_jumper(RP2350MachineState *s)
+{
+    DeviceState *gpio = DEVICE(&s->soc.gpio);
+    unsigned from, to;
+    char tail;
+    int i;
+
+    if (!s->jumper) {
+        return;
+    }
+    if (sscanf(s->jumper, "%u:%u%c", &from, &to, &tail) != 2 ||
+        from >= RP2350_GPIO_BANK0_PINS || to >= RP2350_GPIO_BANK0_PINS ||
+        from == to) {
+        error_report("rp2350: jumper must be FROM:TO, two different bank 0 "
+                     "GPIOs below %d", RP2350_GPIO_BANK0_PINS);
+        exit(1);
+    }
+    for (i = 0; i < ARRAY_SIZE(rp2350_serial_pins); i++) {
+        if (serial_hd(i) && (from == rp2350_serial_pins[i].tx_pin ||
+                             to == rp2350_serial_pins[i].rx_pin)) {
+            error_report("rp2350: jumper on GPIO %u, which serial port %d "
+                         "is wired to", from == rp2350_serial_pins[i].tx_pin ?
+                         from : to, i);
+            exit(1);
+        }
+    }
+    qdev_connect_gpio_out_named(gpio, RP2350_GPIO_PAD_OUT, from,
+                                qdev_get_gpio_in_named(gpio, RP2350_GPIO_PAD_IN,
+                                                       to));
+}
+
 /* [spec:nuos:req:emu.direct-load] */
 static void rp2350_init(MachineState *machine)
 {
@@ -177,6 +220,7 @@ static void rp2350_init(MachineState *machine)
     for (i = 0; i < ARRAY_SIZE(rp2350_serial_pins); i++) {
         rp2350_attach_serial(s, i);
     }
+    rp2350_attach_jumper(s);
 
     /* [spec:nuos:req:emu.bootrom+2] */
     if (machine->firmware) {
@@ -255,6 +299,19 @@ static void rp2350_set_psram_size(Object *obj, Visitor *v, const char *name,
     s->psram_size = size;
 }
 
+static char *rp2350_get_jumper(Object *obj, Error **errp)
+{
+    return g_strdup(RP2350_MACHINE(obj)->jumper);
+}
+
+static void rp2350_set_jumper(Object *obj, const char *value, Error **errp)
+{
+    RP2350MachineState *s = RP2350_MACHINE(obj);
+
+    g_free(s->jumper);
+    s->jumper = g_strdup(value);
+}
+
 /*
  * The machine as a whole is what runs unmodified pico-sdk programs; see
  * emu/tests/run-pico-conformance.sh in NuOS.
@@ -274,6 +331,10 @@ static void rp2350_machine_class_init(ObjectClass *oc, const void *data)
                               NULL, NULL);
     object_class_property_set_description(oc, "psram-size",
         "Size of the board's QSPI PSRAM on chip select 1 (default: none)");
+    object_class_property_add_str(oc, "jumper", rp2350_get_jumper,
+                                  rp2350_set_jumper);
+    object_class_property_set_description(oc, "jumper",
+        "A wire from bank 0 GPIO FROM to GPIO TO, as FROM:TO (default: none)");
 
     mc->desc = "Raspberry Pi RP2350 (2x Cortex-M33)";
     mc->init = rp2350_init;

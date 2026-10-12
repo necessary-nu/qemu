@@ -1,5 +1,5 @@
 /*
- * Asynchronous serial lines: edge timing and a host serial adapter
+ * A host serial adapter on asynchronous serial lines
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -19,28 +19,9 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/char/uart-line.h"
+#include "hw/core/line-time.h"
 #include "chardev/char-serial.h"
 #include "migration/vmstate.h"
-
-/* The deadline of the line change being delivered, or -1 outside one. */
-static int64_t uart_line_edge_time = -1;
-
-int64_t uart_line_now(void)
-{
-    if (uart_line_edge_time >= 0) {
-        return uart_line_edge_time;
-    }
-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-}
-
-void uart_line_set(qemu_irq irq, int level, int64_t when)
-{
-    int64_t outer = uart_line_edge_time;
-
-    uart_line_edge_time = when;
-    qemu_set_irq(irq, level);
-    uart_line_edge_time = outer;
-}
 
 /* 8N1: start, eight data bits, stop. */
 #define FRAME_BITS 10
@@ -92,7 +73,7 @@ static void uart_line_rx_sample(void *opaque)
 static void uart_line_rx_in(void *opaque, int n, int level)
 {
     UARTLineState *s = opaque;
-    int64_t now = uart_line_now();
+    int64_t now = line_time();
     uint8_t v = level != 0;
 
     /* An undriven line reads high through the adapter's pull-up. */
@@ -101,6 +82,16 @@ static void uart_line_rx_in(void *opaque, int n, int level)
     }
     if (v == s->rx_level) {
         return;
+    }
+    /*
+     * Samples that fell due by the edge's time see the level before it,
+     * however late their timer runs: a sender catching up on bits whose
+     * time has passed (a UART whose registers are read) can make its
+     * edges ahead of the samples' timers.
+     */
+    while (timer_pending(s->rx_timer) && s->rx_next <= now) {
+        timer_del(s->rx_timer);
+        uart_line_rx_sample(s);
     }
     s->rx_level = v;
     if (v) {
@@ -127,7 +118,7 @@ static void uart_line_set_txd(UARTLineState *s, int level, int64_t when)
 {
     if (s->txd != level) {
         s->txd = level;
-        uart_line_set(s->tx, level, when);
+        line_set_at(s->tx, level, when);
     }
 }
 
@@ -198,7 +189,7 @@ static void uart_line_receive(void *opaque, const uint8_t *buf, int size)
     for (i = 0; i < size && !fifo8_is_full(&s->tx_queue); i++) {
         fifo8_push(&s->tx_queue, buf[i]);
     }
-    uart_line_tx_start(s, uart_line_now());
+    uart_line_tx_start(s, line_time());
 }
 
 static void uart_line_event(void *opaque, QEMUChrEvent event)
@@ -207,7 +198,7 @@ static void uart_line_event(void *opaque, QEMUChrEvent event)
 
     if (event == CHR_EVENT_BREAK) {
         s->tx_break = true;
-        uart_line_tx_start(s, uart_line_now());
+        uart_line_tx_start(s, line_time());
     }
 }
 

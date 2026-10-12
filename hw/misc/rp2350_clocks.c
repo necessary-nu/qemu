@@ -76,11 +76,35 @@ static uint64_t period_scale(uint64_t a, uint64_t num, uint64_t den)
     return hi ? UINT64_MAX : lo;
 }
 
+/* Whether timer @t has fallen due: pending, its time come. */
+static bool clkregs_due(QEMUTimer *t)
+{
+    return timer_pending(t) &&
+           timer_expire_time_ns(t) <= qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+/*
+ * A register access first takes the block's events due by its moment
+ * (each block's catch_up): software then reads a status (an oscillator's
+ * startup, a PLL's lock, the frequency counter's result) as of the
+ * access, not of when the host ran its timer.
+ */
+static void rp2350_clkregs_catch_up(RP2350ClkRegsState *s)
+{
+    RP2350ClkRegsClass *c = RP2350_CLKREGS_GET_CLASS(s);
+
+    if (c->catch_up) {
+        c->catch_up(s);
+    }
+}
+
 static uint64_t rp2350_clkregs_read(void *opaque, hwaddr addr, unsigned size)
 {
     RP2350ClkRegsState *s = opaque;
     RP2350ClkRegsClass *c = RP2350_CLKREGS_GET_CLASS(s);
     unsigned reg = rp2350_atomic_reg(addr) / 4;
+
+    rp2350_clkregs_catch_up(s);
 
     if (reg >= c->nregs) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of bad offset 0x%"
@@ -97,6 +121,8 @@ static void rp2350_clkregs_write(void *opaque, hwaddr addr, uint64_t value,
     RP2350ClkRegsClass *c = RP2350_CLKREGS_GET_CLASS(s);
     unsigned reg = rp2350_atomic_reg(addr) / 4;
     uint32_t mask, v;
+
+    rp2350_clkregs_catch_up(s);
 
     if (reg >= c->nregs) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write to bad offset 0x%"
@@ -511,6 +537,26 @@ static void clocks_resus_cb(void *opaque)
     clocks_update_irq(s);
 }
 
+/*
+ * The frequency counter's delay and interval end, and the resuscitation,
+ * when due; a count that ends starts the next phase, which may be due
+ * too.
+ */
+/* [spec:nuos:req:emu.clock-tree] */
+static void clocks_catch_up(RP2350ClkRegsState *rs)
+{
+    RP2350ClocksState *s = RP2350_CLOCKS(rs);
+
+    if (clkregs_due(s->resus_timer)) {
+        timer_del(s->resus_timer);
+        clocks_resus_cb(s);
+    }
+    while (clkregs_due(s->fc0_timer)) {
+        timer_del(s->fc0_timer);
+        fc0_cb(s);
+    }
+}
+
 static void clocks_src_changed(void *opaque, ClockEvent event)
 {
     clocks_update(opaque);
@@ -895,6 +941,7 @@ static void rp2350_clocks_class_init(ObjectClass *klass, const void *data)
     c->wmask = clocks_wmask;
     c->read = clocks_read;
     c->written = clocks_written;
+    c->catch_up = clocks_catch_up;
     c->reset_hold = clocks_reset_hold;
     rc->phases.exit = rp2350_clocks_exit_reset;
     dc->vmsd = &vmstate_rp2350_clocks;
@@ -1019,6 +1066,18 @@ static void xosc_startup_cb(void *opaque)
         xosc_set_gated(x, false);
     }
     xosc_update_out(x);
+}
+
+/* The end of the startup delay, when due: the output starts. */
+/* [spec:nuos:req:emu.clocks] */
+static void xosc_catch_up(RP2350ClkRegsState *s)
+{
+    RP2350XOSCState *x = RP2350_XOSC(s);
+
+    if (clkregs_due(x->startup_timer)) {
+        timer_del(x->startup_timer);
+        xosc_startup_cb(x);
+    }
 }
 
 /* [spec:nuos:req:emu.clocks] */
@@ -1228,6 +1287,7 @@ static void rp2350_xosc_class_init(ObjectClass *klass, const void *data)
     c->read = xosc_read;
     c->write = xosc_write;
     c->written = xosc_written;
+    c->catch_up = xosc_catch_up;
     c->reset_hold = xosc_reset_hold;
     rc->phases.exit = rp2350_xosc_exit_reset;
     dc->realize = rp2350_xosc_realize;
@@ -1374,6 +1434,18 @@ static void pll_lock_cb(void *opaque)
     pll_update_out(p);
 }
 
+/* The lock, when due. */
+/* [spec:nuos:req:emu.clocks] */
+static void pll_catch_up(RP2350ClkRegsState *s)
+{
+    RP2350PLLState *p = RP2350_PLL(s);
+
+    if (clkregs_due(p->lock_timer)) {
+        timer_del(p->lock_timer);
+        pll_lock_cb(p);
+    }
+}
+
 static void pll_ref_changed(void *opaque, ClockEvent event)
 {
     RP2350PLLState *p = opaque;
@@ -1504,6 +1576,7 @@ static void rp2350_pll_class_init(ObjectClass *klass, const void *data)
     c->read = pll_read;
     c->write = pll_write;
     c->written = pll_written;
+    c->catch_up = pll_catch_up;
     c->reset_hold = pll_reset_hold;
     rc->phases.exit = rp2350_pll_exit_reset;
     dc->vmsd = &vmstate_rp2350_pll;

@@ -197,6 +197,20 @@ static void ptimer_tick(void *opaque)
     ptimer_transaction_commit(s);
 }
 
+/*
+ * An enabled timer outside a transaction is armed for next_event. Each
+ * expiry taken here is the late callback's, which then does not run.
+ */
+void ptimer_run_due(ptimer_state *s)
+{
+    assert(!s->in_transaction);
+    while (s->enabled &&
+           s->next_event <= qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_del(s->timer);
+        ptimer_tick(s);
+    }
+}
+
 uint64_t ptimer_get_count(ptimer_state *s)
 {
     uint64_t counter;

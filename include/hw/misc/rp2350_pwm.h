@@ -76,6 +76,8 @@ typedef struct RP2350PWMSlice {
 
     /* Wraps not yet signalled on the DREQ line. */
     uint32_t dreq_pending;
+    /* The virtual time the timer is due at. */
+    int64_t due_ns;
 
     /* Levels last driven on the GPIO lines, per channel. */
     uint8_t out_level[2];

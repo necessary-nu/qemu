@@ -17,10 +17,11 @@ config PL011
 
 config PL011_C
     bool
-    select UART_LINE
+    select LINE_TIME
 
 config UART_LINE
     bool
+    select LINE_TIME
 
 config ESP32_UART_LINE
     bool

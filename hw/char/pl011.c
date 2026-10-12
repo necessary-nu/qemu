@@ -24,8 +24,8 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "hw/char/pl011.h"
-#include "hw/char/uart-line.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
@@ -350,7 +350,7 @@ static void pl011_line_set_txd(PL011State *s, int level, int64_t when)
         return;
     }
     s->txd = level;
-    uart_line_set(s->txd_out, level, when);
+    line_set_at(s->txd_out, level, when);
     if (pl011_loopback_enabled(s)) {
         pl011_line_rx_changed(s, when);
     }
@@ -373,7 +373,7 @@ static void pl011_line_update_rts(PL011State *s, int64_t when)
         return;
     }
     s->nrts = level;
-    uart_line_set(s->nrts_out, level, when);
+    line_set_at(s->nrts_out, level, when);
     if (pl011_loopback_enabled(s)) {
         pl011_line_cts_changed(s, when);
     }
@@ -484,9 +484,11 @@ static void pl011_line_write_txdata(PL011State *s, uint8_t data)
     if (s->tx_count > pl011_tx_level(s)) {
         s->int_level &= ~INT_TX;
     }
-    pl011_line_tx_start(s, uart_line_now());
+    pl011_line_tx_start(s, line_time());
     pl011_update(s);
 }
+
+static void pl011_line_rx_sample(void *opaque);
 
 /* The receiver's input: UARTRXD, or UARTTXD in loopback. */
 static void pl011_line_rx_changed(PL011State *s, int64_t when)
@@ -495,6 +497,15 @@ static void pl011_line_rx_changed(PL011State *s, int64_t when)
 
     if (level == s->rx_level) {
         return;
+    }
+    /*
+     * Samples that fell due by the edge's time see the level before it,
+     * however late their timer runs: the sender may be catching up on
+     * bits whose time has passed (pl011_line_catch_up()).
+     */
+    while (timer_pending(s->rx_timer) && s->rx_next <= when) {
+        timer_del(s->rx_timer);
+        pl011_line_rx_sample(s);
     }
     s->rx_level = level;
     if (level) {
@@ -650,7 +661,7 @@ static uint32_t pl011_line_read_rxdata(PL011State *s)
         timer_del(s->rt_timer);
     }
     s->rsr = (c >> 8) & 0xf;
-    pl011_line_update_rts(s, uart_line_now());
+    pl011_line_update_rts(s, line_time());
     pl011_update(s);
     return c;
 }
@@ -677,7 +688,7 @@ static uint32_t pl011_line_flags(PL011State *s)
 
 static void pl011_line_write_lcr(PL011State *s, uint32_t old)
 {
-    int64_t now = uart_line_now();
+    int64_t now = line_time();
 
     /* UARTLCR_H writes load the divisors into the baud rate generator. */
     s->brd = (s->ibrd << 6) | s->fbrd;
@@ -696,7 +707,7 @@ static void pl011_line_write_lcr(PL011State *s, uint32_t old)
 
 static void pl011_line_write_cr(PL011State *s, uint32_t old)
 {
-    int64_t now = uart_line_now();
+    int64_t now = line_time();
 
     if ((old ^ s->cr) & CR_LBE) {
         pl011_line_rx_changed(s, now);
@@ -711,7 +722,7 @@ static void pl011_line_rxd_in(void *opaque, int n, int level)
     PL011State *s = opaque;
 
     s->rxd_pin = level != 0;
-    pl011_line_rx_changed(s, uart_line_now());
+    pl011_line_rx_changed(s, line_time());
 }
 
 static void pl011_line_ncts_in(void *opaque, int n, int level)
@@ -719,7 +730,7 @@ static void pl011_line_ncts_in(void *opaque, int n, int level)
     PL011State *s = opaque;
 
     s->ncts_pin = level != 0;
-    pl011_line_cts_changed(s, uart_line_now());
+    pl011_line_cts_changed(s, line_time());
 }
 
 static void pl011_line_reset(PL011State *s)
@@ -811,11 +822,60 @@ static uint32_t pl011_read_rxdata(PL011State *s)
     return c;
 }
 
+/*
+ * The line timers whose time has come by `now`, the earliest first, as
+ * their callbacks would run them; each runs at its own time.
+ */
+static QEMUTimer *pl011_line_due(PL011State *s, int64_t now)
+{
+    QEMUTimer *timers[] = { s->tx_timer, s->rx_timer, s->rt_timer };
+    QEMUTimer *due = NULL;
+
+    for (int i = 0; i < ARRAY_SIZE(timers); i++) {
+        QEMUTimer *t = timers[i];
+
+        if (timer_pending(t) && timer_expire_time_ns(t) <= now &&
+            (!due || timer_expire_time_ns(t) < timer_expire_time_ns(due))) {
+            due = t;
+        }
+    }
+    return due;
+}
+
+/*
+ * [spec:nuos:req:emu.uart]
+ * A register access first takes every line event due by its moment, each
+ * at its own time: without icount the line timers' callbacks run late,
+ * and until they do software would read BUSY, the FIFOs and the
+ * interrupts as of when the host got to them, not of the access.
+ */
+static void pl011_line_catch_up(PL011State *s)
+{
+    int64_t now = line_time();
+    QEMUTimer *t;
+
+    if (!s->line_level) {
+        return;
+    }
+    while ((t = pl011_line_due(s, now))) {
+        timer_del(t);
+        if (t == s->tx_timer) {
+            pl011_line_tx_tick(s);
+        } else if (t == s->rx_timer) {
+            pl011_line_rx_sample(s);
+        } else {
+            pl011_line_rt_tick(s);
+        }
+    }
+}
+
 static uint64_t pl011_read(void *opaque, hwaddr offset,
                            unsigned size)
 {
     PL011State *s = (PL011State *)opaque;
     uint64_t r;
+
+    pl011_line_catch_up(s);
 
     switch (offset >> 2) {
     case 0: /* UARTDR */
@@ -968,6 +1028,7 @@ static void pl011_write(void *opaque, hwaddr offset,
     uint32_t old;
 
     trace_pl011_write(offset, value, pl011_regname(offset));
+    pl011_line_catch_up(s);
 
     switch (offset >> 2) {
     case 0: /* UARTDR */
@@ -1029,7 +1090,7 @@ static void pl011_write(void *opaque, hwaddr offset,
         s->ifl = value;
         pl011_set_read_trigger(s);
         if (s->line_level) {
-            pl011_line_update_rts(s, uart_line_now());
+            pl011_line_update_rts(s, line_time());
         }
         break;
     case 14: /* UARTIMSC */
