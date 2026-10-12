@@ -35,6 +35,8 @@
 
 #define CSR_EN          (1u << 0)
 #define CSR_EXPAND_EN   (1u << 1)
+#define CSR_COUPLED_MODE (1u << 4)
+#define CSR_COUPLED_SEL(n) ((n) << 5)
 #define CSR_SHIFT(n)    ((n) << 8)
 #define CSR_N_SHIFTS(n) ((n) << 16)
 #define CSR_CLKPHASE(n) ((n) << 24)
@@ -66,6 +68,20 @@
 #define PAD_IE          (1u << 6)
 
 #define HSTX_PATH       "/machine/soc/hstx"
+
+#define RESETS_RESET_SET 0x40022000
+#define RESET_HSTX      (1u << 3)
+
+#define PIO0            0x50200000
+#define PIO_CTRL        (PIO0 + 0x000)
+#define PIO_INSTR_MEM(n) (PIO0 + 0x048 + 4 * (n))
+#define SM0_CLKDIV      (PIO0 + 0x0c8)
+#define SM0_EXECCTRL    (PIO0 + 0x0cc)
+#define SM0_INSTR       (PIO0 + 0x0d8)
+#define SM0_PINCTRL     (PIO0 + 0x0dc)
+#define PIO_SM0_EN      (1u << 0)
+#define PIO_WRAP(b, t)  (((t) << 12) | ((b) << 7))
+#define PIO_SET_PINS(n, b) (((n) << 26) | ((b) << 5))
 
 static char *rom_path;
 /* Virtual time, in ns. */
@@ -607,6 +623,76 @@ static void test_pins_settle(void)
     qtest_quit(qts);
 }
 
+/*
+ * Coupled mode on PIO0's output for GPIO 12, which PIO0 drives high 3
+ * clk_sys cycles and low 5 by turns: output bit 0 shows it in both
+ * half-cycles of every clk_hstx cycle, clk_hstx being clk_sys.
+ */
+static void coupled_start(QTestState *qts)
+{
+    /* set pins, 1 [2]; set pins, 0 [4], on GPIO 12. */
+    qtest_writel(qts, PIO_INSTR_MEM(0), 0xe201);
+    qtest_writel(qts, PIO_INSTR_MEM(1), 0xe400);
+    qtest_writel(qts, SM0_CLKDIV, 1u << 16);
+    qtest_writel(qts, SM0_EXECCTRL, PIO_WRAP(0, 1));
+    qtest_writel(qts, SM0_PINCTRL, PIO_SET_PINS(1, 12));
+    /* set pindirs, 1 */
+    qtest_writel(qts, SM0_INSTR, 0xe081);
+    qtest_writel(qts, PIO_CTRL, PIO_SM0_EN);
+
+    qtest_writel(qts, BITN(0), BITN_SEL_P(24) | BITN_SEL_N(24));
+    qtest_writel(qts, CSR, CSR_EN | CSR_EXPAND_EN | CSR_COUPLED_MODE |
+                           CSR_COUPLED_SEL(0) | CSR_N_SHIFTS(1));
+    qtest_writel(qts, FIFO, CMD_RAW_REPEAT | 0);
+    qtest_writel(qts, FIFO, 0);
+}
+
+/* Bit 0's history holds runs of 6 and 10 half-cycles, high and low. */
+static void coupled_check(QTestState *qts)
+{
+    uint64_t h = history(qts, 0);
+    int i, level = h & 1, len = 0, first = 1;
+
+    for (i = 0; i < 64; i++) {
+        int b = (h >> i) & 1;
+
+        if (b == level) {
+            len++;
+            continue;
+        }
+        if (!first) {
+            g_assert_cmpint(len, ==, level ? 6 : 10);
+        }
+        first = 0;
+        level = b;
+        len = 1;
+    }
+}
+
+/*
+ * HSTX leaves reset a third of a nanosecond after one of clk_sys's edges
+ * (at 150 MHz, every 20/3 ns from time 0): its cycles still begin on
+ * clk_sys's edges, PIO's, so that every PIO change falls in the HSTX
+ * cycle that begins with it.
+ */
+/* [spec:nuos:req:emu.hstx/test] */
+static void test_coupled(void)
+{
+    QTestState *qts = start();
+
+    step(qts, 20 + 7 - vnow % 20);
+    g_assert_cmpint(vnow % 20, ==, 7);
+    qtest_writel(qts, RESETS_RESET_SET, RESET_HSTX);
+    rp2350_unreset(qts, RESET_HSTX);
+    vnow += RP2350_RESETS_RELEASE_NS;
+    coupled_start(qts);
+    for (int round = 0; round < 8; round++) {
+        cycles(qts, 37);
+        coupled_check(qts);
+    }
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     static const uint32_t blank[2];
@@ -627,6 +713,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/hstx/tmds", test_tmds);
     qtest_add_func("/rp2350/hstx/tmds-repeat", test_tmds_repeat);
     qtest_add_func("/rp2350/hstx/pins-settle", test_pins_settle);
+    qtest_add_func("/rp2350/hstx/coupled", test_coupled);
     ret = g_test_run();
 
     unlink(rom_path);
