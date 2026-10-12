@@ -634,9 +634,12 @@ static void test_fs_host_scatter_gather(void)
  * OTG_FS's frames at a PHY clock of no whole number of Hz: PLL_F48M_CLK
  * from SPLL_CLK's 480 MHz by 11, 43 7/11 MHz. Unprogrammed, HFIR's frame
  * interval is the PHY clocks in 1 ms, 43636, and each frame lasts
- * 43636 * 11/480 us, 999991 2/3 ns: frame 1000 begins 999991666 2/3 ns
- * after frame 0, at the first ns after. Counted at the clock's frequency
- * in whole Hz, the frames would run ten nanoseconds late by then.
+ * 43636 * 11/480 us, 999991 2/3 ns. The frames count the PHY clock's
+ * edges, at multiples of 275/12 ns (SPLL_CLK runs from XTAL_CLK's edge at
+ * time 0, and the divider, set then, from its edge there), from the last
+ * at or before the port starts running: frame 1000 begins 1000 frames
+ * after that edge, at the first ns at or after. Counted at the clock's
+ * frequency in whole Hz, from the start, the frames would run late.
  */
 /* [spec:nuos:req:emu.esp32p4.usb/test] */
 static void test_fs_host_frames_exact(void)
@@ -646,7 +649,7 @@ static void test_fs_host_frames_exact(void)
                                  "usb-kbd,bus=usb-otg-fs.0,port=1,"
                                  "usb_version=1");
     uint32_t ctrl0 = qtest_readl(qts, LP_CLKRST_HP_USB_CLKRST_CTRL0);
-    int64_t t0, t;
+    int64_t t0, t, end;
 
     fs_clock_on(qts);
     qtest_writel(qts, LP_CLKRST_HP_USB_CLKRST_CTRL0,
@@ -657,8 +660,9 @@ static void test_fs_host_frames_exact(void)
     t0 = qtest_clock_step(qts, 1) - 1;
     g_assert_cmpuint(rd(qts, OTG_FS, HFIR) & 0xffff, ==, 43636);
     g_assert_cmpuint(rd(qts, OTG_FS, HFNUM) & 0x3fff, ==, 0);
-    t = qtest_clock_step(qts, t0 + 999991666 - (t0 + 1));
-    g_assert_cmpint(t, ==, t0 + 999991666);
+    end = ((t0 * 12 / 275 + 43636 * 1000ll) * 275 + 11) / 12;
+    t = qtest_clock_step(qts, end - 1 - (t0 + 1));
+    g_assert_cmpint(t, ==, end - 1);
     g_assert_cmpuint(rd(qts, OTG_FS, HFNUM) & 0x3fff, ==, 999);
     qtest_clock_step(qts, 1);
     g_assert_cmpuint(rd(qts, OTG_FS, HFNUM) & 0x3fff, ==, 1000);

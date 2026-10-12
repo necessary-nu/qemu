@@ -569,9 +569,11 @@ static void test_timing(void)
 
 /*
  * The same transfer from I2C_SCLK at XTAL_CLK / (2 + 1/3), 175/3 ns a
- * cycle: its 1910 cycles take 111416 2/3 ns, every step counted from the
- * start at the clock's exact period, and TRANS_COMPLETE comes at the
- * first nanosecond after.
+ * cycle: its 1910 cycles take 111416 2/3 ns, every step counted at the
+ * clock's exact period. The divider, set at time 0, counts from XTAL_CLK's
+ * edge there, and the transfer, started at 1 ns, from the clock's edge at
+ * 0: it ends at 111416 2/3 ns, and TRANS_COMPLETE comes at the first
+ * nanosecond after.
  */
 /* [spec:nuos:req:emu.esp32p4.i2c/test] */
 static void test_exact_timing(void)
@@ -593,8 +595,8 @@ static void test_exact_timing(void)
     wr(qts, I2C0, COMD(2), CMD(CMD_STOP, 0, 0, 0, 0));
     t0 = qtest_clock_step(qts, 1);
     trans_start(qts, I2C0);
-    g_assert_cmpint(qtest_clock_step(qts, cycles * 175 / 3), ==,
-                    t0 + 111416);
+    g_assert_cmpint(qtest_clock_step(qts, cycles * 175 / 3 - t0), ==,
+                    111416);
     g_assert_cmphex(rd(qts, I2C0, INT_RAW) & INT_TRANS_COMPLETE, ==, 0);
     qtest_clock_step(qts, 1);
     g_assert_cmphex(rd(qts, I2C0, INT_RAW) & INT_TRANS_COMPLETE, ==,

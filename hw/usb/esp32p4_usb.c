@@ -113,12 +113,31 @@ static int64_t esp32p4_usb_clock_cycles_ns(DWC2OTGState *s, Clock *clk,
     return esp32p4_clk_cycles_ns(esp32p4_clk_exact(clk), n);
 }
 
+/* And their edges, with their phase. */
+static uint64_t esp32p4_usb_clock_count(DWC2OTGState *s, Clock *clk,
+                                        int64_t from, int64_t t)
+{
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(clk, from);
+
+    return esp32p4_clk_edges_between(&e, from, t);
+}
+
+static int64_t esp32p4_usb_clock_after(DWC2OTGState *s, Clock *clk,
+                                       int64_t from, uint64_t n)
+{
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(clk, from);
+
+    return esp32p4_clk_edges_after(&e, from, n);
+}
+
 static void esp32p4_usb_otg_class_init(ObjectClass *klass, const void *data)
 {
     DWC2OTGClass *oc = DWC2_OTG_CLASS(klass);
 
     oc->clock_cycles = esp32p4_usb_clock_cycles;
     oc->clock_cycles_ns = esp32p4_usb_clock_cycles_ns;
+    oc->clock_count = esp32p4_usb_clock_count;
+    oc->clock_after = esp32p4_usb_clock_after;
 }
 
 /* USB_WRAP */

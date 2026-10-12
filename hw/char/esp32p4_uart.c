@@ -37,6 +37,9 @@
  * edge comes at the first nanosecond at or after its exact time, and the
  * frames of a back-to-back transfer are timed from the first one's
  * start, so that they keep to the bit time however long the transfer.
+ * A transfer starts at the core clock's first edge at or after its start
+ * (to within 2^-16 of a bit), and a change of the clock's rate or edges
+ * moves the rest of a frame to the clock's first edge after it.
  */
 
 #include "qemu/osdep.h"
@@ -749,8 +752,24 @@ static void tx_wave_bit(ESP32P4UartState *s, unsigned i, bool v)
 }
 
 /*
+ * The time from @t to the UART core clock's first edge at or after it, in
+ * @unit, rounded down; the clock's edges are taken as the transmitter's.
+ */
+static int64_t tx_sclk_wait(ESP32P4UartState *s, ESP32P4ClkPeriod unit,
+                            int64_t t)
+{
+    s->tx_sclk = esp32p4_clk_edges_or_at(s->sclk, t);
+    if (!esp32p4_clk_edges_running(&s->tx_sclk)) {
+        return 0;
+    }
+    return esp32p4_clk_units_cycles(unit, 0,
+                                    esp32p4_clk_edge_wait(&s->tx_sclk, t));
+}
+
+/*
  * Begin a phase at t: from the exact end of the phase before, when it
- * follows that at once at the same bit time, or afresh from t.
+ * follows that at once at the same bit time, or afresh from the core
+ * clock's first edge at or after t.
  */
 static void tx_begin(ESP32P4UartState *s, uint8_t phase, uint32_t end16,
                      int64_t t)
@@ -761,7 +780,7 @@ static void tx_begin(ESP32P4UartState *s, uint8_t phase, uint32_t end16,
         s->tx_shift = s->tx_chain_pos;
     } else {
         s->tx_start_ns = t;
-        s->tx_shift = 0;
+        s->tx_shift = tx_sclk_wait(s, unit, t);
         s->tx_unit = unit;
     }
     s->tx_phase = phase;
@@ -1059,20 +1078,26 @@ static void uart_tx_freeze(ESP32P4UartState *s, int64_t t)
 }
 
 /*
- * Continue the phase in flight at the current bit time: from where it has
- * got, if that changed.
+ * Continue the phase in flight at the current bit time, if that, or the
+ * core clock's edges, changed: from where it has got, at the clock's
+ * first edge at or after t.
  */
 static void uart_tx_rerate(ESP32P4UartState *s, int64_t t)
 {
     ESP32P4ClkPeriod unit = tx_bit_unit(s);
+    ESP32P4ClkEdges sclk = esp32p4_clk_edges_or_at(s->sclk, t);
 
-    if (!esp32p4_clk_period_eq(unit, s->tx_unit)) {
+    if (!esp32p4_clk_period_eq(unit, s->tx_unit) ||
+        !esp32p4_clk_edges_eq(&sclk, &s->tx_sclk)) {
         if (s->tx_phase != ESP32P4_UART_TX_IDLE &&
             esp32p4_clk_period_running(unit)) {
-            s->tx_shift = -(int64_t)tx_pos16_at(s, t);
+            int64_t pos = tx_pos16_at(s, t);
+
+            s->tx_shift = tx_sclk_wait(s, unit, t) - pos;
             s->tx_start_ns = t;
         }
         s->tx_unit = unit;
+        s->tx_sclk = sclk;
         s->tx_chain_ns = INT64_MIN;
     }
     uart_tx_schedule(s);
@@ -1088,6 +1113,7 @@ static void uart_tx_reset(ESP32P4UartState *s, int64_t t, bool drive)
     s->tx_n_edges = 0;
     s->tx_next_edge = 0;
     s->tx_unit = esp32p4_clk_period_stopped();
+    s->tx_sclk = esp32p4_clk_edges_stopped();
     s->tx_pos16 = 0;
     s->tx_chain_ns = INT64_MIN;
     s->send_xon = false;
@@ -1666,16 +1692,17 @@ static void uart_sync(ESP32P4UartState *s)
 
 static void uart_update_schedule(ESP32P4UartState *s)
 {
-    ESP32P4ClkPeriod p = esp32p4_clk_exact(s->sclk);
+    int64_t now = now_ns();
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(s->sclk, now);
 
     if (!s->update_pending || !core_running(s) ||
-        !esp32p4_clk_period_running(p)) {
+        !esp32p4_clk_edges_running(&e)) {
         timer_del(&s->update_timer);
         return;
     }
     if (!timer_pending(&s->update_timer)) {
-        timer_mod_ns(&s->update_timer, now_ns() +
-                     esp32p4_clk_cycles_ns(p, UPDATE_SYNC_CYCLES));
+        timer_mod_ns(&s->update_timer,
+                     esp32p4_clk_edges_after(&e, now, UPDATE_SYNC_CYCLES));
     }
 }
 
@@ -2281,8 +2308,8 @@ static void uart_init(Object *obj)
 
 static const VMStateDescription vmstate_esp32p4_uart = {
     .name = TYPE_ESP32P4_UART,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(sclk, ESP32P4UartState),
         VMSTATE_CLOCK(sys_clk, ESP32P4UartState),
@@ -2321,6 +2348,7 @@ static const VMStateDescription vmstate_esp32p4_uart = {
         VMSTATE_UINT32(tx_end16, ESP32P4UartState),
         VMSTATE_INT64(tx_start_ns, ESP32P4UartState),
         VMSTATE_ESP32P4_CLK_PERIOD(tx_unit, ESP32P4UartState),
+        VMSTATE_ESP32P4_CLK_EDGES(tx_sclk, ESP32P4UartState),
         VMSTATE_INT64(tx_shift, ESP32P4UartState),
         VMSTATE_UINT64(tx_pos16, ESP32P4UartState),
         VMSTATE_INT64(tx_chain_ns, ESP32P4UartState),

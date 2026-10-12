@@ -1626,12 +1626,34 @@ static void slave_cs(ESP32P4SpiState *s, bool active)
 /* The master */
 
 /*
- * The first whole ns by which @h half cycles of @half have elapsed,
- * capped so that a time it is added to stays in range.
+ * The first whole ns by which half cycle @h of the transfer has ended:
+ * edge h0 + h of its half cycles; capped so that a time stays in range.
  */
-static int64_t half_to_ns(ESP32P4ClkPeriod half, uint64_t h)
+static int64_t master_half_time(ESP32P4SpiState *s, uint64_t h)
 {
-    return MIN(esp32p4_clk_cycles_ns(half, h), INT64_MAX / 2);
+    if (h > INT64_MAX / 4 || s->h0 > INT64_MAX / 4) {
+        return INT64_MAX / 2;
+    }
+    return MIN(esp32p4_clk_edge_ns(&s->half_e, s->h0 + h), INT64_MAX / 2);
+}
+
+/*
+ * Count the transfer's half cycles afresh, at the current half period,
+ * half cycle @h ending at clk_spi_mst's first edge at or after @t.
+ */
+static void master_restart(ESP32P4SpiState *s, int64_t t, uint64_t h)
+{
+    ESP32P4ClkEdges mst = esp32p4_clk_edges_or_at(s->mst_clk, t);
+    int64_t k;
+    bool at;
+
+    s->half_e = esp32p4_clk_edges_from(s->half, &mst, t);
+    if (!esp32p4_clk_edges_running(&s->half_e)) {
+        s->h0 = 0;
+        return;
+    }
+    k = esp32p4_clk_edge_index(&s->half_e, t, &at) + !at;
+    s->h0 = k - (int64_t)h;
 }
 
 /*
@@ -2338,13 +2360,13 @@ static void master_run(ESP32P4SpiState *s)
             master_enter(s);
             s->entered = true;
         }
-        end = s->t0 + half_to_ns(s->half, s->h + step);
+        end = master_half_time(s, s->h + step);
         if (end > now) {
             uint32_t ahead = ph->beats ? 2 * MIN(BATCH_BEATS,
                                                  ph->beats - s->cur_beat)
                                        : step;
 
-            timer_mod(s->timer, s->t0 + half_to_ns(s->half, s->h + ahead));
+            timer_mod(s->timer, master_half_time(s, s->h + ahead));
             break;
         }
         if (!ph->beats) {
@@ -2361,15 +2383,16 @@ static void master_run(ESP32P4SpiState *s)
                 /*
                  * The segment runs on the clock its CONF buffer set,
                  * from the CONF state's exact end if that is the clock
-                 * the last ran on.
+                 * the last ran on, and otherwise from the clock's edge
+                 * at it (the first in the ns before it).
                  */
                 half = master_half(s);
                 if (esp32p4_clk_period_eq(half, s->half)) {
                     s->h += step;
                 } else {
-                    s->t0 = end;
-                    s->h = 0;
                     s->half = half;
+                    s->h = 0;
+                    master_restart(s, end - 1, 0);
                 }
                 master_plan(s);
                 s->entered = false;
@@ -2448,8 +2471,8 @@ static void master_try_start(ESP32P4SpiState *s)
     s->abort = false;
     s->entered = false;
     s->rx_had_data = false;
-    s->t0 = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->h = 0;
+    master_restart(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), 0);
     master_run(s);
 }
 
@@ -2473,9 +2496,9 @@ static void master_kick(ESP32P4SpiState *s)
     }
     s->stalled = false;
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    end = s->t0 + half_to_ns(s->half, s->h + step_halves(s));
+    end = master_half_time(s, s->h + step_halves(s));
     if (now > end) {
-        s->t0 += now - end;
+        master_restart(s, now, s->h + step_halves(s));
     }
     master_run(s);
 }
@@ -2534,8 +2557,10 @@ static void spi_schedule_update(ESP32P4SpiState *s)
 {
     if (s->update_pending && clock_is_enabled(s->mst_clk) &&
         !timer_pending(s->update_timer)) {
-        timer_mod(s->update_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->mst_clk), 2));
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(s->mst_clk, now);
+
+        timer_mod(s->update_timer, esp32p4_clk_edges_after(&e, now, 2));
     }
 }
 
@@ -2583,7 +2608,7 @@ static void master_resume(ESP32P4SpiState *s)
         master_try_start(s);
         return;
     }
-    s->t0 = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - half_to_ns(s->half, s->h);
+    master_restart(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), s->h);
     s->stalled = false;
     master_run(s);
 }
@@ -3098,8 +3123,8 @@ static const VMStateDescription vmstate_esp32p4_spi_beat = {
 
 static const VMStateDescription vmstate_esp32p4_spi = {
     .name = TYPE_ESP32P4_SPI,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .post_load = esp32p4_spi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(cmd, ESP32P4SpiState),
@@ -3150,7 +3175,8 @@ static const VMStateDescription vmstate_esp32p4_spi = {
         VMSTATE_UINT8(cur, ESP32P4SpiState),
         VMSTATE_UINT32(cur_beat, ESP32P4SpiState),
         VMSTATE_ESP32P4_CLK_PERIOD(half, ESP32P4SpiState),
-        VMSTATE_INT64(t0, ESP32P4SpiState),
+        VMSTATE_ESP32P4_CLK_EDGES(half_e, ESP32P4SpiState),
+        VMSTATE_INT64(h0, ESP32P4SpiState),
         VMSTATE_UINT64(h, ESP32P4SpiState),
         VMSTATE_UINT8(gen, ESP32P4SpiState),
         VMSTATE_UINT32(gen_beat, ESP32P4SpiState),

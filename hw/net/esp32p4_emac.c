@@ -321,17 +321,31 @@ static bool p4_emac_exact_edges(Object *obj, Clock *out,
     return true;
 }
 
-/* The edges of @clk from time 0, at its exact period. */
+/*
+ * The edges of @clk from time 0, at its exact period and phase: edge 1 is
+ * its first at or after time 0, at phase / den Clock units.
+ */
 static uint64_t p4_emac_clock_edges(Esp32DwmacState *d, Clock *clk,
                                     int64_t ns)
 {
-    return esp32p4_clk_ns_cycles(esp32p4_clk_exact(clk), ns);
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(clk, 0);
+    bool at;
+
+    if (!esp32p4_clk_edges_running(&e)) {
+        return 0;
+    }
+    return esp32p4_clk_edge_index(&e, MAX(ns, 0), &at) + 1;
 }
 
 static int64_t p4_emac_clock_edge_ns(Esp32DwmacState *d, Clock *clk,
                                      uint64_t edge)
 {
-    return esp32p4_clk_cycles_ns(esp32p4_clk_exact(clk), edge);
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(clk, 0);
+
+    if (!esp32p4_clk_edges_running(&e)) {
+        return INT64_MAX;
+    }
+    return edge ? esp32p4_clk_edge_ns(&e, edge - 1) : 0;
 }
 
 static void p4_emac_route_changed(Notifier *n, void *data)

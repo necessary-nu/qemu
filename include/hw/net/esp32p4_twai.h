@@ -230,8 +230,9 @@ typedef struct ESP32P4TwaiCtrl {
     bool rx_level;
     bool in_reset;
 
-    /* TWAIn_CLK's exact period, as it last changed. */
+    /* TWAIn_CLK's exact period, and its edges, as it last changed. */
     ESP32P4ClkPeriod clk_period;
+    ESP32P4ClkEdges clk_edges;
 
     /* The timestamp counter: its count at ts_base_ns. */
     uint64_t ts_count_base;

@@ -419,19 +419,42 @@ static bool esp32p4_i2c_runs(ESP32P4I2CState *s)
 }
 
 /*
- * The first ns by which @n cycles of I2C_SCLK have elapsed; the clock
- * must be running.
+ * The edges I2C_SCLK has at @now: its own, or the LP controller's divided
+ * clock's, which counts them from the first at or after a change of the
+ * function clock's edges or of the division, and keeps its edges while
+ * neither changes.
  */
-static int64_t esp32p4_i2c_cyc(ESP32P4I2CState *s, uint64_t n)
+static ESP32P4ClkEdges esp32p4_i2c_edges(ESP32P4I2CState *s, int64_t now)
 {
-    return MIN(esp32p4_clk_cycles_ns(esp32p4_i2c_period(s), n),
+    ESP32P4ClkPeriod period = esp32p4_i2c_period(s);
+    ESP32P4ClkEdges sclk = esp32p4_clk_edges_or_at(s->sclk, now);
+
+    if (!esp32p4_i2c_is_lp(s) || !esp32p4_clk_period_running(period)) {
+        return esp32p4_clk_period_eq(period, sclk.period) ?
+               sclk : esp32p4_clk_edges_stopped();
+    }
+    if (esp32p4_clk_period_eq(period, s->tp_edges.period) &&
+        esp32p4_clk_edges_eq(&sclk, &s->tp_sclk)) {
+        return s->tp_edges;
+    }
+    return esp32p4_clk_edges_from(period, &sclk, now);
+}
+
+/*
+ * The first ns by which @n cycles of I2C_SCLK, its edges, have come after
+ * @from; the clock must be running.
+ */
+static int64_t esp32p4_i2c_after(ESP32P4I2CState *s, int64_t from,
+                                 uint64_t n)
+{
+    return MIN(esp32p4_clk_edges_after(&s->tp_edges, from, n),
                INT64_MAX / 2);
 }
 
 /*
- * The master's instants: @tp's cycles of I2C_SCLK, at the period the
- * controller took as the clock last changed, after its origin, exactly;
- * at the first nanosecond they have elapsed.
+ * The master's instants: @tp's cycles of I2C_SCLK, its edges as the
+ * controller took them as the clock last changed, after its origin,
+ * exactly; at the first nanosecond they have come.
  */
 static ESP32P4I2CTp esp32p4_i2c_tp(int64_t t)
 {
@@ -444,14 +467,18 @@ static ESP32P4I2CTp esp32p4_i2c_tp_after(ESP32P4I2CTp tp, uint64_t n)
     return tp;
 }
 
-static int64_t esp32p4_i2c_tp_ns_at(ESP32P4ClkPeriod p, ESP32P4I2CTp tp)
+static int64_t esp32p4_i2c_tp_ns_at(const ESP32P4ClkEdges *e,
+                                    ESP32P4I2CTp tp)
 {
-    return tp.origin + MIN(esp32p4_clk_cycles_ns(p, tp.cyc), INT64_MAX / 2);
+    if (!tp.cyc) {
+        return tp.origin;
+    }
+    return MIN(esp32p4_clk_edges_after(e, tp.origin, tp.cyc), INT64_MAX / 2);
 }
 
 static int64_t esp32p4_i2c_tp_ns(ESP32P4I2CState *s, ESP32P4I2CTp tp)
 {
-    return esp32p4_i2c_tp_ns_at(s->tp_period, tp);
+    return esp32p4_i2c_tp_ns_at(&s->tp_edges, tp);
 }
 
 static int64_t esp32p4_i2c_now(void)
@@ -677,7 +704,7 @@ static void esp32p4_i2c_fsm_at(ESP32P4I2CState *s, ESP32P4I2CTp tp,
     s->step_tp = tp;
     s->step_mark = esp32p4_i2c_tp_ns(s, tp);
     s->step_left = 0;
-    if (esp32p4_clk_period_running(s->tp_period)) {
+    if (esp32p4_clk_edges_running(&s->tp_edges)) {
         timer_mod(&s->fsm_timer, s->step_mark);
     } else {
         timer_del(&s->fsm_timer);
@@ -691,7 +718,7 @@ static void esp32p4_i2c_fsm_at(ESP32P4I2CState *s, ESP32P4I2CTp tp,
 static void esp32p4_i2c_fsm_after(ESP32P4I2CState *s, uint64_t cycles,
                                   unsigned step)
 {
-    if (!esp32p4_clk_period_running(s->tp_period)) {
+    if (!esp32p4_clk_edges_running(&s->tp_edges)) {
         s->step = step;
         s->step_mark = s->step_ns;
         s->step_left = cycles;
@@ -730,33 +757,35 @@ static void esp32p4_i2c_fsm_cancel(ESP32P4I2CState *s)
 static void esp32p4_i2c_fsm_rescale(ESP32P4I2CState *s)
 {
     int64_t now = esp32p4_i2c_now();
-    ESP32P4ClkPeriod old = s->tp_period;
-    ESP32P4ClkPeriod period = esp32p4_i2c_period(s);
+    ESP32P4ClkEdges old = s->tp_edges;
+    ESP32P4ClkEdges edges = esp32p4_i2c_edges(s, now);
     unsigned i;
 
-    if (esp32p4_clk_period_eq(old, period)) {
+    if (esp32p4_clk_edges_eq(&old, &edges)) {
         return;
     }
-    s->cur_tp = esp32p4_i2c_tp(esp32p4_i2c_tp_ns_at(old, s->cur_tp));
-    s->fall_tp = esp32p4_i2c_tp(esp32p4_i2c_tp_ns_at(old, s->fall_tp));
+    s->cur_tp = esp32p4_i2c_tp(esp32p4_i2c_tp_ns_at(&old, s->cur_tp));
+    s->fall_tp = esp32p4_i2c_tp(esp32p4_i2c_tp_ns_at(&old, s->fall_tp));
     for (i = 0; i < 2; i++) {
         s->drv_tp[i] = esp32p4_i2c_tp(s->drv_ns[i]);
         s->line[i].edge_tp = esp32p4_i2c_tp(s->line[i].edge_ns);
         s->line[i].pend_tp = esp32p4_i2c_tp(
-            esp32p4_i2c_tp_ns_at(old, s->line[i].pend_tp));
+            esp32p4_i2c_tp_ns_at(&old, s->line[i].pend_tp));
     }
-    s->tp_period = period;
+    s->tp_edges = edges;
+    s->tp_sclk = esp32p4_clk_edges_or_at(s->sclk, now);
     if (s->step == ST_NONE || esp32p4_i2c_fsm_waiting(s)) {
         return;
     }
-    if (esp32p4_clk_period_running(old)) {
+    if (esp32p4_clk_edges_running(&old)) {
         s->step_left = 0;
         if (s->step_mark > now) {
-            s->step_left = esp32p4_clk_ns_cycles(old, s->step_mark - now);
+            s->step_left = esp32p4_clk_edges_between(&old, now,
+                                                     s->step_mark);
         }
         s->step_mark = MIN(s->step_mark, now);
     }
-    if (!esp32p4_clk_period_running(period)) {
+    if (!esp32p4_clk_edges_running(&edges)) {
         timer_del(&s->fsm_timer);
         return;
     }
@@ -774,7 +803,7 @@ static void esp32p4_i2c_fsm_timer(void *opaque)
     unsigned step = s->step;
 
     if (step == ST_NONE || esp32p4_i2c_fsm_waiting(s) ||
-        !esp32p4_clk_period_running(s->tp_period)) {
+        !esp32p4_clk_edges_running(&s->tp_edges)) {
         return;
     }
     s->step = ST_NONE;
@@ -1536,8 +1565,8 @@ static void esp32p4_i2c_slv_tx_begin(ESP32P4I2CState *s, bool first,
         return;
     }
     s->slv_byte = esp32p4_i2c_slv_tx_fetch(s);
-    esp32p4_i2c_slv_tx_bit(s, when + esp32p4_i2c_cyc(s, ACT(s, R_SDA_HOLD) +
-                                                       1));
+    esp32p4_i2c_slv_tx_bit(s, esp32p4_i2c_after(s, when,
+                                                ACT(s, R_SDA_HOLD) + 1));
 }
 
 /*
@@ -1735,7 +1764,7 @@ static void esp32p4_i2c_slv_scl_rise(ESP32P4I2CState *s, int64_t when)
  */
 static void esp32p4_i2c_slv_scl_fall(ESP32P4I2CState *s, int64_t when)
 {
-    int64_t hold = when + esp32p4_i2c_cyc(s, ACT(s, R_SDA_HOLD) + 1);
+    int64_t hold = esp32p4_i2c_after(s, when, ACT(s, R_SDA_HOLD) + 1);
     uint8_t req;
 
     switch (s->slv_state) {
@@ -1812,7 +1841,7 @@ static void esp32p4_i2c_slv_stretch_clr(ESP32P4I2CState *s)
         s->slv_ack = esp32p4_i2c_slv_rx_ack(s);
         esp32p4_i2c_slv_sda_at(s, s->slv_ack, now);
     }
-    esp32p4_i2c_slv_scl_at(s, true, now + esp32p4_i2c_cyc(s, protect));
+    esp32p4_i2c_slv_scl_at(s, true, esp32p4_i2c_after(s, now, protect));
     esp32p4_i2c_to_update(s);
 }
 
@@ -1956,10 +1985,11 @@ static bool esp32p4_i2c_to_cond(ESP32P4I2CState *s)
            s->slv_state != SLV_IGNORE && !s->slv_stretch;
 }
 
-/* 2^@n cycles of I2C_SCLK in ns. */
-static int64_t esp32p4_i2c_pow2_cyc(ESP32P4I2CState *s, unsigned n)
+/* When 2^@n cycles of I2C_SCLK, less @less, after @from have come. */
+static int64_t esp32p4_i2c_pow2_after(ESP32P4I2CState *s, int64_t from,
+                                      unsigned n, uint64_t less)
 {
-    return esp32p4_i2c_cyc(s, 1ull << n);
+    return esp32p4_i2c_after(s, from, (1ull << n) - less);
 }
 
 /*
@@ -1985,16 +2015,14 @@ static void esp32p4_i2c_to_update(ESP32P4I2CState *s)
         return;
     }
     if (cond && (to & TO_EN)) {
-        s->to_scl_due = MAX(s->line[LINE_SCL].edge_ns, s->to_since) +
-                        esp32p4_i2c_pow2_cyc(s, TO_VALUE(to));
+        s->to_scl_due = esp32p4_i2c_pow2_after(
+            s, MAX(s->line[LINE_SCL].edge_ns, s->to_since), TO_VALUE(to), 0);
     }
     if (esp32p4_i2c_master(s) && esp32p4_i2c_fsm_waiting(s)) {
-        s->to_st_due = s->wait_since +
-            esp32p4_i2c_pow2_cyc(s, ACT(s, R_SCL_ST_TIME_OUT) + 1) -
-            esp32p4_i2c_cyc(s, 1);
-        s->to_main_due = s->wait_since +
-            esp32p4_i2c_pow2_cyc(s, ACT(s, R_SCL_MAIN_ST_TIME_OUT) + 1) -
-            esp32p4_i2c_cyc(s, 1);
+        s->to_st_due = esp32p4_i2c_pow2_after(
+            s, s->wait_since, ACT(s, R_SCL_ST_TIME_OUT) + 1, 1);
+        s->to_main_due = esp32p4_i2c_pow2_after(
+            s, s->wait_since, ACT(s, R_SCL_MAIN_ST_TIME_OUT) + 1, 1);
     }
     due = MIN(s->to_scl_due, MIN(s->to_st_due, s->to_main_due));
     if (due == INT64_MAX) {
@@ -2395,7 +2423,9 @@ static void esp32p4_i2c_reset_hold(Object *obj, ResetType type)
     s->bus_active = false;
     s->step = ST_NONE;
     s->step_left = 0;
-    s->tp_period = esp32p4_i2c_period(s);
+    s->tp_edges = esp32p4_clk_edges_stopped();
+    s->tp_edges = esp32p4_i2c_edges(s, esp32p4_i2c_now());
+    s->tp_sclk = esp32p4_clk_edges_or_at(s->sclk, esp32p4_i2c_now());
     s->mst_busy = false;
     s->mst_suspended = false;
     s->mst_in_txn = false;
@@ -2485,8 +2515,8 @@ static const VMStateDescription vmstate_esp32p4_i2c_line = {
 
 static const VMStateDescription vmstate_esp32p4_i2c = {
     .name = TYPE_ESP32P4_I2C,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(sclk, ESP32P4I2CState),
         VMSTATE_TIMER(fsm_timer, ESP32P4I2CState),
@@ -2522,7 +2552,8 @@ static const VMStateDescription vmstate_esp32p4_i2c = {
         VMSTATE_UINT32(step, ESP32P4I2CState),
         VMSTATE_UINT64(step_left, ESP32P4I2CState),
         VMSTATE_INT64(step_mark, ESP32P4I2CState),
-        VMSTATE_ESP32P4_CLK_PERIOD(tp_period, ESP32P4I2CState),
+        VMSTATE_ESP32P4_CLK_EDGES(tp_edges, ESP32P4I2CState),
+        VMSTATE_ESP32P4_CLK_EDGES(tp_sclk, ESP32P4I2CState),
         VMSTATE_INT64(step_tp.origin, ESP32P4I2CState),
         VMSTATE_UINT64(step_tp.cyc, ESP32P4I2CState),
         VMSTATE_INT64(step_ns, ESP32P4I2CState),

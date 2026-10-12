@@ -1597,24 +1597,30 @@ static uint32_t clk_div(Esp32McpwmState *s)
 }
 
 /*
- * @clk's whole cycles in @ns, and the first nanosecond by which @ticks of
- * them have elapsed: the ESP32-P4's at MCPWMn_CLK's exact period
- * (esp32p4_clk_period.h), the ESP32's at its Clock's.
+ * @clk's whole cycles from @from to @t, and the first nanosecond by which
+ * @ticks of them have elapsed from @from: the ESP32-P4's MCPWMn_CLK's
+ * edges, at its exact period and phase (esp32p4_clk_period.h), the
+ * ESP32's at its Clock's period from @from.
  */
-static uint64_t mcpwm_clk_cycles(Esp32McpwmState *s, Clock *clk, int64_t ns)
+static uint64_t mcpwm_clk_cycles(Esp32McpwmState *s, Clock *clk,
+                                 int64_t from, int64_t t)
 {
-    if (s->p4) {
-        return esp32p4_clk_ns_cycles(s->p4_period, ns);
+    if (t <= from) {
+        return 0;
     }
-    return clock_ns_to_ticks(clk, ns);
+    if (s->p4) {
+        return esp32p4_clk_edges_between(&s->p4_edges, from, t);
+    }
+    return clock_ns_to_ticks(clk, t - from);
 }
 
-static uint64_t mcpwm_clk_ns(Esp32McpwmState *s, Clock *clk, uint64_t ticks)
+static int64_t mcpwm_clk_after(Esp32McpwmState *s, Clock *clk, int64_t from,
+                               uint64_t ticks)
 {
     uint64_t ns;
 
     if (s->p4) {
-        return esp32p4_clk_cycles_ns(s->p4_period, ticks);
+        return esp32p4_clk_edges_after(&s->p4_edges, from, ticks);
     }
     if (!clock_is_enabled(clk)) {
         return INT64_MAX;
@@ -1623,7 +1629,7 @@ static uint64_t mcpwm_clk_ns(Esp32McpwmState *s, Clock *clk, uint64_t ticks)
     while (clock_ns_to_ticks(clk, ns) < ticks) {
         ns++;
     }
-    return ns;
+    return from + MIN(ns, (uint64_t)INT64_MAX / 2);
 }
 
 /*
@@ -1631,17 +1637,14 @@ static uint64_t mcpwm_clk_ns(Esp32McpwmState *s, Clock *clk, uint64_t ticks)
  * of the source's cycles that keeps its count through a change of the
  * source's rate and of the division: a change keeps the part of the
  * PWM_clk cycle in progress that the counter has counted. The source's
- * own cycles are counted from its last change, src_ns, starting afresh
- * there as every block counting a clock takes them (esp32p4_clk_period.h;
- * the ESP32's Clocks likewise). At the source's cycle div_tick, at div_ns,
- * PWM_clk cycle div_cycle had div_k of them counted.
+ * own cycles are counted from its last change, src_ns, at its edges after
+ * it as every block counting a clock takes them (esp32p4_clk_period.h;
+ * the ESP32's Clocks from the change). At the source's cycle div_tick, at
+ * div_ns, PWM_clk cycle div_cycle had div_k of them counted.
  */
 static uint64_t mcpwm_src_cycles(Esp32McpwmState *s, int64_t ns)
 {
-    if (ns <= s->src_ns) {
-        return 0;
-    }
-    return mcpwm_clk_cycles(s, s->core_clk, ns - s->src_ns);
+    return mcpwm_clk_cycles(s, s->core_clk, s->src_ns, ns);
 }
 
 static uint64_t mcpwm_cycle_at(Esp32McpwmState *s, int64_t ns)
@@ -1657,7 +1660,7 @@ static uint64_t mcpwm_cycle_at(Esp32McpwmState *s, int64_t ns)
 /* The first virtual time at which PWM_clk has reached `cycle`. */
 static int64_t mcpwm_ns_at(Esp32McpwmState *s, uint64_t cycle)
 {
-    uint64_t ticks, ns;
+    uint64_t ticks;
 
     if (cycle <= s->div_cycle) {
         return s->div_ns;
@@ -1666,8 +1669,8 @@ static int64_t mcpwm_ns_at(Esp32McpwmState *s, uint64_t cycle)
         return INT64_MAX / 2;
     }
     ticks = s->div_tick + (cycle - s->div_cycle) * clk_div(s) - s->div_k;
-    ns = mcpwm_clk_ns(s, s->core_clk, ticks);
-    return s->src_ns + MIN(ns, (uint64_t)INT64_MAX / 2);
+    return MIN(mcpwm_clk_after(s, s->core_clk, s->src_ns, ticks),
+               INT64_MAX / 2);
 }
 
 /*
@@ -1737,7 +1740,7 @@ static uint32_t cap_timer_at(Esp32McpwmState *s, int64_t t)
         return s->cap_anchor;
     }
     return s->cap_anchor + (uint32_t)mcpwm_clk_cycles(s, s->cap_clk,
-                                                      t - s->cap_anchor_ns);
+                                                      s->cap_anchor_ns, t);
 }
 
 static uint32_t cap_timer_now(Esp32McpwmState *s)
@@ -2942,7 +2945,7 @@ static void esp32p4_mcpwm_clk_update(void *opaque, ClockEvent event)
     if (event == ClockPreUpdate) {
         mcpwm_at(esp32p4_mcpwm_clk_pre, s);
     } else {
-        s->p4_period = esp32p4_clk_exact(s->core_clk);
+        s->p4_edges = esp32p4_clk_edges_or_at(s->core_clk, s->src_ns);
         esp32_line_run_at(s->src_ns, mcpwm_core_clk_post, s);
     }
 }
@@ -2956,7 +2959,8 @@ static void esp32_mcpwm_reset_hold(Object *obj, ResetType type)
     timer_del(s->timer);
     mcpwm_changed(s);
     if (s->p4) {
-        s->p4_period = esp32p4_clk_exact(s->core_clk);
+        s->p4_edges = esp32p4_clk_edges_or_at(
+            s->core_clk, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }
     /* Input levels come from outside the block and survive its reset. */
     memcpy(fault_in, c->fault_in, sizeof(fault_in));
@@ -3157,13 +3161,15 @@ static bool esp32p4_mcpwm_period_needed(void *opaque)
 
 static const VMStateDescription vmstate_esp32p4_mcpwm_period = {
     .name = TYPE_ESP32_MCPWM "/p4-period",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .needed = esp32p4_mcpwm_period_needed,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT64(p4_period.num_hi, Esp32McpwmState),
-        VMSTATE_UINT64(p4_period.num_lo, Esp32McpwmState),
-        VMSTATE_UINT64(p4_period.den, Esp32McpwmState),
+        VMSTATE_UINT64(p4_edges.period.num_hi, Esp32McpwmState),
+        VMSTATE_UINT64(p4_edges.period.num_lo, Esp32McpwmState),
+        VMSTATE_UINT64(p4_edges.period.den, Esp32McpwmState),
+        VMSTATE_UINT64(p4_edges.phase_hi, Esp32McpwmState),
+        VMSTATE_UINT64(p4_edges.phase_lo, Esp32McpwmState),
         VMSTATE_END_OF_LIST()
     },
 };

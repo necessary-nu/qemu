@@ -167,15 +167,17 @@ struct ESP32P4I2CState {
      * The master's next step: due at step_mark, the instant step_tp, or
      * with the clock stopped step_left cycles after it restarts; a clock
      * change rescales what is left. step_ns is the time of the step being
-     * run, the instant cur_tp. The instants count I2C_SCLK's cycles at
-     * tp_period, its exact period as the clock last changed (stopped
-     * while it is). drv_ns and drv_tp are when the controller last
-     * changed each line it drives (LINE_SCL, LINE_SDA), and that instant.
+     * run, the instant cur_tp. The instants count I2C_SCLK's cycles,
+     * tp_edges, its edges as the clock last changed (stopped while it
+     * is), the function clock's then being tp_sclk. drv_ns and drv_tp are
+     * when the controller last changed each line it drives (LINE_SCL,
+     * LINE_SDA), and that instant.
      */
     uint32_t step;
     uint64_t step_left;
     int64_t step_mark;
-    ESP32P4ClkPeriod tp_period;
+    ESP32P4ClkEdges tp_edges;
+    ESP32P4ClkEdges tp_sclk;
     ESP32P4I2CTp step_tp;
     int64_t step_ns;
     ESP32P4I2CTp cur_tp;

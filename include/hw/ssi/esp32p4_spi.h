@@ -249,7 +249,12 @@ struct ESP32P4SpiState {
     uint8_t cur;            /* the state being consumed */
     uint32_t cur_beat;
     ESP32P4ClkPeriod half;  /* half an SPI_CLK cycle, exactly */
-    int64_t t0;             /* when half cycle 0 began */
+    /*
+     * The half cycles' edges, the transfer's half cycle h ending at edge
+     * h0 + h, from clk_spi_mst's edge at which they last began afresh.
+     */
+    ESP32P4ClkEdges half_e;
+    int64_t h0;
     uint64_t h;             /* half cycles from t0 to the next step */
     /* The generator, ahead of the consumer. */
     uint8_t gen;

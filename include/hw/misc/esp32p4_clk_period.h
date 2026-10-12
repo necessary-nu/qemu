@@ -595,6 +595,34 @@ static inline int64_t esp32p4_clk_edge_ns(const ESP32P4ClkEdges *e,
 }
 
 /*
+ * The time from @t ns to the first edge at or after it of a running clock,
+ * in Clock units, rounded up: 0 for an edge at @t; saturating at
+ * UINT64_MAX.
+ */
+static inline uint64_t esp32p4_clk_edge_wait(const ESP32P4ClkEdges *e,
+                                             int64_t t)
+{
+    uint64_t y[3], a[3], q;
+    int64_t k;
+    bool at, rem;
+
+    k = esp32p4_clk_edge_index(e, t, &at);
+    if (at || k == INT64_MAX) {
+        return 0;
+    }
+    /* Edge k + 1, less t: (phase + (k + 1) * num - t * 2^32 * den) / den. */
+    esp32p4_mul_64_128(a, k + 1, e->period.num_hi, e->period.num_lo);
+    if (!esp32p4_add_192_128(a, e->phase_hi, e->phase_lo)) {
+        return UINT64_MAX;
+    }
+    esp32p4_clk_scaled(y, t, e->period.den);
+    esp32p4_sub_192_128(a, y[1], y[0]);
+    a[2] -= y[2];
+    q = esp32p4_div_192_128(a, 0, e->period.den, &rem);
+    return q == UINT64_MAX ? UINT64_MAX : q + rem;
+}
+
+/*
  * The edges of a clock of period @p whose edges are some of those of @in,
  * its first one at the first edge of @in at or after @t ns: as a divider
  * started at @t has them, or a PLL locking to @in at @t. To within

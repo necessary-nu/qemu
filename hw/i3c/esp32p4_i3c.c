@@ -286,10 +286,11 @@ static int64_t esp32p4_i3c_now(void)
     return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
-/* The first ns by which @n cycles of exact period @period have elapsed */
-static int64_t esp32p4_i3c_cyc(ESP32P4ClkPeriod period, uint64_t n)
+/* The first ns by which @n cycles of a clock of edges @e after @from have */
+static int64_t esp32p4_i3c_after(const ESP32P4ClkEdges *e, int64_t from,
+                                 uint64_t n)
 {
-    return MIN(esp32p4_clk_cycles_ns(period, n), INT64_MAX / 2);
+    return MIN(esp32p4_clk_edges_after(e, from, n), INT64_MAX / 2);
 }
 
 /* Master: interrupts and buffers */
@@ -436,28 +437,28 @@ static void esp32p4_i3c_mst_from(ESP32P4I3CMstState *s, int64_t t)
 /*
  * End the current phase @cycles of I3C_MST_CLK after the last ended,
  * moving to @phase; with the clock stopped the phase waits for it. The
- * phases count I3C_MST_CLK's cycles at its exact period from where they
- * last started afresh, each ending at the first nanosecond its cycles
- * have elapsed, so that a run of them keeps to the clock.
+ * phases count I3C_MST_CLK's edges from where they last started afresh,
+ * each ending at the first nanosecond its cycles have come, so that a run
+ * of them keeps to the clock.
  */
 static void esp32p4_i3c_mst_after(ESP32P4I3CMstState *s, uint64_t cycles,
                                   uint32_t phase)
 {
-    ESP32P4ClkPeriod period = esp32p4_clk_exact(s->clk);
+    ESP32P4ClkEdges edges = esp32p4_clk_edges_or_at(s->clk, s->phase_due);
 
     s->phase = phase;
-    if (!esp32p4_clk_period_eq(period, s->phase_period)) {
+    if (!esp32p4_clk_edges_eq(&edges, &s->phase_edges)) {
         esp32p4_i3c_mst_from(s, s->phase_due);
-        s->phase_period = period;
+        s->phase_edges = edges;
     }
-    if (!esp32p4_clk_period_running(period)) {
+    if (!esp32p4_clk_edges_running(&edges)) {
         s->phase_left = cycles;
         timer_del(&s->timer);
         return;
     }
     s->phase_left = 0;
     s->phase_cyc += cycles;
-    s->phase_due = s->phase_origin + esp32p4_i3c_cyc(period, s->phase_cyc);
+    s->phase_due = esp32p4_i3c_after(&edges, s->phase_origin, s->phase_cyc);
     timer_mod(&s->timer, s->phase_due);
 }
 
@@ -466,7 +467,7 @@ static void esp32p4_i3c_mst_timer(void *opaque)
     ESP32P4I3CMstState *s = opaque;
 
     if (s->phase == PH_NONE || s->phase >= PH_WAIT_TX ||
-        !esp32p4_clk_period_running(s->phase_period)) {
+        !esp32p4_clk_edges_running(&s->phase_edges)) {
         return;
     }
     esp32p4_i3c_mst_phase_end(s, s->phase_due);
@@ -480,27 +481,27 @@ static void esp32p4_i3c_mst_timer(void *opaque)
 static void esp32p4_i3c_mst_clock_update(void *opaque, ClockEvent event)
 {
     ESP32P4I3CMstState *s = opaque;
-    ESP32P4ClkPeriod period = esp32p4_clk_exact(s->clk);
     int64_t now = esp32p4_i3c_now();
+    ESP32P4ClkEdges edges = esp32p4_clk_edges_or_at(s->clk, now);
 
     if (s->phase == PH_NONE || s->phase >= PH_WAIT_TX) {
         return;
     }
-    if (esp32p4_clk_period_running(s->phase_period)) {
+    if (esp32p4_clk_edges_running(&s->phase_edges)) {
         s->phase_left = 0;
         if (s->phase_due > now) {
-            s->phase_left = esp32p4_clk_ns_cycles(s->phase_period,
-                                                  s->phase_due - now);
+            s->phase_left = esp32p4_clk_edges_between(&s->phase_edges, now,
+                                                      s->phase_due);
         }
     }
-    s->phase_period = period;
+    s->phase_edges = edges;
     esp32p4_i3c_mst_from(s, now);
-    if (!esp32p4_clk_period_running(period)) {
+    if (!esp32p4_clk_edges_running(&edges)) {
         timer_del(&s->timer);
         return;
     }
     s->phase_cyc = s->phase_left;
-    s->phase_due = now + esp32p4_i3c_cyc(period, s->phase_left);
+    s->phase_due = esp32p4_i3c_after(&edges, now, s->phase_left);
     s->phase_left = 0;
     timer_mod(&s->timer, s->phase_due);
 }
@@ -1205,7 +1206,7 @@ static void esp32p4_i3c_mst_phase_end(ESP32P4I3CMstState *s, int64_t t)
         esp32p4_i3c_mst_drive(s, true, true, t);
         n = MAX(extract32(s->regs[R_SCL_STOP_HOLD], 0, 9) + 1,
                 extract32(s->regs[R_BUS_FREE_TIME], 0, 16));
-        s->free_at = t + esp32p4_i3c_cyc(s->phase_period, n);
+        s->free_at = esp32p4_i3c_after(&s->phase_edges, t, n);
         esp32p4_i3c_mst_idle(s);
         break;
     case PH_IBI:
@@ -1523,7 +1524,7 @@ static void esp32p4_i3c_mst_reset_hold(Object *obj, ResetType type)
     s->present_dct = 0;
     s->present_dat = 0;
     s->phase = PH_NONE;
-    s->phase_period = esp32p4_clk_period_stopped();
+    s->phase_edges = esp32p4_clk_edges_stopped();
     s->phase_left = 0;
     s->busy = false;
     s->in_txn = false;
@@ -1611,8 +1612,8 @@ static const VMStateDescription vmstate_esp32p4_i3c_ibi = {
 
 static const VMStateDescription vmstate_esp32p4_i3c_mst = {
     .name = TYPE_ESP32P4_I3C_MST,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4I3CMstState),
         VMSTATE_TIMER(timer, ESP32P4I3CMstState),
@@ -1649,7 +1650,7 @@ static const VMStateDescription vmstate_esp32p4_i3c_mst = {
         VMSTATE_UINT32(cmd_h, ESP32P4I3CMstState),
         VMSTATE_UINT32(phase, ESP32P4I3CMstState),
         VMSTATE_INT64(phase_due, ESP32P4I3CMstState),
-        VMSTATE_ESP32P4_CLK_PERIOD(phase_period, ESP32P4I3CMstState),
+        VMSTATE_ESP32P4_CLK_EDGES(phase_edges, ESP32P4I3CMstState),
         VMSTATE_UINT64(phase_left, ESP32P4I3CMstState),
         VMSTATE_INT64(phase_origin, ESP32P4I3CMstState),
         VMSTATE_UINT64(phase_cyc, ESP32P4I3CMstState),
