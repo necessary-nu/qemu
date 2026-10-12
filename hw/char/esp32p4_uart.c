@@ -1056,7 +1056,10 @@ static void uart_tx_advance(ESP32P4UartState *s)
     uart_update_irq(s);
 }
 
-/* How far the current phase has got, in 2^-16 bits. */
+/*
+ * How far the current phase has got, in 2^-16 bits: no less than where it
+ * last stood, which it holds until it goes on at the clock's next edge.
+ */
 static uint64_t tx_pos16_at(ESP32P4UartState *s, int64_t t)
 {
     int64_t pos;
@@ -1066,7 +1069,7 @@ static uint64_t tx_pos16_at(ESP32P4UartState *s, int64_t t)
     }
     pos = esp32p4_clk_ns_cycles(s->tx_unit, t - s->tx_start_ns) -
           s->tx_shift;
-    return MAX(pos, 0);
+    return MAX(pos, (int64_t)s->tx_pos16);
 }
 
 /* Note how far the phase has got, before the bit time changes. */
@@ -1095,6 +1098,7 @@ static void uart_tx_rerate(ESP32P4UartState *s, int64_t t)
 
             s->tx_shift = tx_sclk_wait(s, unit, t) - pos;
             s->tx_start_ns = t;
+            s->tx_pos16 = pos;
         }
         s->tx_unit = unit;
         s->tx_sclk = sclk;

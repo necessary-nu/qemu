@@ -164,12 +164,13 @@ struct ESP32P4UartState {
      * sixteenth t16 comes exactly (t16 * 4096 + tx_shift) * tx_unit after
      * tx_start_ns: tx_unit is 2^-16 of a bit, stopped while the
      * transmitter's clock is, the phase having then reached tx_pos16
-     * 2^-16 bits; tx_shift is where the phase began, after the phases of
-     * a run before it, after tx_start_ns at the core clock's first edge
-     * (whose edges were then tx_sclk) when it began afresh, or before it
-     * when the bit time or the clock's edges changed in it. The last
-     * phase to end ended at tx_chain_ns, tx_chain_pos units from
-     * tx_start_ns, where the next follows it at once.
+     * 2^-16 bits, where it stays until it goes on; tx_shift is where the
+     * phase began, after the phases of a run before it, after
+     * tx_start_ns at the core clock's first edge (whose edges were then
+     * tx_sclk) when it began afresh, or before it when the bit time or
+     * the clock's edges changed in it. The last phase to end ended at
+     * tx_chain_ns, tx_chain_pos units from tx_start_ns, where the next
+     * follows it at once.
      */
     QEMUTimer tx_timer;
     uint8_t tx_phase;

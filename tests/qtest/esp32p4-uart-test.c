@@ -466,6 +466,42 @@ static void test_exact_frames(void)
 }
 
 /*
+ * A frame whose core clock moves to another of the same frequency at
+ * another phase goes on at the new clock's edges. UART1_SCLK, XTAL_CLK
+ * undivided, has its edges at multiples of 25 ns; switched, 4501 ns into
+ * a frame, to PLL_F80M_CLK (the SPLL's 480 MHz by 6, from XTAL_CLK's edge
+ * at time 0) divided by 2, it is 40 MHz again, its divider counting from
+ * PLL_F80M_CLK's first edge after the switch, 11.5 ns on: the rest of the
+ * frame comes 11.5 ns later, and TX_DONE at the first ns after.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+/* [spec:nuos:req:emu.esp32p4.clocks/test] */
+static void test_clock_phase(void)
+{
+    QTestState *qts = start();
+    uint32_t ctrl111, ctrl112;
+    int64_t t0;
+
+    setup(qts, UART(1), CONF0_8N1);
+    xtal_edge(qts);
+    t0 = qtest_clock_step(qts, 25);
+    wr(qts, UART(1), FIFO, 0x55);
+    qtest_clock_step(qts, 4501);
+    ctrl111 = qtest_readl(qts, HP_SYS_CLKRST_PERI_CLK_CTRL111);
+    ctrl112 = qtest_readl(qts, HP_SYS_CLKRST_PERI_CLK_CTRL112);
+    qtest_writel(qts, HP_SYS_CLKRST_PERI_CLK_CTRL111,
+                 (ctrl111 & ~(3u << 24)) | (2u << 24));
+    qtest_writel(qts, HP_SYS_CLKRST_PERI_CLK_CTRL112,
+                 (ctrl112 & ~0xffu) | 1u);
+    g_assert_cmpint(qtest_clock_step(qts, FRAME_NS + 11 - 4501), ==,
+                    t0 + FRAME_NS + 11);
+    g_assert_false(rd(qts, UART(1), INT_RAW) & INT_TX_DONE);
+    qtest_clock_step(qts, 1);
+    g_assert_true(rd(qts, UART(1), INT_RAW) & INT_TX_DONE);
+    qtest_quit(qts);
+}
+
+/*
  * The FIFOs and their interrupts, through the internal loopback:
  * RXFIFO_FULL at the threshold, TXFIFO_EMPTY below its threshold, latched
  * until cleared and set again while their condition holds; RXFIFO_TOUT
@@ -1665,6 +1701,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/uart/reg_update", test_reg_update);
     qtest_add_func("esp32p4/uart/baud_timing", test_baud_timing);
     qtest_add_func("esp32p4/uart/exact_frames", test_exact_frames);
+    qtest_add_func("esp32p4/uart/clock_phase", test_clock_phase);
     qtest_add_func("esp32p4/uart/fifo_irq", test_fifo_irq);
     qtest_add_func("esp32p4/uart/uart_to_uart", test_uart_to_uart);
     qtest_add_func("esp32p4/uart/hw_flow", test_hw_flow);
