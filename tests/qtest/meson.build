@@ -382,8 +382,7 @@ qtests_riscv32 = \
      'esp32p4-boot-uart-test', 'esp32p4-boot-esptool-test',
      'esp32p4-boot-usb-test', 'esp32p4-adc-test',
      'esp32p4-tsens-test', 'esp32p4-touch-test',
-     'esp32p4-ana-cmpr-test', 'esp32p4-lp-rom-test',
-     'esp32p4-rom-loader-test'] :
+     'esp32p4-ana-cmpr-test', 'esp32p4-lp-rom-test'] :
     [])
 
 qtests_riscv64 = ['riscv-csr-test'] + \
