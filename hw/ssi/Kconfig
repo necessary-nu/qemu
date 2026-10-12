@@ -1,6 +1,7 @@
 config PL022
     bool
     select SSI
+    select LINE_TIME
 
 config SIFIVE_SPI
     bool
