@@ -289,15 +289,32 @@ static void esp_send(int fd, uint8_t cmd, const uint8_t *data, size_t len,
 }
 
 /*
- * Read from @fd for up to 3 s until the response to @cmd: true with its
+ * How long, in the host's time, a wait for the ROM may last: a SYNC that
+ * goes unanswered for SYNC_WAIT_MS is sent again, as esptool sends it; a
+ * command's response, or text, comes within REPLY_WAIT_MS however loaded
+ * the host is. The waits end as soon as what they wait for arrives. They
+ * are bounded in time rather than in reads, as the ROM's other output,
+ * such as its further answers to a SYNC, arrives in pieces meanwhile.
+ */
+#define SYNC_WAIT_MS        3000
+#define REPLY_WAIT_MS       30000
+
+static int64_t deadline_us(int ms)
+{
+    return g_get_monotonic_time() + ms * (int64_t)1000;
+}
+
+/*
+ * Read from @fd for up to @ms ms until the response to @cmd: true with its
  * first status byte (0 for success) in *status.
  */
-static bool esp_response(int fd, uint8_t cmd, uint8_t *status)
+static bool esp_response(int fd, uint8_t cmd, uint8_t *status, int ms)
 {
+    int64_t end = deadline_us(ms);
     uint8_t buf[4096];
     size_t got = 0;
 
-    for (int i = 0; i < 30; i++) {
+    while (g_get_monotonic_time() < end) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
 
         if (poll(&pfd, 1, 100) > 0) {
@@ -335,7 +352,7 @@ void esp_sync(int fd)
 
     for (int i = 0; i < 20 && !synced; i++) {
         esp_send(fd, 0x08, sync_data, sizeof(sync_data), 0);
-        synced = esp_response(fd, 0x08, &status);
+        synced = esp_response(fd, 0x08, &status, SYNC_WAIT_MS);
     }
     g_assert(synced);
     g_assert_cmpint(status, ==, 0);
@@ -359,7 +376,7 @@ void esp_load_and_run(QTestState *qts, int fd)
     stl_le_p(begin + 8, sizeof(prog_magic));
     stl_le_p(begin + 12, LOAD_ADDR);
     esp_send(fd, 0x05, begin, sizeof(begin), 0);
-    g_assert(esp_response(fd, 0x05, &status));
+    g_assert(esp_response(fd, 0x05, &status, REPLY_WAIT_MS));
     g_assert_cmpint(status, ==, 0);
 
     stl_le_p(data, sizeof(prog_magic));
@@ -373,7 +390,7 @@ void esp_load_and_run(QTestState *qts, int fd)
         checksum ^= data[i];
     }
     esp_send(fd, 0x07, data, sizeof(data), checksum);
-    g_assert(esp_response(fd, 0x07, &status));
+    g_assert(esp_response(fd, 0x07, &status, REPLY_WAIT_MS));
     g_assert_cmpint(status, ==, 0);
 
     stl_le_p(end, 0);                   /* run it */
@@ -386,15 +403,17 @@ void esp_load_and_run(QTestState *qts, int fd)
 }
 
 /*
- * Read @fd for up to 30 s until the text received holds @want. @rx holds
- * what has arrived and not yet been matched: what follows the match stays
- * in it for the next call, as one read may bring several lines.
+ * Read @fd for up to REPLY_WAIT_MS until the text received holds @want.
+ * @rx holds what has arrived and not yet been matched: what follows the
+ * match stays in it for the next call, as one read may bring several
+ * lines.
  */
 void await_text(int fd, GString *rx, const char *want)
 {
+    int64_t end = deadline_us(REPLY_WAIT_MS);
     const char *at;
 
-    for (int i = 0; i < 300 && !strstr(rx->str, want); i++) {
+    while (!strstr(rx->str, want) && g_get_monotonic_time() < end) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
         char buf[256];
 
@@ -427,15 +446,16 @@ static void esp_drain(int fd)
 
 /*
  * Read the next response frame from @fd, SLIP-decoded, waiting up to
- * 3 s: its status bytes follow its data.
+ * REPLY_WAIT_MS: its status bytes follow its data.
  */
 static bool esp_reply(int fd, EspReply *r)
 {
+    int64_t end = deadline_us(REPLY_WAIT_MS);
     uint8_t frame[256];
     size_t n = 0;
     bool in = false;
 
-    for (int i = 0; i < 300; i++) {
+    while (g_get_monotonic_time() < end) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
         uint8_t c;
 
