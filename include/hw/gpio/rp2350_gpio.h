@@ -70,6 +70,10 @@ static inline int rp2350_gpio_sio_bit(int pin)
  *
  * Source levels are the peripherals' state, so they are not reset with
  * this device; a peripheral sets its own on reset.
+ *
+ * The muxing and pads are combinational: a change reaches every receiver
+ * within the call that makes it, and keeps the time the driver gave it
+ * (hw/core/line-time.h), so that each receiver takes it at that time.
  */
 typedef enum RP2350GPIOPort {
     RP2350_GPIO_PORT_SPI0,

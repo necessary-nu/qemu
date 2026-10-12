@@ -36,8 +36,9 @@
  *
  * Time. The blocks hold their state as of a clk_sys cycle, counted on
  * the clock's own grid from when it started, and are run forward to the
- * current virtual time before every register access and pin input
- * change. Cycles in which no state machine has anything to do are
+ * time of every register access and pin input change: the present, or
+ * the time a stamped change carries (hw/core/line-time.h). Cycles in
+ * which no state machine has anything to do are
  * skipped: a state machine is only run in cycles in which its divider
  * gives an enable, and one that stalled with nothing changed since that
  * could release it is not run at all. A jump to itself that tests
@@ -52,14 +53,24 @@
  * ahead is limited to a horizon that starts short after every disturbance
  * and grows while there are none. Output changes on GPIOs that no pin
  * routes to PIO are not timed: they are delivered whenever the blocks
- * next catch up. Pin changes are driven to the IO bank in the cycle they
- * happen, so PIO-to-PIO paths through the pads are exact.
+ * next catch up. Every change is driven with the time it reaches the
+ * pads, however late the timer fires, so that PIO-to-PIO paths through
+ * the pads are exact and every other receiver takes it in its cycle; a
+ * timer firing takes the blocks to its deadline only, so that other
+ * devices' timers due before their next change find them there.
+ *
+ * A pin change from outside is taken in the cycle of its time. Under
+ * icount a timer fires up to an instruction late, so a register access
+ * can run the blocks past a change still to be driven to them: the change
+ * is recorded in its own cycle as long as no state machine can yet have
+ * seen it through the synchronisers.
  *
  * Without icount, virtual time follows the host clock. Blocks with more
  * to do than they can run in real time (pins toggling every few cycles
  * through the pads, say) stop catching up after RUN_BUDGET_NS of host
  * time and let the cycles they could not run go: they run slow rather
- * than fall ever further behind. Their own timing stays exact.
+ * than fall ever further behind. Their own timing stays exact. A timer
+ * firing more than PIO_MAX_LATE_NS late takes the blocks to the present.
  *
  * Not modelled: pad input and output delays beyond the synchronisers.
  */
@@ -69,6 +80,7 @@
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
@@ -218,6 +230,14 @@ enum {
  * in real time would otherwise never catch up with it.
  */
 #define RUN_BUDGET_NS           (1 * SCALE_MS)
+
+/*
+ * How late a timer firing may be and still take the blocks only to its
+ * deadline: far more than icount ever leaves a timer (up to a clk_sys
+ * cycle), and as little as keeps what a late host must catch up on, one
+ * output change at a time, short.
+ */
+#define PIO_MAX_LATE_NS         (10 * SCALE_US)
 
 typedef enum PIORunResult {
     RUN_DONE,       /* reached the target */
@@ -444,36 +464,69 @@ static uint64_t core_in_at(const RP2350PIOCore *core, uint64_t t)
 }
 
 /*
- * Record the pin levels `vec` from cycle `t` on, keeping only the history
- * still to be seen through the synchronisers.
+ * The first cycle in which a pin change can still be recorded: two
+ * before the next cycle to run, as no state machine has yet seen a change
+ * from then through the synchronisers; the next cycle itself for a pin
+ * that some block takes in INPUT_SYNC_BYPASS.
  */
-static void core_input(RP2350PIOCore *core, uint64_t vec, uint64_t t)
+static uint64_t core_input_floor(const RP2350PIOCore *core, uint64_t mask)
 {
-    int keep = 0, k;
+    int b;
 
-    if (core->in_cycle[core->in_n - 1] >= t) {
-        core->in_val[core->in_n - 1] = vec;
-    } else {
-        /* The newest entry from at least two cycles before t is enough. */
-        for (k = core->in_n - 1; k >= 0; k--) {
-            if (core->in_cycle[k] + 2 <= t) {
-                keep = k;
-                break;
-            }
+    for (b = 0; b < RP2350_PIO_BLOCKS; b++) {
+        const RP2350PIOBlock *blk = &core->blk[b];
+
+        if ((mask >> blk->gpiobase) & blk->sync_bypass) {
+            return core->cycle;
         }
-        if (keep) {
-            memmove(&core->in_val[0], &core->in_val[keep],
-                    (core->in_n - keep) * sizeof(core->in_val[0]));
-            memmove(&core->in_cycle[0], &core->in_cycle[keep],
-                    (core->in_n - keep) * sizeof(core->in_cycle[0]));
-            core->in_n -= keep;
+    }
+    return core->cycle >= 2 ? core->cycle - 2 : 0;
+}
+
+/*
+ * Record the change of the pins in `mask` to their levels in `vec` from
+ * cycle `t` on, keeping only the history still to be seen through the
+ * synchronisers. A change from before the next cycle to run, back to
+ * core_input_floor(), applies to the levels recorded since as well.
+ */
+static void core_input(RP2350PIOCore *core, uint64_t mask, uint64_t vec,
+                       uint64_t t)
+{
+    int keep = 0, at, k;
+
+    t = MAX(t, core_input_floor(core, mask));
+    /* The newest entry from two cycles before the next to run is enough. */
+    for (k = core->in_n - 1; k >= 0; k--) {
+        if (core->in_cycle[k] + 2 <= core->cycle) {
+            keep = k;
+            break;
         }
+    }
+    if (keep) {
+        memmove(&core->in_val[0], &core->in_val[keep],
+                (core->in_n - keep) * sizeof(core->in_val[0]));
+        memmove(&core->in_cycle[0], &core->in_cycle[keep],
+                (core->in_n - keep) * sizeof(core->in_cycle[0]));
+        core->in_n -= keep;
+    }
+    /* The entry the levels from t on start with, made if there is none. */
+    for (at = core->in_n - 1; at > 0 && core->in_cycle[at] > t; at--) {
+    }
+    if (core->in_cycle[at] < t) {
         assert(core->in_n < RP2350_PIO_IN_HIST);
-        core->in_val[core->in_n] = vec;
-        core->in_cycle[core->in_n] = t;
+        at++;
+        memmove(&core->in_val[at + 1], &core->in_val[at],
+                (core->in_n - at) * sizeof(core->in_val[0]));
+        memmove(&core->in_cycle[at + 1], &core->in_cycle[at],
+                (core->in_n - at) * sizeof(core->in_cycle[0]));
+        core->in_val[at] = core->in_val[at - 1];
+        core->in_cycle[at] = t;
         core->in_n++;
     }
-    core->in_settle = t + 2;
+    for (k = at; k < core->in_n; k++) {
+        core->in_val[k] = (core->in_val[k] & ~mask) | (vec & mask);
+    }
+    core->in_settle = MAX(core->in_settle, t + 2);
     core_changed(core);
 }
 
@@ -1331,14 +1384,66 @@ static void core_lines(const RP2350PIOCore *core, uint32_t *irq,
     }
 }
 
+/* Time */
+
+/*
+ * clk_sys's cycles, counted from base_cycle at base_ns. Its edges are at
+ * whole multiples of its period from time 0, the grid every device timed
+ * on it shares, whenever each started counting: an edge at the same
+ * virtual time is the same edge for all of them.
+ */
+static uint64_t pio_cycle_at(RP2350PIOState *s, int64_t ns)
+{
+    if (ns <= s->base_ns || !clock_is_enabled(s->clk)) {
+        return s->base_cycle;
+    }
+    return s->base_cycle + clock_ns_to_ticks(s->clk, ns) -
+           clock_ns_to_ticks(s->clk, s->base_ns);
+}
+
+/* The first virtual time at which clk_sys has reached `cycle`. */
+static int64_t pio_ns_at(RP2350PIOState *s, uint64_t cycle)
+{
+    uint64_t t, ns;
+
+    if (cycle <= s->base_cycle || !clock_is_enabled(s->clk)) {
+        return s->base_ns;
+    }
+    t = clock_ns_to_ticks(s->clk, s->base_ns) + (cycle - s->base_cycle);
+    ns = clock_ticks_to_ns(s->clk, t);
+    while (clock_ns_to_ticks(s->clk, ns) < t) {
+        ns++;
+    }
+    return MIN(ns, (uint64_t)INT64_MAX / 2);
+}
+
+/* The cycle of the present, or of the stamped change being propagated. */
+static uint64_t pio_now(RP2350PIOState *s)
+{
+    return pio_cycle_at(s, line_time());
+}
+
+/*
+ * The time a pin change made in the cycle before `cycle` reaches the
+ * pads, never later than the present: an instruction written to SMx_INSTR
+ * runs in the cycle under way, whose end is still to come.
+ */
+static int64_t pio_drive_time(RP2350PIOState *s, uint64_t cycle)
+{
+    return MIN(pio_ns_at(s, cycle), qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
 /* The pins a block drives, numbered by GPIO. */
 static uint64_t blk_gpio(const RP2350PIOBlock *blk, uint32_t v)
 {
     return ((uint64_t)v << blk->gpiobase) & GPIO_MASK;
 }
 
-/* Drive block b's pin outputs that differ from what was last driven. */
-static void drive_pins(RP2350PIOState *s, int b)
+/*
+ * Drive block b's pin outputs that differ from what was last driven, as
+ * changes of time `when` (hw/core/line-time.h).
+ */
+static void drive_pins(RP2350PIOState *s, int b, int64_t when)
 {
     RP2350PIOBlock *blk = &s->core.blk[b];
     uint64_t out = blk_gpio(blk, blk->pad_out);
@@ -1356,30 +1461,31 @@ static void drive_pins(RP2350PIOState *s, int b)
         int p = ctz64(d_oe);
 
         d_oe &= d_oe - 1;
-        qemu_set_irq(s->oe[b * RP2350_PIO_GPIOS + p],
-                     (s->drv_oe[b] >> p) & 1);
+        line_set_at(s->oe[b * RP2350_PIO_GPIOS + p],
+                    (s->drv_oe[b] >> p) & 1, when);
     }
     while (d_out) {
         int p = ctz64(d_out);
 
         d_out &= d_out - 1;
-        qemu_set_irq(s->out[b * RP2350_PIO_GPIOS + p],
-                     (s->drv_out[b] >> p) & 1);
+        line_set_at(s->out[b * RP2350_PIO_GPIOS + p],
+                    (s->drv_out[b] >> p) & 1, when);
         if (p >= RP2350_PIO_HSTX_FIRST &&
             p < RP2350_PIO_HSTX_FIRST + RP2350_PIO_HSTX_BITS) {
-            qemu_set_irq(s->hstx[b * RP2350_PIO_HSTX_BITS + p -
-                                 RP2350_PIO_HSTX_FIRST],
-                         (s->drv_out[b] >> p) & 1);
+            line_set_at(s->hstx[b * RP2350_PIO_HSTX_BITS + p -
+                                RP2350_PIO_HSTX_FIRST],
+                        (s->drv_out[b] >> p) & 1, when);
         }
     }
 }
 
 /*
  * Drive the IRQ and DREQ lines that differ from what was last driven, one
- * at a time from the current state: a DMA answering a DREQ accesses the
- * FIFOs from within its edge, which can change the other lines.
+ * at a time from the current state, as changes of time `when`: a DMA
+ * answering a DREQ accesses the FIFOs from within its edge, which can
+ * change the other lines.
  */
-static void drive_lines(RP2350PIOState *s)
+static void drive_lines(RP2350PIOState *s, int64_t when)
 {
     for (;;) {
         uint32_t irq, dreq;
@@ -1389,25 +1495,25 @@ static void drive_lines(RP2350PIOState *s)
         if (irq != s->drv_irq) {
             n = ctz32(irq ^ s->drv_irq);
             s->drv_irq ^= 1u << n;
-            qemu_set_irq(s->irq[n], (s->drv_irq >> n) & 1);
+            line_set_at(s->irq[n], (s->drv_irq >> n) & 1, when);
         } else if (dreq != s->drv_dreq) {
             n = ctz32(dreq ^ s->drv_dreq);
             s->drv_dreq ^= 1u << n;
-            qemu_set_irq(s->dreq[n], (s->drv_dreq >> n) & 1);
+            line_set_at(s->dreq[n], (s->drv_dreq >> n) & 1, when);
         } else {
             return;
         }
     }
 }
 
-static void drive_all(RP2350PIOState *s)
+static void drive_all(RP2350PIOState *s, int64_t when)
 {
     int b;
 
     for (b = 0; b < RP2350_PIO_BLOCKS; b++) {
-        drive_pins(s, b);
+        drive_pins(s, b, when);
     }
-    drive_lines(s);
+    drive_lines(s, when);
 }
 
 /*
@@ -1428,10 +1534,11 @@ static uint64_t blk_routed(RP2350PIOState *s, int b)
 
 /*
  * Run `core` up to (not including) cycle `target`. The live state drives
- * pin changes as they happen, so that they come back through the pads
- * stamped with the right cycle. A run ahead (`spec`) drives nothing and
- * stops after the first cycle that changes an output visible outside the
- * blocks. Without icount, a run also stops when it has taken
+ * each cycle's changes as it runs it, with the time they reach the pads,
+ * so that they come back through the pads in the right cycle and reach
+ * every other receiver at their time. A run ahead (`spec`) drives nothing
+ * and stops after the first cycle that changes an output visible outside
+ * the blocks. Without icount, a run also stops when it has taken
  * RUN_BUDGET_NS of host time.
  */
 static PIORunResult core_run(RP2350PIOState *s, RP2350PIOCore *core,
@@ -1478,9 +1585,11 @@ static PIORunResult core_run(RP2350PIOState *s, RP2350PIOCore *core,
         core->cycle = c + 1;
 
         if (!spec) {
+            int64_t when = pio_drive_time(s, core->cycle);
+
             for (b = 0; b < RP2350_PIO_BLOCKS; b++) {
                 if (ch.pins[b]) {
-                    drive_pins(s, b);
+                    drive_pins(s, b, when);
                 }
             }
             /*
@@ -1489,7 +1598,7 @@ static PIORunResult core_run(RP2350PIOState *s, RP2350PIOCore *core,
              * that access happens here, between this cycle and the next.
              */
             if (ch.outputs) {
-                drive_lines(s);
+                drive_lines(s, when);
             }
             continue;
         }
@@ -1514,78 +1623,50 @@ static PIORunResult core_run(RP2350PIOState *s, RP2350PIOCore *core,
     return RUN_DONE;
 }
 
-/* Time */
-
-static uint64_t pio_cycle_at(RP2350PIOState *s, int64_t ns)
-{
-    if (ns <= s->base_ns || !clock_is_enabled(s->clk)) {
-        return s->base_cycle;
-    }
-    return s->base_cycle + clock_ns_to_ticks(s->clk, ns - s->base_ns);
-}
-
-/* The first virtual time at which clk_sys has reached `cycle`. */
-static int64_t pio_ns_at(RP2350PIOState *s, uint64_t cycle)
-{
-    uint64_t d, ns;
-
-    if (cycle <= s->base_cycle) {
-        return s->base_ns;
-    }
-    d = cycle - s->base_cycle;
-    ns = clock_ticks_to_ns(s->clk, d);
-    while (clock_ns_to_ticks(s->clk, ns) < d) {
-        ns++;
-    }
-    return s->base_ns + MIN(ns, (uint64_t)INT64_MAX / 2);
-}
-
-static uint64_t pio_now(RP2350PIOState *s)
-{
-    return pio_cycle_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-}
-
 /*
- * Bring the blocks up to the current virtual time: commit the run ahead
- * if it has come due, or else discard it and run the blocks themselves.
+ * Apply the queued pin changes from outside up to cycle `target`, each in
+ * the cycle it came in, to the pins it changed: the blocks' own pins,
+ * which come back through the pads as the blocks run up to that cycle,
+ * keep the levels the blocks gave them. Returns false if the blocks ran
+ * out of host time on the way; every change queued then applies at once.
  */
-/*
- * Apply the queued pin changes from outside, each in the cycle it came
- * in, to the pins it changed: the blocks' own pins, which come back
- * through the pads as the blocks run up to that cycle, keep the levels
- * the blocks gave them. Returns false if the blocks ran out of host time
- * on the way; the rest then apply at once.
- */
-static bool pio_apply_inputs(RP2350PIOState *s)
+static bool pio_apply_inputs(RP2350PIOState *s, uint64_t target)
 {
     bool ok = true;
     uint32_t k;
 
-    for (k = 0; k < s->inq_n; k++) {
+    for (k = 0; k < s->inq_n && (!ok || s->inq_cycle[k] <= target); k++) {
         if (ok && s->inq_cycle[k] > s->core.cycle) {
             ok = core_run(s, &s->core, s->inq_cycle[k], false) != RUN_SLOW;
         }
-        core_input(&s->core,
-                   (s->core.in_val[s->core.in_n - 1] & ~s->inq_mask[k]) |
-                   (s->inq_vec[k] & s->inq_mask[k]), s->core.cycle);
+        core_input(&s->core, s->inq_mask[k], s->inq_vec[k],
+                   MIN(s->inq_cycle[k], s->core.cycle));
     }
-    s->inq_n = 0;
+    s->inq_n -= k;
+    memmove(&s->inq_vec[0], &s->inq_vec[k], s->inq_n * sizeof(s->inq_vec[0]));
+    memmove(&s->inq_mask[0], &s->inq_mask[k],
+            s->inq_n * sizeof(s->inq_mask[0]));
+    memmove(&s->inq_cycle[0], &s->inq_cycle[k],
+            s->inq_n * sizeof(s->inq_cycle[0]));
     return ok;
 }
 
-static void pio_sync(RP2350PIOState *s)
+/*
+ * Bring the blocks up to cycle `target`: commit the run ahead if it has
+ * come due, or else discard it and run the blocks themselves.
+ */
+static void pio_sync(RP2350PIOState *s, uint64_t target)
 {
-    uint64_t now = pio_now(s);
     bool slow;
 
     s->busy = true;
-    if (s->spec_valid && s->spec.cycle <= now) {
+    if (s->spec_valid && s->spec.cycle <= target) {
         s->core = s->spec;
-        drive_all(s);
+        drive_all(s, pio_drive_time(s, s->core.cycle));
     }
     s->spec_valid = false;
-    slow = !pio_apply_inputs(s);
-    if (slow || core_run(s, &s->core, now, false) == RUN_SLOW) {
+    slow = !pio_apply_inputs(s, target);
+    if (slow || core_run(s, &s->core, target, false) == RUN_SLOW) {
         /*
          * The blocks cannot keep up with virtual time. Rather than fall
          * ever further behind, they let the cycles they could not run go:
@@ -1594,13 +1675,27 @@ static void pio_sync(RP2350PIOState *s)
         s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         s->base_cycle = s->core.cycle;
     }
-    drive_all(s);
+    drive_all(s, pio_drive_time(s, s->core.cycle));
     s->busy = false;
+}
+
+/*
+ * The cycle a timer due at `due` takes the blocks to: its deadline's,
+ * with every change on the way reaching the pads at its own time. A timer
+ * fired more than PIO_MAX_LATE_NS late, as when the host falls behind
+ * virtual time without icount, takes them to the present.
+ */
+static uint64_t pio_timer_target(RP2350PIOState *s, int64_t due)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    return pio_cycle_at(s, now - due > PIO_MAX_LATE_NS ? now : due);
 }
 
 /* Run ahead to find when the blocks next change an output. */
 static void pio_schedule(RP2350PIOState *s)
 {
+    uint64_t end;
     bool event;
 
     if (!clock_is_enabled(s->clk)) {
@@ -1609,8 +1704,12 @@ static void pio_schedule(RP2350PIOState *s)
         return;
     }
     s->spec = s->core;
-    event = core_run(s, &s->spec, s->core.cycle + s->horizon, true) ==
-            RUN_EVENT;
+    end = s->core.cycle + s->horizon;
+    if (s->inq_n) {
+        /* The queued pin changes are still to come in. */
+        end = MIN(end, MAX(s->inq_cycle[0], s->core.cycle + 1));
+    }
+    event = core_run(s, &s->spec, end, true) == RUN_EVENT;
     if (!event && core_next(&s->spec) == NO_CYCLE) {
         /* Nothing will happen until something disturbs the blocks. */
         s->spec_valid = false;
@@ -1618,23 +1717,33 @@ static void pio_schedule(RP2350PIOState *s)
         return;
     }
     s->spec_valid = true;
-    timer_mod(s->timer, pio_ns_at(s, s->spec.cycle));
+    s->due_ns = pio_ns_at(s, s->spec.cycle);
+    timer_mod(s->timer, s->due_ns);
 }
 
+/*
+ * [spec:nuos:req:emu.pio]
+ * The blocks change an output: run them to that cycle only, so that the
+ * timers of other devices due before the next change, running in deadline
+ * order, find them there.
+ */
 static void pio_timer_cb(void *opaque)
 {
     RP2350PIOState *s = opaque;
 
     s->horizon = MIN(s->horizon * 2, HORIZON_MAX);
-    pio_sync(s);
+    pio_sync(s, pio_timer_target(s, s->due_ns));
     pio_schedule(s);
 }
 
-/* Something outside is about to change the blocks: catch them up. */
+/*
+ * Something outside is about to change the blocks: catch them up to its
+ * time, the present or the stamped change's (hw/core/line-time.h).
+ */
 static void pio_disturb(RP2350PIOState *s)
 {
     s->horizon = HORIZON_MIN;
-    pio_sync(s);
+    pio_sync(s, pio_now(s));
     core_settle_loops(&s->core);
 }
 
@@ -1642,7 +1751,7 @@ static void pio_disturb(RP2350PIOState *s)
 static void pio_settle(RP2350PIOState *s)
 {
     s->busy = true;
-    drive_all(s);
+    drive_all(s, line_time());
     s->busy = false;
     pio_schedule(s);
 }
@@ -1657,11 +1766,20 @@ static void pio_run_cycle(RP2350PIOState *s)
     s->busy = busy;
 }
 
-/* [spec:nuos:req:emu.pio] */
+/*
+ * [spec:nuos:req:emu.pio]
+ * A pin change reaches the blocks in the cycle of its time (see
+ * hw/core/line-time.h), however late the device that made it drove it. A
+ * register access can have run the blocks on past that time, by up to an
+ * instruction under icount, before the driver's timer fired: the change
+ * is still taken in its cycle as long as no state machine can have seen
+ * it through the synchronisers (core_input_floor()).
+ */
 static void pio_in(void *opaque, int n, int level)
 {
     RP2350PIOState *s = opaque;
     uint64_t vec = deposit64(s->in_level, n, 1, level != 0);
+    uint64_t cycle;
 
     if (vec == s->in_level) {
         return;
@@ -1669,14 +1787,18 @@ static void pio_in(void *opaque, int n, int level)
     s->in_level = vec;
     if (s->busy) {
         /* The blocks' own pin change, coming back through the pads. */
-        core_input(&s->core, vec, s->core.cycle);
+        core_input(&s->core, BIT_ULL(n), vec, s->core.cycle);
         return;
     }
-    if (!s->inq_n || (s->inq_cycle[s->inq_n - 1] < pio_now(s) &&
+    cycle = MAX(pio_now(s), core_input_floor(&s->core, BIT_ULL(n)));
+    if (s->inq_n) {
+        cycle = MAX(cycle, s->inq_cycle[s->inq_n - 1]);
+    }
+    if (!s->inq_n || (s->inq_cycle[s->inq_n - 1] < cycle &&
                       s->inq_n < RP2350_PIO_IN_QUEUE)) {
         s->inq_vec[s->inq_n] = 0;
         s->inq_mask[s->inq_n] = 0;
-        s->inq_cycle[s->inq_n] = pio_now(s);
+        s->inq_cycle[s->inq_n] = cycle;
         s->inq_n++;
     }
     /*
@@ -1689,19 +1811,28 @@ static void pio_in(void *opaque, int n, int level)
     /* The run ahead assumed the pins would not change. */
     s->spec_valid = false;
     s->horizon = HORIZON_MIN;
-    timer_mod(s->in_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    if (!timer_pending(s->in_timer)) {
+        s->in_due_ns = line_time();
+        timer_mod(s->in_timer, s->in_due_ns);
+    }
 }
 
 /*
- * Catch up with the queued pin changes once the access that made them
- * has completed, at the same virtual time: under icount, before the vCPU
- * executes on.
+ * Catch up with the queued pin changes once the propagation that brought
+ * them has completed, at the time of the first: under icount, before the
+ * vCPU executes on, and before any timer due later.
  */
 static void pio_in_timer_cb(void *opaque)
 {
     RP2350PIOState *s = opaque;
+    uint64_t target = pio_timer_target(s, s->in_due_ns);
 
-    pio_disturb(s);
+    if (s->inq_n) {
+        target = MAX(target, s->inq_cycle[s->inq_n - 1]);
+    }
+    s->horizon = HORIZON_MIN;
+    pio_sync(s, target);
+    core_settle_loops(&s->core);
     pio_schedule(s);
 }
 
@@ -2101,7 +2232,7 @@ static bool pio_access_begin(RP2350PIOState *s)
 static void pio_access_end(RP2350PIOState *s, bool nested)
 {
     if (nested) {
-        drive_all(s);
+        drive_all(s, line_time());
     } else {
         pio_settle(s);
     }
@@ -2401,8 +2532,10 @@ static int rp2350_pio_post_load(void *opaque, int version_id)
             s->inq_mask[k] = UINT64_MAX;
         }
     }
+    s->due_ns = timer_expire_time_ns(s->timer);
     if (s->inq_n) {
-        timer_mod(s->in_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        s->in_due_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        timer_mod(s->in_timer, s->in_due_ns);
     }
     return 0;
 }
