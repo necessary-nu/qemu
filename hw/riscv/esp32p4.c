@@ -324,6 +324,14 @@
  *     its interrupt PWMn_INTR (sources 38 and 39), its six outputs, sync,
  *     fault and capture inputs matrix signals 89 to 106. Their ETM events
  *     and tasks are the ETM's.
+ *   - The board's cameras: an esp32p4-image-source on the camera inputs'
+ *     pads, dvp-camera for LCD_CAM's camera port and the ISP's DVP input,
+ *     csi-camera for MIPI CSI (include/hw/misc/esp32p4_image_source.h).
+ *     The machine wires each to its port and its pads, and the inputs
+ *     capture what it streams:
+ *
+ *       -object esp32p4-image-source,id=cam0,format=raw10,width=1280,
+ *               height=720,image=photo.png -M esp32p4,csi-camera=cam0
  *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
@@ -1693,6 +1701,32 @@ static void esp32p4_init_gpio(ESP32P4MachineState *s)
                 ESP32P4_SIG_CORE_GPIO_IN_PAD_IN0 + n,
                 qdev_get_gpio_in_named(cpu, ESP32P4_CPU_GPIO_IN, i));
         }
+    }
+}
+
+/*
+ * The board's camera sensors: each wired to its port, VSYNC, HSYNC and DE
+ * driven onto the pads the source names, and PWDN and RESETB taken from
+ * theirs. A camera input attaches to the source its port's is.
+ */
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
+/* [spec:nuos:req:emu.esp32p4.mipi] */
+static void esp32p4_init_cameras(ESP32P4MachineState *s)
+{
+    if (s->dvp_camera && s->dvp_camera == s->csi_camera) {
+        error_report("esp32p4: one camera sensor cannot be both dvp-camera "
+                     "and csi-camera");
+        exit(1);
+    }
+    if (s->dvp_camera) {
+        esp32p4_image_source_bind(s->dvp_camera, ESP32P4_IMAGE_PORT_DVP,
+                                  &error_fatal);
+        esp32p4_image_source_connect_pads(s->dvp_camera, DEVICE(&s->gpio));
+    }
+    if (s->csi_camera) {
+        esp32p4_image_source_bind(s->csi_camera, ESP32P4_IMAGE_PORT_CSI,
+                                  &error_fatal);
+        esp32p4_image_source_connect_pads(s->csi_camera, DEVICE(&s->gpio));
     }
 }
 
@@ -4399,6 +4433,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_efuse(s);
     esp32p4_init_timers(s);
     esp32p4_init_gpio(s);
+    esp32p4_init_cameras(s);
     esp32p4_init_i2c(s);
     esp32p4_init_pms(s);
     esp32p4_init_dma(s);
@@ -4543,6 +4578,20 @@ static void esp32p4_machine_instance_init(Object *obj)
                                  object_property_allow_set_link, 0);
         object_property_set_description(obj, name, desc);
     }
+    /* Strong: the machine's camera inputs use the sensor to the end. */
+    object_property_add_link(obj, "dvp-camera", TYPE_ESP32P4_IMAGE_SOURCE,
+                             (Object **)&s->dvp_camera,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
+    object_property_set_description(obj, "dvp-camera",
+        "The camera sensor (-object esp32p4-image-source) on LCD_CAM's "
+        "camera port and the ISP's DVP input");
+    object_property_add_link(obj, "csi-camera", TYPE_ESP32P4_IMAGE_SOURCE,
+                             (Object **)&s->csi_camera,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
+    object_property_set_description(obj, "csi-camera",
+        "The camera sensor (-object esp32p4-image-source) on MIPI CSI");
 }
 
 static void esp32p4_machine_instance_finalize(Object *obj)

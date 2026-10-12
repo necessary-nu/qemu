@@ -371,6 +371,175 @@
             '*id-list': 'str' } }
 
 ##
+# @Esp32p4ImageSourceProperties:
+#     Properties for esp32p4-image-source objects: a camera sensor
+#     on an ESP32-P4 board, streaming frames in virtual time to the
+#     camera input (DVP or MIPI CSI) the machine's dvp-camera or
+#     csi-camera wires it to.
+#
+# @file: a file of raw frames in the format's line layout, played in a
+#     loop
+#
+# @image: a still picture, a binary PPM or PGM, or a PNG, scaled to
+#     the frame and converted to the format
+#
+# @pattern: with no file or image, the moving test pattern, "bars"
+#     (default) or "checker"
+#
+# @cell: the test patterns' square, in pixels, even (default 16)
+#
+# @format: raw8, raw10, raw12, rgb565 (default), rgb565be, rgb888,
+#     bgr888, yuv422, yuyv, vyuy or yvyu
+#
+# @bayer: the RAW formats' colour filter array, "rggb" (default),
+#     "grbg", "gbrg" or "bggr"
+#
+# @yuv-matrix: the YUV formats' "bt601" (default) or "bt709"
+#
+# @yuv-range: the YUV formats' "full" (default) or "limited" range
+#
+# @width: pixels a line (default 640, or the image's)
+#
+# @height: lines of pixels a frame (default 480, or the image's)
+#
+# @fps: frames a second (default 30)
+#
+# @pixel-clock: the pixel clock in Hz, in place of @fps
+#
+# @hblank: pixel periods of horizontal blanking a line (default
+#     width / 4, at least 16)
+#
+# @vblank: lines of vertical blanking a frame (default height / 16,
+#     at least 3)
+#
+# @hts: pixel periods a line, width plus @hblank, in its place
+#
+# @vts: lines a frame, height plus @vblank, in its place
+#
+# @hsync: HSYNC's length in pixel periods (default hblank / 8, at
+#     least 1)
+#
+# @hbp: pixel periods from HSYNC's end to the line's first pixel
+#     (default hblank / 4)
+#
+# @vsync: VSYNC's length in lines (default vblank / 10, at least 1)
+#
+# @vbp: lines from VSYNC's end to the first line of pixels (default
+#     vblank / 2)
+#
+# @dvp-width: DVP data lines carrying the formats other than RAW, 8
+#     (default) or 16
+#
+# @pclk-pad: the GPIO pad the board wires DVP PCLK to
+#
+# @vsync-pad: the GPIO pad the board wires DVP VSYNC to
+#
+# @hsync-pad: the GPIO pad the board wires DVP HSYNC to
+#
+# @de-pad: the GPIO pad the board wires DVP DE (HREF) to
+#
+# @data-pads: the GPIO pads the board wires DVP D0 upwards to, a list
+#     separated by colons or commas, -1 for an unwired line
+#
+# @vsync-active-low: DVP VSYNC is active low (default false)
+#
+# @hsync-active-low: DVP HSYNC is active low (default false)
+#
+# @de-active-low: DVP DE is active low (default false)
+#
+# @pwdn-pad: the GPIO pad driving the sensor's PWDN
+#
+# @pwdn-active-low: PWDN powers the sensor down while low (default
+#     false: while high)
+#
+# @reset-pad: the GPIO pad driving the sensor's RESETB
+#
+# @reset-active-high: RESETB holds the sensor in reset while high
+#     (default false: while low)
+#
+# @lanes: MIPI CSI data lanes, 1 to 4 (default 2)
+#
+# @lane-rate: MIPI CSI bits a second on each lane (default: the lowest
+#     multiple of 10 Mbit/s from 80 Mbit/s that leaves a fifth of each
+#     line idle)
+#
+# @vc: MIPI CSI virtual channel, 0 to 3 (default 0)
+#
+# @line-sync: MIPI CSI line start and end packets around each line
+#     (default false)
+#
+# @clock-continuous: the MIPI CSI clock lane stays in high speed
+#     between bursts (default true)
+#
+# @streaming: the sensor's software stream on (default true)
+#
+# Since: 11.2
+##
+{ 'struct': 'Esp32p4ImageSourceProperties',
+  'data': { '*file': 'str',
+            '*image': 'str',
+            '*pattern': 'str',
+            '*cell': 'uint32',
+            '*format': 'str',
+            '*bayer': 'str',
+            '*yuv-matrix': 'str',
+            '*yuv-range': 'str',
+            '*width': 'uint32',
+            '*height': 'uint32',
+            '*fps': 'uint32',
+            '*pixel-clock': 'uint64',
+            '*hblank': 'uint32',
+            '*vblank': 'uint32',
+            '*hts': 'uint32',
+            '*vts': 'uint32',
+            '*hsync': 'uint32',
+            '*hbp': 'uint32',
+            '*vsync': 'uint32',
+            '*vbp': 'uint32',
+            '*dvp-width': 'uint32',
+            '*pclk-pad': 'int',
+            '*vsync-pad': 'int',
+            '*hsync-pad': 'int',
+            '*de-pad': 'int',
+            '*data-pads': 'str',
+            '*vsync-active-low': 'bool',
+            '*hsync-active-low': 'bool',
+            '*de-active-low': 'bool',
+            '*pwdn-pad': 'int',
+            '*pwdn-active-low': 'bool',
+            '*reset-pad': 'int',
+            '*reset-active-high': 'bool',
+            '*lanes': 'uint32',
+            '*lane-rate': 'uint64',
+            '*vc': 'uint32',
+            '*line-sync': 'bool',
+            '*clock-continuous': 'bool',
+            '*streaming': 'bool' } }
+
+##
+# @Esp32p4ImageProbeProperties:
+#     Properties for esp32p4-image-probe objects: a camera input on an
+#     esp32p4-image-source's port that writes what it receives to a
+#     file, a line of text each.
+#
+# @source: the esp32p4-image-source's ID
+#
+# @port: the port the sensor is wired to, "dvp" or "csi"
+#
+# @log: the file the records go to
+#
+# @data: record the lines' samples and the packets' payloads (default
+#     true)
+#
+# Since: 11.2
+##
+{ 'struct': 'Esp32p4ImageProbeProperties',
+  'data': { 'source': 'str',
+            'port': 'str',
+            'log': 'str',
+            '*data': 'bool' } }
+
+##
 # @NetfilterInsert:
 #     Indicates where to insert a netfilter relative to a given other
 #     filter.
@@ -1261,6 +1430,8 @@
     { 'name': 'cryptodev-vhost-user',
       'if': 'CONFIG_VHOST_CRYPTO' },
     'dbus-vmstate',
+    'esp32p4-image-probe',
+    'esp32p4-image-source',
     'filter-buffer',
     'filter-dump',
     'filter-mirror',
@@ -1340,6 +1511,8 @@
       'cryptodev-vhost-user':       { 'type': 'CryptodevVhostUserProperties',
                                       'if': 'CONFIG_VHOST_CRYPTO' },
       'dbus-vmstate':               'DBusVMStateProperties',
+      'esp32p4-image-probe':        'Esp32p4ImageProbeProperties',
+      'esp32p4-image-source':       'Esp32p4ImageSourceProperties',
       'filter-buffer':              'FilterBufferProperties',
       'filter-dump':                'FilterDumpProperties',
       'filter-mirror':              'FilterMirrorProperties',
