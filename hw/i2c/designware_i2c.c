@@ -33,6 +33,13 @@
  * FIFO, and while a target waits for software, and waits for SCL and
  * SDA to be high before a START.
  *
+ * Time. Steps follow on from each other at their own times, however late
+ * the timer marking their ends runs: a step ends at its deadline, which
+ * what it changes carries (hw/core/line-time.h), and the next begins
+ * there. A step waiting on SCL or SDA begins at the time of the edge that
+ * releases it, and one the controller begins at its own time takes the
+ * wires' levels as they were then, whatever changes came in since.
+ *
  * Target transfers. The target logic answers on the bus through
  * TYPE_DESIGNWARE_I2C_TARGET slaves. QEMU's slave interface completes
  * every byte at once, so a target can only stretch SCL toward a
@@ -418,8 +425,39 @@ static int64_t dw_cycles_ns(DesignWareI2CState *s, uint64_t cycles)
 }
 
 /*
- * Arm the timer `cycles` ic_clk cycles from now. A connected ic_clk that
- * is stopped holds them until it runs again.
+ * The first virtual time at which ic_clk has made `ticks` ticks, its edges
+ * at whole multiples of its period from time 0.
+ */
+static int64_t dw_tick_ns(DesignWareI2CState *s, uint64_t ticks)
+{
+    uint64_t ns = clock_ticks_to_ns(s->clk, ticks);
+
+    while (clock_ns_to_ticks(s->clk, ns) < ticks) {
+        ns++;
+    }
+    return MIN(ns, (uint64_t)INT64_MAX / 2);
+}
+
+/*
+ * The end of `cycles` ic_clk cycles from virtual time `from`, counted from
+ * the start of the clock cycle `from` falls in, as a register access acts
+ * in the cycle it falls in: a step that follows on from another at its
+ * end, an edge, ends on the edge it should however many steps follow on.
+ */
+static int64_t dw_after_cycles(DesignWareI2CState *s, int64_t from,
+                               uint64_t cycles)
+{
+    if (!clock_get(s->clk)) {
+        return from + dw_cycles_ns(s, cycles);
+    }
+    return dw_tick_ns(s, clock_ns_to_ticks(s->clk, from) + cycles);
+}
+
+/*
+ * Arm the timer `cycles` ic_clk cycles from the time of the change at
+ * hand (line_time()): the present, the end of a step, or the edge that
+ * lets a step begin. A connected ic_clk that is stopped holds them until
+ * it runs again.
  */
 static void dw_timer_in(DesignWareI2CState *s, uint64_t cycles)
 {
@@ -430,8 +468,8 @@ static void dw_timer_in(DesignWareI2CState *s, uint64_t cycles)
         return;
     }
     s->timer_held = false;
-    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                        dw_cycles_ns(s, cycles));
+    s->timer_due = dw_after_cycles(s, line_time(), cycles);
+    timer_mod(s->timer, s->timer_due);
 }
 
 /*
@@ -797,6 +835,7 @@ static void dw_mst_begin_step(DesignWareI2CState *s)
     bool start = step == DW_I2C_STEP_SBYTE || step == DW_I2C_STEP_ADDR ||
                  step == DW_I2C_STEP_ADDR_R;
     bool read = s->mst_cmd & DATA_CMD_CMD;
+    bool scl;
 
     if (step == DW_I2C_STEP_DATA && read && rx_count(s) == FIFO_DEPTH &&
         (s->con & CON_RX_FIFO_FULL_HLD_CTRL)) {
@@ -806,8 +845,9 @@ static void dw_mst_begin_step(DesignWareI2CState *s)
     }
     s->mst_rx_stall = false;
     dw_i2c_update(s);
+    scl = line_history_at(&s->scl_in, line_time());
     if (!s->mst_owned) {
-        if (!s->scl_in || !s->sda_in) {
+        if (!scl || !line_history_at(&s->sda_in, line_time())) {
             return;
         }
         if (i2c_bus_busy(s->bus)) {
@@ -815,7 +855,7 @@ static void dw_mst_begin_step(DesignWareI2CState *s)
             dw_timer_in(s, dw_bit_cycles(s));
             return;
         }
-    } else if (!s->scl_in) {
+    } else if (!scl) {
         return;
     }
     if (step == DW_I2C_STEP_DATA && !dw_mst_targets_ready(s, read)) {
@@ -1021,7 +1061,7 @@ static void dw_i2c_kick(DesignWareI2CState *s)
     s->mst_kicking = false;
 }
 
-static void dw_i2c_timer(void *opaque)
+static void dw_i2c_timer_at(void *opaque)
 {
     DesignWareI2CState *s = opaque;
 
@@ -1034,20 +1074,31 @@ static void dw_i2c_timer(void *opaque)
     dw_i2c_kick(s);
 }
 
+/* A step or a poll ends at its deadline, however late the timer runs. */
+static void dw_i2c_timer(void *opaque)
+{
+    DesignWareI2CState *s = opaque;
+
+    line_run_at(s->timer_due, dw_i2c_timer_at, s);
+}
+
+/* A wire changes at its time (line_time()), from which a step can begin. */
 static void dw_i2c_scl_in(void *opaque, int n, int level)
 {
     DesignWareI2CState *s = opaque;
 
-    s->scl_in = level;
-    dw_i2c_kick(s);
+    if (line_history_set(&s->scl_in, level != 0, line_time())) {
+        dw_i2c_kick(s);
+    }
 }
 
 static void dw_i2c_sda_in(void *opaque, int n, int level)
 {
     DesignWareI2CState *s = opaque;
 
-    s->sda_in = level;
-    dw_i2c_kick(s);
+    if (line_history_set(&s->sda_in, level != 0, line_time())) {
+        dw_i2c_kick(s);
+    }
 }
 
 /* Registers. */
@@ -1464,6 +1515,9 @@ static void designware_i2c_enter_reset(Object *obj, ResetType type)
     timer_del(s->timer);
     s->timer_held = false;
     s->held_cycles = 0;
+    /* The wires' levels are outside the block; their past changes go. */
+    line_history_reset(&s->scl_in, s->scl_in.level);
+    line_history_reset(&s->sda_in, s->sda_in.level);
     s->con = dc->con_reset;
     s->tar = dc->tar_reset;
     s->sar = dc->sar_reset;
@@ -1542,12 +1596,17 @@ static int designware_i2c_post_load(void *opaque, int version_id)
         return -EINVAL;
     }
     s->slv_bus = NULL;
+    s->timer_due = timer_expire_time_ns(s->timer);
+    if (version_id < 3) {
+        line_history_reset(&s->scl_in, s->scl_in.level);
+        line_history_reset(&s->sda_in, s->sda_in.level);
+    }
     return 0;
 }
 
 static const VMStateDescription vmstate_designware_i2c = {
     .name = TYPE_DESIGNWARE_I2C,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = designware_i2c_post_load,
     .fields = (const VMStateField[]) {
@@ -1582,8 +1641,12 @@ static const VMStateDescription vmstate_designware_i2c = {
                              DESIGNWARE_I2C_RX_FIFO_SIZE),
         VMSTATE_UINT8(rx_head, DesignWareI2CState),
         VMSTATE_UINT8(rx_num, DesignWareI2CState),
-        VMSTATE_BOOL(scl_in, DesignWareI2CState),
-        VMSTATE_BOOL(sda_in, DesignWareI2CState),
+        VMSTATE_BOOL(scl_in.level, DesignWareI2CState),
+        VMSTATE_BOOL(sda_in.level, DesignWareI2CState),
+        VMSTATE_STRUCT(scl_in, DesignWareI2CState, 3, vmstate_line_history,
+                       LineHistory),
+        VMSTATE_STRUCT(sda_in, DesignWareI2CState, 3, vmstate_line_history,
+                       LineHistory),
         VMSTATE_BOOL(scl_hold, DesignWareI2CState),
         VMSTATE_BOOL(ic_en, DesignWareI2CState),
         VMSTATE_TIMER_PTR(timer, DesignWareI2CState),
@@ -1625,8 +1688,8 @@ static void designware_i2c_instance_init(Object *obj)
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dw_i2c_timer, s);
     /* Unconnected wires are pulled up. */
-    s->scl_in = true;
-    s->sda_in = true;
+    line_history_reset(&s->scl_in, true);
+    line_history_reset(&s->sda_in, true);
 
     object_initialize_child(obj, "target", &s->target,
                             TYPE_DESIGNWARE_I2C_TARGET);
