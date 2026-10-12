@@ -23,7 +23,9 @@
  * receiver, flow control, autobaud, AT_CMD and wakeup detection) works
  * from the _SYNC registers as REG_UPDATE last carried them into the
  * UART_SCLK domain (TRM 45.5.1), which takes three core clock cycles and
- * waits while that clock is stopped or the core held in reset.
+ * waits while that clock is stopped or the core held in reset; an access
+ * or a line change after those cycles finds them carried over at their
+ * end, however late the timer that carries them runs.
  *
  * Behaviour the TRM leaves open follows the ESP32 TRM, whose UART this
  * one descends from: the FSM_STATUS state numbers (ESP32 TRM register
@@ -280,9 +282,13 @@ static void uart_tout_fire(ESP32P4UartState *s);
 static void uart_idle_fire(ESP32P4UartState *s);
 static void uart_at_fire(ESP32P4UartState *s);
 
+/*
+ * The present: the moment of the line change being propagated or of the
+ * event being caught up with, if one is (esp32_line_time()).
+ */
 static int64_t now_ns(void)
 {
-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return esp32_line_time();
 }
 
 static uint32_t reg_reset(ESP32P4UartState *s, unsigned r)
@@ -1712,6 +1718,26 @@ static void uart_update_timer_cb(void *opaque)
 }
 
 /*
+ * Carry the _SYNC registers over at REG_UPDATE's time if it has come: the
+ * timer that does it may run late on the host's clock, after an access, a
+ * frame received or a receiver's sample that must find them carried over.
+ */
+static void uart_update_catch_up(ESP32P4UartState *s)
+{
+    int64_t due;
+
+    if (!timer_pending(&s->update_timer)) {
+        return;
+    }
+    due = timer_expire_time_ns(&s->update_timer);
+    if (due > now_ns()) {
+        return;
+    }
+    timer_del(&s->update_timer);
+    esp32_line_run_at(due, uart_update_timer_cb, s);
+}
+
+/*
  * The core's _SYNC copies and state as a core reset leaves them; the TX
  * line is driven idle if `drive`.
  */
@@ -1879,6 +1905,7 @@ static uint64_t uart_read(void *opaque, hwaddr addr, unsigned size)
     ESP32P4UartState *s = ESP32P4_UART(opaque);
     uint32_t v = 0;
 
+    uart_update_catch_up(s);
     uart_tx_advance(s);
     uart_filt_timer_cb(s);
     esp32_uart_rx_flush(&s->rx);
@@ -1975,6 +2002,7 @@ static void uart_write(void *opaque, hwaddr addr, uint64_t value,
     int64_t t = now_ns();
     unsigned r = R(addr);
 
+    uart_update_catch_up(s);
     uart_tx_advance(s);
     uart_filt_timer_cb(s);
     esp32_uart_rx_flush(&s->rx);
@@ -2114,6 +2142,7 @@ static void uart_rxd_in(void *opaque, int n, int level)
 {
     ESP32P4UartState *s = ESP32P4_UART(opaque);
 
+    uart_update_catch_up(s);
     s->rxd_pin = level > 0;
     uart_rx_input(s, esp32_line_time());
 }
@@ -2122,6 +2151,7 @@ static void uart_cts_in(void *opaque, int n, int level)
 {
     ESP32P4UartState *s = ESP32P4_UART(opaque);
 
+    uart_update_catch_up(s);
     s->cts_pin = level > 0;
     uart_update_inputs(s, esp32_line_time(), true);
     uart_update_irq(s);
@@ -2131,6 +2161,7 @@ static void uart_dsr_in(void *opaque, int n, int level)
 {
     ESP32P4UartState *s = ESP32P4_UART(opaque);
 
+    uart_update_catch_up(s);
     s->dsr_pin = level > 0;
     uart_update_inputs(s, esp32_line_time(), true);
     uart_update_irq(s);
@@ -2161,6 +2192,7 @@ static void uart_sclk_update(void *opaque, ClockEvent event)
     int64_t t = now_ns();
 
     if (event == ClockPreUpdate) {
+        uart_update_catch_up(s);
         uart_tx_advance(s);
         uart_tx_freeze(s, t);
         return;
@@ -2185,6 +2217,7 @@ static void uart_line_sync(Notifier *n, void *data)
 {
     ESP32P4UartState *s = container_of(n, ESP32P4UartState, line_source);
 
+    uart_update_catch_up(s);
     uart_tx_advance(s);
     uart_filt_timer_cb(s);
     uart_irda_release(s);
