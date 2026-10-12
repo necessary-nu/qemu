@@ -207,6 +207,12 @@
  *     and its reset, a baseline encoder and decoder whose pipeline runs on
  *     the same clock, its interrupt JPEG_INTR (source 95). Its data paths
  *     are the 2D-DMA's (include/hw/misc/esp32p4_jpeg.h).
+ *   - The H264 encoder (TRM chapter 41) at 0x50084000 and its dedicated
+ *     DMA, H264_DMA, at 0x500A7000, behind H264_SYS_CLK and the H264
+ *     reset, coding on H264_CLK, a baseline-profile encoder whose every
+ *     input and output moves through H264_DMA's channels and memory, as
+ *     the APMs allow; its interrupts sources 115 to 126, the DMA
+ *     channels' and the encoder's (hw/misc/esp32p4_h264.c).
  *   - The debug blocks (TRM chapters 3, 22 and 23): the debug assistant at
  *     0x3FF06000, watching the HP cores' SP, their accesses to four
  *     regions and their PCs; each HP core's RISC-V trace encoder, at
