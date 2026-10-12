@@ -10,6 +10,7 @@
 #define TARGET_RISCV_ESP32P4_CPU_H
 
 #include "target/riscv/cpu.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "target/riscv/esp32p4_pie.h"
 #include "qom/object.h"
 
@@ -443,9 +444,11 @@ struct ESP32P4CPU {
 
     /*
      * Both cores' counters (tcg/esp32p4_counters.c). The core's clock
-     * (ESP32P4_CPU_CLK), and the cycles of it counted up to the virtual
-     * time cycles_ns plus cycles_frac 2^-32 ns, the end of the last whole
-     * cycle counted while the clock runs. insns counts the instructions
+     * (ESP32P4_CPU_CLK) at its exact period as it last changed
+     * (clk_period), and the cycles of it counted: cycles_synced of them
+     * since the clock's current run began at the virtual time cycles_ns
+     * plus cycles_frac 2^-32 ns, its last change, start or restart, or
+     * the present while it is stopped. insns counts the instructions
      * the core has started, less those that did not retire; the code
      * QEMU translates for the core adds to it. mcycle and minstret are
      * ctr_base[] plus the cycles or instructions since ctr_ref[] while
@@ -454,7 +457,9 @@ struct ESP32P4CPU {
      * the LP core) hold what is written.
      */
     Clock *clk;
+    ESP32P4ClkPeriod clk_period;
     uint64_t cycles;
+    uint64_t cycles_synced;
     int64_t cycles_ns;
     uint32_t cycles_frac;
     uint64_t insns;
@@ -605,7 +610,8 @@ void esp32p4_trace_trap(ESP32P4CPU *cpu, uint32_t epc, uint32_t cause,
  * esp32p4_counters.c: both cores' counters. The counters' CSRs, which the
  * chip's CSR table hands over; the core's state changing, with the BQL
  * held: before its reset or clock enable changes or its clock changes
- * rate (esp32p4_counters_update()), and as an HP core enters WFI and
+ * rate (esp32p4_counters_update()), once its clock has changed
+ * (esp32p4_counters_clock_changed()), and as an HP core enters WFI and
  * as it leaves; and its reset.
  */
 RISCVException esp32p4_counters_read(CPURISCVState *env, int csrno,
@@ -613,6 +619,7 @@ RISCVException esp32p4_counters_read(CPURISCVState *env, int csrno,
 RISCVException esp32p4_counters_write(CPURISCVState *env, int csrno,
                                       target_ulong val);
 void esp32p4_counters_update(ESP32P4CPU *cpu);
+void esp32p4_counters_clock_changed(ESP32P4CPU *cpu);
 void esp32p4_counters_wfi(ESP32P4CPU *cpu, bool wfi);
 void esp32p4_counters_reset(ESP32P4CPU *cpu);
 

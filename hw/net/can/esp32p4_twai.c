@@ -95,6 +95,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
 #include "qemu/host-utils.h"
+#include "qemu/int128.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "hw/core/irq.h"
@@ -567,7 +568,11 @@ static int twai_tx_detect(const TwaiBits *b, int from)
     return -1;
 }
 
-/* A receiver's bit timing, in picoseconds and time quanta. */
+/*
+ * A receiver's bit timing: its time quantum, in ticks of a time base it
+ * shares with the transmitter's bit time (twai_timing()), and its
+ * segments in quanta.
+ */
 typedef struct TwaiTiming {
     int64_t tq;
     int pbs1;
@@ -588,19 +593,22 @@ enum {
     DECODE_NO_FRAME,
 };
 
-/* The bus level @t picoseconds after SOF, @b driven up to bit @stop. */
-static bool twai_level_at(const TwaiBits *b, int stop, int64_t bit_ps,
+/*
+ * The bus level @t ticks after SOF, @b driven up to bit @stop at @bit
+ * ticks a bit.
+ */
+static bool twai_level_at(const TwaiBits *b, int stop, int64_t bit,
                           int64_t t)
 {
-    int64_t k = t / bit_ps;
+    int64_t k = t / bit;
 
     return t < 0 || k >= stop || k >= (int64_t)b->len || b->v[k];
 }
 
 /*
- * Receive @b, transmitted at @bit_ps and driven up to bit @stop, with the
- * bit timing @rt: hard synchronisation at SOF, then a sample per bit at
- * the end of PBS1, resynchronising on each recessive to dominant edge
+ * Receive @b, transmitted at @bit ticks a bit and driven up to bit @stop,
+ * with the bit timing @rt: hard synchronisation at SOF, then a sample per
+ * bit at the end of PBS1, resynchronising on each recessive to dominant edge
  * after a recessive sample, by the phase error in quanta up to SJW. An
  * SOF sampled recessive was a glitch: the receiver is idle again until
  * the next recessive to dominant edge. The de-stuffed stream is checked
@@ -609,7 +617,7 @@ static bool twai_level_at(const TwaiBits *b, int stop, int64_t bit_ps,
  * error, which for a CRC error is the ACK delimiter's (its error flag
  * follows that).
  */
-static int twai_resample(const TwaiBits *b, int stop, int64_t bit_ps,
+static int twai_resample(const TwaiBits *b, int stop, int64_t bit,
                          const TwaiTiming *rt, TwaiDecode *out)
 {
     int nbt = 1 + rt->pbs1 + rt->pbs2;
@@ -629,17 +637,17 @@ static int twai_resample(const TwaiBits *b, int stop, int64_t bit_ps,
         uint8_t seg;
 
         if (prev) {
-            for (int64_t k = s / bit_ps + 1; k * bit_ps < end; k++) {
+            for (int64_t k = s / bit + 1; k * bit < end; k++) {
                 int q;
 
-                if (k * bit_ps <= s) {
+                if (k * bit <= s) {
                     continue;
                 }
-                if (twai_level_at(b, stop, bit_ps, k * bit_ps) ||
-                    !twai_level_at(b, stop, bit_ps, k * bit_ps - 1)) {
+                if (twai_level_at(b, stop, bit, k * bit) ||
+                    !twai_level_at(b, stop, bit, k * bit - 1)) {
                     continue;
                 }
-                q = (k * bit_ps - s) / rt->tq;
+                q = (k * bit - s) / rt->tq;
                 if (q == 0) {
                     break;
                 }
@@ -652,7 +660,7 @@ static int twai_resample(const TwaiBits *b, int stop, int64_t bit_ps,
             }
         }
         sp = s + (1 + rt->pbs1 + lengthen) * rt->tq;
-        v = twai_level_at(b, stop, bit_ps, sp);
+        v = twai_level_at(b, stop, bit, sp);
         prev = v;
         s += (nbt + lengthen - shorten) * rt->tq;
         seg = crc_done ? SEG_CRC_DELIM : frame_bit_seg(eff, u, ndata, &alc);
@@ -662,13 +670,13 @@ static int twai_resample(const TwaiBits *b, int stop, int64_t bit_ps,
             if (!v) {
                 out->ecc = ECC(ECC_FORM, true, SEG_CRC_DELIM);
                 out->crc = false;
-                out->bit = (s - 1) / bit_ps;
+                out->bit = (s - 1) / bit;
                 return DECODE_ERROR;
             }
             if (crc_rx != crc) {
                 out->ecc = ECC(ECC_OTHER, true, SEG_ACK_DELIM);
                 out->crc = true;
-                out->bit = (s + 2 * nbt * rt->tq - 1) / bit_ps;
+                out->bit = (s + 2 * nbt * rt->tq - 1) / bit;
                 return DECODE_ERROR;
             }
             return DECODE_OK;
@@ -677,7 +685,7 @@ static int twai_resample(const TwaiBits *b, int stop, int64_t bit_ps,
             if (v == last) {
                 out->ecc = ECC(ECC_STUFF, true, seg);
                 out->crc = false;
-                out->bit = (s - 1) / bit_ps;
+                out->bit = (s - 1) / bit;
                 return DECODE_ERROR;
             }
             last = v;
@@ -690,7 +698,7 @@ static int twai_resample(const TwaiBits *b, int stop, int64_t bit_ps,
         if (u == 0 && v) {
             int64_t k;
 
-            for (k = sp / bit_ps + 1; k < MIN(stop, (int)b->len); k++) {
+            for (k = sp / bit + 1; k < MIN(stop, (int)b->len); k++) {
                 if (!b->v[k] && b->v[k - 1]) {
                     break;
                 }
@@ -698,7 +706,7 @@ static int twai_resample(const TwaiBits *b, int stop, int64_t bit_ps,
             if (k >= MIN(stop, (int)b->len)) {
                 return DECODE_NO_FRAME;
             }
-            s = k * bit_ps;
+            s = k * bit;
             prev = false;
             run = 0;
             last = -1;
@@ -732,7 +740,7 @@ static int twai_resample(const TwaiBits *b, int stop, int64_t bit_ps,
     }
     out->ecc = ECC(ECC_STUFF, true, SEG_DATA);
     out->crc = false;
-    out->bit = (s - 1) / bit_ps;
+    out->bit = (s - 1) / bit;
     return DECODE_ERROR;
 }
 
@@ -754,28 +762,62 @@ static ESP32P4ClkPeriod twai_bit(ESP32P4TwaiCtrl *c)
     return esp32p4_clk_period_scale(c->clk_period, 2 * (brp + 1) * nbt, 1);
 }
 
-/* @p in picoseconds, rounded down: 0 while stopped. */
-static int64_t twai_ps(ESP32P4ClkPeriod p)
+/*
+ * The transmitter's bit time @bit and the receiver's time quantum @tq, as
+ * whole numbers of ticks of a common time base, in *@bit_t and *@tq_t:
+ * exactly, the two in their ratio in lowest terms, while that has terms
+ * of at most 40 bits, as any two bit timings from TWAIn_CLK's sources
+ * have; otherwise in Clock units, both scaled down alike to 40 bits.
+ */
+static void twai_ticks(ESP32P4ClkPeriod bit, ESP32P4ClkPeriod tq,
+                       int64_t *bit_t, int64_t *tq_t)
 {
-    if (!esp32p4_clk_period_running(p)) {
-        return 0;
+    uint64_t b, q;
+    int sh;
+
+    if (!bit.num_hi && !tq.num_hi) {
+        uint64_t blo, bhi, qlo, qhi;
+        Int128 a, c, g, r;
+
+        mulu64(&blo, &bhi, bit.num_lo, tq.den);
+        mulu64(&qlo, &qhi, tq.num_lo, bit.den);
+        a = int128_make128(blo, bhi);
+        c = int128_make128(qlo, qhi);
+        g = a;
+        r = c;
+        while (int128_nz(r)) {
+            Int128 t = int128_remu(g, r);
+
+            g = r;
+            r = t;
+        }
+        a = int128_divu(a, g);
+        c = int128_divu(c, g);
+        if (!int128_gethi(a) && !int128_gethi(c) &&
+            int128_getlo(a) < (1ull << 40) && int128_getlo(c) < (1ull << 40)) {
+            *bit_t = int128_getlo(a);
+            *tq_t = int128_getlo(c);
+            return;
+        }
     }
-    return esp32p4_clk_cycles_ns_floor(p, 1000);
+    b = esp32p4_clk_period_floor(bit);
+    q = esp32p4_clk_period_floor(tq);
+    sh = MAX(64 - clz64(MAX(b, q)) - 40, 0);
+    *bit_t = MAX(b >> sh, 1);
+    *tq_t = MAX(q >> sh, 1);
 }
 
 /*
- * The bit time in picoseconds, or 0 while TWAIn_CLK is stopped: the
- * resolution at which a receiver at another bit time decodes the bus.
+ * Receiver @c's bit timing, to decode a frame sent at the exact bit time
+ * @bit, which is *@bit_t ticks of the time base the timing's quantum is
+ * in.
  */
-static int64_t twai_bit_ps(ESP32P4TwaiCtrl *c)
+static void twai_timing(ESP32P4TwaiCtrl *c, ESP32P4ClkPeriod bit,
+                        TwaiTiming *t, int64_t *bit_t)
 {
-    return twai_ps(twai_bit(c));
-}
-
-static void twai_timing(ESP32P4TwaiCtrl *c, TwaiTiming *t)
-{
-    t->tq = twai_ps(esp32p4_clk_period_scale(c->clk_period,
-                        2 * (extract32(c->btr0, 0, 14) + 1), 1));
+    twai_ticks(bit, esp32p4_clk_period_scale(c->clk_period,
+                        2 * (extract32(c->btr0, 0, 14) + 1), 1),
+               bit_t, &t->tq);
     t->pbs1 = extract32(c->btr1, 0, 4) + 1;
     t->pbs2 = extract32(c->btr1, 4, 3) + 1;
     t->sjw = extract32(c->btr0, 14, 2) + 1;
@@ -794,7 +836,8 @@ static int64_t twai_bits_ns(ESP32P4TwaiCtrl *c, int64_t n)
 
 static bool twai_operating(ESP32P4TwaiCtrl *c)
 {
-    return !(c->mode & MODE_RM) && !c->in_reset && twai_bit_ps(c) > 0;
+    return !(c->mode & MODE_RM) && !c->in_reset &&
+           esp32p4_clk_period_running(twai_bit(c));
 }
 
 /* The bus the controller is on, or -1. */
@@ -1444,16 +1487,17 @@ static void twai_ep_plan(ESP32P4TwaiState *s, int seg)
         if (!(receivers & bitmask(i))) {
             continue;
         }
-        if (twai_bit_ps(c) == ep->bit_ps) {
+        if (esp32p4_clk_period_eq(twai_bit(c), ep->bit)) {
             if (stop < L) {
                 o[i].det = twai_detect_forced(&wb, stop, true, &o[i].ecc);
             }
         } else {
             TwaiTiming rt;
             TwaiDecode dec;
+            int64_t bit_t;
 
-            twai_timing(c, &rt);
-            switch (twai_resample(&wb, stop, ep->bit_ps, &rt, &dec)) {
+            twai_timing(c, ep->bit, &rt, &bit_t);
+            switch (twai_resample(&wb, stop, bit_t, &rt, &dec)) {
             case DECODE_ERROR:
                 o[i].det = dec.bit;
                 o[i].ecc = dec.ecc;
@@ -1923,7 +1967,6 @@ static void twai_ep_start(ESP32P4TwaiState *s, int seg)
     ep->winner = ctz32(live);
     memcpy(ep->frame, s->ctrl[ep->winner].txbuf, sizeof(ep->frame));
     ep->bit = twai_bit(&s->ctrl[ep->winner]);
-    ep->bit_ps = twai_ps(ep->bit);
     ep->active = true;
 
     for (i = 0; i < ESP32P4_TWAI_NUM; i++) {
@@ -2953,15 +2996,14 @@ static const VMStateDescription vmstate_esp32p4_twai_action = {
 
 static const VMStateDescription vmstate_esp32p4_twai_episode = {
     .name = "esp32p4-twai-episode",
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(active, ESP32P4TwaiEpisode),
         VMSTATE_BOOL(start_pending, ESP32P4TwaiEpisode),
         VMSTATE_INT64(start_at, ESP32P4TwaiEpisode),
         VMSTATE_INT64(t_sof, ESP32P4TwaiEpisode),
         VMSTATE_ESP32P4_CLK_PERIOD(bit, ESP32P4TwaiEpisode),
-        VMSTATE_INT64(bit_ps, ESP32P4TwaiEpisode),
         VMSTATE_UINT8(members, ESP32P4TwaiEpisode),
         VMSTATE_UINT8(departed, ESP32P4TwaiEpisode),
         VMSTATE_UINT8(passive, ESP32P4TwaiEpisode),

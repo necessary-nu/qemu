@@ -83,6 +83,8 @@
 #define HP_RST_EN1          (CLKRST + 0xc4)
 #define TWAI_APB_CLK_EN(n)  (1u << (24 + (n)))
 #define TWAI_CLK_EN(n)      (1u << (25 + 2 * (n)))
+#define TWAI_SRC_RC_FAST(n) (1u << (24 + 2 * (n)))
+#define FOSC_CNTL           0x5011101cu
 #define RST_EN_CAN(n)       (1u << (26 + (n)))
 
 #define GPIO                0x500e0000u
@@ -1171,6 +1173,42 @@ static void test_bit_rate_mismatch(void)
 }
 
 /*
+ * A receiver at another bit time samples the bus at the exact times of
+ * its own quanta and the transmitter's edges. Both controllers count
+ * RC_FAST_CLK trimmed to FOSC_DFREQ 53, a cycle of 120000/2053 ns, which
+ * is no whole number of picoseconds: TWAI0 sends 0x653 at 80 cycles a bit
+ * (BRP 4, TSEG1 3, TSEG2 2) and TWAI1, at 76 (BRP 1, TSEG1 14, TSEG2 2,
+ * SJW 2), resynchronising on its edges, takes every bit right, receives
+ * it and acknowledges it. With the bit time and quantum rounded down to
+ * picoseconds, a sample falls the wrong side of an edge and TWAI1 finds
+ * the CRC wrong.
+ */
+/* [spec:nuos:req:emu.esp32p4.twai/test] */
+static void test_bit_rate_exact(void)
+{
+    uint8_t f[13];
+
+    two_nodes();
+    qtest_writel(qts, FOSC_CNTL, 53u << 22);
+    qtest_writel(qts, PERI_CLK_CTRL115,
+                 TWAI_CLK_EN(0) | TWAI_CLK_EN(1) | TWAI_CLK_EN(2) |
+                 TWAI_SRC_RC_FAST(0) | TWAI_SRC_RC_FAST(1));
+    setup(0, 0x04, 0x23, 0);
+    setup(1, 0x4001, 0x2e, 0);
+    step(100 * 5 * BIT_NS);
+    sff(f, 0x653, false, 0, NULL);
+    load(0, f);
+    wr(0, CMD, CMD_TR);
+    step((frame_bits(f) + 30) * 5 * BIT_NS);
+    g_assert_cmphex(rd(0, STATUS) & ST_TCS, ==, ST_TCS);
+    g_assert_cmphex(rd(1, RMC), ==, 1);
+    expect_rx(1, f, 3);
+    g_assert_cmphex(rd(1, RXERR), ==, 0);
+    g_assert_cmphex(rd(0, TXERR), ==, 0);
+    stop();
+}
+
+/*
  * The timestamp counter: TWAIn_CLK / (TS_DIV_NUM + 1), counting from 0 as
  * it is enabled; each frame stamped at its SOF; its overflow interrupt.
  */
@@ -1398,6 +1436,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/twai/bus_off_recovery", test_bus_off_recovery);
     qtest_add_func("esp32p4/twai/no_transceiver", test_no_transceiver);
     qtest_add_func("esp32p4/twai/bit_rate_mismatch", test_bit_rate_mismatch);
+    qtest_add_func("esp32p4/twai/bit_rate_exact", test_bit_rate_exact);
     qtest_add_func("esp32p4/twai/timestamp", test_timestamp);
     qtest_add_func("esp32p4/twai/function_clock", test_function_clock);
     qtest_add_func("esp32p4/twai/block_reset", test_block_reset);

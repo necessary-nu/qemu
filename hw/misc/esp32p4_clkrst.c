@@ -1730,6 +1730,7 @@ static void esp32p4_clkrst_update_hp_core_reset(ESP32P4ClkRstState *s,
  */
 static void esp32p4_clkrst_update(ESP32P4ClkRstState *s, bool force)
 {
+    ESP32P4ClkPeriod old[ESP32P4_NUM_CLOCKS];
     int i;
 
     if (s->recomputing) {
@@ -1740,12 +1741,13 @@ static void esp32p4_clkrst_update(ESP32P4ClkRstState *s, bool force)
     do {
         s->recompute_again = false;
         for (i = 0; i < ESP32P4_NUM_CLOCKS; i++) {
+            old[i] = s->exact[i];
             s->exact[i] = esp32p4_clkrst_compute(s, i);
             s->period[i] = esp32p4_clk_period_clock(s->exact[i]);
         }
         esp32p4_clkrst_check_soc(s);
         for (i = 0; i < ESP32P4_NUM_CLOCKS; i++) {
-            clock_update(s->clk[i], s->period[i]);
+            esp32p4_clk_update(s->clk[i], old[i], s->exact[i]);
         }
         for (i = 0; i < ESP32P4_CLKRST_HP_CORES; i++) {
             if (s->core_pulse_waiting[i] &&

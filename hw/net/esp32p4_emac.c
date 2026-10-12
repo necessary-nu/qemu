@@ -289,11 +289,11 @@ static void p4_emac_update_pad_ref(ESP32P4EmacState *s)
                    (p4_emac_pad(s->pad_ref_clk) &&
                     esp32p4_gpio_iomux_in_selected(s->gpio, s->pad_ref_clk,
                         ESP32P4_EMAC_RMII_CLK_FUNC));
+    ESP32P4ClkPeriod old = s->pad_txrx_period;
 
     s->pad_txrx_period = through ? esp32p4_clk_exact(s->phy_ref_clk)
                                  : esp32p4_clk_period_stopped();
-    clock_update(s->pad_txrx_clk,
-                 esp32p4_clk_period_clock(s->pad_txrx_period));
+    esp32p4_clk_update(s->pad_txrx_clk, old, s->pad_txrx_period);
 }
 
 /*

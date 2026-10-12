@@ -560,6 +560,11 @@ struct CPUArchState {
     xtensa_mpu_entry mpu_fg[MAX_MPU_FOREGROUND_SEGMENTS];
     unsigned autorefill_idx;
     bool runstall;
+    /*
+     * Waiting in WAITI for an interrupt above PS.INTLEVEL: a run stall
+     * holds the CPU in the wait, and its release leaves it there.
+     */
+    bool waiti;
     AddressSpace *address_space_er;
     MemoryRegion *system_er;
     int pending_irq_level; /* level of last raised IRQ */

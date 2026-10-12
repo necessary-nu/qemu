@@ -146,35 +146,81 @@ void dwc2_otg_set_dma(DWC2OTGState *s, AddressSpace *as, MemTxAttrs attrs)
 }
 
 /*
- * The PHY clock the core runs from: the dedicated full-speed PHY's, which
- * a host talking to a low-speed device divides by 8 (HCFG.FSLSPclkSel at
+ * The PHY clock the core runs from, NULL while it is stopped, and what
+ * the core divides it by: the dedicated full-speed PHY's, which a host
+ * talking to a low-speed device divides by 8 (HCFG.FSLSPclkSel at
  * 6 MHz), or the UTMI+ PHY's, which runs a 16-bit interface at half the
  * rate.
  */
-uint64_t dwc2_otg_phy_hz(DWC2OTGState *s)
+static Clock *dwc2_phy_clk(DWC2OTGState *s, uint64_t *div)
 {
-    uint64_t hz;
+    Clock *clk;
 
+    *div = 1;
     if (s->pcgcctl & PCGCTL_STOPPCLK) {
-        return 0;
+        return NULL;
     }
     if (s->gusbcfg & GUSBCFG_PHYSEL) {
-        hz = clock_get_hz(s->fsphy_clk);
+        clk = s->fsphy_clk;
         if (s->host_mode && (s->hcfg & HCFG_FSLSPCLKSEL_MASK) ==
                             HCFG_FSLSPCLKSEL_6_MHZ) {
-            hz /= 8;
+            *div = 8;
         }
-        return hz;
+    } else {
+        clk = s->utmi_clk;
+        if (s->gusbcfg & GUSBCFG_PHYIF16) {
+            *div = 2;
+        }
     }
-    hz = clock_get_hz(s->utmi_clk);
-    return (s->gusbcfg & GUSBCFG_PHYIF16) ? hz / 2 : hz;
+    return clock_is_enabled(clk) ? clk : NULL;
+}
+
+uint64_t dwc2_otg_phy_period(DWC2OTGState *s)
+{
+    uint64_t div;
+    Clock *clk = dwc2_phy_clk(s, &div);
+
+    return clk ? clock_get(clk) * div : 0;
 }
 
 int64_t dwc2_otg_phy_ticks_ns(DWC2OTGState *s, uint64_t ticks)
 {
-    uint64_t hz = dwc2_otg_phy_hz(s);
+    uint64_t div;
+    Clock *clk = dwc2_phy_clk(s, &div);
 
-    return hz ? muldiv64_round_up(ticks, NANOSECONDS_PER_SECOND, hz) : 0;
+    if (!clk) {
+        return 0;
+    }
+    return DWC2_OTG_GET_CLASS(s)->clock_cycles_ns(s, clk, ticks * div);
+}
+
+uint64_t dwc2_otg_phy_ticks(DWC2OTGState *s, int64_t ns)
+{
+    uint64_t div;
+    Clock *clk = dwc2_phy_clk(s, &div);
+
+    if (!clk || ns <= 0) {
+        return 0;
+    }
+    return DWC2_OTG_GET_CLASS(s)->clock_cycles(s, clk, ns) / div;
+}
+
+static uint64_t dwc2_default_clock_cycles(DWC2OTGState *s, Clock *clk,
+                                          int64_t ns)
+{
+    return ns > 0 ? clock_ns_to_ticks(clk, ns) : 0;
+}
+
+static int64_t dwc2_default_clock_cycles_ns(DWC2OTGState *s, Clock *clk,
+                                            uint64_t n)
+{
+    uint64_t lo, hi;
+
+    mulu64(&lo, &hi, n, clock_get(clk));
+    if (hi >> 31) {
+        return INT64_MAX;
+    }
+    return (hi << 32 | lo >> 32) + !!(uint32_t)lo;
 }
 
 /* FIFO RAM */
@@ -714,7 +760,7 @@ static void dwc2_soft_reset(DWC2OTGState *s)
 static void dwc2_try_soft_reset(DWC2OTGState *s)
 {
     if ((s->grstctl & GRSTCTL_CSFTRST) &&
-        !(s->grstctl & GRSTCTL_CSFTRST_DONE) && dwc2_otg_phy_hz(s)) {
+        !(s->grstctl & GRSTCTL_CSFTRST_DONE) && dwc2_otg_phy_period(s)) {
         dwc2_soft_reset(s);
     }
 }
@@ -745,7 +791,7 @@ static void dwc2_grstctl_write(DWC2OTGState *s, uint32_t val)
         if (s->snpsid >= DWC2_SNPSID_4_20A) {
             s->grstctl &= ~GRSTCTL_CSFTRST_DONE;
         }
-        if (!dwc2_otg_phy_hz(s)) {
+        if (!dwc2_otg_phy_period(s)) {
             /* Waits for the PHY clock. */
             return;
         }
@@ -1582,8 +1628,8 @@ static const VMStateDescription vmstate_dwc2_otg_reqq = {
 
 static const VMStateDescription vmstate_dwc2_otg = {
     .name = TYPE_DWC2_OTG,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .pre_save = dwc2_otg_pre_save,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(gotgctl, DWC2OTGState),
@@ -1652,7 +1698,7 @@ static const VMStateDescription vmstate_dwc2_otg = {
         VMSTATE_INT64(frame_ns, DWC2OTGState),
         VMSTATE_INT64(frame_origin_ns, DWC2OTGState),
         VMSTATE_UINT64(frame_ticks, DWC2OTGState),
-        VMSTATE_UINT64(frame_hz, DWC2OTGState),
+        VMSTATE_UINT64(frame_period, DWC2OTGState),
         VMSTATE_UINT16(frnum, DWC2OTGState),
         VMSTATE_BOOL(xact_busy, DWC2OTGState),
         VMSTATE_UINT8(xact_chan, DWC2OTGState),
@@ -1701,6 +1747,7 @@ static void dwc2_otg_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
+    DWC2OTGClass *oc = DWC2_OTG_CLASS(klass);
 
     dc->desc = "Synopsys DesignWare USB 2.0 OTG controller";
     dc->realize = dwc2_otg_realize;
@@ -1709,6 +1756,8 @@ static void dwc2_otg_class_init(ObjectClass *klass, const void *data)
     rc->phases.exit = dwc2_otg_reset_exit;
     device_class_set_props(dc, dwc2_otg_properties);
     set_bit(DEVICE_CATEGORY_USB, dc->categories);
+    oc->clock_cycles = dwc2_default_clock_cycles;
+    oc->clock_cycles_ns = dwc2_default_clock_cycles_ns;
 }
 
 /* [spec:nuos:req:emu.esp32p4.usb] */
@@ -1718,6 +1767,7 @@ static const TypeInfo dwc2_otg_types[] = {
         .parent        = TYPE_SYS_BUS_DEVICE,
         .instance_size = sizeof(DWC2OTGState),
         .instance_init = dwc2_otg_init,
+        .class_size    = sizeof(DWC2OTGClass),
         .class_init    = dwc2_otg_class_init,
     },
 };
