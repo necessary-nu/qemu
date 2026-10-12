@@ -1503,10 +1503,10 @@ static void sd_blk_write(SDState *sd, uint64_t addr, uint32_t len)
  *
  *   speed-class      SPEED_CLASS: 4 for SDSC, 10 for SDHC and SDXC; 0, 2,
  *                    4, 6 or 10, but 10 not for SDSC (4.13.1.8.1).
- *   uhs-speed-grade  UHS_SPEED_GRADE: 0, as the card is no UHS-I card; 1
- *                    or 3 for SDHC and SDXC (though an SDXC card with a
- *                    grade must support CMD20, which this card does not,
- *                    4.13.3.2).
+ *   uhs-speed-grade  UHS_SPEED_GRADE: 1 for a UHS-I card (the "uhs"
+ *                    property), 0 for another; 1 or 3 for SDHC and SDXC
+ *                    (though an SDXC card with a grade must support CMD20,
+ *                    which this card does not, 4.13.3.2).
  *   au-size          AU_SIZE, and UHS_AU_SIZE with a grade: the largest
  *                    Table 4-48 allows for the capacity, 4 MiB for SDXC.
  *   erase-size, erase-timeout, erase-offset
@@ -1987,7 +1987,10 @@ static void sd_timing_reset(SDState *sd)
     if (tm->kind == SD_KIND_SDSC && tm->speed_class == 10) {
         tm->speed_class = 6;
     }
-    tm->uhs_grade = tm->uhs_grade_prop != SD_AUTO ? tm->uhs_grade_prop : 0;
+    /* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+    /* A UHS-I card is U1 unless the property says otherwise. */
+    tm->uhs_grade = tm->uhs_grade_prop != SD_AUTO ? tm->uhs_grade_prop
+                    : sd_is_uhs(sd) ? 1 : 0;
     tm->au_size = tm->au_size_prop ? tm->au_size_prop
                   : tm->kind == SD_KIND_SDXC ? 4 * MiB : sd_au_max(size);
     tm->au_size = MIN(tm->au_size, sd_au_max(size));

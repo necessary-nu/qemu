@@ -9,7 +9,8 @@
  * with a QEMU SD card: S18R and S18A in ACMD41, the CMD11 voltage switch
  * and its timing, CMD6's UHS-I functions, CMD19, VO4's voltage as the
  * pads' and what a card and pads at different voltages make of each
- * other, and the sample phase at SDR50 and DDR50.
+ * other, the sample phase at SDR50 and DDR50, and the UHS speed grade in
+ * the card's SD status.
  *
  * The controller's CIU runs at 40 MHz (25 ns) from PLL_F160M_CLK for
  * identification, the card at 400 kHz (2.5 us); SDR50 and DDR50 take the
@@ -842,6 +843,41 @@ static void test_sdr104(void)
     unlink(img);
 }
 
+/*
+ * The SD status of the socket's UHS-I card: UHS speed grade 1, its AU
+ * (4 MiB for 4 GiB, code 9) as UHS_AU_SIZE; a card of the same capacity
+ * in slot 1, not UHS-I, has no grade.
+ */
+/* [spec:nuos:req:emu.esp32p4.sd-uhs/test] */
+static void test_uhs_grade(void)
+{
+    g_autofree char *img = make_image(SDHC_SIZE);
+    g_autofree char *img1 = make_image(SDHC_SIZE);
+    QTestState *qts = start(img, img1);
+    uint8_t ssr[64];
+    uint32_t rca;
+
+    rca = uhs_card(qts);
+    cmd_ok(qts, 0, R1 | CMD_WAIT, 55, rca << 16);
+    g_assert_cmphex(read_data(qts, 0, 0, 13, 0, 64, ssr) & INT_ERRORS, ==,
+                    0);
+    g_assert_cmphex(ssr[14], ==, (1 << 4) | 9);
+    g_assert_cmphex(ssr[10] >> 4, ==, 9);
+
+    g_assert_cmphex(identify(qts, 1, true) & OCR_S18, ==, 0);
+    cmd_ok(qts, 1, R2 | CMD_WAIT, 2, 0);
+    cmd_ok(qts, 1, R1 | CMD_WAIT, 3, 0);
+    rca = qtest_readl(qts, SD_RESP(0)) >> 16;
+    cmd_ok(qts, 1, R1 | CMD_WAIT, 7, rca << 16);
+    cmd_ok(qts, 1, R1 | CMD_WAIT, 55, rca << 16);
+    g_assert_cmphex(read_data(qts, 1, 0, 13, 0, 64, ssr) & INT_ERRORS, ==,
+                    0);
+    g_assert_cmphex(ssr[14], ==, 0);
+    qtest_quit(qts);
+    unlink(img);
+    unlink(img1);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -855,5 +891,6 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/sd-uhs/mismatch", test_mismatch);
     qtest_add_func("/esp32p4/sd-uhs/tuning", test_tuning);
     qtest_add_func("/esp32p4/sd-uhs/sdr104", test_sdr104);
+    qtest_add_func("/esp32p4/sd-uhs/uhs-grade", test_uhs_grade);
     return g_test_run();
 }
