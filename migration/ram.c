@@ -1040,7 +1040,7 @@ static uint64_t physical_memory_sync_dirty_bitmap(RAMBlock *rb,
             }
         }
         if (num_dirty) {
-            physical_memory_dirty_bits_cleared(start, length);
+            physical_memory_dirty_bits_cleared(start + rb->offset, length);
         }
 
         if (rb->clear_bmap) {
