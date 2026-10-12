@@ -1,5 +1,5 @@
 /*
- * Asynchronous serial lines: edge timing and a host serial adapter
+ * A host serial adapter on asynchronous serial lines
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -14,21 +14,6 @@
 #include "qemu/fifo8.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
-
-/*
- * Edge timing.
- *
- * A UART modelled at line level changes its TX line from QEMU_CLOCK_VIRTUAL
- * timers at the bit boundaries, and a receiver samples the line from its
- * own timers in the middle of each bit. Timers run in deadline order, but
- * may all run late together, so a receiver must not time a frame from the
- * clock reading at the edge: it times it from the edge's deadline. A
- * transmitter changes its line with uart_line_set(), giving the time the
- * change belongs to; a receiver reads that time with uart_line_now(),
- * which outside such a change is the current virtual time.
- */
-int64_t uart_line_now(void);
-void uart_line_set(qemu_irq irq, int level, int64_t when);
 
 /*
  * A host serial adapter on a UART's lines, for a board to attach a

@@ -194,6 +194,8 @@ struct RP2350PIOState {
     Clock *clk;
     RP2350GPIOState *gpio;
     QEMUTimer *timer;
+    /* The virtual time timer is due at: the run ahead's end. */
+    int64_t due_ns;
 
     qemu_irq irq[RP2350_PIO_IRQS];
     qemu_irq out[RP2350_PIO_BLOCKS * RP2350_PIO_GPIOS];
@@ -221,15 +223,17 @@ struct RP2350PIOState {
      * Pin changes from outside the blocks and the cycles they came in,
      * oldest first. They arrive while the IO bank propagates, when the
      * blocks cannot run (their pin changes would not reach the bank in
-     * time), so they wait here for in_timer, due at once, or the next
-     * catch-up. Each carries only the pins that changed (inq_mask): the
-     * blocks' own pins may change before it applies.
+     * time), so they wait here for in_timer, due at the first one's time
+     * (in_due_ns), or the next catch-up. Each carries only the pins that
+     * changed (inq_mask): the blocks' own pins may change before it
+     * applies.
      */
     uint64_t inq_vec[RP2350_PIO_IN_QUEUE];
     uint64_t inq_mask[RP2350_PIO_IN_QUEUE];
     uint64_t inq_cycle[RP2350_PIO_IN_QUEUE];
     uint32_t inq_n;
     QEMUTimer *in_timer;
+    int64_t in_due_ns;
 
     /* Levels last driven on the outputs, GPIO-numbered for the pins. */
     uint64_t drv_out[RP2350_PIO_BLOCKS];

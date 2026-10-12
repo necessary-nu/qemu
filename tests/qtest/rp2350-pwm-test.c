@@ -66,12 +66,28 @@
 
 static char *rom_path;
 
+/*
+ * clk_sys's edges fall at whole multiples of its period from time 0; at
+ * 150 MHz, every 20 ns is one. Step to the next, so that the tests' writes,
+ * whole microseconds apart, land on edges and the counts they time start
+ * with a whole cycle.
+ */
+static void align_to_clk_sys(QTestState *qts)
+{
+    int64_t now = qtest_clock_step(qts, 1);
+
+    if (now % 20) {
+        qtest_clock_step(qts, 20 - now % 20);
+    }
+}
+
 static QTestState *start(void)
 {
     QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
 
     rp2350_clocks_init(qts);
     rp2350_unreset(qts, RP2350_RESETS_ALL);
+    align_to_clk_sys(qts);
     qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");
     return qts;
 }
@@ -83,6 +99,7 @@ static QTestState *start_pads(void)
 
     rp2350_clocks_init(qts);
     rp2350_unreset(qts, RP2350_RESETS_ALL);
+    align_to_clk_sys(qts);
     qtest_irq_intercept_out_named(qts, "/machine/soc/gpio", "pad-out");
     return qts;
 }

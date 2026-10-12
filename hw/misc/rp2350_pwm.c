@@ -30,14 +30,19 @@
  * passing the input synchroniser, or a DREQ. Every edge and every DREQ
  * comes at its own cycle, however close to the next, so that PIO
  * sampling a PWM pin, or another slice counting its edges, sees each; the
- * host's work grows with the edges' rate. The RP2350's lines carry no
- * time, so a receiver takes an edge when it is driven: under icount at
- * its cycle. Without icount the timer can fire late, the host behind
- * virtual time; the slice is then taken to the present at once, its
- * outputs showing their level there, the edges in between not driven,
- * and the DREQ line pulsed once per wrap since (at most
+ * host's work grows with the edges' rate.
+ *
+ * An edge carries its own time on the line (hw/core/line-time.h) however
+ * late its timer fires, so that a receiver takes it at its cycle: a
+ * firing at most PWM_MAX_LATE_NS late takes the slice to its deadline
+ * only, drives what changes there with that time, and leaves later edges
+ * to their own firings. Later than that, as when the host falls behind
+ * virtual time without icount, the slice is taken to the present at once,
+ * its outputs showing their level there, the edges in between not
+ * driven, and the DREQ line pulsed once per wrap since (at most
  * RP2350_PWM_DREQ_BURST times), so that the work a late firing does is
- * bounded however late it is.
+ * bounded however late it is. A change of the B pin is taken at the time
+ * it carries.
  *
  * clk_sys is the "clk" clock input.
  */
@@ -45,6 +50,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_pwm.h"
@@ -94,6 +100,14 @@ enum {
 /* The most DREQ pulses one late timer firing delivers. */
 #define RP2350_PWM_DREQ_BURST   64
 
+/*
+ * How late a timer firing may be and still take the slice through its
+ * edges one at a time: far more than icount ever leaves a timer (up to a
+ * clk_sys cycle), and as little as keeps the edges a late host must catch
+ * up on few.
+ */
+#define PWM_MAX_LATE_NS         (10 * SCALE_US)
+
 #define NO_EVENT                UINT64_MAX
 
 /*
@@ -132,28 +146,35 @@ static uint32_t pwm_chan_cc(uint32_t cc, int ch)
     return ch ? cc >> 16 : cc & 0xffff;
 }
 
+/*
+ * clk_sys's cycles, counted from base_cycle at base_ns. Its edges are at
+ * whole multiples of its period from time 0, the grid every device timed
+ * on it shares, whenever each started counting: an edge at the same
+ * virtual time is the same edge for all of them.
+ */
 static uint64_t pwm_cycle_at(RP2350PWMState *s, int64_t ns)
 {
     if (ns <= s->base_ns) {
         return s->base_cycle;
     }
-    return s->base_cycle + clock_ns_to_ticks(s->clk, ns - s->base_ns);
+    return s->base_cycle + clock_ns_to_ticks(s->clk, ns) -
+           clock_ns_to_ticks(s->clk, s->base_ns);
 }
 
 /* The first virtual time at which clk_sys has reached `cycle`. */
 static int64_t pwm_ns_at(RP2350PWMState *s, uint64_t cycle)
 {
-    uint64_t d, ns;
+    uint64_t t, ns;
 
-    if (cycle <= s->base_cycle) {
+    if (cycle <= s->base_cycle || !clock_is_enabled(s->clk)) {
         return s->base_ns;
     }
-    d = cycle - s->base_cycle;
-    ns = clock_ticks_to_ns(s->clk, d);
-    while (clock_ns_to_ticks(s->clk, ns) < d) {
+    t = clock_ns_to_ticks(s->clk, s->base_ns) + (cycle - s->base_cycle);
+    ns = clock_ticks_to_ns(s->clk, t);
+    while (clock_ns_to_ticks(s->clk, ns) < t) {
         ns++;
     }
-    return s->base_ns + MIN(ns, (uint64_t)INT64_MAX / 2);
+    return MIN(ns, (uint64_t)INT64_MAX / 2);
 }
 
 /*
@@ -374,9 +395,10 @@ static void pwm_sync(RP2350PWMState *s, int i, uint64_t cycle)
     pwm_try_advance(s, i);
 }
 
+/* The cycle of the present, or of the stamped change being propagated. */
 static uint64_t pwm_now_cycle(RP2350PWMState *s)
 {
-    return pwm_cycle_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    return pwm_cycle_at(s, line_time());
 }
 
 static void pwm_sync_all(RP2350PWMState *s)
@@ -505,6 +527,7 @@ static void pwm_schedule(RP2350PWMState *s, int i)
     if (due == INT64_MAX) {
         timer_del(sl->timer);
     } else {
+        sl->due_ns = due;
         timer_mod(sl->timer, due);
     }
 }
@@ -525,14 +548,29 @@ static void pwm_update_all(RP2350PWMState *s)
     }
 }
 
+/* Run the slice to its timer's deadline and drive it, at that time. */
+static void pwm_fire(void *opaque)
+{
+    RP2350PWMSlice *sl = opaque;
+    RP2350PWMState *s = sl->pwm;
+
+    pwm_sync(s, sl->index, pwm_cycle_at(s, sl->due_ns));
+    pwm_update(s, sl->index);
+}
+
+/* [spec:nuos:req:emu.pwm] */
 static void pwm_timer_cb(void *opaque)
 {
     RP2350PWMSlice *sl = opaque;
     RP2350PWMState *s = sl->pwm;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    pwm_sync(s, sl->index, pwm_cycle_at(s, now));
-    pwm_update(s, sl->index);
+    if (now - sl->due_ns > PWM_MAX_LATE_NS) {
+        pwm_sync(s, sl->index, pwm_cycle_at(s, now));
+        pwm_update(s, sl->index);
+        return;
+    }
+    line_run_at(sl->due_ns, pwm_fire, sl);
 }
 
 static void pwm_set_csr(RP2350PWMState *s, int i, uint32_t csr)
@@ -576,7 +614,17 @@ static void pwm_b_in(void *opaque, int n, int level)
         sl->b_in = sl->b_seen = b;
         return;
     }
-    cycle = pwm_now_cycle(s);
+    /*
+     * The change arrives in the cycle of its time. A register access can
+     * have run the slice on past that time, by up to an instruction under
+     * icount, before the driver's timer fired: the change is still taken
+     * in its cycle if the slice has not yet run the cycle after it, in
+     * which the synchroniser passes it on; otherwise in that cycle.
+     */
+    cycle = MAX(pwm_now_cycle(s), sl->sync_cycle ? sl->sync_cycle - 1 : 0);
+    if (sl->b_in != sl->b_seen) {
+        cycle = MAX(cycle, sl->b_change);
+    }
     pwm_sync(s, n, cycle);
     sl->b_in = b;
     sl->b_change = cycle;
@@ -908,10 +956,22 @@ static const VMStateDescription vmstate_rp2350_pwm_slice = {
     },
 };
 
+static int rp2350_pwm_post_load(void *opaque, int version_id)
+{
+    RP2350PWMState *s = opaque;
+    int i;
+
+    for (i = 0; i < RP2350_PWM_SLICES; i++) {
+        s->slice[i].due_ns = timer_expire_time_ns(s->slice[i].timer);
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_rp2350_pwm = {
     .name = TYPE_RP2350_PWM,
     .version_id = 2,
     .minimum_version_id = 2,
+    .post_load = rp2350_pwm_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, RP2350PWMState),
         VMSTATE_INT64(base_ns, RP2350PWMState),

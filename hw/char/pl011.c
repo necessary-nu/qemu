@@ -24,8 +24,8 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "hw/char/pl011.h"
-#include "hw/char/uart-line.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
@@ -350,7 +350,7 @@ static void pl011_line_set_txd(PL011State *s, int level, int64_t when)
         return;
     }
     s->txd = level;
-    uart_line_set(s->txd_out, level, when);
+    line_set_at(s->txd_out, level, when);
     if (pl011_loopback_enabled(s)) {
         pl011_line_rx_changed(s, when);
     }
@@ -373,7 +373,7 @@ static void pl011_line_update_rts(PL011State *s, int64_t when)
         return;
     }
     s->nrts = level;
-    uart_line_set(s->nrts_out, level, when);
+    line_set_at(s->nrts_out, level, when);
     if (pl011_loopback_enabled(s)) {
         pl011_line_cts_changed(s, when);
     }
@@ -484,7 +484,7 @@ static void pl011_line_write_txdata(PL011State *s, uint8_t data)
     if (s->tx_count > pl011_tx_level(s)) {
         s->int_level &= ~INT_TX;
     }
-    pl011_line_tx_start(s, uart_line_now());
+    pl011_line_tx_start(s, line_time());
     pl011_update(s);
 }
 
@@ -661,7 +661,7 @@ static uint32_t pl011_line_read_rxdata(PL011State *s)
         timer_del(s->rt_timer);
     }
     s->rsr = (c >> 8) & 0xf;
-    pl011_line_update_rts(s, uart_line_now());
+    pl011_line_update_rts(s, line_time());
     pl011_update(s);
     return c;
 }
@@ -688,7 +688,7 @@ static uint32_t pl011_line_flags(PL011State *s)
 
 static void pl011_line_write_lcr(PL011State *s, uint32_t old)
 {
-    int64_t now = uart_line_now();
+    int64_t now = line_time();
 
     /* UARTLCR_H writes load the divisors into the baud rate generator. */
     s->brd = (s->ibrd << 6) | s->fbrd;
@@ -707,7 +707,7 @@ static void pl011_line_write_lcr(PL011State *s, uint32_t old)
 
 static void pl011_line_write_cr(PL011State *s, uint32_t old)
 {
-    int64_t now = uart_line_now();
+    int64_t now = line_time();
 
     if ((old ^ s->cr) & CR_LBE) {
         pl011_line_rx_changed(s, now);
@@ -722,7 +722,7 @@ static void pl011_line_rxd_in(void *opaque, int n, int level)
     PL011State *s = opaque;
 
     s->rxd_pin = level != 0;
-    pl011_line_rx_changed(s, uart_line_now());
+    pl011_line_rx_changed(s, line_time());
 }
 
 static void pl011_line_ncts_in(void *opaque, int n, int level)
@@ -730,7 +730,7 @@ static void pl011_line_ncts_in(void *opaque, int n, int level)
     PL011State *s = opaque;
 
     s->ncts_pin = level != 0;
-    pl011_line_cts_changed(s, uart_line_now());
+    pl011_line_cts_changed(s, line_time());
 }
 
 static void pl011_line_reset(PL011State *s)
@@ -1090,7 +1090,7 @@ static void pl011_write(void *opaque, hwaddr offset,
         s->ifl = value;
         pl011_set_read_trigger(s);
         if (s->line_level) {
-            pl011_line_update_rts(s, uart_line_now());
+            pl011_line_update_rts(s, line_time());
         }
         break;
     case 14: /* UARTIMSC */
