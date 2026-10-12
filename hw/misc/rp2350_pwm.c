@@ -27,12 +27,17 @@
  * it is observed or changed, and a per-slice timer fires only at the
  * moments something becomes visible outside the block: a wrap whose
  * interrupt is enabled (and not yet raised), an output edge, a B pin edge
- * passing the input synchroniser, or a DREQ. Output edges and DREQs
- * closer together than the min-edge-ns property are coalesced: the timer
- * then fires every min-edge-ns, the outputs show the slice's true level
- * at each firing, and the DREQ line is pulsed once per wrap since the
- * last firing (at most RP2350_PWM_DREQ_BURST times). Wrap interrupts are
- * never coalesced.
+ * passing the input synchroniser, or a DREQ. Every edge and every DREQ
+ * comes at its own cycle, however close to the next, so that PIO
+ * sampling a PWM pin, or another slice counting its edges, sees each; the
+ * host's work grows with the edges' rate. The RP2350's lines carry no
+ * time, so a receiver takes an edge when it is driven: under icount at
+ * its cycle. Without icount the timer can fire late, the host behind
+ * virtual time; the slice is then taken to the present at once, its
+ * outputs showing their level there, the edges in between not driven,
+ * and the DREQ line pulsed once per wrap since (at most
+ * RP2350_PWM_DREQ_BURST times), so that the work a late firing does is
+ * bounded however late it is.
  *
  * clk_sys is the "clk" clock input.
  */
@@ -41,7 +46,6 @@
 #include "qemu/log.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
-#include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_pwm.h"
 #include "migration/vmstate.h"
@@ -87,7 +91,7 @@ enum {
 #define TOP_RESET               0xffffu
 #define SLICES_MASK             ((1u << RP2350_PWM_SLICES) - 1)
 
-/* The most DREQ pulses one coalesced timer firing delivers. */
+/* The most DREQ pulses one late timer firing delivers. */
 #define RP2350_PWM_DREQ_BURST   64
 
 #define NO_EVENT                UINT64_MAX
@@ -467,7 +471,6 @@ static void pwm_schedule(RP2350PWMState *s, int i)
     unsigned mode = pwm_divmode(sl);
     int64_t due = INT64_MAX;
 
-    sl->out_due_ns = INT64_MAX;
     if (!pwm_running(s, sl)) {
         timer_del(sl->timer);
         return;
@@ -482,7 +485,6 @@ static void pwm_schedule(RP2350PWMState *s, int i)
         bool irq_wrap = !(s->intr & (1u << i)) &&
                         ((s->inte[0] | s->inte[1]) & (1u << i));
         uint64_t wrap, k = NO_EVENT;
-        int64_t floor = sl->last_out_ns + s->min_edge_ns;
         int ch;
 
         pwm_segments(sl->ctr, sl->down, sl->top_latched, pwm_ph_correct(sl),
@@ -496,8 +498,7 @@ static void pwm_schedule(RP2350PWMState *s, int i)
             k = MIN(k, pwm_next_change(sl, ch));
         }
         if (k != NO_EVENT) {
-            sl->out_due_ns = MAX(pwm_ns_at(s, pwm_tick_cycle(sl, k)), floor);
-            due = MIN(due, sl->out_due_ns);
+            due = MIN(due, pwm_ns_at(s, pwm_tick_cycle(sl, k)));
         }
     }
 
@@ -531,9 +532,6 @@ static void pwm_timer_cb(void *opaque)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     pwm_sync(s, sl->index, pwm_cycle_at(s, now));
-    if (sl->out_due_ns <= now) {
-        sl->last_out_ns = now;
-    }
     pwm_update(s, sl->index);
 }
 
@@ -835,8 +833,6 @@ static void rp2350_pwm_hold_reset(Object *obj, ResetType type)
         sl->b_seen = sl->b_in;
         sl->b_change = 0;
         sl->dreq_pending = 0;
-        sl->last_out_ns = INT64_MIN / 2;
-        sl->out_due_ns = INT64_MAX;
         /* Force every line to be driven afresh. */
         memset(sl->out_level, 0xff, sizeof(sl->out_level));
         memset(sl->oe_level, 0xff, sizeof(sl->oe_level));
@@ -886,14 +882,10 @@ static void rp2350_pwm_realize(DeviceState *dev, Error **errp)
     }
 }
 
-static const Property rp2350_pwm_properties[] = {
-    DEFINE_PROP_UINT32("min-edge-ns", RP2350PWMState, min_edge_ns, 1000),
-};
-
 static const VMStateDescription vmstate_rp2350_pwm_slice = {
     .name = TYPE_RP2350_PWM "-slice",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(timer, RP2350PWMSlice),
         VMSTATE_UINT32(csr, RP2350PWMSlice),
@@ -910,8 +902,6 @@ static const VMStateDescription vmstate_rp2350_pwm_slice = {
         VMSTATE_BOOL(b_seen, RP2350PWMSlice),
         VMSTATE_UINT64(b_change, RP2350PWMSlice),
         VMSTATE_UINT32(dreq_pending, RP2350PWMSlice),
-        VMSTATE_INT64(last_out_ns, RP2350PWMSlice),
-        VMSTATE_INT64(out_due_ns, RP2350PWMSlice),
         VMSTATE_UINT8_ARRAY(out_level, RP2350PWMSlice, 2),
         VMSTATE_UINT8_ARRAY(oe_level, RP2350PWMSlice, 2),
         VMSTATE_END_OF_LIST()
@@ -920,8 +910,8 @@ static const VMStateDescription vmstate_rp2350_pwm_slice = {
 
 static const VMStateDescription vmstate_rp2350_pwm = {
     .name = TYPE_RP2350_PWM,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, RP2350PWMState),
         VMSTATE_INT64(base_ns, RP2350PWMState),
@@ -944,7 +934,6 @@ static void rp2350_pwm_class_init(ObjectClass *klass, const void *data)
     rc->phases.hold = rp2350_pwm_hold_reset;
     rc->phases.exit = rp2350_pwm_exit_reset;
     dc->vmsd = &vmstate_rp2350_pwm;
-    device_class_set_props(dc, rp2350_pwm_properties);
 }
 
 /* [spec:nuos:req:emu.pwm] */

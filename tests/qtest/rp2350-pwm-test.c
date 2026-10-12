@@ -76,6 +76,17 @@ static QTestState *start(void)
     return qts;
 }
 
+/* As start(), with the pads' levels intercepted rather than the CPU's IRQs */
+static QTestState *start_pads(void)
+{
+    QTestState *qts = qtest_initf("-M rp2350 -bios %s", rom_path);
+
+    rp2350_clocks_init(qts);
+    rp2350_unreset(qts, RP2350_RESETS_ALL);
+    qtest_irq_intercept_out_named(qts, "/machine/soc/gpio", "pad-out");
+    return qts;
+}
+
 static void step(QTestState *qts, int64_t ns)
 {
     qtest_clock_step(qts, ns);
@@ -447,8 +458,8 @@ static void test_outputs(void)
 }
 
 /*
- * Edges faster than the model delivers them one by one: the pins still
- * show the slice's true level whenever the slice is observed.
+ * Edges every one or two clk_sys cycles, each driven at its own: the pin
+ * shows the slice's level at whatever moment it is read.
  */
 /* [spec:nuos:req:emu.pwm/test] */
 static void test_fast_outputs(void)
@@ -463,9 +474,55 @@ static void test_fast_outputs(void)
     for (i = 0; i < 20; i++) {
         uint32_t ctr;
 
-        step(qts, 1000 * US + 7 * i);
+        step(qts, 1 * US + 7 * i);
         ctr = qtest_readl(qts, CTR(2));
         g_assert_cmpint(pin_in(qts, 20), ==, ctr < 1);
+    }
+    qtest_quit(qts);
+}
+
+/*
+ * Edges a few clk_sys cycles apart, each at its own cycle: slice 0's A on
+ * GPIO 0 high for 3 of 9 counts at the full 150 MHz, edges 20 ns and
+ * 40 ns apart. The edges' cycles are three apart, so that from the first
+ * edge they come at whole nanoseconds: the pad is checked on each side of
+ * every edge for ten periods.
+ */
+/* [spec:nuos:req:emu.pwm/test] */
+static void test_close_edges(void)
+{
+    QTestState *qts = start_pads();
+    int64_t t0 = 0, now;
+    int i;
+
+    pin_pwm(qts, 0);
+    qtest_writel(qts, TOP(0), 8);
+    qtest_writel(qts, CC(0), 3);
+    qtest_writel(qts, CSR(0), CSR_EN);
+    /* The first rising edge after the high from the enable, 60 ns on */
+    for (i = 0; i < 100; i++) {
+        bool before = qtest_get_irq(qts, 0);
+
+        t0 = qtest_clock_step(qts, 1);
+        if (!before && qtest_get_irq(qts, 0)) {
+            break;
+        }
+    }
+    g_assert_cmpint(i, <, 100);
+    now = t0;
+    for (i = 0; i < 10; i++) {
+        int64_t t = t0 + 60 * i;
+
+        if (t + 19 > now) {
+            qtest_clock_step(qts, t + 19 - now);
+        }
+        g_assert_true(qtest_get_irq(qts, 0));
+        qtest_clock_step(qts, 1);
+        g_assert_false(qtest_get_irq(qts, 0));
+        qtest_clock_step(qts, 39);
+        g_assert_false(qtest_get_irq(qts, 0));
+        now = qtest_clock_step(qts, 1);
+        g_assert_true(qtest_get_irq(qts, 0));
     }
     qtest_quit(qts);
 }
@@ -573,6 +630,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/pwm/outputs", test_outputs);
     qtest_add_func("/rp2350/pwm/fast-outputs", test_fast_outputs);
     qtest_add_func("/rp2350/pwm/input-modes", test_input_modes);
+    qtest_add_func("/rp2350/pwm/close-edges", test_close_edges);
 
     ret = g_test_run();
     unlink(rom_path);
