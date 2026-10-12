@@ -1804,6 +1804,8 @@ static void test_refused(void)
     expect_refused(qts, "'format': 'raw8', 'dvp-width': 16");
     expect_refused(qts, "'vsync-pad': 20, 'de-pad': 20");
     expect_refused(qts, "'data-pads': '1,2,99'");
+    expect_refused(qts, "'data-pads': '10:11:10'");
+    expect_refused(qts, "'data-pads': '10:11', 'pclk-pad': 11");
     expect_refused(qts, "'vc': 4");
     expect_refused(qts, "'lanes': 5");
 

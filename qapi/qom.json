@@ -438,8 +438,8 @@
 #
 # @de-pad: the GPIO pad the board wires DVP DE (HREF) to
 #
-# @data-pads: the GPIO pads the board wires DVP D0 upwards to, a
-#     comma-separated list, -1 for an unwired line
+# @data-pads: the GPIO pads the board wires DVP D0 upwards to, a list
+#     separated by colons or commas, -1 for an unwired line
 #
 # @vsync-active-low: DVP VSYNC is active low (default false)
 #

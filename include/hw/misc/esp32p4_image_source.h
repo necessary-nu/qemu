@@ -117,8 +117,9 @@
  * never as pad levels: the bus changes at up to tens of MHz, too fast to
  * carry edge by edge. Which pads the board wires the sensor's signals to
  * is "pclk-pad", "vsync-pad", "hsync-pad", "de-pad" and "data-pads" (D0
- * upwards, a list such as "10,11,12,13,14,15,16,17"; -1 for an unwired
- * line); a receiver (LCD_CAM's camera port, the ISP's DVP input) reads
+ * upwards, a list such as "10:11:12:13:14:15:16:17", or with commas; -1
+ * for an unwired line); a receiver (LCD_CAM's camera port, the ISP's DVP
+ * input) reads
  * esp32p4_image_source_dvp_pad() and the GPIO matrix's routing
  * (esp32p4_gpio_sig_in_pad()) to see which sensor signal reaches each of
  * its CAM_* inputs. A signal with no pad given reaches the receiver
@@ -136,10 +137,11 @@
  * type the format's, at the start of its line, between line start and
  * line end short packets (LS, LE) with "line-sync"; and a frame end short
  * packet (FE) after the last line. Each packet is a high-speed burst of
- * its own on "lanes" data lanes (default 2; 1 to 4) at "lane-rate" bits
- * a second on each lane (default: the lowest multiple of 10 Mbit/s from
- * 80 Mbit/s that keeps the line's bursts within 80% of a line), the
- * packet's bytes dealt to the lanes in turn. The bursts follow D-PHY 1.1
+ * its own on "lanes" data lanes (default 2; 1 to 4, of which the P4
+ * receives one or two) at "lane-rate" bits a second on each lane
+ * (default: the lowest multiple of 10 Mbit/s from 80 Mbit/s that keeps
+ * the line's bursts within 80% of a line), the packet's bytes dealt to
+ * the lanes in turn. The bursts follow D-PHY 1.1
  * with T_LPX 50 ns, T_HS-PREPARE 50 ns + 5 UI, T_HS-ZERO 100 ns + 6 UI,
  * the 8-UI sync sequence, the bytes, T_HS-TRAIL max(8 UI, 60 ns + 4 UI)
  * and at least T_HS-EXIT 100 ns in LP-11 before the next. The packets'

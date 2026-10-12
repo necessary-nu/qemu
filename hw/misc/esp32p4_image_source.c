@@ -1356,7 +1356,8 @@ static bool parse_data_pads(ESP32P4ImageSource *s, Error **errp)
     if (!s->data_pads || !*s->data_pads) {
         return true;
     }
-    items = g_strsplit(s->data_pads, ",", -1);
+    /* ':' as well as ',', which -object's syntax would have doubled */
+    items = g_strsplit_set(s->data_pads, ",:", -1);
     if (g_strv_length(items) > 16) {
         error_setg(errp, "esp32p4-image-source: data-pads has more than 16 "
                    "pads");
@@ -1721,7 +1722,7 @@ static const StrProp str_props[] = {
     { "image", offsetof(ESP32P4ImageSource, image),
       "A still picture: binary PPM or PGM, or PNG" },
     { "data-pads", offsetof(ESP32P4ImageSource, data_pads),
-      "DVP: the pads D0 upwards are wired to, such as 10,11,12 (-1 none)" },
+      "DVP: the pads D0 upwards are wired to, such as 10:11:12 (-1 none)" },
 };
 
 static bool settable(ESP32P4ImageSource *s, const char *name, Error **errp)
