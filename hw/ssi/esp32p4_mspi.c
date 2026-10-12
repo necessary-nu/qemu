@@ -2333,7 +2333,7 @@ static void mspi_spi1_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (r) {
     case R1_CMD:
-        start = v & mask & CMD_OPS;
+        start = v & mask & (CMD_OPS | CMD_FLASH_PE);
         if (start && spi1_busy(s)) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: SPI1_CMD 0x%08" PRIx32
                           " while an operation is in progress; ignored\n",
@@ -2346,7 +2346,7 @@ static void mspi_spi1_write(void *opaque, hwaddr addr, uint64_t val,
                 break;
             }
             s->spi1[R1_CMD] |= start;
-            spi1_start(s, s->spi1[R1_CMD] & CMD_OPS);
+            spi1_start(s, s->spi1[R1_CMD] & (CMD_OPS | CMD_FLASH_PE));
         }
         break;
     case R1_FLASH_SUS_CTRL:
