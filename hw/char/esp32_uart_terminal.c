@@ -15,7 +15,13 @@
  * inversions it does not follow.
  *
  * While its chardev is connected the terminal drives its TX pad, idle
- * high, as a bridge's TX output does.
+ * high, as a bridge's TX output does. It starts a frame of the chardev's
+ * bytes only while the UART's RX FIFO has room for it and the frame
+ * before, which the UART may still be decoding (esp32_uart_line_rx_room()),
+ * and starts the next when the UART tells it the FIFO has room again: the
+ * host's bytes wait for the chip, as QEMU's serial devices take host
+ * input, rather than overflow a FIFO the chip's CPU, held up by the host,
+ * has not had the chance to empty.
  *
  * Its "break" property holds that line low, a break, as a host does with
  * its serial port's break condition: a frame being sent is cut off, and
@@ -131,14 +137,18 @@ static unsigned term_tx_next_change(Esp32UartTerminalState *s)
 
 static void term_tx_advance(Esp32UartTerminalState *s);
 
-/* Start sending the next byte waiting, at start_ns, if the UART can run. */
+/*
+ * Start sending the next byte waiting, at start_ns, if the UART can run
+ * and its RX FIFO has room for this frame and one being decoded.
+ */
 static bool term_tx_start(Esp32UartTerminalState *s, int64_t start_ns)
 {
     Esp32UartFrameFmt fmt;
     bool was_full = fifo8_is_full(&s->in);
 
     if (s->brk || fifo8_is_empty(&s->in) ||
-        !esp32_uart_line_get_format(s->uart, &fmt)) {
+        !esp32_uart_line_get_format(s->uart, &fmt) ||
+        esp32_uart_line_rx_room(s->uart) < 2) {
         return false;
     }
     s->tx_nbits = esp32_uart_frame_levels(&fmt, fifo8_pop(&s->in),
