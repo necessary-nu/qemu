@@ -558,6 +558,35 @@ static void pwm_fire(void *opaque)
     pwm_update(s, sl->index);
 }
 
+/*
+ * Take slice i's timer firings due before `when`, the time of an access or
+ * of a change the slice takes, each at its own time, as they would have
+ * run at their deadlines: under icount an access can come up to an
+ * instruction after a deadline whose timer has yet to fire, and the edges
+ * then due must not take the access's time. Firings further behind than
+ * PWM_MAX_LATE_NS are left to the slice's run to the present.
+ */
+static void pwm_catch_up(RP2350PWMState *s, int i, int64_t when)
+{
+    RP2350PWMSlice *sl = &s->slice[i];
+
+    while (timer_pending(sl->timer) && sl->due_ns < when &&
+           when - sl->due_ns <= PWM_MAX_LATE_NS) {
+        timer_del(sl->timer);
+        line_run_at(sl->due_ns, pwm_fire, sl);
+    }
+}
+
+static void pwm_catch_up_all(RP2350PWMState *s)
+{
+    int64_t when = line_time();
+    int i;
+
+    for (i = 0; i < RP2350_PWM_SLICES; i++) {
+        pwm_catch_up(s, i, when);
+    }
+}
+
 /* [spec:nuos:req:emu.pwm] */
 static void pwm_timer_cb(void *opaque)
 {
@@ -621,6 +650,7 @@ static void pwm_b_in(void *opaque, int n, int level)
      * in its cycle if the slice has not yet run the cycle after it, in
      * which the synchroniser passes it on; otherwise in that cycle.
      */
+    pwm_catch_up(s, n, line_time());
     cycle = MAX(pwm_now_cycle(s), sl->sync_cycle ? sl->sync_cycle - 1 : 0);
     if (sl->b_in != sl->b_seen) {
         cycle = MAX(cycle, sl->b_change);
@@ -644,6 +674,7 @@ static uint64_t rp2350_pwm_read(void *opaque, hwaddr addr, unsigned size)
 
         i = reg / SLICE_STRIDE;
         sl = &s->slice[i];
+        pwm_catch_up(s, i, line_time());
         pwm_sync(s, i, pwm_now_cycle(s));
         switch (reg % SLICE_STRIDE) {
         case A_CSR:
@@ -666,6 +697,7 @@ static uint64_t rp2350_pwm_read(void *opaque, hwaddr addr, unsigned size)
         return v;
     }
 
+    pwm_catch_up_all(s);
     pwm_sync_all(s);
     switch (reg) {
     case A_EN:
@@ -713,6 +745,7 @@ static void rp2350_pwm_write(void *opaque, hwaddr addr, uint64_t value64,
 
         i = reg / SLICE_STRIDE;
         sl = &s->slice[i];
+        pwm_catch_up(s, i, line_time());
         pwm_sync(s, i, pwm_now_cycle(s));
         switch (reg % SLICE_STRIDE) {
         case A_CSR:
@@ -753,6 +786,7 @@ static void rp2350_pwm_write(void *opaque, hwaddr addr, uint64_t value64,
         return;
     }
 
+    pwm_catch_up_all(s);
     pwm_sync_all(s);
     switch (reg) {
     case A_EN: {

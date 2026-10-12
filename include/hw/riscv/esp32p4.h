@@ -49,11 +49,13 @@
 #include "hw/misc/esp32p4_huk.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_icm.h"
+#include "hw/misc/esp32p4_image_source.h"
 #include "hw/misc/esp32p4_keymng.h"
 #include "hw/misc/esp32p4_lp_ana.h"
 #include "hw/misc/esp32p4_lp_mailbox.h"
 #include "hw/misc/esp32p4_ledc.h"
 #include "hw/misc/esp32p4_lp_sys.h"
+#include "hw/misc/esp32p4_jpeg.h"
 #include "hw/misc/esp32p4_parlio.h"
 #include "hw/misc/esp32p4_pcnt.h"
 #include "hw/misc/esp32_mcpwm.h"
@@ -231,9 +233,13 @@ struct ESP32P4MachineState {
     ESP32P4SpiState spi[2];
     ESP32P4BitScramblerState bitscrambler;
     ESP32P4ParlioState parlio;
+    ESP32P4JpegState jpeg;
     ESP32P4TwaiState twai;
     /* The QEMU CAN buses on TWAI0 to TWAI2's pads, or NULL. */
     CanBusState *canbus[ESP32P4_TWAI_NUM];
+    /* The board's camera sensors on the DVP and MIPI CSI inputs, or NULL */
+    ESP32P4ImageSource *dvp_camera;
+    ESP32P4ImageSource *csi_camera;
     ESP32P4RmtState rmt;
     ESP32P4PcntState pcnt;
     ESP32P4LedcState ledc;

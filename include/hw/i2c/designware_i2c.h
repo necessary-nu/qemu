@@ -39,6 +39,7 @@
 #include "hw/i2c/i2c.h"
 #include "hw/core/clock.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
 
@@ -115,6 +116,8 @@ struct DesignWareI2CState {
     qemu_irq scl_oe;
     Clock *clk;
     QEMUTimer *timer;
+    /* The virtual time the timer is due at. */
+    int64_t timer_due;
     /*
      * ic_clk cycles left on the timer, held while a connected ic_clk is
      * stopped.
@@ -156,9 +159,12 @@ struct DesignWareI2CState {
     uint8_t rx_head;
     uint8_t rx_num;
 
-    /* The SCL and SDA wires and whether this device holds SCL low. */
-    bool scl_in;
-    bool sda_in;
+    /*
+     * The SCL and SDA wires, with their latest changes and times, and
+     * whether this device holds SCL low.
+     */
+    LineHistory scl_in;
+    LineHistory sda_in;
     bool scl_hold;
     /* ic_en, the enable status, as last seen by dw_i2c_update(). */
     bool ic_en;

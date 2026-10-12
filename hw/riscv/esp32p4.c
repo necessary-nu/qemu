@@ -203,6 +203,10 @@
  *     own resets and its DMA on PARLIO_SYS_CLK through GDMA-AXI, its pad
  *     signals matrix signals 186 to 203 and 242 (TX CS), its interrupts
  *     HP_PARLIO_RX_INTR and _TX_INTR (sources 113 and 114).
+ *   - The JPEG codec (TRM chapter 37) at 0x50086000, behind JPEG_SYS_CLK
+ *     and its reset, a baseline encoder and decoder whose pipeline runs on
+ *     the same clock, its interrupt JPEG_INTR (source 95). Its data paths
+ *     are the 2D-DMA's (include/hw/misc/esp32p4_jpeg.h).
  *   - The debug blocks (TRM chapters 3, 22 and 23): the debug assistant at
  *     0x3FF06000, watching the HP cores' SP, their accesses to four
  *     regions and their PCs; each HP core's RISC-V trace encoder, at
@@ -330,6 +334,14 @@
  *     accelerator (TRM chapter 39) at 0x50087000, behind PPA_SYS_CLK, at
  *     which it computes, and its reset, its interrupt PPA_INTR (source 96),
  *     its SRM and BLEND engines served by the 2D-DMA.
+ *   - The board's cameras: an esp32p4-image-source on the camera inputs'
+ *     pads, dvp-camera for LCD_CAM's camera port and the ISP's DVP input,
+ *     csi-camera for MIPI CSI (include/hw/misc/esp32p4_image_source.h).
+ *     The machine wires each to its port and its pads, and the inputs
+ *     capture what it streams:
+ *
+ *       -object esp32p4-image-source,id=cam0,format=raw10,width=1280,
+ *               height=720,image=photo.png -M esp32p4,csi-camera=cam0
  *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
@@ -441,7 +453,6 @@ static const struct {
     /* HP peripherals 0. */
     { "pau",              0x50082000, 4 * KiB },
     { "h264",             0x50084000, 4 * KiB },
-    { "jpeg",             0x50086000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
     { "pvt",              0x5009e000, 4 * KiB },
     { "csi-host",         0x5009f000, 2 * KiB },
@@ -1698,6 +1709,32 @@ static void esp32p4_init_gpio(ESP32P4MachineState *s)
                 ESP32P4_SIG_CORE_GPIO_IN_PAD_IN0 + n,
                 qdev_get_gpio_in_named(cpu, ESP32P4_CPU_GPIO_IN, i));
         }
+    }
+}
+
+/*
+ * The board's camera sensors: each wired to its port, VSYNC, HSYNC and DE
+ * driven onto the pads the source names, and PWDN and RESETB taken from
+ * theirs. A camera input attaches to the source its port's is.
+ */
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
+/* [spec:nuos:req:emu.esp32p4.mipi] */
+static void esp32p4_init_cameras(ESP32P4MachineState *s)
+{
+    if (s->dvp_camera && s->dvp_camera == s->csi_camera) {
+        error_report("esp32p4: one camera sensor cannot be both dvp-camera "
+                     "and csi-camera");
+        exit(1);
+    }
+    if (s->dvp_camera) {
+        esp32p4_image_source_bind(s->dvp_camera, ESP32P4_IMAGE_PORT_DVP,
+                                  &error_fatal);
+        esp32p4_image_source_connect_pads(s->dvp_camera, DEVICE(&s->gpio));
+    }
+    if (s->csi_camera) {
+        esp32p4_image_source_bind(s->csi_camera, ESP32P4_IMAGE_PORT_CSI,
+                                  &error_fatal);
+        esp32p4_image_source_connect_pads(s->csi_camera, DEVICE(&s->gpio));
     }
 }
 
@@ -2989,6 +3026,29 @@ static void esp32p4_init_pwm(ESP32P4MachineState *s)
                 qdev_get_gpio_in_named(dev, ESP32_MCPWM_CAP_IN, n));
         }
     }
+}
+
+/*
+ * The JPEG codec, behind JPEG_SYS_CLK and its reset, its pipeline on the
+ * same clock, its interrupt JPEG_INTR. Its data moves only through the
+ * 2D-DMA, as include/hw/misc/esp32p4_jpeg.h describes; until the 2D-DMA
+ * connects its paths, a qtest plays them.
+ */
+/* [spec:nuos:req:emu.esp32p4.jpeg] */
+static void esp32p4_init_jpeg(ESP32P4MachineState *s)
+{
+    DeviceState *dev;
+
+    object_initialize_child(OBJECT(s), "jpeg", &s->jpeg, TYPE_ESP32P4_JPEG);
+    dev = DEVICE(&s->jpeg);
+    qdev_connect_clock_in(dev, "clk",
+                          qdev_get_clock_out(DEVICE(&s->clkrst), "jpeg-sys"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_JPEG_BASE, ESP32P4_CLK_JPEG_SYS,
+                             ESP32P4_RST_JPEG, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_JPEG));
 }
 
 /*
@@ -4438,6 +4498,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_efuse(s);
     esp32p4_init_timers(s);
     esp32p4_init_gpio(s);
+    esp32p4_init_cameras(s);
     esp32p4_init_i2c(s);
     esp32p4_init_pms(s);
     esp32p4_init_dma(s);
@@ -4448,6 +4509,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_emac(s);
     esp32p4_init_spi(s);
     esp32p4_init_parlio(s);
+    esp32p4_init_jpeg(s);
     esp32p4_init_low_power(s);
     esp32p4_init_lp_core(s);
     esp32p4_init_uart(s);
@@ -4582,6 +4644,20 @@ static void esp32p4_machine_instance_init(Object *obj)
                                  object_property_allow_set_link, 0);
         object_property_set_description(obj, name, desc);
     }
+    /* Strong: the machine's camera inputs use the sensor to the end. */
+    object_property_add_link(obj, "dvp-camera", TYPE_ESP32P4_IMAGE_SOURCE,
+                             (Object **)&s->dvp_camera,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
+    object_property_set_description(obj, "dvp-camera",
+        "The camera sensor (-object esp32p4-image-source) on LCD_CAM's "
+        "camera port and the ISP's DVP input");
+    object_property_add_link(obj, "csi-camera", TYPE_ESP32P4_IMAGE_SOURCE,
+                             (Object **)&s->csi_camera,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
+    object_property_set_description(obj, "csi-camera",
+        "The camera sensor (-object esp32p4-image-source) on MIPI CSI");
 }
 
 static void esp32p4_machine_instance_finalize(Object *obj)
