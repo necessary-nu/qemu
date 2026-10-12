@@ -1184,16 +1184,22 @@ static void rp2350_soc_wire_clocks(RP2350State *s)
     clock_set_source(s->clk_sys, CLK(s, SYS));
 }
 
-/* The Winbond W25Q parts that fit each supported flash size. */
+/*
+ * The flash part of each supported size: the boards' own chips at their
+ * sizes, the Waveshare RP2350-USB-C's W25Q16JVUXIQ at 2 MiB and the Pico
+ * 2's W25Q32RVXHJQ at 4 MiB, modelled from their datasheets; Winbond W25Q
+ * parts at the others.
+ */
+/* [spec:nuos:req:emu.flash-chip] */
 static const char *rp2350_flash_part(uint32_t size)
 {
     switch (size) {
     case 1 * MiB:
         return "w25q80bl";
     case 2 * MiB:
-        return "w25q16";
+        return "w25q16jv";
     case 4 * MiB:
-        return "w25q32";
+        return "w25q32rv";
     case 8 * MiB:
         return "w25q64";
     default:
@@ -1241,6 +1247,8 @@ static bool rp2350_soc_realize_xip(RP2350State *s, Error **errp)
             continue;
         }
         dev = qdev_new(devices[cs].type);
+        object_property_add_child(OBJECT(s), cs ? "psram" : "flash",
+                                  OBJECT(dev));
         qdev_prop_set_uint8(dev, "cs", cs);
         if (cs == 0) {
             DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
@@ -1262,6 +1270,12 @@ static bool rp2350_soc_realize_xip(RP2350State *s, Error **errp)
         qdev_connect_gpio_out_named(DEVICE(sbd), "cs", cs,
                                     qdev_get_gpio_in_named(dev, SSI_GPIO_CS,
                                                            0));
+        if (cs == 0) {
+            qdev_connect_gpio_out_named(dev, "array-mapped", 0,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(sbd),
+                                            RP2350_XIP_ARRAY_MAPPED, cs));
+        }
     }
     return true;
 }

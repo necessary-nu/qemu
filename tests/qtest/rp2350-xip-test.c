@@ -354,6 +354,9 @@ static void test_program_erase(void)
     cmd_begin(qts, 0);
     flash_cmd_addr(qts, 0x20, addr);
     cmd_end(qts);
+    /* The W25Q32RV erases a sector in 30 ms, programs a page in 0.25 ms. */
+    g_assert_cmphex(flash_status(qts) & 0x01, ==, 0x01);
+    qtest_clock_step(qts, 30 * 1000 * 1000);
     g_assert_cmphex(flash_status(qts) & 0x01, ==, 0);
 
     flash_simple(qts, 0x06);
@@ -363,6 +366,8 @@ static void test_program_erase(void)
         xfer(qts, 0x10 + i);
     }
     cmd_end(qts);
+    qtest_clock_step(qts, 250 * 1000);
+    g_assert_cmphex(flash_status(qts) & 0x01, ==, 0);
 
     /* A 03h read through direct mode sees the new data. */
     cmd_begin(qts, 0);

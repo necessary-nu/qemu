@@ -732,16 +732,20 @@ static void esp32p4_init_memory(ESP32P4MachineState *s)
                            ESP32P4_PSRAM_SIZE, &error_fatal);
 }
 
-/* The Winbond W25Q parts of each flash size. */
+/*
+ * The flash part of each size: the W25Q16JV and W25Q32RV, modelled from
+ * their datasheets, at 2 and 4 MiB; Winbond W25Q parts at the others.
+ */
+/* [spec:nuos:req:emu.flash-chip] */
 static const char *esp32p4_flash_part(uint64_t size)
 {
     switch (size) {
     case 1 * MiB:
         return "w25q80bl";
     case 2 * MiB:
-        return "w25q16";
+        return "w25q16jv";
     case 4 * MiB:
-        return "w25q32";
+        return "w25q32rv";
     case 8 * MiB:
         return "w25q64";
     case 16 * MiB:
@@ -779,6 +783,7 @@ static void esp32p4_init_flash(ESP32P4MachineState *s)
         return;
     }
     flash = qdev_new(esp32p4_flash_part(s->flash_size));
+    object_property_add_child(OBJECT(s), "flash", OBJECT(flash));
     qdev_prop_set_bit(flash, "write-enable-autoclear", true);
     if (dinfo) {
         BlockBackend *blk = blk_by_legacy_dinfo(dinfo);
