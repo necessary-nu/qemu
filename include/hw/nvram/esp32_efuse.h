@@ -1,5 +1,6 @@
 #pragma once
 
+#include "hw/core/clock.h"
 #include "hw/core/registerfields.h"
 #include "hw/core/sysbus.h"
 #include "system/block-backend.h"
@@ -16,6 +17,8 @@ REG32(EFUSE_BLK1_WDATA0, 0x98)
 REG32(EFUSE_BLK2_WDATA0, 0xb8)
 REG32(EFUSE_BLK3_WDATA0, 0xd8)
 REG32(EFUSE_CLK, 0xf8)
+    FIELD(EFUSE_CLK, SEL0, 0, 8)
+    FIELD(EFUSE_CLK, SEL1, 8, 8)
 REG32(EFUSE_CONF, 0xfc)
     FIELD(EFUSE_CONF, OP_CODE, 0, 16)
 REG32(EFUSE_STATUS, 0x100)
@@ -25,6 +28,7 @@ REG32(EFUSE_INT_ST, 0x10c)
 REG32(EFUSE_INT_ENA, 0x110)
 REG32(EFUSE_INT_CLR, 0x114)
 REG32(EFUSE_DAC_CONF, 0x118)
+    FIELD(EFUSE_DAC_CONF, DAC_CLK_DIV, 0, 8)
 REG32(EFUSE_DEC_STATUS, 0x11c)
 REG32(EFUSE_DATE, 0x1fc)
 
@@ -37,6 +41,8 @@ REG32(EFUSE_DATE, 0x1fc)
 #define EFUSE_PGM_OP_CODE 0x5A5A
 
 #define ESP32_EFUSE_UPDATE_GPIO "efuse-update"
+/* Clock input: APB_CLK, which times the controller's commands */
+#define ESP32_EFUSE_APB_CLK "apb"
 
 
 typedef struct Esp32EfuseRegs {
@@ -104,6 +110,14 @@ typedef struct Esp32EfuseState {
     BlockBackend *blk;
     QEMUTimer op_timer;
     qemu_irq efuse_update_gpio;
+    Clock *apb_clk;
+    /*
+     * The running command's length in APB_CLK cycles, the cycles it had
+     * run when the clock last changed, and when that was.
+     */
+    uint64_t op_cycles;
+    uint64_t op_cycles_done;
+    int64_t op_anchor_ns;
 
     Esp32EfuseRegs efuse_wr;
     Esp32EfuseRegs efuse_wr_dis;
