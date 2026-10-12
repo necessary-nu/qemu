@@ -84,20 +84,28 @@ static void resets_update(RP2350ResetsState *s)
 }
 
 /* [spec:nuos:req:emu.resets] */
-static void resets_release_cb(void *opaque)
+void rp2350_resets_catch_up(RP2350ResetsState *s)
 {
-    RP2350ResetsState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t done = 0;
     int i;
 
     for (i = 0; i < RP2350_NUM_RESETS; i++) {
         if (s->release_ns[i] >= 0 && s->release_ns[i] <= now) {
             s->release_ns[i] = -1;
-            s->held &= ~BIT(i);
+            done |= BIT(i);
         }
     }
-    resets_sync(s);
-    resets_schedule(s);
+    if (done) {
+        s->held &= ~done;
+        resets_sync(s);
+        resets_schedule(s);
+    }
+}
+
+static void resets_release_cb(void *opaque)
+{
+    rp2350_resets_catch_up(opaque);
 }
 
 /* [spec:nuos:req:emu.resets] */
@@ -150,6 +158,7 @@ static uint64_t rp2350_resets_read(void *opaque, hwaddr addr, unsigned size)
 {
     RP2350ResetsState *s = opaque;
 
+    rp2350_resets_catch_up(s);
     switch (rp2350_atomic_reg(addr)) {
     case A_RESET:
         return s->reset;
@@ -171,6 +180,7 @@ static void rp2350_resets_write(void *opaque, hwaddr addr, uint64_t value,
 {
     RP2350ResetsState *s = opaque;
 
+    rp2350_resets_catch_up(s);
     switch (rp2350_atomic_reg(addr)) {
     case A_RESET:
         s->reset = rp2350_atomic_apply(addr, s->reset, value) &

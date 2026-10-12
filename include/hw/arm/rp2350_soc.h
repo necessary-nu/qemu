@@ -193,6 +193,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350State, RP2350_SOC)
 typedef struct RP2350ResetGate {
     MemoryRegion mr;
     const char *name;
+    RP2350State *soc;
+    int reset;
+    hwaddr base;
 } RP2350ResetGate;
 
 struct RP2350State {
@@ -266,6 +269,8 @@ struct RP2350State {
     AddressSpace sram_as;
 
     MemoryRegion *board_memory;
+    /* Board memory, for passing an access on from a lifted reset gate. */
+    AddressSpace board_as;
 
     /*
      * DORMANT: the wake events' levels (the GPIO banks' dormant_wake

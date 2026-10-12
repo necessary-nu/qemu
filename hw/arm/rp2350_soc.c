@@ -326,6 +326,34 @@ static const struct {
 };
 
 /*
+ * The gate is lifted when RESETS releases the subsystem, which can be after
+ * the release was due: an access then takes the release first, and passes
+ * on to the subsystem, out of reset, through the board memory without the
+ * gate.
+ */
+static bool rp2350_reset_gate_pass(RP2350ResetGate *gate, hwaddr addr,
+                                   uint64_t *data, unsigned size,
+                                   MemTxAttrs attrs, bool is_write,
+                                   MemTxResult *res)
+{
+    uint8_t buf[4];
+
+    rp2350_resets_catch_up(&gate->soc->resets);
+    if (gate->soc->resets.held & BIT(gate->reset)) {
+        return false;
+    }
+    if (is_write) {
+        stn_le_p(buf, size, *data);
+    }
+    *res = address_space_rw(&gate->soc->board_as, gate->base + addr, attrs,
+                            buf, size, is_write);
+    if (!is_write) {
+        *data = ldn_le_p(buf, size);
+    }
+    return true;
+}
+
+/*
  * A subsystem in reset does not answer on the bus: reads of its registers
  * return zero and writes have no effect, without a bus error. Erratum
  * RP2350-E23 documents this: SYSINFO, left in reset, reads as zero.
@@ -336,7 +364,11 @@ static MemTxResult rp2350_reset_gate_read(void *opaque, hwaddr addr,
                                           MemTxAttrs attrs)
 {
     RP2350ResetGate *gate = opaque;
+    MemTxResult res;
 
+    if (rp2350_reset_gate_pass(gate, addr, data, size, attrs, false, &res)) {
+        return res;
+    }
     qemu_log_mask(LOG_GUEST_ERROR, "rp2350: read of %s offset 0x%"
                   HWADDR_PRIx " while it is in reset\n", gate->name, addr);
     *data = 0;
@@ -349,7 +381,11 @@ static MemTxResult rp2350_reset_gate_write(void *opaque, hwaddr addr,
                                            MemTxAttrs attrs)
 {
     RP2350ResetGate *gate = opaque;
+    MemTxResult res;
 
+    if (rp2350_reset_gate_pass(gate, addr, &value, size, attrs, true, &res)) {
+        return res;
+    }
     qemu_log_mask(LOG_GUEST_ERROR, "rp2350: write to %s offset 0x%"
                   HWADDR_PRIx " while it is in reset\n", gate->name, addr);
     return MEMTX_OK;
@@ -431,6 +467,8 @@ static void rp2350_soc_init_reset_gates(RP2350State *s)
 {
     int i, n;
 
+    address_space_init(&s->board_as, s->board_memory, "rp2350-board");
+
     for (i = 0; i < RP2350_NUM_RESETS; i++) {
         for (n = 0; n < RP2350_RESET_MAX_WINDOWS; n++) {
             const RP2350ResetWindow *w = &rp2350_reset_blocks[i].window[n];
@@ -441,6 +479,9 @@ static void rp2350_soc_init_reset_gates(RP2350State *s)
                 continue;
             }
             gate->name = rp2350_reset_blocks[i].name;
+            gate->soc = s;
+            gate->reset = i;
+            gate->base = w->base;
             name = g_strdup_printf("rp2350.%s-in-reset", gate->name);
             memory_region_init_io(&gate->mr, OBJECT(s),
                                   &rp2350_reset_gate_ops, gate, name,

@@ -92,6 +92,14 @@ void rp2350_resets_set_hold_fn(RP2350ResetsState *s, RP2350ResetsHoldFn *fn,
                                void *opaque);
 
 /*
+ * Release the subsystems whose release is due. The release timer's
+ * callback can run well after that on the host clock, so whatever looks
+ * at a subsystem's reset state calls this first: RESETS' own registers,
+ * and an access to a held subsystem's registers.
+ */
+void rp2350_resets_catch_up(RP2350ResetsState *s);
+
+/*
  * Pulse the reset of the subsystems in `blocks`, as a watchdog reset does
  * for those RESETS.WDSEL selects: each restarts from its reset state, and
  * RESETS.RESET keeps its value.
