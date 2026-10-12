@@ -4,6 +4,7 @@ slow_qtests = {
   'bios-tables-test' : 910,
   'cdrom-test' : 610,
   'device-introspect-test' : 720,
+  'esp32p4-migration-test' : 240,
   'ide-test' : 120,
   'migration-test' : 480,
   'npcm7xx_pwm-test': 300,
@@ -365,6 +366,8 @@ qtests_riscv32 = \
   (config_all_devices.has_key('CONFIG_SIFIVE_E_AON') ? ['sifive-e-aon-watchdog-test'] : []) + \
   (config_all_devices.has_key('CONFIG_RISCV_VIRT') and
    config_all_accel.has_key('CONFIG_TCG') ? ['shutdown-stop-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_ESP32P4') and
+   config_all_accel.has_key('CONFIG_TCG') ? ['esp32p4-migration-test'] : []) + \
   (config_all_devices.has_key('CONFIG_ESP32P4') ?
     ['esp32p4-machine-test', 'esp32p4-clocks-test', 'esp32p4-efuse-test',
      'esp32p4-clic-test', 'esp32p4-intmatrix-test', 'esp32p4-pms-test',
