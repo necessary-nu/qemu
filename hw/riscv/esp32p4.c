@@ -203,6 +203,10 @@
  *     own resets and its DMA on PARLIO_SYS_CLK through GDMA-AXI, its pad
  *     signals matrix signals 186 to 203 and 242 (TX CS), its interrupts
  *     HP_PARLIO_RX_INTR and _TX_INTR (sources 113 and 114).
+ *   - The JPEG codec (TRM chapter 37) at 0x50086000, behind JPEG_SYS_CLK
+ *     and its reset, a baseline encoder and decoder whose pipeline runs on
+ *     the same clock, its interrupt JPEG_INTR (source 95). Its data paths
+ *     are the 2D-DMA's (include/hw/misc/esp32p4_jpeg.h).
  *   - The debug blocks (TRM chapters 3, 22 and 23): the debug assistant at
  *     0x3FF06000, watching the HP cores' SP, their accesses to four
  *     regions and their PCs; each HP core's RISC-V trace encoder, at
@@ -431,7 +435,6 @@ static const struct {
     /* HP peripherals 0. */
     { "pau",              0x50082000, 4 * KiB },
     { "h264",             0x50084000, 4 * KiB },
-    { "jpeg",             0x50086000, 4 * KiB },
     { "ppa",              0x50087000, 4 * KiB },
     { "dma2d",            0x50088000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
@@ -2938,6 +2941,29 @@ static void esp32p4_init_pwm(ESP32P4MachineState *s)
 }
 
 /*
+ * The JPEG codec, behind JPEG_SYS_CLK and its reset, its pipeline on the
+ * same clock, its interrupt JPEG_INTR. Its data moves only through the
+ * 2D-DMA, as include/hw/misc/esp32p4_jpeg.h describes; until the 2D-DMA
+ * connects its paths, a qtest plays them.
+ */
+/* [spec:nuos:req:emu.esp32p4.jpeg] */
+static void esp32p4_init_jpeg(ESP32P4MachineState *s)
+{
+    DeviceState *dev;
+
+    object_initialize_child(OBJECT(s), "jpeg", &s->jpeg, TYPE_ESP32P4_JPEG);
+    dev = DEVICE(&s->jpeg);
+    qdev_connect_clock_in(dev, "clk",
+                          qdev_get_clock_out(DEVICE(&s->clkrst), "jpeg-sys"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_JPEG_BASE, ESP32P4_CLK_JPEG_SYS,
+                             ESP32P4_RST_JPEG, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_JPEG));
+}
+
+/*
  * The BitScrambler, between GDMA and the peripherals HP_SYSTEM attaches it
  * to; and the parallel IO controller, served by GDMA-AXI, its pads through
  * the GPIO matrix.
@@ -4382,6 +4408,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_emac(s);
     esp32p4_init_spi(s);
     esp32p4_init_parlio(s);
+    esp32p4_init_jpeg(s);
     esp32p4_init_low_power(s);
     esp32p4_init_lp_core(s);
     esp32p4_init_uart(s);
