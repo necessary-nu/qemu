@@ -88,6 +88,7 @@ static void systick_follow_clock(SysTickState *s)
  */
 static void systick_clock_changed(SysTickState *s)
 {
+    ptimer_run_due(s->ptimer);
     ptimer_transaction_begin(s->ptimer);
     if (!clock_is_enabled(systick_clock(s))) {
         ptimer_stop(s->ptimer);
@@ -127,6 +128,9 @@ static MemTxResult systick_read(void *opaque, hwaddr addr, uint64_t *data,
         /* Generate BusFault for unprivileged accesses */
         return MEMTX_ERROR;
     }
+
+    /* The counter, and COUNTFLAG, as of the access. */
+    ptimer_run_due(s->ptimer);
 
     switch (addr) {
     case 0x0: /* SysTick Control and Status.  */
@@ -190,6 +194,7 @@ static MemTxResult systick_write(void *opaque, hwaddr addr,
     }
 
     trace_systick_write(addr, value, size);
+    ptimer_run_due(s->ptimer);
 
     switch (addr) {
     case 0x0: /* SysTick Control and Status.  */

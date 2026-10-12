@@ -160,6 +160,25 @@ void ptimer_transaction_begin(ptimer_state *s);
 void ptimer_transaction_commit(ptimer_state *s);
 
 /**
+ * ptimer_run_due - Take the expiries that fell due before now
+ * @s: ptimer
+ *
+ * Without icount the timer's callback can run late, after the guest has
+ * already gone on past the time an expiry fell due; until it runs, the
+ * counter reads 0 and the device has not seen the expiry. This takes
+ * each such expiry now, as the late callback would: the counter reloads
+ * on the timer's own schedule, from when the expiry fell due, and the
+ * device's callback runs. A device calls it before an access that reads
+ * or changes the counter or depends on its expiries, so that the access
+ * sees the timer as of its own time. Under icount the timer always runs
+ * at its time, and this does nothing.
+ *
+ * This function must not be called within a ptimer_transaction_begin/
+ * commit block.
+ */
+void ptimer_run_due(ptimer_state *s);
+
+/**
  * ptimer_set_period - Set counter increment interval in nanoseconds
  * @s: ptimer to configure
  * @period: period of the counter in nanoseconds
