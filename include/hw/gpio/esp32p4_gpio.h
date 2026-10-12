@@ -321,6 +321,45 @@ typedef struct ESP32P4GpioFilter {
     uint64_t tick;
 } ESP32P4GpioFilter;
 
+/* Words of a bitmap of the HP signals */
+#define ESP32P4_GPIO_SIG_WORDS  (ESP32P4_GPIO_SIGS / 64)
+/* Values of GPIO_PINn_INT_TYPE and LP_GPIO_PINn_INT_TYPE, 3-bit fields */
+#define ESP32P4_GPIO_INT_TYPES  8
+
+/*
+ * The routing the registers set up, for a recomputation that takes in
+ * one change: what each signal and pad reaches. Bit n of a pad mask is
+ * GPIOn.
+ */
+typedef struct ESP32P4GpioRoutes {
+    /* The pads whose drive takes each HP and LP output signal */
+    uint64_t out_pads[ESP32P4_GPIO_SIGS];
+    uint32_t lp_out_pads[ESP32P4_GPIO_LP_SIGS];
+    /* The pads on each pad's board wire, itself among them */
+    uint64_t wire_net[ESP32P4_GPIO_PADS];
+    /*
+     * The HP input signals each pad's HP chain reaches through the GPIO
+     * matrix, and those its unfiltered input reaches through its IO MUX
+     * function; the LP input signals each LP pad's LP chain reaches.
+     */
+    uint64_t chain_sigs[ESP32P4_GPIO_PADS][ESP32P4_GPIO_SIG_WORDS];
+    uint64_t direct_sigs[ESP32P4_GPIO_PADS][ESP32P4_GPIO_SIG_WORDS];
+    uint32_t lp_chain_sigs[ESP32P4_GPIO_LP_PADS];
+    /* The pad whose IO MUX function carries each input signal, or -1 */
+    int8_t iomux_src[ESP32P4_GPIO_SIGS];
+    /*
+     * The pads of each interrupt type, those with WAKEUP_ENABLE set, and
+     * those whose status each of GPIO_INTR0 to _3 takes; the LP pads of
+     * each type, with WAKEUP_ENABLE, and with it on an edge type.
+     */
+    uint64_t int_type[ESP32P4_GPIO_INT_TYPES];
+    uint64_t wakeup;
+    uint64_t intr[4];
+    uint64_t lp_int_type[ESP32P4_GPIO_INT_TYPES];
+    uint32_t lp_wakeup;
+    uint32_t lp_edge_wakeup;
+} ESP32P4GpioRoutes;
+
 /* An MMIO region's block, ESP32P4_GPIO_MMIO_*, for its accessors. */
 typedef struct ESP32P4GpioRegion {
     ESP32P4GpioState *s;
@@ -487,6 +526,19 @@ struct ESP32P4GpioState {
      */
     int64_t round_ns;
     Esp32LineDeferred deferred;
+    /*
+     * What has changed since the last round, for the next to take in:
+     * the drive of these pads, the filters' outputs, or anything at all,
+     * for which the round recomputes everything (see propagate()).
+     */
+    uint64_t dirty_pads;
+    bool filters_dirty;
+    bool dirty_all;
+    /* The routing, as of the last round that recomputed everything */
+    ESP32P4GpioRoutes routes;
+    /* The pads pulled up and with their input enabled, as resolved */
+    uint64_t pulled;
+    uint64_t ie_mask;
 };
 
 /*
