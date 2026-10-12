@@ -15,13 +15,20 @@
  * inversions it does not follow.
  *
  * While its chardev is connected the terminal drives its TX pad, idle
- * high, as a bridge's TX output does. It starts a frame of the chardev's
- * bytes only while the UART's RX FIFO has room for it and the frame
- * before, which the UART may still be decoding (esp32_uart_line_rx_room()),
- * and starts the next when the UART tells it the FIFO has room again: the
- * host's bytes wait for the chip, as QEMU's serial devices take host
- * input, rather than overflow a FIFO the chip's CPU, held up by the host,
- * has not had the chance to empty.
+ * high, as a bridge's TX output does, and sends the chardev's bytes back
+ * to back at the line's rate, as a bridge does whatever the chip does
+ * with them: a UART whose software stops reading overflows its RX FIFO
+ * and loses bytes, as on silicon.
+ *
+ * Only on the host's clock (neither icount nor qtest's clock) does it
+ * pace them: it starts a frame only while the UART's RX FIFO has room for
+ * it and the frame before, which the UART may still be decoding
+ * (esp32_uart_line_rx_room()), and starts the next when the UART tells it
+ * the FIFO has room again. That stands in for a CPU the host has
+ * descheduled: virtual time then runs on without it, and a line kept at
+ * its rate would overflow a FIFO that software reading at the chip's
+ * speed empties in time. Under icount virtual time stops with the CPU,
+ * so the line cannot outrun software that reads.
  *
  * Its "break" property holds that line low, a break, as a host does with
  * its serial port's break condition: a frame being sent is cut off, and
@@ -41,6 +48,8 @@
 #include "hw/char/esp32_uart_terminal.h"
 #include "hw/gpio/esp32_line.h"
 #include "migration/vmstate.h"
+#include "exec/icount.h"
+#include "system/qtest.h"
 
 static gboolean term_out_ready(void *do_not_use, GIOCondition cond,
                                void *opaque);
@@ -138,8 +147,19 @@ static unsigned term_tx_next_change(Esp32UartTerminalState *s)
 static void term_tx_advance(Esp32UartTerminalState *s);
 
 /*
+ * On the host's clock, whether the UART's RX FIFO lacks room for a frame
+ * and one being decoded, so that the host's bytes wait (see the top of
+ * the file).
+ */
+static bool term_rx_paced(Esp32UartTerminalState *s)
+{
+    return !icount_enabled() && !qtest_enabled() &&
+           esp32_uart_line_rx_room(s->uart) < 2;
+}
+
+/*
  * Start sending the next byte waiting, at start_ns, if the UART can run
- * and its RX FIFO has room for this frame and one being decoded.
+ * and, on the host's clock, its RX FIFO has room for it.
  */
 static bool term_tx_start(Esp32UartTerminalState *s, int64_t start_ns)
 {
@@ -147,8 +167,7 @@ static bool term_tx_start(Esp32UartTerminalState *s, int64_t start_ns)
     bool was_full = fifo8_is_full(&s->in);
 
     if (s->brk || fifo8_is_empty(&s->in) ||
-        !esp32_uart_line_get_format(s->uart, &fmt) ||
-        esp32_uart_line_rx_room(s->uart) < 2) {
+        !esp32_uart_line_get_format(s->uart, &fmt) || term_rx_paced(s)) {
         return false;
     }
     s->tx_nbits = esp32_uart_frame_levels(&fmt, fifo8_pop(&s->in),
