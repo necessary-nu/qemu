@@ -62,6 +62,8 @@
  *     clears as it is read, its INT_FORCE bits reading as set while set;
  *     CSI_INTR is high while a group has a status bit whose INT_MSK bit is
  *     set. INT_ST_MAIN shows the groups that have, latched until read.
+ *     Register accesses first bring the PHY's start-up up to their time,
+ *     however late the QEMU timer that times it.
  *   - "packet", a qtest's hook: a hex string of a whole packet as it comes
  *     off the lanes (header, ECC, payload, checksum) is received now, past
  *     the PHY, as the sensor cannot make errors.
@@ -119,6 +121,8 @@
  *   - HOST_CTRL's CSI_ENABLECLK and CSI_CFG_CLK_EN gate the host's clock
  *     lane and PHY clock; LOOPBK_TEST_EN (the DSI PHY looped to this one)
  *     is not modelled (logged).
+ *   - Register accesses, VDMA's reads and its acknowledges first end a
+ *     request interval that fell due before them, at its time.
  */
 
 #include "qemu/osdep.h"
@@ -277,6 +281,18 @@ static void phy_timer_cb(void *opaque)
     ESP32P4CsiHostState *s = opaque;
 
     esp32_line_run_at(s->phy_due_ns, phy_update, s);
+}
+
+/*
+ * A register access at esp32_line_time(): first the PHY's start-up, if it
+ * fell due before, at its own time.
+ */
+static void phy_catch_up(ESP32P4CsiHostState *s)
+{
+    if (timer_pending(s->phy_timer) && s->phy_due_ns <= esp32_line_time()) {
+        timer_del(s->phy_timer);
+        esp32_line_run_at(s->phy_due_ns, phy_update, s);
+    }
 }
 
 static uint32_t host_lanes(ESP32P4CsiHostState *s)
@@ -613,6 +629,7 @@ static uint64_t host_read(void *opaque, hwaddr addr, unsigned size)
     int g, k;
     uint32_t v;
 
+    phy_catch_up(s);
     switch (addr) {
     case A_VERSION:
         return 0x3135302a;
@@ -673,6 +690,7 @@ static void host_write(void *opaque, hwaddr addr, uint64_t value,
     uint8_t data;
     int g, k;
 
+    phy_catch_up(s);
     switch (addr) {
     case A_N_LANES:
         if ((v & 7) > 1) {
@@ -1053,6 +1071,19 @@ static void brg_req_timer_cb(void *opaque)
     esp32_line_run_at(s->req_hold_ns, (void (*)(void *))brg_update_req, s);
 }
 
+/*
+ * An access or acknowledge at esp32_line_time(): first the request
+ * interval's end, if it fell due before, at its own time.
+ */
+static void brg_catch_up(ESP32P4CsiBridgeState *s)
+{
+    if (timer_pending(s->req_timer) && s->req_hold_ns <= esp32_line_time()) {
+        timer_del(s->req_timer);
+        esp32_line_run_at(s->req_hold_ns,
+                          (void (*)(void *))brg_update_req, s);
+    }
+}
+
 static void brg_hs_ack(void *opaque, int n, int level)
 {
     ESP32P4CsiBridgeState *s = opaque;
@@ -1062,6 +1093,7 @@ static void brg_hs_ack(void *opaque, int n, int level)
     if (!level) {
         return;
     }
+    brg_catch_up(s);
     if (s->req_last || (s->req && ++s->bursts >= s->blk_size)) {
         s->bursts = 0;
         if (breg(s, C_DMA_REQ_CFG) & CFG_UPD_BY_BLK) {
@@ -1094,8 +1126,10 @@ static uint64_t brg_mem_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4CsiBridgeState *s = opaque;
     uint8_t b[8] = { 0 };
-    uint32_t n = MIN(size, s->buf_num);
+    uint32_t n;
 
+    brg_catch_up(s);
+    n = MIN(size, s->buf_num);
     if (n < size) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of the buffer's port with "
                       "%u of %u bytes there\n", TYPE_ESP32P4_CSI_BRIDGE, n,
@@ -1472,6 +1506,7 @@ static uint64_t brg_read(void *opaque, hwaddr addr, unsigned size)
     ESP32P4CsiBridgeState *s = opaque;
     const CsiReg *r = brg_reg(addr);
 
+    brg_catch_up(s);
     if (!r) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of unknown register 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_CSI_BRIDGE, addr);
@@ -1496,6 +1531,7 @@ static void brg_write(void *opaque, hwaddr addr, uint64_t value,
     const CsiReg *r = brg_reg(addr);
     uint32_t v = value, old;
 
+    brg_catch_up(s);
     if (!r) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write of unknown register 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_CSI_BRIDGE, addr);
