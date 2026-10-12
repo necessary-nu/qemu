@@ -22,6 +22,9 @@ config GUEST_LOADER
     default y
     depends on TCG && DEVICE_TREE
 
+config LINE_TIME
+    bool
+
 config OR_IRQ
     bool
 
