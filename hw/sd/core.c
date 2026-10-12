@@ -274,6 +274,19 @@ int64_t sdbus_busy_end_time(SDBus *sdbus)
     return 0;
 }
 
+void sdbus_set_power(SDBus *sdbus, bool on)
+{
+    SDState *card = get_card(sdbus);
+
+    if (card) {
+        SDCardClass *sc = SDMMC_COMMON_GET_CLASS(card);
+
+        if (sc->set_power) {
+            sc->set_power(card, on);
+        }
+    }
+}
+
 int64_t sdbus_get_time(SDBus *sdbus)
 {
     SDBusClass *sbc = SD_BUS_GET_CLASS(sdbus);

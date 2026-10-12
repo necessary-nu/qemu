@@ -53,6 +53,7 @@
 #include "sdmmc-internal.h"
 #include "trace.h"
 #include "crypto/hmac.h"
+#include "hw/block/power_cut.h"
 #include "system/runstate.h"
 
 //#define DEBUG_SD 1
@@ -191,6 +192,8 @@ typedef struct SDTiming {
     int64_t t_read;
     int64_t t_prog;
 
+    /* The card's supply is off: it holds no state and answers nothing. */
+    bool unpowered;
     /* When the read block the card is sending can start on DAT */
     int64_t data_ready;
     SDTimedOp op;
@@ -1147,6 +1150,7 @@ static const VMStateDescription sd_timing_vmstate = {
     .minimum_version_id = 1,
     .needed = sd_timing_vmstate_needed,
     .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(tm.unpowered, SDState),
         VMSTATE_INT64(tm.data_ready, SDState),
         VMSTATE_UINT8(tm.op.kind, SDState),
         VMSTATE_UINT64(tm.op.addr, SDState),
@@ -1548,6 +1552,14 @@ static int64_t sd_erase_end(SDState *sd, int64_t t, uint64_t addr,
     return sd_add_ns(t, ns);
 }
 
+static void sd_load(SDState *sd, uint64_t addr, void *buf, uint64_t len)
+{
+    if (!sd->blk || blk_pread(sd->blk, addr + sd_part_offset(sd), len, buf,
+                              0) < 0) {
+        error_report("sd: reading the card's drive failed");
+    }
+}
+
 static void sd_store(SDState *sd, uint64_t addr, const void *buf,
                      uint64_t len)
 {
@@ -1557,18 +1569,30 @@ static void sd_store(SDState *sd, uint64_t addr, const void *buf,
     }
 }
 
-/* Erase [@addr, @addr + @len), an SDSC card skipping its protected groups. */
-static void sd_erase_cells(SDState *sd, uint64_t addr, uint64_t len)
+/*
+ * Erase [@addr, @addr + @len): every cell (@thr UINT32_MAX and @whole),
+ * or those a cut leaves done. An SDSC card skips its write protected
+ * groups.
+ */
+static void sd_erase_cells(SDState *sd, uint64_t addr, uint64_t len,
+                           uint32_t thr, bool whole)
 {
     g_autofree uint8_t *buf = g_malloc(SD_ERASE_CHUNK);
     uint64_t end = addr + len;
 
-    memset(buf, 0xff, SD_ERASE_CHUNK);
     while (addr < end) {
         uint64_t n = MIN(end - addr, SD_ERASE_CHUNK - addr % SD_ERASE_CHUNK);
 
         if (sd->tm.kind != SD_KIND_SDSC ||
             !test_bit(sd_addr_to_wpnum(addr), sd->wp_group_bmap)) {
+            if (whole) {
+                memset(buf, 0xff, n);
+            } else {
+                sd_load(sd, addr, buf, n);
+                for (uint64_t i = 0; i < n; i++) {
+                    buf[i] |= power_cut_done_mask((addr + i) * 8, thr);
+                }
+            }
             sd_store(sd, addr, buf, n);
         }
         addr += n;
@@ -1604,7 +1628,7 @@ static void sd_op_finish(SDState *sd)
         sd->blk_written++;
         break;
     case SD_OP_ERASE:
-        sd_erase_cells(sd, op->addr, op->len);
+        sd_erase_cells(sd, op->addr, op->len, UINT32_MAX, true);
         break;
     default:
         break;
@@ -1634,20 +1658,62 @@ static bool sd_busy(SDState *sd)
 }
 
 /*
- * A reset of the card or QEMU's shutdown: what the card has in hand
- * completes at once, its blocks stored.
+ * [spec:nuos:req:emu.sd-card-power-cut]
+ * Cut what the card has in hand short, at the present. A block's
+ * programming or an erase cut short leaves its cells as
+ * hw/block/power_cut.h gives them, by the fraction of its time that has
+ * passed, each cell (bit address: card byte address * 8 + bit) new,
+ * written or erased to 1, or as it was; blocks a write finished keep their
+ * new contents and blocks it never sent their old. The cuts: a power cycle
+ * (a reset of the card, which the machines give it with QEMU's system
+ * reset only), the board switching the card's supply off (sdbus_set_power),
+ * QEMU's shutdown, and CMD0 and CMD15, which terminate any programming
+ * ("This may destroy the data contents on the card", 4.3). A reset of the
+ * controller does not reach the card: what it programs goes on.
  */
 static void sd_timing_cut(SDState *sd)
 {
-    if (sd->tm.op.kind != SD_OP_NONE) {
-        sd_op_finish(sd);
+    SDTimedOp *op = &sd->tm.op;
+    int64_t now, done;
+    uint32_t thr;
+
+    if (op->kind == SD_OP_NONE) {
+        return;
     }
+    now = sd_now(sd);
+    if (now >= op->end) {
+        sd_op_finish(sd);
+        return;
+    }
+    done = now - op->start;
+    trace_sdcard_cut(op->kind, op->addr, done, op->end - op->start);
+    thr = power_cut_threshold(done, op->end - op->start);
+    if (op->kind == SD_OP_WRITE) {
+        uint8_t old[512];
+
+        sd_load(sd, op->addr, old, op->len);
+        for (uint64_t i = 0; i < op->len; i++) {
+            uint8_t done_mask = power_cut_done_mask((op->addr + i) * 8, thr);
+
+            old[i] = (old[i] & ~done_mask) | (op->data[i] & done_mask);
+        }
+        sd_store(sd, op->addr, old, op->len);
+    } else if (op->kind == SD_OP_ERASE && thr) {
+        sd_erase_cells(sd, op->addr, op->len, thr, false);
+    }
+    op->kind = SD_OP_NONE;
+    sd->card_status |= READY_FOR_DATA;
 }
 
-/* QEMU shuts down: the card stores what it has in hand. */
+/* [spec:nuos:req:emu.sd-card-power-cut] */
+/* QEMU shuts down: the card loses power. */
 static void sd_timing_shutdown(Notifier *n, void *opaque)
 {
-    sd_timing_cut(container_of(n, SDState, tm.shutdown));
+    SDState *sd = container_of(n, SDState, tm.shutdown);
+
+    if (!sd->tm.unpowered) {
+        sd_timing_cut(sd);
+    }
 }
 
 /* [spec:nuos:req:emu.sd-card-timing] */
@@ -1743,6 +1809,7 @@ static void sd_timing_reset(SDState *sd)
     st[14] = tm->uhs_grade << 4 | (tm->uhs_grade ? au : 0);
     sd->scr[1] |= 0x80;
 
+    tm->unpowered = false;
     tm->data_ready = 0;
     tm->op.kind = SD_OP_NONE;
 }
@@ -1891,6 +1958,10 @@ static void sd_timing_erase(SDState *sd, uint64_t addr, uint64_t len)
 /* [spec:nuos:req:emu.sd-card-timing] */
 static uint8_t sd_timed_dat_lines(SDState *sd, uint8_t lines)
 {
+    if (sd->tm.unpowered) {
+        /* The board's pull-ups */
+        return 0xf;
+    }
     sd_timing_sync(sd);
     return sd_busy(sd) ? lines & ~1 : lines;
 }
@@ -1898,6 +1969,9 @@ static uint8_t sd_timed_dat_lines(SDState *sd, uint8_t lines)
 /* [spec:nuos:req:emu.sd-card-timing] */
 static int64_t sd_data_ready_time(SDState *sd)
 {
+    if (sd->tm.unpowered) {
+        return INT64_MAX;
+    }
     if (!sd->tm.on) {
         return 0;
     }
@@ -1908,11 +1982,36 @@ static int64_t sd_data_ready_time(SDState *sd)
 /* [spec:nuos:req:emu.sd-card-timing] */
 static int64_t sd_busy_end_time(SDState *sd)
 {
-    if (!sd->tm.on) {
+    if (!sd->tm.on || sd->tm.unpowered) {
         return 0;
     }
     sd_timing_sync(sd);
     return sd_busy(sd) ? sd->tm.op.end : 0;
+}
+
+/* [spec:nuos:req:emu.sd-card-power-cut] */
+/*
+ * The board switches the card's supply: off, it loses what it had in hand
+ * and its state, and answers nothing, its lines left to the board's
+ * pull-ups; on, it starts from power-up.
+ */
+static void sd_set_power(SDState *sd, bool on)
+{
+    SDTiming *tm = &sd->tm;
+
+    if (on == !tm->unpowered) {
+        return;
+    }
+    trace_sdcard_power(on);
+    if (!on) {
+        if (tm->on) {
+            sd_timing_cut(sd);
+        }
+        tm->unpowered = true;
+    } else {
+        tm->unpowered = false;
+        sd_reset(DEVICE(sd));
+    }
 }
 
 static bool rpmb_calc_hmac(SDState *sd, const RPMBDataFrame *frame,
@@ -2744,6 +2843,9 @@ static sd_rsp_type_t sd_cmd_GO_INACTIVE_STATE(SDState *sd, SDRequest req)
         return sd_invalid_state_for_cmd(sd, req);
     }
     if (sd_req_rca_same(sd, req)) {
+        if (sd->tm.on) {
+            sd_timing_cut(sd);
+        }
         sd->state = sd_inactive_state;
     }
 
@@ -3299,6 +3401,9 @@ static size_t sd_do_command(SDState *sd, SDRequest *req,
     if (!sd->blk || !blk_is_inserted(sd->blk)) {
         return 0;
     }
+    if (sd->tm.unpowered) {
+        return 0;
+    }
     if (sd->tm.on) {
         sd_timing_sync(sd);
     }
@@ -3475,6 +3580,9 @@ static size_t sd_write_data(SDState *sd, const void *buf, size_t length)
         return length;
     }
 
+    if (sd->tm.unpowered) {
+        return length;
+    }
     if (sd->tm.on) {
         sd_timing_sync(sd);
     }
@@ -3647,7 +3755,7 @@ static size_t sd_read_data(SDState *sd, void *buf, size_t length)
     uint32_t io_len;
     uint8_t *value = buf;
 
-    if (!sd->blk || !blk_is_inserted(sd->blk)) {
+    if (!sd->blk || !blk_is_inserted(sd->blk) || sd->tm.unpowered) {
         memset(buf, dummy_byte, length);
         return length;
     }
@@ -3738,6 +3846,9 @@ static size_t sd_read_data(SDState *sd, void *buf, size_t length)
 
 static bool sd_receive_ready(SDState *sd)
 {
+    if (sd->tm.unpowered) {
+        return false;
+    }
     if (sd->tm.on) {
         sd_timing_sync(sd);
         if (sd_busy(sd)) {
@@ -3749,6 +3860,9 @@ static bool sd_receive_ready(SDState *sd)
 
 static bool sd_data_ready(SDState *sd)
 {
+    if (sd->tm.unpowered) {
+        return false;
+    }
     if (sd->tm.on) {
         sd_timing_sync(sd);
         if (sd->state == sd_sendingdata_state &&
@@ -4124,6 +4238,7 @@ static void sdmmc_common_class_init(ObjectClass *klass, const void *data)
     sc->get_readonly = sd_get_readonly;
     sc->data_ready_time = sd_data_ready_time;
     sc->busy_end_time = sd_busy_end_time;
+    sc->set_power = sd_set_power;
 }
 
 static void sd_class_init(ObjectClass *klass, const void *data)

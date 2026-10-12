@@ -149,6 +149,8 @@ struct SDCardClass {
      */
     int64_t (*data_ready_time)(SDState *sd);
     int64_t (*busy_end_time)(SDState *sd);
+    /* The board switches the card's supply on or off. */
+    void (*set_power)(SDState *sd, bool on);
 
     const struct SDProto *proto;
 };
@@ -259,6 +261,15 @@ int64_t sdbus_data_ready_time(SDBus *sd);
  * erases) ends; 0 while it is not busy, or for no card.
  */
 int64_t sdbus_busy_end_time(SDBus *sd);
+/**
+ * sdbus_set_power: The board switches the supply of the card on @sd
+ * @sd: bus
+ * @on: true to power the card
+ *
+ * A card switched off loses its state and does not answer; switched on,
+ * it starts from power-up.
+ */
+void sdbus_set_power(SDBus *sd, bool on);
 /**
  * sdbus_reparent_card: Reparent an SD card from one controller to another
  * @from: controller bus to remove card from
