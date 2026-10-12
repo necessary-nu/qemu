@@ -409,11 +409,42 @@ static void pl022_set_fssin(void *opaque, int n, int level)
     pl022_update(s);
 }
 
+/*
+ * A register access first takes the frame ends and receive timeout due by
+ * its moment, each at its own time: without icount their timers run late
+ * on a loaded host, and until they do software would read BSY, the FIFOs
+ * and the interrupts as of when the host got to them, not of the access.
+ *
+ * A frame that would end into a full receive FIFO is left to its timer.
+ * Inside an access, whatever drains the FIFO cannot get to it between the
+ * frames taken (the DMA, which may be making the access, cannot re-enter
+ * the port), so the frames' receive DREQs would go unanswered and the
+ * FIFO overrun where on the chip it is drained at each frame's end.
+ */
+static void pl022_catch_up(PL022State *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    while (timer_pending(s->frame_timer) &&
+           timer_expire_time_ns(s->frame_timer) <= now &&
+           !(s->busy && s->rx_fifo_len == PL022_FIFO_DEPTH)) {
+        timer_del(s->frame_timer);
+        pl022_frame_done(s);
+    }
+    if (timer_pending(s->rt_timer) &&
+        timer_expire_time_ns(s->rt_timer) <= now) {
+        timer_del(s->rt_timer);
+        pl022_rt_expired(s);
+    }
+}
+
 static uint64_t pl022_read(void *opaque, hwaddr offset,
                            unsigned size)
 {
     PL022State *s = (PL022State *)opaque;
     int val;
+
+    pl022_catch_up(s);
 
     if (offset >= 0xfe0 && offset < 0x1000) {
         val = pl022_id[(offset - 0xfe0) >> 2];
@@ -491,6 +522,8 @@ static void pl022_write(void *opaque, hwaddr offset,
                         uint64_t value, unsigned size)
 {
     PL022State *s = (PL022State *)opaque;
+
+    pl022_catch_up(s);
 
     switch (offset) {
     case 0x00: /* CR0 */
