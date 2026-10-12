@@ -1525,8 +1525,18 @@ static void test_usj_host(void)
     qtest_quit(qts);
 }
 
-/* How long esptool waits for SYNC's response before resending it. */
+/*
+ * How long esptool waits for SYNC's response before resending it, and how
+ * many SYNCs one attempt of its connect sends.
+ */
 #define SYNC_WAIT_MS    100
+#define SYNC_TRIES      5
+
+#define SYSTIMER_UNIT0_OP   0x500e2004
+#define SYSTIMER_UNIT0_HI   0x500e2040
+#define SYSTIMER_UNIT0_LO   0x500e2044
+#define SYSTIMER_UPDATE     (1u << 30)
+#define SYSTIMER_PER_MS     16000
 
 /*
  * Read from @fd into @buf, up to @len bytes, until @want shows or @ms
@@ -1554,15 +1564,26 @@ static size_t read_until(int fd, char *buf, size_t len, const char *want,
 }
 
 /*
- * The boot ROM in download mode (strap-mode 0x04, GPIO35 low and GPIO36
- * high) through serial port 0: it says it is waiting, then answers
- * esptool's SLIP-framed SYNC command, received on GPIO38 by UART0 with
- * the ROM's interrupt-driven receiver, with SYNC's response. The ROM
- * detects the baud rate from the first SYNC and answers a later one, so
- * SYNC is resent until answered, as esptool resends it.
+ * The chip's time in milliseconds, from the system timer's unit 0, which
+ * the boot ROM leaves alone. esptool's timeouts are the chip's time on
+ * silicon; under icount on a busy host the chip runs slower than the
+ * wall clock, so they are measured on the chip.
  */
-/* [spec:nuos:req:emu.esp32p4.uart/test] */
-static void test_rom_download_sync(void)
+static uint64_t chip_ms(QTestState *qts)
+{
+    uint64_t ticks;
+
+    qtest_writel(qts, SYSTIMER_UNIT0_OP, SYSTIMER_UPDATE);
+    ticks = qtest_readl(qts, SYSTIMER_UNIT0_HI);
+    ticks = ticks << 32 | qtest_readl(qts, SYSTIMER_UNIT0_LO);
+    return ticks / SYSTIMER_PER_MS;
+}
+
+/*
+ * Send esptool's SLIP-framed SYNC command on @fd and wait SYNC_WAIT_MS of
+ * the chip's time for a SYNC response: true if one came.
+ */
+static bool sync_once(QTestState *qts, int fd)
 {
     static const uint8_t sync_cmd[] = {
         0xc0, 0x00, 0x08, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1574,6 +1595,46 @@ static void test_rom_download_sync(void)
         0xc0,
     };
     static const char sync_resp[] = { (char)0xc0, 0x01, 0x08 };
+    char buf[512];
+    size_t got = 0;
+    uint64_t deadline;
+
+    g_assert_cmpint(send(fd, sync_cmd, sizeof(sync_cmd), 0), ==,
+                    sizeof(sync_cmd));
+    deadline = chip_ms(qts) + SYNC_WAIT_MS;
+    while (chip_ms(qts) < deadline) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+
+        if (poll(&pfd, 1, 10) > 0) {
+            ssize_t n;
+
+            if (got == sizeof(buf)) {
+                memmove(buf, buf + got - 2, 2);
+                got = 2;
+            }
+            n = recv(fd, buf + got, sizeof(buf) - got, 0);
+            g_assert_cmpint(n, >, 0);
+            got += n;
+        }
+        if (memmem(buf, got, sync_resp, sizeof(sync_resp))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * The boot ROM in download mode (strap-mode 0x04, GPIO35 low and GPIO36
+ * high) through serial port 0: it says it is waiting, then answers
+ * esptool's SLIP-framed SYNC command, received on GPIO38 by UART0 with
+ * the ROM's interrupt-driven receiver, with SYNC's response. The ROM
+ * detects the baud rate from the first SYNC and answers a later one, so
+ * SYNC is resent until answered, as esptool resends it, within the five
+ * SYNCs of one attempt of esptool's connect.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+static void test_rom_download_sync(void)
+{
     static const char waiting[] = "waiting for download";
     char buf[512];
     size_t got = 0;
@@ -1586,16 +1647,9 @@ static void test_rom_download_sync(void)
                      30000);
     g_assert_nonnull(memmem(buf, got, "DOWNLOAD(USB/UART0/SPI)", 23));
     g_assert_nonnull(memmem(buf, got, waiting, strlen(waiting)));
-    for (i = 0; i < 30000 / SYNC_WAIT_MS; i++) {
-        g_assert_cmpint(send(fd, sync_cmd, sizeof(sync_cmd), 0), ==,
-                        sizeof(sync_cmd));
-        got = read_until(fd, buf, sizeof(buf), sync_resp, sizeof(sync_resp),
-                         SYNC_WAIT_MS);
-        if (memmem(buf, got, sync_resp, sizeof(sync_resp))) {
-            break;
-        }
+    for (i = 0; i < SYNC_TRIES && !sync_once(qts, fd); i++) {
     }
-    g_assert_nonnull(memmem(buf, got, sync_resp, sizeof(sync_resp)));
+    g_assert_cmpint(i, <, SYNC_TRIES);
     close(fd);
     qtest_quit(qts);
 }
@@ -1608,32 +1662,13 @@ static void test_rom_download_sync(void)
 /* [spec:nuos:req:emu.esp32p4.uart/test] */
 static void test_rom_download_sync_usj(void)
 {
-    static const uint8_t sync_cmd[] = {
-        0xc0, 0x00, 0x08, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x07, 0x07, 0x12, 0x20,
-        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
-        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
-        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
-        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
-        0xc0,
-    };
-    static const char sync_resp[] = { (char)0xc0, 0x01, 0x08 };
-    char buf[512];
-    size_t got = 0;
     int fd, i;
     QTestState *qts = start_usj_args(&fd, ",strap-mode=0x04 -accel tcg "
                                      "-icount shift=0,sleep=off");
 
-    for (i = 0; i < 30000 / SYNC_WAIT_MS; i++) {
-        g_assert_cmpint(send(fd, sync_cmd, sizeof(sync_cmd), 0), ==,
-                        sizeof(sync_cmd));
-        got = read_until(fd, buf, sizeof(buf), sync_resp, sizeof(sync_resp),
-                         SYNC_WAIT_MS);
-        if (memmem(buf, got, sync_resp, sizeof(sync_resp))) {
-            break;
-        }
+    for (i = 0; i < SYNC_TRIES && !sync_once(qts, fd); i++) {
     }
-    g_assert_nonnull(memmem(buf, got, sync_resp, sizeof(sync_resp)));
+    g_assert_cmpint(i, <, SYNC_TRIES);
     close(fd);
     qtest_quit(qts);
 }
