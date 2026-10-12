@@ -606,13 +606,16 @@ static void rtc_adc_start(Esp32SensState *s, unsigned unit)
                    bits + 1) * div);
 }
 
+static void sens_catch_up(Esp32SensState *s);
+
 uint32_t esp32_sens_ulp_adc(Esp32SensState *s, unsigned unit, unsigned mux,
                             uint32_t *cycles)
 {
-    uint32_t start = s->regs[meas_start_reg(unit) / 4];
-    uint32_t read = unit ? REG(s, SENS_SAR_READ_CTRL2) :
-                           REG(s, SENS_SAR_READ_CTRL);
-    uint32_t code;
+    uint32_t start, read, code;
+
+    sens_catch_up(s);
+    start = s->regs[meas_start_reg(unit) / 4];
+    read = unit ? REG(s, SENS_SAR_READ_CTRL2) : REG(s, SENS_SAR_READ_CTRL);
 
     /* 23 + the amplifier's three waits + the sampling (ESP-IDF's ADC) */
     *cycles = 23 +
@@ -955,10 +958,47 @@ static void touch_update_mode(Esp32SensState *s)
     }
 }
 
+static void i2c_timer_cb(void *opaque);
+
+static bool wait_due(Esp32SensWait *w, int64_t now)
+{
+    return timer_pending(&w->timer) && timer_expire_time_ns(&w->timer) <= now;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.analog]
+ * End the waits due by now, each at its own time. Their timers can run
+ * late on a loaded host without icount, and until they did software would
+ * see a conversion, a touch measurement or an RTC I2C transfer under way
+ * after it had ended; so whatever looks at them takes them first: the
+ * registers, the ULP's ADC and I2C instructions, a change of the touch
+ * FSM's timer, and a change of the clocks the waits count.
+ */
+static void sens_catch_up(Esp32SensState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (unsigned u = 0; u < ESP32_ADC_UNITS; u++) {
+        if (wait_due(&s->adc_wait[u], now)) {
+            timer_del(&s->adc_wait[u].timer);
+            rtc_adc_done(s, u);
+        }
+    }
+    if (wait_due(&s->i2c_wait, now)) {
+        timer_del(&s->i2c_wait.timer);
+        i2c_timer_cb(s);
+    }
+    while (wait_due(&s->touch_wait, now)) {
+        timer_del(&s->touch_wait.timer);
+        touch_timer_cb(s);
+    }
+}
+
 static void esp32_sens_touch_timer(void *opaque, int n, int level)
 {
     Esp32SensState *s = ESP32_SENS(opaque);
 
+    sens_catch_up(s);
     s->touch_timer_en = level;
     touch_update_mode(s);
 }
@@ -980,6 +1020,9 @@ static void esp32_sens_clk_event(Esp32SensState *s, Clock *clk,
     Esp32SensWait *waits[ESP32_ADC_UNITS + 2];
     unsigned n = 0;
 
+    if (event == ClockPreUpdate) {
+        sens_catch_up(s);
+    }
     if (clk == s->fast_clk) {
         for (unsigned u = 0; u < ESP32_ADC_UNITS; u++) {
             if (s->adc_busy[u]) {
@@ -1084,6 +1127,7 @@ uint32_t esp32_sens_rtc_i2c(Esp32SensState *s, uint32_t ctrl,
     uint32_t mask, addr, *a4 = &REG(s, SENS_SAR_SLAVE_ADDR4);
     uint8_t rdata;
 
+    sens_catch_up(s);
     if (sel > 7) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "esp32_sens: RTC I2C slave address %u of 0-7\n", sel);
@@ -1131,6 +1175,7 @@ static uint64_t esp32_sens_read(void *opaque, hwaddr addr, unsigned size)
                       "\n", addr);
         return 0;
     }
+    sens_catch_up(s);
     switch (addr) {
     case A_SENS_SAR_READ_STATUS1:
     case A_SENS_SAR_READ_STATUS2:
@@ -1165,6 +1210,7 @@ static void esp32_sens_write(void *opaque, hwaddr addr, uint64_t value,
                       "\n", addr);
         return;
     }
+    sens_catch_up(s);
     old = s->regs[idx];
     writable = reg_info[idx].writable;
 
