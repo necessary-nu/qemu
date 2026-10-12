@@ -1614,9 +1614,13 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                R_DPORT_WIFI_CLK_EN_RNG_MASK, 0);
 
     qdev_realize(DEVICE(&s->efuse), &s->periph_bus, &error_fatal);
-    esp32_soc_add_gated_device(s, &s->efuse, DR_REG_EFUSE_BASE,
-                               ESP32_GATE_PERIP, R_DPORT_PERIP_EFUSE_MASK,
-                               R_DPORT_PERIP_EFUSE_MASK);
+    {
+        /* APB_CLK times the controller's read and program commands. */
+        Esp32PeriphGate *g = esp32_soc_add_gated_device(
+            s, &s->efuse, DR_REG_EFUSE_BASE, ESP32_GATE_PERIP,
+            R_DPORT_PERIP_EFUSE_MASK, R_DPORT_PERIP_EFUSE_MASK);
+        g->apb_clk = s->efuse_apb_clk;
+    }
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->efuse), 0,
                        qdev_get_gpio_in(intmatrix_dev, ETS_EFUSE_INTR_SOURCE));
 
@@ -2060,6 +2064,9 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "rsa", &s->rsa, TYPE_ESP32_RSA);
 
     object_initialize_child(obj, "efuse", &s->efuse, TYPE_ESP32_EFUSE);
+    s->efuse_apb_clk = clock_new(obj, "efuse-apb");
+    qdev_connect_clock_in(DEVICE(&s->efuse), ESP32_EFUSE_APB_CLK,
+                          s->efuse_apb_clk);
 
     object_initialize_child(obj, "flash_enc", &s->flash_enc, TYPE_ESP32_FLASH_ENCRYPTION);
 
