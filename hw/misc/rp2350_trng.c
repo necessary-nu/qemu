@@ -99,11 +99,11 @@ static unsigned trng_sample_bit(RP2350TRNGState *s)
 }
 
 /*
- * Draw a whole collection from fresh: sample the ring oscillator until
- * the EHR fills or an entropy check fails, recording which happened and
- * after how many samples.
+ * Draw a whole collection from fresh, starting at `start`: sample the ring
+ * oscillator until the EHR fills or an entropy check fails, recording
+ * which happened and after how many samples.
  */
-static void trng_draw_collection(RP2350TRNGState *s)
+static void trng_draw_collection(RP2350TRNGState *s, int64_t start)
 {
     bool vnc = !(s->debug_control & DEBUG_VNC_BYPASS);
     bool crngt = !(s->debug_control & DEBUG_CRNGT_BYPASS);
@@ -161,7 +161,7 @@ static void trng_draw_collection(RP2350TRNGState *s)
         }
     }
     s->samples_left = samples;
-    s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->sync_ns = start;
 }
 
 /* rng_clk cycles between samples; a count of 0 samples every cycle. */
@@ -229,7 +229,7 @@ static void trng_maybe_start(RP2350TRNGState *s)
     if ((s->rnd_source_enable & 1) && !s->ehr_valid && !s->collecting &&
         !(s->isr & INT_AUTOCORR_ERR)) {
         s->collecting = true;
-        trng_draw_collection(s);
+        trng_draw_collection(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         trng_schedule(s);
     }
 }
@@ -253,14 +253,33 @@ static void trng_collection_done(void *opaque)
         break;
     case TRNG_EVENT_VN_ERR:
     case TRNG_EVENT_CRNGT_ERR:
-        /* The failed bits are discarded and collection starts again. */
+        /*
+         * The failed bits are discarded and collection starts again, from
+         * the failing sample: sync_ns is that sample's time.
+         */
         s->isr |= s->pending_event == TRNG_EVENT_VN_ERR ? INT_VN_ERR
                                                         : INT_CRNGT_ERR;
-        trng_draw_collection(s);
+        trng_draw_collection(s, s->sync_ns);
         trng_schedule(s);
         break;
     }
     trng_update_irq(s);
+}
+
+/*
+ * End the collections due by now. The timer's callback can run well after
+ * that on the host clock, so the registers and a clock change take them
+ * first: a collection ends when it was due, whenever the callback runs.
+ */
+static void trng_catch_up(RP2350TRNGState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    while (timer_pending(s->timer) &&
+           timer_expire_time_ns(s->timer) <= now) {
+        timer_del(s->timer);
+        trng_collection_done(s);
+    }
 }
 
 static void trng_reset_state(RP2350TRNGState *s)
@@ -291,6 +310,7 @@ static uint64_t rp2350_trng_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr reg = rp2350_atomic_reg(addr);
     uint32_t v;
 
+    trng_catch_up(s);
     switch (reg) {
     case A_RNG_IMR:
         return s->imr;
@@ -357,6 +377,7 @@ static void rp2350_trng_write(void *opaque, hwaddr addr, uint64_t value64,
     hwaddr reg = rp2350_atomic_reg(addr);
     uint32_t value = value64;
 
+    trng_catch_up(s);
     switch (reg) {
     case A_RNG_IMR:
         s->imr = rp2350_atomic_apply(addr, s->imr, value) & INT_ALL;
@@ -455,6 +476,7 @@ static void trng_clk_changed(void *opaque, ClockEvent event)
     RP2350TRNGState *s = opaque;
 
     if (event == ClockPreUpdate) {
+        trng_catch_up(s);
         trng_sync(s);
         return;
     }
