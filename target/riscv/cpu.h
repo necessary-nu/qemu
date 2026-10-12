@@ -774,6 +774,11 @@ FIELD(EXT_TB_FLAGS, ESP32P4_SPMON, 38, 1)
  * instruction reports its start to it.
  */
 FIELD(EXT_TB_FLAGS, ESP32P4_TRACE, 39, 1)
+/*
+ * ESP32-P4 HP core branch predictor: mhpmcounter8 counts mispredictions,
+ * so every conditional branch runs the predictor.
+ */
+FIELD(EXT_TB_FLAGS, ESP32P4_BPRED, 40, 1)
 
 #ifdef TARGET_RISCV32
 #define riscv_cpu_mxl(env)  ((void)(env), MXL_RV32)

@@ -53,10 +53,11 @@
  * with known digests on silicon; the TRM says nothing of such writes.
  * Dropped, they would leave blocks unhashed; taken later without holding
  * the core, they would let it overwrite SHA_M_n_REG with the next block
- * before the operation took this one. A core held this way takes a
- * pending interrupt before making the write again. A start written by
- * another master (qtest), which no wait state holds, while the
- * accelerator is busy is dropped and logged.
+ * before the operation took this one. A core held this way makes the
+ * write before it takes an interrupt pending as the wait ends, such as
+ * SHA_INTR at the end of a DMA-SHA operation. A start written by another
+ * master (qtest), which no wait state holds, while the accelerator is
+ * busy is dropped and logged.
  *
  * Other registers written while it is busy are dropped and logged, as are
  * writes while its clock is stopped or it is held in reset. While HMAC,
