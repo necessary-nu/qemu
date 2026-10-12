@@ -21,6 +21,7 @@ config ARM_SBCON_I2C
 config DESIGNWARE_I2C
     bool
     select I2C
+    select LINE_TIME
 
 config RP2350_I2C
     bool
