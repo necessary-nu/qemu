@@ -16,6 +16,7 @@
 #include "hw/char/esp32p4_uart.h"
 #include "hw/char/esp32p4_usb_serial_jtag.h"
 #include "hw/cpu/cluster.h"
+#include "hw/display/esp32p4_ppa.h"
 #include "hw/core/or-irq.h"
 #include "hw/core/split-irq.h"
 #include "hw/dma/esp32p4_bitscrambler.h"
@@ -225,6 +226,7 @@ struct ESP32P4MachineState {
     ESP32P4GdmaState gdma[2];
     ESP32P4DwGdmaState vdma;
     ESP32P4Dma2dState dma2d;
+    ESP32P4PpaState ppa;
     /* GP-SPI2, GP-SPI3. */
     ESP32P4SpiState spi[2];
     ESP32P4BitScramblerState bitscrambler;

@@ -326,7 +326,10 @@
  *     and 129, its ETM events and tasks the ETM's; its accesses go
  *     through the DMA APM as the 2D-DMA masters, to memory directly, past
  *     the caches. A peripheral served by it attaches as
- *     include/hw/dma/esp32p4_dma2d.h describes.
+ *     include/hw/dma/esp32p4_dma2d.h describes. The pixel-processing
+ *     accelerator (TRM chapter 39) at 0x50087000, behind PPA_SYS_CLK, at
+ *     which it computes, and its reset, its interrupt PPA_INTR (source 96),
+ *     its SRM and BLEND engines served by the 2D-DMA.
  *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
@@ -439,7 +442,6 @@ static const struct {
     { "pau",              0x50082000, 4 * KiB },
     { "h264",             0x50084000, 4 * KiB },
     { "jpeg",             0x50086000, 4 * KiB },
-    { "ppa",              0x50087000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
     { "pvt",              0x5009e000, 4 * KiB },
     { "csi-host",         0x5009f000, 2 * KiB },
@@ -2224,7 +2226,8 @@ static void esp32p4_init_dma(ESP32P4MachineState *s)
 
 /*
  * The 2D-DMA controller, on the bus through the APMs, behind its bus clock
- * and reset, which also clock its transfers.
+ * and reset, which also clock its transfers; and the PPA, behind its
+ * clock and reset, served by the 2D-DMA.
  */
 /* [spec:nuos:req:emu.esp32p4.ppa] */
 static void esp32p4_init_media(ESP32P4MachineState *s)
@@ -2253,6 +2256,18 @@ static void esp32p4_init_media(ESP32P4MachineState *s)
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), n,
                            esp32p4_intr_source(s, dma2d_intr[n]));
     }
+
+    object_initialize_child(OBJECT(s), "ppa", &s->ppa, TYPE_ESP32P4_PPA);
+    dev = DEVICE(&s->ppa);
+    object_property_set_link(OBJECT(dev), "dma2d", OBJECT(&s->dma2d),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, "ppa-sys"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_PPA_BASE, ESP32P4_CLK_PPA_SYS,
+                             ESP32P4_RST_PPA, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_PPA));
 }
 
 /*
