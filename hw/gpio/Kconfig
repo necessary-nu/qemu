@@ -18,6 +18,7 @@ config RP2350_GPIO
 
 config ESP32_LINE
     bool
+    select LINE_TIME
 
 config STM32L4X5_GPIO
     bool

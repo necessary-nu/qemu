@@ -824,7 +824,7 @@ static void esp32_gpio_settle_deferred(void *opaque)
     Esp32GpioState *s = opaque;
 
     s->update_pending = false;
-    esp32_line_deferred_replay(&s->deferred, s->round_ns);
+    line_deferred_replay(&s->deferred, s->round_ns);
     if (s->update_pending) {
         esp32_gpio_settle(s);
     }
@@ -853,7 +853,7 @@ static void esp32_gpio_update(Esp32GpioState *s)
     s->updating = true;
     s->round_ns = esp32_line_time();
     esp32_line_run_at(s->round_ns, esp32_gpio_settle, s);
-    while (esp32_line_deferred_next(&s->deferred, &when)) {
+    while (line_deferred_next(&s->deferred, &when)) {
         s->round_ns = when;
         esp32_line_run_at(when, esp32_gpio_settle_deferred, s);
     }
@@ -868,13 +868,13 @@ static void esp32_gpio_update(Esp32GpioState *s)
  * resolved at its own time. Such a change is, for one, the edge of a
  * source that was behind and catches up as it takes the round's change.
  */
-static bool esp32_gpio_held_back(Esp32GpioState *s, Esp32LineInput *fn,
+static bool esp32_gpio_held_back(Esp32GpioState *s, LineInput *fn,
                                  int n, int level)
 {
     if (!s->updating || esp32_line_time() == s->round_ns) {
         return false;
     }
-    esp32_line_defer(&s->deferred, fn, s, n, level);
+    line_defer(&s->deferred, fn, s, n, level, esp32_line_time());
     return true;
 }
 
@@ -1604,7 +1604,7 @@ static void esp32_gpio_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
     DeviceState *dev = DEVICE(obj);
 
-    esp32_line_deferred_init(&s->deferred);
+    line_deferred_init(&s->deferred);
     memory_region_init_io(&s->iomem, obj, &esp32_gpio_ops, s,
                           TYPE_ESP32_GPIO, 0x1000);
     sysbus_init_mmio(sbd, &s->iomem);
@@ -1743,7 +1743,7 @@ static void esp32_gpio_class_init(ObjectClass *klass, const void *data)
 
 static void esp32_gpio_finalize(Object *obj)
 {
-    esp32_line_deferred_finalize(&ESP32_GPIO(obj)->deferred);
+    line_deferred_finalize(&ESP32_GPIO(obj)->deferred);
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] */
