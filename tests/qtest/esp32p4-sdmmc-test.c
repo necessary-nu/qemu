@@ -8,8 +8,10 @@
  * The controller is clocked as ESP-IDF clocks it: SDMMC_SYS_CLK on, the
  * SDIO_LS clocks from PLL_F160M_CLK divided by 4 (40 MHz, 25 ns), and
  * card 0's clock divided by 2 * 50 to 400 kHz (2.5 us) for identification
- * or by 2 to 10 MHz for data. The cards are raw images of 1 MiB, standard
- * capacity, byte addressed.
+ * or by 2 to 10 MHz for data. Slot 0's pads are on the PMU's regulator
+ * VO4, off from reset, which the tests power at 3.3 V (bypass), as
+ * ESP-IDF's on-chip LDO power control does. The cards are raw images of
+ * 1 MiB, standard capacity, byte addressed.
  */
 
 #include "qemu/osdep.h"
@@ -186,9 +188,15 @@ static QTestState *start(const char *img0, const char *img1)
     return qtest_initf("-M esp32p4 %s %s", d0, d1);
 }
 
-/* SDMMC_SYS_CLK, and the SDIO_LS clocks at 40 MHz. */
+/* The PMU's VO4: XPD, FORCE_TIEH_SEL (TIEH_SEL 0) and TIEH (bypass) */
+#define PMU_EXT_LDO_VO4     0x501151d8
+#define VO4_ON_3V3          ((1u << 7) | (1u << 8) | (1u << 14))
+
+/* SDMMC_SYS_CLK, the SDIO_LS clocks at 40 MHz, and slot 0's pads. */
 static void clocks_on(QTestState *qts)
 {
+    qtest_writel(qts, PMU_EXT_LDO_VO4,
+                 qtest_readl(qts, PMU_EXT_LDO_VO4) | VO4_ON_3V3);
     uint32_t edges = (3u << 17) | (3u << 9) | (1u << 13) | (7u << 27);
 
     qtest_writel(qts, SOC_CLK_CTRL1,

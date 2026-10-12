@@ -155,6 +155,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 /* The board pad the IP101GRI's RESET_N is on */
 #define ESP32P4_BOARD_PHY_RESET_PAD 51
 
+/* The PMU regulator, VO<n>, that supplies the microSD slot's pads */
+#define ESP32P4_BOARD_SD_PAD_LDO    4
+
 /* The crypto block resets that hold more than their own block. */
 #define ESP32P4_CRYPTO_RST_SPLITS   4
 
