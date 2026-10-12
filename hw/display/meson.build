@@ -146,6 +146,8 @@ endif
 system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
 
 system_ss.add(when: 'CONFIG_ESP_RGB', if_true: files('esp_rgb.c'))
-system_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_ppa.c'))
+system_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_ppa.c',
+                                                      'esp32p4_mipi_dsi.c',
+                                                      'esp32p4_dsi_panel.c'))
 
 modules += { 'hw-display': hw_display_modules }

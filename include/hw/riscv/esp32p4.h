@@ -16,6 +16,7 @@
 #include "hw/char/esp32p4_uart.h"
 #include "hw/char/esp32p4_usb_serial_jtag.h"
 #include "hw/cpu/cluster.h"
+#include "hw/display/esp32p4_mipi_dsi.h"
 #include "hw/display/esp32p4_ppa.h"
 #include "hw/core/or-irq.h"
 #include "hw/core/split-irq.h"
@@ -56,6 +57,7 @@
 #include "hw/misc/esp32p4_lp_mailbox.h"
 #include "hw/misc/esp32p4_ledc.h"
 #include "hw/misc/esp32p4_lp_sys.h"
+#include "hw/misc/esp32p4_mipi_csi.h"
 #include "hw/misc/esp32p4_jpeg.h"
 #include "hw/misc/esp32p4_parlio.h"
 #include "hw/misc/esp32p4_pcnt.h"
@@ -242,6 +244,10 @@ struct ESP32P4MachineState {
     /* The board's camera sensors on the DVP and MIPI CSI inputs, or NULL */
     ESP32P4ImageSource *dvp_camera;
     ESP32P4ImageSource *csi_camera;
+    ESP32P4DsiHostState dsi_host;
+    ESP32P4DsiBridgeState dsi_bridge;
+    ESP32P4CsiHostState csi_host;
+    ESP32P4CsiBridgeState csi_bridge;
     ESP32P4RmtState rmt;
     ESP32P4PcntState pcnt;
     ESP32P4LedcState ledc;

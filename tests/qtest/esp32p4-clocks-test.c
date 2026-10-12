@@ -120,7 +120,7 @@ static const Reg clkrst_regs[] = {
     { HP_BASE + 0x030, 0x0000c03c, 0x3fffffff, 0, 0 },
     { HP_BASE + 0x034, 0x00000401, 0x01ffffff, 0, 0 },
     { HP_BASE + 0x038, 0x00000000, 0xfffffeff, 0x00000100, 0 },
-    { HP_BASE + 0x03c, 0x00000000, 0x0000ffff, 0, 0 },
+    { HP_BASE + 0x03c, 0x00080000, 0x07ffffff, 0, 0 },
     { HP_BASE + 0x040, 0x00000000, 0x0fffffff, 0, 0 },
     { HP_BASE + 0x044, 0x00000000, 0x07ffffff, 0, 0 },
     { HP_BASE + 0x048, 0x00000000, 0x03ffffff, 0, 0 },
