@@ -488,6 +488,8 @@ static void pl011_line_write_txdata(PL011State *s, uint8_t data)
     pl011_update(s);
 }
 
+static void pl011_line_rx_sample(void *opaque);
+
 /* The receiver's input: UARTRXD, or UARTTXD in loopback. */
 static void pl011_line_rx_changed(PL011State *s, int64_t when)
 {
@@ -495,6 +497,15 @@ static void pl011_line_rx_changed(PL011State *s, int64_t when)
 
     if (level == s->rx_level) {
         return;
+    }
+    /*
+     * Samples that fell due by the edge's time see the level before it,
+     * however late their timer runs: the sender may be catching up on
+     * bits whose time has passed (pl011_line_catch_up()).
+     */
+    while (timer_pending(s->rx_timer) && s->rx_next <= when) {
+        timer_del(s->rx_timer);
+        pl011_line_rx_sample(s);
     }
     s->rx_level = level;
     if (level) {
@@ -811,11 +822,60 @@ static uint32_t pl011_read_rxdata(PL011State *s)
     return c;
 }
 
+/*
+ * The line timers whose time has come by `now`, the earliest first, as
+ * their callbacks would run them; each runs at its own time.
+ */
+static QEMUTimer *pl011_line_due(PL011State *s, int64_t now)
+{
+    QEMUTimer *timers[] = { s->tx_timer, s->rx_timer, s->rt_timer };
+    QEMUTimer *due = NULL;
+
+    for (int i = 0; i < ARRAY_SIZE(timers); i++) {
+        QEMUTimer *t = timers[i];
+
+        if (timer_pending(t) && timer_expire_time_ns(t) <= now &&
+            (!due || timer_expire_time_ns(t) < timer_expire_time_ns(due))) {
+            due = t;
+        }
+    }
+    return due;
+}
+
+/*
+ * [spec:nuos:req:emu.uart]
+ * A register access first takes every line event due by its moment, each
+ * at its own time: without icount the line timers' callbacks run late,
+ * and until they do software would read BUSY, the FIFOs and the
+ * interrupts as of when the host got to them, not of the access.
+ */
+static void pl011_line_catch_up(PL011State *s)
+{
+    int64_t now = uart_line_now();
+    QEMUTimer *t;
+
+    if (!s->line_level) {
+        return;
+    }
+    while ((t = pl011_line_due(s, now))) {
+        timer_del(t);
+        if (t == s->tx_timer) {
+            pl011_line_tx_tick(s);
+        } else if (t == s->rx_timer) {
+            pl011_line_rx_sample(s);
+        } else {
+            pl011_line_rt_tick(s);
+        }
+    }
+}
+
 static uint64_t pl011_read(void *opaque, hwaddr offset,
                            unsigned size)
 {
     PL011State *s = (PL011State *)opaque;
     uint64_t r;
+
+    pl011_line_catch_up(s);
 
     switch (offset >> 2) {
     case 0: /* UARTDR */
@@ -968,6 +1028,7 @@ static void pl011_write(void *opaque, hwaddr offset,
     uint32_t old;
 
     trace_pl011_write(offset, value, pl011_regname(offset));
+    pl011_line_catch_up(s);
 
     switch (offset >> 2) {
     case 0: /* UARTDR */

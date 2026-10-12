@@ -102,6 +102,16 @@ static void uart_line_rx_in(void *opaque, int n, int level)
     if (v == s->rx_level) {
         return;
     }
+    /*
+     * Samples that fell due by the edge's time see the level before it,
+     * however late their timer runs: a sender catching up on bits whose
+     * time has passed (a UART whose registers are read) can make its
+     * edges ahead of the samples' timers.
+     */
+    while (timer_pending(s->rx_timer) && s->rx_next <= now) {
+        timer_del(s->rx_timer);
+        uart_line_rx_sample(s);
+    }
     s->rx_level = v;
     if (v) {
         if (s->rx_break) {
