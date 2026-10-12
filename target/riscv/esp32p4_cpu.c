@@ -87,6 +87,7 @@
 #include "qapi/error.h"
 #include "migration/vmstate.h"
 #include "system/tcg.h"
+#include "exec/translation-block.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "target/riscv/esp32p4_cpu.h"
 #include "internals.h"
@@ -257,7 +258,14 @@ static void esp32p4_cpu_bus_wait_check(CPUState *cs, uintptr_t retaddr)
 }
 #endif
 
-/* Run on the core: its access may go through now. */
+/*
+ * Run on the core: its access may go through now. The access completes
+ * before the core takes an interrupt, one pending by now included: the
+ * core makes it again in a block of that one instruction, translated not
+ * to take interrupts first (CF_NOIRQ), as cpu_io_recompile() replays an
+ * instruction.
+ */
+/* [spec:nuos:req:emu.esp32p4.machine] */
 static void esp32p4_cpu_bus_go(CPUState *cs, run_on_cpu_data data)
 {
     ESP32P4CPU *cpu = ESP32P4_CPU(cs);
@@ -268,6 +276,7 @@ static void esp32p4_cpu_bus_go(CPUState *cs, run_on_cpu_data data)
     qatomic_set(&cpu->bus_wait, false);
 #ifdef CONFIG_TCG
     esp32p4_counters_bus_wait(cpu, false);
+    cs->cflags_next_tb = cs->tcg_cflags | CF_NOIRQ | 1;
 #endif
     if (!esp32p4_cpu_held(cpu) && !cpu->clock_halted) {
         cs->halted = 0;

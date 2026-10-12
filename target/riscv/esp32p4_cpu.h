@@ -586,9 +586,10 @@ bool esp32p4_cpu_mid_block(void);
  * it, not having taken the access. The core stops at the instruction
  * making the access, which it has not made, and neither runs nor takes an
  * interrupt until the device calls esp32p4_cpu_bus_release(); then it
- * makes the access again, unless an interrupt pending by then comes
- * first. Its clock, and its cycle counter, run on meanwhile. A reset of
- * the core ends its wait.
+ * makes the access again, and only then takes an interrupt pending by
+ * then, as the access completes before the instruction after it. Its
+ * clock, and its cycle counter, run on meanwhile. A reset of the core
+ * ends its wait.
  */
 ESP32P4CPU *esp32p4_cpu_bus_waiter(MemTxAttrs attrs);
 MemTxResult esp32p4_cpu_bus_hold(ESP32P4CPU *cpu);
