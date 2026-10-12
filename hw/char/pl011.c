@@ -851,7 +851,7 @@ static QEMUTimer *pl011_line_due(PL011State *s, int64_t now)
  */
 static void pl011_line_catch_up(PL011State *s)
 {
-    int64_t now = uart_line_now();
+    int64_t now = line_time();
     QEMUTimer *t;
 
     if (!s->line_level) {
