@@ -36,6 +36,155 @@ static void gen_esp32p4_count_insn(DisasContext *ctx, int n)
 }
 
 /*
+ * The events an ESP32-P4 core's event counters count (ESP32P4_EV_*,
+ * esp32p4_counters.c): each instruction reports its events once it can
+ * no longer raise an exception, so that one that raises its exception
+ * reports none, as it does not retire. The HP core counts conditional
+ * branches, their mispredictions and store instructions; the LP core
+ * memory reads and writes, unconditional jumps, conditional branches and
+ * those taken, and compressed instructions.
+ */
+
+/* Add @n to the core's count of event @e. */
+static void gen_esp32p4_event_add(int e, TCGv_i64 n)
+{
+    TCGv_i64 t = tcg_temp_new_i64();
+    intptr_t ofs = ESP32P4_ENV_OFFSET(ev) + e * sizeof(uint64_t);
+
+    tcg_gen_ld_i64(t, tcg_env, ofs);
+    tcg_gen_add_i64(t, t, n);
+    tcg_gen_st_i64(t, tcg_env, ofs);
+}
+
+static void gen_esp32p4_event(int e)
+{
+    gen_esp32p4_event_add(e, tcg_constant_i64(1));
+}
+
+/*
+ * A memory read or write of the LP core at @addr: one access, or two for
+ * an unaligned one (TRM 5.7).
+ */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void gen_esp32p4_mem_event(DisasContext *ctx, bool write, TCGv addr,
+                                  MemOp memop)
+{
+    int e = write ? ESP32P4_EV_MEM_WRITE : ESP32P4_EV_MEM_READ;
+    unsigned size = memop_size(memop);
+    TCGv t;
+    TCGv_i64 n;
+
+    if (!ctx->esp32p4_lp) {
+        return;
+    }
+    if (size == 1) {
+        gen_esp32p4_event(e);
+        return;
+    }
+    t = tcg_temp_new();
+    n = tcg_temp_new_i64();
+    tcg_gen_andi_tl(t, addr, size - 1);
+    tcg_gen_setcondi_tl(TCG_COND_NE, t, t, 0);
+    tcg_gen_addi_tl(t, t, 1);
+    tcg_gen_extu_tl_i64(n, t);
+    gen_esp32p4_event_add(e, n);
+}
+
+/* An atomic memory operation of the LP core: a read and a write. */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void gen_esp32p4_amo_event(DisasContext *ctx)
+{
+    if (ctx->esp32p4_lp) {
+        gen_esp32p4_event(ESP32P4_EV_MEM_READ);
+        gen_esp32p4_event(ESP32P4_EV_MEM_WRITE);
+    }
+}
+
+/* SC.W on the LP core: a write, unless it failed and stored nothing. */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void gen_esp32p4_sc_event(DisasContext *ctx, TCGv failed)
+{
+    TCGv t;
+    TCGv_i64 n;
+
+    if (!ctx->esp32p4_lp) {
+        return;
+    }
+    t = tcg_temp_new();
+    n = tcg_temp_new_i64();
+    tcg_gen_xori_tl(t, failed, 1);
+    tcg_gen_extu_tl_i64(n, t);
+    gen_esp32p4_event_add(ESP32P4_EV_MEM_WRITE, n);
+}
+
+/* A store instruction of the HP core (mhpmevent13's 0xB). */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static void gen_esp32p4_store_insn(DisasContext *ctx)
+{
+    if (ctx->esp32p4_hp) {
+        gen_esp32p4_event(ESP32P4_EV_STORE);
+    }
+}
+
+/* A compressed instruction of the LP core retires. */
+static void gen_esp32p4_compressed(DisasContext *ctx)
+{
+    if (ctx->esp32p4_lp && ctx->cur_insn_len == 2) {
+        gen_esp32p4_event(ESP32P4_EV_COMPRESSED);
+    }
+}
+
+/*
+ * An unconditional jump (JAL, JALR and their compressed forms) of the LP
+ * core, which ends its TB.
+ */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void gen_esp32p4_jump_event(DisasContext *ctx)
+{
+    if (ctx->esp32p4_lp) {
+        gen_esp32p4_event(ESP32P4_EV_JUMP);
+        gen_esp32p4_compressed(ctx);
+    }
+}
+
+/* A conditional branch, which ends its TB. */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void gen_esp32p4_branch_event(DisasContext *ctx)
+{
+    if (ctx->esp32p4_hp || ctx->esp32p4_lp) {
+        gen_esp32p4_event(ESP32P4_EV_BRANCH);
+        gen_esp32p4_compressed(ctx);
+    }
+}
+
+/*
+ * The way the conditional branch goes: count it if taken, and run the
+ * HP core's branch predictor with it while it counts mispredictions.
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void gen_esp32p4_branch_outcome(DisasContext *ctx, bool taken)
+{
+    if (ctx->esp32p4_lp && taken) {
+        gen_esp32p4_event(ESP32P4_EV_TAKEN);
+    }
+    if (ctx->esp32p4_bpred) {
+        gen_helper_esp32p4_branch(tcg_env, tcg_constant_i32(taken));
+    }
+}
+
+/*
+ * The instruction has completed without ending its TB: a compressed one
+ * of the LP core retires.
+ */
+/* [spec:nuos:req:emu.esp32p4.lp-core] */
+static void gen_esp32p4_insn_done(DisasContext *ctx)
+{
+    gen_esp32p4_compressed(ctx);
+}
+
+/*
  * Continue after the current instruction at next, the next instruction
  * when next is NULL, or a loop's start if the instruction ends one, and
  * end the TB.
