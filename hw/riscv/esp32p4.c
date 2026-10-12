@@ -3029,10 +3029,61 @@ static void esp32p4_init_pwm(ESP32P4MachineState *s)
 }
 
 /*
+ * The JPEG codec's paths are the 2D-DMA's, as its peripheral 0 both ways:
+ * the codec pulls and pushes through the 2D-DMA, and the 2D-DMA tells it
+ * of data and room as it tells any peripheral it serves.
+ */
+static size_t jpeg_dma2d_pull(void *opaque, uint8_t *buf, size_t len,
+                              bool *eof)
+{
+    return esp32p4_dma2d_pull(opaque, ESP32P4_DMA2D_TX_JPEG, buf, len, eof);
+}
+
+static size_t jpeg_dma2d_push(void *opaque, const uint8_t *buf, size_t len,
+                              unsigned flags)
+{
+    return esp32p4_dma2d_push(opaque, ESP32P4_DMA2D_RX_JPEG, buf, len,
+                              (flags & ESP32P4_JPEG_DMA_EOF ?
+                               ESP32P4_DMA2D_EOF : 0) |
+                              (flags & ESP32P4_JPEG_DMA_ERR_EOF ?
+                               ESP32P4_DMA2D_ERR_EOF : 0));
+}
+
+static void jpeg_dma2d_rx_format(void *opaque, int format)
+{
+    static const int mcu[] = {
+        [ESP32P4_JPEG_MCU_GRAY] = ESP32P4_DMA2D_MCU_GRAY,
+        [ESP32P4_JPEG_MCU_YUV444] = ESP32P4_DMA2D_MCU_YUV444,
+        [ESP32P4_JPEG_MCU_YUV422] = ESP32P4_DMA2D_MCU_YUV422,
+        [ESP32P4_JPEG_MCU_YUV420] = ESP32P4_DMA2D_MCU_YUV420,
+    };
+
+    assert(format >= 0 && format < ARRAY_SIZE(mcu));
+    esp32p4_dma2d_rx_mcu_format(opaque, ESP32P4_DMA2D_RX_JPEG, mcu[format]);
+}
+
+static const ESP32P4JpegDmaOps jpeg_dma2d_ops = {
+    .pull = jpeg_dma2d_pull,
+    .push = jpeg_dma2d_push,
+    .rx_format = jpeg_dma2d_rx_format,
+};
+
+static void jpeg_dma2d_ready(void *opaque, unsigned sel)
+{
+    esp32p4_jpeg_dma_ready(opaque);
+}
+
+static const ESP32P4Dma2dPeriphOps jpeg_dma2d_periph = {
+    .tx_ready = jpeg_dma2d_ready,
+    .rx_ready = jpeg_dma2d_ready,
+    .sync = esp32p4_jpeg_dma_sync,
+};
+
+/*
  * The JPEG codec, behind JPEG_SYS_CLK and its reset, its pipeline on the
- * same clock, its interrupt JPEG_INTR. Its data moves only through the
- * 2D-DMA, as include/hw/misc/esp32p4_jpeg.h describes; until the 2D-DMA
- * connects its paths, a qtest plays them.
+ * same clock, its interrupt JPEG_INTR, its data through the 2D-DMA (a
+ * qtest may play the paths instead, as include/hw/misc/esp32p4_jpeg.h
+ * describes).
  */
 /* [spec:nuos:req:emu.esp32p4.jpeg] */
 static void esp32p4_init_jpeg(ESP32P4MachineState *s)
@@ -3049,6 +3100,11 @@ static void esp32p4_init_jpeg(ESP32P4MachineState *s)
                              ESP32P4_RST_JPEG, 0);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        esp32p4_intr_source(s, ESP32P4_INTR_JPEG));
+    esp32p4_jpeg_connect_dma(&s->jpeg, &jpeg_dma2d_ops, &s->dma2d);
+    esp32p4_dma2d_attach(&s->dma2d, ESP32P4_DMA2D_OUT, ESP32P4_DMA2D_TX_JPEG,
+                         &jpeg_dma2d_periph, &s->jpeg);
+    esp32p4_dma2d_attach(&s->dma2d, ESP32P4_DMA2D_IN, ESP32P4_DMA2D_RX_JPEG,
+                         &jpeg_dma2d_periph, &s->jpeg);
 }
 
 /*
