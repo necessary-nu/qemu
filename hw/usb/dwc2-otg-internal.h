@@ -68,11 +68,15 @@ void dwc2_otg_update_irq(DWC2OTGState *s);
  * has it, 0 while it is stopped; the first ns by which @ticks of it have
  * elapsed from one of its edges, 0 while stopped; and its whole cycles in
  * @ns from one, at the period the class counts it at
- * (DWC2OTGClass.clock_cycles).
+ * (DWC2OTGClass.clock_cycles); and, by its edges as the class counts
+ * them, its ticks after one time by another, and when a number of them
+ * after a time have come.
  */
 uint64_t dwc2_otg_phy_period(DWC2OTGState *s);
 int64_t dwc2_otg_phy_ticks_ns(DWC2OTGState *s, uint64_t ticks);
 uint64_t dwc2_otg_phy_ticks(DWC2OTGState *s, int64_t ns);
+uint64_t dwc2_otg_phy_count(DWC2OTGState *s, int64_t from, int64_t t);
+int64_t dwc2_otg_phy_after(DWC2OTGState *s, int64_t from, uint64_t ticks);
 bool dwc2_otg_dma_enabled(DWC2OTGState *s);
 bool dwc2_otg_dma_read(DWC2OTGState *s, uint32_t addr, void *buf,
                        uint32_t len);

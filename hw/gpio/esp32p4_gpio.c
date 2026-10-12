@@ -1256,14 +1256,16 @@ static void sdm_advance(ESP32P4GpioState *s, unsigned ch, int64_t now)
     uint32_t reg = s->sdm[ch];
     uint32_t div = FIELD_EX32(reg, SDM, PRESCALE) + 1;
     uint32_t d = FIELD_EX32(reg, SDM, IN) ^ 0x80;
+    ESP32P4ClkCount edges = s->iomux_edges;
     uint64_t total, n;
     uint32_t a;
 
     if (!sdm_clock_on(s) || now <= s->sdm_anchor_ns[ch]) {
         return;
     }
-    total = esp32p4_clk_ns_cycles(s->iomux_edges.period,
-                                  now - s->sdm_anchor_ns[ch]) / div;
+    /* The clock's edges since the anchor. */
+    esp32p4_clk_count_rebase(&edges, s->sdm_anchor_ns[ch]);
+    total = esp32p4_clk_count_at(&edges, now) / div;
     if (total <= s->sdm_ticks[ch]) {
         return;
     }
@@ -3257,7 +3259,8 @@ static void esp32p4_gpio_set_ana_comp(void *opaque, int n, int level)
     filters_catch_up(s, now);
     s->ana_comp[n] = level != 0;
     quiet = esp32p4_clk_count_running(&s->iomux_edges) ?
-            esp32p4_clk_cycles_ns(s->iomux_edges.period, s->zero_det[n]) : 0;
+            esp32p4_clk_cycles_ns(s->iomux_edges.edges.period,
+                                  s->zero_det[n]) : 0;
     if (s->ana_comp_int_ns[n] == INT64_MIN ||
         now - s->ana_comp_int_ns[n] >= quiet) {
         s->int_raw |= (level ? INT_COMP_RISE(n) : INT_COMP_FALL(n)) |
@@ -3489,7 +3492,7 @@ static void esp32p4_gpio_iomux_clk_update(void *opaque, ClockEvent event)
         for (unsigned ch = 0; ch < ESP32P4_GPIO_GLITCH_FILTERS; ch++) {
             s->glitch_filter[ch].tick = 0;
         }
-        s->iomux_edges.origin_ns = now;
+        esp32p4_clk_count_rebase(&s->iomux_edges, now);
     } else {
         esp32p4_clk_count_start(&s->iomux_edges, s->iomux_clk, now);
         esp32p4_gpio_update(s);
@@ -3507,7 +3510,7 @@ static void esp32p4_gpio_lp_clk_update(void *opaque, ClockEvent event)
         for (unsigned n = 0; n < ESP32P4_GPIO_LP_PADS; n++) {
             s->lp_pin_filter[n].tick = 0;
         }
-        s->lp_edges.origin_ns = now;
+        esp32p4_clk_count_rebase(&s->lp_edges, now);
     } else {
         esp32p4_clk_count_start(&s->lp_edges, s->lp_clk, now);
         esp32p4_gpio_update(s);

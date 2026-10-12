@@ -287,7 +287,7 @@ static uint64_t cyc_at(ESP32P4RmtState *s, int64_t a_ns, uint64_t a_c,
     if (t <= a_ns) {
         return a_c;
     }
-    return a_c + esp32p4_clk_ns_cycles(s->sclk_period, t - a_ns);
+    return a_c + esp32p4_clk_edges_between(&s->sclk_edges, a_ns, t);
 }
 
 /* The first time at which such a channel has reached cycle cyc */
@@ -299,11 +299,8 @@ static int64_t cyc_time(ESP32P4RmtState *s, int64_t a_ns, uint64_t a_c,
     if (cyc <= a_c) {
         return a_ns;
     }
-    ns = esp32p4_clk_cycles_ns(s->sclk_period, cyc - a_c);
-    if (ns >= NEVER - a_ns) {
-        return NEVER;
-    }
-    return a_ns + ns;
+    ns = esp32p4_clk_edges_after(&s->sclk_edges, a_ns, cyc - a_c);
+    return MIN(ns, NEVER);
 }
 
 /* The first channel clock tick at or after cycle cyc */
@@ -947,11 +944,10 @@ static void rx_raw(ESP32P4RmtState *s, unsigned m, int64_t t, uint8_t level)
         /* The pulse was shorter than RX_FILTER_THRES */
         c->filt_pending = false;
     } else if (level != c->in_filt) {
-        uint64_t ns = esp32p4_clk_period_running(s->sclk_period) ?
-                      esp32p4_clk_cycles_ns(s->sclk_period, thres) : 0;
-
         c->filt_pending = true;
-        c->filt_ns = ns ? t + ns : NEVER;
+        c->filt_ns = esp32p4_clk_edges_running(&s->sclk_edges) ?
+                     MIN(esp32p4_clk_edges_after(&s->sclk_edges, t, thres),
+                         NEVER) : NEVER;
     }
 }
 
@@ -1712,7 +1708,7 @@ static void esp32p4_rmt_clk_update(void *opaque, ClockEvent event)
             s->rx[m].anchor_ns = now;
         }
     } else {
-        s->sclk_period = esp32p4_clk_exact(s->sclk);
+        s->sclk_edges = esp32p4_clk_edges_or_at(s->sclk, now);
         rmt_schedule(s);
     }
 }
@@ -1724,7 +1720,7 @@ static void esp32p4_rmt_reset_hold(Object *obj, ResetType type)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     timer_del(&s->timer);
-    s->sclk_period = esp32p4_clk_exact(s->sclk);
+    s->sclk_edges = esp32p4_clk_edges_or_at(s->sclk, now);
     s->int_raw = 0;
     s->int_ena = 0;
     s->sys_conf = SYS_CONF_RESET;
@@ -1898,8 +1894,8 @@ static const VMStateDescription vmstate_esp32p4_rmt_rx = {
 
 static const VMStateDescription vmstate_esp32p4_rmt = {
     .name = TYPE_ESP32P4_RMT,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(ram, ESP32P4RmtState, RAM_WORDS),
         VMSTATE_UINT8_ARRAY(eof_bytes, ESP32P4RmtState, RAM_WORDS),
@@ -1916,7 +1912,7 @@ static const VMStateDescription vmstate_esp32p4_rmt = {
                              vmstate_esp32p4_rmt_rx, ESP32P4RmtRx),
         VMSTATE_TIMER(timer, ESP32P4RmtState),
         VMSTATE_CLOCK(sclk, ESP32P4RmtState),
-        VMSTATE_ESP32P4_CLK_PERIOD(sclk_period, ESP32P4RmtState),
+        VMSTATE_ESP32P4_CLK_EDGES(sclk_edges, ESP32P4RmtState),
         VMSTATE_END_OF_LIST()
     }
 };

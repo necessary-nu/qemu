@@ -162,8 +162,8 @@ struct ESP32P4RmtState {
     qemu_irq irq;
     qemu_irq sig_out[ESP32P4_RMT_TX_CHANNELS];
     Clock *sclk;
-    /* rmt_sclk's exact period, as it last changed. */
-    ESP32P4ClkPeriod sclk_period;
+    /* rmt_sclk's edges, exact period and phase, as it last changed. */
+    ESP32P4ClkEdges sclk_edges;
     QEMUTimer timer;
     Notifier line_source;
     ESP32P4GdmaState *gdma;

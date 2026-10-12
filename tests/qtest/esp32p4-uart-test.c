@@ -177,6 +177,20 @@ static void wr(QTestState *qts, uint32_t base, uint32_t off, uint32_t v)
 }
 
 /* REG_UPDATE: the core takes the _SYNC registers within a few cycles. */
+/*
+ * Step to the next edge of XTAL_CLK, at a multiple of 25 ns: the UARTs'
+ * core clocks, XTAL_CLK undivided, have their edges there, and a transfer
+ * started on one begins at once.
+ */
+static void xtal_edge(QTestState *qts)
+{
+    int64_t t = qtest_clock_step(qts, 1);
+
+    if (t % 25) {
+        qtest_clock_step(qts, 25 - t % 25);
+    }
+}
+
 static void update(QTestState *qts, uint32_t base)
 {
     wr(qts, base, REG_UPDATE, 1);
@@ -378,6 +392,7 @@ static void test_baud_timing(void)
     wr(qts, UART(1), CLKDIV, DIV_1US | (8u << 20));
     update(qts, UART(1));
     wr(qts, UART(1), INT_CLR, INT_TX_DONE);
+    xtal_edge(qts);
     wr(qts, UART(1), FIFO, 0x00);
     qtest_clock_step(qts, 10125 - 10);
     g_assert_false(rd(qts, UART(1), INT_RAW) & INT_TX_DONE);
@@ -389,6 +404,7 @@ static void test_baud_timing(void)
     wr(qts, UART(1), IDLE_CONF, 5 << 10);
     update(qts, UART(1));
     wr(qts, UART(1), INT_CLR, 0xfffff);
+    xtal_edge(qts);
     wr(qts, UART(1), FIFO, 0x00);
     qtest_clock_step(qts, FRAME_NS + 10);
     g_assert_true(rd(qts, UART(1), INT_RAW) & INT_TX_DONE);
@@ -407,10 +423,12 @@ static void test_baud_timing(void)
  * A train of frames from a core clock whose period is not a whole
  * nanosecond: UART1_SCLK from PLL_F80M_CLK (the SPLL's 480 MHz by 6)
  * divided by 1 + 1/3, 60 MHz, and CLKDIV 7, bits of 350/3 ns and frames
- * of 3500/3. The frames follow each other at once, so that the 95th ends
- * at exactly 95 * 3500/3 = 110833 1/3 ns: TX_DONE comes at the first
- * nanosecond after, 110834 ns, not a frame's fraction of a nanosecond
- * early per frame.
+ * of 3500/3. The PLL runs from XTAL_CLK's edge at time 0, and the divider,
+ * set up then, from its edge there: UART1_SCLK's edges are at multiples
+ * of 50/3 ns, and the transfer starts on one, at 650 ns. The frames follow
+ * each other at once, so that the 95th ends at exactly 95 * 3500/3 =
+ * 110833 1/3 ns later: TX_DONE comes at the first nanosecond after,
+ * 110834 ns, not a frame's fraction of a nanosecond early per frame.
  */
 /* [spec:nuos:req:emu.esp32p4.uart/test] */
 static void test_exact_frames(void)
@@ -429,6 +447,7 @@ static void test_exact_frames(void)
     wr(qts, UART(1), CLKDIV, 7);
     update(qts, UART(1));
     t0 = qtest_clock_step(qts, 1);
+    t0 = qtest_clock_step(qts, 650 - t0);
     for (i = 0; i < 95; i++) {
         wr(qts, UART(1), FIFO, i);
     }
@@ -440,6 +459,43 @@ static void test_exact_frames(void)
     g_assert_cmpuint(STATUS_TXFIFO_CNT(rd(qts, UART(1), STATUS)), ==,
                      95 - 49);
     g_assert_cmpint(qtest_clock_step(qts, 110833 - 56000), ==, t0 + 110833);
+    g_assert_false(rd(qts, UART(1), INT_RAW) & INT_TX_DONE);
+    qtest_clock_step(qts, 1);
+    g_assert_true(rd(qts, UART(1), INT_RAW) & INT_TX_DONE);
+    qtest_quit(qts);
+}
+
+/*
+ * A frame whose core clock moves to another of the same frequency at
+ * another phase goes on at the new clock's edges. UART1_SCLK, XTAL_CLK
+ * undivided, has its edges at multiples of 25 ns; switched, 4513 ns into
+ * a frame, to PLL_F80M_CLK (the SPLL's 480 MHz by 6, its edges at
+ * multiples of 12.5 ns from XTAL_CLK's edge at time 0) divided by 2, it
+ * is 40 MHz again, its divider counting PLL_F80M_CLK's edges after the
+ * switch: its edges come 12.5 ns after XTAL_CLK's would have, and so does
+ * the rest of the frame: TX_DONE comes at FRAME_NS + 13 ns, not FRAME_NS.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+/* [spec:nuos:req:emu.esp32p4.clocks/test] */
+static void test_clock_phase(void)
+{
+    QTestState *qts = start();
+    uint32_t ctrl111, ctrl112;
+    int64_t t0;
+
+    setup(qts, UART(1), CONF0_8N1);
+    xtal_edge(qts);
+    t0 = qtest_clock_step(qts, 25);
+    wr(qts, UART(1), FIFO, 0x55);
+    qtest_clock_step(qts, 4513);
+    ctrl111 = qtest_readl(qts, HP_SYS_CLKRST_PERI_CLK_CTRL111);
+    ctrl112 = qtest_readl(qts, HP_SYS_CLKRST_PERI_CLK_CTRL112);
+    qtest_writel(qts, HP_SYS_CLKRST_PERI_CLK_CTRL111,
+                 (ctrl111 & ~(3u << 24)) | (2u << 24));
+    qtest_writel(qts, HP_SYS_CLKRST_PERI_CLK_CTRL112,
+                 (ctrl112 & ~0xffu) | 1u);
+    g_assert_cmpint(qtest_clock_step(qts, FRAME_NS + 12 - 4513), ==,
+                    t0 + FRAME_NS + 12);
     g_assert_false(rd(qts, UART(1), INT_RAW) & INT_TX_DONE);
     qtest_clock_step(qts, 1);
     g_assert_true(rd(qts, UART(1), INT_RAW) & INT_TX_DONE);
@@ -1681,6 +1737,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/uart/reg_update", test_reg_update);
     qtest_add_func("esp32p4/uart/baud_timing", test_baud_timing);
     qtest_add_func("esp32p4/uart/exact_frames", test_exact_frames);
+    qtest_add_func("esp32p4/uart/clock_phase", test_clock_phase);
     qtest_add_func("esp32p4/uart/fifo_irq", test_fifo_irq);
     qtest_add_func("esp32p4/uart/uart_to_uart", test_uart_to_uart);
     qtest_add_func("esp32p4/uart/hw_flow", test_hw_flow);

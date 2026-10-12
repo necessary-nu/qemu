@@ -358,6 +358,49 @@ static void test_exact_cycles(void)
     qtest_quit(qts);
 }
 
+/*
+ * Two 32768 Hz oscillators of one period, 1/32768 s, at different phases:
+ * RC32K powered up at 1000 ns, XTAL32K at 11000 ns, each with its first
+ * edge there. LP_SLOW_CLK switched from RC32K to XTAL32K in one write
+ * moves the timer's counting to XTAL32K's edges. Switched at 1 ms, it
+ * counts the next one, at 11000 + 33 periods, 1018080.078125 ns, as the
+ * next count, and the 100th, at 11000 + 132 periods, 4039320.3125 ns, as
+ * the target 100 on: its alarm comes at 4039321 ns. At RC32K's edges it
+ * would come at 4029321 ns, and at edges counted from the switch to
+ * RC32K at 20000 ns, 4048321 ns.
+ */
+/* [spec:nuos:req:emu.esp32p4.timers/test] */
+/* [spec:nuos:req:emu.esp32p4.clocks/test] */
+static void test_clock_phase(void)
+{
+    QTestState *qts = start();
+    uint64_t c;
+
+    step(qts, 1000);
+    qtest_set_irq_in(qts, CLKRST, ESP32P4_CLKRST_PMU_XPD,
+                     ESP32P4_CLKRST_XPD_RC32K, 1);
+    step(qts, 10000);
+    qtest_set_irq_in(qts, CLKRST, ESP32P4_CLKRST_PMU_XPD,
+                     ESP32P4_CLKRST_XPD_XTAL32K, 1);
+    step(qts, 9000);
+    qtest_writel(qts, LP_CLK_CONF, (qtest_readl(qts, LP_CLK_CONF) & ~3u) | 2);
+    step(qts, 1 * MS - now);
+    qtest_writel(qts, LP_CLK_CONF, (qtest_readl(qts, LP_CLK_CONF) & ~3u) | 1);
+    c = count(qts);
+    wr(qts, INT_ENA, INT_TARGET);
+    set_target(qts, 0, c + 100, true);
+    step(qts, 1018080 - now);
+    g_assert_cmpuint(count(qts), ==, c);
+    step(qts, 1);
+    g_assert_cmpuint(count(qts), ==, c + 1);
+    step(qts, 4039320 - now);
+    g_assert_cmphex(rd(qts, INT_RAW), ==, 0);
+    step(qts, 1);
+    g_assert_cmphex(rd(qts, INT_RAW), ==, INT_TARGET);
+    g_assert_cmpuint(count(qts), ==, c + 100);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -368,5 +411,6 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/lp-timer/overflow", test_overflow);
     qtest_add_func("/esp32p4/lp-timer/logging", test_logging);
     qtest_add_func("/esp32p4/lp-timer/exact-cycles", test_exact_cycles);
+    qtest_add_func("/esp32p4/lp-timer/clock-phase", test_clock_phase);
     return g_test_run();
 }

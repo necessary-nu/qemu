@@ -205,6 +205,30 @@ uint64_t dwc2_otg_phy_ticks(DWC2OTGState *s, int64_t ns)
     return DWC2_OTG_GET_CLASS(s)->clock_cycles(s, clk, ns) / div;
 }
 
+/* The PHY clock's ticks after @from by @t: 0 while it is stopped. */
+uint64_t dwc2_otg_phy_count(DWC2OTGState *s, int64_t from, int64_t t)
+{
+    uint64_t div;
+    Clock *clk = dwc2_phy_clk(s, &div);
+
+    if (!clk || t <= from) {
+        return 0;
+    }
+    return DWC2_OTG_GET_CLASS(s)->clock_count(s, clk, from, t) / div;
+}
+
+/* When @ticks of the PHY clock after @from have come: INT64_MAX if never. */
+int64_t dwc2_otg_phy_after(DWC2OTGState *s, int64_t from, uint64_t ticks)
+{
+    uint64_t div;
+    Clock *clk = dwc2_phy_clk(s, &div);
+
+    if (!clk) {
+        return INT64_MAX;
+    }
+    return DWC2_OTG_GET_CLASS(s)->clock_after(s, clk, from, ticks * div);
+}
+
 static uint64_t dwc2_default_clock_cycles(DWC2OTGState *s, Clock *clk,
                                           int64_t ns)
 {
@@ -221,6 +245,20 @@ static int64_t dwc2_default_clock_cycles_ns(DWC2OTGState *s, Clock *clk,
         return INT64_MAX;
     }
     return (hi << 32 | lo >> 32) + !!(uint32_t)lo;
+}
+
+static uint64_t dwc2_default_clock_count(DWC2OTGState *s, Clock *clk,
+                                         int64_t from, int64_t t)
+{
+    return dwc2_default_clock_cycles(s, clk, t - from);
+}
+
+static int64_t dwc2_default_clock_after(DWC2OTGState *s, Clock *clk,
+                                        int64_t from, uint64_t n)
+{
+    int64_t ns = dwc2_default_clock_cycles_ns(s, clk, n);
+
+    return ns > INT64_MAX - from ? INT64_MAX : from + ns;
 }
 
 /* FIFO RAM */
@@ -1758,6 +1796,8 @@ static void dwc2_otg_class_init(ObjectClass *klass, const void *data)
     set_bit(DEVICE_CATEGORY_USB, dc->categories);
     oc->clock_cycles = dwc2_default_clock_cycles;
     oc->clock_cycles_ns = dwc2_default_clock_cycles_ns;
+    oc->clock_count = dwc2_default_clock_count;
+    oc->clock_after = dwc2_default_clock_after;
 }
 
 /* [spec:nuos:req:emu.esp32p4.usb] */

@@ -100,6 +100,12 @@ struct ESP32P4AnaState {
     bool cal_end[ESP32P4_ANA_NUM_PLLS];
     /* The period each output last took, exactly. */
     ESP32P4ClkPeriod out_period[ESP32P4_ANA_NUM_PLLS];
+    /*
+     * The outputs' edges, and XTAL_CLK's edges, to which each locked, as
+     * it last saw them.
+     */
+    ESP32P4ClkEdges out_edges[ESP32P4_ANA_NUM_PLLS];
+    ESP32P4ClkEdges ref_edges[ESP32P4_ANA_NUM_PLLS];
     QEMUTimer *lock_timer[ESP32P4_ANA_NUM_PLLS];
     QEMUTimer *cal_timer[ESP32P4_ANA_NUM_PLLS];
     ESP32P4AnaPllTimer timer_ctx[ESP32P4_ANA_NUM_PLLS];

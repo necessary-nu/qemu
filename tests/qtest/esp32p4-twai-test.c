@@ -1210,7 +1210,8 @@ static void test_bit_rate_exact(void)
 
 /*
  * The timestamp counter: TWAIn_CLK / (TS_DIV_NUM + 1), counting from 0 as
- * it is enabled; each frame stamped at its SOF; its overflow interrupt.
+ * it is enabled, the clock's edges after that (enabled on one, here);
+ * each frame stamped at its SOF; its overflow interrupt.
  */
 /* [spec:nuos:req:emu.esp32p4.twai/test] */
 static void test_timestamp(void)
@@ -1224,6 +1225,8 @@ static void test_timestamp(void)
      */
     two_nodes_with(",strap-mode=0");
     wr(1, TS_PRESCALER, 39);
+    /* TWAIn_CLK, XTAL_CLK, has its edges at multiples of 25 ns. */
+    step((25 - now % 25) % 25);
     t_en = now;
     wr(1, TS_CFG, 1);
     step(12345);
@@ -1239,6 +1242,7 @@ static void test_timestamp(void)
     /* At 40 MHz the 32-bit count wraps after 107.3741824 s. */
     wr(1, TS_PRESCALER, 0);
     wr(1, TS_CFG, 0);
+    step((25 - now % 25) % 25);
     t_en = now;
     wr(1, TS_CFG, 1);
     wr(1, INT_ENA, INT_TSI);

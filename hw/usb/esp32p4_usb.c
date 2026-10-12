@@ -113,12 +113,31 @@ static int64_t esp32p4_usb_clock_cycles_ns(DWC2OTGState *s, Clock *clk,
     return esp32p4_clk_cycles_ns(esp32p4_clk_exact(clk), n);
 }
 
+/* And their edges, with their phase. */
+static uint64_t esp32p4_usb_clock_count(DWC2OTGState *s, Clock *clk,
+                                        int64_t from, int64_t t)
+{
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(clk, from);
+
+    return esp32p4_clk_edges_between(&e, from, t);
+}
+
+static int64_t esp32p4_usb_clock_after(DWC2OTGState *s, Clock *clk,
+                                       int64_t from, uint64_t n)
+{
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(clk, from);
+
+    return esp32p4_clk_edges_after(&e, from, n);
+}
+
 static void esp32p4_usb_otg_class_init(ObjectClass *klass, const void *data)
 {
     DWC2OTGClass *oc = DWC2_OTG_CLASS(klass);
 
     oc->clock_cycles = esp32p4_usb_clock_cycles;
     oc->clock_cycles_ns = esp32p4_usb_clock_cycles_ns;
+    oc->clock_count = esp32p4_usb_clock_count;
+    oc->clock_after = esp32p4_usb_clock_after;
 }
 
 /* USB_WRAP */
@@ -429,19 +448,29 @@ static void utmi_update_clock(ESP32P4UsbUtmiState *s)
               (!c[ESP32P4_USB_UTMI_CTRL_PHY_PLL_FORCE_EN] ||
                c[ESP32P4_USB_UTMI_CTRL_PHY_PLL_EN]);
 
-    clock_update(s->utmi_clk, on ? esp32p4_clk_period_clock(utmi_period())
-                                 : 0);
+    ESP32P4ClkEdges old = s->utmi_edges, ref;
+
+    if (!on) {
+        s->utmi_edges = esp32p4_clk_edges_stopped();
+    } else if (!esp32p4_clk_edges_running(&old)) {
+        /* The PLL locks to the reference clock's first edge from now. */
+        ref = esp32p4_clk_edges_or_at(s->refclk,
+                                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        s->utmi_edges = esp32p4_clk_edges_from(
+            utmi_period(), &ref, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+    esp32p4_clk_update(s->utmi_clk, &old, &s->utmi_edges);
 }
 
 /* [spec:nuos:req:emu.esp32p4.usb] */
-static bool utmi_exact_period(Object *obj, Clock *out, ESP32P4ClkPeriod *p)
+static bool utmi_exact_edges(Object *obj, Clock *out, ESP32P4ClkEdges *e)
 {
     ESP32P4UsbUtmiState *s = ESP32P4_USB_UTMI(obj);
 
     if (out != s->utmi_clk) {
         return false;
     }
-    *p = clock_get(out) ? utmi_period() : esp32p4_clk_period_stopped();
+    *e = s->utmi_edges;
     return true;
 }
 
@@ -578,10 +607,11 @@ static void utmi_init(Object *obj)
 
 static const VMStateDescription vmstate_utmi = {
     .name = TYPE_ESP32P4_USB_UTMI,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(refclk, ESP32P4UsbUtmiState),
+        VMSTATE_ESP32P4_CLK_EDGES(utmi_edges, ESP32P4UsbUtmiState),
         VMSTATE_UINT8_ARRAY(fc, ESP32P4UsbUtmiState, ESP32P4_USB_UTMI_REGS),
         VMSTATE_BOOL(phy_reset, ESP32P4UsbUtmiState),
         VMSTATE_BOOL_ARRAY(ctrl, ESP32P4UsbUtmiState,
@@ -602,7 +632,7 @@ static void utmi_class_init(ObjectClass *klass, const void *data)
     dc->vmsd = &vmstate_utmi;
     rc->phases.hold = utmi_reset_hold;
     rc->phases.exit = utmi_reset_exit;
-    csc->exact_period = utmi_exact_period;
+    csc->exact_edges = utmi_exact_edges;
 }
 
 /* [spec:nuos:req:emu.esp32p4.usb] */

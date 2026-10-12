@@ -965,10 +965,14 @@ static int64_t dwmac_ptp_edge_ns(Esp32DwmacState *s, uint64_t edge)
     return dwmac_class(s)->clock_edge_ns(s, s->ptp_clk, edge);
 }
 
-/* @cycles of the bus clock in ns, from an edge of it */
-static int64_t dwmac_bus_cycles_ns(Esp32DwmacState *s, uint64_t cycles)
+/* When @cycles of the bus clock, its edges after @from, have come */
+static int64_t dwmac_bus_after(Esp32DwmacState *s, int64_t from,
+                               uint64_t cycles)
 {
-    return dwmac_class(s)->clock_edge_ns(s, s->bus_clk, cycles);
+    Esp32DwmacClass *k = dwmac_class(s);
+
+    return k->clock_edge_ns(s, s->bus_clk,
+                            k->clock_edges(s, s->bus_clk, from) + cycles);
 }
 
 /* The sub-second increments @cycles cycles of the PTP clock make */
@@ -2152,8 +2156,9 @@ static bool dwmac_rx_dma_frame(Esp32DwmacState *s, const uint8_t *frame,
 
             if (riwt && clock_get_hz(s->bus_clk)) {
                 timer_mod(&s->rx_wdt_timer,
-                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                          dwmac_bus_cycles_ns(s, riwt * 256));
+                          dwmac_bus_after(s,
+                                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                          riwt * 256));
             }
         } else {
             timer_del(&s->rx_wdt_timer);
@@ -2506,7 +2511,7 @@ static void dwmac_mdio_start(Esp32DwmacState *s)
     Esp32DwmacClass *k = dwmac_class(s);
     unsigned cr = (s->mii_addr >> MII_CR_SHIFT) & 0xf;
     uint32_t d = div[cr];
-    int64_t ns;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), end;
 
     if (!d) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -2514,13 +2519,14 @@ static void dwmac_mdio_start(Esp32DwmacState *s)
         d = 42;
     }
     /* Without its clock the frame takes the time it would at 80 MHz. */
-    ns = clock_get_hz(s->bus_clk) ? dwmac_bus_cycles_ns(s, 64 * d)
-                                  : muldiv64(64 * d, NANOSECONDS_PER_SECOND,
-                                             80000000);
+    end = clock_get_hz(s->bus_clk) ? dwmac_bus_after(s, now, 64 * d)
+                                   : now + muldiv64(64 * d,
+                                                    NANOSECONDS_PER_SECOND,
+                                                    80000000);
     if (k->mdio_drive) {
         k->mdio_drive(s, true);
     }
-    timer_mod(&s->mdio_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
+    timer_mod(&s->mdio_timer, end);
 }
 
 /*

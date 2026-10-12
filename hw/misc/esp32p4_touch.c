@@ -1190,12 +1190,15 @@ static void touch_fast_update(void *opaque, ClockEvent event)
         esp32p4_clkwait_fold(&s->xpd_wait, now);
         if (touch_counting(s)) {
             s->meas_count = touch_count_at(s, now);
-            s->meas_edges.origin_ns = MAX(now, s->meas_edges.origin_ns);
+            if (now > s->meas_edges.origin_ns) {
+                esp32p4_clk_count_rebase(&s->meas_edges, now);
+            }
         }
         return;
     }
     esp32p4_clkwait_resched(&s->xpd_wait);
-    s->meas_edges.period = esp32p4_clk_exact(s->fast);
+    esp32p4_clk_count_start(&s->meas_edges, s->fast,
+                            s->meas_edges.origin_ns);
     if (touch_counting(s)) {
         touch_meas_arm(s);
     }

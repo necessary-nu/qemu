@@ -328,7 +328,7 @@ static void systimer_clk_update(void *opaque, ClockEvent event)
         edges = systimer_edges(s, now);
         systimer_sync_units(s, edges);
         s->clk_edges = edges;
-        s->clk_count.origin_ns = now;
+        esp32p4_clk_count_rebase(&s->clk_count, now);
         return;
     }
     esp32p4_clk_count_start(&s->clk_count, s->clk, now);

@@ -315,8 +315,12 @@ static void test_tx_waveform(void)
     qtest_writel(qts, TX_START_CFG, START);
     tx_clock(qts, 0, 4, true);
 
-    /* Rising edges at 50, 150, ... ns: CS falls at the first. */
-    qtest_clock_step(qts, 49);
+    /*
+     * The divider, started with its gate, has its edges from XTAL_CLK's
+     * there: rising edges at 100, 200, ... ns, the first after the start.
+     * CS falls at the first.
+     */
+    qtest_clock_step(qts, 99);
     g_assert_cmphex(pads(qts) & 0x300ff, ==, 0x20081);
     qtest_clock_step(qts, 1);
     g_assert_cmphex(pads(qts) & 0x300ff, ==, 0x10081);
