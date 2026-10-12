@@ -207,6 +207,12 @@
  *     and its reset, a baseline encoder and decoder whose pipeline runs on
  *     the same clock, its interrupt JPEG_INTR (source 95). Its data paths
  *     are the 2D-DMA's (include/hw/misc/esp32p4_jpeg.h).
+ *   - The H264 encoder (TRM chapter 41) at 0x50084000 and its dedicated
+ *     DMA, H264_DMA, at 0x500A7000, behind H264_SYS_CLK and the H264
+ *     reset, coding on H264_CLK, a baseline-profile encoder whose every
+ *     input and output moves through H264_DMA's channels and memory, as
+ *     the APMs allow; its interrupts sources 115 to 126, the DMA
+ *     channels' and the encoder's (hw/misc/esp32p4_h264.c).
  *   - The debug blocks (TRM chapters 3, 22 and 23): the debug assistant at
  *     0x3FF06000, watching the HP cores' SP, their accesses to four
  *     regions and their PCs; each HP core's RISC-V trace encoder, at
@@ -327,7 +333,8 @@
  *   - The 2D-DMA controller (TRM chapter 8) at 0x50088000, behind
  *     DMA2D_SYS_CLK, which also clocks its transfers, and its reset, four
  *     TX and three RX channels, their interrupts sources 104 to 108, 128
- *     and 129, its ETM events and tasks the ETM's; its accesses go
+ *     and 129 (ESP-IDF's 133 and 134, by their mapping registers at 0x214
+ *     and 0x218), its ETM events and tasks the ETM's; its accesses go
  *     through the DMA APM as the 2D-DMA masters, to memory directly, past
  *     the caches. A peripheral served by it attaches as
  *     include/hw/dma/esp32p4_dma2d.h describes. The pixel-processing
@@ -466,7 +473,6 @@ static const struct {
 
     /* HP peripherals 0. */
     { "pau",              0x50082000, 4 * KiB },
-    { "h264",             0x50084000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
     { "pvt",              0x5009e000, 4 * KiB },
     { "csi-host",         0x5009f000, 2 * KiB },
@@ -476,7 +482,6 @@ static const struct {
     { "isp",              0x500a1000, 4 * KiB },
     /* The AXI ICM's QoS command interface, above its own registers. */
     { "axi-icm-qos",      0x500a4400, 3 * KiB },
-    { "h264-dma",         0x500a7000, 4 * KiB },
 
     /* HP peripherals 1. */
     { "iomux-mspi-pin",   0x500e1200, 4 * KiB - 0x200 },
@@ -2762,7 +2767,7 @@ static void esp32p4_sw_sys_reset(void *opaque, int n, int level)
  *     taking their resets for its PC records.
  *   - The AXI performance monitor (0x500A8000), behind AXI_PERF_MON_SYS_CLK
  *     and its reset, counting SYS_CLK, the AXI matrix's clock, its
- *     interrupt AXI_PERF_MON_INTR (source 130).
+ *     interrupt AXI_PERF_MON_INTR (source 130, ESP-IDF's 135).
  *   - Each HP core's trace encoder (0x3FF04000, 0x3FF05000), behind
  *     TRACE_CPU_CLK and its RST_EN_CORETRACE<n> reset, its AHB master on
  *     TRACE_SYS_CLK writing the trace memory through the access permission
@@ -3043,6 +3048,38 @@ static void esp32p4_init_pwm(ESP32P4MachineState *s)
                 sig[i].cap + n,
                 qdev_get_gpio_in_named(dev, ESP32_MCPWM_CAP_IN, n));
         }
+    }
+}
+
+/*
+ * The H264 encoder and its dedicated DMA: the encoder's registers and
+ * H264_DMA's behind H264_SYS_CLK and the H264 reset, the coding timed by
+ * H264_CLK, the DMA on the bus through the APMs, and its twelve interrupt
+ * sources, the DMA channels' and the encoder's.
+ */
+/* [spec:nuos:req:emu.esp32p4.h264] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_h264(ESP32P4MachineState *s)
+{
+    DeviceState *dev;
+
+    object_initialize_child(OBJECT(s), "h264", &s->h264, TYPE_ESP32P4_H264);
+    dev = DEVICE(&s->h264);
+    object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "clk",
+                          qdev_get_clock_out(DEVICE(&s->clkrst), "h264"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev),
+                             ESP32P4_H264_MMIO_ENC, ESP32P4_H264_BASE,
+                             ESP32P4_CLK_H264_SYS, ESP32P4_RST_H264, 0);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev),
+                             ESP32P4_H264_MMIO_DMA, ESP32P4_H264_DMA_BASE,
+                             ESP32P4_CLK_H264_SYS, ESP32P4_RST_H264, 0);
+    for (int i = 0; i < ESP32P4_H264_IRQS; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), i,
+                           esp32p4_intr_source(s,
+                               ESP32P4_INTR_H264_DMA2D_OUT_CH0 + i));
     }
 }
 
@@ -4627,6 +4664,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_emac(s);
     esp32p4_init_spi(s);
     esp32p4_init_parlio(s);
+    esp32p4_init_h264(s);
     esp32p4_init_jpeg(s);
     esp32p4_init_lcd_cam(s);
     esp32p4_init_low_power(s);

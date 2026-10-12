@@ -21,7 +21,9 @@
  *     invalid, route it nowhere. SRC_PASS_IN_SEC (6) lets the source take
  *     part in remapping, and SRC_IN_SEC_FLAG (7) makes it a secure source.
  *   - INTR_STATUS_REG_0 to _3 (0x200 to 0x20C) and _4 (0x220): each
- *     source's level, a bit per source, whatever its mapping.
+ *     source's level, a bit per source, whatever its mapping: source n at
+ *     bit n % 32 of register n / 32, sources 128 to 130 at bits 0 to 2 of
+ *     _4 (include/hw/intc/esp32p4_intmatrix.h says why 130 is at bit 2).
  *   - CLOCK_GATE_REG (0x210): REG_CLK_EN, which forces the register
  *     file's own clock gate on; it has no effect software can see.
  *   - INTR_SIG_IDX_ASSERT_IN_SEC_REG (0x228), INTR_SEC_STATUS_REG (0x22C)

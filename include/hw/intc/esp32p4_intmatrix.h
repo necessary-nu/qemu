@@ -38,13 +38,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4IntMatrixState, ESP32P4_INTMATRIX)
  * named after ESP-IDF's ETS_<name>_INTR_SOURCE (soc/interrupts.h), whose
  * numbers they are up to 127. 83, 99 and 112, which the TRM lists as
  * reserved, have mapping registers in v3 silicon's register set and
- * ESP-IDF names: the cache's error interrupt among them. ESP-IDF numbers
- * the three sources above 127 by their mapping registers' indices, 133 to
- * 135, as its routing code indexes the registers by source; the hardware
- * numbers them 128 to 130, and their status is bits 0 to 2 of
- * CORE<n>_INTR_STATUS_REG_4. TRM table 13.4-1 gives sources 4 and 5 as
- * MB_LP and MB_HP; their mapping registers, at 0x10 and 0x14, are MB_HP's
- * and MB_LP's, as ESP-IDF has them and as here.
+ * ESP-IDF names: the cache's error interrupt among them.
+ *
+ * The three sources v3 silicon adds are 128 to 130 (DMA2D_IN_CH2,
+ * DMA2D_OUT_CH3, AXI_PERF_MON), as TRM table 13.4-1 numbers them and as
+ * the hardware counts them: HP_SYSTEM's HP2LP groups have 110 bits, one
+ * for each of sources 21 to 130. Their mapping registers are at 0x214 to
+ * 0x21C, past the status registers and CLOCK_GATE_REG, and ESP-IDF
+ * numbers them by those registers' indices, 133 to 135, as its routing
+ * code writes the register at 4 * number: software routes a source by
+ * its ESP-IDF number at 4 * that number, every source alike. Their status
+ * is bits 0 to 2 of CORE<n>_INTR_STATUS_REG_4, a bit for each of the three
+ * as the register's description has it (the table gives AXI_PERF_MON's as
+ * bit 3, which would number it 131, beyond the HP2LP groups' sources).
+ *
+ * TRM table 13.4-1 gives sources 4 and 5 as MB_LP and MB_HP; their
+ * mapping registers, at 0x10 and 0x14, are MB_HP's and MB_LP's, as
+ * ESP-IDF has them and as here.
  */
 enum {
     ESP32P4_INTR_LP_RTC = 0,
