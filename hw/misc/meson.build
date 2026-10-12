@@ -243,6 +243,9 @@ system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_huk.c',
   'esp32p4_i2c_ana_mst.c',
   'esp32p4_icm.c',
+  'esp32p4_image_probe.c',
+  'esp32p4_jpeg.c',
+  'esp32p4_jpeg_codec.c',
   'esp32p4_keymng.c',
   'esp32p4_ledc.c',
   'esp32p4_lp_ana.c',
@@ -257,6 +260,8 @@ system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_trng.c',
   'esp32p4_tsens.c',
 ))
+system_ss.add(when: 'CONFIG_ESP32P4', if_true: [
+  files('esp32p4_image_decode.c', 'esp32p4_image_source.c'), zlib])
 # The blocks that reach into the cores.
 specific_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_assist_debug.c',

@@ -160,6 +160,74 @@ static int64_t icount_window_x(void)
     return INT64_MIN;
 }
 
+/*
+ * The time of edge @k of a clock whose exact period is @period + @frac /
+ * @den 2^-32 ns, in 2^-32 ns from time 0, as *@hi:*@lo, and in *@rem the
+ * fraction of a unit beyond it, in 1/@den.
+ */
+static void icount_edge_time(uint64_t k, uint64_t period, uint64_t frac,
+                             uint64_t den, uint64_t *lo, uint64_t *hi,
+                             uint64_t *rem)
+{
+    mulu64(lo, hi, k, period);
+    *rem = 0;
+    if (frac) {
+        uint64_t flo, fhi;
+
+        mulu64(&flo, &fhi, k, frac);
+        *rem = divu128(&flo, &fhi, den);
+        *lo += flo;
+        *hi += fhi + (*lo < flo);
+    }
+}
+
+/*
+ * The first edge of @cpu's icount clock at or after @units 2^-32 ns past
+ * the window's start, in the same units. The clock's edges fall at whole
+ * multiples of its exact period from time 0 (on the virtual clock, its
+ * bias included), the edges devices timed on the clock count. @cpu's
+ * remainder is set for that edge, so that its instructions, each taking
+ * an exact period, go on from edge to edge.
+ */
+static int64_t icount_window_edge(CPUState *cpu, int64_t units)
+{
+    uint64_t period = qatomic_read(&cpu->icount_period);
+    uint64_t frac = qatomic_read(&cpu->icount_period_frac);
+    uint64_t den = qatomic_read(&cpu->icount_period_den);
+    int64_t start_ns = timers_state.qemu_icount_bias + timers_state.window_ns;
+    uint64_t tlo, thi, qlo, qhi, elo, ehi, rem, k;
+
+    if (!period || start_ns < 0 || units < 0 || units > INT64_MAX / 2) {
+        return units;
+    }
+    /* The time, in 2^-32 ns from time 0. */
+    tlo = ((uint64_t)start_ns << 32) | timers_state.window_frac;
+    thi = (uint64_t)start_ns >> 32;
+    tlo += (uint64_t)units;
+    thi += tlo < (uint64_t)units;
+    /* The first edge of the whole period: edges of the exact one are later. */
+    qlo = tlo;
+    qhi = thi;
+    if (divu128(&qlo, &qhi, period)) {
+        qlo++;
+        qhi += !qlo;
+    }
+    if (qhi) {
+        return units;
+    }
+    k = qlo;
+    while (k > 0) {
+        icount_edge_time(k - 1, period, frac, den, &elo, &ehi, &rem);
+        if (ehi < thi || (ehi == thi && elo < tlo)) {
+            break;
+        }
+        k--;
+    }
+    icount_edge_time(k, period, frac, den, &elo, &ehi, &rem);
+    cpu->icount_time_rem = rem;
+    return units + (int64_t)(elo - tlo);
+}
+
 /* Virtual time past the window's start, in 2^-32 ns. */
 static int64_t icount_window_elapsed(void)
 {
@@ -269,7 +337,12 @@ void icount_window_set_idle(CPUState *cpu, bool idle)
         timers_state.window_running--;
         icount_window_sync();
     } else {
-        cpu->icount_own = MAX(cpu->icount_own, icount_window_elapsed());
+        int64_t elapsed = icount_window_elapsed();
+
+        /* Virtual time has passed it: it wakes on its clock's next edge. */
+        if (elapsed > cpu->icount_own) {
+            cpu->icount_own = icount_window_edge(cpu, elapsed);
+        }
         cpu->icount_window_idle = false;
         timers_state.window_running++;
     }
@@ -284,7 +357,7 @@ void icount_window_join(CPUState *cpu, uint64_t units)
     seqlock_write_lock(&timers_state.vm_clock_seqlock,
                        &timers_state.vm_clock_lock);
     elapsed = icount_window_elapsed();
-    cpu->icount_own = elapsed;
+    cpu->icount_own = icount_window_edge(cpu, elapsed);
     cpu->icount_in_window = true;
     cpu->icount_window_idle = false;
     timers_state.window_cpus++;
@@ -293,6 +366,16 @@ void icount_window_join(CPUState *cpu, uint64_t units)
         units < timers_state.window_units - elapsed) {
         timers_state.window_units = elapsed + units;
     }
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
+void icount_window_align(CPUState *cpu)
+{
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    cpu->icount_own = icount_window_edge(cpu, cpu->icount_own);
+    cpu->icount_realign = false;
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
                          &timers_state.vm_clock_lock);
 }
@@ -362,7 +445,13 @@ int64_t icount_get_raw(void)
     return icount;
 }
 
-/* Return the virtual CPU time, based on the instruction counter.  */
+/*
+ * Return the virtual CPU time, based on the instruction counter: with
+ * CPUs executing at a clock's rate, the time their instructions have run
+ * up to rounded up to the nanosecond, so that an instruction ending on a
+ * clock edge ends at the edge's time as devices timed on the clock count
+ * it (the first nanosecond at or after the edge).
+ */
 int64_t icount_get(void)
 {
     int64_t icount;
@@ -370,7 +459,8 @@ int64_t icount_get(void)
 
     do {
         start = seqlock_read_begin(&timers_state.vm_clock_seqlock);
-        icount = icount_get_locked();
+        icount = icount_get_locked() +
+                 (timers_state.qemu_icount_time_frac != 0);
     } while (seqlock_read_retry(&timers_state.vm_clock_seqlock, start));
 
     return icount;
@@ -764,6 +854,7 @@ static void icount_cpu_clock_update(void *opaque, ClockEvent event)
 
     if (period) {
         qatomic_set(&cpu->icount_period, period);
+        cpu->icount_realign = true;
         if (icount_enabled() && cpu == current_cpu) {
             cpu_exit(cpu);
         }
@@ -776,6 +867,7 @@ void icount_set_cpu_period_frac(CPUState *cpu, uint64_t frac, uint64_t den)
     qatomic_set(&cpu->icount_period_den, den);
     qatomic_set(&cpu->icount_period_frac, frac);
     cpu->icount_time_rem = 0;
+    cpu->icount_realign = true;
 }
 
 void icount_set_cpu_clock(CPUState *cpu, Clock *clk)

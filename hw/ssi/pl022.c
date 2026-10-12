@@ -140,6 +140,33 @@ static int64_t pl022_ns(PL022State *s, uint64_t bits)
     return clock_ticks_to_ns(s->clk, pl022_bit_ticks(s) * bits);
 }
 
+/* The first virtual time at which SSPCLK has made `ticks` ticks. */
+static int64_t pl022_tick_ns(PL022State *s, uint64_t ticks)
+{
+    uint64_t ns = clock_ticks_to_ns(s->clk, ticks);
+
+    while (clock_ns_to_ticks(s->clk, ns) < ticks) {
+        ns++;
+    }
+    return MIN(ns, (uint64_t)INT64_MAX / 2);
+}
+
+/*
+ * The time of the SSPCLK edge `ticks` edges after the first at or after
+ * virtual time `t`, its edges at whole multiples of its period from time
+ * 0: the serial interface runs on SSPCLK, so a frame starts on an edge,
+ * however its write fell between two, and ends `ticks` later.
+ */
+static int64_t pl022_edge_ns(PL022State *s, int64_t t, uint64_t ticks)
+{
+    uint64_t k = clock_ns_to_ticks(s->clk, MAX(t, 0));
+
+    if (pl022_tick_ns(s, k) < t) {
+        k++;
+    }
+    return pl022_tick_ns(s, k + ticks);
+}
+
 /* Drive the interface signals, skipping lines whose level is unchanged. */
 static void pl022_set_pin(PL022State *s, int n, int level)
 {
@@ -320,10 +347,10 @@ static void pl022_end_frame(PL022State *s)
 
 /*
  * A master transmits while it is enabled and its transmit FIFO holds
- * data, the next frame starting at virtual time `start`, while SSPCLK
- * runs. With no SSPCLK connected, frames complete at once, and the
- * transmitter stalls while the receive FIFO is full rather than lose
- * data.
+ * data, the next frame starting on SSPCLK's first edge at or after
+ * virtual time `start`, while SSPCLK runs. With no SSPCLK connected,
+ * frames complete at once, and the transmitter stalls while the receive
+ * FIFO is full rather than lose data.
  */
 static void pl022_xfer_at(PL022State *s, int64_t start)
 {
@@ -338,7 +365,8 @@ static void pl022_xfer_at(PL022State *s, int64_t start)
            (timed || s->rx_fifo_len < PL022_FIFO_DEPTH)) {
         pl022_start_frame(s);
         if (timed) {
-            s->frame_end = start + pl022_ns(s, pl022_frame_bits(s));
+            s->frame_end = pl022_edge_ns(s, start, pl022_bit_ticks(s) *
+                                         pl022_frame_bits(s));
             timer_mod(s->frame_timer, s->frame_end);
             break;
         }
@@ -747,7 +775,7 @@ static void pl022_clk_update(void *opaque, ClockEvent event)
         return;
     }
     if (s->busy && !timer_pending(s->frame_timer)) {
-        s->frame_end = now + clock_ticks_to_ns(s->clk, s->frame_left);
+        s->frame_end = pl022_edge_ns(s, now, s->frame_left);
         timer_mod(s->frame_timer, s->frame_end);
     }
     pl022_rt_restart(s);
