@@ -474,8 +474,8 @@ static void ref_bayer(const Cfg *c, const uint8_t *raw, Plane *out)
                 if (c->dpc_ctrl & 4) {
                     if (!(c->dpc_ctrl & 16)) {
                         bad |= v > mx + thh || v < mn - thl;
-                    } else if (!(v * 16 < mx * (thh & 31) &&
-                                 v * 16 > mx * (thl & 31))) {
+                    } else if (!(v * 32 < mx * (thh & 31) &&
+                                 v * 32 > mx * (thl & 31))) {
                         int est = sum / 8, dif = abs(est - v);
                         int avg = (sum + 8 * v) / 16;
 
@@ -531,49 +531,61 @@ typedef struct RGB {
     uint8_t v[MAXH][MAXW][3];
 } RGB;
 
-/* Demosaic: green by Hamilton-Adams, red and blue by colour differences */
+/*
+ * Demosaic: green by Hamilton-Adams, red and blue by colour differences,
+ * at a red or blue site against the diagonal neighbours' green in the
+ * site's own direction, at a green site against both directions' mean
+ */
 static void ref_demosaic(const Cfg *c, const Plane *b, RGB *out)
 {
-    static int gs[MAXH][MAXW], ga[MAXH][MAXW];
+    /* Each site's green: selected, mean, horizontal, vertical */
+    static int ge[MAXH][MAXW][4], gd[MAXH][MAXW];
 
     for (int y = 0; y < c->h; y++) {
         for (int x = 0; x < c->w; x++) {
             int s = site(c, x, y), v = b->v[y][x];
-            int gw, ge, gn, gsth, gh, gv, dh, dv;
+            int gw, gea, gn, gsth, gh, gv, dh, dv;
+            int *e = ge[y][x];
 
             if (s == GR_ || s == GB_) {
-                gs[y][x] = ga[y][x] = 8 * v;
+                e[0] = e[1] = e[2] = e[3] = 8 * v;
+                gd[y][x] = 1;
                 continue;
             }
             gw = at(b, c, x - 1, y);
-            ge = at(b, c, x + 1, y);
+            gea = at(b, c, x + 1, y);
             gn = at(b, c, x, y - 1);
             gsth = at(b, c, x, y + 1);
-            gh = 4 * (gw + ge) + 2 * (2 * v - at(b, c, x - 2, y) -
-                                      at(b, c, x + 2, y));
+            gh = 4 * (gw + gea) + 2 * (2 * v - at(b, c, x - 2, y) -
+                                       at(b, c, x + 2, y));
             gv = 4 * (gn + gsth) + 2 * (2 * v - at(b, c, x, y - 2) -
                                         at(b, c, x, y + 2));
-            dh = abs(gw - ge);
+            dh = abs(gw - gea);
             dv = abs(gn - gsth);
-            ga[y][x] = (gh + gv) / 2;
-            gs[y][x] = dh * c->grad < dv * 16 ? gh :
-                       dv * c->grad < dh * 16 ? gv : ga[y][x];
+            e[1] = (gh + gv) / 2;
+            e[2] = gh;
+            e[3] = gv;
+            gd[y][x] = dh * c->grad < dv * 16 ? 2 :
+                       dv * c->grad < dh * 16 ? 3 : 1;
+            e[0] = e[gd[y][x]];
         }
     }
     for (int y = 0; y < c->h; y++) {
         for (int x = 0; x < c->w; x++) {
             int s = site(c, x, y), v = b->v[y][x];
-#define CD(X, Y) (8 * at(b, c, X, Y) - ga[mir(Y, c->h)][mir(X, c->w)])
+#define CD(X, Y, K) (8 * at(b, c, X, Y) - ge[mir(Y, c->h)][mir(X, c->w)][K])
             if (s == R_ || s == B_) {
-                int o = 4 * gs[y][x] + CD(x - 1, y - 1) + CD(x + 1, y - 1) +
-                        CD(x - 1, y + 1) + CD(x + 1, y + 1);
+                int d = gd[y][x];
+                int o = 4 * ge[y][x][0] + CD(x - 1, y - 1, d) +
+                        CD(x + 1, y - 1, d) + CD(x - 1, y + 1, d) +
+                        CD(x + 1, y + 1, d);
 
-                out->v[y][x][1] = clamp8((gs[y][x] + 4) >> 3);
+                out->v[y][x][1] = clamp8((ge[y][x][0] + 4) >> 3);
                 out->v[y][x][s == R_ ? 0 : 2] = v;
                 out->v[y][x][s == R_ ? 2 : 0] = clamp8((o + 16) >> 5);
             } else {
-                int h = 32 * v + 2 * (CD(x - 1, y) + CD(x + 1, y));
-                int vv = 32 * v + 2 * (CD(x, y - 1) + CD(x, y + 1));
+                int h = 32 * v + 2 * (CD(x - 1, y, 1) + CD(x + 1, y, 1));
+                int vv = 32 * v + 2 * (CD(x, y - 1, 1) + CD(x, y + 1, 1));
 
                 out->v[y][x][1] = v;
                 out->v[y][x][0] = clamp8(((s == GR_ ? h : vv) + 16) >> 5);
@@ -1022,6 +1034,8 @@ static void dpc_run(Cfg *c)
     raw[4 * c->w + 8] = 0;
     raw[2 * c->w + 11] = 250;
     raw[6 * c->w + 2] = 5;
+    /* Dim, at 3/8 of its neighbours: algorithm 1's first step keeps it */
+    raw[5 * c->w + 10] = raw[5 * c->w + 10] * 3 / 8;
     raw[0] = 255;
     raw[c->w * c->h - 1] = 0;
     apply(qts, c);
