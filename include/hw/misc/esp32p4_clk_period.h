@@ -469,6 +469,40 @@ static inline uint64_t esp32p4_clk_units_cycles(ESP32P4ClkPeriod p,
     return esp32p4_div_192_128(y, p.num_hi, p.num_lo, &rem);
 }
 
+/* esp32p4_clk_ns_cycles(), counting a cycle begun as a whole one. */
+static inline uint64_t esp32p4_clk_ns_cycles_up(ESP32P4ClkPeriod p,
+                                                int64_t ns)
+{
+    uint64_t y[3], lo, hi, q;
+    bool rem;
+
+    if (ns <= 0 || !esp32p4_clk_period_running(p)) {
+        return 0;
+    }
+    mulu64(&lo, &hi, ns, p.den);
+    y[2] = hi >> 32;
+    y[1] = hi << 32 | lo >> 32;
+    y[0] = lo << 32;
+    q = esp32p4_div_192_128(y, p.num_hi, p.num_lo, &rem);
+    return q == UINT64_MAX ? q : q + rem;
+}
+
+/* esp32p4_clk_units_cycles(), counting a cycle begun as a whole one. */
+static inline uint64_t esp32p4_clk_units_cycles_up(ESP32P4ClkPeriod p,
+                                                   uint64_t units_hi,
+                                                   uint64_t units_lo)
+{
+    uint64_t y[3], q;
+    bool rem;
+
+    if (!esp32p4_clk_period_running(p)) {
+        return 0;
+    }
+    esp32p4_mul_64_128(y, p.den, units_hi, units_lo);
+    q = esp32p4_div_192_128(y, p.num_hi, p.num_lo, &rem);
+    return q == UINT64_MAX ? q : q + rem;
+}
+
 /* Whether a period @p is a whole number of ns, every edge on a whole ns. */
 static inline bool esp32p4_clk_period_whole_ns(ESP32P4ClkPeriod p)
 {
@@ -623,31 +657,49 @@ static inline uint64_t esp32p4_clk_edge_wait(const ESP32P4ClkEdges *e,
 }
 
 /*
- * The edges of a clock of period @p whose edges are some of those of @in,
- * its first one at the first edge of @in at or after @t ns: as a divider
- * started at @t has them, or a PLL locking to @in at @t. To within
- * 1 / p.den of a unit; with @in stopped, from an edge at @t.
+ * The time to @t ns from the last edge at or before it of a running clock,
+ * in Clock units, rounded down: 0 for an edge at @t; saturating at
+ * UINT64_MAX.
  */
-static inline ESP32P4ClkEdges esp32p4_clk_edges_from(ESP32P4ClkPeriod p,
-                                                     const ESP32P4ClkEdges *in,
-                                                     int64_t t)
+static inline uint64_t esp32p4_clk_edge_since(const ESP32P4ClkEdges *e,
+                                              int64_t t)
+{
+    uint64_t y[3], a[3];
+    int64_t k;
+    bool at, rem;
+
+    k = esp32p4_clk_edge_index(e, t, &at);
+    if (at || k == INT64_MAX) {
+        return 0;
+    }
+    /* t, less edge k: (t * 2^32 * den - phase - k * num) / den. */
+    esp32p4_clk_scaled(y, t, e->period.den);
+    if (k < 0) {
+        esp32p4_add_192_128(y, e->period.num_hi, e->period.num_lo);
+        esp32p4_sub_192_128(y, e->phase_hi, e->phase_lo);
+    } else {
+        esp32p4_mul_64_128(a, k, e->period.num_hi, e->period.num_lo);
+        esp32p4_add_192_128(a, e->phase_hi, e->phase_lo);
+        esp32p4_sub_192_128(y, a[1], a[0]);
+        y[2] -= a[2];
+    }
+    return esp32p4_div_192_128(y, 0, e->period.den, &rem);
+}
+
+/*
+ * The edges of a clock of period @p through edge @k, at least 0, of the
+ * running @in; to within 1 / p.den of a unit. Out of range, from an edge
+ * at @t ns.
+ */
+static inline ESP32P4ClkEdges esp32p4_clk_edges_through(
+    ESP32P4ClkPeriod p, const ESP32P4ClkEdges *in, int64_t k, int64_t t)
 {
     ESP32P4ClkEdges e = { p, 0, 0 };
     uint64_t a[3], q[3], v[3], r[2], rr, lo, hi;
-    int64_t k;
-    bool at;
 
-    if (!esp32p4_clk_period_running(p)) {
-        return esp32p4_clk_edges_stopped();
-    }
-    if (!esp32p4_clk_edges_running(in)) {
-        return esp32p4_clk_edges_at(p, t);
-    }
-    k = esp32p4_clk_edge_index(in, t, &at);
     if (k == INT64_MAX) {
         return esp32p4_clk_edges_at(p, t);
     }
-    k += !at;
     /* The edge: a / in.den units, a = phase + k * num. */
     esp32p4_mul_64_128(a, k, in->period.num_hi, in->period.num_lo);
     /* a = Q * in.den + R; at p.den, Q * p.den + R * p.den / in.den. */
@@ -669,6 +721,51 @@ static inline ESP32P4ClkEdges esp32p4_clk_edges_from(ESP32P4ClkPeriod p,
     e.phase_hi = r[1];
     e.phase_lo = r[0];
     return e;
+}
+
+/*
+ * The edges of a clock of period @p whose edges are some of those of @in,
+ * its first one at the first edge of @in at or after @t ns: as a PLL
+ * locking to @in at @t has them, or a block that starts dividing @in at
+ * its next edge. With @in stopped, from an edge at @t.
+ */
+static inline ESP32P4ClkEdges esp32p4_clk_edges_from(ESP32P4ClkPeriod p,
+                                                     const ESP32P4ClkEdges *in,
+                                                     int64_t t)
+{
+    int64_t k;
+    bool at;
+
+    if (!esp32p4_clk_period_running(p)) {
+        return esp32p4_clk_edges_stopped();
+    }
+    if (!esp32p4_clk_edges_running(in)) {
+        return esp32p4_clk_edges_at(p, t);
+    }
+    k = esp32p4_clk_edge_index(in, t, &at);
+    return esp32p4_clk_edges_through(p, in, k == INT64_MAX ? k : k + !at, t);
+}
+
+/*
+ * The edges of a divider of @in to period @p restarted at @t ns: counting
+ * @in's edges after @t, its first edge is at the one that completes its
+ * period, the period after @in's last edge at or before @t (or its first,
+ * when it has none by then). With @in stopped, from an edge at @t.
+ */
+static inline ESP32P4ClkEdges esp32p4_clk_edges_restart(
+    ESP32P4ClkPeriod p, const ESP32P4ClkEdges *in, int64_t t)
+{
+    int64_t k;
+    bool at;
+
+    if (!esp32p4_clk_period_running(p)) {
+        return esp32p4_clk_edges_stopped();
+    }
+    if (!esp32p4_clk_edges_running(in)) {
+        return esp32p4_clk_edges_at(p, t);
+    }
+    k = esp32p4_clk_edge_index(in, t, &at);
+    return esp32p4_clk_edges_through(p, in, MAX(k, 0), t);
 }
 
 /*

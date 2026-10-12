@@ -420,9 +420,9 @@ static bool esp32p4_i2c_runs(ESP32P4I2CState *s)
 
 /*
  * The edges I2C_SCLK has at @now: its own, or the LP controller's divided
- * clock's, which counts them from the first at or after a change of the
- * function clock's edges or of the division, and keeps its edges while
- * neither changes.
+ * clock's, which counts them afresh after a change of the function
+ * clock's edges or of the division, and keeps its edges while neither
+ * changes.
  */
 static ESP32P4ClkEdges esp32p4_i2c_edges(ESP32P4I2CState *s, int64_t now)
 {
@@ -437,7 +437,7 @@ static ESP32P4ClkEdges esp32p4_i2c_edges(ESP32P4I2CState *s, int64_t now)
         esp32p4_clk_edges_eq(&sclk, &s->tp_sclk)) {
         return s->tp_edges;
     }
-    return esp32p4_clk_edges_from(period, &sclk, now);
+    return esp32p4_clk_edges_restart(period, &sclk, now);
 }
 
 /*

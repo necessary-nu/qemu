@@ -468,11 +468,12 @@ static void test_exact_frames(void)
 /*
  * A frame whose core clock moves to another of the same frequency at
  * another phase goes on at the new clock's edges. UART1_SCLK, XTAL_CLK
- * undivided, has its edges at multiples of 25 ns; switched, 4501 ns into
- * a frame, to PLL_F80M_CLK (the SPLL's 480 MHz by 6, from XTAL_CLK's edge
- * at time 0) divided by 2, it is 40 MHz again, its divider counting from
- * PLL_F80M_CLK's first edge after the switch, 11.5 ns on: the rest of the
- * frame comes 11.5 ns later, and TX_DONE at the first ns after.
+ * undivided, has its edges at multiples of 25 ns; switched, 4513 ns into
+ * a frame, to PLL_F80M_CLK (the SPLL's 480 MHz by 6, its edges at
+ * multiples of 12.5 ns from XTAL_CLK's edge at time 0) divided by 2, it
+ * is 40 MHz again, its divider counting PLL_F80M_CLK's edges after the
+ * switch: its edges come 12.5 ns after XTAL_CLK's would have, and so does
+ * the rest of the frame: TX_DONE comes at FRAME_NS + 13 ns, not FRAME_NS.
  */
 /* [spec:nuos:req:emu.esp32p4.uart/test] */
 /* [spec:nuos:req:emu.esp32p4.clocks/test] */
@@ -486,15 +487,15 @@ static void test_clock_phase(void)
     xtal_edge(qts);
     t0 = qtest_clock_step(qts, 25);
     wr(qts, UART(1), FIFO, 0x55);
-    qtest_clock_step(qts, 4501);
+    qtest_clock_step(qts, 4513);
     ctrl111 = qtest_readl(qts, HP_SYS_CLKRST_PERI_CLK_CTRL111);
     ctrl112 = qtest_readl(qts, HP_SYS_CLKRST_PERI_CLK_CTRL112);
     qtest_writel(qts, HP_SYS_CLKRST_PERI_CLK_CTRL111,
                  (ctrl111 & ~(3u << 24)) | (2u << 24));
     qtest_writel(qts, HP_SYS_CLKRST_PERI_CLK_CTRL112,
                  (ctrl112 & ~0xffu) | 1u);
-    g_assert_cmpint(qtest_clock_step(qts, FRAME_NS + 11 - 4501), ==,
-                    t0 + FRAME_NS + 11);
+    g_assert_cmpint(qtest_clock_step(qts, FRAME_NS + 12 - 4513), ==,
+                    t0 + FRAME_NS + 12);
     g_assert_false(rd(qts, UART(1), INT_RAW) & INT_TX_DONE);
     qtest_clock_step(qts, 1);
     g_assert_true(rd(qts, UART(1), INT_RAW) & INT_TX_DONE);

@@ -1519,14 +1519,11 @@ static bool esp32p4_clkrst_pmu_gated(ESP32P4ClkRstState *s, int id)
 /*
  * [spec:nuos:req:emu.esp32p4.clocks]
  * Clock @id's period, exactly, from its parent's: each divider scales the
- * exact period, so that only the Clock's rounding is ever lost.
- */
-/*
- * Clock @id's period; in *@from the clock its edges come from, another
- * clock, PARENT_IN with an input, or PARENT_NONE for one of the sources,
- * whose edges are its own; and in *@div whether it divides that clock's
- * edges (or locks to them, as the LP PLL does), or passes them on, as a
- * mux and a gate do.
+ * exact period, so that only the Clock's rounding is ever lost. In *@from
+ * the clock its edges come from, another clock, PARENT_IN with an input,
+ * or PARENT_NONE for one of the sources, whose edges are its own; and in
+ * *@div whether it divides that clock's edges (or locks to them, as the LP
+ * PLL does), or passes them on, as a mux and a gate do.
  */
 static ESP32P4ClkPeriod esp32p4_clkrst_compute(ESP32P4ClkRstState *s, int id,
                                                int16_t *from, bool *div)
@@ -1767,9 +1764,9 @@ static void esp32p4_clkrst_update_hp_core_reset(ESP32P4ClkRstState *s,
  * [spec:nuos:req:emu.esp32p4.clocks]
  * Clock @id's period and edges, after a change at @now. A mux or a gate
  * passes on its input's edges. A divider counts its input's edges
- * afresh from the first at or after a change of its input (its period or
- * edges), its divisor, or its gate, which comes before it, and keeps its
- * edges while none changes; a PLL locks to its reference the same way. A
+ * afresh after a change of its input (its period or edges), its divisor,
+ * or its gate, which comes before it, its first edge at the one that
+ * completes its period, and keeps its edges while none changes. A
  * source's first edge is where it starts, or changes frequency.
  */
 static void esp32p4_clkrst_compute_edges(ESP32P4ClkRstState *s, int id,
@@ -1793,7 +1790,7 @@ static void esp32p4_clkrst_compute_edges(ESP32P4ClkRstState *s, int id,
                esp32p4_clk_edges_eq(&in, &s->edge_from_edges[id])) {
         /* Nothing it counts has changed: it goes on as it was. */
     } else if (from != PARENT_NONE) {
-        *e = esp32p4_clk_edges_from(p, &in, now);
+        *e = esp32p4_clk_edges_restart(p, &in, now);
     } else {
         *e = esp32p4_clk_edges_at(p, now);
     }

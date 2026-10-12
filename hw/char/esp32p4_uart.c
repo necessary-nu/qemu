@@ -38,8 +38,9 @@
  * frames of a back-to-back transfer are timed from the first one's
  * start, so that they keep to the bit time however long the transfer.
  * A transfer starts at the core clock's first edge at or after its start
- * (to within 2^-16 of a bit), and a change of the clock's rate or edges
- * moves the rest of a frame to the clock's first edge after it.
+ * (to within 2^-16 of a bit). A change of the clock's rate or edges keeps
+ * the frame where the clock's last edge before it left it, and the rest
+ * of the frame counts the new clock's edges after it.
  */
 
 #include "qemu/osdep.h"
@@ -709,7 +710,8 @@ static int64_t tx_time16(ESP32P4UartState *s, uint64_t t16)
                                            0));
 
     return ns >= INT64_MAX - s->tx_start_ns ? INT64_MAX
-                                            : s->tx_start_ns + ns;
+                                            : MAX(s->tx_start_ns + ns,
+                                                  s->tx_hold_ns);
 }
 
 /* Put the transmitter's level on TXD at t, and on the receiver in loopback. */
@@ -788,6 +790,7 @@ static void tx_begin(ESP32P4UartState *s, uint8_t phase, uint32_t end16,
     s->tx_next_edge = 0;
     s->tx_end16 = end16;
     s->tx_pos16 = 0;
+    s->tx_hold_ns = t;
 }
 
 /* [spec:nuos:req:emu.esp32p4.uart] Start the frame of tx_byte at t. */
@@ -1058,7 +1061,7 @@ static void uart_tx_advance(ESP32P4UartState *s)
 
 /*
  * How far the current phase has got, in 2^-16 bits: no less than where it
- * last stood, which it holds until it goes on at the clock's next edge.
+ * last stood, so that it does not go back when the clock changes.
  */
 static uint64_t tx_pos16_at(ESP32P4UartState *s, int64_t t)
 {
@@ -1077,13 +1080,62 @@ static void uart_tx_freeze(ESP32P4UartState *s, int64_t t)
 {
     if (s->tx_phase != ESP32P4_UART_TX_IDLE && tx_clocked(s)) {
         s->tx_pos16 = tx_pos16_at(s, t);
+        s->tx_hold_ns = t;
     }
 }
 
 /*
+ * The first whole ns *@ns at or after the last edge of @e at or before
+ * @t, and the time from that edge to it in Clock units; @t and the time
+ * from the edge before it for a clock with none from time 0 by then, and
+ * @t for one without edges.
+ */
+static uint64_t tx_last_edge(const ESP32P4ClkEdges *e, int64_t t,
+                             int64_t *ns)
+{
+    int64_t k;
+    bool at;
+
+    *ns = t;
+    if (!esp32p4_clk_edges_running(e)) {
+        return 0;
+    }
+    k = esp32p4_clk_edge_index(e, t, &at);
+    if (k >= 0 && k < INT64_MAX) {
+        *ns = MIN(esp32p4_clk_edge_ns(e, k), t);
+    }
+    return esp32p4_clk_edge_since(e, *ns);
+}
+
+/*
+ * How far the current phase had got, in 2^-16 bits, by the core clock's
+ * last edge at or before @t, the last it counted: to within 2^-15 of a
+ * bit, never short of it, and exactly for a whole number of 2^-16 bits.
+ */
+static int64_t tx_pos16_counted(ESP32P4UartState *s, int64_t t)
+{
+    uint64_t since;
+    int64_t ns;
+
+    if (!tx_clocked(s)) {
+        return s->tx_pos16;
+    }
+    since = tx_last_edge(&s->tx_sclk, t, &ns);
+    if (ns < s->tx_start_ns) {
+        ns = t;
+        since = esp32p4_clk_edges_running(&s->tx_sclk) ?
+                esp32p4_clk_edge_since(&s->tx_sclk, t) : 0;
+    }
+    return esp32p4_clk_ns_cycles_up(s->tx_unit, ns - s->tx_start_ns) -
+           s->tx_shift - esp32p4_clk_units_cycles(s->tx_unit, 0, since);
+}
+
+/*
  * Continue the phase in flight at the current bit time, if that, or the
- * core clock's edges, changed: from where it has got, at the clock's
- * first edge at or after t.
+ * core clock's edges, changed at t: from where it had got by the clock's
+ * last edge at or before t, counting the new clock's edges after t, as if
+ * it had counted from its own last edge at or before t (to within 2^-14
+ * of a bit, never late). A stopped clock holds it where it had got.
  */
 static void uart_tx_rerate(ESP32P4UartState *s, int64_t t)
 {
@@ -1094,11 +1146,17 @@ static void uart_tx_rerate(ESP32P4UartState *s, int64_t t)
         !esp32p4_clk_edges_eq(&sclk, &s->tx_sclk)) {
         if (s->tx_phase != ESP32P4_UART_TX_IDLE &&
             esp32p4_clk_period_running(unit)) {
-            int64_t pos = tx_pos16_at(s, t);
+            int64_t pos = tx_pos16_at(s, t), ns;
+            uint64_t since = tx_last_edge(&sclk, t, &ns);
 
-            s->tx_shift = tx_sclk_wait(s, unit, t) - pos;
-            s->tx_start_ns = t;
+            s->tx_shift = -tx_pos16_counted(s, t) -
+                          esp32p4_clk_units_cycles_up(unit, 0, since);
+            s->tx_start_ns = ns;
             s->tx_pos16 = pos;
+            s->tx_hold_ns = t;
+        } else if (s->tx_phase != ESP32P4_UART_TX_IDLE) {
+            s->tx_pos16 = MAX(tx_pos16_counted(s, t), 0);
+            s->tx_hold_ns = t;
         }
         s->tx_unit = unit;
         s->tx_sclk = sclk;
@@ -1119,6 +1177,7 @@ static void uart_tx_reset(ESP32P4UartState *s, int64_t t, bool drive)
     s->tx_unit = esp32p4_clk_period_stopped();
     s->tx_sclk = esp32p4_clk_edges_stopped();
     s->tx_pos16 = 0;
+    s->tx_hold_ns = 0;
     s->tx_chain_ns = INT64_MIN;
     s->send_xon = false;
     s->send_xoff = false;
@@ -2355,6 +2414,7 @@ static const VMStateDescription vmstate_esp32p4_uart = {
         VMSTATE_ESP32P4_CLK_EDGES(tx_sclk, ESP32P4UartState),
         VMSTATE_INT64(tx_shift, ESP32P4UartState),
         VMSTATE_UINT64(tx_pos16, ESP32P4UartState),
+        VMSTATE_INT64(tx_hold_ns, ESP32P4UartState),
         VMSTATE_INT64(tx_chain_ns, ESP32P4UartState),
         VMSTATE_INT64(tx_chain_pos, ESP32P4UartState),
         VMSTATE_INT64(tx_free_ns, ESP32P4UartState),
