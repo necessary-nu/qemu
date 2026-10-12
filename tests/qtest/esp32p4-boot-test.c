@@ -241,6 +241,15 @@ static uint32_t spi_slave_ready(QTestState *qts, uint8_t reg, uint32_t *seq)
 /*
  * Send a command over the SPI slave protocol and read its response: its
  * status byte.
+ *
+ * The ROM starts the slave with TXSTA in its init state and posts its
+ * first response there without waiting for the host to acknowledge that
+ * state. esp-serial-flasher acknowledges it only as it waits for that
+ * response, its write a few microseconds after its read; this host, each
+ * of whose transactions is a round trip through qtest while the chip runs
+ * on, can take long enough for the response's status to come in between,
+ * which its write then clears. So it acknowledges TXSTA's init state
+ * before it sends a command.
  */
 static int spi_slave_command(QTestState *qts, uint32_t seq[2], uint8_t op,
                              const uint8_t *data, size_t len,
@@ -250,6 +259,9 @@ static int spi_slave_command(QTestState *qts, uint32_t seq[2], uint8_t op,
 
     g_assert_cmpuint(8 + len, <=, sizeof(pkt));
     g_assert_cmpuint(spi_slave_ready(qts, SLAVE_RXSTA, &seq[0]), >=, 8 + len);
+    if ((spi_slave_rd(qts, SLAVE_TXSTA) & 3) == 3) {
+        spi_slave_wr(qts, SLAVE_TXSTA, 0);
+    }
     pkt[0] = 0;
     pkt[1] = op;
     stw_le_p(pkt + 2, len);
