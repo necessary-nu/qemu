@@ -46,13 +46,21 @@ void icount_update(CPUState *cpu);
 /* get raw icount value */
 int64_t icount_get_raw(void);
 
-/* return the virtual CPU time in ns, based on the instruction counter. */
+/*
+ * return the virtual CPU time in ns, based on the instruction counter.
+ * With CPUs executing at a clock's rate (icount_set_cpu_clock()), the
+ * time their instructions have run up to is rounded up to the
+ * nanosecond: an instruction ending on a clock edge ends at the first
+ * nanosecond at or after the edge, the time devices timed on the clock
+ * give the edge.
+ */
 int64_t icount_get(void);
 /*
- * icount_get_precise: the virtual time icount_get() returns, and in @frac
- * the fraction of a nanosecond beyond it, in units of 2^-32 ns, that the
- * instructions of CPUs executing at a clock's rate have run up (see
- * icount_set_cpu_clock()); 0 when no CPU has a clock.
+ * icount_get_precise: the virtual time the instructions have run up to,
+ * in whole nanoseconds, rounded down, and in @frac the fraction of a
+ * nanosecond beyond, in units of 2^-32 ns, that the instructions of CPUs
+ * executing at a clock's rate have run up (see icount_set_cpu_clock());
+ * 0 when no CPU has a clock, the time icount_get() returns.
  */
 int64_t icount_get_precise(uint32_t *frac);
 /*
@@ -81,7 +89,14 @@ int64_t icount_round(int64_t count);
  * @clk: the clock the CPU executes one instruction per cycle of
  *
  * With a fixed "shift", each instruction @cpu executes takes one period
- * of @clk, as it is when the instruction executes, instead of 2^shift ns.
+ * of @clk, as it is when the instruction executes, instead of 2^shift ns,
+ * and starts and ends on the clock's edges, whole multiples of its period
+ * from time 0, the edges devices timed on the clock count: @cpu starts
+ * running, wakes from idle and goes on after a change of @clk on the
+ * first edge at or after the time it does, so that an access it makes
+ * comes at an edge's time and finds every timer due before it fired. A
+ * timer due at the edge an access comes at fires after it, as a register
+ * clocked by the edge changes after the access the edge completes.
  * CPUs with a clock run as if in parallel, each at its clock's rate
  * whatever the others do: those not idle run through windows of virtual
  * time together, in turns, and virtual time follows their own times, so
