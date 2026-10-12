@@ -11,6 +11,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "libqtest.h"
 
 #define XIP_BASE            0x10000000
@@ -861,6 +862,175 @@ static void test_modes(void)
     qtest_quit(qts);
 }
 
+/* The array as XIP reads it, outside direct mode. */
+static void xip_read(QTestState *qts, uint32_t addr, uint8_t *buf,
+                     size_t len)
+{
+    qtest_writel(qts, DIRECT_CSR, CSR_CLKDIV(6));
+    qtest_memread(qts, XIP_UNCACHED + addr, buf, len);
+    qtest_writel(qts, DIRECT_CSR, CSR_CLKDIV(6) | CSR_EN);
+}
+
+/*
+ * `len` bytes at `addr` as an erase from `old` cut `done` ns into `total`
+ * leaves them: neither the old contents nor erased, and exactly the rule's.
+ */
+static void expect_erase_cut(const uint8_t *got, uint32_t addr, size_t len,
+                             int64_t done, int64_t total)
+{
+    size_t i, same = 0, erased = 0;
+
+    for (i = 0; i < len; i++) {
+        uint8_t old = pattern(addr + i);
+
+        g_assert_cmphex(got[i], ==, erase_partial(addr + i, old, done,
+                                                  total));
+        same += got[i] == old;
+        erased += got[i] == 0xff;
+    }
+    g_assert_cmpuint(same, <, len);
+    g_assert_cmpuint(erased, <, len);
+}
+
+static void expect_program_cut(const uint8_t *got, uint32_t addr,
+                               const uint8_t *data, size_t len,
+                               int64_t done, int64_t total)
+{
+    size_t i, same = 0, programmed = 0;
+
+    for (i = 0; i < len; i++) {
+        g_assert_cmphex(got[i], ==, program_partial(addr + i, 0xff, data[i],
+                                                    done, total));
+        same += got[i] == 0xff;
+        programmed += got[i] == data[i];
+    }
+    g_assert_cmpuint(same, <, len);
+    g_assert_cmpuint(programmed, <, len);
+}
+
+/* [spec:nuos:req:emu.flash-power-cut/test] */
+static void test_power_cut_reset(void)
+{
+    QTestState *qts = start("flash-size=4M");
+    const uint32_t a = 0x50000, p = 0x61000, b = 0x70000, c = 0x80000;
+    uint8_t data[PAGE], got[SECTOR];
+    unsigned i;
+
+    for (i = 0; i < PAGE; i++) {
+        data[i] = pattern(p + i) ^ 0x3c;
+    }
+    fill(qts, a, SECTOR);
+    fill(qts, b, SECTOR);
+    fill(qts, c, SECTOR);
+    erase(qts, 0x20, p);
+    qtest_clock_step(qts, RV_TSE);
+
+    /* An erase cut 10 ms into its 30 ms by a machine reset. */
+    erase(qts, 0x20, a);
+    qtest_clock_step(qts, 10 * MS);
+    qtest_system_reset(qts);
+    qtest_writel(qts, DIRECT_CSR, CSR_CLKDIV(6) | CSR_EN);
+    g_assert_cmphex(sr1(qts), ==, 0);
+    g_assert_cmphex(rdsr(qts, 0x35) & SR2_SUS, ==, 0);
+    xip_read(qts, a, got, SECTOR);
+    expect_erase_cut(got, a, SECTOR, 10 * MS, RV_TSE);
+
+    /* A page program cut 100 us into its 250 us. */
+    program(qts, p, data, PAGE);
+    qtest_clock_step(qts, 100 * US);
+    qtest_system_reset(qts);
+    qtest_writel(qts, DIRECT_CSR, CSR_CLKDIV(6) | CSR_EN);
+    xip_read(qts, p, got, PAGE);
+    expect_program_cut(got, p, data, PAGE, 100 * US, RV_TPP);
+
+    /* A suspended erase keeps what it had done when it suspended. */
+    erase(qts, 0x20, b);
+    qtest_clock_step(qts, 5 * MS);
+    cmd(qts, 0x75);
+    qtest_clock_step(qts, 2 * MS);
+    qtest_system_reset(qts);
+    qtest_writel(qts, DIRECT_CSR, CSR_CLKDIV(6) | CSR_EN);
+    g_assert_cmphex(rdsr(qts, 0x35) & SR2_SUS, ==, 0);
+    xip_read(qts, b, got, SECTOR);
+    expect_erase_cut(got, b, SECTOR, 5 * MS + TSUS, RV_TSE);
+
+    /* A software reset cuts an erase the same way. */
+    erase(qts, 0x20, c);
+    qtest_clock_step(qts, 4 * MS);
+    cmd(qts, 0x66);
+    cmd(qts, 0x99);
+    qtest_clock_step(qts, 30 * US);
+    xip_read(qts, c, got, SECTOR);
+    expect_erase_cut(got, c, SECTOR, 4 * MS, RV_TSE);
+
+    /* Erasing the part-erased sector again: the rule is monotonic. */
+    erase(qts, 0x20, a);
+    qtest_clock_step(qts, 4 * MS);
+    qtest_system_reset(qts);
+    qtest_writel(qts, DIRECT_CSR, CSR_CLKDIV(6) | CSR_EN);
+    xip_read(qts, a, got, SECTOR);
+    expect_erase_cut(got, a, SECTOR, 10 * MS, RV_TSE);
+    qtest_quit(qts);
+}
+
+/*
+ * A cycle cut by QEMU's shutdown, and one cut by a machine reset, as the
+ * drive holds them afterwards.
+ */
+/* [spec:nuos:req:emu.flash-power-cut/test] */
+static void test_power_cut_drive(void)
+{
+    const uint32_t a = 0x50000, p = 0x61000;
+    g_autofree uint8_t *image = g_malloc(4 * MiB);
+    g_autofree char *path = NULL;
+    g_autofree char *opts = NULL;
+    g_autofree gchar *after = NULL;
+    uint8_t data[PAGE];
+    gsize len;
+    QTestState *qts;
+    GError *err = NULL;
+    int fd;
+    unsigned i;
+
+    for (i = 0; i < 4 * MiB; i++) {
+        image[i] = pattern(i);
+    }
+    for (i = 0; i < SECTOR; i++) {
+        image[p - (p % SECTOR) + i] = 0xff;
+    }
+    for (i = 0; i < PAGE; i++) {
+        data[i] = pattern(p + i) ^ 0x3c;
+    }
+    fd = g_file_open_tmp("rp2350-flash-XXXXXX.img", &path, &err);
+    g_assert_no_error(err);
+    g_assert_cmpint(write(fd, image, 4 * MiB), ==, 4 * MiB);
+    close(fd);
+
+    opts = g_strdup_printf("flash-size=4M -drive file=%s,if=mtd,format=raw",
+                           path);
+    qts = start(opts);
+    erase(qts, 0x20, a);
+    qtest_clock_step(qts, 7 * MS);
+    qtest_quit(qts);
+    g_assert(g_file_get_contents(path, &after, &len, NULL));
+    g_assert_cmpuint(len, ==, 4 * MiB);
+    expect_erase_cut((uint8_t *)after + a, a, SECTOR, 7 * MS, RV_TSE);
+    g_assert_cmpmem(after, a, image, a);
+    g_assert_cmpmem(after + a + SECTOR, 4 * MiB - a - SECTOR,
+                    image + a + SECTOR, 4 * MiB - a - SECTOR);
+    g_free(after);
+
+    qts = start(opts);
+    program(qts, p, data, PAGE);
+    qtest_clock_step(qts, 50 * US);
+    qtest_system_reset(qts);
+    qtest_quit(qts);
+    g_assert(g_file_get_contents(path, &after, &len, NULL));
+    expect_program_cut((uint8_t *)after + p, p, data, PAGE, 50 * US,
+                       RV_TPP);
+    unlink(path);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -875,5 +1045,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350-flash/security-registers",
                    test_security_registers);
     qtest_add_func("/rp2350-flash/modes", test_modes);
+    qtest_add_func("/rp2350-flash/power-cut-reset", test_power_cut_reset);
+    qtest_add_func("/rp2350-flash/power-cut-drive", test_power_cut_drive);
     return g_test_run();
 }

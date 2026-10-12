@@ -493,6 +493,68 @@ static void test_security_registers(void)
     qtest_quit(qts);
 }
 
+/* The model's rule for the cells a cycle has done (m25p80_chip.c). */
+static uint8_t done_mask(uint32_t addr, int64_t done, int64_t total)
+{
+    uint32_t thr = ((uint64_t)done << 32) / total;
+    uint8_t m = 0;
+    int b;
+
+    for (b = 0; b < 8; b++) {
+        uint32_t h = addr * 8 + b;
+
+        h ^= h >> 16;
+        h *= 0x85ebca6b;
+        h ^= h >> 13;
+        h *= 0xc2b2ae35;
+        h ^= h >> 16;
+        if (h < thr) {
+            m |= 1 << b;
+        }
+    }
+    return m;
+}
+
+/*
+ * A machine reset cuts an erase of the upper 16 MiB short, and a program
+ * of a page: their cells read part done, by the model's rule.
+ */
+/* [spec:nuos:req:emu.flash-power-cut/test] */
+static void test_power_cut(void)
+{
+    QTestState *qts = start(NULL);
+    uint8_t zeros[64] = { 0 }, got[64];
+    int64_t t0;
+    unsigned i, same = 0;
+
+    erase(qts, 0x21, HIGH, 32);
+    step(qts, T_SE);
+    program(qts, 0x12, HIGH, 32, zeros, 64);
+    step(qts, T_PP);
+    t0 = erase(qts, 0x21, HIGH, 32);
+    step_to(qts, t0 + 12 * MS);
+    qtest_system_reset(qts);
+    user(qts, 0x13, HIGH, 32, 0, NULL, 0, got, 64);
+    for (i = 0; i < 64; i++) {
+        g_assert_cmphex(got[i], ==, done_mask(HIGH + i, 12 * MS, T_SE));
+        same += got[i] == 0;
+    }
+    g_assert_cmpuint(same, <, 64);
+
+    erase(qts, 0x21, HIGH, 32);
+    step(qts, T_SE);
+    t0 = program(qts, 0x12, HIGH + 0x100, 32, zeros, 64);
+    step_to(qts, t0 + 80 * US);
+    qtest_system_reset(qts);
+    user(qts, 0x13, HIGH + 0x100, 32, 0, NULL, 0, got, 64);
+    for (i = 0; i < 64; i++) {
+        g_assert_cmphex(got[i], ==,
+                        (uint8_t)~done_mask(HIGH + 0x100 + i, 80 * US,
+                                            T_BP1 + 63 * T_BP2));
+    }
+    qtest_quit(qts);
+}
+
 /*
  * The boot ROM boots an image from the 32 MiB flash: it reads it through
  * SPI0 with 24-bit addresses, as the chip comes up in 3-byte mode.
@@ -531,6 +593,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/gd25q256e/protection", test_protection);
     qtest_add_func("/esp32p4/gd25q256e/security-registers",
                    test_security_registers);
+    qtest_add_func("/esp32p4/gd25q256e/power-cut", test_power_cut);
     qtest_add_func("/esp32p4/gd25q256e/rom-boot", test_rom_boot);
     return g_test_run();
 }

@@ -75,8 +75,11 @@
  * left.
  *
  * Cells left partly done: a suspended cycle's sector or page while it is
- * suspended, and a cycle cut short (a software reset, and a machine
- * reset, which is a power cycle for the chip), hold its cells part way.
+ * suspended, and a cycle cut short, hold its cells part way. A cycle is
+ * cut short by a software reset, by a machine reset, which this model
+ * takes as a power cycle of the chip (on the boards a watchdog or RUN
+ * reset of the SoC leaves the flash powered, but QEMU resets every device
+ * with the machine), and by QEMU's shutdown, as a power-off.
  * A cell is done once the fraction f of the cycle's time that has passed
  * exceeds h / 2^32, where h is murmur3's 32-bit finalizer of the cell's
  * bit address (byte address * 8 + bit, security register n's bytes
@@ -84,10 +87,12 @@
  * and the rest keep their bits, a program's done cells that it clears
  * read 0 and the rest keep theirs. The rule is monotonic, so suspending,
  * resuming and cutting a cycle in any order leaves what one cut at its
- * total elapsed time does. A status register write cut short keeps the
- * old values. The stored status register bits and the security registers
- * are not on the drive (-drive if=mtd), which holds the array only: they
- * start from the factory values in each run.
+ * total elapsed time does. The cells a cut leaves are written back to the
+ * drive (-drive if=mtd) as they change, at a shutdown before QEMU exits.
+ * A status register write cut short keeps the old values. The stored
+ * status register bits and the security registers are not on the drive,
+ * which holds the array only: they start from the factory values in each
+ * run.
  */
 
 #include "qemu/osdep.h"
@@ -543,6 +548,7 @@ static uint32_t cell_hash(uint32_t h)
  * the fraction of the cycle passed exceeds its hash's fraction of 2^32.
  */
 /* [spec:nuos:req:emu.flash-timing] */
+/* [spec:nuos:req:emu.flash-power-cut] */
 static void op_partial(M25Chip *c, const M25ChipOp *op, int64_t done,
                        bool now)
 {
@@ -759,8 +765,10 @@ static void catch_up(M25Chip *c)
 
 /*
  * Cut the running and suspended cycles short, leaving their cells part
- * way. Returns whether an erase was among them.
+ * way, written back at once with `now`. Returns whether an erase was
+ * among them.
  */
+/* [spec:nuos:req:emu.flash-power-cut] */
 static bool ops_cut(M25Chip *c, bool now)
 {
     bool erase = false;
@@ -1899,11 +1907,22 @@ int64_t m25chip_busy_until(M25Chip *c)
 
 /* Power */
 
+/* A machine reset: the chip's power cycles. */
+/* [spec:nuos:req:emu.flash-power-cut] */
 void m25chip_reset(M25Chip *c)
 {
     ops_cut(c, false);
     power_up(c);
     update_romd(c);
+}
+
+/* QEMU shuts down: the chip loses power. */
+/* [spec:nuos:req:emu.flash-power-cut] */
+static void m25chip_shutdown(Notifier *n, void *opaque)
+{
+    M25Chip *c = container_of(n, M25Chip, shutdown);
+
+    ops_cut(c, true);
 }
 
 /* [spec:nuos:req:emu.flash-chip] */
@@ -1930,6 +1949,8 @@ bool m25chip_realize(M25Chip *c, Error **errp)
     }
     c->op_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, op_timer_cb, c);
     c->deaf_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, deaf_end, c);
+    c->shutdown.notify = m25chip_shutdown;
+    qemu_register_shutdown_notifier(&c->shutdown);
 
     memcpy(c->sr_nv, c->info->sr_default, sizeof(c->sr_nv));
     memset(c->secreg, 0xff, sizeof(c->secreg));
@@ -1941,6 +1962,7 @@ bool m25chip_realize(M25Chip *c, Error **errp)
 
 void m25chip_unrealize(M25Chip *c)
 {
+    notifier_remove(&c->shutdown);
     timer_free(c->op_timer);
     timer_free(c->deaf_timer);
 }

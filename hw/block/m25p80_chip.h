@@ -57,6 +57,8 @@ typedef struct M25Chip {
     char *uid_prop;
     bool wp_level;
 
+    /* Shutdown cuts the chip's power. */
+    Notifier shutdown;
     QEMUTimer *op_timer;
     QEMUTimer *deaf_timer;
     /* Cells changed while the mapping was out of ROMD mode. */
