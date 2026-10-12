@@ -574,10 +574,11 @@ static uint8_t *make_source(const EncCfg *e, const Img *rgb, Img **ref)
                 o[2] = bb << 3 | bb >> 2;
                 break;
             case SRC_YUV444:
+                /* TRM table 8.4-9: V, U, Y; reversed Y, U, V. */
                 o = &src[3 * i];
-                o[0] = e->pixel_rev ? cr[i] : y[i];
+                o[0] = e->pixel_rev ? y[i] : cr[i];
                 o[1] = cb[i];
-                o[2] = e->pixel_rev ? y[i] : cr[i];
+                o[2] = e->pixel_rev ? cr[i] : y[i];
                 break;
             case SRC_YUV422:
                 if (!(c & 1)) {
@@ -585,17 +586,18 @@ static uint8_t *make_source(const EncCfg *e, const Img *rgb, Img **ref)
                     uint8_t u = (cb[i] + cb[i + 1] + bias) >> 1;
                     uint8_t vv = (cr[i] + cr[i + 1] + bias) >> 1;
 
+                    /* TRM table 8.4-10: U Y0 V Y1; reversed Y0 U Y1 V. */
                     o = &src[2 * i];
                     if (e->pixel_rev) {
-                        o[0] = vv;
-                        o[1] = y[i];
-                        o[2] = u;
-                        o[3] = y[i + 1];
-                    } else {
                         o[0] = y[i];
-                        o[1] = vv;
+                        o[1] = u;
                         o[2] = y[i + 1];
-                        o[3] = u;
+                        o[3] = vv;
+                    } else {
+                        o[0] = u;
+                        o[1] = y[i];
+                        o[2] = vv;
+                        o[3] = y[i + 1];
                     }
                 }
                 break;

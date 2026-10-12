@@ -52,7 +52,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4JpegState, ESP32P4_JPEG)
  * takes up to @len TX bytes, returning how many it got, and sets *eof at
  * the frame's end; ops->push gives RX bytes and returns how many the
  * channel took, a flag marking the last byte given (none unless it took
- * them all), the flags' values GDMA's. It tells the codec of bytes
+ * them all), the flags' values GDMA's; ops->rx_format, where given,
+ * tells the RX channel the format of the MCUs the decoder is about to
+ * give (ESP32P4_JPEG_MCU_*), as the decoder starts: the macroblock size
+ * does not tell GRAY from YUV444. It tells the codec of bytes
  * arriving in an empty TX FIFO and of room appearing in a full RX FIFO
  * (and of an RX channel starting) with esp32p4_jpeg_dma_ready(), and
  * esp32p4_jpeg_dma_sync() runs what the codec has due by a time, as
@@ -66,10 +69,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4JpegState, ESP32P4_JPEG)
 #define ESP32P4_JPEG_DMA_EOF        (1u << 0)
 #define ESP32P4_JPEG_DMA_ERR_EOF    (1u << 1)
 
+/* The decoder's MCU formats, TRM table 37.5-5's. */
+enum {
+    ESP32P4_JPEG_MCU_GRAY,
+    ESP32P4_JPEG_MCU_YUV444,
+    ESP32P4_JPEG_MCU_YUV422,
+    ESP32P4_JPEG_MCU_YUV420,
+};
+
 typedef struct ESP32P4JpegDmaOps {
     size_t (*pull)(void *opaque, uint8_t *buf, size_t len, bool *eof);
     size_t (*push)(void *opaque, const uint8_t *buf, size_t len,
                    unsigned flags);
+    void (*rx_format)(void *opaque, int format);
 } ESP32P4JpegDmaOps;
 
 void esp32p4_jpeg_connect_dma(ESP32P4JpegState *s,

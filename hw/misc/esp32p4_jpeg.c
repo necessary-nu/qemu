@@ -99,13 +99,18 @@
  * when 64 bytes are waiting, the pack FIFO full.
  *
  * Further interpretations, where the TRM is silent:
- *   - Byte orders of the sources: RGB888 B, G, R (R, G, B with
- *     JPEG_PIXEL_REV); RGB565 a little-endian word, R in bits 15:11 (B
- *     there with JPEG_PIXEL_REV), each field widened by repeating its top
- *     bits; YUV444 Y, U, V (V, U, Y); YUV422 Y0 V Y1 U (V Y0 U Y1);
- *     YUV420 U Y Y on even rows and V Y Y on odd ones. These are
- *     ESP-IDF's FOURCC layouts for the encoder's formats
- *     (jpeg_types.h); for YUV422 the TRM's table says YUYV.
+ *   - Byte orders of the sources. TRM table 37.5-1 names each pixel's
+ *     components from the most significant byte of its little-endian
+ *     word down, as tables 8.4-8 to 8.4-10 lay out the same formats in
+ *     memory for the 2D-DMA: RGB888 "RGB" is B, G, R in memory; RGB565 a
+ *     little-endian word, R in bits 15:11; YUV444 "YUV" is V, U, Y;
+ *     YUV422 "YUYV", two 16-bit pixels Y over U and Y over V, is U, Y0,
+ *     V, Y1; YUV420 "YYU/YYV" is U Y0 Y1 on even rows and V Y0 Y1 on odd
+ *     ones. JPEG_PIXEL_REV reverses each pixel's components: R, G, B; B
+ *     in bits 15:11; Y, U, V; Y0, U, Y1, V. RGB565's fields widen by
+ *     repeating their top bits. ESP-IDF's FOURCC labels (jpeg_types.h)
+ *     agree for RGB888, RGB565 and YUV420 and call YUV444 Y, U, V and
+ *     YUV422 Y0, V, Y1, U.
  *   - Down-sampling averages the samples it merges, rounding with a bias
  *     that alternates along each row (0 and 1 horizontally, 1 and 2 for
  *     2x2), and a YUV422 source's rows pairwise rounding up.
@@ -538,24 +543,21 @@ static void enc_planes(ESP32P4JpegState *s, const uint8_t *mb, EncPlanes *p)
                                         &p->v[i]);
                 break;
             case SRC_YUV444:
+                /* V, U, Y; Y, U, V reversed. */
                 px = mb + 3 * i;
-                p->y[i] = s->pixel_rev ? px[2] : px[0];
+                p->y[i] = s->pixel_rev ? px[0] : px[2];
                 p->u[i] = px[1];
-                p->v[i] = s->pixel_rev ? px[0] : px[2];
+                p->v[i] = s->pixel_rev ? px[2] : px[0];
                 break;
             case SRC_YUV422:
-                /* Y0 V Y1 U, or V Y0 U Y1 reversed, per pixel pair. */
+                /* U Y0 V Y1, or Y0 U Y1 V reversed, per pixel pair. */
                 px = mb + 4 * (i / 2);
-                if (s->pixel_rev) {
-                    p->y[i] = px[1 + 2 * (c & 1)];
-                } else {
-                    p->y[i] = px[2 * (c & 1)];
-                }
+                p->y[i] = px[(s->pixel_rev ? 0 : 1) + 2 * (c & 1)];
                 if (!(c & 1)) {
                     int j = r * (w / 2) + c / 2;
 
-                    p->v[j] = s->pixel_rev ? px[0] : px[1];
-                    p->u[j] = s->pixel_rev ? px[2] : px[3];
+                    p->u[j] = s->pixel_rev ? px[1] : px[0];
+                    p->v[j] = s->pixel_rev ? px[3] : px[2];
                 }
                 break;
             case SRC_YUV420:
@@ -1342,6 +1344,16 @@ static void jpeg_start(ESP32P4JpegState *s)
     }
     s->mcus = DIV_ROUND_UP(ha, mw) * DIV_ROUND_UP(va, mh);
     if (cfg & CFG_MODE) {
+        static const int mcu_format[] = {
+            [FMT_YUV444] = ESP32P4_JPEG_MCU_YUV444,
+            [FMT_YUV422] = ESP32P4_JPEG_MCU_YUV422,
+            [FMT_YUV420] = ESP32P4_JPEG_MCU_YUV420,
+            [FMT_GRAY] = ESP32P4_JPEG_MCU_GRAY,
+        };
+
+        if (s->dma_ops && s->dma_ops->rx_format) {
+            s->dma_ops->rx_format(s->dma_opaque, mcu_format[s->format]);
+        }
         s->phase = PH_SOS;
         esp32p4_clkwait_start(&s->tmo_frame, now, tmo_cycles(s));
     } else {
