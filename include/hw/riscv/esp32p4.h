@@ -42,6 +42,7 @@
 #include "hw/misc/esp32p4_ecc.h"
 #include "hw/misc/esp32p4_ecdsa.h"
 #include "hw/misc/esp32p4_etm.h"
+#include "hw/misc/esp32p4_h264.h"
 #include "hw/misc/esp32p4_hmac.h"
 #include "hw/misc/esp32p4_hp_sys.h"
 #include "hw/misc/esp32p4_huk.h"
@@ -227,6 +228,7 @@ struct ESP32P4MachineState {
     ESP32P4SpiState spi[2];
     ESP32P4BitScramblerState bitscrambler;
     ESP32P4ParlioState parlio;
+    ESP32P4H264State h264;
     ESP32P4TwaiState twai;
     /* The QEMU CAN buses on TWAI0 to TWAI2's pads, or NULL. */
     CanBusState *canbus[ESP32P4_TWAI_NUM];

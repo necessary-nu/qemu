@@ -406,8 +406,6 @@ void h264e_free(H264Enc *e)
 
 static void alloc_planes(H264Enc *e, int mb_w, int mb_h)
 {
-    size_t ly, lc;
-
     e->w = mb_w * 16;
     e->h = mb_h * 16;
     e->cw = mb_w * 8;
@@ -415,10 +413,10 @@ static void alloc_planes(H264Enc *e, int mb_w, int mb_h)
     if (mb_w == e->alloc_w && mb_h == e->alloc_h) {
         return;
     }
-    ly = (size_t)e->w * e->h;
-    lc = (size_t)e->cw * e->ch;
+    e->ly = e->w * e->h;
+    e->lc = e->cw * e->ch;
     for (int i = 0; i < 3; i++) {
-        size_t n = i ? lc : ly;
+        size_t n = i ? e->lc : e->ly;
 
         g_free(e->src[i]);
         g_free(e->ref[i]);
@@ -430,7 +428,8 @@ static void alloc_planes(H264Enc *e, int mb_w, int mb_h)
         e->out[i] = g_malloc0(n);
     }
     g_free(e->mb);
-    e->mb = g_new0(H264EncMB, mb_w * mb_h);
+    e->mb_count = mb_w * mb_h;
+    e->mb = g_new0(H264EncMB, e->mb_count);
     e->alloc_w = mb_w;
     e->alloc_h = mb_h;
 }
@@ -1712,7 +1711,8 @@ static void code_luma16(H264Enc *e, MBCode *m, const uint8_t *sy, int qp,
                 c[zigzag[k]] = m->ldc[k];
             }
             for (int i = 0; i < 4; i++) {
-                int a = c[4 * i] + c[4 * i + 1], b = c[4 * i + 2] + c[4 * i + 3];
+                int a = c[4 * i] + c[4 * i + 1];
+                int b = c[4 * i + 2] + c[4 * i + 3];
                 int cc = c[4 * i] - c[4 * i + 1];
                 int d = c[4 * i + 2] - c[4 * i + 3];
 

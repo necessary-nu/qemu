@@ -52,6 +52,12 @@ enum {
     H264E_MB_PSKIP = 3,
 };
 
+typedef struct H264EncRoi {
+    bool en;
+    int x, y, w, h;
+    uint8_t qp;                 /* the 7-bit field */
+} H264EncRoi;
+
 /* What one picture is coded with: the register set of its stream. */
 typedef struct H264EncConfig {
     int mb_w, mb_h;
@@ -68,11 +74,7 @@ typedef struct H264EncConfig {
     int i16_deci_offset, ic_deci_offset, p16_deci_offset, pc_deci_offset;
     bool roi_en;
     bool roi_delta;             /* H264_x_ROI_MODE: QP offsets */
-    struct {
-        bool en;
-        int x, y, w, h;
-        uint8_t qp;             /* the 7-bit field */
-    } roi[8];
+    H264EncRoi roi[8];
     uint8_t no_roi_qp;          /* the 7-bit field */
     bool mv_merge_en;
     int mv_merge_type;
@@ -85,7 +87,7 @@ typedef struct H264EncMB {
     int16_t mv[2];              /* quarter samples, inter macroblocks */
     uint8_t nz[16];             /* luma 4x4 blocks' TotalCoeff, raster */
     uint8_t nzc[2][4];          /* chroma AC blocks' TotalCoeff */
-    int8_t i4[16];              /* Intra4x4PredMode, raster */
+    uint8_t i4[16];             /* Intra4x4PredMode, raster */
 } H264EncMB;
 
 typedef struct H264Enc {
@@ -95,12 +97,14 @@ typedef struct H264Enc {
     uint8_t *ref[3];            /* the reference picture */
     uint8_t *rec[3];            /* reconstruction before deblocking */
     uint8_t *out[3];            /* reconstruction after deblocking */
+    uint32_t ly, lc;            /* a luma and a chroma plane's bytes */
     H264EncMB *mb;
-    size_t alloc_w, alloc_h;
+    int32_t mb_count;
+    int32_t alloc_w, alloc_h;
 
     /* The RBSP bits not yet taken, and emulation prevention's state. */
     uint8_t *rbsp;
-    size_t rbsp_len, rbsp_cap;
+    uint32_t rbsp_len, rbsp_cap;
     uint32_t acc;
     int acc_bits;
     int zeros;

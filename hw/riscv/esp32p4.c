@@ -430,7 +430,6 @@ static const struct {
 
     /* HP peripherals 0. */
     { "pau",              0x50082000, 4 * KiB },
-    { "h264",             0x50084000, 4 * KiB },
     { "jpeg",             0x50086000, 4 * KiB },
     { "ppa",              0x50087000, 4 * KiB },
     { "dma2d",            0x50088000, 4 * KiB },
@@ -443,7 +442,6 @@ static const struct {
     { "isp",              0x500a1000, 4 * KiB },
     /* The AXI ICM's QoS command interface, above its own registers. */
     { "axi-icm-qos",      0x500a4400, 3 * KiB },
-    { "h264-dma",         0x500a7000, 4 * KiB },
 
     /* HP peripherals 1. */
     { "lcd-cam",          0x500dc000, 4 * KiB },
@@ -2938,6 +2936,38 @@ static void esp32p4_init_pwm(ESP32P4MachineState *s)
 }
 
 /*
+ * The H264 encoder and its dedicated DMA: the encoder's registers and
+ * H264_DMA's behind H264_SYS_CLK and the H264 reset, the coding timed by
+ * H264_CLK, the DMA on the bus through the APMs, and its twelve interrupt
+ * sources, the DMA channels' and the encoder's.
+ */
+/* [spec:nuos:req:emu.esp32p4.h264] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_h264(ESP32P4MachineState *s)
+{
+    DeviceState *dev;
+
+    object_initialize_child(OBJECT(s), "h264", &s->h264, TYPE_ESP32P4_H264);
+    dev = DEVICE(&s->h264);
+    object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "clk",
+                          qdev_get_clock_out(DEVICE(&s->clkrst), "h264"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev),
+                             ESP32P4_H264_MMIO_ENC, ESP32P4_H264_BASE,
+                             ESP32P4_CLK_H264_SYS, ESP32P4_RST_H264, 0);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev),
+                             ESP32P4_H264_MMIO_DMA, ESP32P4_H264_DMA_BASE,
+                             ESP32P4_CLK_H264_SYS, ESP32P4_RST_H264, 0);
+    for (int i = 0; i < ESP32P4_H264_IRQS; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), i,
+                           esp32p4_intr_source(s,
+                               ESP32P4_INTR_H264_DMA2D_OUT_CH0 + i));
+    }
+}
+
+/*
  * The BitScrambler, between GDMA and the peripherals HP_SYSTEM attaches it
  * to; and the parallel IO controller, served by GDMA-AXI, its pads through
  * the GPIO matrix.
@@ -4382,6 +4412,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_emac(s);
     esp32p4_init_spi(s);
     esp32p4_init_parlio(s);
+    esp32p4_init_h264(s);
     esp32p4_init_low_power(s);
     esp32p4_init_lp_core(s);
     esp32p4_init_uart(s);
