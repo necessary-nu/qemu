@@ -511,6 +511,13 @@ typedef struct EncCfg {
     int sub;
     int quality;
     bool pixel_rev;
+    /*
+     * The tables' entries times @qmul, past 8 bits with
+     * JPEG_QNR_PRECISION; or 256 added to each entry written, which
+     * 8-bit precision drops (@mask8).
+     */
+    int qmul;
+    bool mask8;
 } EncCfg;
 
 /* Bytes per pixel of each source, in halves. */
@@ -676,7 +683,7 @@ static void put8(GByteArray *b, int v)
  * annex K DHTs, SOS.
  */
 static void enc_headers(GByteArray *b, int w, int h, int sub,
-                        uint32_t q[2][64])
+                        uint32_t q[2][64], bool q16)
 {
     int nc = sub == SUB_GRAY ? 1 : 3;
     static const uint8_t app0[] = {
@@ -689,13 +696,18 @@ static void enc_headers(GByteArray *b, int w, int h, int sub,
     g_byte_array_append(b, app0, sizeof(app0));
     for (int t = 0; t < (nc == 3 ? 2 : 1); t++) {
         put16(b, 0xffdb);
-        put16(b, 67);
-        put8(b, t);
+        put16(b, q16 ? 131 : 67);
+        put8(b, (q16 ? 0x10 : 0) | t);
         for (int i = 0; i < 64; i++) {
-            put8(b, q[t][zigzag[i]]);
+            if (q16) {
+                put16(b, q[t][zigzag[i]]);
+            } else {
+                put8(b, q[t][zigzag[i]]);
+            }
         }
     }
-    put16(b, 0xffc0);
+    /* 16-bit tables make the frame extended sequential (SOF1). */
+    put16(b, q16 ? 0xffc1 : 0xffc0);
     put16(b, 8 + 3 * nc);
     put8(b, 8);
     put16(b, h);
@@ -761,6 +773,9 @@ static void enc_setup(QTestState *qts, const EncCfg *e, int w, int h,
     if (e->pixel_rev) {
         cfg |= PIXEL_REV;
     }
+    if (e->qmul > 1) {
+        cfg |= QNR_PRECISION;
+    }
     cfg |= TAILER_EN | FF_CHECK_EN | QNR_FIFO_EN | LQNR_SEL(0) | CQNR_SEL(1);
     wr(qts, CONFIG, cfg);
     wr(qts, PIC_SIZE, w << 16 | h);
@@ -768,7 +783,7 @@ static void enc_setup(QTestState *qts, const EncCfg *e, int w, int h,
         wr(qts, DQT_INFO, (rd(qts, DQT_INFO) & ~(0xffu << (8 * t))) |
                           (uint32_t)t << (8 * t));
         for (int i = 0; i < 64; i++) {
-            wr(qts, TQNR(t), q[t & 1][i]);
+            wr(qts, TQNR(t), q[t & 1][i] + (e->mask8 ? 256 : 0));
         }
     }
 }
@@ -809,6 +824,11 @@ static void encode_check(const EncCfg *e, const Img *rgb, bool exact)
     dir = g_dir_make_tmp("esp32p4-jpeg-XXXXXX", NULL);
     g_assert(dir);
     quant_tables(e->quality, q);
+    for (int t = 0; t < 2 && e->qmul > 1; t++) {
+        for (int i = 0; i < 64; i++) {
+            q[t][i] *= e->qmul;
+        }
+    }
     src = make_source(e, rgb, &ref);
     mbs = macroblocks(src, w, h, src_half[e->src], mw, mh, &len);
     g_assert_cmpuint(len, <=, MEM_IN_SIZE);
@@ -832,7 +852,7 @@ static void encode_check(const EncCfg *e, const Img *rgb, bool exact)
     g_assert_cmphex(scan[rx - 2], ==, 0xff);
     g_assert_cmphex(scan[rx - 1], ==, 0xd9);
 
-    enc_headers(file, w, h, e->sub, q);
+    enc_headers(file, w, h, e->sub, q, e->qmul > 1);
     g_byte_array_append(file, scan, rx);
     out_jpg = g_build_filename(dir, "codec.jpg", NULL);
     out_pnm = g_build_filename(dir, "codec.pnm", NULL);
@@ -853,11 +873,18 @@ static void encode_check(const EncCfg *e, const Img *rgb, bool exact)
     }
     g_assert(g_file_set_contents(qfile, qtxt->str, -1, NULL));
     {
-        const char *argv[] = {
-            cjpeg, "-dct", "int", "-baseline", "-qtables", qfile,
+        const char *argv[16] = {
+            cjpeg, "-dct", "int", "-qtables", qfile,
             "-qslots", "0,1,1", "-sample", sample, "-outfile", ref_jpg,
-            in_pnm, NULL,
         };
+        int n = 11;
+
+        /* 16-bit tables need extended sequential, not -baseline. */
+        if (e->qmul <= 1) {
+            argv[n++] = "-baseline";
+        }
+        argv[n++] = in_pnm;
+        argv[n] = NULL;
 
         run_tool(argv);
     }
@@ -940,6 +967,10 @@ static const EncCfg enc_cases[] = {
     { SRC_YUV422, SUB_422, 80, true },
     { SRC_YUV422, SUB_420, 80, false },
     { SRC_YUV420, SUB_420, 60, false },
+    /* 16-bit tables, and 8-bit precision taking an entry's low 8 bits. */
+    { SRC_RGB888, SUB_420, 30, false, 4 },
+    { SRC_GRAY, SUB_GRAY, 50, false, 3 },
+    { SRC_RGB888, SUB_422, 70, false, 1, true },
 };
 
 /* Decoding. */
@@ -950,6 +981,7 @@ typedef struct JpgInfo {
     int ci[3], hi[3], vi[3], tq[3];
     uint32_t qt[4][64];         /* natural order */
     bool qseen[4];
+    int qprec[4];
     uint8_t bits[2][2][16];     /* [DC, AC][table] */
     uint8_t vals[2][2][256];
     bool dht;
@@ -993,8 +1025,9 @@ static bool parse_jpeg(const uint8_t *d, size_t len, JpgInfo *j)
                 }
                 q += pq ? 128 : 64;
                 j->qseen[tq] = true;
+                j->qprec[tq] = pq;
             }
-        } else if (m == 0xc0) {
+        } else if (m == 0xc0 || m == 0xc1) {
             j->h = be16(d + p + 5);
             j->w = be16(d + p + 7);
             j->nc = d[p + 9];
@@ -1079,7 +1112,9 @@ static int jpg_format(const JpgInfo *j)
  * decoder mode, the size cleared ("digital issue"), the quantisation
  * tables with JPEG_Tn_DQT_INFO set to n, the size rounded up to whole
  * MCUs, the components, the four Huffman tables (annex K's where the
- * file has none) and the restart interval.
+ * file has none) and the restart interval. Where a table is of 16 bits
+ * the precision goes in JPEG_Tn_DQT_INFO too, which ESP-IDF, refusing
+ * such files (SOF1), never writes.
  */
 static void dec_setup(QTestState *qts, const JpgInfo *j)
 {
@@ -1095,7 +1130,7 @@ static void dec_setup(QTestState *qts, const JpgInfo *j)
             continue;
         }
         wr(qts, DQT_INFO, (rd(qts, DQT_INFO) & ~(0xffu << (8 * t))) |
-                          (uint32_t)t << (8 * t));
+                          (uint32_t)(j->qprec[t] << 4 | t) << (8 * t));
         for (int i = 0; i < 64; i++) {
             wr(qts, TQNR(t), j->qt[t][i]);
         }
@@ -1248,6 +1283,7 @@ typedef struct DecCase {
     const char *restart;        /* cjpeg's -restart, or NULL */
     int w, h;
     bool refused;               /* sampling the decoder does not have */
+    int qmul;                   /* annex K's tables times this, 16-bit */
 } DecCase;
 
 /* [spec:nuos:req:emu.esp32p4.jpeg/test] */
@@ -1258,7 +1294,7 @@ static void test_decode(const void *data)
     g_autofree char *enc = find_tool(d->tool);
     g_autofree char *djpeg = enc ? find_tool("djpeg") : NULL;
     g_autofree char *dir = NULL, *in = NULL, *jpg = NULL, *qs = NULL;
-    g_autofree char *size = NULL, *file = NULL;
+    g_autofree char *size = NULL, *file = NULL, *qfile = NULL;
     g_autoptr(Img) src = NULL, ref = NULL, got = NULL;
     uint32_t int_raw;
     double psnr;
@@ -1297,6 +1333,22 @@ static void test_decode(const void *data)
             argv[5] = "-grayscale";
             argv[6] = "-baseline";
         }
+        if (d->qmul) {
+            g_autoptr(GString) t = g_string_new(NULL);
+
+            qfile = g_build_filename(dir, "q.txt", NULL);
+            for (int k = 0; k < 2; k++) {
+                for (int i = 0; i < 64; i++) {
+                    g_string_append_printf(t, "%d%c", base_q[k][i] * d->qmul,
+                                           i % 8 == 7 ? '\n' : ' ');
+                }
+            }
+            g_assert(g_file_set_contents(qfile, t->str, -1, NULL));
+            argv[3] = "-qtables";
+            argv[4] = qfile;
+            argv[7] = "-qslots";
+            argv[8] = "0,1,1";
+        }
         write_pnm(in, src);
         run_tool(argv);
     }
@@ -1323,6 +1375,9 @@ static void test_decode(const void *data)
     g_assert_cmpint(diff, ==, 0);
     unlink(in);
     unlink(jpg);
+    if (qfile) {
+        unlink(qfile);
+    }
     rmdir(dir);
 }
 
@@ -1345,6 +1400,8 @@ static const DecCase dec_cases[] = {
     { "ffmpeg", "yuvj422p", 4, NULL, 64, 48, true },
     { "ffmpeg", "yuvj444p", 3, NULL, 48, 40, true },
     { "ffmpeg", "yuvj420p", 10, NULL, 37, 29 },
+    /* 16-bit tables (SOF1), JPEG_Tn_DQT_INFO's precision set. */
+    { "cjpeg", "2x2", 0, NULL, 48, 32, false, 5 },
 };
 
 /* Registers and tables. */
@@ -1926,6 +1983,35 @@ static void test_encode_eof(void)
     qtest_quit(qts);
 }
 
+/* JPEG_DEBUG_DIRECT_OUT_EN: the macroblocks come out as they went in. */
+/* [spec:nuos:req:emu.esp32p4.jpeg/test] */
+static void test_encode_direct(void)
+{
+    uint8_t px[4 * 64], out[4 * 64 + 8];
+    uint32_t q[2][64];
+    EncCfg e = { SRC_GRAY, SUB_GRAY, 50, false };
+    QTestState *qts;
+    unsigned rx, flags;
+
+    for (int i = 0; i < sizeof(px); i++) {
+        px[i] = i * 37 + 5;
+    }
+    quant_tables(50, q);
+    qts = jpeg_init();
+    enc_setup(qts, &e, 16, 16, q);
+    cfg_set(qts, 0, DEBUG_DIRECT);
+    dma_tx(qts, MEM_IN, px, sizeof(px), true);
+    dma_rx(qts, MEM_OUT, MEM_OUT_SIZE);
+    cfg_set(qts, 0, JPEG_START);
+    g_assert(wait_int(qts, I_DONE, 1000000));
+    dma_status(qts, NULL, &rx, &flags);
+    g_assert_cmpuint(rx, ==, sizeof(px));
+    g_assert_cmpuint(flags, ==, DMA_EOF);
+    qtest_memread(qts, MEM_OUT, out, rx);
+    g_assert(!memcmp(out, px, sizeof(px)));
+    qtest_quit(qts);
+}
+
 /* Timing. */
 
 /* Step to @t cycles after @t0 and say whether INT_RAW has @bit. */
@@ -2139,6 +2225,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/jpeg/data-errors", test_data_errors);
     qtest_add_func("/esp32p4/jpeg/decode-refused", test_decode_refused);
     qtest_add_func("/esp32p4/jpeg/encode-eof", test_encode_eof);
+    qtest_add_func("/esp32p4/jpeg/encode-direct", test_encode_direct);
     qtest_add_func("/esp32p4/jpeg/timing", test_timing);
     qtest_add_func("/esp32p4/jpeg/decode-timeout", test_decode_timeout);
     qtest_add_func("/esp32p4/jpeg/output-flow", test_output_flow);
@@ -2146,8 +2233,9 @@ int main(int argc, char **argv)
     for (int i = 0; i < ARRAY_SIZE(enc_cases); i++) {
         const EncCfg *e = &enc_cases[i];
         g_autofree char *name = g_strdup_printf(
-            "/esp32p4/jpeg/encode/src%d-sub%d-q%d%s", e->src, e->sub,
-            e->quality, e->pixel_rev ? "-rev" : "");
+            "/esp32p4/jpeg/encode/src%d-sub%d-q%d%s%s%s", e->src, e->sub,
+            e->quality, e->pixel_rev ? "-rev" : "",
+            e->qmul > 1 ? "-q16" : "", e->mask8 ? "-mask8" : "");
 
         qtest_add_data_func(name, e, test_encode);
     }
