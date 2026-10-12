@@ -40,6 +40,7 @@
 #include "exec/icount.h"
 #include "system/cpu-timers-internal.h"
 #include "tcg-accel-ops-icount.h"
+#include "tcg-accel-ops-rr.h"
 
 /*
  * ICOUNT: Instruction Counter
@@ -639,7 +640,20 @@ void icount_start_warp_timer(void)
     }
 
     if (replay_mode != REPLAY_MODE_PLAY) {
-        if (!all_cpu_threads_idle()) {
+        /*
+         * Only once every vCPU is idle and the vCPU thread waits for an
+         * event. The thread executes the vCPUs without the BQL, and adds
+         * the instructions of each run to virtual time after the run, so a
+         * vCPU that has halted in its run (in WFI, say) is idle before
+         * virtual time includes them. A warp then, from a time that misses
+         * them, would overshoot the deadline by them, and whatever reads
+         * the time as the vCPU halts (a cycle counter stopping in WFI)
+         * would see the warp; the main loop comes here at any host time,
+         * for a monitor command or after the timers of the last warp. The
+         * thread wakes the main loop as it starts to wait.
+         */
+        if (!all_cpu_threads_idle() ||
+            (first_cpu && !rr_vcpu_thread_waiting())) {
             return;
         }
 

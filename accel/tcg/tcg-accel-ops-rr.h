@@ -15,6 +15,12 @@
 /* Kick all RR vCPUs. */
 void rr_kick_vcpu_thread(CPUState *unused);
 
+/*
+ * Whether the round-robin thread waits for an event with every vCPU idle,
+ * having accounted for every instruction they ran. Call with the BQL held.
+ */
+bool rr_vcpu_thread_waiting(void);
+
 /* start the round robin vcpu thread */
 void rr_start_vcpu_thread(CPUState *cpu);
 

@@ -106,13 +106,30 @@ static void rr_stop_kick_timer(void)
     }
 }
 
+/*
+ * The thread waits for an event with every vCPU idle (set and cleared with
+ * the BQL held). It executes the vCPUs without the BQL, and adds the
+ * instructions of each run to virtual time after the run, so a vCPU that
+ * has halted in its run (in WFI, say) looks idle to a thread holding the
+ * BQL before virtual time includes them. Once this thread waits, it has
+ * added them all, and it runs no vCPU until it is woken.
+ */
+static bool rr_waiting;
+
+bool rr_vcpu_thread_waiting(void)
+{
+    return rr_waiting;
+}
+
 static void rr_wait_io_event(void)
 {
     CPUState *cpu;
 
     while (all_cpu_threads_idle()) {
         rr_stop_kick_timer();
+        rr_waiting = true;
         qemu_cond_wait_bql(first_cpu->halt_cond);
+        rr_waiting = false;
     }
 
     rr_start_kick_timer();
