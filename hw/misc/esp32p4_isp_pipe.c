@@ -417,14 +417,27 @@ static void bf_row(IspPipe *p, uint32_t y, uint8_t *out)
  * DEMOSAIC_GRAD_RATIO (2.4) in the comparison, and the mean of both
  * when neither is smaller. Then red and blue by colour differences: at
  * a blue (red) site the site's green plus the mean of red (blue) minus
- * green over the four diagonal neighbours; at a green site its green
- * plus the mean over the two neighbours of each colour; the green at
- * the neighbours being both directions' mean. Values are kept in eighths
- * and sixteenths, each output rounded to nearest once. This matches
- * Espressif's silicon captures in ESP-IDF's ISP test app (an impulse at
- * each Bayer site through RGB2YUV and YUV2RGB; 99.5% of pixels exact);
- * the remaining differences are around green impulses' neighbours.
+ * green over the four diagonal neighbours, their green the one in the
+ * direction the site took (both directions' mean where it took their
+ * mean); at a green site its green plus the mean over the two
+ * neighbours of each colour, their green both directions' mean. Values
+ * are kept in eighths and sixteenths, each output rounded to nearest
+ * once. Against Espressif's silicon (ESP-IDF's ISP test app's frames, an
+ * impulse at each Bayer site through RGB2YUV and YUV2RGB) this gives
+ * 1351 of the 1620 pixels around the impulses exactly and the rest within
+ * 9; the diagonal neighbours' green in the site's direction fits those
+ * frames and a real scene's (ESP-IDF's dma_input example) better than
+ * their mean does (1321 of the 1620, the rest within 17). The rest, and
+ * most of the scene's pixels, are not matched exactly: see
+ * esp32p4_isp.c.
  */
+#define G_SEL       0
+#define G_AVG       1
+#define G_H         2
+#define G_V         3
+#define G_DIR       4
+#define G_N         5
+
 static void g_row(IspPipe *p, uint32_t y, int16_t *out)
 {
     uint32_t mctrl = reg(p, A_DEMOSAIC_MATRIX_CTRL);
@@ -432,10 +445,12 @@ static void g_row(IspPipe *p, uint32_t y, int16_t *out)
 
     for (uint32_t x = 0; x < p->w; x++) {
         int c = colour(p, x, y), v = row_of(p, S_BF, y)[x];
-        int gw, ge, gn, gs, gh, gv, dh, dv, avg, sel;
+        int16_t *o = out + G_N * x;
+        int gw, ge, gn, gs, gh, gv, dh, dv, avg;
 
         if (c == C_GR || c == C_GB) {
-            out[2 * x] = out[2 * x + 1] = 8 * v;
+            o[G_SEL] = o[G_AVG] = o[G_H] = o[G_V] = 8 * v;
+            o[G_DIR] = G_AVG;
             continue;
         }
         gw = bayer_px(p, S_BF, x - 1, y, mctrl);
@@ -449,24 +464,32 @@ static void g_row(IspPipe *p, uint32_t y, int16_t *out)
         dh = abs(gw - ge);
         dv = abs(gn - gs);
         avg = (gh + gv) / 2;
+        o[G_AVG] = avg;
+        o[G_H] = gh;
+        o[G_V] = gv;
         if (dh * ratio < dv * 16) {
-            sel = gh;
+            o[G_SEL] = gh;
+            o[G_DIR] = G_H;
         } else if (dv * ratio < dh * 16) {
-            sel = gv;
+            o[G_SEL] = gv;
+            o[G_DIR] = G_V;
         } else {
-            sel = avg;
+            o[G_SEL] = avg;
+            o[G_DIR] = G_AVG;
         }
-        out[2 * x] = sel;
-        out[2 * x + 1] = avg;
     }
 }
 
-/* Raw sample minus its interpolated green, in eighths, at (@x, @y). */
-static int cdiff8(IspPipe *p, int x, int y, uint32_t mctrl)
+/*
+ * Raw sample minus its interpolated green, in eighths, at (@x, @y), the
+ * green @which of the G_* estimates.
+ */
+static int cdiff8(IspPipe *p, int x, int y, uint32_t mctrl, int which)
 {
     int16_t *g = (int16_t *)row_of(p, S_G, y);
 
-    return 8 * bayer_px(p, S_BF, x, y, mctrl) - g[2 * mirror(x, p->w) + 1];
+    return 8 * bayer_px(p, S_BF, x, y, mctrl) -
+           g[G_N * mirror(x, p->w) + which];
 }
 
 static void rgb_row(IspPipe *p, uint32_t y, uint8_t *out)
@@ -476,22 +499,24 @@ static void rgb_row(IspPipe *p, uint32_t y, uint8_t *out)
 
     for (int x = 0; x < p->w; x++) {
         int c = colour(p, x, y), v = row_of(p, S_BF, y)[x];
+        const int16_t *e = g + G_N * x;
         int rgb[3];
 
         if (c == C_R || c == C_B) {
-            int o = 4 * g[2 * x] + cdiff8(p, x - 1, y - 1, mctrl) +
-                    cdiff8(p, x + 1, y - 1, mctrl) +
-                    cdiff8(p, x - 1, y + 1, mctrl) +
-                    cdiff8(p, x + 1, y + 1, mctrl);
+            int d = e[G_DIR];
+            int o = 4 * e[G_SEL] + cdiff8(p, x - 1, y - 1, mctrl, d) +
+                    cdiff8(p, x + 1, y - 1, mctrl, d) +
+                    cdiff8(p, x - 1, y + 1, mctrl, d) +
+                    cdiff8(p, x + 1, y + 1, mctrl, d);
 
-            rgb[1] = clamp8((g[2 * x] + 4) >> 3);
+            rgb[1] = clamp8((e[G_SEL] + 4) >> 3);
             rgb[c == C_R ? 0 : 2] = v;
             rgb[c == C_R ? 2 : 0] = clamp8((o + 16) >> 5);
         } else {
-            int h = 32 * v + 2 * (cdiff8(p, x - 1, y, mctrl) +
-                                  cdiff8(p, x + 1, y, mctrl));
-            int vv = 32 * v + 2 * (cdiff8(p, x, y - 1, mctrl) +
-                                   cdiff8(p, x, y + 1, mctrl));
+            int h = 32 * v + 2 * (cdiff8(p, x - 1, y, mctrl, G_AVG) +
+                                  cdiff8(p, x + 1, y, mctrl, G_AVG));
+            int vv = 32 * v + 2 * (cdiff8(p, x, y - 1, mctrl, G_AVG) +
+                                   cdiff8(p, x, y + 1, mctrl, G_AVG));
 
             rgb[1] = v;
             rgb[0] = clamp8(((c == C_GR ? h : vv) + 16) >> 5);
@@ -1204,7 +1229,7 @@ IspPipe *isp_pipe_new(const IspFrameCfg *cfg, IspEmitFn *emit, void *opaque)
         { C_B, C_GB, C_GR, C_R }, { C_GB, C_B, C_R, C_GR },
         { C_GR, C_R, C_B, C_GB }, { C_R, C_GR, C_GB, C_B },
     };
-    static const uint32_t bytes[S_NUM] = { 1, 1, 1, 4, 3, 3, 0 };
+    static const uint32_t bytes[S_NUM] = { 1, 1, 1, 2 * G_N, 3, 3, 0 };
     uint32_t xc = cfg->r[R(A_CROP_X_CAPTURE)];
     uint32_t yc = cfg->r[R(A_CROP_Y_CAPTURE)];
 
