@@ -103,6 +103,12 @@ struct ESP32P4MSPIState {
     int32_t spi1_sus_after;
     uint64_t spi1_cycles;
     bool spi1_waiting;
+    /* When its current phase ends, as the timer cannot tell its callback. */
+    int64_t spi1_end_at;
+    /* The flash's chip select, held until the transaction's last cycle. */
+    bool spi1_cs_held;
+    /* The status reads FLASH_WAITI_CTRL makes follow the transaction. */
+    bool spi1_waiti;
 
     /* The manual encryption block: its state and the ciphertext. */
     uint32_t xts_state;

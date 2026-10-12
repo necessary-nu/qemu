@@ -21,8 +21,12 @@
  * device itself. Memory-mapped reads are served from the device's array,
  * a ROM device region which the SSI device keeps coherent: this is what a
  * correctly configured read command returns. The read format registers
- * are kept but not interpreted, so a format the device would not
- * understand still returns array data. Memory-mapped writes, when the
+ * are not interpreted then, so a format the device would not understand
+ * still returns array data. A device that would not answer a read (a
+ * flash that is busy programming or erasing, or powered down) takes the
+ * region out of ROMD mode; the reads are then issued as serial transfers
+ * in the window's RFMT and RCMD format, and return what the device
+ * answers, 0 from a device that ignores them. Memory-mapped writes, when the
  * window is writable, are issued as serial transfers in the M0/M1 write
  * format, so a flash ignores them (its write enable latch is clear) while
  * a PSRAM stores them.
@@ -33,7 +37,13 @@
  * lines, the access counters, and the cache maintenance window. Where
  * that behaviour is the same for every access, views map the arrays and
  * the cache data RAM directly over it, so that code runs from flash at
- * RAM speed; the views are rebuilt whenever the mapping changes.
+ * RAM speed; the views are rebuilt whenever the mapping changes. While a
+ * device's array is out of ROMD mode, its views stay in place across
+ * direct mode, the array's own handlers refusing accesses then: software
+ * polling a busy flash enables and disables direct mode for every status
+ * read, and rebuilding the views each time would cost far more than the
+ * polling itself. The device signals its array's mode changes on
+ * "array-mapped".
  *
  * The cache itself is not modelled beyond its tag memory for pinned lines:
  * an unpinned access behaves as a miss, so the XIP space is always
@@ -96,6 +106,7 @@
 #define CSR_BUSY                    (1u << 1)
 #define CSR_ASSERT_CS0N             (1u << 2)
 #define CSR_AUTO_CS0N               (1u << 6)
+#define CSR_AUTO_CS1N               (1u << 7)
 #define CSR_TXFULL                  (1u << 10)
 #define CSR_TXEMPTY                 (1u << 11)
 #define CSR_TXLEVEL_SHIFT           12
@@ -301,7 +312,14 @@ static void rp2350_xip_direct_run(RP2350XIPState *s)
             fifo32_push(&s->direct_rx, rx);
         }
     }
-    if (s->direct_busy_until > now) {
+    /*
+     * BUSY itself reads from the time; the timer only drops an AUTO_CSxN
+     * chip select when the frames end, and is not armed without one, so
+     * that software polling a busy flash does not stop time at every
+     * frame.
+     */
+    if (s->direct_busy_until > now &&
+        (s->direct_csr & (CSR_AUTO_CS0N | CSR_AUTO_CS1N))) {
         timer_mod(s->busy_timer, s->direct_busy_until);
     }
     rp2350_xip_update_cs(s);
@@ -393,6 +411,58 @@ static MemTxResult qmi_translate(RP2350XIPState *s, uint32_t xa,
     return MEMTX_OK;
 }
 
+/*
+ * The prefix, 24-bit address, suffix and dummy phases of a memory-mapped
+ * transfer in the format `fmt` with the commands `cmd`.
+ */
+static void qmi_send_header(RP2350XIPState *s, int cs, uint32_t fmt,
+                            uint32_t cmd, uint32_t phys, bool write)
+{
+    unsigned suffix = extract32(fmt, FMT_SUFFIX_LEN_SHIFT, 2);
+    unsigned dummy_bits = extract32(fmt, FMT_DUMMY_LEN_SHIFT, 3) * 4;
+    unsigned i;
+
+    if (fmt & FMT_PREFIX_LEN) {
+        qspi_byte(s, cmd);
+    }
+    qspi_byte(s, phys >> 16);
+    qspi_byte(s, phys >> 8);
+    qspi_byte(s, phys);
+    if (suffix == 2) {
+        qspi_byte(s, cmd >> 8);
+    } else if (suffix) {
+        qemu_log_mask(LOG_GUEST_ERROR, "rp2350-xip: M%d_%cFMT SUFFIX_LEN %u "
+                      "is not supported\n", cs, write ? 'W' : 'R', suffix);
+    }
+    for (i = 0; i < DIV_ROUND_UP(dummy_bits, 8); i++) {
+        qspi_byte(s, 0);
+    }
+}
+
+/*
+ * A memory-mapped read issued as a serial transfer in the window's RFMT
+ * and RCMD format, for a device that has taken its array out of ROMD mode.
+ */
+/* [spec:nuos:req:emu.xip+1] */
+/* [spec:nuos:req:emu.flash-timing] */
+static uint8_t qmi_serial_read(RP2350XIPState *s, int cs, uint32_t phys)
+{
+    uint8_t data;
+
+    s->mm_cs = cs;
+    rp2350_xip_update_cs(s);
+    qmi_send_header(s, cs, s->rfmt[cs], s->rcmd[cs], phys, false);
+    data = qspi_byte(s, 0);
+    s->mm_cs = -1;
+    rp2350_xip_update_cs(s);
+    return data;
+}
+
+static bool array_mapped(RP2350XIPState *s, int cs)
+{
+    return memory_region_is_romd(&s->array[cs].mr);
+}
+
 static MemTxResult qmi_read_byte(RP2350XIPState *s, uint32_t xa,
                                  bool translate, uint8_t *data)
 {
@@ -410,8 +480,13 @@ static MemTxResult qmi_read_byte(RP2350XIPState *s, uint32_t xa,
         return r;
     }
     /* With no device on the chip select, the pulled-down bus reads 0. */
-    *data = s->cs_size[cs] ? array_ptr(s, cs)[phys & (s->cs_size[cs] - 1)]
-                           : 0;
+    if (!s->cs_size[cs]) {
+        *data = 0;
+    } else if (!array_mapped(s, cs)) {
+        *data = qmi_serial_read(s, cs, phys & (s->cs_size[cs] - 1));
+    } else {
+        *data = array_ptr(s, cs)[phys & (s->cs_size[cs] - 1)];
+    }
     return MEMTX_OK;
 }
 
@@ -423,29 +498,9 @@ static MemTxResult qmi_read_byte(RP2350XIPState *s, uint32_t xa,
 static void qmi_write_byte(RP2350XIPState *s, int cs, uint32_t phys,
                            uint8_t data)
 {
-    uint32_t fmt = s->wfmt[cs];
-    uint32_t cmd = s->wcmd[cs];
-    unsigned suffix = extract32(fmt, FMT_SUFFIX_LEN_SHIFT, 2);
-    unsigned dummy_bits = extract32(fmt, FMT_DUMMY_LEN_SHIFT, 3) * 4;
-    unsigned i;
-
     s->mm_cs = cs;
     rp2350_xip_update_cs(s);
-    if (fmt & FMT_PREFIX_LEN) {
-        qspi_byte(s, cmd);
-    }
-    qspi_byte(s, phys >> 16);
-    qspi_byte(s, phys >> 8);
-    qspi_byte(s, phys);
-    if (suffix == 2) {
-        qspi_byte(s, cmd >> 8);
-    } else if (suffix) {
-        qemu_log_mask(LOG_GUEST_ERROR, "rp2350-xip: M%d_WFMT SUFFIX_LEN %u "
-                      "is not supported\n", cs, suffix);
-    }
-    for (i = 0; i < DIV_ROUND_UP(dummy_bits, 8); i++) {
-        qspi_byte(s, 0);
-    }
+    qmi_send_header(s, cs, s->wfmt[cs], s->wcmd[cs], phys, true);
     qspi_byte(s, data);
     s->mm_cs = -1;
     rp2350_xip_update_cs(s);
@@ -705,33 +760,62 @@ static const MemoryRegionOps rp2350_xip_space_ops = {
  * from RAM; writes land here, already translated, and have passed every
  * check but WRITABLE_Mx.
  */
-static uint64_t rp2350_xip_array_read(void *opaque, hwaddr addr,
-                                      unsigned size)
+static bool array_direct_refused(RP2350XIPArray *a)
+{
+    if (a->xip->direct_csr & CSR_EN) {
+        qemu_log_mask(LOG_GUEST_ERROR, "rp2350-xip: memory-mapped access "
+                      "while QMI direct mode is enabled\n");
+        return true;
+    }
+    return false;
+}
+
+static MemTxResult rp2350_xip_array_read(void *opaque, hwaddr addr,
+                                         uint64_t *data, unsigned size,
+                                         MemTxAttrs attrs)
 {
     RP2350XIPArray *a = opaque;
     uint64_t v = 0;
+    unsigned i;
 
-    memcpy(&v, array_ptr(a->xip, a->cs) + addr, size);
-    return le64_to_cpu(v);
+    if (array_direct_refused(a)) {
+        *data = 0;
+        return MEMTX_ERROR;
+    }
+    if (array_mapped(a->xip, a->cs)) {
+        memcpy(&v, array_ptr(a->xip, a->cs) + addr, size);
+        *data = le64_to_cpu(v);
+        return MEMTX_OK;
+    }
+    for (i = 0; i < size; i++) {
+        v |= (uint64_t)qmi_serial_read(a->xip, a->cs, addr + i) << (8 * i);
+    }
+    *data = v;
+    return MEMTX_OK;
 }
 
-static void rp2350_xip_array_write(void *opaque, hwaddr addr, uint64_t value,
-                                   unsigned size)
+static MemTxResult rp2350_xip_array_write(void *opaque, hwaddr addr,
+                                          uint64_t value, unsigned size,
+                                          MemTxAttrs attrs)
 {
     RP2350XIPArray *a = opaque;
     unsigned i;
 
+    if (array_direct_refused(a)) {
+        return MEMTX_ERROR;
+    }
     if (!writable(a->xip, a->cs)) {
-        return;
+        return MEMTX_OK;
     }
     for (i = 0; i < size; i++) {
         qmi_write_byte(a->xip, a->cs, addr + i, value >> (8 * i));
     }
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps rp2350_xip_array_ops = {
-    .read = rp2350_xip_array_read,
-    .write = rp2350_xip_array_write,
+    .read_with_attrs = rp2350_xip_array_read,
+    .write_with_attrs = rp2350_xip_array_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
@@ -826,7 +910,8 @@ static void rp2350_xip_remap(RP2350XIPState *s)
     memory_region_transaction_begin();
     for (cs = 0; cs < RP2350_QMI_CS; cs++) {
         hwaddr window = cs * RP2350_QMI_WINDOW_SIZE;
-        bool present = !direct;
+        /* An array out of ROMD mode refuses direct-mode accesses itself. */
+        bool present = !direct || (s->cs_size[cs] && !array_mapped(s, cs));
 
         if (!s->cs_size[cs]) {
             continue;
@@ -1289,6 +1374,12 @@ void rp2350_xip_power_down(RP2350XIPState *s)
     rp2350_xip_remap(s);
 }
 
+/* A device changed its array's ROMD mode: map its views accordingly. */
+static void rp2350_xip_array_mapped(void *opaque, int cs, int level)
+{
+    rp2350_xip_remap(opaque);
+}
+
 /* A stream stalled by clk_sys stopping resumes when it restarts. */
 static void rp2350_xip_clk_changed(void *opaque, ClockEvent event)
 {
@@ -1316,6 +1407,8 @@ static void rp2350_xip_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(obj), s->cs, "cs", RP2350_QMI_CS);
     qdev_init_gpio_out_named(DEVICE(obj), s->dreq, "dreq",
                              RP2350_XIP_NUM_DREQ);
+    qdev_init_gpio_in_named(DEVICE(obj), rp2350_xip_array_mapped,
+                            RP2350_XIP_ARRAY_MAPPED, RP2350_QMI_CS);
     s->clk = qdev_init_clock_in(DEVICE(obj), "clk", rp2350_xip_clk_changed, s,
                                 ClockUpdate);
 }
