@@ -353,6 +353,12 @@
  *
  *       -device esp32p4-dsi-panel,width=1024,height=600
  *
+ *   - The image signal processor (TRM chapter 38) at 0x500A1000, behind
+ *     CSI_BRG_SYS_CLK, reset by RST_EN_ISP and RST_EN_CSI_BRG, its
+ *     pipeline at ISP_CLK, its interrupt ISP_INTR (source 100): between
+ *     the CSI bridge's CSI_CM and its tail, on the board's dvp-camera, and
+ *     on VDMA's handshaking interface 2, whose writes reach it at the CSI
+ *     bridge's memory port (hw/misc/esp32p4_isp.c).
  *   - The board's cameras: an esp32p4-image-source on the camera inputs'
  *     pads, dvp-camera for LCD_CAM's camera port and the ISP's DVP input,
  *     csi-camera for MIPI CSI (include/hw/misc/esp32p4_image_source.h).
@@ -473,7 +479,6 @@ static const struct {
     { "pau",              0x50082000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
     { "pvt",              0x5009e000, 4 * KiB },
-    { "isp",              0x500a1000, 4 * KiB },
     /* The AXI ICM's QoS command interface, above its own registers. */
     { "axi-icm-qos",      0x500a4400, 3 * KiB },
 
@@ -3269,6 +3274,62 @@ static void esp32p4_init_mipi(ESP32P4MachineState *s)
 }
 
 /*
+ * The image signal processor (TRM chapter 38): its registers behind
+ * CSI_BRG_SYS_CLK, its two resets (RST_EN_ISP, and RST_EN_CSI_BRG, which
+ * resets the ISP too: TRM 38.7.1) on its reset inputs, ISP_CLK; between
+ * the CSI bridge's CSI_CM and its tail and at its memory port for VDMA's
+ * writes, VDMA's handshaking interface 2 (memory to the ISP), the board's
+ * dvp-camera through the GPIO matrix's CAM_* inputs.
+ */
+/* [spec:nuos:req:emu.esp32p4.isp] */
+static void esp32p4_init_isp(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst), *vdma = DEVICE(&s->vdma);
+    DeviceState *isp;
+    static const char *const hs[3] = {
+        ESP32P4_DW_GDMA_HS_REQ, ESP32P4_DW_GDMA_HS_SINGLE,
+        ESP32P4_DW_GDMA_HS_LAST,
+    };
+    static const char *const isp_hs[3] = {
+        ESP32P4_ISP_HS_REQ, ESP32P4_ISP_HS_SINGLE, ESP32P4_ISP_HS_LAST,
+    };
+
+    object_initialize_child(OBJECT(s), "isp", &s->isp, TYPE_ESP32P4_ISP);
+    isp = DEVICE(&s->isp);
+    qdev_connect_clock_in(isp, "clk", qdev_get_clock_out(clkrst, "isp"));
+    object_property_set_link(OBJECT(isp), "bridge", OBJECT(&s->csi_bridge),
+                             &error_abort);
+    object_property_set_link(OBJECT(isp), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
+    if (s->dvp_camera) {
+        object_property_set_link(OBJECT(isp), "camera",
+                                 OBJECT(s->dvp_camera), &error_abort);
+    }
+    sysbus_realize(SYS_BUS_DEVICE(isp), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(isp), 0,
+                             ESP32P4_ISP_BASE, ESP32P4_CLK_CSI_BRG_SYS,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET, ESP32P4_RST_ISP,
+                                qdev_get_gpio_in_named(isp,
+                                                       ESP32P4_ISP_RESET, 0));
+    qdev_connect_gpio_out_named(clkrst, ESP32P4_CLKRST_RESET,
+                                ESP32P4_RST_CSI_BRG,
+                                qdev_get_gpio_in_named(isp,
+                                                       ESP32P4_ISP_RESET, 1));
+    sysbus_connect_irq(SYS_BUS_DEVICE(isp), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_ISP));
+    for (int i = 0; i < 3; i++) {
+        qdev_connect_gpio_out_named(isp, isp_hs[i], 0,
+            qdev_get_gpio_in_named(vdma, hs[i],
+                                   ESP32P4_DW_GDMA_HS_MEM_TO_ISP));
+    }
+    qdev_connect_gpio_out_named(vdma, ESP32P4_DW_GDMA_HS_ACK,
+                                ESP32P4_DW_GDMA_HS_MEM_TO_ISP,
+                                qdev_get_gpio_in_named(isp,
+                                                       ESP32P4_ISP_HS_ACK, 0));
+}
+
+/*
  * The BitScrambler, between GDMA and the peripherals HP_SYSTEM attaches it
  * to; and the parallel IO controller, served by GDMA-AXI, its pads through
  * the GPIO matrix.
@@ -4729,6 +4790,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_h264(s);
     esp32p4_init_jpeg(s);
     esp32p4_init_mipi(s);
+    esp32p4_init_isp(s);
     esp32p4_init_low_power(s);
     esp32p4_init_lp_core(s);
     esp32p4_init_uart(s);
