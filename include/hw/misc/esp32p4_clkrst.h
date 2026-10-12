@@ -922,6 +922,15 @@ bool esp32p4_clkrst_pad_source(ESP32P4ClkRstState *s, unsigned clk,
                                ESP32P4ClkDiv *div);
 
 /*
+ * The SD/MMC host's sample clock phase (TRM 57.10). In high-speed mode
+ * (SDIO_HS_MODE: its clocks the SDIO PLL's outputs) the host's own
+ * DLL_CLK_CONF sets it; in low-speed mode SDIO_LS_SAM_CLK_EDGE_SEL does,
+ * in quarters of the SDIO low-speed clock's period, as written.
+ */
+bool esp32p4_clkrst_sdio_hs_mode(ESP32P4ClkRstState *s);
+unsigned esp32p4_clkrst_sdio_sam_edge(ESP32P4ClkRstState *s);
+
+/*
  * An HP core reset (TRM 11.1) from @source, an ESP32P4_HP_CORE_RESET_*:
  * the HP system's reset, of both HP cores, every HP block and
  * HP_SYS_CLKRST's registers, held for @length_ns and leaving the LP system

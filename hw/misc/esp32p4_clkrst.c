@@ -83,7 +83,14 @@
  *   - The SDIO host's clocks: in low-speed mode its source divided by
  *     (SDIO_LS_CLK_DIV_NUM + 1) and by EDGE_N + 1 of the edge counts
  *     SDIO_LS_CLK_EDGE_CFG_UPDATE takes, in high-speed mode the SDIO PLL's
- *     three outputs. The phases the edge settings give are not modelled.
+ *     three outputs. The source SDIO_LS_CLK_SRC_SEL 1 selects is the SDIO
+ *     PLL (SDIO_PLL0_CLK), as ESP-IDF has it (SDMMC_CLK_SRC_SDIO_200M, for
+ *     the UHS-I modes), where the TRM's register description says APLL.
+ *     The sample clock's phase, SDIO_LS_SAM_CLK_EDGE_SEL, which ESP-IDF's
+ *     tuning changes without SDIO_LS_CLK_EDGE_CFG_UPDATE and so acts as
+ *     written, is the SD/MMC host's to apply
+ *     (esp32p4_clkrst_sdio_sam_edge()); the other edge selections are not
+ *     modelled.
  *   - The three debug clock outputs (DBG_CLK_CTRL*), from the signals
  *     ESP-IDF's soc_clkout_sig_id_t names.
  *
@@ -1444,7 +1451,7 @@ static ESP32P4ClkPeriod esp32p4_clkrst_special(ESP32P4ClkRstState *s, int id,
         if (!extract32(v, 24, 1)) {
             return stopped;
         }
-        src = extract32(v, 23, 1) ? C(APLL) : C(PLL_F160M);
+        src = extract32(v, 23, 1) ? C(SDIO_PLL0) : C(PLL_F160M);
         *from = src;
         return esp32p4_clk_period_scale(
             s->exact[src],
@@ -1901,6 +1908,18 @@ void esp32p4_clkrst_set_chip_reset_cause(ESP32P4ClkRstState *s,
 uint8_t esp32p4_clkrst_system_reset_cause(ESP32P4ClkRstState *s)
 {
     return s->system_reset_cause;
+}
+
+/* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+bool esp32p4_clkrst_sdio_hs_mode(ESP32P4ClkRstState *s)
+{
+    return extract32(s->regs[R_PERI_CLK_CTRL01], 22, 1);
+}
+
+/* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+unsigned esp32p4_clkrst_sdio_sam_edge(ESP32P4ClkRstState *s)
+{
+    return extract32(s->regs[R_PERI_CLK_CTRL02], 25, 2);
 }
 
 /* [spec:nuos:req:emu.esp32p4.parlio] */

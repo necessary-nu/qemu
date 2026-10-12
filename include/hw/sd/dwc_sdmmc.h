@@ -47,7 +47,12 @@ OBJECT_DECLARE_TYPE(DWCSDMMCState, DWCSDMMCClass, DWC_SDMMC)
  *     present), "card-write-prt" (high while it is write protected) and
  *     "card-int-n" (an SDIO interrupt request, low while asserted).
  *   GPIO outputs, one line per slot: "card-rst-n", RST_N's bit for the
- *     slot; and "ccmd-od-pullup-en-n", CTRL.ENABLE_OD_PULLUP inverted.
+ *     slot; "volt-reg", UHS_REG.VOLT_REG's bit for the slot (1: the slot's
+ *     pads are to signal at 1.8 V); and "ccmd-od-pullup-en-n",
+ *     CTRL.ENABLE_OD_PULLUP inverted.
+ *   GPIO input "pad-mv", one line per slot: the voltage, in mV, that
+ *     supplies the slot's pads and that they signal at, 0 while
+ *     unpowered; 3300 unless a board drives it.
  *   The slots' buses "sd-bus0" and "sd-bus1", each taking one card.
  *   The IDMAC's accesses go to the AddressSpace dma_as with the
  *     attributes dma_attrs, which a subclass sets before realizing; by
@@ -58,6 +63,8 @@ OBJECT_DECLARE_TYPE(DWCSDMMCState, DWCSDMMCClass, DWC_SDMMC)
 #define DWC_SDMMC_CARD_INT_N        "card-int-n"
 #define DWC_SDMMC_CARD_RST_N        "card-rst-n"
 #define DWC_SDMMC_CCMD_OD_PULLUP_EN_N "ccmd-od-pullup-en-n"
+#define DWC_SDMMC_VOLT_REG          "volt-reg"
+#define DWC_SDMMC_PAD_MV            "pad-mv"
 
 /* An integration's own registers, at 0x800 up, for a subclass to decode. */
 struct DWCSDMMCClass {
@@ -85,6 +92,13 @@ struct DWCSDMMCClass {
      */
     int64_t (*clock_after)(DWCSDMMCState *s, Clock *clk, int64_t from,
                            uint64_t cycles);
+    /*
+     * Whether the host's sample point for slot @slot's DAT lines (@dat)
+     * or CMD line falls where the card's output is valid; by default
+     * (NULL) always, an integration whose sample phase and board delays
+     * matter deciding it (dwc_sdmmc_card_div() gives the card clock).
+     */
+    bool (*sample_ok)(DWCSDMMCState *s, unsigned slot, bool dat);
 };
 
 /* The command the CIU has on the bus, or is about to take. */
@@ -115,6 +129,7 @@ struct DWCSDMMCState {
     MemoryRegion iomem;
     qemu_irq irq;
     qemu_irq card_rst_n[DWC_SDMMC_MAX_SLOTS];
+    qemu_irq volt_reg[DWC_SDMMC_MAX_SLOTS];
     qemu_irq od_pullup_en_n;
     Clock *hclk;
     Clock *cclk;
@@ -208,6 +223,16 @@ struct DWCSDMMCState {
     /* Each slot's card has taken CMD55: its next command is an ACMD. */
     uint8_t app_cmd;
 
+    /* Each slot's pad supply, mV (the "pad-mv" input; no reset takes it) */
+    uint32_t pad_mv[DWC_SDMMC_MAX_SLOTS];
+    /* The slots whose card SDCLK reaches, as it was last told */
+    uint8_t sdclk_on;
+    /*
+     * The slots whose clock a clock update with VOLT_SWITCH started again:
+     * their second voltage switch interrupt waits for DAT[3:0] high.
+     */
+    uint8_t volt_wait;
+
     /* The command path */
     uint32_t cmd_phase;
     /* The command on the bus, as the CIU took it */
@@ -251,6 +276,12 @@ struct DWCSDMMCState {
     uint32_t xfer_dir;
     /* A card error was flagged during the transfer: descriptor CES */
     bool card_error;
+    /* The error the block on the bus ends with, from how it was sampled */
+    uint32_t blk_fault;
+    /* The last bit, nibble or byte of each line's data, for a shift */
+    uint8_t shift_carry;
+    /* How the host samples the read chunk on the bus (dwc_rx_fault()) */
+    uint32_t chunk_fault;
 
     /* The FIFO, a byte ring */
     uint8_t fifo[DWC_SDMMC_MAX_FIFO_WORDS * 4];
@@ -278,6 +309,12 @@ extern const VMStateDescription vmstate_dwc_sdmmc;
  */
 void dwc_sdmmc_catch_up(DWCSDMMCState *s);
 void dwc_sdmmc_clock_changed(DWCSDMMCState *s);
+
+/*
+ * Slot @slot's card clock as the CIU has it, in cycles of the CIU's clock
+ * (the card interface clock); 0 while it is stopped.
+ */
+uint64_t dwc_sdmmc_card_div(DWCSDMMCState *s, unsigned slot);
 
 /*
  * The board switches the supply of the card in @slot (sdbus_set_power()),

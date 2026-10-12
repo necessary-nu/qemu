@@ -11,7 +11,9 @@
  *
  * The controller is clocked as ESP-IDF clocks it: SDIO_LS at 40 MHz
  * (25 ns), card 0's clock 400 kHz (2.5 us) for identification and 10 MHz
- * (100 ns) for data, 4 bits wide. The SDSC card is a raw image of 1 MiB:
+ * (100 ns) for data, 4 bits wide, slot 0's pads powered at 3.3 V on the
+ * PMU's regulator VO4 (bypass), as ESP-IDF's on-chip LDO power control
+ * powers them. The SDSC card is a raw image of 1 MiB:
  * Class 4, so its access and programming times are both its TAAC, 70 us,
  * its AU 512 KiB. The SDHC card is 4 GiB of zeros that keeps no writes.
  */
@@ -81,6 +83,10 @@
 #define SDMMC_SYS_CLK_EN    (1u << 14)
 #define PERI_CLK_CTRL01     (HP_CLKRST + 0x34)
 #define PERI_CLK_CTRL02     (HP_CLKRST + 0x38)
+
+/* The PMU's VO4: XPD, FORCE_TIEH_SEL (TIEH_SEL 0) and TIEH (bypass) */
+#define PMU_EXT_LDO_VO4     0x501151d8
+#define VO4_ON_3V3          ((1u << 7) | (1u << 8) | (1u << 14))
 
 /* GPIO45, the gate of the microSD socket's supply switch */
 #define GPIO                0x500e0000
@@ -159,11 +165,13 @@ static QTestState *start(const char *img, const char *opts)
                        img, opts);
 }
 
-/* SDMMC_SYS_CLK, and the SDIO_LS clocks at 40 MHz. */
+/* SDMMC_SYS_CLK, the SDIO_LS clocks at 40 MHz, and slot 0's pads. */
 static void clocks_on(QTestState *qts)
 {
     uint32_t edges = (3u << 17) | (3u << 9) | (1u << 13) | (7u << 27);
 
+    qtest_writel(qts, PMU_EXT_LDO_VO4,
+                 qtest_readl(qts, PMU_EXT_LDO_VO4) | VO4_ON_3V3);
     qtest_writel(qts, SOC_CLK_CTRL1,
                  qtest_readl(qts, SOC_CLK_CTRL1) | SDMMC_SYS_CLK_EN);
     qtest_writel(qts, PERI_CLK_CTRL01, 0x401 | (1u << 24));

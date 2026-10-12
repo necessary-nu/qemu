@@ -155,8 +155,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
 /* The board pad the IP101GRI's RESET_N is on */
 #define ESP32P4_BOARD_PHY_RESET_PAD 51
 
+/* The PMU regulator, VO<n>, that supplies the microSD slot's pads */
+#define ESP32P4_BOARD_SD_PAD_LDO    4
+
 /* The board pad whose high level switches the microSD socket's supply off */
 #define ESP32P4_BOARD_SD_POWER_PAD  45
+/*
+ * The socket's supply switch: ESP_3V3 through Q1, whose gate threshold
+ * the pad's high level must come within to turn it off (mV)
+ */
+#define ESP32P4_BOARD_SD_SUPPLY_MV  3300
+#define ESP32P4_BOARD_SD_SWITCH_VTH_MV 900
 
 /* The crypto block resets that hold more than their own block. */
 #define ESP32P4_CRYPTO_RST_SPLITS   4
@@ -232,6 +241,8 @@ struct ESP32P4MachineState {
     ESP32P4I3CMstState i3c_mst;
     ESP32P4I3CSlvState i3c_slv;
     ESP32P4SdmmcState sdmmc;
+    /* GPIO45, the microSD socket's supply switch, is driven high. */
+    bool sd_power_pad;
     /* GDMA-AHB, GDMA-AXI. */
     ESP32P4GdmaState gdma[2];
     ESP32P4DwGdmaState vdma;

@@ -80,6 +80,22 @@ typedef struct {
     uint8_t crc;
 } SDRequest;
 
+/*
+ * When a card's output on CMD and DAT is valid, as the timing of its bus
+ * speed mode gives it: a bit the card launches on an SDCLK edge (the
+ * falling edge if @falling, else the rising edge) is valid from
+ * *_delay_ps after that edge until *_hold_ps after the edge that launches
+ * the next one, which on DAT with @ddr is the next edge of either kind.
+ */
+typedef struct SDOutputTiming {
+    uint32_t cmd_delay_ps;
+    uint32_t cmd_hold_ps;
+    uint32_t dat_delay_ps;
+    uint32_t dat_hold_ps;
+    bool falling;
+    bool ddr;
+} SDOutputTiming;
+
 
 #define TYPE_SD_CARD "sd-card"
 OBJECT_DECLARE_TYPE(SDState, SDCardClass, SD_CARD)
@@ -136,6 +152,15 @@ struct SDCardClass {
     void (*set_voltage)(SDState *sd, uint16_t millivolts);
     uint8_t (*get_dat_lines)(SDState *sd);
     bool (*get_cmd_line)(SDState *sd);
+    /*
+     * The voltage, in mV, at which the card signals on CLK, CMD and
+     * DAT: its I/O's supply, 3.3 V or, once switched, 1.8 V.
+     */
+    uint16_t (*get_signal_voltage)(SDState *sd);
+    /* Whether SDCLK reaches the card (it runs, at a level the card sees). */
+    void (*set_clock)(SDState *sd, bool running);
+    /* The card's output timing in its present bus speed mode. */
+    void (*get_output_timing)(SDState *sd, SDOutputTiming *t);
     bool (*get_inserted)(SDState *sd);
     bool (*get_readonly)(SDState *sd);
     void (*set_cid)(SDState *sd);
@@ -179,6 +204,12 @@ struct SDBusClass {
      */
     void (*set_irq)(DeviceState *dev, bool level);
     /*
+     * Called by a card that changes the levels it drives on CMD or
+     * DAT[3:0] on its own, not in answer to the controller, at the time
+     * line_time() gives (hw/core/line-time.h).
+     */
+    void (*lines_changed)(DeviceState *dev);
+    /*
      * For a card that takes time: the present on the bus, as the
      * controller times its events (by default, the virtual clock); and
      * when @cycles of the card clock from @from have passed (INT64_MAX
@@ -195,6 +226,27 @@ struct SDBusClass {
 void sdbus_set_voltage(SDBus *sdbus, uint16_t millivolts);
 uint8_t sdbus_get_dat_lines(SDBus *sdbus);
 bool sdbus_get_cmd_line(SDBus *sdbus);
+/**
+ * sdbus_get_signal_voltage: The card's signalling voltage, in mV.
+ * @sdbus: bus
+ *
+ * Return: 3300 for a card that does not say, or no card.
+ */
+uint16_t sdbus_get_signal_voltage(SDBus *sdbus);
+/**
+ * sdbus_set_clock: Whether SDCLK reaches the card, as of line_time().
+ * @sdbus: bus
+ * @running: true while the clock runs at a level the card sees
+ */
+void sdbus_set_clock(SDBus *sdbus, bool running);
+/**
+ * sdbus_get_output_timing: The card's output timing in its bus mode.
+ * @sdbus: bus
+ * @t: filled in
+ *
+ * Return: false if there is no card or it gives none.
+ */
+bool sdbus_get_output_timing(SDBus *sdbus, SDOutputTiming *t);
 /**
  * sdbus_do_command: Process a SD command request
  * @sd: card
@@ -291,6 +343,11 @@ void sdbus_set_readonly(SDBus *sd, bool inserted);
  * @level: true while the card requests an interrupt
  */
 void sdbus_set_irq(SDBus *sd, bool level);
+/**
+ * sdbus_lines_changed: The card changed what it drives on CMD or DAT.
+ * @sd: bus
+ */
+void sdbus_lines_changed(SDBus *sd);
 /**
  * sdbus_get_time: The present on the bus, for a card that takes time
  * @sd: bus

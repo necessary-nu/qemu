@@ -131,6 +131,13 @@
  *     A card is on the board, not the chip: no reset of the chip or the
  *     controller reaches it, only a power cycle (QEMU's system reset) and
  *     the board's switch of the socket's supply, SD1_VDD, by GPIO45.
+ *     The socket's card is UHS-I (if of high capacity): slot 0's pads
+ *     are on VDD_IO_5, which the board takes from the PMU's regulator VO4
+ *     (ESP_LDO_VO4), off until software powers it, and signal at its
+ *     voltage; the host's UHS_REG.VOLT_REG bits are the regulators' mode
+ *     inputs; the host samples with the sample phase HP_SYS_CLKRST (or,
+ *     in high-speed mode, its DLL) sets, over the board's 4.0 ns round
+ *     trip (hw/sd/esp32p4_sdmmc.c). Slot 1's pads are at 3.3 V.
  *
  *   - The UARTs (TRM chapter 45): UART0 to UART4 at 0x500CA000 to
  *     0x500CE000, behind UARTn_APB_CLK and their APB resets, their cores
@@ -2174,6 +2181,41 @@ static void esp32p4_init_emac(ESP32P4MachineState *s)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * The SD slot's pads: the board supplies VDD_IO_5, the pads of GPIO39 to
+ * GPIO48 and so of SDMMC slot 0's IO MUX pins (CLK GPIO43, CMD GPIO44,
+ * D0 to D3 GPIO39 to GPIO42, as the board's microSD socket has them),
+ * from ESP_LDO_VO4, the PMU's regulator VO4, which also takes the
+ * slot's 51 kOhm pull-ups; the SD/MMC host's UHS_REG.VOLT_REG bits are
+ * the regulators' mode inputs SDMMC_0 and SDMMC_1. Slot 1's pads, which
+ * the GPIO matrix routes, are on the board's 3.3 V.
+ */
+static void esp32p4_sd_supply_update(ESP32P4MachineState *s);
+
+static void esp32p4_sd_pads(void *opaque, int n, int mv)
+{
+    ESP32P4MachineState *s = opaque;
+
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->sdmmc), DWC_SDMMC_PAD_MV,
+                                        0), mv);
+    esp32p4_sd_supply_update(s);
+}
+
+static void esp32p4_init_sd_power(ESP32P4MachineState *s)
+{
+    DeviceState *pmu = DEVICE(&s->pmu), *sd = DEVICE(&s->sdmmc);
+
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LDO_MV,
+                                ESP32P4_BOARD_SD_PAD_LDO - 1,
+                                qemu_allocate_irq(esp32p4_sd_pads, s, 0));
+    for (int i = 0; i < DWC_SDMMC_MAX_SLOTS; i++) {
+        qdev_connect_gpio_out_named(sd, DWC_SDMMC_VOLT_REG, i,
+                                    qdev_get_gpio_in_named(pmu,
+                                        ESP32P4_PMU_SDMMC_VOLT, i));
+    }
+}
+
+/*
  * [spec:nuos:req:emu.sd-card-power-cut]
  * The microSD socket's supply, SD1_VDD: ESP_3V3 through Q1, an AO3401
  * P-channel MOSFET whose gate is GPIO45, pulled down by R27 (10K; R23, a
@@ -2183,12 +2225,30 @@ static void esp32p4_init_emac(ESP32P4MachineState *s)
  * weak pull-up loses to R27. Waveshare's documentation for its ESP32-P4
  * boards names GPIO45 the TF card's power control, low to enable. Switched
  * off, the card loses its state; switched on, it powers up afresh.
+ *
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * GPIO45 is a VDD_IO_5 pad, on VO4 as the slot's are: driven high, it
+ * holds Q1's gate at VO4's voltage, which turns Q1 off only within its
+ * gate threshold of ESP_3V3, 0.9 V (the AO3401's typical VGS(th)): from
+ * 2.4 V. With VO4 at 1.8 V, for UHS-I, the gate is 1.5 V below the source
+ * and Q1 conducts: software switches the socket off with VO4 back at
+ * 3.3 V. Unpowered, the pad drives nothing, and R27 keeps Q1 on.
  */
+static void esp32p4_sd_supply_update(ESP32P4MachineState *s)
+{
+    uint32_t gate_mv = s->sd_power_pad ? DWC_SDMMC(&s->sdmmc)->pad_mv[0] : 0;
+
+    dwc_sdmmc_set_card_power(DWC_SDMMC(&s->sdmmc), 0,
+                             gate_mv + ESP32P4_BOARD_SD_SWITCH_VTH_MV <
+                             ESP32P4_BOARD_SD_SUPPLY_MV);
+}
+
 static void esp32p4_sd_supply(void *opaque, int n, int level)
 {
     ESP32P4MachineState *s = opaque;
 
-    dwc_sdmmc_set_card_power(DWC_SDMMC(&s->sdmmc), 0, !level);
+    s->sd_power_pad = level;
+    esp32p4_sd_supply_update(s);
 }
 
 /*
@@ -2213,6 +2273,8 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
                             TYPE_ESP32P4_SDMMC);
     dev = DEVICE(&s->sdmmc);
     object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "clkrst", OBJECT(&s->clkrst),
                              &error_abort);
     qdev_connect_clock_in(dev, "hclk",
                           qdev_get_clock_out(clkrst, "sdmmc-sys"));
@@ -2254,6 +2316,11 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
             qdev_prop_set_drive_err(card, "drive",
                                     blk_by_legacy_dinfo(dinfo),
                                     &error_fatal);
+            /* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+            /* The microSD socket's card is UHS-I (if high capacity). */
+            if (slot == 0) {
+                qdev_prop_set_uint8(card, "uhs", UHS_I);
+            }
             qdev_realize_and_unref(card, bus, &error_fatal);
         }
     }
@@ -2547,6 +2614,7 @@ static void esp32p4_init_low_power(ESP32P4MachineState *s)
                        esp32p4_intr_source(s, ESP32P4_INTR_PMU_0));
     sysbus_connect_irq(SYS_BUS_DEVICE(pmu), 1,
                        esp32p4_intr_source(s, ESP32P4_INTR_PMU_1));
+    esp32p4_init_sd_power(s);
 
     s->hp_top_power = qemu_allocate_irq(esp32p4_hp_top_power, s, 0);
     s->hp_mem_power = qemu_allocate_irq(esp32p4_hp_mem_power, s, 0);

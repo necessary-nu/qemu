@@ -26,14 +26,37 @@
  *   - RAW_INTS (0x804), read-only, whose meaning the TRM does not give:
  *     it reads 0, logged as unimplemented.
  *   - DLL_CLK_CONF (0x808) and DLL_CONF (0x80C): the DLL that phases the
- *     clock in ULTRA_HIGH_SPEED_MODE, held as written; its calibration is
- *     not modelled, so DLL_CAL_END stays 0 (logged as unimplemented).
+ *     clock in high-speed mode (HP_SYS_CLKRST's SDIO_HS_MODE, the SDIO
+ *     PLL's clocks undivided): DLL_CCLK_IN_SAM_PHASE sets the sample
+ *     clock's phase, below; the other phases and the clock enables are
+ *     held as written; the calibration is not modelled, so DLL_CAL_END
+ *     stays 0 (logged as unimplemented).
  *
  * The CIU's clock, cclk_in, is SDIO_LS_SLF_CLK; it reaches a card only
  * while SDIO_LS_DRV_CLK and SDIO_LS_SAM_CLK run too. The IDMAC's accesses
  * go through the permission managers as DMA master SDMMC, AHB master ID 6
  * (ESP32P4_ICM_ID_SDMMC): one the DMA APM refuses ends with a fatal bus
  * error, and the AXI ICM records it.
+ *
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * Sampling (TRM 57.10). The host samples CMD and DAT on its sample clock,
+ * whose phase is, in low-speed mode, HP_SYS_CLKRST's
+ * SDIO_LS_SAM_CLK_EDGE_SEL in quarters of cclk_in's period (as ESP-IDF
+ * reckons it: the source's period times the divider, over four) and, in
+ * high-speed mode, DLL_CCLK_IN_SAM_PHASE in 64ths. A bit is good where
+ * that sample point, after the card clock edge that follows the one
+ * launching it (half a period after a Default Speed card's falling-edge
+ * launch; on DAT in DDR, the next edge of either kind), falls in the
+ * card's output window (hw/sd/sd.h's SDOutputTiming) delayed by the board
+ * round trip: the clock out through a pad and the trace to the card, the
+ * data back along its trace and in through a pad, "board-delay-ps",
+ * 4.0 ns by default (the P4's pad delays are not published; 1.6 ns each
+ * way through a pad and 0.4 ns each way along the board's traces). A
+ * response sampled outside it fails its CRC check, a data block its CRC
+ * (hw/sd/dwc_sdmmc.c). With the defaults, at SDR50 (100 MHz, phases of
+ * 2.5 ns) phases 1 and 2 sample within the window and 0 and 3 do not;
+ * at DDR50 (50 MHz, phases of 5 ns) only phase 1 does on both CMD and
+ * DAT; Default Speed and High Speed work at phase 0 up to 25 and 50 MHz.
  */
 
 #include "qemu/osdep.h"
@@ -100,6 +123,38 @@ static bool esp32p4_sdmmc_vendor_write(DWCSDMMCState *d, hwaddr offset,
     default:
         return false;
     }
+}
+
+/* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+static bool esp32p4_sdmmc_sample_ok(DWCSDMMCState *d, unsigned slot,
+                                    bool dat)
+{
+    ESP32P4SdmmcState *s = ESP32P4_SDMMC(d);
+    uint64_t cclk_ps = (clock_get(d->cclk) * 1000) >> 32;
+    uint64_t div = dwc_sdmmc_card_div(d, slot);
+    uint64_t t, period, phase, capture, delay, hold;
+    SDOutputTiming out;
+    bool ddr;
+
+    if (!div || !s->clkrst ||
+        !sdbus_get_output_timing(&d->sdbus[slot], &out)) {
+        return true;
+    }
+    if (esp32p4_clkrst_sdio_hs_mode(s->clkrst)) {
+        phase = cclk_ps * extract32(s->dll_clk_conf, 15, 6) / 64;
+    } else {
+        phase = cclk_ps * esp32p4_clkrst_sdio_sam_edge(s->clkrst) / 4;
+    }
+    t = cclk_ps * div;
+    ddr = dat && out.ddr;
+    period = ddr ? t / 2 : t;
+    if (ddr) {
+        phase %= period;
+    }
+    capture = (out.falling ? t / 2 : period) + phase;
+    delay = (dat ? out.dat_delay_ps : out.cmd_delay_ps) + s->board_delay_ps;
+    hold = (dat ? out.dat_hold_ps : out.cmd_hold_ps) + s->board_delay_ps;
+    return capture >= delay && capture <= period + hold;
 }
 
 /* The CIU's clock, if the output and input clocks run too. */
@@ -200,6 +255,10 @@ static const VMStateDescription vmstate_esp32p4_sdmmc = {
 static const Property esp32p4_sdmmc_properties[] = {
     DEFINE_PROP_LINK("pms", ESP32P4SdmmcState, pms, TYPE_ESP32P4_PMS,
                      ESP32P4PmsState *),
+    DEFINE_PROP_LINK("clkrst", ESP32P4SdmmcState, clkrst,
+                     TYPE_ESP32P4_CLKRST, ESP32P4ClkRstState *),
+    DEFINE_PROP_UINT32("board-delay-ps", ESP32P4SdmmcState, board_delay_ps,
+                       4000),
 };
 
 static void esp32p4_sdmmc_class_init(ObjectClass *klass, const void *data)
@@ -217,6 +276,7 @@ static void esp32p4_sdmmc_class_init(ObjectClass *klass, const void *data)
     sc->vendor_write = esp32p4_sdmmc_vendor_write;
     sc->cclk_period = esp32p4_sdmmc_cclk_period;
     sc->clock_after = esp32p4_sdmmc_clock_after;
+    sc->sample_ok = esp32p4_sdmmc_sample_ok;
 }
 
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */
