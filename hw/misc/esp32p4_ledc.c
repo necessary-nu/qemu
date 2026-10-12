@@ -292,7 +292,40 @@ static ESP32P4ClkPeriod timer_q(ESP32P4LedcState *s, int x)
 
 static bool timer_runs(const ESP32P4LedcTimer *t)
 {
-    return esp32p4_clk_period_running(t->q);
+    return esp32p4_clk_edges_running(&t->q);
+}
+
+/*
+ * Take the count's period after a change at the anchor: on the divided
+ * clock's edges from the first LEDC_CLK edge at or after the anchor, its
+ * first count a period after that; as they were if neither the period
+ * nor LEDC_CLK's edges have changed.
+ */
+static void timer_set_q(ESP32P4LedcState *s, int x)
+{
+    ESP32P4LedcTimer *t = &s->t[x];
+    ESP32P4ClkPeriod q = timer_q(s, x);
+    ESP32P4ClkEdges clk = esp32p4_clk_edges_or_at(s->clk, t->anchor_ns);
+    bool at;
+
+    if (esp32p4_clk_period_eq(q, t->q.period) &&
+        esp32p4_clk_edges_eq(&clk, &t->q_clk)) {
+        return;
+    }
+    t->q_clk = clk;
+    t->q = esp32p4_clk_edges_from(q, &clk, t->anchor_ns);
+    t->q_start = 0;
+    if (timer_runs(t)) {
+        t->q_start = esp32p4_clk_edge_index(&t->q, t->anchor_ns, &at) + !at;
+    }
+}
+
+/* The edge of the divided clock the counter last counted by time @x. */
+static int64_t timer_edge(const ESP32P4LedcTimer *t, int64_t x)
+{
+    bool at;
+
+    return MAX(esp32p4_clk_edge_index(&t->q, x, &at), t->q_start);
 }
 
 /*
@@ -309,7 +342,7 @@ static void timer_pos(const ESP32P4LedcTimer *t, int64_t x, uint64_t *k,
         *v = t->anchor_cnt;
         return;
     }
-    total = t->anchor_cnt + esp32p4_clk_ns_cycles(t->q, x - t->anchor_ns);
+    total = t->anchor_cnt + (timer_edge(t, x) - timer_edge(t, t->anchor_ns));
     *k = t->anchor_cycle + (total >> t->res);
     *v = total & (timer_period(t) - 1);
 }
@@ -333,11 +366,11 @@ static int64_t timer_time(const ESP32P4LedcTimer *t, uint64_t k, uint64_t v)
     if (!timer_runs(t)) {
         return INT64_MAX;
     }
-    ns = esp32p4_clk_cycles_ns(t->q, m);
-    if (ns >= INT64_MAX - t->anchor_ns) {
+    if (m > INT64_MAX - timer_edge(t, t->anchor_ns)) {
         return INT64_MAX;
     }
-    return t->anchor_ns + ns;
+    ns = esp32p4_clk_edge_ns(&t->q, timer_edge(t, t->anchor_ns) + m);
+    return MAX(ns, t->anchor_ns);
 }
 
 /* An event's time, one already due counting as due at the anchor. */
@@ -1077,7 +1110,7 @@ static void timer_take_update(ESP32P4LedcState *s, int x, int64_t when,
     t->pend_div = false;
     t->pend_res = false;
     t->conf &= ~TCONF_PARA_UP;
-    t->q = timer_q(s, x);
+    timer_set_q(s, x);
     for (int n = 0; n < ESP32P4_LEDC_CHANNELS; n++) {
         if (s->ch[n].timer == x) {
             chan_rebase_level(s, n, k, when, level[n]);
@@ -1343,7 +1376,7 @@ static void ledc_clk_update(void *opaque, ClockEvent event)
     }
     for (int x = 0; x < ESP32P4_LEDC_TIMERS; x++) {
         timer_reanchor(&s->t[x], now);
-        s->t[x].q = timer_q(s, x);
+        timer_set_q(s, x);
     }
     ledc_schedule(s);
 }
@@ -1381,7 +1414,7 @@ static void ledc_timer_write(ESP32P4LedcState *s, int x, uint32_t v,
         }
         t->pend_div = true;
         t->pend_res = true;
-        t->q = esp32p4_clk_period_stopped();
+        t->q = esp32p4_clk_edges_stopped();
         timer_take_update(s, x, now, t->anchor_cycle);
         /* Held at count 0 of its cycle, which has had no overflow. */
         t->ovf_next = t->anchor_cycle;
@@ -1398,7 +1431,7 @@ static void ledc_timer_write(ESP32P4LedcState *s, int x, uint32_t v,
         t->pend_res = true;
         t->conf |= TCONF_PARA_UP;
     }
-    t->q = timer_q(s, x);
+    timer_set_q(s, x);
 }
 
 /*
@@ -1706,7 +1739,7 @@ static void esp32p4_ledc_etm_task(void *opaque, int line, int level)
     case TASK_TIMER_PAUSE:
         timer_reanchor(&s->t[i], now);
         s->t[i].etm_paused = !s->t[i].etm_paused;
-        s->t[i].q = timer_q(s, i);
+        timer_set_q(s, i);
         break;
     case TASK_GAMMA_RESTART:
         chan_request_ops(s, i, OP_RESTART, now);
@@ -1799,8 +1832,8 @@ static const Property esp32p4_ledc_properties[] = {
 
 static const VMStateDescription vmstate_esp32p4_ledc_timer = {
     .name = TYPE_ESP32P4_LEDC "-timer",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(conf, ESP32P4LedcTimer),
         VMSTATE_UINT32(cmp, ESP32P4LedcTimer),
@@ -1814,7 +1847,9 @@ static const VMStateDescription vmstate_esp32p4_ledc_timer = {
         VMSTATE_INT64(anchor_ns, ESP32P4LedcTimer),
         VMSTATE_UINT64(anchor_cycle, ESP32P4LedcTimer),
         VMSTATE_UINT32(anchor_cnt, ESP32P4LedcTimer),
-        VMSTATE_ESP32P4_CLK_PERIOD(q, ESP32P4LedcTimer),
+        VMSTATE_ESP32P4_CLK_EDGES(q, ESP32P4LedcTimer),
+        VMSTATE_INT64(q_start, ESP32P4LedcTimer),
+        VMSTATE_ESP32P4_CLK_EDGES(q_clk, ESP32P4LedcTimer),
         VMSTATE_UINT64(ovf_next, ESP32P4LedcTimer),
         VMSTATE_UINT64(cmp_next, ESP32P4LedcTimer),
         VMSTATE_END_OF_LIST()
@@ -1870,7 +1905,7 @@ static const VMStateDescription vmstate_esp32p4_ledc = {
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4LedcState),
         VMSTATE_TIMER(timer, ESP32P4LedcState),
-        VMSTATE_STRUCT_ARRAY(t, ESP32P4LedcState, ESP32P4_LEDC_TIMERS, 1,
+        VMSTATE_STRUCT_ARRAY(t, ESP32P4LedcState, ESP32P4_LEDC_TIMERS, 2,
                              vmstate_esp32p4_ledc_timer, ESP32P4LedcTimer),
         VMSTATE_STRUCT_ARRAY(ch, ESP32P4LedcState, ESP32P4_LEDC_CHANNELS, 1,
                              vmstate_esp32p4_ledc_channel,

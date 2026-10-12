@@ -65,13 +65,17 @@ typedef struct ESP32P4LedcTimer {
     bool etm_paused;        /* paused by the PAUSE and RESUME tasks */
     /*
      * The counter: count anchor_cnt of cycle anchor_cycle at anchor_ns,
-     * moving one count every period q, exactly (stopped while it stands
-     * still).
+     * moving one count on each of the edges q of its divided clock, exact
+     * period and phase (stopped while it stands still), after edge
+     * q_start, the first LEDC_CLK edge as the divider last started, whose
+     * edges q_clk were then.
      */
     int64_t anchor_ns;
     uint64_t anchor_cycle;
     uint32_t anchor_cnt;
-    ESP32P4ClkPeriod q;
+    ESP32P4ClkEdges q;
+    int64_t q_start;
+    ESP32P4ClkEdges q_clk;
     /* The first cycle whose overflow, and CMP match, are not yet seen */
     uint64_t ovf_next;
     uint64_t cmp_next;

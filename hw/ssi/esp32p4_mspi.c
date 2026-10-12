@@ -1731,14 +1731,18 @@ static uint64_t spi1_clock_div(ESP32P4MSPIState *s)
 
 static void spi1_schedule(ESP32P4MSPIState *s)
 {
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    ESP32P4ClkEdges e;
+
     if (!clock_is_enabled(s->core_clk)) {
         s->spi1_waiting = true;
         return;
     }
     s->spi1_waiting = false;
-    timer_mod(&s->spi1_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->core_clk),
-                                    s->spi1_cycles * spi1_clock_div(s)));
+    e = esp32p4_clk_edges_or_at(s->core_clk, now);
+    timer_mod(&s->spi1_timer,
+              esp32p4_clk_edges_after(&e, now,
+                                      s->spi1_cycles * spi1_clock_div(s)));
 }
 
 /* The cycles of the status read FLASH_WAITI_CTRL makes after an operation. */

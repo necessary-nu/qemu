@@ -205,12 +205,12 @@ static bool tsens_quiet(ESP32P4TsensState *s, uint32_t v)
 /*
  * Arm the timer for the first sample after @now on the sampling period's
  * grid that would do something: sample k comes as the clock completes
- * k periods of SAMPLE_RATE cycles from the anchor, exactly (a rate of 0
- * samples every nanosecond).
+ * k periods of SAMPLE_RATE cycles from the anchor, at its edges (a rate of
+ * 0 samples every nanosecond).
  */
 static void tsens_schedule(ESP32P4TsensState *s, int64_t now)
 {
-    ESP32P4ClkPeriod p = esp32p4_clk_exact(s->clk);
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(s->clk, s->anchor_ns);
     uint64_t rate = SAMPLE_RATE(REG(s, A_SAMPLE_RATE));
     uint64_t k;
 
@@ -221,8 +221,8 @@ static void tsens_schedule(ESP32P4TsensState *s, int64_t now)
     if (!rate) {
         s->next_ns = MAX(now, s->anchor_ns) + 1;
     } else {
-        k = esp32p4_clk_ns_cycles(p, now - s->anchor_ns) / rate + 1;
-        s->next_ns = s->anchor_ns + esp32p4_clk_cycles_ns(p, k * rate);
+        k = esp32p4_clk_edges_between(&e, s->anchor_ns, now) / rate + 1;
+        s->next_ns = esp32p4_clk_edges_after(&e, s->anchor_ns, k * rate);
     }
     timer_mod(&s->sample_timer, s->next_ns);
 }

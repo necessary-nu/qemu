@@ -268,9 +268,13 @@ static void esp32p4_apm_total(ESP32P4AxiPerfMonState *s, int n,
     }
 }
 
-static uint64_t esp32p4_apm_cycles(ESP32P4AxiPerfMonState *s, int64_t ns)
+/* The AXI clock's edges after @from and by @t. */
+static uint64_t esp32p4_apm_cycles(ESP32P4AxiPerfMonState *s, int64_t from,
+                                   int64_t t)
 {
-    return esp32p4_clk_ns_cycles(esp32p4_clk_exact(s->axi_clk), ns);
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(s->axi_clk, from);
+
+    return esp32p4_clk_edges_between(&e, from, t);
 }
 
 /* VALID_STROBE_NUM's time (bits 7:0) or data (15:8) divisor, less one. */
@@ -287,7 +291,7 @@ static void esp32p4_apm_avg_update(ESP32P4AxiPerfMonState *s, int n, int dir)
 {
     ESP32P4AxiPerfMonMeasure *m = &s->measure[n][dir];
     uint64_t data = m->avg_beats / (esp32p4_apm_strobe(s, n, dir, true) + 1);
-    uint64_t time = esp32p4_apm_cycles(s, m->avg_last_ns - m->avg_start_ns) /
+    uint64_t time = esp32p4_apm_cycles(s, m->avg_start_ns, m->avg_last_ns) /
                     (esp32p4_apm_strobe(s, n, dir, false) + 1);
 
     esp32p4_apm_total(s, n, dir == RD ? METRIC_RD_AVG_DATA
