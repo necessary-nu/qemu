@@ -267,8 +267,8 @@ uint32_t dwc2_otg_hfnum_read(DWC2OTGState *s)
 
     if (timer_pending(s->frame_timer) && s->frame_period &&
         s->frame_period == dwc2_otg_phy_period(s)) {
-        done = dwc2_otg_phy_ticks(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
-                                     s->frame_origin_ns);
+        done = dwc2_otg_phy_count(s, s->frame_origin_ns,
+                                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         left = s->frame_ticks > done ? s->frame_ticks - done : 0;
     }
     return s->frnum | (MIN(left, 0xffff) << HFNUM_FRREM_SHIFT);
@@ -1486,8 +1486,9 @@ static void host_frame_next(DWC2OTGState *s)
         return;
     }
     s->frame_ticks += len;
-    s->frame_ns = s->frame_origin_ns +
-                  dwc2_otg_phy_ticks_ns(s, s->frame_ticks) - s->frame_start_ns;
+    s->frame_ns = MIN(dwc2_otg_phy_after(s, s->frame_origin_ns,
+                                         s->frame_ticks),
+                      INT64_MAX / 2) - s->frame_start_ns;
 }
 
 /* A (micro)frame boundary: the SOF, and a new round of transactions. */

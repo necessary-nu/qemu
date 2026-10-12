@@ -668,9 +668,11 @@ static void rx_end_frame(ESP32P4ParlioState *s, bool err)
  */
 static int64_t rx_timeout_at(ESP32P4ParlioState *s)
 {
-    return s->rx_timeout_from +
-           MIN(esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->sys_clk),
-                                     RX_TIMEOUT_THRES(s->rx_genrl_act)),
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(s->sys_clk,
+                                                s->rx_timeout_from);
+
+    return MIN(esp32p4_clk_edges_after(&e, s->rx_timeout_from,
+                                       RX_TIMEOUT_THRES(s->rx_genrl_act)),
                INT64_MAX / 2);
 }
 
@@ -813,23 +815,51 @@ static bool uclk_pad(ESP32P4ParlioClk *u, ESP32P4ClkDiv *div)
 }
 
 /*
- * The time of internal edge @n, a rising edge for even @n: n + 1 half
- * periods of the unit's clock after edge 0, at the first nanosecond that
- * has come, at the clock's exact period.
+ * The time of internal edge @n, a rising edge for even @n: n half periods
+ * of the unit's clock after edge 0, the clock's first rising edge after
+ * base_ns, at its exact period and phase; at the first nanosecond that
+ * has come.
  */
 static int64_t uclk_edge_ns(ESP32P4ParlioClk *u, uint64_t n)
 {
-    return u->base_ns + MIN(esp32p4_clk_cycles_ns(u->half, n + 1),
-                            INT64_MAX / 2);
+    if (n > INT64_MAX / 4 || u->k0 + (int64_t)n < 0) {
+        return INT64_MAX / 2;
+    }
+    return MIN(esp32p4_clk_edge_ns(&u->half_e, u->k0 + n), INT64_MAX / 2);
 }
 
 /* The number of the first internal edge after @t. */
 static uint64_t uclk_edge_after(ESP32P4ParlioClk *u, int64_t t)
 {
-    if (t < u->base_ns) {
+    int64_t k;
+    bool at;
+
+    if (t < u->base_ns || !esp32p4_clk_edges_running(&u->half_e)) {
         return 0;
     }
-    return esp32p4_clk_ns_cycles(u->half, t - u->base_ns);
+    k = esp32p4_clk_edge_index(&u->half_e, t, &at);
+    return k >= u->k0 ? k - u->k0 + 1 : 0;
+}
+
+/*
+ * Time the internal clock afresh from @t: its half periods on the clock's
+ * edges, internal edge @next, or the falling one after it for odd @next,
+ * at its first rising edge after @t.
+ */
+static void uclk_rebase(ESP32P4ParlioClk *u, int64_t t, uint64_t next)
+{
+    ESP32P4ClkEdges clk = esp32p4_clk_edges_or_at(u->clk, t);
+    int64_t k;
+    bool at;
+
+    u->base_ns = t;
+    u->half_e = esp32p4_clk_edges_from(u->half, &clk, t);
+    u->k0 = 0;
+    if (!esp32p4_clk_edges_running(&u->half_e)) {
+        return;
+    }
+    k = esp32p4_clk_edge_index(&u->half_e, t, &at) + !at;
+    u->k0 = k + (at ? 2 : 0) - (int64_t)(next & ~1ull);
 }
 
 /*
@@ -996,11 +1026,9 @@ static void parlio_slip(ESP32P4ParlioState *s, int64_t now)
     }
     for (int i = 0; i < 2; i++) {
         ESP32P4ParlioClk *u = &s->uclk[i];
-        int64_t delta = now + esp32p4_clk_cycles_ns(u->half, 1) -
-                        uclk_due(u);
 
-        if (timer_pending(u->timer) && delta > 0) {
-            u->base_ns += delta;
+        if (timer_pending(u->timer) && uclk_due(u) <= now) {
+            uclk_rebase(u, now, u->next);
             timer_mod(u->timer, uclk_due(u));
         }
     }
@@ -1098,8 +1126,8 @@ static void uclk_update(void *opaque, ClockEvent event)
     timer_del(u->timer);
     u->running = false;
     u->half = esp32p4_clk_period_scale(esp32p4_clk_exact(u->clk), 1, 2);
-    u->base_ns = esp32_line_time();
     u->next = 0;
+    uclk_rebase(u, esp32_line_time(), 0);
     if (esp32p4_clk_period_running(u->half)) {
         /* A started clock starts low. */
         u->in_level = false;
@@ -1562,12 +1590,14 @@ static const VMStateDescription vmstate_parlio_fifo = {
 
 static const VMStateDescription vmstate_parlio_clk = {
     .name = "esp32p4-parlio-clk",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4ParlioClk),
         VMSTATE_TIMER_PTR(timer, ESP32P4ParlioClk),
         VMSTATE_INT64(base_ns, ESP32P4ParlioClk),
+        VMSTATE_ESP32P4_CLK_EDGES(half_e, ESP32P4ParlioClk),
+        VMSTATE_INT64(k0, ESP32P4ParlioClk),
         VMSTATE_ESP32P4_CLK_PERIOD(half, ESP32P4ParlioClk),
         VMSTATE_UINT64(next, ESP32P4ParlioClk),
         VMSTATE_BOOL(running, ESP32P4ParlioClk),

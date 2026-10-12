@@ -27,10 +27,16 @@ struct DWC2OTGClass {
      * The whole cycles of @clk, one of the core's PHY clocks, in @ns from
      * one of its edges, and the first ns by which @n of them have elapsed:
      * by default at the Clock's period; a machine that knows the clock's
-     * period more exactly than a Clock holds it counts at that.
+     * period more exactly than a Clock holds it counts at that. And of
+     * its edges: those after @from by @t, and the first ns by which @n of
+     * them have come after @from; by default as if it had one at @from.
      */
     uint64_t (*clock_cycles)(DWC2OTGState *s, Clock *clk, int64_t ns);
     int64_t (*clock_cycles_ns)(DWC2OTGState *s, Clock *clk, uint64_t n);
+    uint64_t (*clock_count)(DWC2OTGState *s, Clock *clk, int64_t from,
+                            int64_t t);
+    int64_t (*clock_after)(DWC2OTGState *s, Clock *clk, int64_t from,
+                           uint64_t n);
 };
 
 /*

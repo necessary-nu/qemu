@@ -12,6 +12,7 @@
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
 #include "hw/nvram/esp32p4_efuse.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "hw/usb/dwc2-otg.h"
 #include "qom/object.h"
 
@@ -115,6 +116,8 @@ struct ESP32P4UsbUtmiState {
     MemoryRegion iomem;
     Clock *refclk;
     Clock *utmi_clk;
+    /* The edges of the PLL's clock, from its lock to the reference. */
+    ESP32P4ClkEdges utmi_edges;
     qemu_irq sense[DWC2_OTG_SENSE_NUM];
     qemu_irq phy_st[4];
 

@@ -253,24 +253,39 @@ static ESP32P4ClkPeriod esp32p4_ana_out_period(ESP32P4AnaState *s, int pll)
     return esp32p4_clk_period_stopped();
 }
 
+/*
+ * The output's edges: a PLL locked to XTAL_CLK at its first edge at or
+ * after the lock, which it keeps while it stays locked to the same edges.
+ */
 static void esp32p4_ana_update_out(ESP32P4AnaState *s, int pll)
 {
-    ESP32P4ClkPeriod old = s->out_period[pll];
+    ESP32P4ClkEdges old = s->out_edges[pll], xtal;
+    ESP32P4ClkPeriod p = esp32p4_ana_out_period(s, pll);
 
-    s->out_period[pll] = esp32p4_ana_out_period(s, pll);
-    esp32p4_clk_update(s->out[pll], old, s->out_period[pll]);
+    xtal = esp32p4_clk_edges_or_at(s->xtal,
+                                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    if (!esp32p4_clk_period_running(p)) {
+        s->out_edges[pll] = esp32p4_clk_edges_stopped();
+    } else if (!esp32p4_clk_period_eq(p, old.period) ||
+               !esp32p4_clk_edges_eq(&xtal, &s->ref_edges[pll])) {
+        s->out_edges[pll] = esp32p4_clk_edges_from(
+            p, &xtal, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+    s->ref_edges[pll] = xtal;
+    s->out_period[pll] = s->out_edges[pll].period;
+    esp32p4_clk_update(s->out[pll], &old, &s->out_edges[pll]);
 }
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */
-static bool esp32p4_ana_exact_period(Object *obj, Clock *out,
-                                     ESP32P4ClkPeriod *p)
+static bool esp32p4_ana_exact_edges(Object *obj, Clock *out,
+                                    ESP32P4ClkEdges *e)
 {
     ESP32P4AnaState *s = ESP32P4_ANA(obj);
     int pll;
 
     for (pll = 0; pll < ESP32P4_ANA_NUM_PLLS; pll++) {
         if (s->out[pll] == out) {
-            *p = s->out_period[pll];
+            *e = s->out_edges[pll];
             return true;
         }
     }
@@ -576,7 +591,7 @@ static int esp32p4_ana_post_load(void *opaque, int version_id)
     int i;
 
     for (i = 0; i < ESP32P4_ANA_NUM_PLLS; i++) {
-        s->out_period[i] = esp32p4_ana_out_period(s, i);
+        s->out_period[i] = s->out_edges[i].period;
         clock_set(s->out[i], esp32p4_clk_period_clock(s->out_period[i]));
     }
     return 0;
@@ -584,11 +599,17 @@ static int esp32p4_ana_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_esp32p4_ana = {
     .name = TYPE_ESP32P4_ANA,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = esp32p4_ana_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(xtal, ESP32P4AnaState),
+        VMSTATE_STRUCT_ARRAY(out_edges, ESP32P4AnaState,
+                             ESP32P4_ANA_NUM_PLLS, 0,
+                             vmstate_esp32p4_clk_edges, ESP32P4ClkEdges),
+        VMSTATE_STRUCT_ARRAY(ref_edges, ESP32P4AnaState,
+                             ESP32P4_ANA_NUM_PLLS, 0,
+                             vmstate_esp32p4_clk_edges, ESP32P4ClkEdges),
         VMSTATE_UINT8_2DARRAY(regs, ESP32P4AnaState, ESP32P4_ANA_NUM_SLAVES,
                               ESP32P4_ANA_SLAVE_REGS),
         VMSTATE_BOOL_ARRAY(xpd, ESP32P4AnaState, ESP32P4_ANA_NUM_PLLS),
@@ -611,7 +632,7 @@ static void esp32p4_ana_class_init(ObjectClass *klass, const void *data)
 
     rc->phases.hold = esp32p4_ana_reset_hold;
     dc->vmsd = &vmstate_esp32p4_ana;
-    csc->exact_period = esp32p4_ana_exact_period;
+    csc->exact_edges = esp32p4_ana_exact_edges;
 }
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */

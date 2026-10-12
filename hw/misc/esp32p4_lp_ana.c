@@ -485,9 +485,9 @@ static void lp_ana_update(ESP32P4LPAnaState *s)
     /* Mode 1. */
     if (s->brownout && lp_ana_mode1_enabled(s)) {
         if (!timer_pending(&s->mode1_timer) && clock_is_enabled(s->fast)) {
-            timer_mod(&s->mode1_timer,
-                      now + esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->fast),
-                                                  1));
+            ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(s->fast, now);
+
+            timer_mod(&s->mode1_timer, esp32p4_clk_edges_after(&e, now, 1));
         }
     } else {
         timer_del(&s->mode1_timer);

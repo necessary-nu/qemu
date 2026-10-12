@@ -888,13 +888,18 @@ static bool twai_clkout(ESP32P4TwaiCtrl *c, int64_t now)
     uint32_t cd = c->cdr & CDR_CD;
     uint64_t div = cd == CDR_CD ? 1 : 2 * (cd + 1);
 
+    ESP32P4ClkEdges half;
+    bool at;
+
     if ((c->cdr & CDR_CLOCK_OFF) ||
         !esp32p4_clk_period_running(c->clk_period)) {
         return false;
     }
-    return (esp32p4_clk_ns_cycles(esp32p4_clk_period_scale(c->clk_period,
-                                                           1, 2), now) /
-            div) & 1;
+    /* Half periods of the clock, on its edges: each one toggles. */
+    half = esp32p4_clk_edges_from(esp32p4_clk_period_scale(c->clk_period,
+                                                           1, 2),
+                                  &c->clk_edges, 0);
+    return ((esp32p4_clk_edge_index(&half, now, &at) + 1) / div) & 1;
 }
 
 static void twai_update_lines(ESP32P4TwaiCtrl *c)
@@ -921,7 +926,9 @@ static void twai_standby_schedule(ESP32P4TwaiCtrl *c)
         return;
     }
     twai_arm(c->standby_timer, &c->standby_due,
-             c->idle_since + bits_ns(c->clk_period, c->hw_standby_cnt));
+             MIN(esp32p4_clk_edges_after(&c->clk_edges, c->idle_since,
+                                         c->hw_standby_cnt),
+                 INT64_MAX / 4));
 }
 
 static void twai_set_standby(ESP32P4TwaiCtrl *c, bool on)
@@ -976,7 +983,7 @@ static uint64_t twai_ts_count(ESP32P4TwaiCtrl *c, int64_t t)
         return c->ts_count_base;
     }
     return c->ts_count_base +
-           esp32p4_clk_ns_cycles(c->clk_period, t - c->ts_base_ns) /
+           esp32p4_clk_edges_between(&c->clk_edges, c->ts_base_ns, t) /
            twai_ts_div(c);
 }
 
@@ -990,9 +997,11 @@ static void twai_ts_schedule(ESP32P4TwaiCtrl *c)
         return;
     }
     next = (twai_ts_count(c, twai_now()) | 0xffffffffULL) + 1;
-    twai_arm(c->ts_timer, &c->ts_due, c->ts_base_ns +
-             bits_ns(c->clk_period, (next - c->ts_count_base) *
-                                    twai_ts_div(c)));
+    twai_arm(c->ts_timer, &c->ts_due,
+             MIN(esp32p4_clk_edges_after(&c->clk_edges, c->ts_base_ns,
+                                         (next - c->ts_count_base) *
+                                         twai_ts_div(c)),
+                 INT64_MAX / 4));
 }
 
 /* Carry the count over a change of its clock or divider. */
@@ -2763,7 +2772,8 @@ static void esp32p4_twai_clk_update(void *opaque, ClockEvent event)
         twai_recov_fold(c, twai_now());
         return;
     }
-    c->clk_period = esp32p4_clk_exact(c->clk);
+    c->clk_edges = esp32p4_clk_edges_or_at(c->clk, twai_now());
+    c->clk_period = c->clk_edges.period;
     c->ts_base_ns = twai_now();
     twai_ts_schedule(c);
     twai_rejoin(c);
@@ -2827,7 +2837,8 @@ static void twai_ctrl_reset(ESP32P4TwaiCtrl *c)
     c->recov_paused = false;
     c->recov_mark = 0;
     c->recov_runs = 0;
-    c->clk_period = esp32p4_clk_exact(c->clk);
+    c->clk_edges = esp32p4_clk_edges_or_at(c->clk, now);
+    c->clk_period = c->clk_edges.period;
     c->local_active = false;
     c->ts_count_base = 0;
     c->ts_base_ns = now;
@@ -3033,8 +3044,8 @@ static const VMStateDescription vmstate_esp32p4_twai_episode = {
 
 static const VMStateDescription vmstate_esp32p4_twai_ctrl = {
     .name = "esp32p4-twai-ctrl",
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(mode, ESP32P4TwaiCtrl),
         VMSTATE_UINT32(status, ESP32P4TwaiCtrl),
@@ -3096,6 +3107,7 @@ static const VMStateDescription vmstate_esp32p4_twai_ctrl = {
         VMSTATE_BOOL(rx_level, ESP32P4TwaiCtrl),
         VMSTATE_BOOL(in_reset, ESP32P4TwaiCtrl),
         VMSTATE_ESP32P4_CLK_PERIOD(clk_period, ESP32P4TwaiCtrl),
+        VMSTATE_ESP32P4_CLK_EDGES(clk_edges, ESP32P4TwaiCtrl),
         VMSTATE_UINT64(ts_count_base, ESP32P4TwaiCtrl),
         VMSTATE_INT64(ts_base_ns, ESP32P4TwaiCtrl),
         VMSTATE_TIMER_PTR(ts_timer, ESP32P4TwaiCtrl),

@@ -192,8 +192,11 @@ struct Esp32McpwmState {
     uint64_t div_tick;
     uint64_t div_cycle;
     uint32_t div_k;
-    /* The ESP32-P4's MCPWMn_CLK at its exact period, as it last changed */
-    ESP32P4ClkPeriod p4_period;
+    /*
+     * The ESP32-P4's MCPWMn_CLK's edges, exact period and phase, as it
+     * last changed
+     */
+    ESP32P4ClkEdges p4_edges;
 
     /* GPIO SYNCn levels as received, before inversion */
     bool sync_in[ESP32_MCPWM_SYNCS];

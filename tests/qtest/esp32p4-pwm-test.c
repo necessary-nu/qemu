@@ -174,7 +174,11 @@ static QTestState *start(void)
     QTestState *qts = qtest_init("-M esp32p4,strap-mode=0x04");
     uint32_t v;
 
-    now = qtest_clock_step(qts, 1);
+    /*
+     * On an edge of XTAL_CLK, which runs from time 0: the clocks below,
+     * and a timer started now, count from it.
+     */
+    now = qtest_clock_step(qts, 25);
     qtest_writel(qts, SOC_CLK_CTRL2, qtest_readl(qts, SOC_CLK_CTRL2) |
                  MCPWM0_APB_CLK_EN | MCPWM1_APB_CLK_EN);
     qtest_writel(qts, SOC_CLK_CTRL3, qtest_readl(qts, SOC_CLK_CTRL3) |

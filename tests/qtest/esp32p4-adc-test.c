@@ -414,12 +414,17 @@ static void test_self_calibration(void)
     stop();
 }
 
-/* A conversion takes 25 cycles of the LP SAR clock, divided by SARn_CLK_DIV. */
+/*
+ * A conversion takes 25 cycles of the LP SAR clock, divided by
+ * SARn_CLK_DIV: it ends at the 25 * div-th edge of the clock after the
+ * start, which a start between two edges reaches less than a period
+ * sooner than 25 * div periods on.
+ */
 /* [spec:nuos:req:emu.esp32p4.analog/test] */
 static void test_oneshot_timing(void)
 {
     uint64_t hz;
-    int64_t t25;
+    int64_t t25, period;
 
     start();
     hz = clk_hz("lp-adc-sar1");
@@ -431,10 +436,11 @@ static void test_oneshot_timing(void)
         lp_setup(0, 1, 3);
         m = rd(MEAS_CTRL2(0));
         wr(MEAS_CTRL2(0), m | START_SAR);
-        t25 = 25 * div * 1000000000ll / hz;
-        step(t25 - 50);
+        period = 1000000000ll / hz;
+        t25 = 25 * div * period;
+        step(t25 - period - 1);
         g_assert_false(rd(MEAS_CTRL2(0)) & MEAS_DONE);
-        step(100);
+        step(period + 2);
         g_assert_true(rd(MEAS_CTRL2(0)) & MEAS_DONE);
         g_assert_true(rd(LP_INT_RAW) & LP_INT_DONE(0));
         wr(LP_INT_CLR, LP_INT_DONE(0));

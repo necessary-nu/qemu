@@ -114,10 +114,12 @@ static uint64_t esp32p4_sdmmc_cclk_period(DWCSDMMCState *d)
 }
 
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */
-static int64_t esp32p4_sdmmc_clock_ns(DWCSDMMCState *d, Clock *clk,
-                                      uint64_t cycles)
+static int64_t esp32p4_sdmmc_clock_after(DWCSDMMCState *d, Clock *clk,
+                                         int64_t from, uint64_t cycles)
 {
-    return MAX(esp32p4_clk_cycles_ns(esp32p4_clk_exact(clk), cycles), 1);
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(clk, from);
+
+    return MAX(esp32p4_clk_edges_after(&e, from, cycles), from + 1);
 }
 
 static void esp32p4_sdmmc_clock_update(void *opaque, ClockEvent event)
@@ -214,7 +216,7 @@ static void esp32p4_sdmmc_class_init(ObjectClass *klass, const void *data)
     sc->vendor_read = esp32p4_sdmmc_vendor_read;
     sc->vendor_write = esp32p4_sdmmc_vendor_write;
     sc->cclk_period = esp32p4_sdmmc_cclk_period;
-    sc->clock_ns = esp32p4_sdmmc_clock_ns;
+    sc->clock_after = esp32p4_sdmmc_clock_after;
 }
 
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */

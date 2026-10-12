@@ -940,9 +940,17 @@ static void pmu_seq_at(ESP32P4PMUState *s, int64_t when)
  * LP_DYN_SLOW_CLK from the change that starts it (esp32_line_time()), or,
  * while a clock they need is stopped, when it runs.
  */
+/* When @cycles of @clk after @from have come: @from for none. */
+static int64_t pmu_clk_after(Clock *clk, int64_t from, uint64_t cycles)
+{
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(clk, from);
+
+    return esp32p4_clk_edges_after(&e, from, cycles);
+}
+
 static void pmu_seq_arm(ESP32P4PMUState *s, uint64_t fast, uint64_t slow)
 {
-    int64_t ns = 0;
+    int64_t now = esp32_line_time(), t = now;
 
     s->seq_fast = fast;
     s->seq_slow = slow;
@@ -954,12 +962,12 @@ static void pmu_seq_arm(ESP32P4PMUState *s, uint64_t fast, uint64_t slow)
     }
     s->seq_waiting = false;
     if (fast) {
-        ns += esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->fast), fast);
+        t = pmu_clk_after(s->fast, t, fast);
     }
     if (slow) {
-        ns += esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->slow), slow);
+        t = pmu_clk_after(s->slow, t, slow);
     }
-    pmu_seq_at(s, esp32_line_time() + MAX(ns, 1));
+    pmu_seq_at(s, MAX(t, now + 1));
 }
 
 /* The fast cycles a wake to HP_ACTIVE waits besides ANA_WAIT_TARGET. */
@@ -1089,8 +1097,8 @@ static void pmu_check(ESP32P4PMUState *s)
     case ESP32P4_PMU_ST_HP_SLEEP:
         earliest = s->sleep_start_ns;
         if (clock_is_enabled(s->slow)) {
-            earliest += esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->slow),
-                                              HP_MIN_SLP_VAL(cntl3));
+            earliest = pmu_clk_after(s->slow, earliest,
+                                     HP_MIN_SLP_VAL(cntl3));
         }
         if (wake && now >= earliest) {
             pmu_start_wake(s, wake);
@@ -1104,9 +1112,9 @@ static void pmu_check(ESP32P4PMUState *s)
         if (wake || (!s->lp_cpu_on && lp_wake)) {
             earliest = s->sleep_start_ns;
             if (clock_is_enabled(s->slow)) {
-                earliest += esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->slow),
-                                                  MAX(HP_MIN_SLP_VAL(cntl3),
-                                                      LP_MIN_SLP_VAL(cntl3)));
+                earliest = pmu_clk_after(s->slow, earliest,
+                                         MAX(HP_MIN_SLP_VAL(cntl3),
+                                             LP_MIN_SLP_VAL(cntl3)));
             }
             if (now < earliest) {
                 pmu_seq_at(s, earliest);
@@ -1275,8 +1283,9 @@ static void pmu_lp_sleep_arm(ESP32P4PMUState *s)
     if (s->lp_sleep_waiting) {
         return;
     }
-    s->lp_sleep_due_ns = esp32_line_time() +
-        MAX(esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->fast), cycles), 1);
+    s->lp_sleep_due_ns = MAX(pmu_clk_after(s->fast, esp32_line_time(),
+                                           cycles),
+                             esp32_line_time() + 1);
     timer_mod(&s->lp_sleep_timer, s->lp_sleep_due_ns);
 }
 
@@ -1450,7 +1459,7 @@ static void pmu_ldo_schedule(ESP32P4PMUState *s, int n)
 {
     ESP32P4PMULdo *l = &s->ldo[n];
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    ESP32P4ClkPeriod slow = esp32p4_clk_exact(s->slow);
+    ESP32P4ClkEdges slow = esp32p4_clk_edges_or_at(s->slow, l->start_ns);
     uint64_t cycles, due = UINT64_MAX;
     int k;
 
@@ -1458,7 +1467,7 @@ static void pmu_ldo_schedule(ESP32P4PMUState *s, int n)
     if (!l->running || !clock_is_enabled(s->slow)) {
         return;
     }
-    cycles = esp32p4_clk_ns_cycles(slow, now - l->start_ns);
+    cycles = esp32p4_clk_edges_between(&slow, l->start_ns, now);
     for (k = 0; k < 2; k++) {
         uint64_t at = (uint64_t)pmu_ldo_target(s, n, k) * LDO_CYCLES_PER_COUNT;
 
@@ -1474,7 +1483,8 @@ static void pmu_ldo_schedule(ESP32P4PMUState *s, int n)
         due = MIN(due, at);
     }
     if (due != UINT64_MAX) {
-        timer_mod(&l->timer, l->start_ns + esp32p4_clk_cycles_ns(slow, due));
+        timer_mod(&l->timer, esp32p4_clk_edges_after(&slow, l->start_ns,
+                                                     due));
     }
     pmu_update_irqs(s);
 }

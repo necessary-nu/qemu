@@ -71,16 +71,19 @@ typedef struct ESP32P4ParlioFifo {
 } ESP32P4ParlioFifo;
 
 /*
- * A unit's core clock: its internal source's edges, timed from base_ns,
- * or its pad's, divided; and the clock it puts out.
+ * A unit's core clock: its internal source's edges, timed from base_ns
+ * on the clock's own edges, or its pad's, divided; and the clock it puts
+ * out.
  */
 typedef struct ESP32P4ParlioClk {
     struct ESP32P4ParlioState *s;
     int unit;
     Clock *clk;
     QEMUTimer *timer;
-    int64_t base_ns;        /* the internal clock's edge 0 */
+    int64_t base_ns;        /* when the internal clock was last timed */
     ESP32P4ClkPeriod half;  /* ... half its period then, exactly */
+    ESP32P4ClkEdges half_e; /* its half periods, on its edges */
+    int64_t k0;             /* the half period internal edge 0 ends */
     uint64_t next;          /* the next internal edge's number */
     bool running;           /* edges being taken, one after the other */
     bool in_level;          /* the divided input clock */

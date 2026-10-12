@@ -1304,25 +1304,41 @@ static uint32_t fld(ESP32P4ClkRstState *s, ClkField f)
 
 /*
  * [spec:nuos:req:emu.esp32p4.clocks]
- * Clock input @in's period, exactly as the device driving it gives it: a
- * PLL's from the analog block, a pad's from the block whose clock the
- * pad carries (esp32p4_clk_exact()).
+ * Take clock input @in's edges, exactly as the device driving it gives
+ * them: a PLL's from the analog block, a pad's from the block whose clock
+ * the pad carries (esp32p4_clk_exact_edges()). An input whose edges no
+ * device gives keeps those it had while its period is unchanged, and
+ * otherwise has its first edge at @now.
  */
-static ESP32P4ClkPeriod esp32p4_clkrst_input(ESP32P4ClkRstState *s, int in)
+static void esp32p4_clkrst_take_input(ESP32P4ClkRstState *s, int in,
+                                      int64_t now)
 {
-    return esp32p4_clk_exact(s->clk_in[in]);
+    ESP32P4ClkEdges e;
+
+    if (esp32p4_clk_exact_edges(s->clk_in[in], &e)) {
+        s->in_edges[in] = e;
+    } else if (!esp32p4_clk_period_eq(e.period, s->in_edges[in].period)) {
+        s->in_edges[in] = esp32p4_clk_edges_at(e.period, now);
+    }
+}
+
+/* The edges of parent @p: a clock, an input, or none, a stopped clock. */
+static ESP32P4ClkEdges esp32p4_clkrst_parent_edges(ESP32P4ClkRstState *s,
+                                                   int16_t p)
+{
+    if (p == PARENT_NONE) {
+        return esp32p4_clk_edges_stopped();
+    }
+    if (p & PARENT_IN) {
+        return s->in_edges[p & ~PARENT_IN];
+    }
+    return s->edges[p];
 }
 
 static ESP32P4ClkPeriod esp32p4_clkrst_parent(ESP32P4ClkRstState *s,
                                               int16_t p)
 {
-    if (p == PARENT_NONE) {
-        return esp32p4_clk_period_stopped();
-    }
-    if (p & PARENT_IN) {
-        return esp32p4_clkrst_input(s, p & ~PARENT_IN);
-    }
-    return s->exact[p];
+    return esp32p4_clkrst_parent_edges(s, p).period;
 }
 
 /* The period divided by (int + 1) + num / den; den 0 drops the fraction. */
@@ -1370,12 +1386,19 @@ static ESP32P4ClkPeriod esp32p4_clkrst_rc_fast(ESP32P4ClkRstState *s)
     return esp32p4_clk_period_of_hz(num, den);
 }
 
-static ESP32P4ClkPeriod esp32p4_clkrst_special(ESP32P4ClkRstState *s, int id)
+/*
+ * A special clock's period; in *@from the clock its edges come from, and
+ * in *@div whether it divides them, as esp32p4_clkrst_compute() has it.
+ */
+static ESP32P4ClkPeriod esp32p4_clkrst_special(ESP32P4ClkRstState *s, int id,
+                                               int16_t *from, bool *div)
 {
     ESP32P4ClkPeriod stopped = esp32p4_clk_period_stopped();
     uint32_t v, sel;
     int i, src;
 
+    *from = PARENT_NONE;
+    *div = true;
     switch (id) {
     case C(OSC_XTAL):
         return s->pmu_xpd[ESP32P4_CLKRST_XPD_XTAL] ?
@@ -1394,6 +1417,7 @@ static ESP32P4ClkPeriod esp32p4_clkrst_special(ESP32P4ClkRstState *s, int id)
     case C(OSC_PLL_LP):
         src = extract32(s->regs[R_LP_CLK_CONF], 10, 1) ? C(OSC_XTAL32K) :
                                                          C(OSC_RC32K);
+        *from = src;
         return s->pmu_xpd[ESP32P4_CLKRST_XPD_LP_PLL] && s->period[src] ?
                esp32p4_clk_period_of_hz(PLL_LP_HZ, 1) : stopped;
     case C(CPU):
@@ -1401,6 +1425,7 @@ static ESP32P4ClkPeriod esp32p4_clkrst_special(ESP32P4ClkRstState *s, int id)
     case C(SYS):
     case C(APB):
         i = id - C(CPU);
+        *from = id - 1;
         return esp32p4_clkrst_frac(s->exact[id - 1], s->soc_div[i][0],
                                    s->soc_div[i][1], s->soc_div[i][2]);
     case C(SDIO_LS):
@@ -1409,6 +1434,7 @@ static ESP32P4ClkPeriod esp32p4_clkrst_special(ESP32P4ClkRstState *s, int id)
             return stopped;
         }
         src = extract32(v, 23, 1) ? C(APLL) : C(PLL_F160M);
+        *from = src;
         return esp32p4_clk_period_scale(
             s->exact[src],
             (uint64_t)(extract32(s->regs[R_PERI_CLK_CTRL02], 0, 8) + 1) *
@@ -1420,10 +1446,10 @@ static ESP32P4ClkPeriod esp32p4_clkrst_special(ESP32P4ClkRstState *s, int id)
         if (!extract32(s->regs[R_PERI_CLK_CTRL02], 27 + i, 1)) {
             return stopped;
         }
-        if (extract32(s->regs[R_PERI_CLK_CTRL01], 22, 1)) {
-            return s->exact[C(SDIO_PLL0) + i];
-        }
-        return s->exact[C(SDIO_LS)];
+        *div = false;
+        *from = extract32(s->regs[R_PERI_CLK_CTRL01], 22, 1) ?
+                C(SDIO_PLL0) + i : C(SDIO_LS);
+        return s->exact[*from];
     case C(CLKOUT0):
     case C(CLKOUT1):
     case C(CLKOUT2):
@@ -1436,18 +1462,23 @@ static ESP32P4ClkPeriod esp32p4_clkrst_special(ESP32P4ClkRstState *s, int id)
                      extract32(s->regs[R_DBG_CLK_CTRL1], 8 * (i - 1), 8);
         for (src = 0; src < ARRAY_SIZE(esp32p4_clkout_sigs); src++) {
             if (esp32p4_clkout_sigs[src].sig == sel) {
+                *from = esp32p4_clkout_sigs[src].clk;
                 return esp32p4_clk_period_scale(
                     s->exact[esp32p4_clkout_sigs[src].clk], v + 1, 1);
             }
         }
         return stopped;
     case C(LP_DYN_FAST):
-        return s->exact[s->pmu_lp_sleep ? C(LP_SLOW) : C(LP_FAST)];
+        *div = false;
+        *from = s->pmu_lp_sleep ? C(LP_SLOW) : C(LP_FAST);
+        return s->exact[*from];
     case C(LP_CORE):
         if (!(s->regs[R_LPPERI_CLK_EN] & CK_EN_LP_CORE) &&
             !s->pmu_lp_core_clock) {
             return stopped;
         }
+        *div = false;
+        *from = C(LP_DYN_FAST);
         return s->exact[C(LP_DYN_FAST)];
     default:
         g_assert_not_reached();
@@ -1488,9 +1519,14 @@ static bool esp32p4_clkrst_pmu_gated(ESP32P4ClkRstState *s, int id)
 /*
  * [spec:nuos:req:emu.esp32p4.clocks]
  * Clock @id's period, exactly, from its parent's: each divider scales the
- * exact period, so that only the Clock's rounding is ever lost.
+ * exact period, so that only the Clock's rounding is ever lost. In *@from
+ * the clock its edges come from, another clock, PARENT_IN with an input,
+ * or PARENT_NONE for one of the sources, whose edges are its own; and in
+ * *@div whether it divides that clock's edges (or locks to them, as the LP
+ * PLL does), or passes them on, as a mux and a gate do.
  */
-static ESP32P4ClkPeriod esp32p4_clkrst_compute(ESP32P4ClkRstState *s, int id)
+static ESP32P4ClkPeriod esp32p4_clkrst_compute(ESP32P4ClkRstState *s, int id,
+                                               int16_t *from, bool *div)
 {
     const ClkDesc *d = &esp32p4_clk_desc[id];
     ESP32P4ClkPeriod p;
@@ -1498,15 +1534,16 @@ static ESP32P4ClkPeriod esp32p4_clkrst_compute(ESP32P4ClkRstState *s, int id)
     int i;
 
     if (d->kind == SPECIAL) {
-        return esp32p4_clkrst_special(s, id);
+        return esp32p4_clkrst_special(s, id, from, div);
     }
     sel = fld(s, d->sel);
     if (id == C(ROOT) && s->pmu_sysclk[ESP32P4_CLKRST_SYSCLK_PMU_SEL]) {
         sel = s->pmu_sysclk[ESP32P4_CLKRST_SYSCLK_SEL0] |
               s->pmu_sysclk[ESP32P4_CLKRST_SYSCLK_SEL1] << 1;
     }
-    p = sel < d->nparents ? esp32p4_clkrst_parent(s, d->parent[sel]) :
-                            esp32p4_clk_period_stopped();
+    *from = sel < d->nparents ? d->parent[sel] : PARENT_NONE;
+    *div = d->kind != DIV_NONE;
+    p = esp32p4_clkrst_parent(s, *from);
     for (i = 0; i < ARRAY_SIZE(d->gate); i++) {
         if (d->gate[i].width && !fld(s, d->gate[i])) {
             return esp32p4_clk_period_stopped();
@@ -1725,12 +1762,53 @@ static void esp32p4_clkrst_update_hp_core_reset(ESP32P4ClkRstState *s,
 
 /*
  * [spec:nuos:req:emu.esp32p4.clocks]
+ * Clock @id's period and edges, after a change at @now. A mux or a gate
+ * passes on its input's edges. A divider counts its input's edges
+ * afresh after a change of its input (its period or edges), its divisor,
+ * or its gate, which comes before it, its first edge at the one that
+ * completes its period, and keeps its edges while none changes. A
+ * source's first edge is where it starts, or changes frequency.
+ */
+static void esp32p4_clkrst_compute_edges(ESP32P4ClkRstState *s, int id,
+                                         int64_t now)
+{
+    ESP32P4ClkEdges in, *e = &s->edges[id];
+    ESP32P4ClkPeriod p;
+    int16_t from;
+    bool div;
+
+    p = esp32p4_clkrst_compute(s, id, &from, &div);
+    in = esp32p4_clkrst_parent_edges(s, from);
+    if (!esp32p4_clk_period_running(p)) {
+        *e = esp32p4_clk_edges_stopped();
+    } else if (from != PARENT_NONE && !div &&
+               esp32p4_clk_period_eq(p, in.period)) {
+        *e = in;
+    } else if (esp32p4_clk_edges_running(e) &&
+               esp32p4_clk_period_eq(p, e->period) &&
+               from == s->edge_from[id] &&
+               esp32p4_clk_edges_eq(&in, &s->edge_from_edges[id])) {
+        /* Nothing it counts has changed: it goes on as it was. */
+    } else if (from != PARENT_NONE) {
+        *e = esp32p4_clk_edges_restart(p, &in, now);
+    } else {
+        *e = esp32p4_clk_edges_at(p, now);
+    }
+    s->edge_from[id] = from;
+    s->edge_from_edges[id] = in;
+    s->exact[id] = e->period;
+    s->period[id] = esp32p4_clk_period_clock(e->period);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.clocks]
  * Recompute the clock tree and everything that follows from the
  * registers, driving the outputs that change.
  */
 static void esp32p4_clkrst_update(ESP32P4ClkRstState *s, bool force)
 {
-    ESP32P4ClkPeriod old[ESP32P4_NUM_CLOCKS];
+    ESP32P4ClkEdges old[ESP32P4_NUM_CLOCKS];
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int i;
 
     if (s->recomputing) {
@@ -1740,14 +1818,16 @@ static void esp32p4_clkrst_update(ESP32P4ClkRstState *s, bool force)
     s->recomputing = true;
     do {
         s->recompute_again = false;
+        for (i = 0; i < ESP32P4_NUM_CLKIN; i++) {
+            esp32p4_clkrst_take_input(s, i, now);
+        }
         for (i = 0; i < ESP32P4_NUM_CLOCKS; i++) {
-            old[i] = s->exact[i];
-            s->exact[i] = esp32p4_clkrst_compute(s, i);
-            s->period[i] = esp32p4_clk_period_clock(s->exact[i]);
+            old[i] = s->edges[i];
+            esp32p4_clkrst_compute_edges(s, i, now);
         }
         esp32p4_clkrst_check_soc(s);
         for (i = 0; i < ESP32P4_NUM_CLOCKS; i++) {
-            esp32p4_clk_update(s->clk[i], old[i], s->exact[i]);
+            esp32p4_clk_update(s->clk[i], &old[i], &s->edges[i]);
         }
         for (i = 0; i < ESP32P4_CLKRST_HP_CORES; i++) {
             if (s->core_pulse_waiting[i] &&
@@ -1853,12 +1933,14 @@ bool esp32p4_clkrst_pad_source(ESP32P4ClkRstState *s, unsigned clk,
 }
 
 /*
- * Time the current phase of core @n's CPU reset, in cycles of its clock;
- * while that clock is stopped the phase waits for it.
+ * Time the current phase of core @n's CPU reset, in cycles of its clock,
+ * its edges after now; while that clock is stopped the phase waits for
+ * it.
  */
 static void esp32p4_clkrst_arm_pulse(ESP32P4ClkRstState *s, int n)
 {
     unsigned clk = s->core_pulse_clk[n];
+    ESP32P4ClkCount count = { .edges = s->edges[clk] };
 
     if (!s->period[clk]) {
         s->core_pulse_waiting[n] = true;
@@ -1866,8 +1948,9 @@ static void esp32p4_clkrst_arm_pulse(ESP32P4ClkRstState *s, int n)
         return;
     }
     s->core_pulse_waiting[n] = false;
-    timer_mod(s->core_timer[n], qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              esp32p4_clk_cycles_ns(s->exact[clk], s->core_pulse_cycles[n]));
+    esp32p4_clk_count_rebase(&count, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    timer_mod(s->core_timer[n],
+              esp32p4_clk_count_time(&count, s->core_pulse_cycles[n]));
 }
 
 /*
@@ -2743,7 +2826,7 @@ static int esp32p4_clkrst_post_load(void *opaque, int version_id)
     int i;
 
     for (i = 0; i < ESP32P4_NUM_CLOCKS; i++) {
-        s->exact[i] = esp32p4_clkrst_compute(s, i);
+        s->exact[i] = s->edges[i].period;
         s->period[i] = esp32p4_clk_period_clock(s->exact[i]);
         clock_set(s->clk[i], s->period[i]);
     }
@@ -2759,11 +2842,20 @@ static int esp32p4_clkrst_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_esp32p4_clkrst = {
     .name = TYPE_ESP32P4_CLKRST,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .post_load = esp32p4_clkrst_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, ESP32P4ClkRstState, ESP32P4_CLKRST_NREGS),
+        VMSTATE_STRUCT_ARRAY(edges, ESP32P4ClkRstState, ESP32P4_NUM_CLOCKS, 0,
+                             vmstate_esp32p4_clk_edges, ESP32P4ClkEdges),
+        VMSTATE_INT16_ARRAY(edge_from, ESP32P4ClkRstState,
+                            ESP32P4_NUM_CLOCKS),
+        VMSTATE_STRUCT_ARRAY(edge_from_edges, ESP32P4ClkRstState,
+                             ESP32P4_NUM_CLOCKS, 0, vmstate_esp32p4_clk_edges,
+                             ESP32P4ClkEdges),
+        VMSTATE_STRUCT_ARRAY(in_edges, ESP32P4ClkRstState, ESP32P4_NUM_CLKIN,
+                             0, vmstate_esp32p4_clk_edges, ESP32P4ClkEdges),
         VMSTATE_UINT8_2DARRAY(soc_div, ESP32P4ClkRstState, 4, 3),
         VMSTATE_UINT8_ARRAY(sdio_edge, ESP32P4ClkRstState, 3),
         VMSTATE_ARRAY_CLOCK(clk_in, ESP32P4ClkRstState, ESP32P4_NUM_CLKIN),
@@ -2820,8 +2912,8 @@ static const Property esp32p4_clkrst_properties[] = {
 };
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */
-static bool esp32p4_clkrst_exact_period(Object *obj, Clock *out,
-                                        ESP32P4ClkPeriod *p)
+static bool esp32p4_clkrst_exact_edges(Object *obj, Clock *out,
+                                       ESP32P4ClkEdges *e)
 {
     ESP32P4ClkRstState *s = ESP32P4_CLKRST(obj);
     gpointer id = g_hash_table_lookup(s->clk_ids, out);
@@ -2829,7 +2921,7 @@ static bool esp32p4_clkrst_exact_period(Object *obj, Clock *out,
     if (!id) {
         return false;
     }
-    *p = s->exact[GPOINTER_TO_INT(id) - 1];
+    *e = s->edges[GPOINTER_TO_INT(id) - 1];
     return true;
 }
 
@@ -2843,7 +2935,7 @@ static void esp32p4_clkrst_class_init(ObjectClass *klass, const void *data)
     dc->realize = esp32p4_clkrst_realize;
     dc->vmsd = &vmstate_esp32p4_clkrst;
     device_class_set_props(dc, esp32p4_clkrst_properties);
-    csc->exact_period = esp32p4_clkrst_exact_period;
+    csc->exact_edges = esp32p4_clkrst_exact_edges;
 }
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */

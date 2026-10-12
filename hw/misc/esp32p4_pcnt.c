@@ -284,7 +284,9 @@ static bool pcnt_pending(ESP32P4PcntState *s, unsigned i, int64_t *due)
     }
     *due = s->raw_since_ns[i];
     if (conf0 & CONF0_FILTER_EN) {
-        *due += esp32p4_clk_cycles_ns(esp32p4_clk_exact(s->apb_clk), thres);
+        ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(s->apb_clk, *due);
+
+        *due = esp32p4_clk_edges_after(&e, *due, thres);
     }
     return true;
 }

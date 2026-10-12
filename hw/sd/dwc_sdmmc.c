@@ -400,18 +400,12 @@ static int64_t dwc_now(void)
     return esp32_line_time();
 }
 
-/* @ns from the present. */
-static int64_t dwc_after(int64_t ns)
+static int64_t dwc_default_clock_after(DWCSDMMCState *s, Clock *clk,
+                                       int64_t from, uint64_t cycles)
 {
-    int64_t now = dwc_now();
+    int64_t ns = dwc_cycles_ns(clock_get(clk), cycles);
 
-    return ns > INT64_MAX - now ? INT64_MAX : now + ns;
-}
-
-static int64_t dwc_default_clock_ns(DWCSDMMCState *s, Clock *clk,
-                                    uint64_t cycles)
-{
-    return dwc_cycles_ns(clock_get(clk), cycles);
+    return ns > INT64_MAX - from ? INT64_MAX : from + ns;
 }
 
 /* cclk_in's cycles in one of the CIU's clock. */
@@ -450,11 +444,15 @@ static uint64_t dwc_cclk_period(DWCSDMMCState *s)
     return DWC_SDMMC_GET_CLASS(s)->cclk_period(s);
 }
 
-/* @cycles of the CIU's clock in ns: the clock must be running. */
-static int64_t dwc_cclk_ns(DWCSDMMCState *s, uint64_t cycles)
+/*
+ * When @cycles of the CIU's clock from @from have elapsed: the clock must
+ * be running.
+ */
+static int64_t dwc_cclk_after(DWCSDMMCState *s, int64_t from,
+                              uint64_t cycles)
 {
-    return DWC_SDMMC_GET_CLASS(s)->clock_ns(s, s->cclk,
-                                            cycles * dwc_ciu_div(s));
+    return DWC_SDMMC_GET_CLASS(s)->clock_after(s, s->cclk, from,
+                                               cycles * dwc_ciu_div(s));
 }
 
 static uint64_t dwc_hclk_period(DWCSDMMCState *s)
@@ -462,10 +460,11 @@ static uint64_t dwc_hclk_period(DWCSDMMCState *s)
     return clock_get(s->hclk);
 }
 
-/* @cycles of the bus clock in ns: it must be running. */
-static int64_t dwc_hclk_ns(DWCSDMMCState *s, uint64_t cycles)
+/* When @cycles of the bus clock from @from have elapsed: it must run. */
+static int64_t dwc_hclk_after(DWCSDMMCState *s, int64_t from,
+                              uint64_t cycles)
 {
-    return DWC_SDMMC_GET_CLASS(s)->clock_ns(s, s->hclk, cycles);
+    return DWC_SDMMC_GET_CLASS(s)->clock_after(s, s->hclk, from, cycles);
 }
 
 /*
@@ -488,7 +487,7 @@ static uint64_t dwc_card_div(DWCSDMMCState *s, unsigned slot)
 /* @cycles of a card clock of @div from now. */
 static int64_t dwc_card_after(DWCSDMMCState *s, uint64_t div, uint64_t cycles)
 {
-    return dwc_after(dwc_cclk_ns(s, cycles * div));
+    return dwc_cclk_after(s, dwc_now(), cycles * div);
 }
 
 static SDBus *dwc_bus(DWCSDMMCState *s, unsigned slot)
@@ -602,7 +601,7 @@ static void dwc_cmd_try_take(DWCSDMMCState *s)
     }
     s->cmd_phase = DWC_CMD_TAKING;
     dwc_arm(&s->cmd_timer, &s->cmd_due,
-            dwc_after(dwc_cclk_ns(s, CIU_SYNC_CYCLES)));
+            dwc_cclk_after(s, dwc_now(), CIU_SYNC_CYCLES));
 }
 
 static void dwc_idmac_start(DWCSDMMCState *s);
@@ -1272,19 +1271,19 @@ static void dwc_sdmmc_update(DWCSDMMCState *s)
 static void dwc_resets_schedule(DWCSDMMCState *s)
 {
     uint64_t hclk = dwc_hclk_period(s), cclk = dwc_cclk_period(s);
-    int64_t delay;
+    int64_t when;
 
     if (!s->resets_pending || !hclk ||
         (!(s->resets_pending & CTRL_DMA_RESET) && !cclk)) {
         timer_del(&s->reset_timer);
         return;
     }
-    delay = dwc_hclk_ns(s, RESET_CYCLES);
+    when = dwc_hclk_after(s, dwc_now(), RESET_CYCLES);
     if ((s->resets_pending & (CTRL_CONTROLLER_RESET | CTRL_FIFO_RESET)) &&
         cclk) {
-        delay += dwc_cclk_ns(s, RESET_CYCLES);
+        when = dwc_cclk_after(s, when, RESET_CYCLES);
     }
-    dwc_arm(&s->reset_timer, &s->reset_due, dwc_now() + delay);
+    dwc_arm(&s->reset_timer, &s->reset_due, when);
 }
 
 /*
@@ -1906,7 +1905,7 @@ static void dwc_debounce_arm(DWCSDMMCState *s, unsigned slot)
     }
     if (hclk) {
         dwc_arm(&s->debounce_timer[slot], &s->debounce_due[slot],
-                dwc_after(dwc_hclk_ns(s, extract32(s->debnce, 0, 24))));
+                dwc_hclk_after(s, dwc_now(), extract32(s->debnce, 0, 24)));
     }
 }
 
@@ -2348,7 +2347,7 @@ static void dwc_sdmmc_class_init(ObjectClass *klass, const void *data)
     rc->phases.hold = dwc_sdmmc_reset_hold;
     rc->phases.exit = dwc_sdmmc_reset_exit;
     sc->cclk_period = dwc_default_cclk_period;
-    sc->clock_ns = dwc_default_clock_ns;
+    sc->clock_after = dwc_default_clock_after;
 }
 
 static void dwc_sdmmc_bus_class_init(ObjectClass *klass, const void *data)

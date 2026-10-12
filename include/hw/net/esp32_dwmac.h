@@ -152,9 +152,9 @@ struct Esp32DwmacClass {
     /*
      * The edges of @clk (the bus or the PTP reference clock) counted from
      * time 0: how many have come by @ns, and the first nanosecond by which
-     * edge @edge has. By default from the clock's frequency in whole Hz; a
-     * subclass whose clocks carry exact periods of their own counts at
-     * those.
+     * edge @edge has. By default from the clock's frequency in whole Hz,
+     * an edge at time 0; a subclass whose clocks carry exact periods and
+     * edges of their own counts those.
      */
     uint64_t (*clock_edges)(Esp32DwmacState *s, Clock *clk, int64_t ns);
     int64_t (*clock_edge_ns)(Esp32DwmacState *s, Clock *clk, uint64_t edge);

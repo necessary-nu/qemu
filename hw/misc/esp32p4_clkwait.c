@@ -29,10 +29,16 @@ int64_t esp32p4_clkwait_end(ESP32P4ClkWait *w)
 
 void esp32p4_clkwait_resched(ESP32P4ClkWait *w)
 {
+    ESP32P4ClkEdges e;
     int64_t end;
 
     if (w->active) {
-        w->count.period = esp32p4_clk_exact(w->clk);
+        e = esp32p4_clk_edges_or_at(w->clk, w->count.origin_ns);
+        if (!esp32p4_clk_edges_eq(&e, &w->count.edges)) {
+            /* The clock has changed: its edges from the fold on. */
+            w->count.edges = e;
+            esp32p4_clk_count_rebase(&w->count, w->count.origin_ns);
+        }
     }
     end = esp32p4_clkwait_end(w);
     if (end == INT64_MAX) {
@@ -46,15 +52,15 @@ void esp32p4_clkwait_resched(ESP32P4ClkWait *w)
 void esp32p4_clkwait_start(ESP32P4ClkWait *w, int64_t from_ns,
                            uint64_t cycles)
 {
-    ESP32P4ClkPeriod p = esp32p4_clk_exact(w->clk);
+    ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(w->clk, from_ns);
 
     if (!w->active && from_ns == w->ended_ns &&
-        esp32p4_clk_period_eq(p, w->count.period) &&
+        esp32p4_clk_edges_eq(&e, &w->count.edges) &&
         cycles <= UINT64_MAX - w->end) {
         w->end += cycles;
     } else {
-        w->count.period = p;
-        w->count.origin_ns = from_ns;
+        w->count.edges = e;
+        esp32p4_clk_count_rebase(&w->count, from_ns);
         w->end = cycles;
     }
     w->from_ns = from_ns;
@@ -83,7 +89,9 @@ void esp32p4_clkwait_fold(ESP32P4ClkWait *w, int64_t when)
     }
     done = MIN(esp32p4_clk_count_at(&w->count, when), w->end);
     w->end -= done;
-    w->count.origin_ns = MAX(when, w->count.origin_ns);
+    if (when > w->count.origin_ns) {
+        esp32p4_clk_count_rebase(&w->count, when);
+    }
     w->from_ns = MAX(when, w->from_ns);
 }
 
