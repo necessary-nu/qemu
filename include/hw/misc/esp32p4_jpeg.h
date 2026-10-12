@@ -62,9 +62,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4JpegState, ESP32P4_JPEG)
  * GDMA's ops->sync does: the two serve as the tx_ready, rx_ready and sync
  * callbacks a GDMA peripheral gives its controller.
  *
- * Unconnected, the paths are a qtest's: the codec's "dma" property
- * (hw/misc/esp32p4_jpeg.c) queues TX data from memory and RX buffers in
- * memory, the 2D-DMA's descriptors as a test plays them.
+ * A qtest plays the paths through the codec's "dma" property
+ * (hw/misc/esp32p4_jpeg.c), which queues TX data from memory and RX
+ * buffers in memory, the 2D-DMA's descriptors as the test plays them: it
+ * takes the paths from the qtest's first command on, connected or not.
  */
 #define ESP32P4_JPEG_DMA_EOF        (1u << 0)
 #define ESP32P4_JPEG_DMA_ERR_EOF    (1u << 1)
@@ -195,6 +196,7 @@ struct ESP32P4JpegState {
     /* The qtest stand-in for the 2D-DMA. */
     ESP32P4JpegQtSeg qt_tx[ESP32P4_JPEG_QT_SEGS];
     ESP32P4JpegQtSeg qt_rx[ESP32P4_JPEG_QT_SEGS];
+    bool qt_on;
     uint32_t qt_tx_num;
     uint32_t qt_rx_num;
     uint32_t qt_rx_total;

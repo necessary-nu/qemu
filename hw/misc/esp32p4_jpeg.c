@@ -389,7 +389,7 @@ static size_t dma_pull(ESP32P4JpegState *s, uint8_t *buf, size_t len,
     if (!len) {
         return 0;
     }
-    if (s->dma_ops) {
+    if (s->dma_ops && !s->qt_on) {
         return s->dma_ops->pull(s->dma_opaque, buf, len, eof);
     }
     return qt_pull(s, buf, len, eof);
@@ -398,7 +398,7 @@ static size_t dma_pull(ESP32P4JpegState *s, uint8_t *buf, size_t len,
 static size_t dma_push(ESP32P4JpegState *s, const uint8_t *buf, size_t len,
                        unsigned flags)
 {
-    if (s->dma_ops) {
+    if (s->dma_ops && !s->qt_on) {
         return s->dma_ops->push(s->dma_opaque, buf, len, flags);
     }
     return qt_push(s, buf, len, flags);
@@ -1351,7 +1351,7 @@ static void jpeg_start(ESP32P4JpegState *s)
             [FMT_GRAY] = ESP32P4_JPEG_MCU_GRAY,
         };
 
-        if (s->dma_ops && s->dma_ops->rx_format) {
+        if (s->dma_ops && s->dma_ops->rx_format && !s->qt_on) {
             s->dma_ops->rx_format(s->dma_opaque, mcu_format[s->format]);
         }
         s->phase = PH_SOS;
@@ -1704,7 +1704,8 @@ void esp32p4_jpeg_dma_sync(void *opaque, int64_t when)
 }
 
 /*
- * The qtest's stand-in for the 2D-DMA, while none is connected: setting
+ * The qtest's stand-in for the 2D-DMA, which takes the codec's paths from
+ * the first command on, whether the 2D-DMA's are connected or not: setting
  * "dma" to "tx <addr> <len> <eof>" queues a TX descriptor, the codec
  * reading its <len> bytes from memory at <addr>, the frame's end after
  * them where <eof> is 1; "rx <addr> <len>" queues an RX buffer in memory;
@@ -1727,10 +1728,7 @@ static void jpeg_set_dma(Object *obj, const char *value, Error **errp)
     unsigned int n = g_strv_length(f), addr, len, eof = 0;
     ESP32P4JpegQtSeg *g;
 
-    if (s->dma_ops) {
-        error_setg(errp, "dma: the codec's 2D-DMA paths are connected");
-        return;
-    }
+    s->qt_on = true;
     if (n == 1 && !strcmp(f[0], "reset")) {
         s->qt_tx_num = 0;
         s->qt_rx_num = 0;
