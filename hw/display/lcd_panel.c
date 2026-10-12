@@ -18,6 +18,7 @@ LCDBus *lcd_bus_create(DeviceState *parent, const char *name)
     return LCD_BUS(qbus_new(TYPE_LCD_BUS, parent, name));
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 void lcd_bus_foreach(LCDBus *bus, void (*fn)(LCDPanel *p, void *opaque),
                      void *opaque)
 {

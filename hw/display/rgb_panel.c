@@ -97,6 +97,7 @@ static void rgb_panel_vsync(LCDPanel *p, bool level, int64_t when_ns)
     s->in_frame = true;
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void rgb_panel_line(LCDPanel *p, const LCDDpiLine *line)
 {
     RgbPanel *s = RGB_PANEL(p);
@@ -152,6 +153,7 @@ static unsigned rgb_panel_bus_width(LCDPanel *p)
     return RGB_PANEL(p)->data_width;
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static bool rgb_panel_update_display(void *opaque)
 {
     return true;

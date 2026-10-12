@@ -648,6 +648,7 @@ static bool panel_selected(ESP32P4LcdCamState *s, LCDPanel *p)
     return !panel_level(s, ESP32P4_LCD_CAM_OUT_CS);
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void panel_dbi(LCDPanel *p, void *opaque)
 {
     PanelRun *r = opaque;
@@ -713,6 +714,7 @@ static void panel_vsync(LCDPanel *p, void *opaque)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void panel_line(LCDPanel *p, void *opaque)
 {
     PanelRun *r = opaque;
@@ -830,6 +832,7 @@ static unsigned lcd_stride(ESP32P4LcdCamState *s)
 }
 
 /* Stage one: GDMA's bytes in groups of LCD_BYTE_MODE's. */
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void lcd_feed(ESP32P4LcdCamState *s, const uint8_t *bytes, unsigned n)
 {
     unsigned stride = lcd_stride(s), i, j;
@@ -891,6 +894,7 @@ static bool lcd_has_data(ESP32P4LcdCamState *s)
  * ready (stopping at a frame's end in i80 mode). Returns whether any
  * came.
  */
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static bool lcd_pull(ESP32P4LcdCamState *s, uint32_t need)
 {
     bool any = false, i80 = !CFG(CTRL, RGB_MODE_EN);
@@ -1000,6 +1004,7 @@ static uint64_t i80_hold_cycles(ESP32P4LcdCamState *s)
     return CFG(MISC, BK_EN) ? CFG(MISC, VBK_CYCLELEN) + 1 : 0;
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void i80_begin(ESP32P4LcdCamState *s)
 {
     uint64_t *ph = s->i80_phase;
@@ -1441,6 +1446,7 @@ static void rgb_frame_end(ESP32P4LcdCamState *s)
 }
 
 /* The structural events at @pos, at their time. */
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void rgb_event(ESP32P4LcdCamState *s, uint64_t pos)
 {
     const ESP32P4LcdCamFrame *f = &s->frame;
@@ -1693,6 +1699,7 @@ static void lcd_tx_arrived(void *opaque)
  * Take the engine's events due by @until, each at its own time, with a
  * GDMA delivery that came during them taken at its time.
  */
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void lcd_run(ESP32P4LcdCamState *s, int64_t until)
 {
     int64_t t;
@@ -1837,6 +1844,7 @@ static void cam_lost(ESP32P4LcdCamState *s)
  * descriptor holding it, as ESP-IDF's frame-sized buffers need). While
  * an EOF waits for GDMA, bytes after it are lost.
  */
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void cam_give(ESP32P4LcdCamState *s, const uint8_t *b, uint32_t n,
                      bool eof)
 {
@@ -1989,6 +1997,7 @@ static void cam_stream(void *opaque, bool on, int64_t when_ns)
 {
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void cam_frame_end(ESP32P4LcdCamState *s, int64_t when)
 {
     if (!cam_running(s)) {
@@ -2064,6 +2073,7 @@ static uint16_t cam_sample(ESP32P4LcdCamState *s, const int8_t *src,
     return out ^ inv;
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void cam_dvp_line(void *opaque, const ESP32P4DvpLine *line)
 {
     ESP32P4LcdCamState *s = opaque;
@@ -2269,6 +2279,7 @@ static void lcd_cam_sync(ESP32P4LcdCamState *s)
     lcd_run(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static uint64_t lcd_cam_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4LcdCamState *s = opaque;
@@ -2359,6 +2370,7 @@ static void cam_ctrl1_write(ESP32P4LcdCamState *s, uint32_t val)
                            R_CAM_CTRL1_AFIFO_RESET_MASK);
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void lcd_cam_write(void *opaque, hwaddr addr, uint64_t value,
                           unsigned size)
 {

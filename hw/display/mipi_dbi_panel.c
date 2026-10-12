@@ -334,6 +334,7 @@ static void dbi_params_done(MipiDbiPanel *s)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void dbi_command(MipiDbiPanel *s, uint8_t cmd)
 {
     MipiDbiPanelClass *k = MIPI_DBI_PANEL_GET_CLASS(s);
@@ -380,6 +381,7 @@ static void dbi_command(MipiDbiPanel *s, uint8_t cmd)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static void dbi_write(LCDPanel *p, const LCDDbiRun *run)
 {
     MipiDbiPanel *s = MIPI_DBI_PANEL(p);
@@ -438,6 +440,7 @@ static uint32_t dbi_shown(MipiDbiPanel *s, unsigned x, unsigned y)
     return rgb_to_pixel32(r << 2 | r >> 4, g << 2 | g >> 4, b << 2 | b >> 4);
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 static bool dbi_update_display(void *opaque)
 {
     MipiDbiPanel *s = opaque;

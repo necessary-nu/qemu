@@ -392,6 +392,7 @@ static void take_byte(ESP32P4LcdCamConv *c, const ConvMode *m, uint8_t b,
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 void esp32p4_lcd_cam_conv_feed(ESP32P4LcdCamConv *c, const uint8_t *bytes,
                                unsigned n, ESP32P4LcdCamEmit *emit,
                                void *opaque)
