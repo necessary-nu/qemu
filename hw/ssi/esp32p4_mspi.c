@@ -1817,7 +1817,8 @@ static void spi1_start(ESP32P4MSPIState *s, uint32_t cmd)
 {
     ESP32P4MSPIXfer x;
     uint32_t op = cmd & CMD_USR ? CMD_USR : BIT(31 - clz32(cmd & CMD_OPS));
-    uint32_t busy = op;
+    /* FLASH_PE, with any operation, clears as the operation ends. */
+    uint32_t busy = op | (cmd & CMD_FLASH_PE);
     uint32_t end = INT1_SLV_ST_END | INT1_MST_ST_END;
     uint64_t extra = 0;
     bool pe = false, to_status = false, to_buf = false;
@@ -1836,7 +1837,6 @@ static void spi1_start(ESP32P4MSPIState *s, uint32_t cmd)
     switch (op) {
     case CMD_USR:
         spi1_xfer_user(s, &x);
-        busy |= cmd & CMD_FLASH_PE;
         pe = cmd & CMD_FLASH_PE;
         to_buf = x.miso_bytes;
         break;
