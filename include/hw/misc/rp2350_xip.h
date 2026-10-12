@@ -139,6 +139,14 @@ struct RP2350XIPState {
 MemoryRegion *rp2350_xip_array(RP2350XIPState *s, int cs);
 
 /*
+ * Named GPIO input "array-mapped", one line per chip select: the device
+ * changed its array region's ROMD mode (it raises the line when the
+ * region is in ROMD mode). The device connects it when it takes its array
+ * out of ROMD mode while it would not answer reads.
+ */
+#define RP2350_XIP_ARRAY_MAPPED "array-mapped"
+
+/*
  * Reset XIP_CTRL, the QMI and XIP_AUX, as a PSM reset of the XIP stage
  * does. Unlike a device reset, this leaves the QSPI devices on the bus
  * alone: they are outside the chip.

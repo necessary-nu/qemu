@@ -87,6 +87,14 @@ xen_block_blockdev_del(const char *node_name) "%s"
 xen_block_device_create(unsigned int number) "%u"
 xen_block_device_destroy(unsigned int number) "%u"
 
+# m25p80_chip.c
+m25chip_command(const char *part, uint8_t cmd, bool accepted) "%s: command 0x%02x accepted %d"
+m25chip_cycle_start(const char *part, uint8_t kind, uint32_t addr, uint32_t len, int64_t total) "%s: cycle %u at 0x%"PRIx32" len %u for %"PRId64" ns"
+m25chip_cycle_end(const char *part, uint8_t kind) "%s: cycle %u done"
+m25chip_suspend(const char *part, uint8_t kind, int64_t done) "%s: cycle %u suspended after %"PRId64" ns"
+m25chip_resume(const char *part, uint8_t kind, int64_t left) "%s: cycle %u resumed with %"PRId64" ns left"
+m25chip_cut(const char *part, uint8_t kind, int64_t done, int64_t total) "%s: cycle %u cut after %"PRId64" of %"PRId64" ns"
+
 # m25p80.c
 m25p80_flash_erase(void *s, int offset, uint32_t len) "[%p] offset = 0x%"PRIx32", len = %u"
 m25p80_programming_zero_to_one(void *s, uint32_t addr, uint8_t prev, uint8_t data) "[%p] programming zero to one! addr=0x%"PRIx32"  0x%"PRIx8" -> 0x%"PRIx8

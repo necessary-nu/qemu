@@ -53,15 +53,20 @@
  * MMU table is SRAM: the controller's resets leave it, and only a power-on
  * or system reset clears it. The physical page wraps at the memory's size.
  *
- * The flash: a W25Q part on the SSI bus "ssi", selected by chip select 0
- * (SSI_GPIO_CS line 0). SPI1's transactions are driven onto the bus as
- * QEMU's flash models take them, a byte a transfer whatever the line count:
+ * The flash: the M25P80 model's part on the SSI bus "ssi", selected by
+ * chip select 0 (SSI_GPIO_CS line 0). SPI1's transactions are driven onto
+ * the bus as QEMU's flash models take them, a byte a transfer whatever
+ * the line count, with the chip select raised at the transaction's last
+ * cycle, when the flash starts the program or erase it was given:
  * the command, the address (USR_ADDR_BITLEN + 1 bits, most significant byte
  * first), the dummy phase as (cycles * address lines + 7) / 8 bytes (as
  * the mode bits of a DIO or QIO read go in the address or dummy phase),
- * then the data. Reads through SPI0 are a READ4 (0x13) of the flash's
- * contents: SPI0's command, line, dummy and timing settings are held but
- * do not change what a read returns, since the TRM does not document
+ * then the data. Reads through SPI0 are a READ (0x03) of the flash's
+ * contents with a 24-bit address, or, while CACHE_FCTRL's
+ * CACHE_USR_ADDR_4BYTE is set (as ESP-IDF sets it for a flash over
+ * 16 MiB), a READ4 (0x13) with a 32-bit one: the address length is
+ * followed, but SPI0's command, line, dummy and timing settings are held
+ * and do not change what a read returns, since the TRM does not document
  * them, so a configuration the hardware could not read with reads as one
  * it could. The built-in block erase is the 64 KiB one (0xD8), which the
  * ROM and ESP-IDF erase blocks with; the headers' "(32KB)" contradicts
@@ -132,10 +137,14 @@
  * each at its line count (double rate in DDR mode), with the SPI clock the
  * core clock ("core" clock input) divided by CLOCK_CLKCNT_N + 1 (unless
  * CLK_EQU_SYSCLK), plus the wait after RES, DP and HPM (CS_HOLD_DLY_RES
- * times 4, or 128 with SUS_STATUS's *_DLY_128) and the automatic status
- * read after a program, erase or status write while FLASH_WAITI_CTRL_
- * WAITI_EN is set (the flash model completes programs and erases at once,
- * so one read finds it idle). Its CMD bits clear, its read data reaches
+ * times 4, or 128 with SUS_STATUS's *_DLY_128) and, after a program, erase
+ * or status write while FLASH_WAITI_CTRL_WAITI_EN is set, the automatic
+ * status reads, one and then another while the flash reads busy (the
+ * reads a flash with busy times, m25p80_busy_until(), would take, without
+ * placing each on the bus, as they change nothing). SPI0's accesses wait
+ * for no SPI1 transaction here: one arriving while SPI1 holds the chip
+ * select ends that transaction on the bus first. Its CMD bits clear, its
+ * read data reaches
  * W0..W15 and RD_STATUS, and SLV_ST_END, MST_ST_END and, after a program,
  * erase or status write, WPE_END raise when it ends, which an access to
  * SPI1's registers finds however late the timer ending it runs. It waits
@@ -150,10 +159,11 @@
  * Not modelled: ECC on the external memory (FMEM/SMEM ECC, the PSRAM's
  * 16-to-18 byte mode and its address conversion), logged as unimplemented
  * when enabled; the timing tuning registers, which are held and change
- * nothing as every setting reads correctly; the flash's busy time, which
- * QEMU's flash model does not have, so that suspend and resume find no
- * operation in progress and auto-suspend never acts; SPI0's own user
- * command (USR, which the headers mark reserved).
+ * nothing as every setting reads correctly; auto-suspend and auto-resume
+ * (FLASH_SUS_CTRL's PES_EN and PER_EN), with which the controller would
+ * suspend a busy flash for SPI0's reads: SPI0 reads a busy flash as it
+ * answers, ignoring them; SPI0's own user command (USR, which the
+ * headers mark reserved).
  */
 
 #include "qemu/osdep.h"
@@ -165,6 +175,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/block/flash.h"
 #include "hw/ssi/esp32p4_mspi.h"
 #include "migration/vmstate.h"
 #include "system/memory.h"
@@ -592,6 +603,7 @@ static const ESP32P4MSPIReg esp32p4_spi1_psram_regs[ESP32P4_MSPI_NREGS] = {
 #define CTRL1_AW_SIZE0_1_SUPPORT_EN BIT(22)
 #define CTRL2_ECC_16TO18_BYTE_EN    BIT(14)
 #define CACHE_FCTRL_CLOSE_AXI_INF_EN BIT(31)
+#define CACHE_FCTRL_USR_ADDR_4BYTE  BIT(1)
 
 #define INT0_SLV_ST_END         BIT(3)
 #define INT0_MST_ST_END         BIT(4)
@@ -1167,15 +1179,26 @@ static void flash_select(ESP32P4MSPIState *s, int cs, bool selected)
     qemu_set_irq(s->cs[cs], !selected);
 }
 
+/* End SPI1's flash transaction on the bus: the flash acts on /CS rising. */
+static void spi1_release_cs(ESP32P4MSPIState *s)
+{
+    if (s->spi1_cs_held) {
+        s->spi1_cs_held = false;
+        flash_select(s, 0, false);
+    }
+}
+
 /* SPI0's read of `len` bytes of the flash at `addr`. */
 static void flash_read(ESP32P4MSPIState *s, uint32_t addr, uint8_t *buf,
                        uint32_t len)
 {
+    bool four = s->spi0[R0_CACHE_FCTRL] & CACHE_FCTRL_USR_ADDR_4BYTE;
     uint32_t i;
 
+    spi1_release_cs(s);
     flash_select(s, 0, true);
-    ssi_transfer(s->bus, FLASH_READ4);
-    for (i = 0; i < 4; i++) {
+    ssi_transfer(s->bus, four ? FLASH_READ4 : FLASH_READ);
+    for (i = four ? 0 : 1; i < 4; i++) {
         ssi_transfer(s->bus, extract32(addr, 24 - 8 * i, 8));
     }
     for (i = 0; i < len; i++) {
@@ -1653,7 +1676,7 @@ static void spi1_flash_xfer(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x, int cs)
     for (i = 0; i < x->miso_bytes; i++) {
         x->miso[i] = ssi_transfer(s->bus, 0);
     }
-    flash_select(s, 0, false);
+    s->spi1_cs_held = true;
 }
 
 /* Run a transaction on the PSRAM die, chip select 1. */
@@ -1741,9 +1764,10 @@ static void spi1_schedule(ESP32P4MSPIState *s)
     }
     s->spi1_waiting = false;
     e = esp32p4_clk_edges_or_at(s->core_clk, now);
-    timer_mod(&s->spi1_timer,
-              esp32p4_clk_edges_after(&e, now,
-                                      s->spi1_cycles * spi1_clock_div(s)));
+    s->spi1_end_at = esp32p4_clk_edges_after(&e, now,
+                                             s->spi1_cycles *
+                                             spi1_clock_div(s));
+    timer_mod(&s->spi1_timer, s->spi1_end_at);
 }
 
 /* The cycles of the status read FLASH_WAITI_CTRL makes after an operation. */
@@ -1793,7 +1817,8 @@ static void spi1_start(ESP32P4MSPIState *s, uint32_t cmd)
 {
     ESP32P4MSPIXfer x;
     uint32_t op = cmd & CMD_USR ? CMD_USR : BIT(31 - clz32(cmd & CMD_OPS));
-    uint32_t busy = op;
+    /* FLASH_PE, with any operation, clears as the operation ends. */
+    uint32_t busy = op | (cmd & CMD_FLASH_PE);
     uint32_t end = INT1_SLV_ST_END | INT1_MST_ST_END;
     uint64_t extra = 0;
     bool pe = false, to_status = false, to_buf = false;
@@ -1812,7 +1837,6 @@ static void spi1_start(ESP32P4MSPIState *s, uint32_t cmd)
     switch (op) {
     case CMD_USR:
         spi1_xfer_user(s, &x);
-        busy |= cmd & CMD_FLASH_PE;
         pe = cmd & CMD_FLASH_PE;
         to_buf = x.miso_bytes;
         break;
@@ -1911,7 +1935,7 @@ static void spi1_start(ESP32P4MSPIState *s, uint32_t cmd)
         to_status = to_buf = false;
     }
     if (pe) {
-        extra += spi1_waiti_cycles(s);
+        s->spi1_waiti = spi1_waiti_cycles(s);
         end |= INT1_WPE_END;
     }
 
@@ -1983,10 +2007,51 @@ static void spi1_suspend(ESP32P4MSPIState *s, bool resume)
     spi1_schedule(s);
 }
 
+/*
+ * The automatic status reads from `from` on: one, then another for as
+ * long as the flash, whose cycle ends at `ready`, reads busy. The read
+ * starting at or after `ready` finds it idle.
+ */
+/* [spec:nuos:req:emu.flash-timing] */
+static uint64_t spi1_waiti_reads(ESP32P4MSPIState *s, int64_t from,
+                                 int64_t ready)
+{
+    uint64_t per = spi1_waiti_cycles(s) * spi1_clock_div(s);
+    ESP32P4ClkEdges e;
+    int64_t per_ns;
+    uint64_t k;
+
+    if (ready <= from || !clock_is_enabled(s->core_clk)) {
+        return 1;
+    }
+    e = esp32p4_clk_edges_or_at(s->core_clk, from);
+    per_ns = MAX(esp32p4_clk_edges_after(&e, from, per) - from, 1);
+    k = (ready - from + per_ns - 1) / per_ns;
+    while (k > 0 && esp32p4_clk_edges_after(&e, from, (k - 1) * per) >=
+                    ready) {
+        k--;
+    }
+    while (esp32p4_clk_edges_after(&e, from, k * per) < ready) {
+        k++;
+    }
+    return k + 1;
+}
+
 static void spi1_end(void *opaque)
 {
     ESP32P4MSPIState *s = opaque;
 
+    spi1_release_cs(s);
+    if (s->spi1_waiti) {
+        DeviceState *flash = ssi_get_cs(s->bus, 0);
+        int64_t ready = flash ? m25p80_busy_until(flash) : 0;
+
+        s->spi1_waiti = false;
+        s->spi1_cycles = spi1_waiti_reads(s, s->spi1_end_at, ready) *
+                         spi1_waiti_cycles(s);
+        spi1_schedule(s);
+        return;
+    }
     s->spi1[R1_CMD] &= ~s->spi1_busy_cmd;
     s->spi1[R1_FLASH_SUS_CTRL] &= ~s->spi1_busy_sus;
     if (s->spi1_sus_after >= 0) {
@@ -2024,6 +2089,7 @@ static bool spi1_busy(ESP32P4MSPIState *s)
 static void spi1_abort(ESP32P4MSPIState *s)
 {
     timer_del(&s->spi1_timer);
+    spi1_release_cs(s);
     s->spi1[R1_CMD] &= ~s->spi1_busy_cmd;
     s->spi1[R1_FLASH_SUS_CTRL] &= ~s->spi1_busy_sus;
     s->spi1_busy_cmd = 0;
@@ -2031,6 +2097,7 @@ static void spi1_abort(ESP32P4MSPIState *s)
     s->spi1_sus_after = -1;
     s->spi1_end_int = 0;
     s->spi1_waiting = false;
+    s->spi1_waiti = false;
 }
 
 /* Register access */
@@ -2266,7 +2333,7 @@ static void mspi_spi1_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (r) {
     case R1_CMD:
-        start = v & mask & CMD_OPS;
+        start = v & mask & (CMD_OPS | CMD_FLASH_PE);
         if (start && spi1_busy(s)) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: SPI1_CMD 0x%08" PRIx32
                           " while an operation is in progress; ignored\n",
@@ -2279,7 +2346,7 @@ static void mspi_spi1_write(void *opaque, hwaddr addr, uint64_t val,
                 break;
             }
             s->spi1[R1_CMD] |= start;
-            spi1_start(s, s->spi1[R1_CMD] & CMD_OPS);
+            spi1_start(s, s->spi1[R1_CMD] & (CMD_OPS | CMD_FLASH_PE));
         }
         break;
     case R1_FLASH_SUS_CTRL:
@@ -2472,8 +2539,8 @@ static void mspi_init(Object *obj)
 
 static const VMStateDescription vmstate_esp32p4_mspi = {
     .name = TYPE_ESP32P4_MSPI,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(spi0, ESP32P4MSPIState, ESP32P4_MSPI_NREGS),
         VMSTATE_UINT32_ARRAY(spi1, ESP32P4MSPIState, ESP32P4_MSPI_NREGS),
@@ -2486,6 +2553,9 @@ static const VMStateDescription vmstate_esp32p4_mspi = {
         VMSTATE_INT32(spi1_sus_after, ESP32P4MSPIState),
         VMSTATE_UINT64(spi1_cycles, ESP32P4MSPIState),
         VMSTATE_BOOL(spi1_waiting, ESP32P4MSPIState),
+        VMSTATE_INT64(spi1_end_at, ESP32P4MSPIState),
+        VMSTATE_BOOL(spi1_cs_held, ESP32P4MSPIState),
+        VMSTATE_BOOL(spi1_waiti, ESP32P4MSPIState),
         VMSTATE_UINT32(xts_state, ESP32P4MSPIState),
         VMSTATE_UINT8_ARRAY(xts_cipher, ESP32P4MSPIState, 64),
         VMSTATE_UINT8_ARRAY(psram_mr_regs, ESP32P4MSPIState,
