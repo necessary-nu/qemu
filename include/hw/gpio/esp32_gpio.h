@@ -248,10 +248,10 @@ typedef struct Esp32GpioState {
     bool update_pending;
     /*
      * The time of the round being resolved, and the changes held back
-     * from it, at other times (see esp32_line.h).
+     * from it, at other times (see hw/core/line-time.h).
      */
     int64_t round_ns;
-    Esp32LineDeferred deferred;
+    LineDeferred deferred;
 
     /* Told after software changes how signals are routed to pads */
     NotifierList route_notifiers;

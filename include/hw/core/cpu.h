@@ -465,7 +465,9 @@ struct qemu_work_item;
  * @icount_window_idle: It went idle in that window, which counts it as
  *   having run to the window's end.
  * @icount_own: Its own time past the window's start, in Clock units: the
- *   periods of its clock its instructions have taken.
+ *   periods of its clock its instructions have taken, from an edge of the
+ *   clock (icount_window_align()).
+ * @icount_realign: Its clock's period changed since it was put on an edge.
  * @cpu_ases: Pointer to array of CPUAddressSpaces (which define the
  *            AddressSpaces this CPU has)
  * @as: Pointer to the first AddressSpace, for the convenience of targets which
@@ -540,6 +542,7 @@ struct CPUState {
     uint64_t icount_insn_den;
     bool icount_in_window;
     bool icount_window_idle;
+    bool icount_realign;
     int64_t icount_own;
     uint64_t random_seed;
     sigjmp_buf jmp_env;

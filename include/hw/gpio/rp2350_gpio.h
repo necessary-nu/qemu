@@ -10,6 +10,7 @@
 #define HW_GPIO_RP2350_GPIO_H
 
 #include "hw/core/sysbus.h"
+#include "hw/core/line-time.h"
 #include "qom/object.h"
 
 #define TYPE_RP2350_GPIO "rp2350-gpio"
@@ -73,7 +74,10 @@ static inline int rp2350_gpio_sio_bit(int pin)
  *
  * The muxing and pads are combinational: a change reaches every receiver
  * within the call that makes it, and keeps the time the driver gave it
- * (hw/core/line-time.h), so that each receiver takes it at that time.
+ * (hw/core/line-time.h), so that each receiver takes it at that time. A
+ * change that comes in while the device resolves one at another time,
+ * such as the edge of a source that was behind and catches up as it takes
+ * the first, is held back and resolved after it at its own time.
  */
 typedef enum RP2350GPIOPort {
     RP2350_GPIO_PORT_SPI0,
@@ -305,6 +309,12 @@ struct RP2350GPIOState {
 
     bool updating;
     bool update_pending;
+    /*
+     * The time of the round being resolved, and the changes held back
+     * from it, at other times.
+     */
+    int64_t round_ns;
+    LineDeferred deferred;
 };
 
 /* The name of a port, as used in its "<name>-out/-oe/-in" GPIO arrays. */

@@ -20,12 +20,19 @@
  * when its expansion shift register is empty, and fetches the next
  * command as soon as the current one has output its last word.
  *
- * The block is not ticked. It holds its state as of a clk_hstx cycle and
- * is run forward to the current cycle whenever it is observed or written,
+ * The block is not ticked. It holds its state as of a clk_hstx cycle,
+ * counted on the clock's own grid (its edges at whole multiples of its
+ * period from time 0, as for every device timed on a clock, so that
+ * clocks of one rate share their edges), and is run forward to the
+ * current cycle whenever it is observed or written,
  * at the cycle in which a pop makes room in a full FIFO (raising
  * DREQ_HSTX), every pin-refresh-ns while it is shifting, to drive its
  * GPIO outputs at that coarse resolution, and at the cycle in which it
- * stops shifting, to drive their final levels. Cycles in which nothing but the
+ * stops shifting, to drive their final levels. A coupled-mode PIO output
+ * change is taken in the cycle of its time (hw/core/line-time.h), and a
+ * timer firing runs the block to its deadline only, so that a PIO change
+ * due before the firing but delivered after it still finds the block in
+ * time for it. Cycles in which nothing but the
  * output shift register changes are run in bulk, and an infinite
  * RAW_REPEAT or TMDS_REPEAT command, whose output is eventually periodic,
  * is run forward by whole periods.
@@ -55,6 +62,7 @@
 #include "qapi/qapi-builtin-visit.h"
 #include "qapi/visitor.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
@@ -109,6 +117,13 @@ enum {
 #define FF_MAX_PERIOD           4096
 /* The furthest ahead, in cycles, the next FIFO pop is looked for. */
 #define POP_LOOKAHEAD           (1u << 20)
+
+/*
+ * How late a timer firing may be and still take the block only to its
+ * deadline: far more than icount ever leaves a timer, and as little as
+ * keeps a late host's catching up short.
+ */
+#define HSTX_MAX_LATE_NS        (10 * SCALE_US)
 
 /* Register fields. */
 
@@ -600,28 +615,34 @@ static bool hstx_run(RP2350HSTXState *s, RP2350HSTXCore *c, uint64_t end,
 
 /* Time. */
 
+/*
+ * clk_hstx's cycles, counted from base_cycle at base_ns, its edges at
+ * whole multiples of its period from time 0: an edge at the same virtual
+ * time is the same edge for every device timed on a clock of the rate.
+ */
 static uint64_t hstx_cycle_at(RP2350HSTXState *s, int64_t ns)
 {
-    if (ns <= s->base_ns) {
+    if (ns <= s->base_ns || !clock_is_enabled(s->clk)) {
         return s->base_cycle;
     }
-    return s->base_cycle + clock_ns_to_ticks(s->clk, ns - s->base_ns);
+    return s->base_cycle + clock_ns_to_ticks(s->clk, ns) -
+           clock_ns_to_ticks(s->clk, s->base_ns);
 }
 
 /* The first virtual time at which clk_hstx has reached `cycle`. */
 static int64_t hstx_ns_at(RP2350HSTXState *s, uint64_t cycle)
 {
-    uint64_t d, ns;
+    uint64_t t, ns;
 
-    if (cycle <= s->base_cycle) {
+    if (cycle <= s->base_cycle || !clock_is_enabled(s->clk)) {
         return s->base_ns;
     }
-    d = cycle - s->base_cycle;
-    ns = clock_ticks_to_ns(s->clk, d);
-    while (clock_ns_to_ticks(s->clk, ns) < d) {
+    t = clock_ns_to_ticks(s->clk, s->base_ns) + (cycle - s->base_cycle);
+    ns = clock_ticks_to_ns(s->clk, t);
+    while (clock_ns_to_ticks(s->clk, ns) < t) {
         ns++;
     }
-    return s->base_ns + MIN(ns, (uint64_t)INT64_MAX / 2);
+    return MIN(ns, (uint64_t)INT64_MAX / 2);
 }
 
 static int64_t hstx_now(void)
@@ -640,16 +661,15 @@ static void hstx_update_dreq(RP2350HSTXState *s)
 }
 
 /*
- * Bring the block up to the current clk_hstx cycle. While the FIFO is
- * full, DREQ_HSTX rises at the pop that makes room, in that pop's cycle,
- * so that a DMA channel paced by it refills the FIFO between pops however
+ * Bring the block up to clk_hstx cycle `now`. While the FIFO is full,
+ * DREQ_HSTX rises at the pop that makes room, in that pop's cycle, so
+ * that a DMA channel paced by it refills the FIFO between pops however
  * far the block is run.
  */
 /* [spec:nuos:req:emu.hstx] */
-static void hstx_sync(RP2350HSTXState *s)
+static void hstx_sync_to(RP2350HSTXState *s, uint64_t now)
 {
     RP2350HSTXCore *c = &s->core;
-    uint64_t now = hstx_cycle_at(s, hstx_now());
 
     if (s->syncing) {
         return;
@@ -666,6 +686,15 @@ static void hstx_sync(RP2350HSTXState *s)
         hstx_update_dreq(s);
     }
     s->syncing = false;
+}
+
+/*
+ * Bring the block up to the time of the change at hand (line_time()): an
+ * access's, the present, or a stamped change's.
+ */
+static void hstx_sync(RP2350HSTXState *s)
+{
+    hstx_sync_to(s, hstx_cycle_at(s, line_time()));
 }
 
 /* The outputs while the shift register is not shifting. */
@@ -735,7 +764,7 @@ static uint64_t hstx_stop_cycle(RP2350HSTXState *s)
  */
 static void hstx_schedule(RP2350HSTXState *s)
 {
-    int64_t now = hstx_now();
+    int64_t now = line_time();
     int64_t due = INT64_MAX;
     uint64_t stop;
 
@@ -764,7 +793,8 @@ static void hstx_schedule(RP2350HSTXState *s)
     if (due == INT64_MAX) {
         timer_del(s->timer);
     } else {
-        timer_mod(s->timer, MAX(due, now));
+        s->due_ns = MAX(due, now);
+        timer_mod(s->timer, s->due_ns);
     }
 }
 
@@ -774,12 +804,27 @@ static void hstx_update(RP2350HSTXState *s)
     hstx_schedule(s);
 }
 
-static void hstx_timer_cb(void *opaque)
+/* Run the block to its timer's deadline and drive it, at that time. */
+static void hstx_fire(void *opaque)
 {
     RP2350HSTXState *s = opaque;
 
     hstx_sync(s);
     hstx_update(s);
+}
+
+/*
+ * The timer runs the block to its deadline only. One firing more than
+ * HSTX_MAX_LATE_NS late, as when the host falls behind virtual time
+ * without icount, takes it to the present.
+ */
+static void hstx_timer_cb(void *opaque)
+{
+    RP2350HSTXState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    line_run_at(now - s->due_ns > HSTX_MAX_LATE_NS ? now : s->due_ns,
+                hstx_fire, s);
 }
 
 /* What clearing CSR.EN does, and holds while it is clear. */
@@ -966,7 +1011,12 @@ static const MemoryRegionOps rp2350_hstx_fifo_ops = {
     .valid.max_access_size = 4,
 };
 
-/* Coupled-mode PIO outputs. */
+/*
+ * Coupled-mode PIO outputs, each change taken in the cycle of its time;
+ * in the cycle the block has reached if it has run past that, as an
+ * access an instruction after the change's deadline, under icount, can
+ * have run it before the PIO's timer fired.
+ */
 static void hstx_pio_in(void *opaque, int n, int level)
 {
     RP2350HSTXState *s = opaque;
@@ -1163,10 +1213,19 @@ static const VMStateDescription vmstate_rp2350_hstx_rec = {
     },
 };
 
+static int rp2350_hstx_post_load(void *opaque, int version_id)
+{
+    RP2350HSTXState *s = opaque;
+
+    s->due_ns = timer_expire_time_ns(s->timer);
+    return 0;
+}
+
 static const VMStateDescription vmstate_rp2350_hstx = {
     .name = TYPE_RP2350_HSTX,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = rp2350_hstx_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, RP2350HSTXState),
         VMSTATE_TIMER_PTR(timer, RP2350HSTXState),

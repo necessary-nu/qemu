@@ -78,6 +78,22 @@ static int64_t icount_get_limit(void)
     }
 }
 
+/*
+ * How far virtual time is from the next deadline, in 2^-32 ns: from the
+ * time the CPUs' instructions have run up to, to the first time that
+ * rounds up to the deadline's nanosecond (icount_get()), so that a timer
+ * due at a clock edge's time fires at the end of the instruction that
+ * ends on the edge. 0 if the deadline has come.
+ */
+static uint64_t icount_deadline_units(void)
+{
+    uint64_t deadline = (uint64_t)icount_get_deadline() << 32;
+    uint64_t frac = timers_state.qemu_icount_time_frac;
+    uint64_t past = frac ? frac - 1 : (1ull << 32) - 1;
+
+    return deadline > past ? deadline - past : 0;
+}
+
 /* Whether @cpu executes at its icount clock's rate. */
 static bool icount_cpu_clocked(CPUState *cpu)
 {
@@ -205,6 +221,7 @@ static void icount_window_update(int64_t quantum)
         } else {
             icount_window_leave(cpu);
             cpu->icount_in_window = true;
+            icount_window_align(cpu);
         }
     }
 }
@@ -281,12 +298,17 @@ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
          * or woken in it (icount_window_update()), which the others' turns
          * wait for meanwhile.
          */
-        uint64_t period = qatomic_read(&cpu->icount_period);
+        uint64_t period;
         uint64_t left = 0;
 
+        if (cpu->icount_realign && cpu->icount_in_window &&
+            !cpu->icount_window_idle) {
+            icount_window_align(cpu);
+        }
+        period = qatomic_read(&cpu->icount_period);
         if (icount_window_running(cpu) && !icount_window_waiting) {
             uint64_t n = MAX(timers_state.window_running, 1);
-            uint64_t deadline = (uint64_t)icount_get_deadline() << 32;
+            uint64_t deadline = icount_deadline_units();
 
             left = timers_state.window_units - cpu->icount_own;
             if (deadline <= (left - 1) / n) {

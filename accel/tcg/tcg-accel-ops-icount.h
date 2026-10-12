@@ -30,6 +30,17 @@ uint64_t icount_window_start(uint64_t units, int cpus);
 void icount_window_set_idle(CPUState *cpu, bool idle);
 void icount_window_join(CPUState *cpu, uint64_t units);
 
+/*
+ * Each CPU's instructions start and end on its clock's edges, whole
+ * multiples of its exact period from time 0, the edges devices timed on
+ * the clock count. A CPU starts in a window on the first edge at or after
+ * its start, joins one or wakes in it on the first edge at or after the
+ * present, and goes on from edge to edge, a period an instruction.
+ * icount_window_align() puts @cpu's own time on its clock's first edge at
+ * or after it: as it starts in a window, and after its clock changes.
+ */
+void icount_window_align(CPUState *cpu);
+
 void icount_handle_deadline(void);
 void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget);
 int64_t icount_percpu_budget(int cpu_count);
