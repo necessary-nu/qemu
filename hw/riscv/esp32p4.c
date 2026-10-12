@@ -324,6 +324,16 @@
  *     its interrupt PWMn_INTR (sources 38 and 39), its six outputs, sync,
  *     fault and capture inputs matrix signals 89 to 106. Their ETM events
  *     and tasks are the ETM's.
+ *   - The 2D-DMA controller (TRM chapter 8) at 0x50088000, behind
+ *     DMA2D_SYS_CLK, which also clocks its transfers, and its reset, four
+ *     TX and three RX channels, their interrupts sources 104 to 108, 128
+ *     and 129, its ETM events and tasks the ETM's; its accesses go
+ *     through the DMA APM as the 2D-DMA masters, to memory directly, past
+ *     the caches. A peripheral served by it attaches as
+ *     include/hw/dma/esp32p4_dma2d.h describes. The pixel-processing
+ *     accelerator (TRM chapter 39) at 0x50087000, behind PPA_SYS_CLK, at
+ *     which it computes, and its reset, its interrupt PPA_INTR (source 96),
+ *     its SRM and BLEND engines served by the 2D-DMA.
  *   - The board's cameras: an esp32p4-image-source on the camera inputs'
  *     pads, dvp-camera for LCD_CAM's camera port and the ISP's DVP input,
  *     csi-camera for MIPI CSI (include/hw/misc/esp32p4_image_source.h).
@@ -443,8 +453,6 @@ static const struct {
     /* HP peripherals 0. */
     { "pau",              0x50082000, 4 * KiB },
     { "h264",             0x50084000, 4 * KiB },
-    { "ppa",              0x50087000, 4 * KiB },
-    { "dma2d",            0x50088000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
     { "pvt",              0x5009e000, 4 * KiB },
     { "csi-host",         0x5009f000, 2 * KiB },
@@ -2254,6 +2262,52 @@ static void esp32p4_init_dma(ESP32P4MachineState *s)
 }
 
 /*
+ * The 2D-DMA controller, on the bus through the APMs, behind its bus clock
+ * and reset, which also clock its transfers; and the PPA, behind its
+ * clock and reset, served by the 2D-DMA.
+ */
+/* [spec:nuos:req:emu.esp32p4.ppa] */
+static void esp32p4_init_media(ESP32P4MachineState *s)
+{
+    static const int dma2d_intr[ESP32P4_DMA2D_IRQS] = {
+        ESP32P4_INTR_DMA2D_IN_CH0, ESP32P4_INTR_DMA2D_IN_CH1,
+        ESP32P4_INTR_DMA2D_IN_CH2, ESP32P4_INTR_DMA2D_OUT_CH0,
+        ESP32P4_INTR_DMA2D_OUT_CH1, ESP32P4_INTR_DMA2D_OUT_CH2,
+        ESP32P4_INTR_DMA2D_OUT_CH3,
+    };
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    DeviceState *dev;
+    int n;
+
+    object_initialize_child(OBJECT(s), "dma2d", &s->dma2d,
+                            TYPE_ESP32P4_DMA2D);
+    dev = DEVICE(&s->dma2d);
+    object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, "dma2d-sys"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_DMA2D_BASE, ESP32P4_CLK_DMA2D_SYS,
+                             ESP32P4_RST_DMA2D, 0);
+    for (n = 0; n < ESP32P4_DMA2D_IRQS; n++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), n,
+                           esp32p4_intr_source(s, dma2d_intr[n]));
+    }
+
+    object_initialize_child(OBJECT(s), "ppa", &s->ppa, TYPE_ESP32P4_PPA);
+    dev = DEVICE(&s->ppa);
+    object_property_set_link(OBJECT(dev), "dma2d", OBJECT(&s->dma2d),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, "ppa-sys"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_PPA_BASE, ESP32P4_CLK_PPA_SYS,
+                             ESP32P4_RST_PPA, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_PPA));
+}
+
+/*
  * GP-SPI2 and GP-SPI3, their registers behind GPSPI2_APB_CLK and
  * GPSPI3_APB_CLK and their resets, their data paths on GPSPI*_SYS_CLK and
  * their masters on clk_spi_mst (GPSPI*_MST_CLK); their DMA through
@@ -2975,10 +3029,61 @@ static void esp32p4_init_pwm(ESP32P4MachineState *s)
 }
 
 /*
+ * The JPEG codec's paths are the 2D-DMA's, as its peripheral 0 both ways:
+ * the codec pulls and pushes through the 2D-DMA, and the 2D-DMA tells it
+ * of data and room as it tells any peripheral it serves.
+ */
+static size_t jpeg_dma2d_pull(void *opaque, uint8_t *buf, size_t len,
+                              bool *eof)
+{
+    return esp32p4_dma2d_pull(opaque, ESP32P4_DMA2D_TX_JPEG, buf, len, eof);
+}
+
+static size_t jpeg_dma2d_push(void *opaque, const uint8_t *buf, size_t len,
+                              unsigned flags)
+{
+    return esp32p4_dma2d_push(opaque, ESP32P4_DMA2D_RX_JPEG, buf, len,
+                              (flags & ESP32P4_JPEG_DMA_EOF ?
+                               ESP32P4_DMA2D_EOF : 0) |
+                              (flags & ESP32P4_JPEG_DMA_ERR_EOF ?
+                               ESP32P4_DMA2D_ERR_EOF : 0));
+}
+
+static void jpeg_dma2d_rx_format(void *opaque, int format)
+{
+    static const int mcu[] = {
+        [ESP32P4_JPEG_MCU_GRAY] = ESP32P4_DMA2D_MCU_GRAY,
+        [ESP32P4_JPEG_MCU_YUV444] = ESP32P4_DMA2D_MCU_YUV444,
+        [ESP32P4_JPEG_MCU_YUV422] = ESP32P4_DMA2D_MCU_YUV422,
+        [ESP32P4_JPEG_MCU_YUV420] = ESP32P4_DMA2D_MCU_YUV420,
+    };
+
+    assert(format >= 0 && format < ARRAY_SIZE(mcu));
+    esp32p4_dma2d_rx_mcu_format(opaque, ESP32P4_DMA2D_RX_JPEG, mcu[format]);
+}
+
+static const ESP32P4JpegDmaOps jpeg_dma2d_ops = {
+    .pull = jpeg_dma2d_pull,
+    .push = jpeg_dma2d_push,
+    .rx_format = jpeg_dma2d_rx_format,
+};
+
+static void jpeg_dma2d_ready(void *opaque, unsigned sel)
+{
+    esp32p4_jpeg_dma_ready(opaque);
+}
+
+static const ESP32P4Dma2dPeriphOps jpeg_dma2d_periph = {
+    .tx_ready = jpeg_dma2d_ready,
+    .rx_ready = jpeg_dma2d_ready,
+    .sync = esp32p4_jpeg_dma_sync,
+};
+
+/*
  * The JPEG codec, behind JPEG_SYS_CLK and its reset, its pipeline on the
- * same clock, its interrupt JPEG_INTR. Its data moves only through the
- * 2D-DMA, as include/hw/misc/esp32p4_jpeg.h describes; until the 2D-DMA
- * connects its paths, a qtest plays them.
+ * same clock, its interrupt JPEG_INTR, its data through the 2D-DMA (a
+ * qtest may play the paths instead, as include/hw/misc/esp32p4_jpeg.h
+ * describes).
  */
 /* [spec:nuos:req:emu.esp32p4.jpeg] */
 static void esp32p4_init_jpeg(ESP32P4MachineState *s)
@@ -2995,6 +3100,11 @@ static void esp32p4_init_jpeg(ESP32P4MachineState *s)
                              ESP32P4_RST_JPEG, 0);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        esp32p4_intr_source(s, ESP32P4_INTR_JPEG));
+    esp32p4_jpeg_connect_dma(&s->jpeg, &jpeg_dma2d_ops, &s->dma2d);
+    esp32p4_dma2d_attach(&s->dma2d, ESP32P4_DMA2D_OUT, ESP32P4_DMA2D_TX_JPEG,
+                         &jpeg_dma2d_periph, &s->jpeg);
+    esp32p4_dma2d_attach(&s->dma2d, ESP32P4_DMA2D_IN, ESP32P4_DMA2D_RX_JPEG,
+                         &jpeg_dma2d_periph, &s->jpeg);
 }
 
 /*
@@ -3438,8 +3548,8 @@ static void esp32p4_init_analog(ESP32P4MachineState *s)
  *
  * The RMT and the PCNT have no events or tasks on the P4.
  *
- * Not connected, as their blocks are not modelled: the REGDMA and 2D-DMA
- * events and tasks; ADC_EVT_RESULT_DONE0, which the TRM does not
+ * Not connected, as their blocks are not modelled: the REGDMA events and
+ * tasks; ADC_EVT_RESULT_DONE0, which the TRM does not
  * describe; and the RTC timer's tasks (RTC_TASK_*), which the TRM says it
  * does not take.
  */
@@ -3550,6 +3660,17 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
             esp32p4_etm_connect_task(etm, task[g] + k, dev,
                                      ESP32P4_GDMA_ETM_TASK, k);
         }
+    }
+
+    /* The 2D-DMA's channels, those the ETM has IDs for. */
+    dev = DEVICE(&s->dma2d);
+    for (k = 0; k < ESP32P4_DMA2D_ETM_EVENTS; k++) {
+        esp32p4_etm_connect_event(etm, ESP32P4_ETM_DMA2D_EVT_IN_DONE_CH0 + k,
+                                  dev, ESP32P4_DMA2D_ETM_EVENT, k);
+    }
+    for (k = 0; k < ESP32P4_DMA2D_ETM_TASKS; k++) {
+        esp32p4_etm_connect_task(etm, ESP32P4_ETM_DMA2D_TASK_IN_START_CH0 + k,
+                                 dev, ESP32P4_DMA2D_ETM_TASK, k);
     }
 
     /* The LED PWM controller's channels and timers. */
@@ -4437,6 +4558,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_i2c(s);
     esp32p4_init_pms(s);
     esp32p4_init_dma(s);
+    esp32p4_init_media(s);
     esp32p4_init_crypto(s);
     esp32p4_init_ext_memory(s);
     esp32p4_init_sdmmc(s);
