@@ -62,6 +62,26 @@
  *     YUV2RGB, CROP and the tail's packing (TRM table 38.5-2), with AE,
  *     AF, AWB and HIST at their sampling points; each stage's arithmetic
  *     and interpretation is stated there.
+ *   - Against Espressif's silicon. ESP-IDF's ISP test app and its
+ *     dma_input example give an ESP32-P4's RGB888 output (demosaic,
+ *     RGB2YUV, neutral COLOR, YUV2RGB) for known RAW8 input: an impulse
+ *     at each Bayer site of a flat frame, with DPC off, by each dynamic
+ *     method and static, and a real scene. DPC corrects exactly the
+ *     samples the silicon corrects, by each method and static. The
+ *     demosaic and the YUV round trip match the impulses' 9 x 9
+ *     surroundings in 1351 of 1620 pixels and the rest within 9, but the
+ *     scene in only 7.5% of its pixels (79% within 3, 99% within 9, all
+ *     within 32): the arithmetic that reproduces the silicon is not
+ *     known. What the frames show of it: each YUV422 pair shares one
+ *     chroma and its two pixels differ by their luma alone; that chroma
+ *     reaches YUV2RGB with a fraction (the pairs' differences between R,
+ *     G and B take values whole chroma cannot give); and with the
+ *     demosaic keeping each site's own sample, the pair's chroma being
+ *     the mean of its two pixels', fraction kept, is consistent with
+ *     every pair of a blue row around the impulses and about 98% of the
+ *     scene's, against 85% and 90% of a red row's, where no rule tried
+ *     fits them all; taken from the first pixel, as here, it fits fewer,
+ *     but with this demosaic it gives the most exact pixels.
  *   - Configuration. The frame's registers are taken at its start: the
  *     shadowed modules' (BLC, DPC, BF, WBG, CCM, SHARP, COLOR; TRM
  *     38.5.5) by SHADOW_UPDATE_SEL: 0 as they are written, 1 as they are
