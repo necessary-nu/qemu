@@ -67,8 +67,8 @@ typedef struct ESP32P4LedcTimer {
      * The counter: count anchor_cnt of cycle anchor_cycle at anchor_ns,
      * moving one count on each of the edges q of its divided clock, exact
      * period and phase (stopped while it stands still), after edge
-     * q_start, the first LEDC_CLK edge as the divider last started, whose
-     * edges q_clk were then.
+     * q_start, LEDC_CLK's last edge at or before the divider last
+     * started, whose edges q_clk were then.
      */
     int64_t anchor_ns;
     uint64_t anchor_cycle;

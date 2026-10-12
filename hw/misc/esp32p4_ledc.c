@@ -299,10 +299,10 @@ static bool timer_runs(const ESP32P4LedcTimer *t)
 }
 
 /*
- * Take the count's period after a change at the anchor: on the divided
- * clock's edges from the first LEDC_CLK edge at or after the anchor, its
- * first count a period after that; as they were if neither the period
- * nor LEDC_CLK's edges have changed.
+ * Take the count's period after a change at the anchor: the divider
+ * counts LEDC_CLK's edges after the anchor, its first count a period
+ * after LEDC_CLK's last edge at or before it; as they were if neither the
+ * period nor LEDC_CLK's edges have changed.
  */
 static void timer_set_q(ESP32P4LedcState *s, int x)
 {
@@ -316,10 +316,10 @@ static void timer_set_q(ESP32P4LedcState *s, int x)
         return;
     }
     t->q_clk = clk;
-    t->q = esp32p4_clk_edges_from(q, &clk, t->anchor_ns);
+    t->q = esp32p4_clk_edges_restart(q, &clk, t->anchor_ns);
     t->q_start = 0;
     if (timer_runs(t)) {
-        t->q_start = esp32p4_clk_edge_index(&t->q, t->anchor_ns, &at) + !at;
+        t->q_start = esp32p4_clk_edge_index(&t->q, t->anchor_ns, &at);
     }
 }
 
