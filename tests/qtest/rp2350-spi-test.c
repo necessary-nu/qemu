@@ -112,6 +112,21 @@
 
 static char *rom_path;
 
+/*
+ * clk_peri, SSPCLK, is clk_sys at 150 MHz: its edges fall at whole
+ * multiples of 20/3 ns from time 0, and every 20 ns is one. Step to the
+ * next, so that the tests' writes, whole microseconds apart, land on
+ * edges, where the frames they start begin.
+ */
+static void align_to_sspclk(QTestState *qts)
+{
+    int64_t now = qtest_clock_step(qts, 1);
+
+    if (now % 20) {
+        qtest_clock_step(qts, 20 - now % 20);
+    }
+}
+
 static QTestState *start(const char *extra)
 {
     QTestState *qts = qtest_initf("-M rp2350 -bios %s %s", rom_path,
@@ -119,6 +134,7 @@ static QTestState *start(const char *extra)
 
     rp2350_clocks_init(qts);
     rp2350_unreset(qts, RP2350_RESETS_ALL);
+    align_to_sspclk(qts);
 
     qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");
     return qts;
@@ -244,6 +260,32 @@ static void test_loopback_timing(void)
     g_assert_true(rd(qts, SPI0, SSPSR) & SR_BSY);
     step(qts, SLACK);
     g_assert_cmphex(rd(qts, SPI0, SSPDR), ==, 0xbeef);
+    qtest_quit(qts);
+}
+
+/*
+ * A frame starts on SSPCLK's first edge after its write: written 2 ns
+ * after an edge, a loopback frame of 9 bit periods of two SSPCLK cycles
+ * (120 ns) ends 120 ns after the next edge, which comes 4.67 ns after the
+ * write, rather than 120 ns after the write.
+ */
+/* [spec:nuos:req:emu.spi/test] */
+static void test_frame_start_edge(void)
+{
+    QTestState *qts = start(NULL);
+
+    wr(qts, SPI0, SSPCPSR, 2);
+    wr(qts, SPI0, SSPCR0, CR0_DSS(8));
+    wr(qts, SPI0, SSPCR1, CR1_SSE | CR1_LBM);
+    step(qts, 2);
+    wr(qts, SPI0, SSPDR, 0x3c);
+    step(qts, 122);
+    g_assert_true(rd(qts, SPI0, SSPSR) & SR_BSY);
+    step(qts, 2);
+    g_assert_true(rd(qts, SPI0, SSPSR) & SR_BSY);
+    step(qts, 1);
+    g_assert_cmphex(rd(qts, SPI0, SSPSR), ==, SR_RNE | SR_TNF | SR_TFE);
+    g_assert_cmphex(rd(qts, SPI0, SSPDR), ==, 0x3c);
     qtest_quit(qts);
 }
 
@@ -613,6 +655,7 @@ int main(int argc, char **argv)
 
     qtest_add_func("/rp2350/spi/reset-values", test_reset_values);
     qtest_add_func("/rp2350/spi/loopback-timing", test_loopback_timing);
+    qtest_add_func("/rp2350/spi/frame-start-edge", test_frame_start_edge);
     qtest_add_func("/rp2350/spi/data-sizes", test_data_sizes);
     qtest_add_func("/rp2350/spi/frame-formats", test_frame_formats);
     qtest_add_func("/rp2350/spi/fifos-overrun", test_fifos_overrun);

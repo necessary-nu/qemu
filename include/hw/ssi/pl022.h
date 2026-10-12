@@ -23,9 +23,11 @@
  * + Clock input "clk": SSPCLK. Connected and running, it times frames
  *   from SSPCPSR and SSPCR0.SCR in virtual time, so BSY, FIFO levels and
  *   the receive timeout follow the line rate and an unread receive FIFO
- *   overruns. Left unconnected, frames complete as soon as they are
- *   written and the transmitter stalls rather than overrun the receive
- *   FIFO, which boards that model no SSPCLK rely on.
+ *   overruns. A frame starts on an edge of SSPCLK, the first after its
+ *   write, its edges at whole multiples of its period from time 0. Left
+ *   unconnected, frames complete as soon as they are written and the
+ *   transmitter stalls rather than overrun the receive FIFO, which boards
+ *   that model no SSPCLK rely on.
  * + Named GPIO output array "dma-req": SSPTXDMASREQ and SSPRXDMASREQ.
  * + Named GPIO output array "ssp-out": the serial interface signals
  *   SSPCLKOUT, SSPFSSOUT, SSPTXD, nSSPCTLOE and nSSPOE at frame level
