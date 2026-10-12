@@ -666,6 +666,67 @@ static void test_loopback(void)
 }
 
 /*
+ * Everything one change reaches, the routing set up beforehand: output
+ * signal 30 drives GPIO21 and GPIO22, which the board wires to GPIO23;
+ * GPIO23 is input signal 30, and GPIO22 loops back through signal 250 to
+ * GPIO30. GPIO_OUT drives GPIO26, wired to GPIO27, whose pin-filtered
+ * input is I2C0's SCL; an outside driver pulls that wire low over
+ * GPIO26's own high.
+ */
+/* [spec:nuos:req:emu.esp32p4.gpio/test] */
+static void test_fan_out(void)
+{
+    QTestState *qts = qtest_init("-M esp32p4,flash-size=16M -serial none "
+                                 "-global esp32p4-gpio.pad-wires=22:23,26:27");
+    static const int pads[] = { 21, 22, 23, 30 };
+
+    qtest_irq_intercept_out_named(qts, GPIO_PATH, "sig-in");
+    for (int i = 0; i < ARRAY_SIZE(pads); i++) {
+        gpio_mode(qts, pads[i], 0);
+    }
+    qtest_writel(qts, GPIO_FUNC_OUT(21), SIG_I2S0_I_WS);
+    qtest_writel(qts, GPIO_FUNC_OUT(22), SIG_I2S0_I_WS);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_I2S0_I_WS), IN_SIG_IN_SEL | 23);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_LOOP), IN_SIG_IN_SEL | 22);
+    qtest_writel(qts, GPIO_FUNC_OUT(30), SIG_LOOP);
+    for (int k = 0; k < 4; k++) {
+        bool level = !(k & 1);
+
+        sig_out(qts, SIG_I2S0_I_WS, level);
+        g_assert_cmpint(qtest_get_irq(qts, SIG_I2S0_I_WS), ==, level);
+        g_assert_cmpint(qtest_get_irq(qts, SIG_LOOP), ==, level);
+        for (int i = 0; i < ARRAY_SIZE(pads); i++) {
+            g_assert_cmpint(gpio_in(qts, pads[i]), ==, level);
+        }
+    }
+
+    gpio_mode(qts, 26, 0);
+    gpio_mode(qts, 27, FILTER_EN);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_I2C0_SCL), IN_SIG_IN_SEL | 27);
+    g_assert_false(qtest_get_irq(qts, SIG_I2C0_SCL));
+    qtest_writel(qts, GPIO_ENABLE_W1TS, 1u << 26);
+    qtest_writel(qts, GPIO_OUT_W1TS, 1u << 26);
+    g_assert_true(gpio_in(qts, 26));
+    g_assert_false(qtest_get_irq(qts, SIG_I2C0_SCL));
+    qtest_clock_step(qts, 3 * CYCLE_NS);
+    g_assert_true(qtest_get_irq(qts, SIG_I2C0_SCL));
+    g_assert_true(gpio_in(qts, 27));
+    pad_in(qts, 26, 0);
+    g_assert_false(gpio_in(qts, 26));
+    qtest_clock_step(qts, 3 * CYCLE_NS);
+    g_assert_false(qtest_get_irq(qts, SIG_I2C0_SCL));
+    pad_release(qts, 26);
+    g_assert_true(gpio_in(qts, 26));
+    qtest_clock_step(qts, 3 * CYCLE_NS);
+    g_assert_true(qtest_get_irq(qts, SIG_I2C0_SCL));
+    qtest_writel(qts, GPIO_OUT_W1TC, 1u << 26);
+    qtest_clock_step(qts, 3 * CYCLE_NS);
+    g_assert_false(qtest_get_irq(qts, SIG_I2C0_SCL));
+    g_assert_false(gpio_in(qts, 26));
+    qtest_quit(qts);
+}
+
+/*
  * Pad interrupts: rising, falling and any edges, levels that set the
  * status again while they hold, GPIO_STATUS_NEXT, and INT_ENA's bits 13,
  * 14, 16 and 17 to GPIO_INTR0 to _3, sources 74 to 77 of the interrupt
@@ -1383,6 +1444,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/gpio/output_routing", test_output_routing);
     qtest_add_func("esp32p4/gpio/input_routing", test_input_routing);
     qtest_add_func("esp32p4/gpio/loopback", test_loopback);
+    qtest_add_func("esp32p4/gpio/fan_out", test_fan_out);
     qtest_add_func("esp32p4/gpio/interrupts", test_interrupts);
     qtest_add_func("esp32p4/gpio/pin_filter", test_pin_filter);
     qtest_add_func("esp32p4/gpio/glitch_filter", test_glitch_filter);

@@ -137,9 +137,10 @@
  * WAITI_EN is set (the flash model completes programs and erases at once,
  * so one read finds it idle). Its CMD bits clear, its read data reaches
  * W0..W15 and RD_STATUS, and SLV_ST_END, MST_ST_END and, after a program,
- * erase or status write, WPE_END raise when it ends. It waits while the
- * core clock is stopped. SPI0's accesses take no time; each raises SPI0's
- * SLV_ST_END and MST_ST_END.
+ * erase or status write, WPE_END raise when it ends, which an access to
+ * SPI1's registers finds however late the timer ending it runs. It waits
+ * while the core clock is stopped. SPI0's accesses take no time; each
+ * raises SPI0's SLV_ST_END and MST_ST_END.
  *
  * The registers are behind the "sys" bus clock (mapped through the clock
  * and reset tree's gate); the AXI port refuses accesses while it is
@@ -2000,6 +2001,20 @@ static void spi1_end(void *opaque)
     mspi_update_irq(s);
 }
 
+/*
+ * End SPI1's transaction if its time has come: the timer that ends it may
+ * run late on the host's clock, after an access that must find it ended.
+ */
+static void spi1_catch_up(ESP32P4MSPIState *s)
+{
+    if (timer_pending(&s->spi1_timer) &&
+        timer_expire_time_ns(&s->spi1_timer) <=
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_del(&s->spi1_timer);
+        spi1_end(s);
+    }
+}
+
 static bool spi1_busy(ESP32P4MSPIState *s)
 {
     return s->spi1_busy_cmd || s->spi1_busy_sus;
@@ -2225,6 +2240,7 @@ static uint64_t mspi_spi1_read(void *opaque, hwaddr addr, unsigned size)
         log_bad_offset(s, "SPI1", addr, false);
         return 0;
     }
+    spi1_catch_up(s);
     v = r == R1_INT_ST ? s->spi1[R1_INT_RAW] & s->spi1[R1_INT_ENA]
                        : s->spi1[r];
     return extract32(v, 8 * (addr & 3), 8 * size);
@@ -2246,6 +2262,7 @@ static void mspi_spi1_write(void *opaque, hwaddr addr, uint64_t val,
         log_bad_offset(s, "SPI1", addr, true);
         return;
     }
+    spi1_catch_up(s);
 
     switch (r) {
     case R1_CMD:
