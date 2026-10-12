@@ -667,14 +667,16 @@ static void sd_vsw_timer(void *opaque)
     line_run_at(sd->vsw_due_ns, sd_vsw_release, sd);
 }
 
+static int64_t sd_now(SDState *sd);
+
 /*
  * [spec:nuos:req:emu.esp32p4.sd-uhs]
- * SDCLK starts or stops reaching the card, at line_time(): the steps of
- * the voltage switch.
+ * SDCLK starts or stops reaching the card, at the present on its bus: the
+ * steps of the voltage switch.
  */
 static void sd_set_clock(SDState *sd, bool running)
 {
-    int64_t now = line_time();
+    int64_t now = sd_now(sd);
 
     if (running == sd->sdclk) {
         return;
