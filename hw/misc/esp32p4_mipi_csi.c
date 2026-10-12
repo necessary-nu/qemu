@@ -1152,8 +1152,16 @@ static uint64_t brg_mem_read(void *opaque, hwaddr addr, unsigned size)
 static void brg_mem_write(void *opaque, hwaddr addr, uint64_t value,
                           unsigned size)
 {
+    ESP32P4CsiBridgeState *s = opaque;
+    uint8_t b[8];
+
+    if (s->isp_dma_write) {
+        stq_le_p(b, value);
+        s->isp_dma_write(s->isp_dma, b, size);
+        return;
+    }
     qemu_log_mask(LOG_GUEST_ERROR, "%s: write to the buffer's port at 0x%"
-                  HWADDR_PRIx ", which VDMA only reads\n",
+                  HWADDR_PRIx ", with no ISP to take it\n",
                   TYPE_ESP32P4_CSI_BRIDGE, addr);
 }
 
@@ -1475,6 +1483,14 @@ void esp32p4_csi_bridge_attach_isp(ESP32P4CsiBridgeState *s,
 {
     s->isp_ops = ops;
     s->isp = opaque;
+}
+
+void esp32p4_csi_bridge_attach_isp_dma(ESP32P4CsiBridgeState *s,
+                                       ESP32P4CsiDmaWriteFn *write,
+                                       void *opaque)
+{
+    s->isp_dma_write = write;
+    s->isp_dma = opaque;
 }
 
 /* ---- The bridge's registers ---- */

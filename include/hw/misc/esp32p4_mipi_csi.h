@@ -67,6 +67,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4CsiBridgeState, ESP32P4_CSI_BRIDGE)
  * passed CSI_BRIG_CSI_BUF_AFULL_THRD, for an ISP that holds its output
  * back. The CSI bridge's reset (HP_SYS_CLKRST_RST_EN_CSI_BRG) also resets
  * the ISP (TRM 38.7.1), which the machine wires.
+ *
+ * VDMA's writes to the bridge's memory port are the ISP's input from
+ * memory (handshaking interface 2, as ESP-IDF's isp_dma.c addresses
+ * them): an ISP takes them with esp32p4_csi_bridge_attach_isp_dma(); with
+ * none they are logged and dropped.
  */
 typedef struct ESP32P4CsiIdiLine {
     uint8_t vc;
@@ -98,6 +103,12 @@ void esp32p4_csi_bridge_attach_isp(ESP32P4CsiBridgeState *s,
                                    const ESP32P4CsiIdiOps *ops,
                                    void *opaque);
 bool esp32p4_csi_bridge_almost_full(ESP32P4CsiBridgeState *s);
+
+typedef void ESP32P4CsiDmaWriteFn(void *opaque, const uint8_t *data,
+                                  unsigned size);
+void esp32p4_csi_bridge_attach_isp_dma(ESP32P4CsiBridgeState *s,
+                                       ESP32P4CsiDmaWriteFn *write,
+                                       void *opaque);
 
 /*
  * The bridge's named GPIO outputs "hs-req", "hs-single" and "hs-last" are
@@ -165,6 +176,8 @@ struct ESP32P4CsiBridgeState {
     QEMUTimer *req_timer;
     const ESP32P4CsiIdiOps *isp_ops;
     void *isp;
+    ESP32P4CsiDmaWriteFn *isp_dma_write;
+    void *isp_dma;
 
     uint32_t regs[0x50 / 4];
 

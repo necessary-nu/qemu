@@ -52,6 +52,7 @@
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "hw/misc/esp32p4_icm.h"
 #include "hw/misc/esp32p4_image_source.h"
+#include "hw/misc/esp32p4_isp.h"
 #include "hw/misc/esp32p4_keymng.h"
 #include "hw/misc/esp32p4_lcd_cam.h"
 #include "hw/misc/esp32p4_lp_ana.h"
@@ -250,6 +251,7 @@ struct ESP32P4MachineState {
     ESP32P4DsiBridgeState dsi_bridge;
     ESP32P4CsiHostState csi_host;
     ESP32P4CsiBridgeState csi_bridge;
+    ESP32P4IspState isp;
     ESP32P4RmtState rmt;
     ESP32P4PcntState pcnt;
     ESP32P4LedcState ledc;
