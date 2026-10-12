@@ -119,6 +119,11 @@ typedef struct ESP32P4DwGdmaChan {
     uint8_t fifo[ESP32P4_DW_GDMA_FIFO];
     uint32_t fifo_head;
     uint32_t fifo_num;
+    /* The bytes left of a handshaking burst under way, larger than it. */
+    uint32_t src_txn;
+    uint32_t dst_txn;
+    bool src_txn_last;
+    bool dst_txn_last;
 } ESP32P4DwGdmaChan;
 
 struct ESP32P4DwGdmaState {

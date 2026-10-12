@@ -23,7 +23,12 @@
  * esp32p4_dw_gdma.h); a peripheral that is the flow controller (TT_FC 4
  * to 7) ends the block with its last request, and BLOCK_TS does not
  * count. Memory needs no handshake. SRC_TRANSCOMP and DST_TRANSCOMP are
- * raised as a handshaking side's transactions complete.
+ * raised as a handshaking side's transactions complete. A burst
+ * transaction of more items than the channel's FIFO holds (MSIZE 128 and
+ * up at 64 bits, as ESP-IDF's MIPI DSI and CSI drivers use) moves in
+ * pieces as the FIFO fills or empties, and its request is answered as its
+ * last piece goes; a destination burst the block's end cuts short is
+ * answered then.
  *
  * Multi-block transfers (TRM 7.5.4.2, table 7.5-1), by CFG0's
  * SRC_MULTBLK_TYPE and DST_MULTBLK_TYPE: a contiguous side's address
@@ -407,6 +412,8 @@ static void ch_ack(ESP32P4DwGdmaState *s, int n, bool src)
 
 static void ch_stop(ESP32P4DwGdmaChan *c)
 {
+    c->src_txn = 0;
+    c->dst_txn = 0;
     c->enabled = false;
     c->disabling = false;
     c->susp = false;
@@ -600,6 +607,12 @@ static uint32_t ch_block_end(ESP32P4DwGdmaState *s, int n)
     c->dst_bytes = 0;
     c->src_done = false;
     c->dst_done = false;
+    if (c->dst_txn) {
+        /* The block ended within a destination burst: it is answered. */
+        c->dst_txn = 0;
+        ch_ack(s, n, false);
+    }
+    c->src_txn = 0;
     if (c->ctl1 & CTL1_IOC_BLKTFR) {
         ch_event(s, n, BLOCK_TFR_DONE);
     }
@@ -643,17 +656,26 @@ static void fifo_out(ESP32P4DwGdmaChan *c, uint8_t *buf, uint32_t len)
 
 /*
  * The bytes the next source transaction moves, or 0 if it cannot go yet;
- * *last for a flow-controlling source's last request.
+ * *start the bytes of the handshaking transaction it starts (0 for none, or
+ * for one under way), *last for a flow-controlling source's last request.
+ * A transaction the FIFO can hold goes in one round once it has room; a
+ * burst of more (an MSIZE of 128 items or more) moves as the FIFO makes
+ * room, round by round, its request answered as its last item is in.
  */
 static uint32_t src_plan(ESP32P4DwGdmaState *s, ESP32P4DwGdmaChan *c,
-                         bool *last)
+                         uint32_t *start, bool *last)
 {
     uint32_t w = ch_width(c, true);
-    uint32_t items = ch_msize(c, true);
+    uint32_t items = ch_msize(c, true), want;
 
+    *start = 0;
     *last = false;
     if (c->phase != P_XFER || c->src_done || c->susp || c->disabling) {
         return 0;
+    }
+    if (ch_src_periph(c) && c->src_txn) {
+        *last = c->src_txn_last;
+        return MIN(c->src_txn, fifo_room(c) / w * w);
     }
     if (ch_src_periph(c)) {
         DwRequest r = ch_request(s, c, true);
@@ -667,22 +689,31 @@ static uint32_t src_plan(ESP32P4DwGdmaState *s, ESP32P4DwGdmaChan *c,
     if (!ch_fc_src(c) && !ch_fc_dst(c)) {
         items = MIN(items, (ch_block_bytes(c) - c->src_bytes) / w);
     }
-    if (!items || items * w > fifo_room(c)) {
+    want = items * w;
+    if (!items || (want <= FIFO_SIZE && want > fifo_room(c))) {
         return 0;
     }
-    return items * w;
+    if (ch_src_periph(c)) {
+        *start = want;
+    }
+    return MIN(want, fifo_room(c) / w * w);
 }
 
 static uint32_t dst_plan(ESP32P4DwGdmaState *s, ESP32P4DwGdmaChan *c,
-                         bool *last)
+                         uint32_t *start, bool *last)
 {
     uint32_t w = ch_width(c, false);
-    uint32_t items = ch_msize(c, false);
+    uint32_t items = ch_msize(c, false), want;
     bool drain = c->src_done || c->susp || c->disabling;
 
+    *start = 0;
     *last = false;
     if (c->phase != P_XFER || c->dst_done || !c->fifo_num) {
         return 0;
+    }
+    if (ch_dst_periph(c) && c->dst_txn) {
+        *last = c->dst_txn_last;
+        return MIN(c->dst_txn, c->fifo_num);
     }
     if (ch_dst_periph(c)) {
         DwRequest r = ch_request(s, c, false);
@@ -693,12 +724,22 @@ static uint32_t dst_plan(ESP32P4DwGdmaState *s, ESP32P4DwGdmaChan *c,
         items = r.burst ? items : 1;
         *last = r.last && ch_fc_dst(c);
     }
-    if (items * w <= c->fifo_num) {
-        return items * w;
+    want = items * w;
+    if (want <= c->fifo_num) {
+        *start = ch_dst_periph(c) ? want : 0;
+        return want;
+    }
+    if (ch_dst_periph(c) && want > FIFO_SIZE) {
+        *start = want;
+        return c->fifo_num;
     }
     /* At the end, what is left, though less than a burst or an item. */
     if (drain || ch_fc_src(c)) {
-        return ch_dst_periph(c) ? MIN(c->fifo_num, items * w) : c->fifo_num;
+        if (ch_dst_periph(c)) {
+            *start = MIN(c->fifo_num, want);
+            return *start;
+        }
+        return c->fifo_num;
     }
     return ch_dst_periph(c) ? 0 : (c->fifo_num / w) * w;
 }
@@ -708,7 +749,8 @@ static uint32_t ch_src_xfer(ESP32P4DwGdmaState *s, int n)
 {
     ESP32P4DwGdmaChan *c = &s->ch[n];
     bool last;
-    uint32_t bytes = src_plan(s, c, &last);
+    uint32_t start;
+    uint32_t bytes = src_plan(s, c, &start, &last);
     uint32_t w = ch_width(c, true);
     int master = c->ctl0 & CTL0_SMS ? 1 : 0;
     g_autofree uint8_t *buf = g_malloc(bytes);
@@ -730,6 +772,15 @@ static uint32_t ch_src_xfer(ESP32P4DwGdmaState *s, int n)
     fifo_in(c, buf, bytes);
     c->src_bytes += bytes;
     if (ch_src_periph(c)) {
+        if (start) {
+            c->src_txn = start;
+            c->src_txn_last = last;
+        }
+        c->src_txn -= MIN(bytes, c->src_txn);
+        if (c->src_txn) {
+            return beats(bytes);
+        }
+        last = c->src_txn_last;
         ch_ack(s, n, true);
     }
     if (ch_fc_src(c) ? last
@@ -744,7 +795,8 @@ static uint32_t ch_dst_xfer(ESP32P4DwGdmaState *s, int n)
 {
     ESP32P4DwGdmaChan *c = &s->ch[n];
     bool last;
-    uint32_t bytes = dst_plan(s, c, &last);
+    uint32_t start;
+    uint32_t bytes = dst_plan(s, c, &start, &last);
     uint32_t w = ch_width(c, false);
     int master = c->ctl0 & CTL0_DMS ? 1 : 0;
     g_autofree uint8_t *buf = g_malloc(bytes);
@@ -766,6 +818,16 @@ static uint32_t ch_dst_xfer(ESP32P4DwGdmaState *s, int n)
     }
     c->dst_bytes += bytes;
     if (ch_dst_periph(c)) {
+        if (start) {
+            c->dst_txn = start;
+            c->dst_txn_last = last;
+        }
+        c->dst_txn -= MIN(bytes, c->dst_txn);
+        if (c->dst_txn && !(c->src_done && !c->fifo_num)) {
+            return beats(bytes);
+        }
+        last = c->dst_txn_last;
+        c->dst_txn = 0;
         ch_ack(s, n, false);
     }
     if (last) {
@@ -817,19 +879,21 @@ static uint32_t ch_progress(ESP32P4DwGdmaState *s, int n)
 static bool ch_reads(ESP32P4DwGdmaState *s, int n, bool *lli)
 {
     ESP32P4DwGdmaChan *c = &s->ch[n];
+    uint32_t start;
     bool last;
 
     *lli = c->enabled && c->phase == P_SETUP && ch_lli(c) &&
            !c->disabling;
-    return *lli || (c->enabled && src_plan(s, c, &last));
+    return *lli || (c->enabled && src_plan(s, c, &start, &last));
 }
 
 static bool ch_writes(ESP32P4DwGdmaState *s, int n)
 {
     ESP32P4DwGdmaChan *c = &s->ch[n];
+    uint32_t start;
     bool last;
 
-    return c->enabled && dst_plan(s, c, &last);
+    return c->enabled && dst_plan(s, c, &start, &last);
 }
 
 static uint32_t ch_prior(ESP32P4DwGdmaChan *c)
@@ -1008,6 +1072,8 @@ static void ch_enable(ESP32P4DwGdmaState *s, int n)
     c->dst_bytes = 0;
     c->src_done = false;
     c->dst_done = false;
+    c->src_txn = 0;
+    c->dst_txn = 0;
     c->fifo_head = 0;
     c->fifo_num = 0;
     c->cur_lli = 0;
@@ -1652,14 +1718,18 @@ static const VMStateDescription vmstate_esp32p4_dw_gdma_chan = {
         VMSTATE_UINT8_ARRAY(fifo, ESP32P4DwGdmaChan, ESP32P4_DW_GDMA_FIFO),
         VMSTATE_UINT32(fifo_head, ESP32P4DwGdmaChan),
         VMSTATE_UINT32(fifo_num, ESP32P4DwGdmaChan),
+        VMSTATE_UINT32(src_txn, ESP32P4DwGdmaChan),
+        VMSTATE_UINT32(dst_txn, ESP32P4DwGdmaChan),
+        VMSTATE_BOOL(src_txn_last, ESP32P4DwGdmaChan),
+        VMSTATE_BOOL(dst_txn_last, ESP32P4DwGdmaChan),
         VMSTATE_END_OF_LIST()
     },
 };
 
 static const VMStateDescription vmstate_esp32p4_dw_gdma = {
     .name = TYPE_ESP32P4_DW_GDMA,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(ch, ESP32P4DwGdmaState, NCH, 1,
                              vmstate_esp32p4_dw_gdma_chan,

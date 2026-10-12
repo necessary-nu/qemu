@@ -66,7 +66,12 @@
  *     the divisor's integer part. A mux setting the TRM calls invalid
  *     selects a stopped clock; where the TRM calls invalid a setting
  *     ESP-IDF uses (I2S's PLL_F160M, the calibration clock's RC32K and
- *     the DSI PHY's clock), the model follows ESP-IDF.
+ *     DSI_DPI_CLK's APLL_CLK, which figure 43.4-11 gives too), the model
+ *     follows ESP-IDF. DSI_DPHY_PLL_REFCLK has its own mux (XTAL, APLL,
+ *     CPLL, SPLL, MPLL) and divider in PERI_CLK_CTRL03's bits 16 to 26, as
+ *     v3's headers and figure 43.4-11 have it; the TRM's register
+ *     description gives it MIPI_DSI_DPHY_CLK_SRC_SEL's sources, as earlier
+ *     silicon had.
  *   - The PVT monitor's clocks from PLL_F160M_CLK, which ESP-IDF enables
  *     for them (pmu_pvt.c), and the LP ADC's function clock from its bus
  *     clock, LP_PERI_CLK, as TRM table 11.2-7 has it, and its SAR clocks
@@ -319,7 +324,7 @@ static const ESP32P4ClkRstReg esp32p4_clkrst_regs[ESP32P4_CLKRST_NREGS] = {
     REG(PERI_CLK_CTRL02, "HP_SYS_CLKRST_PERI_CLK_CTRL02",
         0x00000000, 0xfffffeff, 0x00000100, 0),
     REG(PERI_CLK_CTRL03, "HP_SYS_CLKRST_PERI_CLK_CTRL03",
-        0x00000000, 0x0000ffff, 0, 0),
+        0x00080000, 0x07ffffff, 0, 0),
     REG(PERI_CLK_CTRL10, "HP_SYS_CLKRST_PERI_CLK_CTRL10",
         0x00000000, 0x0fffffff, 0, 0),
     REG(PERI_CLK_CTRL11, "HP_SYS_CLKRST_PERI_CLK_CTRL11",
@@ -791,16 +796,18 @@ static const ClkDesc esp32p4_clk_desc[ESP32P4_NUM_CLOCKS] = {
                                        PNONE),
                                .sel = F(PERI_CLK_CTRL02, 30, 2),
                                .gate = { B(PERI_CLK_CTRL03, 0) } },
-    [C(MIPI_DSI_DPHY_PLLREF)] = { PARENTS(C(PLL_F20M), C(RC_FAST),
-                                          C(PLL_F25M), PNONE),
-                                  .sel = F(PERI_CLK_CTRL02, 30, 2),
-                                  .gate = { B(PERI_CLK_CTRL03, 1) } },
+    [C(MIPI_DSI_DPHY_PLLREF)] = { PARENTS(C(XTAL), C(APLL), C(CPLL),
+                                          C(SPLL), C(MPLL), PNONE, PNONE,
+                                          PNONE),
+                                  .sel = F(PERI_CLK_CTRL03, 16, 3),
+                                  .gate = { B(PERI_CLK_CTRL03, 1) },
+                                  INTDIV(PERI_CLK_CTRL03, 19, 8) },
     [C(MIPI_CSI_DPHY_CFG)] = { PARENTS(C(PLL_F20M), C(RC_FAST), C(PLL_F25M),
                                        PNONE),
                                .sel = F(PERI_CLK_CTRL03, 2, 2),
                                .gate = { B(PERI_CLK_CTRL03, 4) } },
     [C(MIPI_DSI_DPI)] = { PARENTS(C(XTAL), C(PLL_F240M), C(PLL_F160M),
-                                  PNONE),
+                                  C(APLL)),
                           .sel = F(PERI_CLK_CTRL03, 5, 2),
                           .gate = { B(PERI_CLK_CTRL03, 7) },
                           INTDIV(PERI_CLK_CTRL03, 8, 8) },

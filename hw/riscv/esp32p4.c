@@ -341,6 +341,18 @@
  *     accelerator (TRM chapter 39) at 0x50087000, behind PPA_SYS_CLK, at
  *     which it computes, and its reset, its interrupt PPA_INTR (source 96),
  *     its SRM and BLEND engines served by the 2D-DMA.
+ *   - MIPI DSI (TRM chapter 43): the DSI host at 0x500A0000 and the DSI
+ *     bridge at 0x500A0800, which VDMA feeds through its handshaking
+ *     interface 0 at 0x50105000, their interrupts DSI_INTR and
+ *     DSI_BRIDGE_INTR (sources 88 and 86); and MIPI CSI (TRM chapter 42):
+ *     the CSI-2 host at 0x5009F000 and the CSI bridge at 0x5009F800, which
+ *     VDMA empties through its interface 1 at 0x50104000, their
+ *     interrupts CSI_INTR and CSI_BRIDGE_INTR (sources 87 and 85). The
+ *     board's DSI display is a panel on the DSI host's bus, shown on a
+ *     QEMU console (hw/display/esp32p4_dsi_panel.c):
+ *
+ *       -device esp32p4-dsi-panel,width=1024,height=600
+ *
  *   - The board's cameras: an esp32p4-image-source on the camera inputs'
  *     pads, dvp-camera for LCD_CAM's camera port and the ISP's DVP input,
  *     csi-camera for MIPI CSI (include/hw/misc/esp32p4_image_source.h).
@@ -461,10 +473,6 @@ static const struct {
     { "pau",              0x50082000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
     { "pvt",              0x5009e000, 4 * KiB },
-    { "csi-host",         0x5009f000, 2 * KiB },
-    { "csi-bridge",       0x5009f800, 2 * KiB },
-    { "dsi-host",         0x500a0000, 2 * KiB },
-    { "dsi-bridge",       0x500a0800, 2 * KiB },
     { "isp",              0x500a1000, 4 * KiB },
     /* The AXI ICM's QoS command interface, above its own registers. */
     { "axi-icm-qos",      0x500a4400, 3 * KiB },
@@ -474,10 +482,6 @@ static const struct {
     { "iomux-mspi-pin",   0x500e1200, 4 * KiB - 0x200 },
     { "mem-monitor",      0x500e3000, 4 * KiB },
     { "audio-addc",       0x500e4000, 4 * KiB },
-
-    /* The MIPI bridges' memories. */
-    { "mipi-csi-mem",     0x50104000, 4 * KiB },
-    { "mipi-dsi-mem",     0x50105000, 4 * KiB },
 
     /* LP always-on peripherals. */
     { "rtc-cali",         0x50119000, 4 * KiB },
@@ -3145,6 +3149,126 @@ static void esp32p4_init_jpeg(ESP32P4MachineState *s)
 }
 
 /*
+ * MIPI DSI and MIPI CSI (TRM chapters 43 and 42): each host controller and
+ * bridge behind its bus clock (DSI_SYS_CLK for both of DSI's, the DSI host
+ * with no reset of its own; CSI_HOST_SYS_CLK, CSI_BRG_SYS_CLK) and reset,
+ * the bridges' memories (the VDMA ports) behind the bridges' own; the
+ * D-PHYs' configuration and PLL reference clocks, the DPI clock; the
+ * bridges on VDMA's handshaking interfaces 0 (DSI) and 1 (the ISP's
+ * output, which is the CSI bridge's); the CSI host on the board's
+ * csi-camera, its image interface into the CSI bridge's CSI_CM, where the
+ * ISP takes its place (include/hw/misc/esp32p4_mipi_csi.h); the DSI host's
+ * byte clock to timer group 0's calibration mux. The board's display is a
+ * -device esp32p4-dsi-panel on the DSI host's bus, "dsi".
+ */
+/* [spec:nuos:req:emu.esp32p4.mipi] */
+static void esp32p4_init_mipi(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst), *vdma = DEVICE(&s->vdma);
+    DeviceState *dsi, *dbrg, *csi, *cbrg;
+    ESP32P4ClkRstGate *g;
+    static const char *const hs[3] = {
+        ESP32P4_DW_GDMA_HS_REQ, ESP32P4_DW_GDMA_HS_SINGLE,
+        ESP32P4_DW_GDMA_HS_LAST,
+    };
+    static const char *const brg_hs[3] = {
+        ESP32P4_DSI_HS_REQ, ESP32P4_DSI_HS_SINGLE, ESP32P4_DSI_HS_LAST,
+    };
+    int i;
+
+    object_initialize_child(OBJECT(s), "dsi-host", &s->dsi_host,
+                            TYPE_ESP32P4_DSI_HOST);
+    object_initialize_child(OBJECT(s), "dsi-bridge", &s->dsi_bridge,
+                            TYPE_ESP32P4_DSI_BRIDGE);
+    object_initialize_child(OBJECT(s), "csi-host", &s->csi_host,
+                            TYPE_ESP32P4_CSI_HOST);
+    object_initialize_child(OBJECT(s), "csi-bridge", &s->csi_bridge,
+                            TYPE_ESP32P4_CSI_BRIDGE);
+    dsi = DEVICE(&s->dsi_host);
+    dbrg = DEVICE(&s->dsi_bridge);
+    csi = DEVICE(&s->csi_host);
+    cbrg = DEVICE(&s->csi_bridge);
+
+    qdev_connect_clock_in(dsi, "phy-cfg",
+                          qdev_get_clock_out(clkrst, "mipi-dsi-dphy-cfg"));
+    qdev_connect_clock_in(dsi, "phy-ref",
+                          qdev_get_clock_out(clkrst, "mipi-dsi-dphy-pllref"));
+    qdev_connect_clock_in(dbrg, "bus", qdev_get_clock_out(clkrst, "dsi-sys"));
+    qdev_connect_clock_in(dbrg, "dpi",
+                          qdev_get_clock_out(clkrst, "mipi-dsi-dpi"));
+    object_property_set_link(OBJECT(dbrg), "dsi-host", OBJECT(dsi),
+                             &error_abort);
+    qdev_connect_clock_in(csi, "phy-cfg",
+                          qdev_get_clock_out(clkrst, "mipi-csi-dphy-cfg"));
+    qdev_connect_clock_in(cbrg, "bus",
+                          qdev_get_clock_out(clkrst, "csi-brg-sys"));
+    if (s->csi_camera) {
+        object_property_set_link(OBJECT(csi), "camera",
+                                 OBJECT(s->csi_camera), &error_abort);
+    }
+    sysbus_realize(SYS_BUS_DEVICE(dsi), &error_fatal);
+    sysbus_realize(SYS_BUS_DEVICE(dbrg), &error_fatal);
+    sysbus_realize(SYS_BUS_DEVICE(csi), &error_fatal);
+    sysbus_realize(SYS_BUS_DEVICE(cbrg), &error_fatal);
+
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dsi), 0,
+                             ESP32P4_DSI_HOST_BASE, ESP32P4_CLK_DSI_SYS,
+                             ESP32P4_CLKRST_GATE_NO_RESET, 0);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dbrg), 0,
+                             ESP32P4_DSI_BRIDGE_BASE, ESP32P4_CLK_DSI_SYS,
+                             ESP32P4_RST_DSI_BRG, 0);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dbrg), 1,
+                             ESP32P4_DSI_MEM_BASE, ESP32P4_CLK_DSI_SYS,
+                             ESP32P4_RST_DSI_BRG, 0);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(csi), 0,
+                             ESP32P4_CSI_HOST_BASE, ESP32P4_CLK_CSI_HOST_SYS,
+                             ESP32P4_RST_CSI_HOST, 0);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(cbrg), 0,
+                             ESP32P4_CSI_BRIDGE_BASE, ESP32P4_CLK_CSI_BRG_SYS,
+                             ESP32P4_RST_CSI_BRG, 0);
+    g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(cbrg), 1,
+                                 ESP32P4_CSI_MEM_BASE,
+                                 ESP32P4_CLK_CSI_BRG_SYS,
+                                 ESP32P4_RST_CSI_BRG, 0);
+    esp32p4_clkrst_gate_volatile(g, 0, ESP32P4_CSI_MEM_SIZE);
+
+    sysbus_connect_irq(SYS_BUS_DEVICE(dsi), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_DSI));
+    sysbus_connect_irq(SYS_BUS_DEVICE(dbrg), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_DSI_BRIDGE));
+    sysbus_connect_irq(SYS_BUS_DEVICE(csi), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_CSI));
+    sysbus_connect_irq(SYS_BUS_DEVICE(cbrg), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_CSI_BRIDGE));
+
+    for (i = 0; i < 3; i++) {
+        qdev_connect_gpio_out_named(dbrg, brg_hs[i], 0,
+            qdev_get_gpio_in_named(vdma, hs[i], ESP32P4_DW_GDMA_HS_DSI));
+        qdev_connect_gpio_out_named(cbrg, brg_hs[i], 0,
+            qdev_get_gpio_in_named(vdma, hs[i],
+                                   ESP32P4_DW_GDMA_HS_ISP_TO_MEM));
+    }
+    qdev_connect_gpio_out_named(vdma, ESP32P4_DW_GDMA_HS_ACK,
+                                ESP32P4_DW_GDMA_HS_DSI,
+                                qdev_get_gpio_in_named(dbrg,
+                                                       ESP32P4_DSI_HS_ACK, 0));
+    qdev_connect_gpio_out_named(vdma, ESP32P4_DW_GDMA_HS_ACK,
+                                ESP32P4_DW_GDMA_HS_ISP_TO_MEM,
+                                qdev_get_gpio_in_named(cbrg,
+                                                       ESP32P4_CSI_HS_ACK, 0));
+    qdev_connect_gpio_out_named(dbrg, ESP32P4_DSI_CFG_REF_CLK_EN, 0,
+        qdev_get_gpio_in_named(dsi, ESP32P4_DSI_CFG_REF_CLK_EN, 0));
+    qdev_connect_gpio_out_named(cbrg, ESP32P4_CSI_CFG_CLK_EN, 0,
+        qdev_get_gpio_in_named(csi, ESP32P4_CSI_CFG_CLK_EN, 0));
+    qdev_connect_gpio_out_named(cbrg, ESP32P4_CSI_ENABLECLK, 0,
+        qdev_get_gpio_in_named(csi, ESP32P4_CSI_ENABLECLK, 0));
+    esp32p4_csi_host_set_sink(&s->csi_host, &esp32p4_csi_bridge_cm_ops,
+                              &s->csi_bridge);
+    clock_set_source(qdev_get_clock_in(clkrst, "dsi-dphy-in"),
+                     qdev_get_clock_out(dsi, "lanebyteclk"));
+}
+
+/*
  * The BitScrambler, between GDMA and the peripherals HP_SYSTEM attaches it
  * to; and the parallel IO controller, served by GDMA-AXI, its pads through
  * the GPIO matrix.
@@ -4604,6 +4728,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_parlio(s);
     esp32p4_init_h264(s);
     esp32p4_init_jpeg(s);
+    esp32p4_init_mipi(s);
     esp32p4_init_low_power(s);
     esp32p4_init_lp_core(s);
     esp32p4_init_uart(s);
