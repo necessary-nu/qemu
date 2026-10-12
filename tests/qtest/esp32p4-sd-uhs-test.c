@@ -9,8 +9,9 @@
  * with a QEMU SD card: S18R and S18A in ACMD41, the CMD11 voltage switch
  * and its timing, CMD6's UHS-I functions, CMD19, VO4's voltage as the
  * pads' and what a card and pads at different voltages make of each
- * other, the sample phase at SDR50 and DDR50, and the UHS speed grade in
- * the card's SD status.
+ * other, the sample phase at SDR50 and DDR50, the UHS speed grade in the
+ * card's SD status, and the socket's supply switch, GPIO45, at VO4's
+ * voltage.
  *
  * The controller's CIU runs at 40 MHz (25 ns) from PLL_F160M_CLK for
  * identification, the card at 400 kHz (2.5 us); SDR50 and DDR50 take the
@@ -111,6 +112,18 @@
 #define LDO_TIEH_SEL(v)     ((v) << 9)
 #define LDO_TIEH            (1u << 14)
 #define LDO_ANA(dref, mul)  (((uint32_t)(dref) << 28) | ((mul) << 23))
+
+/* GPIO45, the gate of the microSD socket's supply switch */
+#define GPIO                0x500e0000
+#define GPIO_OUT1_W1TS      (GPIO + 0x014)
+#define GPIO_OUT1_W1TC      (GPIO + 0x018)
+#define GPIO_ENABLE1_W1TS   (GPIO + 0x030)
+#define GPIO_FUNC_OUT(n)    (GPIO + 0x558 + 4 * (n))
+#define IO_MUX_GPIO(n)      (0x500e1000 + 0x004 + 4 * (n))
+#define MCU_SEL_GPIO        (1u << 12)
+#define FUN_IE              (1u << 9)
+#define SIG_GPIO_OUT        0x100
+#define SD_POWER_PAD        45
 
 #define PMU_PATH            "/machine/pmu"
 #define SDMMC_PATH          "/machine/sdmmc"
@@ -878,6 +891,39 @@ static void test_uhs_grade(void)
     unlink(img1);
 }
 
+/* GPIO45 a plain output, driving @high. */
+static void sd_power_pad(QTestState *qts, bool high)
+{
+    qtest_writel(qts, IO_MUX_GPIO(SD_POWER_PAD), MCU_SEL_GPIO | FUN_IE);
+    qtest_writel(qts, GPIO_FUNC_OUT(SD_POWER_PAD), SIG_GPIO_OUT);
+    qtest_writel(qts, high ? GPIO_OUT1_W1TS : GPIO_OUT1_W1TC,
+                 1u << (SD_POWER_PAD - 32));
+    qtest_writel(qts, GPIO_ENABLE1_W1TS, 1u << (SD_POWER_PAD - 32));
+}
+
+/*
+ * GPIO45, on VDD_IO_5 as the slot's pads, drives the supply switch's
+ * gate at VO4's voltage: at 1.8 V it leaves the card powered, at 3.3 V
+ * it cuts the supply; back on, the card is at 3.3 V again, offering S18A.
+ */
+/* [spec:nuos:req:emu.esp32p4.sd-uhs/test] */
+static void test_supply_switch(void)
+{
+    g_autofree char *img = make_image(SDHC_SIZE);
+    QTestState *qts = start(img, NULL);
+    uint32_t rca;
+
+    rca = uhs_card(qts);
+    sd_power_pad(qts, true);
+    cmd_ok(qts, 0, R1 | CMD_WAIT, 13, rca << 16);
+    vo4_3v3(qts);
+    g_assert_cmphex(cmd(qts, 0, R1, 13, rca << 16), ==, INT_CMDD | INT_RTO);
+    sd_power_pad(qts, false);
+    g_assert_cmphex(identify(qts, 0, true) & OCR_S18, ==, OCR_S18);
+    qtest_quit(qts);
+    unlink(img);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -892,5 +938,6 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/sd-uhs/tuning", test_tuning);
     qtest_add_func("/esp32p4/sd-uhs/sdr104", test_sdr104);
     qtest_add_func("/esp32p4/sd-uhs/uhs-grade", test_uhs_grade);
+    qtest_add_func("/esp32p4/sd-uhs/supply-switch", test_supply_switch);
     return g_test_run();
 }

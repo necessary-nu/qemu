@@ -2190,12 +2190,15 @@ static void esp32p4_init_emac(ESP32P4MachineState *s)
  * the regulators' mode inputs SDMMC_0 and SDMMC_1. Slot 1's pads, which
  * the GPIO matrix routes, are on the board's 3.3 V.
  */
+static void esp32p4_sd_supply_update(ESP32P4MachineState *s);
+
 static void esp32p4_sd_pads(void *opaque, int n, int mv)
 {
     ESP32P4MachineState *s = opaque;
 
     qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->sdmmc), DWC_SDMMC_PAD_MV,
                                         0), mv);
+    esp32p4_sd_supply_update(s);
 }
 
 static void esp32p4_init_sd_power(ESP32P4MachineState *s)
@@ -2222,12 +2225,30 @@ static void esp32p4_init_sd_power(ESP32P4MachineState *s)
  * weak pull-up loses to R27. Waveshare's documentation for its ESP32-P4
  * boards names GPIO45 the TF card's power control, low to enable. Switched
  * off, the card loses its state; switched on, it powers up afresh.
+ *
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * GPIO45 is a VDD_IO_5 pad, on VO4 as the slot's are: driven high, it
+ * holds Q1's gate at VO4's voltage, which turns Q1 off only within its
+ * gate threshold of ESP_3V3, 0.9 V (the AO3401's typical VGS(th)): from
+ * 2.4 V. With VO4 at 1.8 V, for UHS-I, the gate is 1.5 V below the source
+ * and Q1 conducts: software switches the socket off with VO4 back at
+ * 3.3 V. Unpowered, the pad drives nothing, and R27 keeps Q1 on.
  */
+static void esp32p4_sd_supply_update(ESP32P4MachineState *s)
+{
+    uint32_t gate_mv = s->sd_power_pad ? DWC_SDMMC(&s->sdmmc)->pad_mv[0] : 0;
+
+    dwc_sdmmc_set_card_power(DWC_SDMMC(&s->sdmmc), 0,
+                             gate_mv + ESP32P4_BOARD_SD_SWITCH_VTH_MV <
+                             ESP32P4_BOARD_SD_SUPPLY_MV);
+}
+
 static void esp32p4_sd_supply(void *opaque, int n, int level)
 {
     ESP32P4MachineState *s = opaque;
 
-    dwc_sdmmc_set_card_power(DWC_SDMMC(&s->sdmmc), 0, !level);
+    s->sd_power_pad = level;
+    esp32p4_sd_supply_update(s);
 }
 
 /*
