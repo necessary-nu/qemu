@@ -78,12 +78,19 @@
  * (SDn_IN + 128) / 256 at every input, though its bit pattern shapes the
  * quantisation noise less steeply than the hardware's.
  *
- * Everything is recomputed whenever a register, a peripheral signal, an
+ * The pads are resolved whenever a register, a peripheral signal, an
  * outside driver or a filter changes, and whenever software samples the
  * pads, so that the modulators' bitstreams are read at the virtual time
- * of the access. A recomputation drives every line it changes at one
- * time (see esp32_line.h): that of the change it propagates, and for a
- * register access the moment the access began, so that every block an
+ * of the access. A resolution recomputes what the change can reach and
+ * no more: for a peripheral's output signal, an outside driver or
+ * GPIO_OUT, the pads that signal or bit drives and those wired to them,
+ * the input chains of the pads whose input buffers change, and the input
+ * signals, IO MUX inputs and ETM events those reach. A change to the
+ * routing, the pads' configuration, the holds, light sleep, the board's
+ * wiring or a clock recomputes everything. Either way it drives the same
+ * lines in the same order. A resolution drives every line it changes at
+ * one time (see esp32_line.h): that of the change it propagates, and for
+ * a register access the moment the access began, so that every block an
  * edge reaches, through the matrix, the IO MUX or the ETM, sees it at the
  * same moment.
  */
@@ -845,28 +852,37 @@ static bool pad_driven_by_chip(ESP32P4GpioState *s, unsigned n, bool *level)
 
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
- * Resolve every pad's level and input buffer. A pad that has just been
- * held latches what it has; a held pad keeps that whatever its registers
- * and signals do (TRM 10.9). Pads the board wires together ("pad-wires")
- * share one level: low while any of them is driven low, from outside or
- * by its own driver; else high while any is driven high or pulled up.
+ * Resolve the pads' levels and input buffers: the drive, pulls and input
+ * enable of the pads in dirty, every pad when all, and the level of each
+ * pad on a wire with one of those; the others stand as last resolved. A
+ * pad that has just been held latches what it has; a held pad keeps that
+ * whatever its registers and signals do (TRM 10.9). Pads the board wires
+ * together ("pad-wires") share one level: low while any of them is driven
+ * low, from outside or by its own driver; else high while any is driven
+ * high or pulled up.
  */
-static void resolve(ESP32P4GpioState *s, uint64_t *pad_out,
-                    uint64_t *raw_out, uint64_t *drv_high_out,
-                    uint64_t *drv_low_out)
+static void resolve(ESP32P4GpioState *s, uint64_t dirty, bool all,
+                    uint64_t *pad_out, uint64_t *raw_out,
+                    uint64_t *drv_high_out, uint64_t *drv_low_out)
 {
-    uint64_t pad = 0, raw = 0, ie_mask = 0;
-    uint64_t drv_low = 0, drv_high = 0, pulled = 0;
-    uint64_t held = (s->ext_hold | s->lp_pad_hold) & PAD_MASK;
+    uint64_t pad, nets = 0, ie_mask = s->ie_mask;
+    uint64_t drv_low = s->drive_low, drv_high = s->drive_high;
+    uint64_t pulled = s->pulled;
+    uint64_t held = s->held;
 
-    if (s->hold_all[ESP32P4_GPIO_HOLD_ALL_HP]) {
-        held |= PAD_MASK & ~LP_PAD_MASK;
-    }
-    if (s->hold_all[ESP32P4_GPIO_HOLD_ALL_LP]) {
-        held |= LP_PAD_MASK;
+    if (all) {
+        held = (s->ext_hold | s->lp_pad_hold) & PAD_MASK;
+        if (s->hold_all[ESP32P4_GPIO_HOLD_ALL_HP]) {
+            held |= PAD_MASK & ~LP_PAD_MASK;
+        }
+        if (s->hold_all[ESP32P4_GPIO_HOLD_ALL_LP]) {
+            held |= LP_PAD_MASK;
+        }
+        dirty = PAD_MASK;
     }
 
-    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
+    for (uint64_t m = dirty & PAD_MASK; m; m &= m - 1) {
+        unsigned n = ctz64(m);
         bool drive, val, pu, ie;
 
         if (bit64(held, n) && !bit64(s->held, n)) {
@@ -898,31 +914,18 @@ static void resolve(ESP32P4GpioState *s, uint64_t *pad_out,
             drive = true;
             val = bit64(s->ext_level, n);
         }
-        if (drive) {
-            if (val) {
-                drv_high |= 1ULL << n;
-            } else {
-                drv_low |= 1ULL << n;
-            }
-        } else if (pu) {
-            pulled |= 1ULL << n;
-        }
-        if (ie) {
-            ie_mask |= 1ULL << n;
-        }
+        drv_high = deposit64(drv_high, n, 1, drive && val);
+        drv_low = deposit64(drv_low, n, 1, drive && !val);
+        pulled = deposit64(pulled, n, 1, !drive && pu);
+        ie_mask = deposit64(ie_mask, n, 1, ie);
+        nets |= s->routes.wire_net[n];
     }
-    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
-        uint64_t net = 1ULL << n;
+    pad = s->pad_level & ~nets;
+    for (uint64_t m = nets; m; m &= m - 1) {
+        unsigned n = ctz64(m);
+        uint64_t net = s->routes.wire_net[n];
         bool level;
 
-        if (s->pad_wire[n]) {
-            net = 0;
-            for (unsigned m = 0; m < ESP32P4_GPIO_PADS; m++) {
-                if (s->pad_wire[m] == s->pad_wire[n]) {
-                    net |= 1ULL << m;
-                }
-            }
-        }
         /*
          * An outside driver wins over the pad's own; on a wire, a low
          * driver wins. Undriven, a pull-up holds the pad high; pulled
@@ -937,10 +940,11 @@ static void resolve(ESP32P4GpioState *s, uint64_t *pad_out,
         }
         pad |= (uint64_t)level << n;
     }
-    raw = pad & ie_mask;
     s->held = held;
+    s->pulled = pulled;
+    s->ie_mask = ie_mask;
     *pad_out = pad;
-    *raw_out = raw;
+    *raw_out = pad & ie_mask;
     *drv_high_out = drv_high;
     *drv_low_out = drv_low;
 }
@@ -1081,11 +1085,16 @@ static bool lp_filter_on(ESP32P4GpioState *s, unsigned n)
     return FIELD_EX32(s->lp_pad[n], LP_PAD, FILTER_EN);
 }
 
-/* Take every enabled filter's samples up to time t. */
+/*
+ * Take every enabled filter's samples up to time t, which may change
+ * their outputs for the next round to take in.
+ */
 static void filters_advance(ESP32P4GpioState *s, int64_t t)
 {
     uint64_t k = clk_cycles(&s->iomux_edges, t);
     uint64_t lk = clk_cycles(&s->lp_edges, t);
+
+    s->filters_dirty = true;
 
     for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
         if (hp_filter_on(s, n)) {
@@ -1145,13 +1154,19 @@ static int64_t filters_next(ESP32P4GpioState *s)
     return next;
 }
 
-/* Arm the timer for the earliest filter output change due. */
+/*
+ * Arm the timer for the earliest filter output change due. This runs on
+ * every change, and timer_del() takes the timer list's lock even for a
+ * timer that is not armed.
+ */
 static void filters_schedule(ESP32P4GpioState *s)
 {
     int64_t next = filters_next(s);
 
     if (next == INT64_MAX) {
-        timer_del(&s->filter_timer);
+        if (timer_pending(&s->filter_timer)) {
+            timer_del(&s->filter_timer);
+        }
     } else {
         timer_mod(&s->filter_timer, next);
     }
@@ -1161,24 +1176,35 @@ static void filters_schedule(ESP32P4GpioState *s)
  * [spec:nuos:req:emu.esp32p4.gpio]
  * Run the input chains on the pads' input buffers at time t: the HP pin
  * filters, then the glitch filters, into the HP chain; the LP pin filters
- * into the LP chain.
+ * into the LP chain. Only the pads in `in` can have changed, in their
+ * input buffers or their filters' outputs, since the chains last ran:
+ * every other pad's filters already have its input, which leaves them
+ * as they are, and its stages of the chains stand.
  */
-static void run_chains(ESP32P4GpioState *s, uint64_t raw, int64_t t,
-                       uint64_t *pf_out, uint64_t *hp_out, uint32_t *lp_out)
+static void run_chains(ESP32P4GpioState *s, uint64_t raw, uint64_t in,
+                       int64_t t, uint64_t *pf_out, uint64_t *hp_out,
+                       uint32_t *lp_out)
 {
-    uint64_t k = clk_cycles(&s->iomux_edges, t);
-    uint64_t lk = clk_cycles(&s->lp_edges, t);
-    uint64_t pf = 0, hp;
-    uint32_t lp = 0;
+    uint64_t k, lk, pf = s->pf_in, hp;
+    uint32_t lp = s->lp_in;
 
-    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
+    if (!(in & PAD_MASK)) {
+        *pf_out = s->pf_in;
+        *hp_out = s->hp_in;
+        *lp_out = s->lp_in;
+        return;
+    }
+    k = clk_cycles(&s->iomux_edges, t);
+    lk = clk_cycles(&s->lp_edges, t);
+    for (uint64_t m = in & PAD_MASK; m; m &= m - 1) {
+        unsigned n = ctz64(m);
         bool v = bit64(raw, n);
 
         if (hp_filter_on(s, n)) {
             filter_input(&s->pin_filter[n], pin_filter_params, v, k);
             v = s->pin_filter[n].out;
         }
-        pf |= (uint64_t)v << n;
+        pf = deposit64(pf, n, 1, v);
     }
     hp = pf;
     for (unsigned ch = 0; ch < ESP32P4_GPIO_GLITCH_FILTERS; ch++) {
@@ -1193,14 +1219,15 @@ static void run_chains(ESP32P4GpioState *s, uint64_t raw, int64_t t,
             hp = deposit64(hp, n, 1, s->glitch_filter[ch].out);
         }
     }
-    for (unsigned n = 0; n < ESP32P4_GPIO_LP_PADS; n++) {
+    for (uint64_t m = in & LP_PAD_MASK; m; m &= m - 1) {
+        unsigned n = ctz64(m);
         bool v = bit64(raw, n);
 
         if (lp_filter_on(s, n)) {
             filter_input(&s->lp_pin_filter[n], pin_filter_params, v, lk);
             v = s->lp_pin_filter[n].out;
         }
-        lp |= (uint32_t)v << n;
+        lp = deposit32(lp, n, 1, v);
     }
     *pf_out = pf;
     *hp_out = hp;
@@ -1278,25 +1305,6 @@ static uint64_t int_view(ESP32P4GpioState *s, unsigned k)
     return gpio_status_all(s) & ena;
 }
 
-/* Whether input level in, as it was prev, makes interrupt type type. */
-static bool int_hit(unsigned type, bool prev, bool in)
-{
-    switch (type) {
-    case INT_TYPE_RISING:
-        return !prev && in;
-    case INT_TYPE_FALLING:
-        return prev && !in;
-    case INT_TYPE_ANY_EDGE:
-        return prev != in;
-    case INT_TYPE_LOW:
-        return !in;
-    case INT_TYPE_HIGH:
-        return in;
-    default:
-        return false;
-    }
-}
-
 /* The interrupt condition: a level type's level; edges are momentary. */
 static bool int_next(unsigned type, bool in)
 {
@@ -1329,6 +1337,27 @@ static uint32_t lp_status_next(ESP32P4GpioState *s)
     return v;
 }
 
+/* The pads, of the interrupt types in t, at their level type's level. */
+static uint64_t int_levels(const uint64_t *t, uint64_t in)
+{
+    uint64_t low = t[INT_TYPE_LOW] & ~in;
+
+    return low | (t[INT_TYPE_HIGH] & in);
+}
+
+/*
+ * The pads, of the interrupt types in t (a mask of pads for each), whose
+ * input, as it was prev and is in, makes their type: its edge, or its
+ * level.
+ */
+static uint64_t int_hits(const uint64_t *t, uint64_t prev, uint64_t in)
+{
+    return (t[INT_TYPE_RISING] & ~prev & in) |
+           (t[INT_TYPE_FALLING] & prev & ~in) |
+           (t[INT_TYPE_ANY_EDGE] & (prev ^ in)) |
+           int_levels(t, in);
+}
+
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
  * Latch pad interrupts into GPIO_STATUS and LP_GPIO_STATUS from each
@@ -1337,28 +1366,11 @@ static uint32_t lp_status_next(ESP32P4GpioState *s)
  */
 static void latch_interrupts(ESP32P4GpioState *s, uint64_t hp, uint32_t lp)
 {
-    uint64_t set = 0;
-    uint32_t lp_set = 0;
+    const ESP32P4GpioRoutes *r = &s->routes;
+    uint64_t set = int_hits(r->int_type, s->hp_in, hp);
+    uint32_t lp_set = int_hits(r->lp_int_type, s->lp_in, lp);
 
-    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
-        if (int_hit(FIELD_EX32(s->pin[n], PIN, INT_TYPE),
-                    bit64(s->hp_in, n), bit64(hp, n))) {
-            set |= 1ULL << n;
-        }
-    }
-    for (unsigned n = 0; n < ESP32P4_GPIO_LP_PADS; n++) {
-        uint32_t pin = s->lp_pin[n];
-        unsigned type = FIELD_EX32(pin, LP_PIN, INT_TYPE);
-        bool prev = bit64(s->lp_in, n), in = bit64(lp, n);
-
-        if (int_hit(type, prev, in)) {
-            lp_set |= 1u << n;
-            if (FIELD_EX32(pin, LP_PIN, WAKEUP_ENABLE) &&
-                type >= INT_TYPE_RISING && type <= INT_TYPE_ANY_EDGE) {
-                s->lp_wakeup_edge |= 1u << n;
-            }
-        }
-    }
+    s->lp_wakeup_edge |= lp_set & r->lp_edge_wakeup;
     s->status[0] |= (uint32_t)set;
     s->status[1] |= (uint32_t)(set >> 32);
     s->lp_status |= lp_set;
@@ -1372,31 +1384,14 @@ static void latch_interrupts(ESP32P4GpioState *s, uint64_t hp, uint32_t lp)
  */
 static bool hp_wakeup(ESP32P4GpioState *s)
 {
-    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
-        uint32_t pin = s->pin[n];
-
-        if (FIELD_EX32(pin, PIN, WAKEUP_ENABLE) &&
-            int_next(FIELD_EX32(pin, PIN, INT_TYPE), bit64(s->hp_in, n))) {
-            return true;
-        }
-    }
-    return false;
+    return (s->routes.wakeup & int_levels(s->routes.int_type, s->hp_in)) != 0;
 }
 
 static bool lp_wakeup(ESP32P4GpioState *s)
 {
-    for (unsigned n = 0; n < ESP32P4_GPIO_LP_PADS; n++) {
-        uint32_t pin = s->lp_pin[n];
-
-        if (!FIELD_EX32(pin, LP_PIN, WAKEUP_ENABLE)) {
-            continue;
-        }
-        if (int_next(FIELD_EX32(pin, LP_PIN, INT_TYPE), bit64(s->lp_in, n)) ||
-            bit64(s->lp_wakeup_edge, n)) {
-            return true;
-        }
-    }
-    return false;
+    return (s->routes.lp_wakeup &
+            (int_levels(s->routes.lp_int_type, s->lp_in) |
+             s->lp_wakeup_edge)) != 0;
 }
 
 /* Input signals */
@@ -1515,29 +1510,166 @@ static void etm_events(ESP32P4GpioState *s, uint64_t pf, int64_t t)
     }
 }
 
+/* The loopback signals' bits in their word of a signal bitmap */
+#define SIG_LOOPBACK_BITS \
+    MAKE_64BIT_MASK(SIG_LOOPBACK_FIRST % 64, \
+                    ESP32P4_GPIO_SIGS - SIG_LOOPBACK_FIRST)
+
+/*
+ * Take the routing from the registers: the pads each output signal
+ * drives, the input signals each pad reaches, and the pads of each
+ * interrupt type and enable.
+ */
+static void routes_build(ESP32P4GpioState *s)
+{
+    ESP32P4GpioRoutes *r = &s->routes;
+
+    memset(r, 0, sizeof(*r));
+    memset(r->iomux_src, -1, sizeof(r->iomux_src));
+    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
+        uint64_t bit = 1ULL << n;
+        uint32_t pin = s->pin[n];
+
+        if (lp_owned(s, n)) {
+            unsigned sel = FIELD_EX32(s->lp_func_out_sel[n], LP_FUNC_OUT,
+                                      OUT_SEL);
+
+            if (lp_func_is_matrix(s, n)) {
+                if (sel < ESP32P4_GPIO_LP_SIGS) {
+                    r->lp_out_pads[sel] |= bit;
+                }
+            } else if (n == LP_PAD_UART_TXD &&
+                       FIELD_EX32(s->lp_pad[n], LP_PAD, FUN_SEL) == 0) {
+                r->lp_out_pads[LP_SIG_UART_TXD] |= bit;
+            }
+        } else {
+            unsigned f;
+            const IomuxFunc *fn = hp_func(s, n, &f);
+            unsigned sel = FIELD_EX32(s->func_out_sel[n], FUNC_OUT, OUT_SEL);
+
+            if (fn->kind == IOMUX_GPIO && sel < ESP32P4_GPIO_SIGS) {
+                r->out_pads[sel] |= bit;
+            } else if (fn->kind == IOMUX_SIG && fn->sig_out >= 0) {
+                r->out_pads[fn->sig_out] |= bit;
+            }
+            if (fn->kind == IOMUX_SIG && fn->sig_in >= 0 &&
+                r->iomux_src[fn->sig_in] < 0) {
+                r->iomux_src[fn->sig_in] = n;
+            }
+        }
+        r->wire_net[n] = bit;
+        if (s->pad_wire[n]) {
+            for (unsigned m = 0; m < ESP32P4_GPIO_PADS; m++) {
+                if (s->pad_wire[m] == s->pad_wire[n]) {
+                    r->wire_net[n] |= 1ULL << m;
+                }
+            }
+        }
+        r->int_type[FIELD_EX32(pin, PIN, INT_TYPE)] |= bit;
+        if (FIELD_EX32(pin, PIN, WAKEUP_ENABLE)) {
+            r->wakeup |= bit;
+        }
+    }
+    for (unsigned n = 0; n < ESP32P4_GPIO_SLOTS; n++) {
+        for (unsigned k = 0; k < 4; k++) {
+            if (FIELD_EX32(s->pin[n], PIN, INT_ENA) & BIT(int_ena_bit[k])) {
+                r->intr[k] |= 1ULL << n;
+            }
+        }
+    }
+    for (unsigned n = 0; n < ESP32P4_GPIO_LP_PADS; n++) {
+        uint32_t pin = s->lp_pin[n];
+        unsigned type = FIELD_EX32(pin, LP_PIN, INT_TYPE);
+
+        r->lp_int_type[type] |= 1ULL << n;
+        if (FIELD_EX32(pin, LP_PIN, WAKEUP_ENABLE)) {
+            r->lp_wakeup |= 1u << n;
+            if (type >= INT_TYPE_RISING && type <= INT_TYPE_ANY_EDGE) {
+                r->lp_edge_wakeup |= 1u << n;
+            }
+        }
+    }
+    for (unsigned sig = 0; sig < ESP32P4_GPIO_SIGS; sig++) {
+        uint32_t cfg = s->func_in_sel[sig];
+        uint64_t bit = 1ULL << (sig % 64);
+        unsigned sel = FIELD_EX32(cfg, FUNC_IN, IN_SEL);
+
+        if (!sig_has_input(sig)) {
+            continue;
+        }
+        if (FIELD_EX32(cfg, FUNC_IN, SIG_IN_SEL)) {
+            if (sel < ESP32P4_GPIO_PADS) {
+                r->chain_sigs[sel][sig / 64] |= bit;
+            }
+        } else if (r->iomux_src[sig] >= 0) {
+            r->direct_sigs[r->iomux_src[sig]][sig / 64] |= bit;
+        }
+    }
+    for (unsigned sig = 0; sig < LP_IN_SIGS; sig++) {
+        uint32_t cfg = s->lp_func_in_sel[sig];
+        unsigned sel = FIELD_EX32(cfg, LP_FUNC_IN, IN_SEL);
+
+        if (FIELD_EX32(cfg, LP_FUNC_IN, SIG_IN_SEL) &&
+            sel < ESP32P4_GPIO_LP_PADS) {
+            r->lp_chain_sigs[sel] |= 1u << sig;
+        }
+    }
+}
+
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
  * One resolution: the modulators up to now, the pads, the input chains at
  * the time of the change being propagated, the interrupts they latch, and
  * every output that changed.
+ *
+ * A round recomputes only what the changes since the last can reach: the
+ * drive of the pads they name (dirty_pads) and of the pads a modulator's
+ * output reaches, the levels of the pads wired to those, the chains of
+ * the pads whose input buffers change (every pad's once a filter has
+ * moved), and the input signals and IO MUX inputs those reach. Nothing
+ * any other pad, chain or signal depends on has changed, so it stands as
+ * the last round left it, and the round drives the lines a round that
+ * recomputes everything would, in the same order. A round that takes in
+ * any other change (dirty_all), or drives every line (resync), recomputes
+ * everything, after taking the routing from the registers. The loopback
+ * signals, the interrupts, the wakeups and the interrupt outputs it
+ * computes every round.
  */
 static void propagate(ESP32P4GpioState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t t = esp32_line_time();
-    int8_t iomux_src[ESP32P4_GPIO_SIGS];
+    const ESP32P4GpioRoutes *r = &s->routes;
     uint64_t pad, raw, pf, hp, changed, drv_high, drv_low;
-    uint32_t lp;
+    uint64_t raw_ch, hp_ch, sigs[ESP32P4_GPIO_SIG_WORDS];
+    uint64_t dirty = s->dirty_pads;
+    uint32_t lp, lp_ch, lp_sigs;
     bool resync = s->resync;
+    bool all = resync || s->dirty_all;
+    bool filters = s->filters_dirty;
     bool irq[ESP32P4_GPIO_IRQS], wakeup;
 
     s->resync = false;
+    s->dirty_all = false;
+    s->filters_dirty = false;
+    s->dirty_pads = 0;
+    if (all) {
+        routes_build(s);
+    }
     for (unsigned ch = 0; ch < ESP32P4_GPIO_SDMS; ch++) {
+        uint8_t was = s->sdm_out[ch];
+
         sdm_advance(s, ch, now);
+        if (s->sdm_out[ch] != was) {
+            dirty |= r->out_pads[SIG_SDM0 + ch];
+        }
     }
 
-    resolve(s, &pad, &raw, &drv_high, &drv_low);
-    run_chains(s, raw, t, &pf, &hp, &lp);
+    resolve(s, dirty, all, &pad, &raw, &drv_high, &drv_low);
+    raw_ch = raw ^ s->raw_in;
+    run_chains(s, raw, all || filters ? PAD_MASK : raw_ch, t, &pf, &hp, &lp);
+    hp_ch = hp ^ s->hp_in;
+    lp_ch = lp ^ s->lp_in;
     etm_events(s, pf, t);
     latch_interrupts(s, hp, lp);
     changed = pad ^ s->pad_level;
@@ -1547,44 +1679,65 @@ static void propagate(ESP32P4GpioState *s)
     s->hp_in = hp;
     s->lp_in = lp;
 
-    memset(iomux_src, -1, sizeof(iomux_src));
-    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
-        unsigned f;
-        const IomuxFunc *fn = hp_func(s, n, &f);
+    for (uint64_t m = resync ? PAD_MASK : changed; m; m &= m - 1) {
+        unsigned n = ctz64(m);
 
-        if (!lp_owned(s, n) && fn->kind == IOMUX_SIG && fn->sig_in >= 0 &&
-            iomux_src[fn->sig_in] < 0) {
-            iomux_src[fn->sig_in] = n;
-        }
-    }
-
-    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
-        if (resync || bit64(changed, n)) {
-            qemu_set_irq(s->pad_out[n], bit64(pad, n));
-        }
+        qemu_set_irq(s->pad_out[n], bit64(pad, n));
     }
     changed = (drv_high ^ s->drive_high) | (drv_low ^ s->drive_low);
     s->drive_high = drv_high;
     s->drive_low = drv_low;
-    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
-        if (resync || bit64(changed, n)) {
-            qemu_set_irq(s->drive_high_out[n], bit64(drv_high, n));
-            qemu_set_irq(s->drive_low_out[n], bit64(drv_low, n));
-        }
-    }
-    for (unsigned sig = 0; sig < ESP32P4_GPIO_SIGS; sig++) {
-        bool v = sig_in_level(s, sig, raw, hp, iomux_src);
+    for (uint64_t m = resync ? PAD_MASK : changed; m; m &= m - 1) {
+        unsigned n = ctz64(m);
 
-        if (resync || v != s->sig_in[sig]) {
-            s->sig_in[sig] = v;
-            qemu_set_irq(s->sig_in_out[sig], v);
+        qemu_set_irq(s->drive_high_out[n], bit64(drv_high, n));
+        qemu_set_irq(s->drive_low_out[n], bit64(drv_low, n));
+    }
+
+    memset(sigs, all ? 0xff : 0, sizeof(sigs));
+    if (!all) {
+        sigs[SIG_LOOPBACK_FIRST / 64] |= SIG_LOOPBACK_BITS;
+        for (uint64_t m = hp_ch; m; m &= m - 1) {
+            for (unsigned w = 0; w < ESP32P4_GPIO_SIG_WORDS; w++) {
+                sigs[w] |= r->chain_sigs[ctz64(m)][w];
+            }
         }
-        if (sig >= SIG_LOOPBACK_FIRST && s->sig_out[sig] != v) {
-            s->sig_out[sig] = v;
-            s->update_pending = true;
+        for (uint64_t m = raw_ch; m; m &= m - 1) {
+            for (unsigned w = 0; w < ESP32P4_GPIO_SIG_WORDS; w++) {
+                sigs[w] |= r->direct_sigs[ctz64(m)][w];
+            }
         }
     }
-    for (unsigned sig = 0; sig < ESP32P4_GPIO_LP_SIGS; sig++) {
+    for (unsigned w = 0; w < ESP32P4_GPIO_SIG_WORDS; w++) {
+        for (uint64_t m = sigs[w]; m; m &= m - 1) {
+            unsigned sig = w * 64 + ctz64(m);
+            bool v = sig_in_level(s, sig, raw, hp, r->iomux_src);
+
+            if (resync || v != s->sig_in[sig]) {
+                s->sig_in[sig] = v;
+                qemu_set_irq(s->sig_in_out[sig], v);
+            }
+            if (sig >= SIG_LOOPBACK_FIRST && s->sig_out[sig] != v) {
+                s->sig_out[sig] = v;
+                s->dirty_pads |= r->out_pads[sig];
+                s->update_pending = true;
+            }
+        }
+    }
+
+    if (all) {
+        lp_sigs = MAKE_64BIT_MASK(0, ESP32P4_GPIO_LP_SIGS);
+    } else {
+        lp_sigs = 0;
+        for (uint32_t m = lp_ch; m; m &= m - 1) {
+            lp_sigs |= r->lp_chain_sigs[ctz32(m)];
+        }
+        if (bit64(raw_ch, LP_PAD_UART_RXD)) {
+            lp_sigs |= BIT(LP_SIG_UART_RXD);
+        }
+    }
+    for (uint32_t m = lp_sigs; m; m &= m - 1) {
+        unsigned sig = ctz32(m);
         bool v = lp_sig_in_level(s, sig, raw, lp);
 
         if (resync || v != s->lp_sig_in[sig]) {
@@ -1592,8 +1745,9 @@ static void propagate(ESP32P4GpioState *s)
             qemu_set_irq(s->lp_sig_in_out[sig], v);
         }
     }
-    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
-        unsigned f;
+
+    for (uint64_t m = all ? PAD_MASK : raw_ch; m; m &= m - 1) {
+        unsigned n = ctz64(m), f;
         const IomuxFunc *fn = hp_func(s, n, &f);
 
         for (unsigned i = 0; i < ESP32P4_IOMUX_FUNCS; i++) {
@@ -1620,7 +1774,8 @@ static void propagate(ESP32P4GpioState *s)
     }
 
     for (unsigned k = 0; k < 4; k++) {
-        irq[ESP32P4_GPIO_IRQ_INTR0 + k] = int_view(s, int_ena_bit[k]) != 0;
+        irq[ESP32P4_GPIO_IRQ_INTR0 + k] =
+            (gpio_status_all(s) & r->intr[k]) != 0;
     }
     irq[ESP32P4_GPIO_IRQ_PAD_COMP] = (s->int_raw & s->int_ena) != 0;
     irq[ESP32P4_GPIO_IRQ_LP] = (s->lp_status & LP_MASK) != 0;
@@ -1701,11 +1856,16 @@ static void esp32p4_gpio_settle_deferred(void *opaque)
  * round resolves, at that round's time, joins it; one at another time is
  * held back (esp32p4_gpio_held_back()) and resolved after, the earliest
  * first, in a round at its own time.
+ *
+ * The change is to the drive of the pads in pads and nothing else, or to
+ * nothing (software sampling the pads, a filter moving): the rounds
+ * recompute only what it reaches (see propagate()).
  */
-static void esp32p4_gpio_update(ESP32P4GpioState *s)
+static void esp32p4_gpio_update_pads(ESP32P4GpioState *s, uint64_t pads)
 {
     int64_t when;
 
+    s->dirty_pads |= pads;
     if (s->updating) {
         s->update_pending = true;
         return;
@@ -1720,6 +1880,17 @@ static void esp32p4_gpio_update(ESP32P4GpioState *s)
     s->update_pending = false;
     s->updating = false;
     filters_schedule(s);
+}
+
+/*
+ * A change to anything: the registers, the holds, light sleep, the
+ * board's wiring, a clock or a reset. The next round recomputes
+ * everything.
+ */
+static void esp32p4_gpio_update(ESP32P4GpioState *s)
+{
+    s->dirty_all = true;
+    esp32p4_gpio_update_pads(s, 0);
 }
 
 /*
@@ -1750,7 +1921,7 @@ static void filters_change(void *opaque)
     ESP32P4GpioState *s = opaque;
 
     filters_advance(s, esp32_line_time());
-    esp32p4_gpio_update(s);
+    esp32p4_gpio_update_pads(s, 0);
 }
 
 /*
@@ -1766,7 +1937,7 @@ static void filters_run(ESP32P4GpioState *s, int64_t t)
     while ((due = filters_next(s)) <= t) {
         if (due <= done) {
             filters_advance(s, t);
-            esp32p4_gpio_update(s);
+            esp32p4_gpio_update_pads(s, 0);
             return;
         }
         done = due;
@@ -1791,7 +1962,7 @@ static void filters_catch_up(ESP32P4GpioState *s, int64_t t)
 static void esp32p4_gpio_sample(ESP32P4GpioState *s)
 {
     esp32_line_sync();
-    esp32p4_gpio_update(s);
+    esp32p4_gpio_update_pads(s, 0);
 }
 
 /* The modulators as a line source, for blocks that sample the pads. */
@@ -1801,7 +1972,7 @@ static void esp32p4_gpio_line_sync(Notifier *n, void *data)
 
     if (sdm_clock_on(s)) {
         filters_catch_up(s, esp32_line_time());
-        esp32p4_gpio_update(s);
+        esp32p4_gpio_update_pads(s, 0);
     }
 }
 
@@ -2204,6 +2375,25 @@ static void put(uint32_t *reg, uint32_t value, uint32_t mask)
 }
 
 /*
+ * Whether a write to the GPIO matrix register at addr changes no more
+ * than the drive of the pads whose GPIO_OUT or GPIO_ENABLE bits it
+ * changes, and the interrupts, which every round recomputes.
+ */
+static bool gpio_write_narrow(hwaddr addr)
+{
+    switch (addr) {
+    case A_OUT ... A_ENABLE1_W1TC:
+    case A_STATUS ... A_STATUS1_W1TC:
+    case A_INT_RAW:
+    case A_INT_ENA:
+    case A_INT_CLR:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
  * [spec:nuos:req:emu.esp32p4.gpio]
  * GPIO matrix and GPIO_EXT register writes, of the bits in mask.
  */
@@ -2211,6 +2401,7 @@ static void gpio_write_reg(ESP32P4GpioState *s, hwaddr addr, uint32_t v,
                            uint32_t mask)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t out = gpio_out_all(s), enable = gpio_enable_all(s);
     bool route = false;
     uint32_t old;
     unsigned i;
@@ -2401,7 +2592,13 @@ static void gpio_write_reg(ESP32P4GpioState *s, hwaddr addr, uint32_t v,
                       "register\n", TYPE_ESP32P4_GPIO, addr);
         return;
     }
-    esp32p4_gpio_update(s);
+    if (gpio_write_narrow(addr)) {
+        esp32p4_gpio_update_pads(s, ((out ^ gpio_out_all(s)) |
+                                     (enable ^ gpio_enable_all(s))) &
+                                    PAD_MASK);
+    } else {
+        esp32p4_gpio_update(s);
+    }
     if (route) {
         notify_route(s);
     }
@@ -2522,6 +2719,7 @@ static bool lp_gpio_read_reg(ESP32P4GpioState *s, hwaddr addr, uint32_t *v)
 static void lp_gpio_write_reg(ESP32P4GpioState *s, hwaddr addr, uint32_t v,
                               uint32_t mask)
 {
+    uint32_t out = s->lp_out, enable = s->lp_enable;
     bool route = false;
     unsigned i, sel;
 
@@ -2609,7 +2807,19 @@ static void lp_gpio_write_reg(ESP32P4GpioState *s, hwaddr addr, uint32_t v,
                       "register\n", TYPE_ESP32P4_GPIO, addr);
         return;
     }
-    esp32p4_gpio_update(s);
+    switch (addr) {
+    case A_LP_OUT ... A_LP_STATUS_W1TC:
+        /*
+         * LP_GPIO_OUT, LP_GPIO_ENABLE and LP_GPIO_STATUS change only the
+         * drive of the pads whose bits change and the interrupts.
+         */
+        esp32p4_gpio_update_pads(s, (out ^ s->lp_out) |
+                                    (enable ^ s->lp_enable));
+        break;
+    default:
+        esp32p4_gpio_update(s);
+        break;
+    }
     if (route) {
         notify_route(s);
     }
@@ -2831,7 +3041,7 @@ static void esp32p4_gpio_pad_in(void *opaque, int n, int level)
     filters_catch_up(s, esp32_line_time());
     s->ext_driven |= 1ULL << n;
     s->ext_level = deposit64(s->ext_level, n, 1, level != 0);
-    esp32p4_gpio_update(s);
+    esp32p4_gpio_update_pads(s, 1ULL << n);
 }
 
 static void esp32p4_gpio_pad_release(void *opaque, int n, int level)
@@ -2844,7 +3054,7 @@ static void esp32p4_gpio_pad_release(void *opaque, int n, int level)
     if (level) {
         filters_catch_up(s, esp32_line_time());
         s->ext_driven &= ~(1ULL << n);
-        esp32p4_gpio_update(s);
+        esp32p4_gpio_update_pads(s, 1ULL << n);
     }
 }
 
@@ -2860,7 +3070,7 @@ static void esp32p4_gpio_set_sig_out(void *opaque, int n, int level)
     }
     filters_catch_up(s, esp32_line_time());
     s->sig_out[n] = level != 0;
-    esp32p4_gpio_update(s);
+    esp32p4_gpio_update_pads(s, s->routes.out_pads[n]);
 }
 
 static void esp32p4_gpio_set_sig_oe(void *opaque, int n, int level)
@@ -2872,7 +3082,7 @@ static void esp32p4_gpio_set_sig_oe(void *opaque, int n, int level)
     }
     filters_catch_up(s, esp32_line_time());
     s->sig_oe[n] = level != 0;
-    esp32p4_gpio_update(s);
+    esp32p4_gpio_update_pads(s, s->routes.out_pads[n]);
 }
 
 static void esp32p4_gpio_set_lp_sig_out(void *opaque, int n, int level)
@@ -2887,7 +3097,7 @@ static void esp32p4_gpio_set_lp_sig_out(void *opaque, int n, int level)
     }
     filters_catch_up(s, esp32_line_time());
     s->lp_sig_out[n] = level != 0;
-    esp32p4_gpio_update(s);
+    esp32p4_gpio_update_pads(s, s->routes.lp_out_pads[n]);
 }
 
 static void esp32p4_gpio_set_lp_sig_oe(void *opaque, int n, int level)
@@ -2899,7 +3109,7 @@ static void esp32p4_gpio_set_lp_sig_oe(void *opaque, int n, int level)
     }
     filters_catch_up(s, esp32_line_time());
     s->lp_sig_oe[n] = level != 0;
-    esp32p4_gpio_update(s);
+    esp32p4_gpio_update_pads(s, s->routes.lp_out_pads[n]);
 }
 
 static void esp32p4_gpio_set_iomux_out(void *opaque, int n, int level)
@@ -2911,7 +3121,7 @@ static void esp32p4_gpio_set_iomux_out(void *opaque, int n, int level)
     }
     filters_catch_up(s, esp32_line_time());
     s->iomux_func_out[n] = level != 0;
-    esp32p4_gpio_update(s);
+    esp32p4_gpio_update_pads(s, 1ULL << (n / ESP32P4_IOMUX_FUNCS));
 }
 
 static void esp32p4_gpio_set_iomux_oe(void *opaque, int n, int level)
@@ -2923,7 +3133,7 @@ static void esp32p4_gpio_set_iomux_oe(void *opaque, int n, int level)
     }
     filters_catch_up(s, esp32_line_time());
     s->iomux_func_oe[n] = level != 0;
-    esp32p4_gpio_update(s);
+    esp32p4_gpio_update_pads(s, 1ULL << (n / ESP32P4_IOMUX_FUNCS));
 }
 
 static void esp32p4_gpio_set_pull_up(void *opaque, int n, int level)
@@ -2935,7 +3145,7 @@ static void esp32p4_gpio_set_pull_up(void *opaque, int n, int level)
     }
     filters_catch_up(s, esp32_line_time());
     s->ext_pull_up = deposit64(s->ext_pull_up, n, 1, level != 0);
-    esp32p4_gpio_update(s);
+    esp32p4_gpio_update_pads(s, 1ULL << n);
 }
 
 static void esp32p4_gpio_set_hold(void *opaque, int n, int level)
@@ -3055,7 +3265,7 @@ static void esp32p4_gpio_set_ana_comp(void *opaque, int n, int level)
         s->ana_comp_int_ns[n] = now;
         etm = s->etm_zero_det[2 * n + (level ? 0 : 1)];
     }
-    esp32p4_gpio_update(s);
+    esp32p4_gpio_update_pads(s, s->routes.out_pads[SIG_ANA_COMP0 + n]);
     if (etm) {
         etm_pulse(etm, now);
     }
@@ -3071,7 +3281,7 @@ static void esp32p4_gpio_etm_task(void *opaque, int line, int level)
 {
     ESP32P4GpioState *s = opaque;
     unsigned ch = line / 3, kind = line % 3;
-    uint64_t pads = 0, out;
+    uint64_t pads = 0, out, was;
 
     if (esp32p4_gpio_held_back(s, esp32p4_gpio_etm_task, line, level)) {
         return;
@@ -3090,7 +3300,7 @@ static void esp32p4_gpio_etm_task(void *opaque, int line, int level)
         return;
     }
     filters_catch_up(s, esp32_line_time());
-    out = gpio_out_all(s);
+    out = was = gpio_out_all(s);
     switch (kind) {
     case ESP32P4_GPIO_ETM_SET:
         out |= pads;
@@ -3104,7 +3314,7 @@ static void esp32p4_gpio_etm_task(void *opaque, int line, int level)
     }
     s->out[0] = (uint32_t)out;
     s->out[1] = (uint32_t)(out >> 32) & HIGH_WORD_MASK;
-    esp32p4_gpio_update(s);
+    esp32p4_gpio_update_pads(s, (out ^ was) & PAD_MASK);
 }
 
 /* Resets */
@@ -3512,6 +3722,7 @@ static void esp32p4_gpio_init(Object *obj)
     }
     /* The USB Serial/JTAG PHY's D+ pull-up, on out of reset */
     s->ext_pull_up = 1ULL << 25;
+    s->dirty_all = true;
 }
 
 static void esp32p4_gpio_realize(DeviceState *dev, Error **errp)
@@ -3552,10 +3763,23 @@ static const VMStateDescription vmstate_esp32p4_gpio_filter = {
     },
 };
 
+/*
+ * The routing and the pads' pulls and input enables, which the rounds
+ * keep, are not migrated: the next round recomputes everything.
+ */
+static int esp32p4_gpio_post_load(void *opaque, int version_id)
+{
+    ESP32P4GpioState *s = opaque;
+
+    s->dirty_all = true;
+    return 0;
+}
+
 static const VMStateDescription vmstate_esp32p4_gpio = {
     .name = TYPE_ESP32P4_GPIO,
     .version_id = 4,
     .minimum_version_id = 4,
+    .post_load = esp32p4_gpio_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(iomux_clk, ESP32P4GpioState),
         VMSTATE_CLOCK(lp_clk, ESP32P4GpioState),
