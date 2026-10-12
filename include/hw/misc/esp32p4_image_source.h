@@ -9,8 +9,10 @@
 #ifndef HW_MISC_ESP32P4_IMAGE_SOURCE_H
 #define HW_MISC_ESP32P4_IMAGE_SOURCE_H
 
+#include "hw/core/clock.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/host-utils.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -89,9 +91,18 @@
  * periods later (default hblank / 4); the frame starts with a VSYNC
  * pulse "vsync" lines long (default vblank / 10, at least 1), and its
  * first line of pixels is "vbp" lines later (default vblank / 2). As on
- * a sensor, these are times on the sensor's own clock, an oscillator of
- * its own: it does not follow the chip's clocks (an XCLK from the chip
- * is not modelled).
+ * a sensor, these are times on the sensor's own clock: an oscillator of
+ * its own ("xclk=osc", the default), or with "xclk=cam" its PLL from the
+ * XCLK the board wires to LCD_CAM's CAM_CLK output, the pixel clock being
+ * XCLK * "pll-mul" / "pll-div" (each default 1; the PLL settings a
+ * sensor's registers would hold, SCCB not being modelled), and fps
+ * following from it (fps and pixel-clock are not given then). XCLK
+ * reaches the sensor while the GPIO matrix routes CAM_CLK to "xclk-pad",
+ * the pad the board wires it to (by default, to any pad): the sensor
+ * streams only while it does, and a change of its rate ends the frame in
+ * progress and starts a new one at the new rate, as the sensor's PLL
+ * relocks (interpretation: a sensor's behaviour as its XCLK changes is
+ * its own; a new frame is the plainest). xclk=cam is for a DVP sensor.
  *
  * Every edge is at an exact time: clock edge n after the stream started
  * is at the first whole ns at or after n periods, and every time in the
@@ -297,10 +308,14 @@ typedef struct ESP32P4DvpLine {
     int64_t hsync_end_ns;
     int64_t de_ns;
     int64_t de_end_ns;
-    /* The stream's start, PCLK 0; the first sample's PCLK; PCLK */
+    /*
+     * The stream's start, PCLK 0; the first sample's PCLK; PCLK's
+     * frequency, rounded to Hz, and its exact period
+     */
     int64_t epoch_ns;
     uint64_t clock;
     uint64_t pclk_hz;
+    ESP32P4ClkPeriod pclk_period;
 } ESP32P4DvpLine;
 
 /*
@@ -394,6 +409,15 @@ int64_t esp32p4_image_source_clock_ns(ESP32P4ImageSource *s, uint32_t frame,
 int esp32p4_image_source_dvp_pad(ESP32P4ImageSource *s, ESP32P4DvpSignal sig);
 
 /*
+ * Board wiring, for the machine: whether the sensor's XCLK is wired to
+ * LCD_CAM's CAM_CLK output ("xclk=cam"), and that clock, after
+ * esp32p4_image_source_connect_pads() (the sensor watches the matrix's
+ * routing of CAM_CLK).
+ */
+bool esp32p4_image_source_xclk_from_cam(ESP32P4ImageSource *s);
+void esp32p4_image_source_connect_xclk(ESP32P4ImageSource *s, Clock *cam_clk);
+
+/*
  * Board wiring, for the machine: drive VSYNC, HSYNC and DE onto their
  * pads, and watch PWDN and RESETB, through the GPIO block's "pad-in",
  * "pad-release" and "pad" lines.
@@ -401,18 +425,12 @@ int esp32p4_image_source_dvp_pad(ESP32P4ImageSource *s, ESP32P4DvpSignal sig);
 void esp32p4_image_source_connect_pads(ESP32P4ImageSource *s,
                                        DeviceState *gpio);
 
-/* The time of sample @k of @line. */
+/* The time of sample @k of @line: the first whole ns its edge has come by. */
 static inline int64_t esp32p4_dvp_sample_ns(const ESP32P4DvpLine *line,
                                             uint32_t k)
 {
-    uint64_t lo, hi;
-
-    mulu64(&lo, &hi, line->clock + k, NANOSECONDS_PER_SECOND);
-    /* Rounded up: the first whole ns the edge has come by. */
-    if (divu128(&lo, &hi, line->pclk_hz)) {
-        lo++;
-    }
-    return line->epoch_ns + lo;
+    return line->epoch_ns + esp32p4_clk_cycles_ns(line->pclk_period,
+                                                  line->clock + k);
 }
 
 /*

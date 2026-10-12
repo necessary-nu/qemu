@@ -161,3 +161,6 @@ config MAC_PVG_PCI
 
 config ESP_RGB
     bool
+
+config LCD_PANEL
+    bool

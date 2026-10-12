@@ -473,6 +473,18 @@
 #
 # @streaming: the sensor's software stream on (default true)
 #
+# @xclk: the sensor's clock, "osc", an oscillator of its own
+#     (default), or "cam", its XCLK wired to LCD_CAM's CAM_CLK output
+#     (a DVP sensor's)
+#
+# @xclk-pad: with xclk=cam, the GPIO pad the board wires XCLK to
+#     (default: wherever the matrix routes CAM_CLK)
+#
+# @pll-mul: with xclk=cam, the sensor's PLL multiplier: the pixel
+#     clock is XCLK * pll-mul / pll-div (default 1)
+#
+# @pll-div: with xclk=cam, the sensor's PLL divider (default 1)
+#
 # Since: 11.2
 ##
 { 'struct': 'Esp32p4ImageSourceProperties',
@@ -514,7 +526,11 @@
             '*vc': 'uint32',
             '*line-sync': 'bool',
             '*clock-continuous': 'bool',
-            '*streaming': 'bool' } }
+            '*streaming': 'bool',
+            '*xclk': 'str',
+            '*xclk-pad': 'int',
+            '*pll-mul': 'uint32',
+            '*pll-div': 'uint32' } }
 
 ##
 # @Esp32p4ImageProbeProperties:
