@@ -252,6 +252,7 @@ const M25ChipInfo m25chip_w25q16jv = {
  * GD25Q256E, temperature range I (-40 to 85 C): the board's
  * GD25Q256EYIGR. The status registers ship as 00h but DRV0 (S21).
  */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 const M25ChipInfo m25chip_gd25q256e = {
     .name = "GD25Q256E",
     .vendor = VENDOR_GIGADEVICE,
@@ -353,6 +354,7 @@ static bool program_kind(uint8_t kind)
 }
 
 /* [spec:nuos:req:emu.flash-chip] */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static uint8_t sr_read(M25Chip *c, int n)
 {
     uint8_t v = c->sr[n];
@@ -387,6 +389,7 @@ static uint8_t sr_read(M25Chip *c, int n)
  * false for none.
  */
 /* [spec:nuos:req:emu.flash-chip] */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static bool bp_range(M25Chip *c, uint32_t *lo, uint32_t *hi)
 {
     uint32_t size = c->info->size;
@@ -789,6 +792,7 @@ static bool ops_cut(M25Chip *c, bool now)
 }
 
 /* The volatile state as power-up or a software reset leaves it. */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static void reset_volatile(M25Chip *c)
 {
     memcpy(c->sr, c->sr_nv, sizeof(c->sr));
@@ -873,6 +877,7 @@ static bool is_program_cmd(uint8_t cmd)
 
 /* The commands the datasheet forbids while a cycle is suspended. */
 /* [spec:nuos:req:emu.flash-timing] */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static bool forbidden_suspended(M25Chip *c, uint8_t cmd)
 {
     bool prog = program_kind(c->susp.kind);
@@ -928,6 +933,7 @@ static bool needs_qe(M25Chip *c, uint8_t cmd)
 }
 
 /* The address length of a GD25Q256E command, by the current mode. */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static unsigned gd_addr_len(M25Chip *c, uint8_t cmd)
 {
     switch (cmd) {
@@ -958,6 +964,7 @@ typedef struct {
 } CmdShape;
 
 /* [spec:nuos:req:emu.flash-chip] */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static CmdShape shape(M25Chip *c, uint8_t cmd)
 {
     CmdShape sh = { .known = true, .next = PH_DATA };
@@ -1114,6 +1121,7 @@ static CmdShape shape(M25Chip *c, uint8_t cmd)
 /* Whether the transaction's opcode is accepted in the chip's state. */
 /* [spec:nuos:req:emu.flash-chip] */
 /* [spec:nuos:req:emu.flash-timing] */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static bool accepted(M25Chip *c, uint8_t cmd)
 {
     if (now_ns() < c->deaf_until) {
@@ -1150,6 +1158,7 @@ static bool accepted(M25Chip *c, uint8_t cmd)
 }
 
 /* The array address of a 3-byte command, with the GD25Q256E's A24. */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static uint32_t array_addr(M25Chip *c)
 {
     uint32_t a = c->addr;
@@ -1403,6 +1412,7 @@ uint8_t m25chip_transfer(M25Chip *c, uint8_t tx)
 /* Execution at /CS high */
 
 /* [spec:nuos:req:emu.flash-timing] */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static int64_t program_time(M25Chip *c, unsigned bytes)
 {
     int64_t pp = t(c, c->info->t_pp);
@@ -1420,6 +1430,7 @@ static bool overlaps(uint32_t a, uint32_t alen, uint32_t b, uint32_t blen)
 }
 
 /* Whether a program or erase of the array may start on [addr, +len). */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static bool may_write(M25Chip *c, uint32_t addr, uint32_t len, bool erase)
 {
     if (!c->wel) {
@@ -1570,6 +1581,7 @@ static void exec_secreg_erase(M25Chip *c)
 
 /* Whether the status registers may be written now. */
 /* [spec:nuos:req:emu.flash-chip] */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static bool sr_writable(M25Chip *c)
 {
     bool hw = !c->wp_level && !quad_enabled(c);
@@ -1650,6 +1662,7 @@ static void exec_wrsr(M25Chip *c, bool vol)
 }
 
 /* [spec:nuos:req:emu.flash-timing] */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static void exec_suspend(M25Chip *c)
 {
     int64_t now = now_ns();
@@ -1693,6 +1706,7 @@ static void exec_resume(M25Chip *c)
     update_romd(c);
 }
 
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static void exec_reset(M25Chip *c)
 {
     bool erase = ops_cut(c, false);
@@ -1725,6 +1739,7 @@ static void exec_lock(M25Chip *c)
 }
 
 /* [spec:nuos:req:emu.flash-chip] */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static void execute(M25Chip *c)
 {
     uint8_t cmd = c->cmd;

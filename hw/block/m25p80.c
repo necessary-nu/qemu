@@ -215,6 +215,9 @@ static const FlashPartInfo known_devices[] = {
     /* GigaDevice */
     { INFO("gd25q32",     0xc84016,      0,  64 << 10,  64, ER_4K) },
     { INFO("gd25q64",     0xc84017,      0,  64 << 10, 128, ER_4K) },
+    /* [spec:nuos:req:emu.esp32p4.flash-chip] */
+    { INFO("gd25q256e",   0xc84019,      0,  64 << 10, 512, ER_4K | ER_32K),
+      .chip = &m25chip_gd25q256e },
 
     /* Intel/Numonyx -- xxxs33b */
     { INFO("160s33b",     0x898911,      0,  64 << 10,  32, 0) },

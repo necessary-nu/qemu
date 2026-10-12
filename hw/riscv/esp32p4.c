@@ -733,10 +733,12 @@ static void esp32p4_init_memory(ESP32P4MachineState *s)
 }
 
 /*
- * The flash part of each size: the W25Q16JV and W25Q32RV, modelled from
- * their datasheets, at 2 and 4 MiB; Winbond W25Q parts at the others.
+ * The flash part of each size: the board's GigaDevice GD25Q256E at 32 MiB
+ * and the W25Q16JV and W25Q32RV at 2 and 4 MiB, modelled from their
+ * datasheets; Winbond W25Q parts at the others.
  */
 /* [spec:nuos:req:emu.flash-chip] */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static const char *esp32p4_flash_part(uint64_t size)
 {
     switch (size) {
@@ -751,7 +753,7 @@ static const char *esp32p4_flash_part(uint64_t size)
     case 16 * MiB:
         return "w25q128";
     case 32 * MiB:
-        return "w25q256";
+        return "gd25q256e";
     case 64 * MiB:
         return "w25q512jv";
     default:
