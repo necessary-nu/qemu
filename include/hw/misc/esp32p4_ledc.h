@@ -127,14 +127,13 @@ typedef struct ESP32P4LedcChannel {
     /*
      * The generator: its level at the start of cycles up to k_base is
      * base_level; gen_level is its level at eval_ns, out_level the output
-     * as last driven, at emit_ns.
+     * as last driven.
      */
     uint64_t k_base;
     bool base_level;
     bool gen_level;
     int64_t eval_ns;
     bool out_level;
-    int64_t emit_ns;
 } ESP32P4LedcChannel;
 
 struct ESP32P4LedcState {
@@ -147,7 +146,6 @@ struct ESP32P4LedcState {
     qemu_irq out[ESP32P4_LEDC_CHANNELS];
     qemu_irq etm_event[ESP32P4_LEDC_ETM_EVENTS];
     Notifier line_source;
-    uint32_t min_edge_ns;
 
     ESP32P4LedcTimer t[ESP32P4_LEDC_TIMERS];
     ESP32P4LedcChannel ch[ESP32P4_LEDC_CHANNELS];

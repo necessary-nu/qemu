@@ -912,6 +912,62 @@ static void test_mcpwm_rate_change(void)
     qtest_quit(qts);
 }
 
+/*
+ * LEDC channel 0 from XTAL_CLK undivided, a count every 25 ns, at a 4-bit
+ * resolution: a 400 ns period, high from HPOINT 2 for DUTY 3 counts, so
+ * that it rises 50 ns into each period and falls 75 ns later. The pad
+ * shows each edge at its nanosecond; MCPWM1's capture channels, counting
+ * XTAL_CLK too, time the pulse; PCNT unit 0 counts every rising edge.
+ */
+/* [spec:nuos:req:emu.esp32p4.pwm/test] */
+static void test_ledc_close_edges(void)
+{
+    QTestState *qts = start();
+    int64_t c;
+
+    qtest_irq_intercept_out_named(qts, GPIO_PATH, "pad");
+    pad_out(qts, 20, SIG_LEDC(0));
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_PWM1_CAP(0)), IN_SIG_IN_SEL | 20);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_PWM1_CAP(1)), IN_SIG_IN_SEL | 20);
+    pwr(qts, 1, CAP_TIMER_CFG, 1);
+    pwr(qts, 1, CAP_CH_CFG(0), 1 | (1 << 2));
+    pwr(qts, 1, CAP_CH_CFG(1), 1 | (1 << 1));
+    qtest_writel(qts, SOC_CLK_CTRL2, qtest_readl(qts, SOC_CLK_CTRL2) |
+                 PCNT_APB_CLK_EN);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_PCNT_CH0(0)), IN_SIG_IN_SEL | 20);
+    /* Rising edges counted up, unfiltered */
+    qtest_writel(qts, PCNT_CONF0(0), PCNT_POS_INC(0));
+    qtest_writel(qts, PCNT_CTRL, PCNT_CNT_RST(0));
+    qtest_writel(qts, PCNT_CTRL, 0);
+
+    ledc_timer(qts, 0, 4, 1);
+    /* The update at the first overflow */
+    c = now + 400;
+    lwr(qts, CH_HPOINT(0), 2);
+    lwr(qts, CH_DUTY(0), 3 << 4);
+    lwr(qts, CH_CONF0(0), SIG_OUT_EN | PARA_UP);
+    for (int m = 0; m < 3; m++) {
+        int64_t t = c + 400 * m;
+
+        step_to(qts, t + 49);
+        g_assert_false(qtest_get_irq(qts, 20));
+        step_to(qts, t + 50);
+        g_assert_true(qtest_get_irq(qts, 20));
+        step_to(qts, t + 124);
+        g_assert_true(qtest_get_irq(qts, 20));
+        step_to(qts, t + 125);
+        g_assert_false(qtest_get_irq(qts, 20));
+    }
+    g_assert_cmpuint(prd(qts, 1, CAP_CH(1)) - prd(qts, 1, CAP_CH(0)), ==, 3);
+
+    /* Into the 1004th period: a rising edge in each */
+    step_to(qts, c + 1003 * 400 + 200);
+    g_assert_cmpuint(qtest_readl(qts, PCNT_CNT(0)), ==, 1004);
+    g_assert_cmpuint(prd(qts, 1, CAP_CH(1)) - prd(qts, 1, CAP_CH(0)), ==, 3);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -921,6 +977,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4-pwm/ledc/fade", test_ledc_fade);
     qtest_add_func("esp32p4-pwm/ledc/overflow", test_ledc_overflow);
     qtest_add_func("esp32p4-pwm/ledc/etm", test_ledc_etm);
+    qtest_add_func("esp32p4-pwm/ledc/close-edges", test_ledc_close_edges);
     qtest_add_func("esp32p4-pwm/mcpwm/reset", test_mcpwm_reset);
     qtest_add_func("esp32p4-pwm/mcpwm/clock", test_mcpwm_clock);
     qtest_add_func("esp32p4-pwm/mcpwm/deadtime", test_mcpwm_deadtime);

@@ -93,19 +93,21 @@
  * (esp32p4_clk_period.h), reached at the first nanosecond its exact time
  * has come; the duty of any cycle, fade or not, in closed form from the
  * fade's last anchor; the outputs as functions of both. Each output
- * changes at its edges' exact times, stamped on the line
- * (hw/gpio/esp32_line.h), but no sooner than min-edge-ns after its
- * previous change: closer edges are coalesced into the level at the end
- * of the interval. Whenever software samples the pads the outputs are
- * brought to their exact levels at that moment. Updates, fade ends,
- * fade pauses and the timers' own updates are handled in time order at
+ * changes at every one of its edges' exact times, however close together,
+ * stamped on the line (hw/gpio/esp32_line.h), so that a capture, a pulse
+ * counter or an ETM event that an edge reaches sees each; the host's work
+ * grows with the edges' rate. Whenever software samples the pads the
+ * outputs are brought to their exact levels at that moment. Updates, fade
+ * ends, fade pauses and the timers' own updates are handled in time order at
  * their overflows; a QEMU timer fires for them, for the edges, and for
  * the overflows, matches and counts that an enabled interrupt or ETM
  * event waits for; the rest are accounted when software looks. An ETM
  * event is pulsed stamped with its time, in time order with the edges,
  * and a task acts at the time its pulse is stamped with. An output more
  * than 10 ms behind the present (the host running that far behind virtual
- * time) skips to its level shortly before the present.
+ * time, slower than the edges it is to drive) skips to its level shortly
+ * before the present, stamped with the moment that level began: the edges
+ * in between are lost, but no edge carries a time other than its own.
  *
  * Not modelled: the light-sleep output (TRM 58.2), which needs the PMU;
  * LEDC_CLK_EN and GAMMA_RAM_CLK_EN, clock gating that software cannot
@@ -118,7 +120,6 @@
 #include "qemu/log.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
-#include "hw/core/qdev-properties.h"
 #include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_ledc.h"
 #include "migration/vmstate.h"
@@ -242,6 +243,8 @@ static const struct {
  * replaying every change.
  */
 #define CATCHUP_NS          (10 * 1000 * 1000)
+/* How far back a skip first looks for the edge its level began at */
+#define SKIP_WINDOW_NS      (100 * 1000)
 /*
  * Cycles looked ahead for a channel's next edge: two show a steady output's
  * pattern, seventeen a dithered one's (DUTY[3:0] repeats every sixteen),
@@ -722,14 +725,38 @@ static void chan_drive(ESP32P4LedcState *s, int n, int64_t when)
     s->seen_ns = MAX(s->seen_ns, when);
     if (level != ch->out_level) {
         ch->out_level = level;
-        ch->emit_ns = when;
         esp32_line_set_at(s->out[n], level, when);
     }
 }
 
 /*
+ * The time of the last edge of channel n at or before x, after `from`,
+ * from which its level has not changed: INT64_MIN if none. Only the last
+ * stretch before x is walked edge by edge, as long as it takes to find
+ * one.
+ */
+static int64_t chan_last_edge(ESP32P4LedcState *s, int n, int64_t from,
+                              int64_t x)
+{
+    for (int64_t w = SKIP_WINDOW_NS;; w *= 2) {
+        int64_t start = x - from > w ? x - w : from;
+        int64_t last = INT64_MIN;
+
+        for (int64_t e = chan_next_edge(s, n, start); e <= x;
+             e = chan_next_edge(s, n, e)) {
+            last = e;
+        }
+        if (last != INT64_MIN || start == from) {
+            return last;
+        }
+    }
+}
+
+/*
  * Run a channel's output up to limit (and including it with inclusive),
- * coalescing edges closer than min-edge-ns after the last change.
+ * each edge at its own time. An edge more than CATCHUP_NS behind limit
+ * skips the output to its level at CATCHUP_NS before limit, stamped with
+ * the edge that began that level.
  */
 static void chan_eval(ESP32P4LedcState *s, int n, int64_t limit,
                       bool inclusive)
@@ -750,14 +777,14 @@ static void chan_eval(ESP32P4LedcState *s, int n, int64_t limit,
 
         if (e != INT64_MAX && e < limit - catchup) {
             int64_t x = limit - catchup;
+            bool level = chan_level_at(s, n, x);
+            int64_t began = level == ch->out_level ? x :
+                            chan_last_edge(s, n, ch->eval_ns, x);
 
             ch->eval_ns = x;
-            ch->gen_level = chan_level_at(s, n, x);
-            chan_drive(s, n, x);
+            ch->gen_level = level;
+            chan_drive(s, n, began == INT64_MIN ? x : began);
             continue;
-        }
-        if (e != INT64_MAX) {
-            e = MAX(e, ch->emit_ns + (int64_t)s->min_edge_ns);
         }
         if (e == INT64_MAX || e > limit || (e == limit && !inclusive)) {
             break;
@@ -1306,9 +1333,7 @@ static int64_t ledc_next_wake(ESP32P4LedcState *s)
             next = MIN(next, due_time(t, timer_time(t, k, timer_top(t))));
         }
         e = ch->sig_out_en ? chan_next_edge(s, n, ch->eval_ns) : INT64_MAX;
-        if (e != INT64_MAX) {
-            next = MIN(next, MAX(e, ch->emit_ns + (int64_t)s->min_edge_ns));
-        }
+        next = MIN(next, e);
     }
     return next;
 }
@@ -1780,7 +1805,6 @@ static void esp32p4_ledc_reset_hold(Object *obj, ResetType type)
 
         memset(ch, 0, sizeof(*ch));
         ch->eval_ns = now;
-        ch->emit_ns = INT64_MIN / 2;
     }
     s->int_raw = 0;
     s->int_ena = 0;
@@ -1826,10 +1850,6 @@ static void esp32p4_ledc_realize(DeviceState *dev, Error **errp)
     esp32_line_add_source(&ESP32P4_LEDC(dev)->line_source);
 }
 
-static const Property esp32p4_ledc_properties[] = {
-    DEFINE_PROP_UINT32("min-edge-ns", ESP32P4LedcState, min_edge_ns, 1000),
-};
-
 static const VMStateDescription vmstate_esp32p4_ledc_timer = {
     .name = TYPE_ESP32P4_LEDC "-timer",
     .version_id = 2,
@@ -1858,8 +1878,8 @@ static const VMStateDescription vmstate_esp32p4_ledc_timer = {
 
 static const VMStateDescription vmstate_esp32p4_ledc_channel = {
     .name = TYPE_ESP32P4_LEDC "-channel",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(conf0, ESP32P4LedcChannel),
         VMSTATE_UINT32(hpoint, ESP32P4LedcChannel),
@@ -1893,15 +1913,14 @@ static const VMStateDescription vmstate_esp32p4_ledc_channel = {
         VMSTATE_BOOL(gen_level, ESP32P4LedcChannel),
         VMSTATE_INT64(eval_ns, ESP32P4LedcChannel),
         VMSTATE_BOOL(out_level, ESP32P4LedcChannel),
-        VMSTATE_INT64(emit_ns, ESP32P4LedcChannel),
         VMSTATE_END_OF_LIST()
     },
 };
 
 static const VMStateDescription vmstate_esp32p4_ledc = {
     .name = TYPE_ESP32P4_LEDC,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4LedcState),
         VMSTATE_TIMER(timer, ESP32P4LedcState),
@@ -1932,7 +1951,6 @@ static void esp32p4_ledc_class_init(ObjectClass *klass, const void *data)
     dc->vmsd = &vmstate_esp32p4_ledc;
     rc->phases.hold = esp32p4_ledc_reset_hold;
     rc->phases.exit = esp32p4_ledc_reset_exit;
-    device_class_set_props(dc, esp32p4_ledc_properties);
 }
 
 /* [spec:nuos:req:emu.esp32p4.pwm] */
