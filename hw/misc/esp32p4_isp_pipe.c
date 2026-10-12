@@ -210,8 +210,13 @@ static int median9(int *a)
  * defective sample is replaced by the neighbourhood's median, of the
  * nine with itself. Dynamic algorithm 0 and 1 are the TRM's formulas,
  * algorithm 1's integer means rounded down (est = sum / 8, avg = (sum +
- * 8 pix) / 16), its thresholds DPC_THRESHOLD_L/H with 4 fractional bits
- * and its factors 5 (ESP-IDF's formats). Static correction walks the
+ * 8 pix) / 16) and its factors with 5 fractional bits (ESP-IDF's
+ * format). Its first step's ratios DPC_THRESHOLD_L/H are taken with 5
+ * fractional bits too, which is Espressif's silicon (ESP-IDF's DPC test
+ * frames: with ESP-IDF's ratios 0.5 and 1.0, written 8 and 16, it leaves
+ * a defect of 0x30 among 0x80 as it is and corrects 0x00, 0xD0 and 0xFF,
+ * as these thresholds do, where the TRM's and ESP-IDF's 4 fractional
+ * bits would correct all four). Static correction walks the
  * LUT in raster order, as the samples stream: an entry ((y << 11) | x,
  * ESP-IDF's format) equal to the sample's coordinates marks it, entries
  * below them are passed, and an entry of all ones ends the list, so the
@@ -266,8 +271,8 @@ static void dpc_row(IspPipe *p, uint32_t y, uint8_t *out)
                 int est = sum >> 3, dif = abs(est - v);
                 int avg = (sum + 8 * v) >> 4;
 
-                if (!(v * 16 < mx * (thh & 0x1f) &&
-                      v * 16 > mx * (thl & 0x1f))) {
+                if (!(v * 32 < mx * (thh & 0x1f) &&
+                      v * 32 > mx * (thl & 0x1f))) {
                     bad = (dif * 32 > avg * fdark && est >= v) ||
                           (dif * 32 > (255 - avg) * fbrig && est < v);
                 }

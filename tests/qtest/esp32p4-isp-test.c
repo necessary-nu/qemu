@@ -474,8 +474,8 @@ static void ref_bayer(const Cfg *c, const uint8_t *raw, Plane *out)
                 if (c->dpc_ctrl & 4) {
                     if (!(c->dpc_ctrl & 16)) {
                         bad |= v > mx + thh || v < mn - thl;
-                    } else if (!(v * 16 < mx * (thh & 31) &&
-                                 v * 16 > mx * (thl & 31))) {
+                    } else if (!(v * 32 < mx * (thh & 31) &&
+                                 v * 32 > mx * (thl & 31))) {
                         int est = sum / 8, dif = abs(est - v);
                         int avg = (sum + 8 * v) / 16;
 
@@ -1022,6 +1022,8 @@ static void dpc_run(Cfg *c)
     raw[4 * c->w + 8] = 0;
     raw[2 * c->w + 11] = 250;
     raw[6 * c->w + 2] = 5;
+    /* Dim, at 3/8 of its neighbours: algorithm 1's first step keeps it */
+    raw[5 * c->w + 10] = raw[5 * c->w + 10] * 3 / 8;
     raw[0] = 255;
     raw[c->w * c->h - 1] = 0;
     apply(qts, c);
