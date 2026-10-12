@@ -207,6 +207,12 @@
  *     and its reset, a baseline encoder and decoder whose pipeline runs on
  *     the same clock, its interrupt JPEG_INTR (source 95). Its data paths
  *     are the 2D-DMA's (include/hw/misc/esp32p4_jpeg.h).
+ *   - The H264 encoder (TRM chapter 41) at 0x50084000 and its dedicated
+ *     DMA, H264_DMA, at 0x500A7000, behind H264_SYS_CLK and the H264
+ *     reset, coding on H264_CLK, a baseline-profile encoder whose every
+ *     input and output moves through H264_DMA's channels and memory, as
+ *     the APMs allow; its interrupts sources 115 to 126, the DMA
+ *     channels' and the encoder's (hw/misc/esp32p4_h264.c).
  *   - The debug blocks (TRM chapters 3, 22 and 23): the debug assistant at
  *     0x3FF06000, watching the HP cores' SP, their accesses to four
  *     regions and their PCs; each HP core's RISC-V trace encoder, at
@@ -452,7 +458,6 @@ static const struct {
 
     /* HP peripherals 0. */
     { "pau",              0x50082000, 4 * KiB },
-    { "h264",             0x50084000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
     { "pvt",              0x5009e000, 4 * KiB },
     { "csi-host",         0x5009f000, 2 * KiB },
@@ -462,7 +467,6 @@ static const struct {
     { "isp",              0x500a1000, 4 * KiB },
     /* The AXI ICM's QoS command interface, above its own registers. */
     { "axi-icm-qos",      0x500a4400, 3 * KiB },
-    { "h264-dma",         0x500a7000, 4 * KiB },
 
     /* HP peripherals 1. */
     { "lcd-cam",          0x500dc000, 4 * KiB },
@@ -3029,6 +3033,38 @@ static void esp32p4_init_pwm(ESP32P4MachineState *s)
 }
 
 /*
+ * The H264 encoder and its dedicated DMA: the encoder's registers and
+ * H264_DMA's behind H264_SYS_CLK and the H264 reset, the coding timed by
+ * H264_CLK, the DMA on the bus through the APMs, and its twelve interrupt
+ * sources, the DMA channels' and the encoder's.
+ */
+/* [spec:nuos:req:emu.esp32p4.h264] */
+/* [spec:nuos:req:emu.esp32p4.interrupt-matrix] */
+static void esp32p4_init_h264(ESP32P4MachineState *s)
+{
+    DeviceState *dev;
+
+    object_initialize_child(OBJECT(s), "h264", &s->h264, TYPE_ESP32P4_H264);
+    dev = DEVICE(&s->h264);
+    object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "clk",
+                          qdev_get_clock_out(DEVICE(&s->clkrst), "h264"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev),
+                             ESP32P4_H264_MMIO_ENC, ESP32P4_H264_BASE,
+                             ESP32P4_CLK_H264_SYS, ESP32P4_RST_H264, 0);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev),
+                             ESP32P4_H264_MMIO_DMA, ESP32P4_H264_DMA_BASE,
+                             ESP32P4_CLK_H264_SYS, ESP32P4_RST_H264, 0);
+    for (int i = 0; i < ESP32P4_H264_IRQS; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), i,
+                           esp32p4_intr_source(s,
+                               ESP32P4_INTR_H264_DMA2D_OUT_CH0 + i));
+    }
+}
+
+/*
  * The JPEG codec's paths are the 2D-DMA's, as its peripheral 0 both ways:
  * the codec pulls and pushes through the 2D-DMA, and the 2D-DMA tells it
  * of data and room as it tells any peripheral it serves.
@@ -4565,6 +4601,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_emac(s);
     esp32p4_init_spi(s);
     esp32p4_init_parlio(s);
+    esp32p4_init_h264(s);
     esp32p4_init_jpeg(s);
     esp32p4_init_low_power(s);
     esp32p4_init_lp_core(s);
