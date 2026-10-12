@@ -200,10 +200,19 @@ static void send_cmd_that_blocks(QTestState *s, const char *id)
                    id, id, fifo_name);
 }
 
+/*
+ * The blocked command reads blkdebug's config from the FIFO until the end
+ * or a line it cannot parse. The end comes when the writer closes the
+ * FIFO, but on macOS a reader can miss it and wait in read() for good, as
+ * about one in a thousand runs did under load; a line, once written, it
+ * always gets. So the writer gives it a line that is not config, which
+ * fails the command: its response, error or not, is what the test awaits.
+ */
 static void unblock_blocked_cmd(void)
 {
     int fd = open(fifo_name, O_WRONLY);
     g_assert(fd >= 0);
+    g_assert(write(fd, "unblock\n", 8) == 8);
     close(fd);
 }
 
