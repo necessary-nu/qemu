@@ -77,10 +77,6 @@ typedef struct RP2350PWMSlice {
     /* Wraps not yet signalled on the DREQ line. */
     uint32_t dreq_pending;
 
-    /* When the timer last fired to update the outputs. */
-    int64_t last_out_ns;
-    int64_t out_due_ns;
-
     /* Levels last driven on the GPIO lines, per channel. */
     uint8_t out_level[2];
     uint8_t oe_level[2];
@@ -95,13 +91,6 @@ struct RP2350PWMState {
     qemu_irq out[RP2350_PWM_SLICES * 2];
     qemu_irq oe[RP2350_PWM_SLICES * 2];
     qemu_irq dreq[RP2350_PWM_SLICES];
-
-    /*
-     * Output edges closer together than this are not each delivered;
-     * the outputs are refreshed at most this often and show the
-     * slice's true level at each refresh.
-     */
-    uint32_t min_edge_ns;
 
     /* clk_sys cycle count at virtual time base_ns. */
     int64_t base_ns;
