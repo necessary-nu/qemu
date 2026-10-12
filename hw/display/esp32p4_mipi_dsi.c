@@ -67,6 +67,10 @@
  *   - DSI_CFG_REF_CLK_EN gates the host's PHY clocks; the loopback tests,
  *     BIST, the credit counters' reset and the memory controls are kept as
  *     written (logged where they would act).
+ *   - Every event happens at its time, however late the QEMU timer that
+ *     runs it (esp32_line_run_at()); register accesses, VDMA's writes and
+ *     acknowledges, and DPI clock changes first run the DPI's events and
+ *     the request interval's end that fell due before them, in order.
  *
  * The DSI host (0x500A0000), DesignWare-derived, with its D-PHY:
  *
@@ -157,6 +161,9 @@
  *     is high while a status bit is set whose INT_MSK0/1 bit is set: the
  *     DesignWare core's meaning, as the CSI host's masks have it (TRM
  *     42.6); TRM 43.4.2.4 says the reverse.
+ *   - Register accesses first run what fell due before them, in order: the
+ *     PHY's start-up, the link's phases, the pattern generator's lines,
+ *     each at its time.
  *   - Not modelled (logged when used): the DBI and eDPI interfaces, 3D,
  *     display stream compression, the TE hardware, HS skew calibration,
  *     VID_SHADOW_PIN_REQ, HS transmit timeouts (TO_HS_TX: the model's link
@@ -1804,8 +1811,42 @@ static void host_triggers(ESP32P4DsiHostState *s, uint32_t v)
 
 /* ---- The host's registers ---- */
 
+static void link_run_cb(void *opaque)
+{
+    link_run(opaque);
+}
+
+/*
+ * A register access at esp32_line_time(): first what fell due before it,
+ * the PHY's start-up, the link's phases and the pattern generator's lines,
+ * in order, each at its own time, however late their QEMU timers run.
+ */
 static void host_sync(ESP32P4DsiHostState *s)
 {
+    int64_t now = esp32_line_time();
+    QEMUTimer *timers[3] = { s->phy_timer, s->link_timer, s->vpg_timer };
+    void (*const fns[3])(void *) = {
+        (void (*)(void *))phy_update, link_run_cb, vpg_line,
+    };
+
+    for (;;) {
+        int64_t due = INT64_MAX;
+        int first = -1;
+
+        for (int i = 0; i < 3; i++) {
+            int64_t t = timer_expire_time_ns(timers[i]);
+
+            if (t >= 0 && t <= now && t < due) {
+                due = t;
+                first = i;
+            }
+        }
+        if (first < 0) {
+            break;
+        }
+        timer_del(timers[first]);
+        esp32_line_run_at(due, fns[first], s);
+    }
     link_run(s);
 }
 
@@ -2453,6 +2494,8 @@ static void brg_update_req(ESP32P4DsiBridgeState *s)
     }
 }
 
+static void brg_catch_up(ESP32P4DsiBridgeState *s, int64_t now);
+
 static void brg_req_timer_cb(void *opaque)
 {
     ESP32P4DsiBridgeState *s = opaque;
@@ -2470,6 +2513,7 @@ static void brg_hs_ack(void *opaque, int n, int level)
     if (!level) {
         return;
     }
+    brg_catch_up(s, now);
     if (breg(s, B_DMA_FLOW_CTRL) & 1) {
         uint32_t got = s->req ? brg_burst(s) : 1;
         uint32_t blk = breg(s, B_DMA_BLOCK_INTERVAL);
@@ -2545,6 +2589,7 @@ static void brg_mem_write(void *opaque, hwaddr addr, uint64_t value,
     ESP32P4DsiBridgeState *s = opaque;
     uint8_t b[8];
 
+    brg_catch_up(s, esp32_line_time());
     stq_le_p(b, value);
     if (!brg_active(s)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: FIFO write while the bridge is "
@@ -2886,13 +2931,27 @@ static void brg_timer_cb(void *opaque)
     esp32_line_run_at(brg_cyc_ns(s, s->next_cyc), brg_event, s);
 }
 
-/* Run the generator's events due by @now. */
+/*
+ * Run the generator's events and the request interval's ends due by @now,
+ * in order, each at its own time.
+ */
 static void brg_catch_up(ESP32P4DsiBridgeState *s, int64_t now)
 {
-    while (s->running && timer_pending(s->timer) &&
-           brg_cyc_ns(s, s->next_cyc) <= now) {
-        timer_del(s->timer);
-        esp32_line_run_at(brg_cyc_ns(s, s->next_cyc), brg_event, s);
+    for (;;) {
+        int64_t gen = s->running && timer_pending(s->timer) ?
+                      brg_cyc_ns(s, s->next_cyc) : INT64_MAX;
+        int64_t req = timer_pending(s->req_timer) ? s->req_hold_ns
+                                                  : INT64_MAX;
+
+        if (gen <= now && gen <= req) {
+            timer_del(s->timer);
+            esp32_line_run_at(gen, brg_event, s);
+        } else if (req <= now) {
+            timer_del(s->req_timer);
+            esp32_line_run_at(req, (void (*)(void *))brg_update_req, s);
+        } else {
+            return;
+        }
     }
 }
 
