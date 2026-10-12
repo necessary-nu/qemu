@@ -236,6 +236,8 @@ system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_ds.c',
   'esp32p4_ecc.c',
   'esp32p4_etm.c',
+  'esp32p4_h264.c',
+  'esp32p4_h264_enc.c',
   'esp32p4_hmac.c',
   'esp32p4_hp_sys.c',
   'esp32p4_huk.c',
