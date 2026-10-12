@@ -20,9 +20,11 @@
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "qemu/cutils.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
 #include "qom/object_interfaces.h"
 #include "migration/vmstate.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/gpio/esp32_line.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "hw/misc/esp32p4_image_source.h"
@@ -41,6 +43,11 @@ enum {
 enum {
     YUV_FULL,
     YUV_LIMITED,
+};
+
+enum {
+    XCLK_OSC,
+    XCLK_CAM,
 };
 
 /* The DVP outputs driven onto pads, in ESP32P4DvpSignal's order. */
@@ -135,6 +142,11 @@ struct ESP32P4ImageSource {
     bool clock_continuous;
     /* "streaming": the sensor's software stream on */
     bool enabled;
+    /* XCLK: "xclk" (XCLK_OSC or XCLK_CAM), its pad, the PLL's ratio */
+    int64_t xclk;
+    int64_t xclk_pad;
+    int64_t pll_mul;
+    int64_t pll_div;
 
     bool complete;
     ESP32P4ImageTiming timing;
@@ -157,10 +169,14 @@ struct ESP32P4ImageSource {
     GArray *events;
     QEMUTimer timer;
     bool in_run;
+    bool lag_logged;
 
     /* Board wiring */
     bool pads_connected;
+    ESP32P4GpioState *gpio;
     Notifier line_source;
+    Clock *xclk_in;
+    Notifier route_notifier;
     qemu_irq sync_in[SYNCS];
     qemu_irq sync_release[SYNCS];
     qemu_irq pin_irq[PINS];
@@ -173,6 +189,8 @@ struct ESP32P4ImageSource {
      */
     bool running;
     bool stopping;
+    /* The stream's clock (PCLK on DVP, the pixel clock on CSI) */
+    ESP32P4ClkPeriod clk_period;
     int64_t epoch_ns;
     uint32_t run_frame0;
     uint32_t frame;
@@ -304,8 +322,8 @@ static int64_t stream_clock_ns(ESP32P4ImageSource *s, uint32_t run_frame,
     const ESP32P4ImageTiming *t = &s->timing;
     uint64_t lines = (uint64_t)run_frame * t->frame_lines + line;
 
-    return s->epoch_ns + cycles_ns(lines * t->line_clocks + clock,
-                                   t->clock_hz);
+    return s->epoch_ns + esp32p4_clk_cycles_ns(s->clk_period,
+                                               lines * t->line_clocks + clock);
 }
 
 /* [spec:nuos:req:emu.esp32p4.lcd-cam] */
@@ -761,6 +779,12 @@ static bool powered(ESP32P4ImageSource *s)
     return !pin_asserted(s, PIN_PWDN) && !pin_asserted(s, PIN_RESET);
 }
 
+/* Whether the sensor's clock runs: its oscillator, or XCLK's PLL. */
+static bool clocked(ESP32P4ImageSource *s)
+{
+    return esp32p4_clk_period_running(s->clk_period);
+}
+
 static bool sync_level(ESP32P4ImageSource *s, unsigned i)
 {
     static const size_t low[SYNCS] = {
@@ -862,6 +886,7 @@ static void run_dvp_line(ESP32P4ImageSource *s, const ImageEvent *ev)
                   t->active_line + ev->line) * t->line_clocks +
                  t->active_start,
         .pclk_hz = t->clock_hz,
+        .pclk_period = s->clk_period,
     };
     guint i;
 
@@ -980,16 +1005,45 @@ static void run_until(ESP32P4ImageSource *s, int64_t now)
     s->in_run = false;
 }
 
+/* How far the host may fall behind the stream before the stream slips. */
+#define IMAGE_MAX_LAG_NS    (10 * SCALE_MS)
+
+static void update_stream(ESP32P4ImageSource *s);
+
+static void image_source_restart(void *opaque)
+{
+    ESP32P4ImageSource *s = opaque;
+
+    stop_stream(s, esp32_line_time());
+    update_stream(s);
+}
+
 /*
  * The timer runs the events at its deadline, the next event's time, and
  * no later ones even if it runs late: with the timers running in deadline
  * order, the sensor's events reach the receivers in order of time with
- * every other device's.
+ * every other device's. On the host's clock a stream faster than the
+ * host can follow falls ever further behind; once it is IMAGE_MAX_LAG_NS
+ * behind it restarts at the present, the frames between dropped (logged),
+ * rather than hold the system back for ever. (Under icount virtual time
+ * waits for it.)
  */
 static void image_source_timer(void *opaque)
 {
     ESP32P4ImageSource *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    if (s->running && s->next_ev < s->events->len &&
+        now - g_array_index(s->events, ImageEvent, s->next_ev).ns >
+        IMAGE_MAX_LAG_NS) {
+        if (!s->lag_logged) {
+            s->lag_logged = true;
+            qemu_log_mask(LOG_UNIMP, "esp32p4-image-source: the host is too "
+                          "slow for the stream: it restarts at the present, "
+                          "frames dropped\n");
+        }
+        esp32_line_run_at(now, image_source_restart, s);
+    }
     if (s->running && s->next_ev < s->events->len) {
         run_until(s, g_array_index(s->events, ImageEvent, s->next_ev).ns);
     }
@@ -1008,13 +1062,13 @@ static void update_stream(ESP32P4ImageSource *s)
         return;
     }
     run_until(s, now);
-    if (s->enabled && powered(s)) {
+    if (s->enabled && powered(s) && clocked(s)) {
         if (!s->running) {
             start_stream(s, now);
         }
         s->stopping = false;
     } else if (s->running) {
-        if (powered(s)) {
+        if (powered(s) && clocked(s)) {
             s->stopping = true;
         } else {
             stop_stream(s, now);
@@ -1050,6 +1104,89 @@ static void image_source_pin(void *opaque, int n, int level)
     for (i = 0; i < SYNCS; i++) {
         sync_pad_update(s, i);
     }
+}
+
+/*
+ * XCLK
+ * ====
+ */
+
+/* Whether CAM_CLK reaches the sensor's XCLK through the matrix. */
+static bool xclk_reaches(ESP32P4ImageSource *s)
+{
+    uint64_t pads;
+
+    if (!s->gpio) {
+        return false;
+    }
+    pads = esp32p4_gpio_sig_out_pads(s->gpio, ESP32P4_SIG_CAM_CLK_PAD_OUT);
+    return s->xclk_pad >= 0 ? pads >> s->xclk_pad & 1 : pads != 0;
+}
+
+/* The stream's clock: XCLK through the PLL, times PCLKs a pixel on DVP. */
+static ESP32P4ClkPeriod xclk_stream_period(ESP32P4ImageSource *s)
+{
+    if (!s->xclk_in || !clock_is_enabled(s->xclk_in) || !xclk_reaches(s)) {
+        return esp32p4_clk_period_stopped();
+    }
+    return esp32p4_clk_period_scale(esp32p4_clk_exact(s->xclk_in),
+                                    s->pll_div,
+                                    s->pll_mul * s->timing.dvp_clocks);
+}
+
+/*
+ * XCLK's rate as it reaches the sensor has changed: a stream in progress
+ * ends there, and one starts at the new rate if the sensor streams.
+ */
+static void xclk_changed(ESP32P4ImageSource *s)
+{
+    ESP32P4ImageTiming *t = &s->timing;
+    ESP32P4ClkPeriod p = xclk_stream_period(s);
+    int64_t now = esp32_line_time();
+    uint64_t units;
+
+    if (esp32p4_clk_period_eq(p, s->clk_period)) {
+        return;
+    }
+    run_until(s, now);
+    if (s->running) {
+        stop_stream(s, now);
+    }
+    s->clk_period = p;
+    units = esp32p4_clk_period_floor(p);
+    t->clock_hz = units ? (CLOCK_PERIOD_1SEC + units / 2) / units : 0;
+    t->pixel_hz = t->clock_hz / MAX(t->dvp_clocks, 1);
+    update_stream(s);
+}
+
+static void xclk_update(void *opaque, ClockEvent event)
+{
+    xclk_changed(opaque);
+}
+
+static void xclk_route_changed(Notifier *n, void *data)
+{
+    xclk_changed(container_of(n, ESP32P4ImageSource, route_notifier));
+}
+
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
+bool esp32p4_image_source_xclk_from_cam(ESP32P4ImageSource *s)
+{
+    return s->xclk == XCLK_CAM;
+}
+
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
+void esp32p4_image_source_connect_xclk(ESP32P4ImageSource *s, Clock *cam_clk)
+{
+    assert(s->xclk == XCLK_CAM && !s->xclk_in);
+    s->xclk_in = clock_new(OBJECT(s), "xclk-in");
+    clock_set_callback(s->xclk_in, xclk_update, s, ClockUpdate);
+    clock_set_source(s->xclk_in, cam_clk);
+    if (s->gpio) {
+        s->route_notifier.notify = xclk_route_changed;
+        esp32p4_gpio_add_route_notifier(s->gpio, &s->route_notifier);
+    }
+    xclk_changed(s);
 }
 
 /*
@@ -1109,6 +1246,11 @@ bool esp32p4_image_source_bind(ESP32P4ImageSource *s, ESP32P4ImagePort port,
     if (t->port != ESP32P4_IMAGE_PORT_NONE) {
         error_setg(errp, "esp32p4-image-source: the sensor is wired to the "
                    "%s port, not %s", names[t->port], names[port]);
+        return false;
+    }
+    if (port == ESP32P4_IMAGE_PORT_CSI && s->xclk == XCLK_CAM) {
+        error_setg(errp, "esp32p4-image-source: xclk=cam is for a DVP "
+                   "sensor");
         return false;
     }
     if (port == ESP32P4_IMAGE_PORT_DVP) {
@@ -1173,6 +1315,9 @@ bool esp32p4_image_source_bind(ESP32P4ImageSource *s, ESP32P4ImagePort port,
         }
     }
     t->port = port;
+    if (s->xclk == XCLK_OSC) {
+        s->clk_period = esp32p4_clk_period_of_hz(t->clock_hz, 1);
+    }
     update_stream(s);
     return true;
 }
@@ -1268,6 +1413,7 @@ void esp32p4_image_source_connect_pads(ESP32P4ImageSource *s,
 
     assert(!s->pads_connected);
     s->pads_connected = true;
+    s->gpio = ESP32P4_GPIO(gpio);
     for (i = 0; i < SYNCS; i++) {
         int64_t pad = s->pad[sync_sig[i]];
 
@@ -1381,11 +1527,12 @@ static bool parse_data_pads(ESP32P4ImageSource *s, Error **errp)
 static bool check_pads(ESP32P4ImageSource *s, Error **errp)
 {
     uint64_t used = 0;
-    int64_t pads[ESP32P4_DVP_SIGNALS + PINS];
+    int64_t pads[ESP32P4_DVP_SIGNALS + PINS + 1];
     unsigned i;
 
     memcpy(pads, s->pad, sizeof(s->pad));
     memcpy(pads + ESP32P4_DVP_SIGNALS, s->pin_pad, sizeof(s->pin_pad));
+    pads[ESP32P4_DVP_SIGNALS + PINS] = s->xclk_pad;
     for (i = 0; i < ARRAY_SIZE(pads); i++) {
         if (pads[i] < 0) {
             continue;
@@ -1491,7 +1638,29 @@ static bool image_source_setup(ESP32P4ImageSource *s, ESP32P4Picture *pic,
         return false;
     }
     total = (uint64_t)s->hts * s->vts;
-    if (s->pixel_clock > 0) {
+    if (s->xclk < 0) {
+        s->xclk = XCLK_OSC;
+    }
+    if (s->pll_mul < 0) {
+        s->pll_mul = 1;
+    }
+    if (s->pll_div < 0) {
+        s->pll_div = 1;
+    }
+    if (s->xclk == XCLK_CAM) {
+        if (s->fps >= 0 || s->pixel_clock > 0) {
+            error_setg(errp, "esp32p4-image-source: with xclk=cam the pixel "
+                       "clock is XCLK * pll-mul / pll-div, not fps or "
+                       "pixel-clock");
+            return false;
+        }
+        s->fps = 0;
+        s->pixel_clock = 0;
+    } else if (s->xclk_pad >= 0 || s->pll_mul != 1 || s->pll_div != 1) {
+        error_setg(errp, "esp32p4-image-source: xclk-pad, pll-mul and "
+                   "pll-div are for a sensor with xclk=cam");
+        return false;
+    } else if (s->pixel_clock > 0) {
         if (s->fps > 0 && s->fps * total != s->pixel_clock) {
             error_setg(errp, "esp32p4-image-source: fps %" PRId64 " is not "
                        "pixel-clock / (hts * vts)", s->fps);
@@ -1583,13 +1752,14 @@ static int image_source_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_image_source = {
     .name = TYPE_ESP32P4_IMAGE_SOURCE,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = image_source_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(enabled, ESP32P4ImageSource),
         VMSTATE_BOOL(running, ESP32P4ImageSource),
         VMSTATE_BOOL(stopping, ESP32P4ImageSource),
+        VMSTATE_ESP32P4_CLK_PERIOD(clk_period, ESP32P4ImageSource),
         VMSTATE_INT64(epoch_ns, ESP32P4ImageSource),
         VMSTATE_UINT32(run_frame0, ESP32P4ImageSource),
         VMSTATE_UINT32(frame, ESP32P4ImageSource),
@@ -1660,6 +1830,13 @@ static const IntProp int_props[] = {
     INT_PROP("lane-rate", lane_rate, 1, 10000000000LL, "CSI: bit/s on each "
              "lane (default: enough for the mode, from 80 Mbit/s)"),
     INT_PROP("vc", vc, 0, 3, "CSI: the packets' virtual channel"),
+    INT_PROP("xclk-pad", xclk_pad, -1, ESP32P4_GPIO_PADS - 1,
+             "xclk=cam: the pad the sensor's XCLK is wired to (default: "
+             "wherever the matrix routes CAM_CLK)"),
+    INT_PROP("pll-mul", pll_mul, 1, 1024, "xclk=cam: the PLL's multiplier, "
+             "pixel clock = XCLK * pll-mul / pll-div (default 1)"),
+    INT_PROP("pll-div", pll_div, 1, 1024, "xclk=cam: the PLL's divider "
+             "(default 1)"),
 };
 
 typedef struct ChoiceProp {
@@ -1675,6 +1852,7 @@ static const char *const bayer_values[] = {
 };
 static const char *const matrix_values[] = { "bt601", "bt709", NULL };
 static const char *const range_values[] = { "full", "limited", NULL };
+static const char *const xclk_values[] = { "osc", "cam", NULL };
 
 static const ChoiceProp choice_props[] = {
     { "pattern", offsetof(ESP32P4ImageSource, pattern), pattern_values,
@@ -1685,6 +1863,9 @@ static const ChoiceProp choice_props[] = {
       "YUV: bt601 (default) or bt709" },
     { "yuv-range", offsetof(ESP32P4ImageSource, yuv_range), range_values,
       "YUV: full (default) or limited" },
+    { "xclk", offsetof(ESP32P4ImageSource, xclk), xclk_values,
+      "The sensor's clock: osc, an oscillator of its own (default), or cam, "
+      "XCLK wired to LCD_CAM's CAM_CLK output" },
 };
 
 typedef struct BoolProp {
@@ -1933,6 +2114,9 @@ static void image_source_finalize(Object *obj)
     timer_del(&s->timer);
     if (s->line_source.notify) {
         notifier_remove(&s->line_source);
+    }
+    if (s->route_notifier.notify) {
+        notifier_remove(&s->route_notifier);
     }
     for (i = 0; i < PINS; i++) {
         qemu_free_irq(s->pin_irq[i]);

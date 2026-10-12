@@ -53,6 +53,7 @@
 #include "hw/misc/esp32p4_icm.h"
 #include "hw/misc/esp32p4_image_source.h"
 #include "hw/misc/esp32p4_keymng.h"
+#include "hw/misc/esp32p4_lcd_cam.h"
 #include "hw/misc/esp32p4_lp_ana.h"
 #include "hw/misc/esp32p4_lp_mailbox.h"
 #include "hw/misc/esp32p4_ledc.h"
@@ -238,6 +239,7 @@ struct ESP32P4MachineState {
     ESP32P4ParlioState parlio;
     ESP32P4H264State h264;
     ESP32P4JpegState jpeg;
+    ESP32P4LcdCamState lcd_cam;
     ESP32P4TwaiState twai;
     /* The QEMU CAN buses on TWAI0 to TWAI2's pads, or NULL. */
     CanBusState *canbus[ESP32P4_TWAI_NUM];

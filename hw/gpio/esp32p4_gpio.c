@@ -2166,6 +2166,42 @@ bool esp32p4_gpio_sig_in_source(ESP32P4GpioState *s, unsigned sig,
     return true;
 }
 
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+int esp32p4_gpio_pad_out_sig(ESP32P4GpioState *s, unsigned n, bool *inverted)
+{
+    const IomuxFunc *fn;
+    bool val, oe;
+    unsigned f;
+    int sig;
+
+    *inverted = false;
+    if (n >= ESP32P4_GPIO_PADS || lp_owned(s, n)) {
+        return -1;
+    }
+    sig = pad_drive(s, n, &val, &oe);
+    if (sig < 0 || !oe) {
+        return -1;
+    }
+    fn = hp_func(s, n, &f);
+    if (fn->kind == IOMUX_GPIO) {
+        *inverted = FIELD_EX32(s->func_out_sel[n], FUNC_OUT, OUT_INV_SEL);
+    }
+    return sig;
+}
+
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+bool esp32p4_gpio_sig_in_inverted(ESP32P4GpioState *s, unsigned sig)
+{
+    uint32_t cfg;
+
+    if (!sig_has_input(sig)) {
+        return false;
+    }
+    cfg = s->func_in_sel[sig];
+    return FIELD_EX32(cfg, FUNC_IN, SIG_IN_SEL) &&
+           FIELD_EX32(cfg, FUNC_IN, IN_INV_SEL);
+}
+
 /* Register blocks */
 
 /* GPIO_INTR_k and GPIO_INTR1_k */

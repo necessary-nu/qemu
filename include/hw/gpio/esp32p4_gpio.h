@@ -575,6 +575,22 @@ bool esp32p4_gpio_sig_in_source(ESP32P4GpioState *s, unsigned sig,
                                 unsigned *src, bool *inverted);
 
 /*
+ * The HP matrix output signal pad n carries with its output enabled
+ * (through the matrix or its IO MUX function), or -1, with *inverted set
+ * where GPIO_FUNCn_OUT_INV_SEL inverts it on the way: for a peripheral
+ * whose link to a board device is above single pad transitions, to see
+ * which of its signals reach the device's pins.
+ */
+int esp32p4_gpio_pad_out_sig(ESP32P4GpioState *s, unsigned n, bool *inverted);
+
+/*
+ * Whether the GPIO matrix inverts input signal sig on its way from the
+ * pad (GPIO_FUNCn_IN_INV_SEL, with SIG_IN_SEL routing it through the
+ * matrix), for the same kind of peripheral as esp32p4_gpio_sig_in_pad().
+ */
+bool esp32p4_gpio_sig_in_inverted(ESP32P4GpioState *s, unsigned sig);
+
+/*
  * Whether HP pad n's IO MUX selects function func, with its input
  * enabled: for a block whose IO MUX function takes a clock from the pad,
  * which no line carries.

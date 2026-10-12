@@ -386,7 +386,7 @@ qtests_riscv32 = \
      'esp32p4-ana-cmpr-test', 'esp32p4-lp-rom-test',
      'esp32p4-image-source-test', 'esp32p4-jpeg-test',
      'esp32p4-dma2d-test', 'esp32p4-ppa-test',
-     'esp32p4-h264-test', 'esp32p4-mipi-test'] :
+     'esp32p4-h264-test', 'esp32p4-mipi-test', 'esp32p4-lcd-cam-test'] :
     [])
 
 qtests_riscv64 = ['riscv-csr-test'] + \

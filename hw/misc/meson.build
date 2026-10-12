@@ -247,6 +247,8 @@ system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_jpeg.c',
   'esp32p4_jpeg_codec.c',
   'esp32p4_keymng.c',
+  'esp32p4_lcd_cam.c',
+  'esp32p4_lcd_cam_conv.c',
   'esp32p4_ledc.c',
   'esp32p4_lp_ana.c',
   'esp32p4_lp_mailbox.c',
