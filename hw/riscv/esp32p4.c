@@ -320,6 +320,13 @@
  *     its interrupt PWMn_INTR (sources 38 and 39), its six outputs, sync,
  *     fault and capture inputs matrix signals 89 to 106. Their ETM events
  *     and tasks are the ETM's.
+ *   - The 2D-DMA controller (TRM chapter 8) at 0x50088000, behind
+ *     DMA2D_SYS_CLK, which also clocks its transfers, and its reset, four
+ *     TX and three RX channels, their interrupts sources 104 to 108, 128
+ *     and 129, its ETM events and tasks the ETM's; its accesses go
+ *     through the DMA APM as the 2D-DMA masters, to memory directly, past
+ *     the caches. A peripheral served by it attaches as
+ *     include/hw/dma/esp32p4_dma2d.h describes.
  *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
@@ -433,7 +440,6 @@ static const struct {
     { "h264",             0x50084000, 4 * KiB },
     { "jpeg",             0x50086000, 4 * KiB },
     { "ppa",              0x50087000, 4 * KiB },
-    { "dma2d",            0x50088000, 4 * KiB },
     { "ddr-phy",          0x5009d000, 4 * KiB },
     { "pvt",              0x5009e000, 4 * KiB },
     { "csi-host",         0x5009f000, 2 * KiB },
@@ -2217,6 +2223,39 @@ static void esp32p4_init_dma(ESP32P4MachineState *s)
 }
 
 /*
+ * The 2D-DMA controller, on the bus through the APMs, behind its bus clock
+ * and reset, which also clock its transfers.
+ */
+/* [spec:nuos:req:emu.esp32p4.ppa] */
+static void esp32p4_init_media(ESP32P4MachineState *s)
+{
+    static const int dma2d_intr[ESP32P4_DMA2D_IRQS] = {
+        ESP32P4_INTR_DMA2D_IN_CH0, ESP32P4_INTR_DMA2D_IN_CH1,
+        ESP32P4_INTR_DMA2D_IN_CH2, ESP32P4_INTR_DMA2D_OUT_CH0,
+        ESP32P4_INTR_DMA2D_OUT_CH1, ESP32P4_INTR_DMA2D_OUT_CH2,
+        ESP32P4_INTR_DMA2D_OUT_CH3,
+    };
+    DeviceState *clkrst = DEVICE(&s->clkrst);
+    DeviceState *dev;
+    int n;
+
+    object_initialize_child(OBJECT(s), "dma2d", &s->dma2d,
+                            TYPE_ESP32P4_DMA2D);
+    dev = DEVICE(&s->dma2d);
+    object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
+                             &error_abort);
+    qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, "dma2d-sys"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_DMA2D_BASE, ESP32P4_CLK_DMA2D_SYS,
+                             ESP32P4_RST_DMA2D, 0);
+    for (n = 0; n < ESP32P4_DMA2D_IRQS; n++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), n,
+                           esp32p4_intr_source(s, dma2d_intr[n]));
+    }
+}
+
+/*
  * GP-SPI2 and GP-SPI3, their registers behind GPSPI2_APB_CLK and
  * GPSPI3_APB_CLK and their resets, their data paths on GPSPI*_SYS_CLK and
  * their masters on clk_spi_mst (GPSPI*_MST_CLK); their DMA through
@@ -3378,8 +3417,8 @@ static void esp32p4_init_analog(ESP32P4MachineState *s)
  *
  * The RMT and the PCNT have no events or tasks on the P4.
  *
- * Not connected, as their blocks are not modelled: the REGDMA and 2D-DMA
- * events and tasks; ADC_EVT_RESULT_DONE0, which the TRM does not
+ * Not connected, as their blocks are not modelled: the REGDMA events and
+ * tasks; ADC_EVT_RESULT_DONE0, which the TRM does not
  * describe; and the RTC timer's tasks (RTC_TASK_*), which the TRM says it
  * does not take.
  */
@@ -3490,6 +3529,17 @@ static void esp32p4_init_etm(ESP32P4MachineState *s)
             esp32p4_etm_connect_task(etm, task[g] + k, dev,
                                      ESP32P4_GDMA_ETM_TASK, k);
         }
+    }
+
+    /* The 2D-DMA's channels, those the ETM has IDs for. */
+    dev = DEVICE(&s->dma2d);
+    for (k = 0; k < ESP32P4_DMA2D_ETM_EVENTS; k++) {
+        esp32p4_etm_connect_event(etm, ESP32P4_ETM_DMA2D_EVT_IN_DONE_CH0 + k,
+                                  dev, ESP32P4_DMA2D_ETM_EVENT, k);
+    }
+    for (k = 0; k < ESP32P4_DMA2D_ETM_TASKS; k++) {
+        esp32p4_etm_connect_task(etm, ESP32P4_ETM_DMA2D_TASK_IN_START_CH0 + k,
+                                 dev, ESP32P4_DMA2D_ETM_TASK, k);
     }
 
     /* The LED PWM controller's channels and timers. */
@@ -4376,6 +4426,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_i2c(s);
     esp32p4_init_pms(s);
     esp32p4_init_dma(s);
+    esp32p4_init_media(s);
     esp32p4_init_crypto(s);
     esp32p4_init_ext_memory(s);
     esp32p4_init_sdmmc(s);

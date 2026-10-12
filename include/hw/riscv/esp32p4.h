@@ -19,6 +19,7 @@
 #include "hw/core/or-irq.h"
 #include "hw/core/split-irq.h"
 #include "hw/dma/esp32p4_bitscrambler.h"
+#include "hw/dma/esp32p4_dma2d.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/dma/esp32p4_gdma.h"
 #include "hw/dma/esp32p4_uhci.h"
@@ -223,6 +224,7 @@ struct ESP32P4MachineState {
     /* GDMA-AHB, GDMA-AXI. */
     ESP32P4GdmaState gdma[2];
     ESP32P4DwGdmaState vdma;
+    ESP32P4Dma2dState dma2d;
     /* GP-SPI2, GP-SPI3. */
     ESP32P4SpiState spi[2];
     ESP32P4BitScramblerState bitscrambler;
