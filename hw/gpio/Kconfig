@@ -15,6 +15,7 @@ config SIFIVE_GPIO
 
 config RP2350_GPIO
     bool
+    select LINE_TIME
 
 config ESP32_LINE
     bool
