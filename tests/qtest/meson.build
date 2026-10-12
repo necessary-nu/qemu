@@ -4,6 +4,7 @@ slow_qtests = {
   'bios-tables-test' : 910,
   'cdrom-test' : 610,
   'device-introspect-test' : 720,
+  'esp32p4-migration-test' : 240,
   'ide-test' : 120,
   'migration-test' : 480,
   'npcm7xx_pwm-test': 300,
@@ -260,6 +261,7 @@ qtests_rp2350 = \
    'rp2350-coresight-test',
    'rp2350-accessctrl-test',
    'rp2350-xip-test',
+   'rp2350-flash-test',
    'rp2350-watchdog-test',
    'rp2350-powman-test',
    'rp2350-pwm-test',
@@ -365,10 +367,13 @@ qtests_riscv32 = \
   (config_all_devices.has_key('CONFIG_SIFIVE_E_AON') ? ['sifive-e-aon-watchdog-test'] : []) + \
   (config_all_devices.has_key('CONFIG_RISCV_VIRT') and
    config_all_accel.has_key('CONFIG_TCG') ? ['shutdown-stop-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_ESP32P4') and
+   config_all_accel.has_key('CONFIG_TCG') ? ['esp32p4-migration-test'] : []) + \
   (config_all_devices.has_key('CONFIG_ESP32P4') ?
     ['esp32p4-machine-test', 'esp32p4-clocks-test', 'esp32p4-efuse-test',
      'esp32p4-clic-test', 'esp32p4-intmatrix-test', 'esp32p4-pms-test',
      'esp32p4-gpio-test', 'esp32p4-mmu-test', 'esp32p4-spimem-test',
+     'esp32p4-gd25q256e-test',
      'esp32p4-systimer-test', 'esp32p4-timg-test', 'esp32p4-lpwdt-test',
      'esp32p4-lp-timer-test', 'esp32p4-gdma-test', 'esp32p4-dwgdma-test',
      'esp32p4-sdmmc-test', 'esp32p4-emac-test', 'esp32p4-etm-test',
@@ -386,7 +391,8 @@ qtests_riscv32 = \
      'esp32p4-ana-cmpr-test', 'esp32p4-lp-rom-test',
      'esp32p4-image-source-test', 'esp32p4-jpeg-test',
      'esp32p4-dma2d-test', 'esp32p4-ppa-test',
-     'esp32p4-h264-test', 'esp32p4-mipi-test', 'esp32p4-isp-test'] :
+     'esp32p4-h264-test', 'esp32p4-mipi-test', 'esp32p4-lcd-cam-test',
+     'esp32p4-isp-test'] :
     [])
 
 qtests_riscv64 = ['riscv-csr-test'] + \
@@ -506,6 +512,7 @@ qtests = {
                        [gio],
   'erst-test': files('erst-test.c'),
   'esp32p4-boot-test': files('esp32p4-boot-utils.c'),
+  'esp32p4-gd25q256e-test': files('esp32p4-boot-utils.c'),
   'esp32p4-boot-secure-test': files('esp32p4-boot-utils.c'),
   'esp32p4-boot-uart-test': files('esp32p4-boot-utils.c'),
   'esp32p4-boot-esptool-test': files('esp32p4-boot-utils.c'),

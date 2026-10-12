@@ -273,12 +273,19 @@ static void *rr_cpu_thread_fn(void *arg)
             }
             current_cpu = cpu;
 
-            qemu_clock_enable(QEMU_CLOCK_VIRTUAL,
-                              (cpu->singlestep_flags & SSTEP_NOTIMER) == 0);
-
             if (cpu_can_run(cpu)) {
                 int excp;
 
+                /*
+                 * Only for a CPU about to run: pause_all_vcpus() disables
+                 * the clock before it stops the vCPUs, so that no timer
+                 * runs while the VM is stopped, and a CPU taking its stop
+                 * here must not enable it again behind its back. With
+                 * the VM stopped no CPU can run, and resume_all_vcpus()
+                 * enables the clock as it starts them.
+                 */
+                qemu_clock_enable(QEMU_CLOCK_VIRTUAL,
+                                  (cpu->singlestep_flags & SSTEP_NOTIMER) == 0);
                 bql_unlock();
                 if (icount_enabled()) {
                     icount_prepare_for_run(cpu, cpu_budget);

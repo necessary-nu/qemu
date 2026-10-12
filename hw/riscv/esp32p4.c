@@ -368,6 +368,20 @@
  *       -object esp32p4-image-source,id=cam0,format=raw10,width=1280,
  *               height=720,image=photo.png -M esp32p4,csi-camera=cam0
  *
+ *   - The LCD and camera controller (TRM chapter 40) at 0x500DC000,
+ *     behind LCDCAM_APB_CLK and its reset, the LCD on LCD_CLK and the
+ *     camera on CAM_CLK, both through GDMA-AXI, its signals matrix
+ *     signals 144 to 145 and 149 to 177, its interrupt LCD_CAM_INTR
+ *     (source 36); its camera port takes the dvp-camera's stream. The
+ *     board's LCD panels are devices on its bus "lcd"
+ *     (include/hw/display/lcd_panel.h), wired to the pads software routes
+ *     the LCD's signals to, each showing on a console of its own: an i80
+ *     panel with an ILI9341 or ST7789 (its GRAM, MIPI DCS commands), or
+ *     an RGB panel:
+ *
+ *       -device st7789,bus=lcd
+ *       -device rgb-panel,bus=lcd,width=800,height=480
+ *
  * The eFuses start as a factory-fresh chip's and are lost when QEMU exits,
  * unless a raw file keeps them: 336 bytes of data, or the whole array in
  * a file longer than 512 bytes. A blank, all-zero, file starts as a
@@ -483,7 +497,6 @@ static const struct {
     { "axi-icm-qos",      0x500a4400, 3 * KiB },
 
     /* HP peripherals 1. */
-    { "lcd-cam",          0x500dc000, 4 * KiB },
     { "iomux-mspi-pin",   0x500e1200, 4 * KiB - 0x200 },
     { "mem-monitor",      0x500e3000, 4 * KiB },
     { "audio-addc",       0x500e4000, 4 * KiB },
@@ -741,22 +754,28 @@ static void esp32p4_init_memory(ESP32P4MachineState *s)
                            ESP32P4_PSRAM_SIZE, &error_fatal);
 }
 
-/* The Winbond W25Q parts of each flash size. */
+/*
+ * The flash part of each size: the board's GigaDevice GD25Q256E at 32 MiB
+ * and the W25Q16JV and W25Q32RV at 2 and 4 MiB, modelled from their
+ * datasheets; Winbond W25Q parts at the others.
+ */
+/* [spec:nuos:req:emu.flash-chip] */
+/* [spec:nuos:req:emu.esp32p4.flash-chip] */
 static const char *esp32p4_flash_part(uint64_t size)
 {
     switch (size) {
     case 1 * MiB:
         return "w25q80bl";
     case 2 * MiB:
-        return "w25q16";
+        return "w25q16jv";
     case 4 * MiB:
-        return "w25q32";
+        return "w25q32rv";
     case 8 * MiB:
         return "w25q64";
     case 16 * MiB:
         return "w25q128";
     case 32 * MiB:
-        return "w25q256";
+        return "gd25q256e";
     case 64 * MiB:
         return "w25q512jv";
     default:
@@ -788,6 +807,7 @@ static void esp32p4_init_flash(ESP32P4MachineState *s)
         return;
     }
     flash = qdev_new(esp32p4_flash_part(s->flash_size));
+    object_property_add_child(OBJECT(s), "flash", OBJECT(flash));
     qdev_prop_set_bit(flash, "write-enable-autoclear", true);
     if (dinfo) {
         BlockBackend *blk = blk_by_legacy_dinfo(dinfo);
@@ -1729,7 +1749,8 @@ static void esp32p4_init_gpio(ESP32P4MachineState *s)
 /*
  * The board's camera sensors: each wired to its port, VSYNC, HSYNC and DE
  * driven onto the pads the source names, and PWDN and RESETB taken from
- * theirs. A camera input attaches to the source its port's is.
+ * theirs; a DVP sensor's XCLK, with xclk=cam, from CAM_CLK. A camera
+ * input attaches to the source its port's is.
  */
 /* [spec:nuos:req:emu.esp32p4.lcd-cam] */
 /* [spec:nuos:req:emu.esp32p4.mipi] */
@@ -1744,6 +1765,10 @@ static void esp32p4_init_cameras(ESP32P4MachineState *s)
         esp32p4_image_source_bind(s->dvp_camera, ESP32P4_IMAGE_PORT_DVP,
                                   &error_fatal);
         esp32p4_image_source_connect_pads(s->dvp_camera, DEVICE(&s->gpio));
+        if (esp32p4_image_source_xclk_from_cam(s->dvp_camera)) {
+            esp32p4_image_source_connect_xclk(s->dvp_camera,
+                qdev_get_clock_out(DEVICE(&s->clkrst), "cam"));
+        }
     }
     if (s->csi_camera) {
         esp32p4_image_source_bind(s->csi_camera, ESP32P4_IMAGE_PORT_CSI,
@@ -3330,6 +3355,50 @@ static void esp32p4_init_isp(ESP32P4MachineState *s)
 }
 
 /*
+ * The LCD and camera controller, behind LCDCAM_APB_CLK and RST_EN_LCDCAM,
+ * on LCD_CLK and CAM_CLK, both directions served by GDMA-AXI, its signals
+ * through the GPIO matrix, its interrupt LCD_CAM_INTR; the board's panels
+ * on its bus "lcd" and its DVP sensor, if any, on its camera port.
+ */
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
+static void esp32p4_init_lcd_cam(ESP32P4MachineState *s)
+{
+    DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
+    DeviceState *dev;
+    unsigned i;
+
+    object_initialize_child(OBJECT(s), "lcd-cam", &s->lcd_cam,
+                            TYPE_ESP32P4_LCD_CAM);
+    dev = DEVICE(&s->lcd_cam);
+    object_property_set_link(OBJECT(dev), "gdma", OBJECT(&s->gdma[1]),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
+    if (s->dvp_camera) {
+        object_property_set_link(OBJECT(dev), "camera",
+                                 OBJECT(s->dvp_camera), &error_abort);
+    }
+    qdev_connect_clock_in(dev, "lcd-clk", qdev_get_clock_out(clkrst, "lcd"));
+    qdev_connect_clock_in(dev, "cam-clk", qdev_get_clock_out(clkrst, "cam"));
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
+                             ESP32P4_LCD_CAM_BASE, ESP32P4_CLK_LCDCAM_APB,
+                             ESP32P4_RST_LCDCAM, 0);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       esp32p4_intr_source(s, ESP32P4_INTR_LCD_CAM));
+    for (i = 0; i < ESP32P4_LCD_CAM_OUTS; i++) {
+        qdev_connect_gpio_out_named(dev, ESP32P4_LCD_CAM_SIG_OUT, i,
+            qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                                   esp32p4_lcd_cam_out_signal(i)));
+    }
+    for (i = 0; i < ESP32P4_LCD_CAM_INS; i++) {
+        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_SIG_IN,
+            esp32p4_lcd_cam_in_signal(i),
+            qdev_get_gpio_in_named(dev, ESP32P4_LCD_CAM_SIG_IN, i));
+    }
+}
+
+/*
  * The BitScrambler, between GDMA and the peripherals HP_SYSTEM attaches it
  * to; and the parallel IO controller, served by GDMA-AXI, its pads through
  * the GPIO matrix.
@@ -4791,6 +4860,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_jpeg(s);
     esp32p4_init_mipi(s);
     esp32p4_init_isp(s);
+    esp32p4_init_lcd_cam(s);
     esp32p4_init_low_power(s);
     esp32p4_init_lp_core(s);
     esp32p4_init_uart(s);

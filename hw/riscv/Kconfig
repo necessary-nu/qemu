@@ -23,6 +23,7 @@ config ESP32P4
     select ESP32_UART_LINE
     select I2C
     select I3C
+    select LCD_PANEL
     select OR_IRQ
     select SSI
     select SPLIT_IRQ

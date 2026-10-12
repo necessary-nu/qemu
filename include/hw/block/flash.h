@@ -50,4 +50,11 @@ PFlashCFI02 *pflash_cfi02_register(hwaddr base,
 
 BlockBackend *m25p80_get_blk(DeviceState *dev);
 
+/*
+ * When a datasheet part's BUSY bit will clear by itself (its cycle ends,
+ * or a suspend takes effect); 0 when it is clear or the part has no busy
+ * time.
+ */
+int64_t m25p80_busy_until(DeviceState *dev);
+
 #endif
