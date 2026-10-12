@@ -2144,6 +2144,14 @@ static void dwc_card_irq(DeviceState *dev, unsigned slot, bool level)
     dwc_sdmmc_update_irq(s);
 }
 
+/* [spec:nuos:req:emu.sd-card-power-cut] */
+void dwc_sdmmc_set_card_power(DWCSDMMCState *s, unsigned slot, bool on)
+{
+    dwc_catch_up(s, dwc_now());
+    sdbus_set_power(&s->sdbus[slot], on);
+    dwc_sdmmc_update(s);
+}
+
 /* [spec:nuos:req:emu.sd-card-timing] */
 /* The present for a card on the bus: this model's, dwc_now(). */
 static int64_t dwc_bus_get_time(DeviceState *dev)

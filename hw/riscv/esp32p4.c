@@ -129,7 +129,8 @@
  *     Every SD card takes time as one that just meets its registers
  *     (hw/sd/sd.c, the sd-card "timing" property, which the machine sets).
  *     A card is on the board, not the chip: no reset of the chip or the
- *     controller reaches it, only a power cycle (QEMU's system reset).
+ *     controller reaches it, only a power cycle (QEMU's system reset) and
+ *     the board's switch of the socket's supply, SD1_VDD, by GPIO45.
  *
  *   - The UARTs (TRM chapter 45): UART0 to UART4 at 0x500CA000 to
  *     0x500CE000, behind UARTn_APB_CLK and their APB resets, their cores
@@ -2173,6 +2174,24 @@ static void esp32p4_init_emac(ESP32P4MachineState *s)
 }
 
 /*
+ * [spec:nuos:req:emu.sd-card-power-cut]
+ * The microSD socket's supply, SD1_VDD: ESP_3V3 through Q1, an AO3401
+ * P-channel MOSFET whose gate is GPIO45, pulled down by R27 (10K; R23, a
+ * 10K pull-up to ESP_3V3, is not fitted) (the board's schematic, "MicroSD
+ * Card"). The socket is powered unless GPIO45 is driven high: undriven, as
+ * from any reset of the chip, or driven low, Q1 conducts; the pad's own
+ * weak pull-up loses to R27. Waveshare's documentation for its ESP32-P4
+ * boards names GPIO45 the TF card's power control, low to enable. Switched
+ * off, the card loses its state; switched on, it powers up afresh.
+ */
+static void esp32p4_sd_supply(void *opaque, int n, int level)
+{
+    ESP32P4MachineState *s = opaque;
+
+    dwc_sdmmc_set_card_power(DWC_SDMMC(&s->sdmmc), 0, !level);
+}
+
+/*
  * The SD/MMC host controller and the cards on its slots. Its registers
  * are behind SDMMC_SYS_CLK and LP_CLKRST's SDMMC reset, BUFFIFO, whose
  * read pops the FIFO, reading 0 while gated; its CIU takes
@@ -2241,6 +2260,9 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
     qdev_connect_gpio_out_named(dev, DWC_SDMMC_CCMD_OD_PULLUP_EN_N, 0,
         qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
                                ESP32P4_SIG_SD_CCMD_OD_PULLUP_EN_N_PAD_OUT));
+    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_DRIVE_HIGH,
+                                ESP32P4_BOARD_SD_POWER_PAD,
+                                qemu_allocate_irq(esp32p4_sd_supply, s, 0));
 }
 
 /*

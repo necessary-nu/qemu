@@ -279,4 +279,10 @@ extern const VMStateDescription vmstate_dwc_sdmmc;
 void dwc_sdmmc_catch_up(DWCSDMMCState *s);
 void dwc_sdmmc_clock_changed(DWCSDMMCState *s);
 
+/*
+ * The board switches the supply of the card in @slot (sdbus_set_power()),
+ * at the present: the controller sees the card as it was up to then.
+ */
+void dwc_sdmmc_set_card_power(DWCSDMMCState *s, unsigned slot, bool on);
+
 #endif /* DWC_SDMMC_H */

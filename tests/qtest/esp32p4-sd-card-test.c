@@ -1,7 +1,9 @@
 /*
  * QTest testcase for SD cards that take time, on the ESP32-P4 machine's
  * SD/MMC host: access times, busy, the commands a busy card refuses, the
- * registers that state the times, and the specification's maximums
+ * registers that state the times, the specification's maximums, and
+ * writes and erases cut short by the board's supply switch (GPIO45), a
+ * machine reset, QEMU's quit and CMD0
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -16,6 +18,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qobject/qdict.h"
 
 #define SD                  0x50083000
 #define SD_CTRL             (SD + 0x000)
@@ -79,6 +82,20 @@
 #define PERI_CLK_CTRL01     (HP_CLKRST + 0x34)
 #define PERI_CLK_CTRL02     (HP_CLKRST + 0x38)
 
+/* GPIO45, the gate of the microSD socket's supply switch */
+#define GPIO                0x500e0000
+#define GPIO_OUT1_W1TS      (GPIO + 0x014)
+#define GPIO_OUT1_W1TC      (GPIO + 0x018)
+#define GPIO_ENABLE1_W1TS   (GPIO + 0x030)
+#define GPIO_ENABLE1_W1TC   (GPIO + 0x034)
+#define GPIO_FUNC_OUT(n)    (GPIO + 0x558 + 4 * (n))
+#define IO_MUX_GPIO(n)      (0x500e1000 + 0x004 + 4 * (n))
+#define MCU_SEL_GPIO        (1u << 12)
+#define FUN_WPU             (1u << 8)
+#define FUN_IE              (1u << 9)
+#define SIG_GPIO_OUT        0x100
+#define SD_POWER_PAD        45
+
 #define CCLK_NS             25
 #define ID_CLK_NS           2500
 #define CLK_NS              100
@@ -123,6 +140,16 @@ static uint8_t image_byte(uint8_t seed, uint32_t offset)
 static uint8_t new_byte(int i)
 {
     return (uint8_t)(0xa5 ^ (i * 13));
+}
+
+static void read_image(const char *path, uint32_t offset, uint8_t *buf,
+                       size_t len)
+{
+    int fd = open(path, O_RDONLY);
+
+    g_assert(fd >= 0);
+    g_assert_cmpint(pread(fd, buf, len, offset), ==, len);
+    close(fd);
 }
 
 static QTestState *start(const char *img, const char *opts)
@@ -301,6 +328,26 @@ static void read_block(QTestState *qts, uint32_t block, uint8_t *buf)
 static bool busy(QTestState *qts)
 {
     return qtest_readl(qts, SD_STATUS) & STATUS_DATA_BUSY;
+}
+
+/*
+ * A block cut short: neither its old contents nor its new; every byte
+ * either, bit by bit.
+ */
+static void check_partial(const uint8_t *got, uint8_t seed, uint32_t block)
+{
+    int same_old = 0, same_new = 0;
+
+    for (int i = 0; i < 512; i++) {
+        uint8_t old = image_byte(seed, block * 512 + i);
+
+        g_assert_cmphex(got[i] & ~(old | new_byte(i)), ==, 0);
+        g_assert_cmphex(~got[i] & old & new_byte(i), ==, 0);
+        same_old += got[i] == old;
+        same_new += got[i] == new_byte(i);
+    }
+    g_assert_cmpint(same_old, <, 512);
+    g_assert_cmpint(same_new, <, 512);
 }
 
 /*
@@ -722,6 +769,162 @@ static void test_max_timing(void)
     qtest_quit(qts);
 }
 
+/* GPIO45 a plain output, driving @level. */
+static void sd_power_pad(QTestState *qts, bool high)
+{
+    qtest_writel(qts, IO_MUX_GPIO(SD_POWER_PAD), MCU_SEL_GPIO | FUN_IE);
+    qtest_writel(qts, GPIO_FUNC_OUT(SD_POWER_PAD), SIG_GPIO_OUT);
+    qtest_writel(qts, high ? GPIO_OUT1_W1TS : GPIO_OUT1_W1TC,
+                 1u << (SD_POWER_PAD - 32));
+    qtest_writel(qts, GPIO_ENABLE1_W1TS, 1u << (SD_POWER_PAD - 32));
+}
+
+/*
+ * The board's supply switch: GPIO45 driven high cuts the socket's supply
+ * half way through a block's programming. The card answers nothing, its
+ * DAT0 high; the block holds neither its old contents nor its new. Driven
+ * low again, the card powers up afresh: identified anew, its data there.
+ * GPIO45 only pulled up, the board's pull-down wins: still powered.
+ */
+/* [spec:nuos:req:emu.sd-card-power-cut/test] */
+static void test_supply_cut(void)
+{
+    g_autofree char *img = make_image(0x88);
+    QTestState *qts = start(img, "");
+    uint32_t rca, st;
+    uint8_t buf[512];
+
+    clocks_on(qts);
+    rca = card_init(qts, NULL);
+    write_start(qts, 12, CMD_WAIT);
+    wait_int(qts, INT_DTO, 1000 * 1000);
+    qtest_clock_step(qts, TAAC_NS / 2);
+    g_assert_true(busy(qts));
+    sd_power_pad(qts, true);
+    g_assert_false(busy(qts));
+    st = cmd(qts, R1, 13, rca << 16);
+    g_assert_cmphex(st & INT_RTO, ==, INT_RTO);
+    qtest_clock_step(qts, TAAC_NS);
+
+    sd_power_pad(qts, false);
+    /* Powered up afresh: in the idle state, not knowing its RCA. */
+    st = cmd(qts, R1, 13, rca << 16);
+    g_assert_cmphex(st & INT_RTO, ==, INT_RTO);
+    rca = card_init(qts, NULL);
+    read_block(qts, 12, buf);
+    check_partial(buf, 0x88, 12);
+    read_block(qts, 11, buf);
+    g_assert_cmphex(buf[7], ==, image_byte(0x88, 11 * 512 + 7));
+
+    /* Pulled up only, the pad is not driven: the card keeps power. */
+    qtest_writel(qts, GPIO_ENABLE1_W1TC, 1u << (SD_POWER_PAD - 32));
+    qtest_writel(qts, GPIO_OUT1_W1TS, 1u << (SD_POWER_PAD - 32));
+    qtest_writel(qts, IO_MUX_GPIO(SD_POWER_PAD),
+                 MCU_SEL_GPIO | FUN_IE | FUN_WPU);
+    g_assert_cmpint(R1_STATE(status_now(qts, rca)), ==, STATE_TRAN);
+    qtest_quit(qts);
+
+    /* The cut block is on the drive as the card left it. */
+    read_image(img, 12 * 512, buf, 512);
+    check_partial(buf, 0x88, 12);
+    unlink(img);
+}
+
+/*
+ * Cuts: a machine reset (a power cycle of the board), QEMU's quit (a
+ * power-off), and CMD0 (which terminates programming) half way through a
+ * block's programming leave it partly written; a block whose programming
+ * finished keeps its new contents.
+ */
+/* [spec:nuos:req:emu.sd-card-power-cut/test] */
+static void test_other_cuts(void)
+{
+    g_autofree char *img = make_image(0x99);
+    QTestState *qts = start(img, "");
+    QDict *rsp;
+    uint8_t buf[512];
+
+    /* A finished write, then one cut by the quit. */
+    clocks_on(qts);
+    card_init(qts, NULL);
+    write_start(qts, 20, CMD_WAIT);
+    wait_int(qts, INT_DTO, 1000 * 1000);
+    qtest_clock_step(qts, TAAC_NS);
+    write_start(qts, 21, CMD_WAIT);
+    wait_int(qts, INT_DTO, 1000 * 1000);
+    qtest_clock_step(qts, TAAC_NS / 2);
+    qtest_quit(qts);
+    read_image(img, 20 * 512, buf, 512);
+    for (int i = 0; i < 512; i++) {
+        g_assert_cmphex(buf[i], ==, new_byte(i));
+    }
+    read_image(img, 21 * 512, buf, 512);
+    check_partial(buf, 0x99, 21);
+
+    /* A machine reset. */
+    qts = start(img, "");
+    clocks_on(qts);
+    card_init(qts, NULL);
+    write_start(qts, 22, CMD_WAIT);
+    wait_int(qts, INT_DTO, 1000 * 1000);
+    qtest_clock_step(qts, TAAC_NS / 3);
+    rsp = qtest_qmp(qts, "{ 'execute': 'system_reset' }");
+    qobject_unref(rsp);
+    qtest_qmp_eventwait(qts, "RESET");
+    clocks_on(qts);
+    card_init(qts, NULL);
+    read_block(qts, 22, buf);
+    check_partial(buf, 0x99, 22);
+
+    /* CMD0, not waiting for the card. */
+    write_start(qts, 23, CMD_WAIT);
+    wait_int(qts, INT_DTO, 1000 * 1000);
+    qtest_clock_step(qts, TAAC_NS * 2 / 3);
+    card_clock(qts, 50);
+    cmd(qts, CMD_INIT, 0, 0);
+    g_assert_false(busy(qts));
+    card_init(qts, NULL);
+    read_block(qts, 23, buf);
+    check_partial(buf, 0x99, 23);
+    qtest_quit(qts);
+    unlink(img);
+}
+
+/*
+ * An erase cut short by the supply leaves the blocks of its range partly
+ * erased: some bits 1 that were 0, none 0 that were 1.
+ */
+/* [spec:nuos:req:emu.sd-card-power-cut/test] */
+static void test_erase_cut(void)
+{
+    g_autofree char *img = make_image(0xaa);
+    QTestState *qts = start(img, "");
+    int erased = 0, kept = 0;
+    uint8_t buf[512];
+
+    clocks_on(qts);
+    card_init(qts, NULL);
+    cmd(qts, R1 | CMD_WAIT, 32, 30 * 512);
+    cmd(qts, R1 | CMD_WAIT, 33, 30 * 512);
+    cmd(qts, R1 | CMD_WAIT, 38, 0);
+    qtest_clock_step(qts, 1000000000LL / 128 / 2);
+    g_assert_true(busy(qts));
+    sd_power_pad(qts, true);
+    qtest_clock_step(qts, 1000);
+    qtest_quit(qts);
+    read_image(img, 30 * 512, buf, 512);
+    for (int i = 0; i < 512; i++) {
+        uint8_t old = image_byte(0xaa, 30 * 512 + i);
+
+        g_assert_cmphex(old & ~buf[i], ==, 0);
+        erased += buf[i] == 0xff;
+        kept += buf[i] == old;
+    }
+    g_assert_cmpint(erased, <, 512);
+    g_assert_cmpint(kept, <, 512);
+    unlink(img);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -734,5 +937,8 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/sd-card/deselect", test_deselect);
     qtest_add_func("/esp32p4/sd-card/erase", test_erase);
     qtest_add_func("/esp32p4/sd-card/max-timing", test_max_timing);
+    qtest_add_func("/esp32p4/sd-card/supply-cut", test_supply_cut);
+    qtest_add_func("/esp32p4/sd-card/other-cuts", test_other_cuts);
+    qtest_add_func("/esp32p4/sd-card/erase-cut", test_erase_cut);
     return g_test_run();
 }

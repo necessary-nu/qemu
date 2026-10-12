@@ -1,7 +1,7 @@
 /*
  * QTest testcase for SD cards that take time on the ESP32 machine: the
  * board's card in the SD/MMC host's slot 1, from -drive if=sd, its
- * registers and busy
+ * registers and busy, and a write cut by a power cycle
  *
  * Copyright (c) 2026 Necessary Innovations AB
  *
@@ -14,6 +14,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qobject/qdict.h"
 
 #define DPORT_WIFI_CLK_EN       0x3ff000cc
 #define DPORT_CORE_RST_EN       0x3ff000d0
@@ -85,6 +86,11 @@ static char *make_image(void)
     g_assert_cmpint(write(fd, data, IMAGE_SIZE), ==, IMAGE_SIZE);
     close(fd);
     return path;
+}
+
+static uint8_t image_byte(uint32_t offset)
+{
+    return (uint8_t)(offset / 512 * 3 + offset);
 }
 
 static uint8_t new_byte(int i)
@@ -255,11 +261,55 @@ static void test_properties(void)
     unlink(img);
 }
 
+/*
+ * A power cycle of the board (QEMU's system reset) half way through a
+ * block's programming leaves it partly written, on the drive too.
+ */
+/* [spec:nuos:req:emu.sd-card-power-cut/test] */
+static void test_reset_cut(void)
+{
+    g_autofree char *img = make_image();
+    QTestState *qts = qtest_initf("-M esp32 -nic none "
+                                  "-drive file=%s,if=sd,format=raw", img);
+    int same_old = 0, same_new = 0;
+    uint32_t taac;
+    uint8_t buf[512];
+    QDict *rsp;
+    int fd;
+
+    sdmmc_setup(qts);
+    card_init(qts, &taac);
+    write_block(qts, 9);
+    qtest_clock_step(qts, TAAC_NS / 2);
+    g_assert_true(busy(qts));
+    rsp = qtest_qmp(qts, "{ 'execute': 'system_reset' }");
+    qobject_unref(rsp);
+    qtest_qmp_eventwait(qts, "RESET");
+    qtest_quit(qts);
+
+    fd = open(img, O_RDONLY);
+    g_assert(fd >= 0);
+    g_assert_cmpint(pread(fd, buf, 512, 9 * 512), ==, 512);
+    close(fd);
+    for (int i = 0; i < 512; i++) {
+        uint8_t old = image_byte(9 * 512 + i);
+
+        g_assert_cmphex(buf[i] & ~(old | new_byte(i)), ==, 0);
+        g_assert_cmphex(~buf[i] & old & new_byte(i), ==, 0);
+        same_old += buf[i] == old;
+        same_new += buf[i] == new_byte(i);
+    }
+    g_assert_cmpint(same_old, <, 512);
+    g_assert_cmpint(same_new, <, 512);
+    unlink(img);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
 
     qtest_add_func("/esp32/sd-card/drive", test_drive);
     qtest_add_func("/esp32/sd-card/properties", test_properties);
+    qtest_add_func("/esp32/sd-card/reset-cut", test_reset_cut);
     return g_test_run();
 }
