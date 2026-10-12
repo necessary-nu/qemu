@@ -199,29 +199,41 @@ static void timer_sys_changed(void *opaque, ClockEvent event)
     timer_clock_changed(s, s->clk_sys, event);
 }
 
-/* Fire every armed alarm whose target the counter has reached. */
-static void timer_alarm_cb(void *opaque)
+/* Fire every armed alarm whose target the counter has reached by now. */
+static void timer_fire_due(RP2350TimerState *s, int64_t now)
 {
-    RP2350TimerState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int i;
 
     for (i = 0; i < RP2350_TIMER_ALARMS; i++) {
         if ((s->armed & (1u << i)) && s->alarm_due_ns[i] >= 0 &&
             s->alarm_due_ns[i] <= now) {
             s->alarm_due_ns[i] = -1;
+            timer_del(s->alarm_timer[i]);
             timer_fire(s, i);
         }
     }
 }
 
-/* [spec:nuos:req:emu.timer] */
+static void timer_alarm_cb(void *opaque)
+{
+    timer_fire_due(opaque, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+/*
+ * [spec:nuos:req:emu.timer]
+ * A register access first fires the alarms the counter has reached by its
+ * moment: without icount the alarms' QEMU timers run late, and until they
+ * do software would read the counter past an alarm whose interrupt has
+ * not yet been raised, as no software sees on the chip.
+ */
 static uint64_t rp2350_timer_read(void *opaque, hwaddr addr, unsigned size)
 {
     RP2350TimerState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     hwaddr reg = rp2350_atomic_reg(addr);
     uint64_t count;
+
+    timer_fire_due(s, now);
 
     switch (reg) {
     case A_TIMEHR:
@@ -270,6 +282,8 @@ static void rp2350_timer_write(void *opaque, hwaddr addr, uint64_t value,
     hwaddr reg = rp2350_atomic_reg(addr);
     uint32_t source;
     int n;
+
+    timer_fire_due(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
     switch (reg) {
     case A_TIMEHW:
