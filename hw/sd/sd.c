@@ -37,6 +37,7 @@
 #include "qemu/cutils.h"
 #include "qemu/bswap.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/registerfields.h"
 #include "system/block-backend.h"
 #include "hw/sd/sd.h"
@@ -206,6 +207,23 @@ struct SDState {
     uint8_t dat_lines;
     bool cmd_line;
     char *preset_auth_key;
+
+    /* UHS-I (see "UHS-I" below) */
+    uint8_t uhs_mode;
+    /* S18R of the first ACMD41 since the card left idle; whether seen */
+    bool s18r;
+    bool s18r_latched;
+    /* The I/O's signalling voltage, mV, and the voltage switch under way */
+    uint16_t signal_mv;
+    uint8_t vsw_state;
+    int64_t vsw_stop_ns;
+    int64_t vsw_due_ns;
+    QEMUTimer *vsw_timer;
+    /* SDCLK reaches the card. */
+    bool sdclk;
+    /* The functions a CMD6 switch selects, taken at its status data's end */
+    uint8_t function_group_new[6];
+    bool function_switch_pending;
 };
 
 static void sd_realize(DeviceState *dev, Error **errp);
@@ -430,6 +448,206 @@ static void sd_set_ocr(SDState *sd)
          */
         sd_ocr_powerup(sd);
     }
+}
+
+/*
+ * UHS-I
+ *
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * A card whose "uhs" property is 1 (UHS-I; a board sets it for its slot,
+ * and 0, the default, keeps the card as other machines know it) is a
+ * UHS104 microSD card: it is of high capacity, as UHS-I cards are, and
+ * Physical Layer 3.01 or later (Simplified Specification 9.10, 3.9.2).
+ *
+ * Signalling voltage. The card signals at 3.3 V from power-up. The first
+ * ACMD41 with a voltage window since the card entered idle asks, with its
+ * S18R, for 1.8 V signalling (the arguments of those after it repeat it,
+ * 4.2.3.1); once the card is ready, the response's S18A says it accepts:
+ * a UHS-I card of high capacity, asked with S18R while it signals at
+ * 3.3 V (4.2.3.1, 4.2.4.1). CMD11 then starts the switch, and is illegal
+ * (no response) in the cases 4.2.4.4 lists: a card that does not switch,
+ * an ACMD41 with S18R 0, a card not in the ready state, or one already at
+ * 1.8 V. The card stays at 1.8 V through CMD0; only a power cycle (its
+ * reset) brings it back to 3.3 V (3.9.4).
+ *
+ * The switch. The simplified specification leaves out its timing (4.2.4.2
+ * and 4.2.4.3, figures 4-7 and 4-8); the card follows the sequence the SD
+ * Host Controller Simplified Specification's signal voltage switch
+ * procedure and Linux's mmc_set_uhs_voltage() keep to:
+ *   - with CMD11's R1 the card drives CMD and DAT[3:0] low;
+ *   - once SDCLK stops reaching it, its I/O moves to 1.8 V, which takes
+ *     5 ms;
+ *   - SDCLK back at least 5 ms after it stopped: the card drives CMD high
+ *     and keeps DAT[3:0] low for 1 ms more, then releases them, which the
+ *     bus's pull-ups take high: the switch is complete (4.2.4.1: "checked
+ *     by high level of DAT[3:0]") and the card works in SDR12;
+ *   - SDCLK back sooner: the switch fails, and the card holds DAT[3:0]
+ *     low until a power cycle, as the host's failure check finds it.
+ * The card answers no command while the switch is under way or failed.
+ *
+ * Bus speed modes (CMD6 function group 1, 4.3.10.3, Table 4-11): Default
+ * Speed and High Speed at 3.3 V, SDR12, SDR25, SDR50, SDR104 and DDR50 at
+ * 1.8 V (DDR50 is mandatory for microSD, 3.9.2). Groups 3 (driver strength
+ * types B, A, C, D) and 4 (power limit 0.72 W to 2.88 W, not 1.80 W, as a
+ * 3.0x card's) offer more than their default at 1.8 V only.
+ *
+ * Output timing. The simplified specification leaves out the bus timing
+ * (6.6.6, 6.7.3, 6.7.4): the card's is that of a card just within the full
+ * specification's limits, its output valid from tODLY after the edge that
+ * launches a bit until tOH after the one that launches the next: Default
+ * Speed, from the falling edge, 14 ns and 0; High Speed 14 ns and 2.5 ns;
+ * SDR12 and SDR25 14 ns and 1.5 ns; SDR50 7.5 ns and 1.5 ns; SDR104, whose
+ * output phase is the card's own, a window of 0.6 UI from 2.5 ns, held
+ * 0.5 ns; DDR50 CMD 13.7 ns and 1.5 ns, DAT on both edges 7.0 ns and
+ * 1.5 ns.
+ */
+enum {
+    SD_VSW_NONE,
+    /* CMD11 answered: CMD and DAT[3:0] low, until SDCLK stops */
+    SD_VSW_LOW,
+    /* SDCLK stopped at vsw_stop_ns: the I/O moves to 1.8 V */
+    SD_VSW_STOPPED,
+    /* SDCLK back: DAT[3:0] released at vsw_due_ns */
+    SD_VSW_RELEASE,
+    /* SDCLK back too soon: DAT[3:0] held low until a power cycle */
+    SD_VSW_FAILED,
+};
+
+#define SD_VSW_STOP_NS          (5 * SCALE_MS)
+#define SD_VSW_RELEASE_NS       (1 * SCALE_MS)
+
+enum {
+    SD_MODE_DS,
+    SD_MODE_HS,
+    SD_MODE_SDR12,
+    SD_MODE_SDR25,
+    SD_MODE_SDR50,
+    SD_MODE_SDR104,
+    SD_MODE_DDR50,
+};
+
+static SDBus *sd_get_bus(SDState *sd)
+{
+    BusState *bus = qdev_get_parent_bus(DEVICE(sd));
+
+    return bus ? SD_BUS(bus) : NULL;
+}
+
+/* A UHS-I card, as it can be: SD mode, high capacity. */
+static bool sd_is_uhs(SDState *sd)
+{
+    return sd->uhs_mode == UHS_I && !sd_is_spi(sd) && !sd_is_emmc(sd) &&
+           sd->spec_version >= SD_PHY_SPECv3_01_VERS &&
+           sd->size > SDSC_MAX_CAPACITY;
+}
+
+/* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+/* S18A: a UHS-I card asked by S18R, signalling at 3.3 V. */
+static bool sd_accepts_1v8(SDState *sd)
+{
+    return sd_is_uhs(sd) && sd->s18r && sd->signal_mv == SD_VOLTAGE_3_3V;
+}
+
+static uint16_t sd_get_signal_voltage(SDState *sd)
+{
+    return sd->signal_mv;
+}
+
+/* The bus speed mode CMD6 group 1 has the card in. */
+static unsigned sd_bus_mode(SDState *sd)
+{
+    if (sd->signal_mv == SD_VOLTAGE_1_8V) {
+        return SD_MODE_SDR12 + sd->function_group[0];
+    }
+    return sd->function_group[0] ? SD_MODE_HS : SD_MODE_DS;
+}
+
+/* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+static void sd_get_output_timing(SDState *sd, SDOutputTiming *t)
+{
+    static const SDOutputTiming timing[] = {
+        [SD_MODE_DS] = { 14000, 0, 14000, 0, true, false },
+        [SD_MODE_HS] = { 14000, 2500, 14000, 2500, false, false },
+        [SD_MODE_SDR12] = { 14000, 1500, 14000, 1500, false, false },
+        [SD_MODE_SDR25] = { 14000, 1500, 14000, 1500, false, false },
+        [SD_MODE_SDR50] = { 7500, 1500, 7500, 1500, false, false },
+        [SD_MODE_SDR104] = { 2500, 500, 2500, 500, false, false },
+        [SD_MODE_DDR50] = { 13700, 1500, 7000, 1500, false, true },
+    };
+
+    *t = timing[sd_bus_mode(sd)];
+}
+
+/* The switch completes: the card releases DAT[3:0], at vsw_due_ns. */
+static void sd_vsw_release(void *opaque)
+{
+    SDState *sd = opaque;
+    SDBus *bus = sd_get_bus(sd);
+
+    sd->dat_lines = 0xf;
+    sd->vsw_state = SD_VSW_NONE;
+    if (bus) {
+        sdbus_lines_changed(bus);
+    }
+}
+
+static void sd_vsw_timer(void *opaque)
+{
+    SDState *sd = opaque;
+
+    line_run_at(sd->vsw_due_ns, sd_vsw_release, sd);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * SDCLK starts or stops reaching the card, at line_time(): the steps of
+ * the voltage switch.
+ */
+static void sd_set_clock(SDState *sd, bool running)
+{
+    int64_t now = line_time();
+
+    if (running == sd->sdclk) {
+        return;
+    }
+    sd->sdclk = running;
+    switch (sd->vsw_state) {
+    case SD_VSW_LOW:
+        if (!running) {
+            sd->vsw_state = SD_VSW_STOPPED;
+            sd->vsw_stop_ns = now;
+            sd->signal_mv = SD_VOLTAGE_1_8V;
+        }
+        break;
+    case SD_VSW_STOPPED:
+        if (!running) {
+            break;
+        }
+        if (now - sd->vsw_stop_ns < SD_VSW_STOP_NS) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: SDCLK back %" PRId64 " ns "
+                          "after it stopped for the voltage switch, which "
+                          "needs it stopped 5 ms: the switch fails, DAT[3:0] "
+                          "held low until a power cycle\n", sd->proto->name,
+                          now - sd->vsw_stop_ns);
+            sd->vsw_state = SD_VSW_FAILED;
+            break;
+        }
+        sd->cmd_line = true;
+        sd->vsw_state = SD_VSW_RELEASE;
+        sd->vsw_due_ns = now + SD_VSW_RELEASE_NS;
+        timer_mod_ns(sd->vsw_timer, sd->vsw_due_ns);
+        break;
+    default:
+        break;
+    }
+}
+
+/* The card's UHS-I state at power-up. */
+static void sd_uhs_power_up(SDState *sd)
+{
+    timer_del(sd->vsw_timer);
+    sd->vsw_state = SD_VSW_NONE;
+    sd->signal_mv = SD_VOLTAGE_3_3V;
 }
 
 /* SD Configuration register */
@@ -732,11 +950,8 @@ static void sd_set_sdstatus(SDState *sd)
 }
 
 static const uint8_t sd_tuning_block_pattern4[64] = {
-    /*
-     * See: Physical Layer Simplified Specification Version 3.01,
-     * Table 4-2.
-     */
-    0xff, 0x0f, 0xff, 0x00,     0x0f, 0xfc, 0xc3, 0xcc,
+    /* Physical Layer Simplified Specification 9.10, Table 4-3 */
+    0xff, 0x0f, 0xff, 0x00,     0xff, 0xcc, 0xc3, 0xcc,
     0xc3, 0x3c, 0xcc, 0xff,     0xfe, 0xff, 0xfe, 0xef,
     0xff, 0xdf, 0xff, 0xdd,     0xff, 0xfb, 0xff, 0xfb,
     0xbf, 0xff, 0x7f, 0xff,     0x77, 0xf7, 0xbd, 0xef,
@@ -948,6 +1163,10 @@ static void sd_reset(DeviceState *dev)
     sd->wp_group_bits = sect;
     sd->wp_group_bmap = bitmap_new(sd->wp_group_bits);
     memset(sd->function_group, 0, sizeof(sd->function_group));
+    sd->function_switch_pending = false;
+    sd->s18r = false;
+    sd->s18r_latched = false;
+    sd_uhs_power_up(sd);
     sd->erase_start = INVALID_ADDRESS;
     sd->erase_end = INVALID_ADDRESS;
     sd->blk_len = 0x200;
@@ -1060,6 +1279,36 @@ static const VMStateDescription emmc_extcsd_vmstate = {
     },
 };
 
+static bool sd_uhs_vmstate_needed(void *opaque)
+{
+    SDState *sd = opaque;
+
+    return sd->uhs_mode || sd->function_switch_pending;
+}
+
+static const VMStateDescription sd_uhs_vmstate = {
+    .name = "sd-card/uhs-state",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sd_uhs_vmstate_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(ocr, SDState),
+        VMSTATE_BOOL(s18r, SDState),
+        VMSTATE_BOOL(s18r_latched, SDState),
+        VMSTATE_UINT16(signal_mv, SDState),
+        VMSTATE_UINT8(vsw_state, SDState),
+        VMSTATE_INT64(vsw_stop_ns, SDState),
+        VMSTATE_INT64(vsw_due_ns, SDState),
+        VMSTATE_TIMER_PTR(vsw_timer, SDState),
+        VMSTATE_BOOL(sdclk, SDState),
+        VMSTATE_UINT8(dat_lines, SDState),
+        VMSTATE_BOOL(cmd_line, SDState),
+        VMSTATE_UINT8_ARRAY(function_group_new, SDState, 6),
+        VMSTATE_BOOL(function_switch_pending, SDState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static int sd_vmstate_pre_load(void *opaque)
 {
     SDState *sd = opaque;
@@ -1107,6 +1356,7 @@ static const VMStateDescription sd_vmstate = {
     },
     .subsections = (const VMStateDescription * const []) {
         &sd_ocr_vmstate,
+        &sd_uhs_vmstate,
         &emmc_extcsd_vmstate,
         &emmc_rpmb_vmstate,
         NULL
@@ -1446,34 +1696,116 @@ static void emmc_function_switch(SDState *sd, uint32_t arg)
     sd->ext_csd[index] = b;
 }
 
+/*
+ * The functions CMD6 offers in function group @g + 1 (Table 4-11): bit i
+ * for function i; 0 and 15 always. Group 1's UHS-I modes and groups 3's
+ * and 4's other functions only at 1.8 V (4.3.10.3).
+ */
+static uint16_t sd_function_support(SDState *sd, unsigned g)
+{
+    bool v18 = sd->signal_mv == SD_VOLTAGE_1_8V;
+
+    switch (g) {
+    case 0:
+        return v18 ? 0x801f : 0x8003;
+    case 1:
+        return 0x8043;
+    case 2:
+    case 3:
+        return v18 ? 0x800f : 0x8001;
+    default:
+        return 0x8001;
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * A UHS-I card's maximum current, mA at 3.6 V, under functions @f: its
+ * bus speed mode's, in mode 1 within the power limit's current (4.3.10.4,
+ * Table 4-12).
+ */
+static uint16_t sd_function_current(SDState *sd, const uint8_t *f, bool set)
+{
+    static const uint16_t mode_ma[] = { 100, 200, 400, 400, 400 };
+    uint16_t ma;
+
+    if (sd->signal_mv == SD_VOLTAGE_1_8V) {
+        ma = mode_ma[f[0]];
+    } else {
+        ma = f[0] ? 200 : 100;
+    }
+    if (set) {
+        ma = MIN(ma, 200 * (f[3] + 1));
+    }
+    return ma;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * CMD6's status (Table 4-13). Mode 0 checks the functions the argument
+ * selects, mode 1 switches to them: a function the card does not offer
+ * reads 0xF and, in mode 1, voids the whole switch, its other groups
+ * reading their current functions (4.3.10.2, 4.3.10.3). The switch takes
+ * effect at the end of the status data, within the 8 clocks 4.3.10.1
+ * allows, so that block goes in the old bus mode.
+ */
 static void sd_function_switch(SDState *sd, uint32_t arg)
 {
-    int i, mode, new_func;
-    mode = !!(arg & 0x80000000);
+    bool set = arg & 0x80000000;
+    uint8_t want[6], status[6];
+    bool valid = true;
+    uint16_t ma;
+    int i;
 
-    sd->data[0] = 0x00;     /* Maximum current consumption */
-    sd->data[1] = 0x01;
-    sd->data[2] = 0x80;     /* Supported group 6 functions */
-    sd->data[3] = 0x01;
-    sd->data[4] = 0x80;     /* Supported group 5 functions */
-    sd->data[5] = 0x01;
-    sd->data[6] = 0x80;     /* Supported group 4 functions */
-    sd->data[7] = 0x01;
-    sd->data[8] = 0x80;     /* Supported group 3 functions */
-    sd->data[9] = 0x01;
-    sd->data[10] = 0x80;    /* Supported group 2 functions */
-    sd->data[11] = 0x43;
-    sd->data[12] = 0x80;    /* Supported group 1 functions */
-    sd->data[13] = 0x03;
+    /* A switch whose status data was cut short never took effect. */
+    sd->function_switch_pending = false;
+    for (i = 0; i < 6; i++) {
+        uint8_t f = extract32(arg, 4 * i, 4);
 
-    memset(&sd->data[14], 0, 3);
-    for (i = 0; i < 6; i ++) {
-        new_func = (arg >> (i * 4)) & 0x0f;
-        if (mode && new_func != 0x0f)
-            sd->function_group[i] = new_func;
-        sd->data[16 - (i >> 1)] |= new_func << ((i % 2) * 4);
+        if (f == 0xf) {
+            want[i] = sd->function_group[i];
+        } else if (sd_function_support(sd, i) & BIT(f)) {
+            want[i] = f;
+        } else {
+            want[i] = 0xf;
+            valid = false;
+        }
     }
-    memset(&sd->data[17], 0, 47);
+    for (i = 0; i < 6; i++) {
+        status[i] = want[i];
+        if (set && !valid && want[i] != 0xf) {
+            status[i] = sd->function_group[i];
+        }
+    }
+    if (set && valid) {
+        memcpy(sd->function_group_new, want, sizeof(want));
+        sd->function_switch_pending = true;
+    }
+
+    memset(sd->data, 0, 64);
+    if (sd->uhs_mode) {
+        ma = valid ? sd_function_current(sd, want, set) : 0;
+    } else {
+        /* What QEMU's cards have always given */
+        ma = 1;
+    }
+    stw_be_p(&sd->data[0], ma);
+    for (i = 0; i < 6; i++) {
+        stw_be_p(&sd->data[12 - 2 * i], sd_function_support(sd, i));
+        sd->data[16 - (i >> 1)] |= status[i] << ((i % 2) * 4);
+    }
+    /* Version 1 has the busy status (all ready); 0 does not. */
+    sd->data[17] = sd->uhs_mode ? 1 : 0;
+}
+
+/* A CMD6 switch's status data has gone: its functions take effect. */
+static void sd_function_switch_done(SDState *sd)
+{
+    if (sd->function_switch_pending) {
+        memcpy(sd->function_group, sd->function_group_new,
+               sizeof(sd->function_group));
+        sd->function_switch_pending = false;
+    }
 }
 
 static inline bool sd_wp_addr(SDState *sd, uint64_t addr)
@@ -1660,8 +1992,13 @@ static sd_rsp_type_t sd_cmd_GO_IDLE_STATE(SDState *sd, SDRequest req)
         }
     }
     if (sd->state != sd_inactive_state) {
+        /* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+        /* The card keeps signalling at 1.8 V, in SDR12 (3.9.4). */
+        uint16_t signal_mv = sd->signal_mv;
+
         sd->state = sd_idle_state;
         sd_reset(DEVICE(sd));
+        sd->signal_mv = signal_mv;
     }
 
     return sd_is_spi(sd) ? sd_r1 : sd_r0;
@@ -1888,6 +2225,35 @@ static sd_rsp_type_t sd_cmd_SEND_CID(SDState *sd, SDRequest req)
     return sd_req_rca_same(sd, req) ? sd_r2_i : sd_r0;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * CMD11: R1 starts the voltage switch, the card driving CMD and DAT[3:0]
+ * low; in the cases 4.2.4.4 lists it is illegal, with no response.
+ */
+static sd_rsp_type_t sd_cmd_VOLTAGE_SWITCH(SDState *sd, SDRequest req)
+{
+    const char *why = NULL;
+
+    if (!sd_is_uhs(sd)) {
+        why = "the card does not switch";
+    } else if (!sd->s18r) {
+        why = "ACMD41 did not ask for it (S18R 0)";
+    } else if (sd->state != sd_ready_state) {
+        why = "the card is not in the ready state";
+    } else if (sd->signal_mv != SD_VOLTAGE_3_3V) {
+        why = "the card signals at 1.8 V already";
+    }
+    if (why) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: CMD11 is illegal: %s\n",
+                      sd->proto->name, why);
+        return sd_illegal;
+    }
+    sd->vsw_state = SD_VSW_LOW;
+    sd->cmd_line = false;
+    sd->dat_lines = 0;
+    return sd_r1;
+}
+
 /* CMD12 */
 static sd_rsp_type_t sd_cmd_STOP_TRANSMISSION(SDState *sd, SDRequest req)
 {
@@ -1989,11 +2355,21 @@ static sd_rsp_type_t sd_cmd_READ_SINGLE_BLOCK(SDState *sd, SDRequest req)
     return sd_cmd_to_sendingdata(sd, req, addr, NULL, sd->blk_len);
 }
 
-/* CMD19 */
+/*
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * CMD19: the tuning block, in the transfer state at 1.8 V (an unlocked
+ * card's: a locked one takes no class 2 command); illegal otherwise
+ * (4.2.4.5).
+ */
 static sd_rsp_type_t sd_cmd_SEND_TUNING_BLOCK(SDState *sd, SDRequest req)
 {
     if (sd->spec_version < SD_PHY_SPECv3_01_VERS) {
         return sd_cmd_illegal(sd, req);
+    }
+    if (sd->signal_mv != SD_VOLTAGE_1_8V) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: CMD19 at 3.3 V signalling is "
+                      "illegal\n", sd->proto->name);
+        return sd_illegal;
     }
 
     return sd_cmd_to_sendingdata(sd, req, 0,
@@ -2272,6 +2648,13 @@ static sd_rsp_type_t sd_cmd_SEND_OP_COND(SDState *sd, SDRequest req)
         return sd_invalid_state_for_cmd(sd, req);
     }
 
+    /* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+    /* The first ACMD41 with a voltage window gives S18R (4.2.3.1). */
+    if (!sd->s18r_latched && (req.arg & ACMD41_ENQUIRY_MASK)) {
+        sd->s18r_latched = true;
+        sd->s18r = FIELD_EX32(req.arg, OCR, ACCEPT_SWITCH_1V8);
+    }
+
     /*
      * If it's the first ACMD41 since reset, we need to decide
      * whether to power up. If this is not an enquiry ACMD41,
@@ -2295,6 +2678,11 @@ static sd_rsp_type_t sd_cmd_SEND_OP_COND(SDState *sd, SDRequest req)
             }
         }
     }
+
+    /* S18A, valid with the busy bit set */
+    sd->ocr = FIELD_DP32(sd->ocr, OCR, ACCEPT_SWITCH_1V8,
+                         FIELD_EX32(sd->ocr, OCR, CARD_POWER_UP) &&
+                         sd_accepts_1v8(sd));
 
     if (sd_is_spi(sd)) {
         sd->state = sd_ready_state;
@@ -2500,6 +2888,16 @@ static size_t sd_do_command(SDState *sd, SDRequest *req,
     if (sd->state == sd_inactive_state) {
         rtype = sd_illegal;
         goto send_response;
+    }
+
+    /* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+    if (sd->vsw_state != SD_VSW_NONE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: CMD%u %s: the card holds its "
+                      "lines and does not answer\n", sd->proto->name,
+                      req->cmd, sd->vsw_state == SD_VSW_FAILED ?
+                      "after a failed voltage switch" :
+                      "during the voltage switch");
+        return 0;
     }
 
     if (sd_req_crc_validate(req)) {
@@ -2837,6 +3235,11 @@ static size_t sd_read_data(SDState *sd, void *buf, size_t length)
                            sd->data_offset, sd->data_size, io_len);
     switch (sd->current_cmd) {
     case 6:  /* CMD6:   SWITCH_FUNCTION */
+        if (sd_generic_read_data(sd, buf, &length)) {
+            sd_function_switch_done(sd);
+        }
+        break;
+
     case 8:  /* CMD8:   SEND_EXT_CSD */
     case 9:  /* CMD9:   SEND_CSD */
     case 10: /* CMD10:  SEND_CID */
@@ -2965,7 +3368,7 @@ static const SDProto sd_proto_sd = {
         [8]  = {0,  sd_bcr,  "SEND_IF_COND", sd_cmd_SEND_IF_COND},
         [9]  = {0,  sd_ac,   "SEND_CSD", sd_cmd_SEND_CSD},
         [10] = {0,  sd_ac,   "SEND_CID", sd_cmd_SEND_CID},
-        [11] = {0,  sd_ac,   "VOLTAGE_SWITCH", sd_cmd_optional},
+        [11] = {0,  sd_ac,   "VOLTAGE_SWITCH", sd_cmd_VOLTAGE_SWITCH},
         [12] = {0,  sd_ac,   "STOP_TRANSMISSION", sd_cmd_STOP_TRANSMISSION},
         [13] = {0,  sd_ac,   "SEND_STATUS", sd_cmd_SEND_STATUS},
         [15] = {0,  sd_ac,   "GO_INACTIVE_STATE", sd_cmd_GO_INACTIVE_STATE},
@@ -3066,6 +3469,8 @@ static void sd_instance_init(Object *obj)
     sd->proto = sc->proto;
     sd->last_cmd_name = "UNSET";
     sd->ocr_power_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sd_ocr_powerup, sd);
+    sd->vsw_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sd_vsw_timer, sd);
+    sd->signal_mv = SD_VOLTAGE_3_3V;
 }
 
 static void sd_instance_finalize(Object *obj)
@@ -3073,6 +3478,7 @@ static void sd_instance_finalize(Object *obj)
     SDState *sd = SDMMC_COMMON(obj);
 
     timer_free(sd->ocr_power_timer);
+    timer_free(sd->vsw_timer);
 }
 
 static void sd_blk_size_error(SDState *sd, int64_t blk_size,
@@ -3108,6 +3514,10 @@ static void sd_realize(DeviceState *dev, Error **errp)
         break;
     default:
         error_setg(errp, "Invalid SD card Spec version: %u", sd->spec_version);
+        return;
+    }
+    if (sd->uhs_mode != UHS_NOT_SUPPORTED && sd->uhs_mode != UHS_I) {
+        error_setg(errp, "uhs must be 0 (none) or 1 (UHS-I)");
         return;
     }
 
@@ -3210,6 +3620,8 @@ static const Property sdmmc_common_properties[] = {
 static const Property sd_properties[] = {
     DEFINE_PROP_UINT8("spec_version", SDState,
                       spec_version, SD_PHY_SPECv3_01_VERS),
+    /* [spec:nuos:req:emu.esp32p4.sd-uhs] */
+    DEFINE_PROP_UINT8("uhs", SDState, uhs_mode, UHS_NOT_SUPPORTED),
 };
 
 static const Property emmc_properties[] = {
@@ -3233,6 +3645,9 @@ static void sdmmc_common_class_init(ObjectClass *klass, const void *data)
     sc->set_voltage = sd_set_voltage;
     sc->get_dat_lines = sd_get_dat_lines;
     sc->get_cmd_line = sd_get_cmd_line;
+    sc->get_signal_voltage = sd_get_signal_voltage;
+    sc->set_clock = sd_set_clock;
+    sc->get_output_timing = sd_get_output_timing;
     sc->do_command = sd_do_command;
     sc->write_data = sd_write_data;
     sc->read_data = sd_read_data;

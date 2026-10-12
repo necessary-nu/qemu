@@ -98,6 +98,48 @@ bool sdbus_get_cmd_line(SDBus *sdbus)
     return cmd_line;
 }
 
+uint16_t sdbus_get_signal_voltage(SDBus *sdbus)
+{
+    SDState *card = get_card(sdbus);
+
+    if (card) {
+        SDCardClass *sc = SDMMC_COMMON_GET_CLASS(card);
+
+        if (sc->get_signal_voltage) {
+            return sc->get_signal_voltage(card);
+        }
+    }
+    return SD_VOLTAGE_3_3V;
+}
+
+void sdbus_set_clock(SDBus *sdbus, bool running)
+{
+    SDState *card = get_card(sdbus);
+
+    if (card) {
+        SDCardClass *sc = SDMMC_COMMON_GET_CLASS(card);
+
+        if (sc->set_clock) {
+            sc->set_clock(card, running);
+        }
+    }
+}
+
+bool sdbus_get_output_timing(SDBus *sdbus, SDOutputTiming *t)
+{
+    SDState *card = get_card(sdbus);
+
+    if (card) {
+        SDCardClass *sc = SDMMC_COMMON_GET_CLASS(card);
+
+        if (sc->get_output_timing) {
+            sc->get_output_timing(card, t);
+            return true;
+        }
+    }
+    return false;
+}
+
 void sdbus_set_voltage(SDBus *sdbus, uint16_t millivolts)
 {
     SDState *card = get_card(sdbus);
@@ -270,6 +312,16 @@ void sdbus_set_irq(SDBus *sdbus, bool level)
 
     if (sbc->set_irq) {
         sbc->set_irq(qbus->parent, level);
+    }
+}
+
+void sdbus_lines_changed(SDBus *sdbus)
+{
+    SDBusClass *sbc = SD_BUS_GET_CLASS(sdbus);
+    BusState *qbus = BUS(sdbus);
+
+    if (sbc->lines_changed) {
+        sbc->lines_changed(qbus->parent);
     }
 }
 
