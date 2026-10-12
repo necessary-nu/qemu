@@ -404,14 +404,16 @@ static void esp_send(int fd, uint8_t cmd, const uint8_t *data, size_t len,
 
 /*
  * Read from @fd for up to 3 s until the response to @cmd: true with its
- * first status byte (0 for success) in *status.
+ * first status byte (0 for success) in *status. Other responses, such as
+ * the ROM's further responses to SYNC, do not end the wait.
  */
 static bool esp_response(int fd, uint8_t cmd, uint8_t *status)
 {
+    int64_t deadline = g_get_monotonic_time() + 3 * G_USEC_PER_SEC;
     uint8_t buf[4096];
     size_t got = 0;
 
-    for (int i = 0; i < 30; i++) {
+    while (g_get_monotonic_time() < deadline) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
 
         if (poll(&pfd, 1, 100) > 0) {
