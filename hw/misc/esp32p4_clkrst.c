@@ -1021,7 +1021,12 @@ static const ClkDesc esp32p4_clk_desc[ESP32P4_NUM_CLOCKS] = {
                               .gate = { B(LP_HP_USB_CLKRST_CTRL1, 30) } },
     GATE(LP_RAM, LP_DYN_FAST, LP_CLK_EN, 27),
 
-    LPPERI_GATE(LP_RNG, 16),
+    /*
+     * The RNG's: RC_FAST_CLK, an entropy source, not a bus clock (TRM
+     * 35.4: "RC_FAST_CLK is gated by setting the LPPERI_CK_EN_RNG bit").
+     */
+    [C(LP_RNG)] = { PARENTS(C(OSC_RC_FAST)),
+                    .gate = { B(LPPERI_CLK_EN, 16) } },
     LPPERI_GATE(LP_TSENS, 17),
     LPPERI_GATE(LP_PMS, 18),
     LPPERI_GATE(LP_EFUSE, 19),
@@ -1725,6 +1730,7 @@ static void esp32p4_clkrst_update_hp_core_reset(ESP32P4ClkRstState *s,
  */
 static void esp32p4_clkrst_update(ESP32P4ClkRstState *s, bool force)
 {
+    ESP32P4ClkPeriod old[ESP32P4_NUM_CLOCKS];
     int i;
 
     if (s->recomputing) {
@@ -1735,12 +1741,13 @@ static void esp32p4_clkrst_update(ESP32P4ClkRstState *s, bool force)
     do {
         s->recompute_again = false;
         for (i = 0; i < ESP32P4_NUM_CLOCKS; i++) {
+            old[i] = s->exact[i];
             s->exact[i] = esp32p4_clkrst_compute(s, i);
             s->period[i] = esp32p4_clk_period_clock(s->exact[i]);
         }
         esp32p4_clkrst_check_soc(s);
         for (i = 0; i < ESP32P4_NUM_CLOCKS; i++) {
-            clock_update(s->clk[i], s->period[i]);
+            esp32p4_clk_update(s->clk[i], old[i], s->exact[i]);
         }
         for (i = 0; i < ESP32P4_CLKRST_HP_CORES; i++) {
             if (s->core_pulse_waiting[i] &&

@@ -357,9 +357,9 @@ void xtensa_runstall(CPUXtensaState *env, bool runstall)
 {
     CPUState *cpu = env_cpu(env);
 
-    env->runstall = runstall;
-    cpu->halted = runstall;
     if (runstall) {
+        env->runstall = true;
+        cpu->halted = 1;
         cpu_interrupt(cpu, CPU_INTERRUPT_HALT);
     } else {
         /*
@@ -368,6 +368,14 @@ void xtensa_runstall(CPUXtensaState *env, bool runstall)
          * thread) must not halt it once released.
          */
         cpu_reset_interrupt(cpu, CPU_INTERRUPT_HALT);
+        /*
+         * The stall holds the CPU where it was: running, or waiting in
+         * WAITI, where it waits on for its interrupt. It cannot leave halt
+         * until the stall ends, so its halt is settled first.
+         */
+        cpu->halted = env->waiti;
+        smp_wmb();
+        env->runstall = false;
         qemu_cpu_kick(cpu);
     }
 }

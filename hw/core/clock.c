@@ -110,6 +110,24 @@ void clock_propagate(Clock *clk)
     clock_propagate_period(clk, true);
 }
 
+static void clock_retime_children(Clock *clk)
+{
+    Clock *child;
+
+    QLIST_FOREACH(child, &clk->children, sibling) {
+        clock_call_callback(child, ClockPreUpdate);
+        clock_call_callback(child, ClockUpdate);
+        clock_retime_children(child);
+    }
+}
+
+void clock_propagate_retime(Clock *clk)
+{
+    assert(clk->source == NULL);
+    trace_clock_propagate(CLOCK_PATH(clk));
+    clock_retime_children(clk);
+}
+
 void clock_set_source(Clock *clk, Clock *src)
 {
     /* changing clock source is not supported */

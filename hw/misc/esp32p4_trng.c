@@ -10,21 +10,30 @@
  * hw_random.c.
  *
  * Each read of RNG_DATA_REG gives a new 32-bit number from the host's
- * CSPRNG (qemu_guest_getrandom), while the generator runs: RNG_RSTN set
- * and its clock running. Otherwise the register holds its last value,
- * zero from reset; RNG_RSTN low clears it.
+ * CSPRNG (qemu_guest_getrandom), while the generator runs: RNG_RSTN set.
+ * Otherwise the register holds its last value, zero from reset; RNG_RSTN
+ * low clears it. The registers are on the LP peripherals' bus clock, as
+ * the machine maps them.
  *
  * The register is the output of a pseudo-random generator into which the
  * TRM's sources of entropy feed (35.3, 35.4): the SAR ADC while it
  * is enabled, RC_FAST_CLK while the PMU powers it (XPD_FOSC) and
- * LPPERI_CK_EN_RNG passes it, and the BUF_CHAIN while RNG_SAMPLE_ENABLE is
- * set. Without any of them the numbers are pseudo-random, not zero
- * ("Otherwise, pseudo-random numbers will be returned"); with them they
- * are true random numbers, which software cannot tell apart; the host's
- * numbers stand for both. The TRM's limit on the rate of reads (1 MHz for
- * full entropy) is advice to software. RNG_SAMPLE_CNT counts the
- * BUF_CHAIN's samples, one each RNG_TIMER_PSCALE + 1 cycles of the clock
- * while RNG_SAMPLE_ENABLE and RNG_TIMER_EN are set and the generator runs.
+ * LPPERI_CK_EN_RNG passes it (the "clk" input: "RC_FAST_CLK is gated by
+ * setting the LPPERI_CK_EN_RNG bit"; the register summary calls
+ * LPPERI_CLK_EN_REG the "integrated clock gating enable signal of
+ * RC_FAST_CLK"), and the BUF_CHAIN while RNG_SAMPLE_ENABLE is set. Without
+ * any of them the numbers are pseudo-random, not zero ("Otherwise,
+ * pseudo-random numbers will be returned"); with them they are true
+ * random numbers, which software cannot tell apart; the host's numbers
+ * stand for both. The TRM's limit on the rate of reads (1 MHz for full
+ * entropy) is advice to software.
+ *
+ * RNG_SAMPLE_CNT counts the BUF_CHAIN's samples, one each RNG_TIMER_PSCALE
+ * + 1 cycles of RC_FAST_CLK, the asynchronous clock that times the
+ * sampling, while RNG_SAMPLE_ENABLE and RNG_TIMER_EN are set and the
+ * generator runs. With RC_FAST_CLK gated off (LPPERI_CK_EN_RNG clear) or
+ * powered down the count stops where it is, and that is all software sees
+ * of the source being off.
  *
  * RNG_CLK_EN (bit 31 of RNG_DATE_REG, clear from reset) forces the
  * register clock gate on, as the CLK_EN bits of the other cryptography
@@ -60,13 +69,13 @@
 
 static bool trng_running(ESP32P4TrngState *s)
 {
-    return (s->rstn & 1) && clock_is_enabled(s->clk);
+    return s->rstn & 1;
 }
 
 static bool trng_sampling(ESP32P4TrngState *s)
 {
-    return trng_running(s) && (s->cfg & CFG_SAMPLE_ENABLE) &&
-           (s->cfg & CFG_TIMER_EN);
+    return trng_running(s) && clock_is_enabled(s->clk) &&
+           (s->cfg & CFG_SAMPLE_ENABLE) && (s->cfg & CFG_TIMER_EN);
 }
 
 /*

@@ -143,6 +143,8 @@
 #define USB_OTG11_SYS_CLK_EN            (1u << 15)
 #define LP_CLKRST_HP_USB_CLKRST_CTRL0   0x50111044
 #define USB_OTG11_48M_CLK_EN            (1u << 4)
+#define PLL_F48M_DIV_MASK               (0xffu << 6)
+#define PLL_F48M_DIV(n)                 (((n) - 1u) << 6)
 #define LP_CLKRST_HP_USB_CLKRST_CTRL1   0x50111048
 #define RST_EN_USB_OTG11                (1u << 3)
 #define RST_EN_USB_OTG20                (1u << 2)
@@ -625,6 +627,41 @@ static void test_fs_host_scatter_gather(void)
     hcint = run_chan(qts, OTG_FS, hcchar);
     g_assert_cmphex(hcint, ==, HCINT_BNA);
     g_assert_cmphex(rd(qts, OTG_FS, HCCHAR(0)) & HCCHAR_CHENA, ==, 0);
+    qtest_quit(qts);
+}
+
+/*
+ * OTG_FS's frames at a PHY clock of no whole number of Hz: PLL_F48M_CLK
+ * from SPLL_CLK's 480 MHz by 11, 43 7/11 MHz. Unprogrammed, HFIR's frame
+ * interval is the PHY clocks in 1 ms, 43636, and each frame lasts
+ * 43636 * 11/480 us, 999991 2/3 ns: frame 1000 begins 999991666 2/3 ns
+ * after frame 0, at the first ns after. Counted at the clock's frequency
+ * in whole Hz, the frames would run ten nanoseconds late by then.
+ */
+/* [spec:nuos:req:emu.esp32p4.usb/test] */
+static void test_fs_host_frames_exact(void)
+{
+    /* Strapped for download boot, where no watchdog resets the chip. */
+    QTestState *qts = qtest_init("-M esp32p4,strap-mode=0x04 -device "
+                                 "usb-kbd,bus=usb-otg-fs.0,port=1,"
+                                 "usb_version=1");
+    uint32_t ctrl0 = qtest_readl(qts, LP_CLKRST_HP_USB_CLKRST_CTRL0);
+    int64_t t0, t;
+
+    fs_clock_on(qts);
+    qtest_writel(qts, LP_CLKRST_HP_USB_CLKRST_CTRL0,
+                 (ctrl0 & ~PLL_F48M_DIV_MASK) | PLL_F48M_DIV(11));
+    qtest_writel(qts, USB_WRAP, 1u << 18);
+    port_up(qts, OTG_FS);
+    /* The port runs, and frame 0 begins, from port_up()'s last writes. */
+    t0 = qtest_clock_step(qts, 1) - 1;
+    g_assert_cmpuint(rd(qts, OTG_FS, HFIR) & 0xffff, ==, 43636);
+    g_assert_cmpuint(rd(qts, OTG_FS, HFNUM) & 0x3fff, ==, 0);
+    t = qtest_clock_step(qts, t0 + 999991666 - (t0 + 1));
+    g_assert_cmpint(t, ==, t0 + 999991666);
+    g_assert_cmpuint(rd(qts, OTG_FS, HFNUM) & 0x3fff, ==, 999);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(rd(qts, OTG_FS, HFNUM) & 0x3fff, ==, 1000);
     qtest_quit(qts);
 }
 
@@ -1238,6 +1275,8 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/usb/force-mode", test_force_mode);
     qtest_add_func("/esp32p4/usb/hs-host-buffer-dma",
                    test_hs_host_buffer_dma);
+    qtest_add_func("/esp32p4/usb/fs-host-frames-exact",
+                   test_fs_host_frames_exact);
     qtest_add_func("/esp32p4/usb/fs-host-scatter-gather",
                    test_fs_host_scatter_gather);
     if (qtest_has_device("usb-audio")) {

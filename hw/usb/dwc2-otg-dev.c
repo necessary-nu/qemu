@@ -560,7 +560,7 @@ static void devport_sof(void *opaque, uint16_t frame)
         return;
     }
     dev_activity(s);
-    if (!dwc2_otg_phy_hz(s)) {
+    if (!dwc2_otg_phy_period(s)) {
         return;
     }
     s->dev_soffn = frame & 0x7ff;
@@ -578,7 +578,7 @@ static bool dev_answers(DWC2OTGState *s, uint8_t addr)
         return false;
     }
     dev_activity(s);
-    return dwc2_otg_phy_hz(s) && dev_addressed(s, addr);
+    return dwc2_otg_phy_period(s) && dev_addressed(s, addr);
 }
 
 /* [spec:nuos:req:emu.esp32p4.usb] */

@@ -202,6 +202,20 @@ static inline bool clock_set_ns(Clock *clk, unsigned ns)
 void clock_propagate(Clock *clk);
 
 /**
+ * clock_propagate_retime:
+ * @clk: the clock
+ *
+ * Run the ClockPreUpdate and ClockUpdate callbacks of every clock
+ * connected to @clk, recursively, as clock_propagate() does when the
+ * period changes, though the period has not: for a clock that its
+ * device times more finely than a Clock period holds, when that finer
+ * timing changes within the same rounded period. The callbacks find the
+ * period as it was. It is an error to call this function on a clock
+ * which has a source.
+ */
+void clock_propagate_retime(Clock *clk);
+
+/**
  * clock_update:
  * @clk: the clock to update.
  * @value: the new clock's value, 0 means unclocked

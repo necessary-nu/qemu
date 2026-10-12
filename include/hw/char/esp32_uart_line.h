@@ -104,7 +104,10 @@ void esp32_uart_rx_init(Esp32UartRx *rx, Esp32UartRxFormat *format,
                         Esp32UartRxDeliver *deliver, void *opaque);
 void esp32_uart_rx_line(Esp32UartRx *rx, bool level, int64_t when_ns);
 void esp32_uart_rx_reset(Esp32UartRx *rx, bool level);
-/* Decode the frame in progress if its stop bit's sample time has passed. */
+/*
+ * Decode the frames whose stop bits' sample times have passed by now
+ * (esp32_line_time()), once every source of line changes is up to then.
+ */
 void esp32_uart_rx_flush(Esp32UartRx *rx);
 extern const VMStateDescription vmstate_esp32_uart_rx;
 

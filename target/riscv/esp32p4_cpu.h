@@ -10,6 +10,7 @@
 #define TARGET_RISCV_ESP32P4_CPU_H
 
 #include "target/riscv/cpu.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "target/riscv/esp32p4_pie.h"
 #include "qom/object.h"
 
@@ -383,6 +384,13 @@ struct ESP32P4CPU {
     /* The HP core's ESP32P4_CPU_WAKEUP input is high. */
     bool wakeup;
     /*
+     * The core waits on the bus for a device to take its access (see
+     * esp32p4_cpu_bus_hold()); a device has asked for that of the access
+     * in progress.
+     */
+    bool bus_wait;
+    bool bus_hold;
+    /*
      * The PC at the core's last trap: LP_SYSTEM_LP_CPU_EXC_PC on the LP
      * core, the debug assistant's LASTPC_BEFORE_EXCEPTION on an HP core.
      */
@@ -436,9 +444,11 @@ struct ESP32P4CPU {
 
     /*
      * Both cores' counters (tcg/esp32p4_counters.c). The core's clock
-     * (ESP32P4_CPU_CLK), and the cycles of it counted up to the virtual
-     * time cycles_ns plus cycles_frac 2^-32 ns, the end of the last whole
-     * cycle counted while the clock runs. insns counts the instructions
+     * (ESP32P4_CPU_CLK) at its exact period as it last changed
+     * (clk_period), and the cycles of it counted: cycles_synced of them
+     * since the clock's current run began at the virtual time cycles_ns
+     * plus cycles_frac 2^-32 ns, its last change, start or restart, or
+     * the present while it is stopped. insns counts the instructions
      * the core has started, less those that did not retire; the code
      * QEMU translates for the core adds to it. mcycle and minstret are
      * ctr_base[] plus the cycles or instructions since ctr_ref[] while
@@ -447,7 +457,9 @@ struct ESP32P4CPU {
      * the LP core) hold what is written.
      */
     Clock *clk;
+    ESP32P4ClkPeriod clk_period;
     uint64_t cycles;
+    uint64_t cycles_synced;
     int64_t cycles_ns;
     uint32_t cycles_frac;
     uint64_t insns;
@@ -521,6 +533,23 @@ void esp32p4_cpu_set_mintthresh(ESP32P4CPU *cpu, uint8_t th);
  */
 bool esp32p4_cpu_mid_block(void);
 
+/*
+ * Bus wait states. A device that cannot take a core's access yet holds
+ * the access on the bus, as an APB slave holds PREADY low: from the
+ * access's handler, esp32p4_cpu_bus_waiter() of its attributes gives the
+ * core making it (NULL when no core is, for a qtest or DMA access, which
+ * no wait state holds), and the handler returns esp32p4_cpu_bus_hold() of
+ * it, not having taken the access. The core stops at the instruction
+ * making the access, which it has not made, and neither runs nor takes an
+ * interrupt until the device calls esp32p4_cpu_bus_release(); then it
+ * makes the access again, unless an interrupt pending by then comes
+ * first. Its clock, and its cycle counter, run on meanwhile. A reset of
+ * the core ends its wait.
+ */
+ESP32P4CPU *esp32p4_cpu_bus_waiter(MemTxAttrs attrs);
+MemTxResult esp32p4_cpu_bus_hold(ESP32P4CPU *cpu);
+void esp32p4_cpu_bus_release(ESP32P4CPU *cpu);
+
 /* The LP core's start, which the machine gives it. */
 void esp32p4_lp_cpu_set_boot(ESP32P4CPU *cpu, ESP32P4LPBootFn fn,
                              void *opaque);
@@ -581,7 +610,8 @@ void esp32p4_trace_trap(ESP32P4CPU *cpu, uint32_t epc, uint32_t cause,
  * esp32p4_counters.c: both cores' counters. The counters' CSRs, which the
  * chip's CSR table hands over; the core's state changing, with the BQL
  * held: before its reset or clock enable changes or its clock changes
- * rate (esp32p4_counters_update()), and as an HP core enters WFI and
+ * rate (esp32p4_counters_update()), once its clock has changed
+ * (esp32p4_counters_clock_changed()), and as an HP core enters WFI and
  * as it leaves; and its reset.
  */
 RISCVException esp32p4_counters_read(CPURISCVState *env, int csrno,
@@ -589,6 +619,7 @@ RISCVException esp32p4_counters_read(CPURISCVState *env, int csrno,
 RISCVException esp32p4_counters_write(CPURISCVState *env, int csrno,
                                       target_ulong val);
 void esp32p4_counters_update(ESP32P4CPU *cpu);
+void esp32p4_counters_clock_changed(ESP32P4CPU *cpu);
 void esp32p4_counters_wfi(ESP32P4CPU *cpu, bool wfi);
 void esp32p4_counters_reset(ESP32P4CPU *cpu);
 

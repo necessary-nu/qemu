@@ -3309,6 +3309,8 @@ static bool trans_SEV(DisasContext *s, arg_SEV *a)
     if (arm_dc_feature(s, ARM_FEATURE_M) ||
         arm_dc_feature(s, ARM_FEATURE_V6K)) {
         gen_helper_sev(tcg_env);
+        /* The helper may end this CPU's turn for a CPU it wakes. */
+        s->base.is_jmp = DISAS_UPDATE_EXIT;
     }
 #endif
     return true;

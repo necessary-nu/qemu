@@ -75,6 +75,12 @@ struct ESP32P4EcdsaState {
     bool sha_started;
     bool sha_held;
     bool ecc_held;
+    /*
+     * The block the SHA interface hashes, and the cores whose start waits
+     * for it to be done, by index.
+     */
+    uint8_t op_message[64];
+    uint32_t waiters;
 };
 
 #endif
