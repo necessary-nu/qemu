@@ -190,6 +190,7 @@ struct Esp32SocState {
     Clock *ledc_rc_fast_clk;
     Clock *twai_apb_clk;
     Clock *pcnt_apb_clk;
+    Clock *efuse_apb_clk;
 
     Esp32PeriphGate gate[ESP32_GATE_MAX];
     unsigned n_gates;
