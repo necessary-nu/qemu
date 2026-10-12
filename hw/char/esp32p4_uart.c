@@ -459,6 +459,26 @@ static void uart_format_changed(ESP32P4UartState *s)
     notifier_list_notify(&s->format_notifiers, s);
 }
 
+/* The frames the RX FIFO can take (see esp32_uart_line_rx_room()). */
+static unsigned uart_rx_room(ESP32P4UartState *s)
+{
+    if (cconf0(s) & CONF0_RXFIFO_RST) {
+        return s->fifo_len;
+    }
+    return s->fifo_len - s->rx_fifo.num;
+}
+
+/*
+ * Software took bytes from the RX FIFO, @was the room before: a terminal
+ * holding the host's bytes for want of room can send them now.
+ */
+static void uart_rx_room_made(ESP32P4UartState *s, unsigned was)
+{
+    if (was < 2 && uart_rx_room(s) >= 2) {
+        uart_format_changed(s);
+    }
+}
+
 /* ---- Interrupts ---- */
 
 /*
@@ -1717,6 +1737,7 @@ static void uart_sync(ESP32P4UartState *s)
     }
     if (c0 & CONF0_RXFIFO_RST) {
         fifo_reset(&s->rx_fifo);
+        uart_rx_room_made(s, 0);
     }
     if (!s->lp && (c0 & CONF0_AUTOBAUD_EN) && !(old_c0 & CONF0_AUTOBAUD_EN)) {
         uart_autobaud_reset(s);
@@ -1869,6 +1890,7 @@ static void uart_write_clk_conf(ESP32P4UartState *s, uint32_t v)
     if (v & CLK_RX_RST_CORE) {
         fifo_reset(&s->rx_fifo);
         uart_rx_reset(s);
+        uart_rx_room_made(s, 0);
     } else if (!(v & CLK_RX_SCLK_EN) && (old & CLK_RX_SCLK_EN)) {
         uart_rx_reset(s);
     }
@@ -1993,8 +2015,11 @@ static uint64_t uart_read(void *opaque, hwaddr addr, unsigned size)
             qemu_log_mask(LOG_GUEST_ERROR, "%s: read of the empty RX FIFO\n",
                           object_get_canonical_path(OBJECT(s)));
         } else {
+            unsigned was = uart_rx_room(s);
+
             v = fifo_pop(s, &s->rx_fifo);
             uart_rx_fifo_changed(s, now_ns());
+            uart_rx_room_made(s, was);
         }
         break;
     case A_INT_RAW:
@@ -2190,11 +2215,14 @@ unsigned esp32p4_uart_dma_rx_count(ESP32P4UartState *s)
 /* [spec:nuos:req:emu.esp32p4.uart] */
 bool esp32p4_uart_dma_rx_pop(ESP32P4UartState *s, uint8_t *byte)
 {
+    unsigned was = uart_rx_room(s);
+
     if (!esp32p4_uart_dma_rx_count(s)) {
         return false;
     }
     *byte = fifo_pop(s, &s->rx_fifo);
     uart_rx_fifo_changed(s, now_ns());
+    uart_rx_room_made(s, was);
     return true;
 }
 
@@ -2295,6 +2323,11 @@ static bool uart_line_get_format(Object *obj, Esp32UartFrameFmt *fmt)
 static void uart_line_add_format_notifier(Object *obj, Notifier *n)
 {
     notifier_list_add(&ESP32P4_UART(obj)->format_notifiers, n);
+}
+
+static unsigned uart_line_rx_room(Object *obj)
+{
+    return uart_rx_room(ESP32P4_UART(obj));
 }
 
 /* ---- Reset, realize and state ---- */
@@ -2517,6 +2550,7 @@ static void uart_class_init(ObjectClass *klass, const void *data)
     rc->phases.exit = uart_reset_exit;
     lc->get_format = uart_line_get_format;
     lc->add_format_notifier = uart_line_add_format_notifier;
+    lc->rx_room = uart_line_rx_room;
 }
 
 /* [spec:nuos:req:emu.esp32p4.uart] */

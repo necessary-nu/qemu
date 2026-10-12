@@ -117,7 +117,17 @@ extern const VMStateDescription vmstate_esp32_uart_rx;
  * bit time the UART is configured for, as a device on the other end of
  * its lines set up to match it sees them, and false while the UART's baud
  * clock is stopped; add_format_notifier() asks to be told whenever either
- * changes.
+ * changes, or the receiver's FIFO gains room after it was full.
+ *
+ * rx_room(), which a UART may leave out, gives how many more frames its
+ * RX FIFO can take. On the host's clock the terminal, the host's serial
+ * port, sends the host's bytes no faster than that, as QEMU takes a
+ * host's serial input as fast as the receiving device can store it
+ * (qemu_chr_fe's can_read): without icount virtual time runs on while
+ * the host has the chip's CPU descheduled, and for longer than the FIFO
+ * lasts it would lose bytes no software running at the chip's speed
+ * loses. Under icount the terminal sends at the line's rate, and a FIFO
+ * that software does not empty overflows, as on silicon.
  */
 #define TYPE_ESP32_UART_LINE_IF "esp32-uart-line-if"
 typedef struct Esp32UartLineIfClass Esp32UartLineIfClass;
@@ -129,9 +139,11 @@ struct Esp32UartLineIfClass {
 
     bool (*get_format)(Object *uart, Esp32UartFrameFmt *fmt);
     void (*add_format_notifier)(Object *uart, Notifier *n);
+    unsigned (*rx_room)(Object *uart);
 };
 
 bool esp32_uart_line_get_format(Object *uart, Esp32UartFrameFmt *fmt);
 void esp32_uart_line_add_format_notifier(Object *uart, Notifier *n);
+unsigned esp32_uart_line_rx_room(Object *uart);
 
 #endif
