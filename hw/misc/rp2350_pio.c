@@ -1780,6 +1780,7 @@ static void pio_in(void *opaque, int n, int level)
     RP2350PIOState *s = opaque;
     uint64_t vec = deposit64(s->in_level, n, 1, level != 0);
     uint64_t cycle;
+    uint32_t k;
 
     if (vec == s->in_level) {
         return;
@@ -1791,27 +1792,40 @@ static void pio_in(void *opaque, int n, int level)
         return;
     }
     cycle = MAX(pio_now(s), core_input_floor(&s->core, BIT_ULL(n)));
-    if (s->inq_n) {
-        cycle = MAX(cycle, s->inq_cycle[s->inq_n - 1]);
+    /*
+     * The queue is in order of cycle. A change can come in after one of a
+     * later time, when a device that was behind catches up as it takes the
+     * later one: it goes in at its own cycle.
+     */
+    for (k = s->inq_n; k > 0 && s->inq_cycle[k - 1] > cycle; k--) {
     }
-    if (!s->inq_n || (s->inq_cycle[s->inq_n - 1] < cycle &&
-                      s->inq_n < RP2350_PIO_IN_QUEUE)) {
-        s->inq_vec[s->inq_n] = 0;
-        s->inq_mask[s->inq_n] = 0;
-        s->inq_cycle[s->inq_n] = cycle;
-        s->inq_n++;
+    if (!k || s->inq_cycle[k - 1] < cycle) {
+        if (s->inq_n < RP2350_PIO_IN_QUEUE) {
+            memmove(&s->inq_vec[k + 1], &s->inq_vec[k],
+                    (s->inq_n - k) * sizeof(s->inq_vec[0]));
+            memmove(&s->inq_mask[k + 1], &s->inq_mask[k],
+                    (s->inq_n - k) * sizeof(s->inq_mask[0]));
+            memmove(&s->inq_cycle[k + 1], &s->inq_cycle[k],
+                    (s->inq_n - k) * sizeof(s->inq_cycle[0]));
+            s->inq_vec[k] = 0;
+            s->inq_mask[k] = 0;
+            s->inq_cycle[k] = cycle;
+            s->inq_n++;
+            k++;
+        } else if (!k) {
+            k = 1;
+        }
     }
     /*
      * Changes in the same cycle, or more frequent than the queue holds,
-     * are merged into the newest.
+     * are merged into the entry before.
      */
-    s->inq_vec[s->inq_n - 1] = deposit64(s->inq_vec[s->inq_n - 1], n, 1,
-                                         level != 0);
-    s->inq_mask[s->inq_n - 1] |= BIT_ULL(n);
+    s->inq_vec[k - 1] = deposit64(s->inq_vec[k - 1], n, 1, level != 0);
+    s->inq_mask[k - 1] |= BIT_ULL(n);
     /* The run ahead assumed the pins would not change. */
     s->spec_valid = false;
     s->horizon = HORIZON_MIN;
-    if (!timer_pending(s->in_timer)) {
+    if (!timer_pending(s->in_timer) || line_time() < s->in_due_ns) {
         s->in_due_ns = line_time();
         timer_mod(s->in_timer, s->in_due_ns);
     }

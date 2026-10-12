@@ -12,6 +12,7 @@
 #include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/ssi/pl022.h"
@@ -168,7 +169,7 @@ static void pl022_drive_pins(PL022State *s)
         tx_oe = s->busy;
     } else {
         tx_oe = pl022_enabled(s) && !(s->cr1 & PL022_CR1_SOD) &&
-                (ti || !s->fssin);
+                (ti || !s->fssin.level);
     }
     pl022_set_pin(s, PL022_NSSPCTLOE, !master);
     pl022_set_pin(s, PL022_SSPCLKOUT,
@@ -353,7 +354,8 @@ static void pl022_xfer(PL022State *s)
 
 /*
  * Back-to-back frames follow on from the end of the last one, however
- * late its timer runs, so the line rate holds in virtual time. A timer
+ * late its timer runs, so the line rate holds in virtual time. The frame
+ * ends at its own time: pl022_frame_timer() runs this at it. A timer
  * that runs late can leave several frames due at once; they complete
  * together only while the receive FIFO has room for them. Once it is
  * full the next frame starts no earlier than now, giving whatever drains
@@ -378,8 +380,25 @@ static void pl022_frame_done(void *opaque)
 }
 
 /*
- * A frame clocked by an external master, for a PL022 in slave mode. The
- * slave takes part while enabled and selected by SSPFSSIN low; TI frames
+ * The frame timer: a frame ends, at its own time however late the timer
+ * runs, so that what it changes carries that time and a slave on the bus
+ * takes its select as it was then.
+ */
+static void pl022_frame_timer(void *opaque)
+{
+    PL022State *s = opaque;
+
+    if (s->busy) {
+        line_run_at(s->frame_end, pl022_frame_done, s);
+    } else {
+        pl022_frame_done(s);
+    }
+}
+
+/*
+ * A frame clocked by an external master, for a PL022 in slave mode, at
+ * the frame's time (line_time()). The slave takes part while enabled and
+ * selected by SSPFSSIN low at that time; TI frames
  * are delimited by frame pulses rather than a select, so a TI slave takes
  * every frame. It shifts out the head of its transmit FIFO (zeros when
  * the FIFO is empty) unless SOD bars it from driving the line.
@@ -390,7 +409,8 @@ static uint32_t pl022_slave_frame(PL022State *s, uint32_t rx)
     uint32_t tx = 0;
 
     if (!pl022_enabled(s) || !pl022_slave(s) ||
-        (pl022_frf(s) != PL022_FRF_TI && s->fssin)) {
+        (pl022_frf(s) != PL022_FRF_TI &&
+         line_history_at(&s->fssin, line_time()))) {
         return 0;
     }
     if (s->tx_fifo_len) {
@@ -401,12 +421,18 @@ static uint32_t pl022_slave_frame(PL022State *s, uint32_t rx)
     return (s->cr1 & PL022_CR1_SOD) ? 0 : tx;
 }
 
+/*
+ * A change of SSPFSSIN, at its time (line_time()). The changes are kept,
+ * so that a frame whose end is delivered after a later change, its timer
+ * running late, still takes the select as it was at its end.
+ */
 static void pl022_set_fssin(void *opaque, int n, int level)
 {
     PL022State *s = opaque;
 
-    s->fssin = level != 0;
-    pl022_update(s);
+    if (line_history_set(&s->fssin, level != 0, line_time())) {
+        pl022_update(s);
+    }
 }
 
 /*
@@ -429,7 +455,7 @@ static void pl022_catch_up(PL022State *s)
            timer_expire_time_ns(s->frame_timer) <= now &&
            !(s->busy && s->rx_fifo_len == PL022_FIFO_DEPTH)) {
         timer_del(s->frame_timer);
-        pl022_frame_done(s);
+        pl022_frame_timer(s);
     }
     if (timer_pending(s->rt_timer) &&
         timer_expire_time_ns(s->rt_timer) <= now) {
@@ -607,6 +633,8 @@ static void pl022_reset_hold(Object *obj, ResetType type)
     s->busy = false;
     s->frame_left = 0;
     s->shift = 0;
+    /* SSPFSSIN is the pin's level, not reset; its past changes go. */
+    line_history_reset(&s->fssin, s->fssin.level);
     s->im = 0;
     s->is = PL022_INT_TX;
     s->sr = PL022_SR_TFE | PL022_SR_TNF;
@@ -642,12 +670,15 @@ static int pl022_post_load(void *opaque, int version_id)
     for (i = 0; i < PL022_SSP_OUTS; i++) {
         s->ssp_level[i] = -1;
     }
+    if (version_id < 4) {
+        line_history_reset(&s->fssin, s->fssin.level);
+    }
     return 0;
 }
 
 static const VMStateDescription vmstate_pl022 = {
     .name = "pl022_ssp",
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .post_load = pl022_post_load,
     .fields = (const VMStateField[]) {
@@ -681,12 +712,14 @@ static const VMStateDescription vmstate_pl022 = {
         VMSTATE_UINT32_V(dmacr, PL022State, 2),
         VMSTATE_BOOL_V(busy, PL022State, 2),
         VMSTATE_UINT16_V(shift, PL022State, 2),
-        VMSTATE_BOOL_V(fssin, PL022State, 2),
+        VMSTATE_BOOL_V(fssin.level, PL022State, 2),
         VMSTATE_INT64_V(frame_end, PL022State, 2),
         VMSTATE_TIMER_PTR_V(frame_timer, PL022State, 2),
         VMSTATE_TIMER_PTR_V(rt_timer, PL022State, 2),
         VMSTATE_CLOCK_V(clk, PL022State, 2),
         VMSTATE_UINT64_V(frame_left, PL022State, 3),
+        VMSTATE_STRUCT(fssin, PL022State, 4, vmstate_line_history,
+                       LineHistory),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -728,7 +761,7 @@ static void pl022_init(Object *obj)
 
     s->clk = qdev_init_clock_in(dev, "clk", pl022_clk_update, s,
                                 ClockPreUpdate | ClockUpdate);
-    s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pl022_frame_done, s);
+    s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pl022_frame_timer, s);
     s->rt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pl022_rt_expired, s);
     qdev_init_gpio_out_named(dev, s->dma_req, PL022_DMA_REQ,
                              ARRAY_SIZE(s->dma_req));

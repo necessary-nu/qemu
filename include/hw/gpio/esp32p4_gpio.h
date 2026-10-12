@@ -522,10 +522,10 @@ struct ESP32P4GpioState {
     bool update_pending;
     /*
      * The time of the round being resolved, and the changes held back
-     * from it, at other times (see esp32_line.h).
+     * from it, at other times (see hw/core/line-time.h).
      */
     int64_t round_ns;
-    Esp32LineDeferred deferred;
+    LineDeferred deferred;
     /*
      * What has changed since the last round, for the next to take in:
      * the drive of these pads, the filters' outputs, or anything at all,

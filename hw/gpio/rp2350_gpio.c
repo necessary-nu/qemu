@@ -569,6 +569,70 @@ static void rp2350_gpio_deliver(RP2350GPIOState *s, int i, uint8_t level)
     }
 }
 
+/* Resolve the changes that came in during a round, at its time. */
+static void rp2350_gpio_settle(RP2350GPIOState *s)
+{
+    while (s->update_pending) {
+        s->update_pending = false;
+        rp2350_gpio_propagate(s, false);
+    }
+}
+
+/* The changes held back at the time of the round, then their round. */
+static void rp2350_gpio_settle_deferred(void *opaque)
+{
+    RP2350GPIOState *s = opaque;
+
+    s->update_pending = false;
+    line_deferred_replay(&s->deferred, s->round_ns);
+    rp2350_gpio_settle(s);
+}
+
+/*
+ * [spec:nuos:req:emu.gpio]
+ * Begin a round at the change's time (line_time()). Every line the round
+ * drives carries that time; a change that comes in during the round at
+ * another time is held back (rp2350_gpio_held_back()).
+ */
+static void rp2350_gpio_round_begin(RP2350GPIOState *s)
+{
+    s->updating = true;
+    s->round_ns = line_time();
+}
+
+/*
+ * [spec:nuos:req:emu.gpio]
+ * End a round: resolve the changes held back from it, the earliest time
+ * first, each time's in a round of its own.
+ */
+static void rp2350_gpio_round_end(RP2350GPIOState *s)
+{
+    int64_t when;
+
+    while (line_deferred_next(&s->deferred, &when)) {
+        s->round_ns = when;
+        line_run_at(when, rp2350_gpio_settle_deferred, s);
+    }
+    s->update_pending = false;
+    s->updating = false;
+}
+
+/*
+ * [spec:nuos:req:emu.gpio]
+ * Whether a change to an input, which fn(opaque, n, level) takes, comes
+ * in while a round resolves at another time: it is then held back, to be
+ * resolved at its own time.
+ */
+static bool rp2350_gpio_held_back(RP2350GPIOState *s, LineInput *fn,
+                                  void *opaque, int n, int level)
+{
+    if (!s->updating || line_time() == s->round_ns) {
+        return false;
+    }
+    line_defer(&s->deferred, fn, opaque, n, level, line_time());
+    return true;
+}
+
 /*
  * Propagate a change of peripheral signal f's output or output enable.
  * Only the pins that select f can change, so this is a full pass cut down
@@ -584,7 +648,7 @@ static void rp2350_gpio_update_signal(RP2350GPIOState *s, int f)
         s->update_pending = true;
         return;
     }
-    s->updating = true;
+    rp2350_gpio_round_begin(s);
     for (p = 0; p < RP2350_GPIO_PINS; p++) {
         bool pad_changed, irq_changed;
         uint8_t to_peri;
@@ -614,11 +678,8 @@ static void rp2350_gpio_update_signal(RP2350GPIOState *s, int f)
     if (irq) {
         rp2350_gpio_set_irqs(s);
     }
-    while (s->update_pending) {
-        s->update_pending = false;
-        rp2350_gpio_propagate(s, false);
-    }
-    s->updating = false;
+    rp2350_gpio_settle(s);
+    rp2350_gpio_round_end(s);
 }
 
 /*
@@ -631,13 +692,10 @@ static void rp2350_gpio_update_force(RP2350GPIOState *s, bool force)
         s->update_pending = true;
         return;
     }
-    s->updating = true;
-    do {
-        s->update_pending = false;
-        rp2350_gpio_propagate(s, force);
-        force = false;
-    } while (s->update_pending);
-    s->updating = false;
+    rp2350_gpio_round_begin(s);
+    rp2350_gpio_propagate(s, force);
+    rp2350_gpio_settle(s);
+    rp2350_gpio_round_end(s);
 }
 
 static void rp2350_gpio_update(RP2350GPIOState *s)
@@ -655,6 +713,10 @@ static void rp2350_gpio_set_src_out(void *opaque, int n, int level)
 {
     RP2350GPIOPortRef *ref = opaque;
 
+    if (rp2350_gpio_held_back(ref->s, rp2350_gpio_set_src_out, ref, n,
+                              level)) {
+        return;
+    }
     if (ref->s->src_out[ref->base + n] != (level != 0)) {
         ref->s->src_out[ref->base + n] = level != 0;
         rp2350_gpio_update_signal(ref->s, ref->base + n);
@@ -665,6 +727,10 @@ static void rp2350_gpio_set_src_oe(void *opaque, int n, int level)
 {
     RP2350GPIOPortRef *ref = opaque;
 
+    if (rp2350_gpio_held_back(ref->s, rp2350_gpio_set_src_oe, ref, n,
+                              level)) {
+        return;
+    }
     if (ref->s->src_oe[ref->base + n] != (level != 0)) {
         ref->s->src_oe[ref->base + n] = level != 0;
         rp2350_gpio_update_signal(ref->s, ref->base + n);
@@ -675,6 +741,9 @@ static void rp2350_gpio_set_pad_in(void *opaque, int n, int level)
 {
     RP2350GPIOState *s = opaque;
 
+    if (rp2350_gpio_held_back(s, rp2350_gpio_set_pad_in, s, n, level)) {
+        return;
+    }
     s->ext[n] = level < 0 ? RP2350_GPIO_EXT_NONE : level != 0;
     rp2350_gpio_update(s);
 }
@@ -1154,6 +1223,7 @@ static void rp2350_gpio_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
     int port, core, i;
 
+    line_deferred_init(&s->deferred);
     memory_region_init_io(&s->io_bank0, obj, &rp2350_io_bank0_ops, s,
                           "rp2350-io-bank0", RP2350_ATOMIC_REGION_SIZE);
     memory_region_init_io(&s->io_qspi, obj, &rp2350_io_qspi_ops, s,
@@ -1259,12 +1329,18 @@ static void rp2350_gpio_class_init(ObjectClass *klass, const void *data)
     dc->vmsd = &vmstate_rp2350_gpio;
 }
 
+static void rp2350_gpio_finalize(Object *obj)
+{
+    line_deferred_finalize(&RP2350_GPIO(obj)->deferred);
+}
+
 /* [spec:nuos:req:emu.gpio] */
 static const TypeInfo rp2350_gpio_info = {
     .name          = TYPE_RP2350_GPIO,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(RP2350GPIOState),
     .instance_init = rp2350_gpio_init,
+    .instance_finalize = rp2350_gpio_finalize,
     .class_init    = rp2350_gpio_class_init,
 };
 

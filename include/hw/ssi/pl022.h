@@ -31,7 +31,13 @@
  *   SSPCLKOUT, SSPFSSOUT, SSPTXD, nSSPCTLOE and nSSPOE at frame level
  *   (see below).
  * + Named GPIO input "sspfssin": SSPFSSIN, the frame/slave select input in
- *   slave mode. Unconnected, it is low: the slave is selected.
+ *   slave mode. Unconnected, it is low: the slave is selected. A frame
+ *   another master clocks in takes the select's level at the frame's
+ *   time (hw/core/line-time.h), whenever its change was delivered.
+ *
+ * Frames end at their own times however late their timer runs: the
+ * frame's exchange on the SSI bus and the signals it changes carry its
+ * time (hw/core/line-time.h).
  *
  * Slave mode is reached through a TYPE_PL022_TARGET device on some
  * master's SSI bus, linked to the PL022 by its "controller" property.
@@ -41,6 +47,7 @@
 #define HW_SSI_PL022_H
 
 #include "hw/core/sysbus.h"
+#include "hw/core/line-time.h"
 #include "hw/ssi/ssi.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -105,7 +112,8 @@ struct PL022State {
     int64_t frame_end;
     /* The SSPCLK cycles left of a frame held while SSPCLK is stopped. */
     uint64_t frame_left;
-    bool fssin;
+    /* SSPFSSIN, with its latest changes and their times. */
+    LineHistory fssin;
 
     QEMUTimer *frame_timer;
     QEMUTimer *rt_timer;

@@ -10,6 +10,7 @@
 #define HW_GPIO_ESP32_LINE_H
 
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "qemu/notify.h"
 
 /*
@@ -41,6 +42,8 @@
  *
  * The ESP32 and the ESP32-P4 GPIO matrices both time their lines this
  * way, so that a peripheral model serves either chip's matrix unchanged.
+ * A change that reaches a matrix while it resolves one at another time is
+ * held back with its own time (see hw/core/line-time.h).
  */
 int64_t esp32_line_time(void);
 void esp32_line_set_at(qemu_irq line, int level, int64_t when_ns);
@@ -48,35 +51,5 @@ void esp32_line_run_at(int64_t when_ns, void (*fn)(void *opaque),
                        void *opaque);
 void esp32_line_add_source(Notifier *n);
 void esp32_line_sync(void);
-
-/*
- * Changes that reach a device while it resolves another.
- *
- * A device that resolves its lines in rounds (a GPIO matrix) is re-entered
- * when a block a round reaches answers by driving a line back. An answer
- * at the round's time belongs with it, as another round at that time. An
- * answer at another time, such as the edges of a source that was behind
- * and catches up as it takes the round's change, would take the round's
- * time if the device took it into its state at once: the device holds it
- * back with its own time (esp32_line_defer(), from the input's handler),
- * and once the round has settled resolves the held-back changes, the
- * earliest time first, each time's in a round of its own: for each time
- * esp32_line_deferred_next() gives, it replays them with
- * esp32_line_deferred_replay() and resolves the result at that time.
- */
-typedef void Esp32LineInput(void *opaque, int n, int level);
-
-typedef struct Esp32LineDeferred {
-    /* Esp32LineChange, in order of time, then of arrival, from head on */
-    GArray *changes;
-    guint head;
-} Esp32LineDeferred;
-
-void esp32_line_deferred_init(Esp32LineDeferred *d);
-void esp32_line_deferred_finalize(Esp32LineDeferred *d);
-void esp32_line_defer(Esp32LineDeferred *d, Esp32LineInput *fn,
-                      void *opaque, int n, int level);
-bool esp32_line_deferred_next(Esp32LineDeferred *d, int64_t *when_ns);
-void esp32_line_deferred_replay(Esp32LineDeferred *d, int64_t when_ns);
 
 #endif

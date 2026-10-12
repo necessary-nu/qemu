@@ -39,7 +39,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350HSTXState, RP2350_HSTX)
  *   "oe"      output[8]: its output enable; HSTX is output-only, so 1
  *   "dreq"    output[1]: DREQ_HSTX, high while the FIFO has room
  *   "pio-out" input[24]: for coupled mode, PIO p's outputs for GPIOs
- *                        12-19 on lines 8p to 8p+7
+ *                        12-19 on lines 8p to 8p+7, each change taken in
+ *                        the clk_hstx cycle of its time
+ *                        (hw/core/line-time.h)
  *
  * clk_hstx is the "clk" clock input.
  */
@@ -125,6 +127,8 @@ struct RP2350HSTXState {
     MemoryRegion fifo_iomem;
     Clock *clk;
     QEMUTimer *timer;
+    /* The virtual time the timer is due at. */
+    int64_t due_ns;
     qemu_irq out[RP2350_HSTX_BITS];
     qemu_irq oe[RP2350_HSTX_BITS];
     qemu_irq dreq;
