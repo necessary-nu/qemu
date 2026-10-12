@@ -63,10 +63,12 @@
  *     gates): a source mux, a gate and a divider,
  *     integer, fractional as above, or I2S's N + b/a from its X, Y, Z and
  *     YN1. Each divider register holds its divisor less one; I2S's N is
- *     the divisor's integer part. A mux setting the TRM calls invalid
- *     selects a stopped clock; where the TRM calls invalid a setting
- *     ESP-IDF uses (I2S's PLL_F160M, the calibration clock's RC32K and
- *     the DSI PHY's clock), the model follows ESP-IDF.
+ *     the divisor's integer part; CAM_CLK's CAM_CLK_DIV_NUM holds its
+ *     divisor's integer part itself, 0 standing for 256 and 1 for 2 (TRM
+ *     40.3.3.2; ESP-IDF's cam_ll writes the divisor there). A mux setting
+ *     the TRM calls invalid selects a stopped clock; where the TRM calls
+ *     invalid a setting ESP-IDF uses (I2S's PLL_F160M, the calibration
+ *     clock's RC32K and the DSI PHY's clock), the model follows ESP-IDF.
  *   - The PVT monitor's clocks from PLL_F160M_CLK, which ESP-IDF enables
  *     for them (pmu_pvt.c), and the LP ADC's function clock from its bus
  *     clock, LP_PERI_CLK, as TRM table 11.2-7 has it, and its SAR clocks
@@ -510,7 +512,7 @@ typedef struct {
     uint8_t width;
 } ClkField;
 
-enum { DIV_NONE, DIV_INT, DIV_FRAC, DIV_I2S, DIV_FIXED, SPECIAL };
+enum { DIV_NONE, DIV_INT, DIV_FRAC, DIV_CAM, DIV_I2S, DIV_FIXED, SPECIAL };
 
 #define PARENT_IN   0x4000
 #define PARENT_NONE 0x7fff
@@ -542,6 +544,8 @@ typedef struct {
     [C(id)] = { PARENTS(C(LP_PERI)), .gate = { B(LPPERI_CLK_EN, b) } }
 #define FRAC(r0, s0, r1, s1, r2, s2) \
     .kind = DIV_FRAC, .div = { F(r0, s0, 8), F(r1, s1, 8), F(r2, s2, 8) }
+#define CAMFRAC(r0, s0, r1, s1, r2, s2) \
+    .kind = DIV_CAM, .div = { F(r0, s0, 8), F(r1, s1, 8), F(r2, s2, 8) }
 #define I2S(rn, sn, rx, sx, ry, sy, rz, sz, ryn, syn) \
     .kind = DIV_I2S, \
     .div = { F(rn, sn, 8), F(rx, sx, 9), F(ry, sy, 9), F(rz, sz, 9), \
@@ -933,8 +937,8 @@ static const ClkDesc esp32p4_clk_desc[ESP32P4_NUM_CLOCKS] = {
     [C(CAM)] = { PARENTS(C(XTAL), C(PLL_F160M), C(APLL), PNONE),
                  .sel = F(PERI_CLK_CTRL119, 27, 2),
                  .gate = { B(PERI_CLK_CTRL119, 29) },
-                 FRAC(PERI_CLK_CTRL120, 0, PERI_CLK_CTRL120, 8,
-                      PERI_CLK_CTRL120, 16) },
+                 CAMFRAC(PERI_CLK_CTRL120, 0, PERI_CLK_CTRL120, 8,
+                         PERI_CLK_CTRL120, 16) },
     [C(MCPWM0)] = { PARENTS(C(XTAL), C(RC_FAST), C(PLL_F160M), PNONE),
                     .sel = F(PERI_CLK_CTRL20, 0, 2),
                     .gate = { B(PERI_CLK_CTRL20, 2) },
@@ -1558,6 +1562,13 @@ static ESP32P4ClkPeriod esp32p4_clkrst_compute(ESP32P4ClkRstState *s, int id,
     case DIV_FRAC:
         return esp32p4_clkrst_frac(p, fld(s, d->div[0]), fld(s, d->div[1]),
                                    fld(s, d->div[2]));
+    case DIV_CAM: {
+        uint32_t n = fld(s, d->div[0]);
+
+        n = n == 0 ? 256 : n == 1 ? 2 : n;
+        return esp32p4_clkrst_frac(p, n - 1, fld(s, d->div[1]),
+                                   fld(s, d->div[2]));
+    }
     case DIV_I2S:
         return esp32p4_clkrst_i2s(p, fld(s, d->div[0]), fld(s, d->div[1]),
                                   fld(s, d->div[2]), fld(s, d->div[3]),
