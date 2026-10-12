@@ -119,12 +119,15 @@
  *     DMA master SDMMC, its interrupt SDIO_HOST_INTR (source 23), and its
  *     card detect, write protect and SDIO interrupt inputs and card reset
  *     outputs matrix signals 126 to 131 and 146 to 148. A card on slot N
- *     is -drive if=sd,index=N: the board's microSD socket is slot 0, on
- *     the IO MUX pads GPIO39 to GPIO44; slot 1 is where the board's
- *     ESP32-C6 sits, as an SDIO slave, and has no card unless given one:
+ *     is -drive if=sd,index=N, or -device sd-card,bus=sd-busN: the
+ *     board's microSD socket is slot 0, on the IO MUX pads GPIO39 to
+ *     GPIO44; slot 1 is where the board's ESP32-C6 sits, as an SDIO
+ *     slave, and has no card unless given one:
  *
  *       -drive if=sd,index=0,format=raw,file=sd.img
  *
+ *     Every SD card takes time as one that just meets its registers
+ *     (hw/sd/sd.c, the sd-card "timing" property, which the machine sets).
  *     A card is on the board, not the chip: no reset of the chip or the
  *     controller reaches it, only a power cycle (QEMU's system reset).
  *
@@ -5016,6 +5019,16 @@ static void esp32p4_machine_instance_finalize(Object *obj)
     g_free(ESP32P4_MACHINE(obj)->lp_rom_file);
 }
 
+/*
+ * [spec:nuos:req:emu.sd-card-timing]
+ * Every SD card in the machine, from -drive if=sd or -device sd-card,
+ * takes time (hw/sd/sd.c); -global sd-card.timing=off or a card's own
+ * timing=off makes one that does not.
+ */
+static GlobalProperty esp32p4_sd_card_timing[] = {
+    { TYPE_SD_CARD, "timing", "on" },
+};
+
 /* [spec:nuos:req:emu.esp32p4.machine] */
 static void esp32p4_machine_class_init(ObjectClass *oc, const void *data)
 {
@@ -5047,6 +5060,8 @@ static void esp32p4_machine_class_init(ObjectClass *oc, const void *data)
     mc->max_cpus = ESP32P4_HP_CORES + 1;
     mc->default_cpus = ESP32P4_HP_CORES + 1;
     machine_add_audiodev_property(mc);
+    compat_props_add(mc->compat_props, esp32p4_sd_card_timing,
+                     ARRAY_SIZE(esp32p4_sd_card_timing));
 }
 
 /* [spec:nuos:req:emu.esp32p4.machine] */
