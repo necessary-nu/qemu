@@ -148,6 +148,7 @@ DEF_HELPER_3(esp32p4_mret, tl, env, i64, tl)
 DEF_HELPER_1(esp32p4_uret, tl, env)
 DEF_HELPER_2(esp32p4_sp_check, void, env, tl)
 DEF_HELPER_FLAGS_3(esp32p4_trace_insn, TCG_CALL_NO_WG, void, env, tl, i32)
+DEF_HELPER_FLAGS_2(esp32p4_branch, TCG_CALL_NO_WG, void, env, i32)
 #include "target/riscv/esp32p4_pie_helper.h"
 #endif
 

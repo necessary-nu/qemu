@@ -299,6 +299,16 @@ static void pie_st128(CPURISCVState *env, target_ulong addr, const PieVec *v,
     cpu_st16_mmu(env, addr, int128_make128(v->w[0], v->w[1]), oi, ra);
 }
 
+/*
+ * The instruction has stored, its only store: a store instruction for
+ * mhpmcounter13 (esp32p4_counters.c).
+ */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
+static void pie_stored(CPURISCVState *env)
+{
+    esp32p4_cpu_from_env(env)->ev[ESP32P4_EV_STORE]++;
+}
+
 /* A 16-byte load or store at a base address, aligned as CFG says. */
 static void pie_load_q(CPURISCVState *env, target_ulong base, PieVec *v,
                        uintptr_t ra)
@@ -310,6 +320,7 @@ static void pie_store_q(CPURISCVState *env, target_ulong base,
                         const PieVec *v, uintptr_t ra)
 {
     pie_st128(env, pie_ea(pie_of(env), base, 16, true), v, ra);
+    pie_stored(env);
 }
 
 /*
@@ -1206,6 +1217,7 @@ void helper_esp32p4_pie_store(CPURISCVState *env, uint32_t desc, uint32_t op,
                              pie->q[qu][FIELD_EX32(op, PIEOP, KIND) ==
                                         PIE_ST_H64],
                              pie_mmu(env), ra);
+        pie_stored(env);
         break;
     case PIE_ST_QACC: {
         int part = FIELD_EX32(op, PIEOP, X);
@@ -1220,6 +1232,7 @@ void helper_esp32p4_pie_store(CPURISCVState *env, uint32_t desc, uint32_t op,
                            : extract64(pie->xacc, 0, 40);
         cpu_stq_le_mmuidx_ra(env, pie_ea(pie, base, 8, true), x,
                              pie_mmu(env), ra);
+        pie_stored(env);
         break;
     default:
         v.w[0] = pie->ua_state[0];
@@ -1251,6 +1264,7 @@ void helper_esp32p4_pie_xq(CPURISCVState *env, uint32_t desc, uint32_t op,
     if (store) {
         cpu_stl_le_mmuidx_ra(env, addr, elt_u(u.w, 32, word), pie_mmu(env),
                              GETPC());
+        pie_stored(env);
     } else {
         elt_set(u.w, 32, word,
                 cpu_ldl_le_mmuidx_ra(env, addr, pie_mmu(env), GETPC()));
