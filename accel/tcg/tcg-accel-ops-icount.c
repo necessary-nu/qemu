@@ -396,6 +396,7 @@ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
         cpu->icount_insn_frac = 0;
         icount_set_budget(cpu, MIN(icount_get_limit(), cpu_budget));
     }
+    icount_stall_take(cpu);
 }
 
 bool icount_run_left(CPUState *cpu)
@@ -456,6 +457,7 @@ void icount_resume_run(CPUState *cpu, bool go_on)
         budget = MIN(budget, icount_budget_to_deadline(cpu));
     }
     icount_set_budget(cpu, budget);
+    icount_stall_take(cpu);
 }
 
 void icount_process_data(CPUState *cpu)

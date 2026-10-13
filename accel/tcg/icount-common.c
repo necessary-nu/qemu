@@ -895,6 +895,26 @@ void icount_set_cpu_clock(CPUState *cpu, Clock *clk)
     cpu->icount_period_den = 1;
 }
 
+void icount_stall_take(CPUState *cpu)
+{
+    int64_t n = MIN(cpu->icount_stall,
+                    cpu->icount_extra + cpu->neg.icount_decr.u16.low);
+    int64_t extra = MIN(n, cpu->icount_extra);
+
+    cpu->icount_extra -= extra;
+    cpu->neg.icount_decr.u16.low -= n - extra;
+    cpu->icount_stall -= n;
+}
+
+void icount_stall(CPUState *cpu, int64_t insns)
+{
+    if (!icount_enabled() || insns <= 0) {
+        return;
+    }
+    cpu->icount_stall += insns;
+    icount_stall_take(cpu);
+}
+
 void icount_notify_exit(void)
 {
     assert(icount_enabled());
