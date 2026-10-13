@@ -62,6 +62,22 @@
 #define PWM_IRQ_WRAP_0  8
 #define PWM_IRQ_WRAP_1  9
 
+#define DMA             0x50000000
+#define DMA_CH(n)       (DMA + 0x40 * (n))
+#define DMA_READ_ADDR   0x00
+#define DMA_WRITE_ADDR  0x04
+#define DMA_TRANS_COUNT 0x08
+#define DMA_CTRL_TRIG   0x0c
+#define DMA_EN          (1u << 0)
+#define DMA_SIZE_WORD   (2u << 2)
+#define DMA_INCR_READ   (1u << 4)
+#define DMA_INCR_WRITE  (1u << 6)
+#define DMA_CHAIN_TO(n) ((n) << 13)
+#define DMA_TREQ(n)     ((n) << 17)
+#define DREQ_PWM_WRAP(n) (32 + (n))
+#define SRC             0x20001000
+#define DST             0x20002000
+
 #define US              1000
 
 static char *rom_path;
@@ -623,6 +639,62 @@ static void test_input_modes(void)
     qtest_quit(qts);
 }
 
+/* Channel @n moves @count words from SRC to DST, paced on @treq. */
+static void dma_paced(QTestState *qts, int n, uint32_t count, int treq)
+{
+    qtest_writel(qts, DMA_CH(n) + DMA_READ_ADDR, SRC);
+    qtest_writel(qts, DMA_CH(n) + DMA_WRITE_ADDR, DST);
+    qtest_writel(qts, DMA_CH(n) + DMA_TRANS_COUNT, count);
+    qtest_writel(qts, DMA_CH(n) + DMA_CTRL_TRIG,
+                 DMA_EN | DMA_SIZE_WORD | DMA_INCR_READ | DMA_INCR_WRITE |
+                 DMA_CHAIN_TO(n) | DMA_TREQ(treq));
+}
+
+/*
+ * [spec:nuos:req:emu.pwm/test]
+ * DREQ_PWM_WRAP: each wrap is a transfer credit for a busy DMA channel
+ * pacing on it, from the first wrap after the channel starts. A slice
+ * counting at clk_sys's rate with TOP 0 wraps every cycle: seconds of it,
+ * its outputs low and its interrupt off, while no channel paces on its
+ * DREQ, cost the host next to nothing; a channel that then does gets a
+ * transfer a cycle.
+ */
+static void test_dreq(void)
+{
+    QTestState *qts = start();
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        qtest_writel(qts, SRC + 4 * i, 0x100 + i);
+    }
+    /* Wraps every 10 us, at 10, 20 and 30 us before the channel starts. */
+    qtest_writel(qts, TOP(0), 9);
+    qtest_writel(qts, DIV(0), DIV_1US);
+    qtest_writel(qts, CSR(0), CSR_EN);
+    step(qts, 35 * US);
+    dma_paced(qts, 0, 4, DREQ_PWM_WRAP(0));
+    g_assert_cmpuint(qtest_readl(qts, DMA_CH(0) + DMA_TRANS_COUNT), ==, 4);
+    step(qts, 5 * US - 1);
+    g_assert_cmpuint(qtest_readl(qts, DMA_CH(0) + DMA_TRANS_COUNT), ==, 4);
+    step(qts, 1);
+    g_assert_cmpuint(qtest_readl(qts, DMA_CH(0) + DMA_TRANS_COUNT), ==, 3);
+    step(qts, 30 * US);
+    g_assert_cmpuint(qtest_readl(qts, DMA_CH(0) + DMA_TRANS_COUNT), ==, 0);
+    for (i = 0; i < 4; i++) {
+        g_assert_cmphex(qtest_readl(qts, DST + 4 * i), ==, 0x100 + i);
+    }
+
+    qtest_writel(qts, TOP(1), 0);
+    qtest_writel(qts, DIV(1), DIV_INT(1));
+    qtest_writel(qts, CSR(1), CSR_EN);
+    step(qts, 10000ll * 1000 * US);
+    g_assert_cmphex(qtest_readl(qts, INTR) & (1u << 1), ==, 1u << 1);
+    dma_paced(qts, 1, 1000, DREQ_PWM_WRAP(1));
+    step(qts, 10 * US);
+    g_assert_cmpuint(qtest_readl(qts, DMA_CH(1) + DMA_TRANS_COUNT), ==, 0);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     static const uint32_t blank[2];
@@ -648,6 +720,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/pwm/fast-outputs", test_fast_outputs);
     qtest_add_func("/rp2350/pwm/input-modes", test_input_modes);
     qtest_add_func("/rp2350/pwm/close-edges", test_close_edges);
+    qtest_add_func("/rp2350/pwm/dreq", test_dreq);
 
     ret = g_test_run();
     unlink(rom_path);

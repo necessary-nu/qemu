@@ -35,12 +35,16 @@ DECLARE_INSTANCE_CHECKER(RP2350PWMState, RP2350_PWM, TYPE_RP2350_PWM)
  *               counting modes)
  *   "dreq-wrap" output: DREQ_PWM_WRAP<slice>. Each counter wrap pulses
  *               the line (1 then 0), one pulse per DMA transfer credit.
- *               Pulses are generated only while the line is connected.
+ *               Pulses are generated only while the line is connected
+ *               and "dreq-wanted" is high.
+ *   "dreq-wanted" input: high while the DMA counts the slice's DREQ, a
+ *               busy channel pacing on it (the DMA's "dreq-wanted").
  */
 #define RP2350_PWM_OUT "out"
 #define RP2350_PWM_OE "oe"
 #define RP2350_PWM_B_IN "b-in"
 #define RP2350_PWM_DREQ "dreq-wrap"
+#define RP2350_PWM_DREQ_WANTED "dreq-wanted"
 
 typedef struct RP2350PWMSlice {
     RP2350PWMState *pwm;
@@ -74,8 +78,9 @@ typedef struct RP2350PWMSlice {
     bool b_seen;
     uint64_t b_change;
 
-    /* Wraps not yet signalled on the DREQ line. */
+    /* Wraps not yet signalled on the DREQ line, and whether it counts. */
     uint32_t dreq_pending;
+    bool dreq_wanted;
     /* The virtual time the timer is due at. */
     int64_t due_ns;
 
