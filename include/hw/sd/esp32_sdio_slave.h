@@ -12,6 +12,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
 #include "hw/sd/sd.h"
+#include "hw/gpio/esp32_gpio.h"
 #include "system/memory.h"
 
 #define TYPE_ESP32_SDIO_SLAVE "esp32.sdio_slave"
@@ -38,6 +39,42 @@ enum {
 #define ESP32_SDIO_SLC_WORDS    (0x200 / 4)
 #define ESP32_SDIO_HOST_WORDS   (0x200 / 4)
 #define ESP32_SDIO_HINF_WORDS   (0x100 / 4)
+
+/*
+ * The slave's SD lines, CLK, CMD and DAT0 to DAT3, as bits of
+ * Esp32SdioLines, and its pads: function 4 of slot 1's IO_MUX pads (TRM
+ * table 6.10-1; ESP-IDF's sdio_slave_pins.h), the pads a board wires the
+ * slave's host to. Slot 0's, function 0 of GPIO6 to GPIO11, are the
+ * ESP32-WROOM-32E's flash lines.
+ */
+#define ESP32_SDIO_LINE_CLK     0x001
+#define ESP32_SDIO_LINE_CMD     0x002
+#define ESP32_SDIO_LINE_DAT(n)  (0x004 << (n))
+#define ESP32_SDIO_LINES        6
+#define ESP32_SDIO_FUNC         4
+#define ESP32_SDIO_SLOT1_PADS   { 14, 15, 2, 4, 12, 13 }
+
+/*
+ * The slave's outputs on its slot 1 pads, a line per SD line (CLK's is
+ * never driven), for the GPIO block's ESP32_GPIO_IOMUX_OUT and
+ * ESP32_GPIO_IOMUX_OE: the levels its lines hold between transfers.
+ */
+#define ESP32_SDIO_PAD_OUT      "pad-out"
+#define ESP32_SDIO_PAD_OE       "pad-oe"
+
+/*
+ * The lines between the slave and the host the board wires to slot 1's
+ * pads (esp32_sdio_slave_lines()): to_slave, where the host's output
+ * reaches the slave's input, with what the slave's input reads where it
+ * does not (slave_level); to_host, where the slave's output reaches the
+ * pad, which is the host's input; host_level, the pads' levels.
+ */
+typedef struct Esp32SdioLines {
+    uint16_t to_slave;
+    uint16_t to_host;
+    uint16_t slave_level;
+    uint16_t host_level;
+} Esp32SdioLines;
 
 /*
  * Depth of the sending DMA's FIFO, which the DMA fills from the
@@ -95,6 +132,10 @@ struct Esp32SdioSlaveState {
     Clock *apb_clk;
     MemoryRegion *dma_mr;
     AddressSpace dma_as;
+    /* The GPIO matrix and IO_MUX between the slave and its pads */
+    Esp32GpioState *gpio;
+    qemu_irq pad_out[ESP32_SDIO_LINES];
+    qemu_irq pad_oe[ESP32_SDIO_LINES];
     /* The card, once plugged into a host's bus */
     DeviceState *card;
 
@@ -127,14 +168,22 @@ struct Esp32SdioSlaveState {
     bool xfer_write;
     bool xfer_inc;
     bool xfer_endless;
+    bool xfer_block;
+    /* A block of this write failed its CRC check: the rest is dropped */
+    bool xfer_discard;
     uint8_t xfer_fn;
     uint32_t xfer_addr;
     uint32_t xfer_left;
     /* The card's interrupt (DAT1) as the host last saw it */
     bool card_irq;
+    /* SLC_SDIO_CRC_ST0's per-line counts of write blocks with bad CRCs */
+    uint8_t dat_crc_err[4];
 };
 
 /* Plug the slave's card into an SD host's bus. */
 void esp32_sdio_slave_attach(Esp32SdioSlaveState *s, SDBus *bus);
+
+/* The lines between the slave and its host on slot 1's pads, as they stand */
+void esp32_sdio_slave_lines(Esp32SdioSlaveState *s, Esp32SdioLines *l);
 
 #endif

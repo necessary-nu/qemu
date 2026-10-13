@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "esp32-flash-pins.h"
 #include "esp32-sd-pins.h"
 
 #define DPORT_PERIP_CLK_EN      0x3ff000c0
@@ -324,17 +325,22 @@ static void test_flash(void)
     const uint32_t set = FLASH_SR_BP1 | FLASH_SR_BP0 | FLASH_SR_WEL;
     QTestState *qts = start();
 
+    /* Each reset takes the pins back, which the ROM then sets up again. */
     stop_watchdogs(qts);
+    flash_pins_rom(qts);
     g_assert_cmphex(flash_status(qts), ==, 0);
     flash_set_status(qts);
     g_assert_cmphex(flash_status(qts), ==, set);
 
     sw_reset(qts);
+    flash_pins_rom(qts);
     g_assert_cmphex(flash_status(qts), ==, set);
     rtc_reset(qts);
+    flash_pins_rom(qts);
     g_assert_cmphex(flash_status(qts), ==, set);
 
     power_cycle(qts);
+    flash_pins_rom(qts);
     g_assert_cmphex(flash_status(qts), ==, 0);
     qtest_quit(qts);
 }

@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "esp32-flash-pins.h"
 
 #define DPORT_PERIP_CLK_EN      0x3ff000c0
 #define DPORT_PERIP_RST_EN      0x3ff000c4
@@ -97,10 +98,15 @@ static uint8_t pattern(uint32_t i)
     return (uint8_t)(i * 7 + 3);
 }
 
+/* The machine with its flash, its pins set up as the ROM sets them up */
 static QTestState *start(void)
 {
-    return qtest_initf("-M esp32 -nic none "
-                       "-drive file=%s,if=mtd,format=raw", flash_path);
+    QTestState *qts = qtest_initf("-M esp32 -nic none "
+                                  "-drive file=%s,if=mtd,format=raw",
+                                  flash_path);
+
+    flash_pins_rom(qts);
+    return qts;
 }
 
 static void dma_wr(QTestState *qts, uint32_t spi, uint32_t reg, uint32_t v)

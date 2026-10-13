@@ -6,14 +6,17 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * The machine's sdio-host option puts an SDHCI at 0x22000000 with the
- * slave's card on its bus; the test is the host's driver, issuing CMD52
- * and CMD53 through it with programmed I/O, and the slave's software,
- * through the slave's registers.
+ * slave's card on its bus, wired to the slave's slot 1 pads; the test is
+ * the host's driver, issuing CMD52 and CMD53 through it with programmed
+ * I/O, and the slave's software, through the slave's registers, setting
+ * the pads up as ESP-IDF's sdio_slave driver does on a board with 10 kOhm
+ * pull-ups (esp32-sdio-pins.h; esp32-sdio-pins-test has the rest).
  */
 
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "libqtest.h"
+#include "esp32-sdio-pins.h"
 
 #define DPORT_CORE_RST_EN       0x3ff000d0
 #define CORE_RST_SDIO           (1u << 5)
@@ -121,8 +124,10 @@
 
 static QTestState *start(void)
 {
-    QTestState *qts = qtest_init("-M esp32,sdio-host=on -nic none");
+    QTestState *qts = qtest_init("-M esp32,sdio-host=on,sd-pull-up=10000 "
+                                 "-nic none");
 
+    sdio_pins(qts, false);
     qtest_writeb(qts, HOST + SDHC_SWRST, 1);
     qtest_writew(qts, HOST + SDHC_CLKCON, 0x0005);
     qtest_writew(qts, HOST + SDHC_NORINTSTSEN, 0xffff);

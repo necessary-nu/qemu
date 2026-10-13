@@ -127,6 +127,12 @@ REG32(GPIO_STRAP, 0x0038)
  * line with the same number in and out (U0RXD_in and U0TXD_out, ...) shares
  * one constant.
  */
+/* SPI0 and SPI1's shared lines, the flash's: SPICLK, SPIQ, SPID, ... */
+#define ESP32_SIG_SPICLK        0
+#define ESP32_SIG_SPIQ          1
+#define ESP32_SIG_SPID          2
+#define ESP32_SIG_SPIHD         3
+#define ESP32_SIG_SPIWP         4
 #define ESP32_SIG_SPICS0        5
 #define ESP32_SIG_HSPICS0       11
 #define ESP32_SIG_U0RXD_IN      14
@@ -326,6 +332,37 @@ void esp32_gpio_iomux_out_path(Esp32GpioState *s, unsigned n, unsigned func,
  */
 bool esp32_gpio_iomux_in_selected(Esp32GpioState *s, unsigned n,
                                   unsigned func);
+
+/*
+ * For a peripheral on GPIO matrix signals, modelled above single pad
+ * transitions, whose output out_sig and input in_sig are one line to a
+ * chip on pad n (an SPI flash's data line; -1 for a line that is only an
+ * output or only an input), with the peripheral's output enable for
+ * out_sig forced on and off:
+ *
+ * - out_on: pad n carries out_sig's output while the peripheral enables
+ *   it, through its IO_MUX function or the matrix, OEN_SEL and its
+ *   inversion, open drain against the pulls, the RTC IO MUX and an outside
+ *   driver as they stand; out_inv: inverted on the way (OUT_INV_SEL);
+ * - pad_level: the pad's level while the peripheral's output is off: an
+ *   outside driver, another of the chip's, else its pulls;
+ * - in_on: in_sig takes pad n's input, its input enabled, with nothing
+ *   driving the pad while the peripheral's output is off, so that the
+ *   chip on the pad reaches it; in_inv: inverted on the way (IN_INV_SEL);
+ * - in_level: in_sig's level while the peripheral's output is off and the
+ *   chip on pad n drives nothing.
+ */
+typedef struct Esp32GpioSigPath {
+    bool out_on;
+    bool out_inv;
+    bool pad_level;
+    bool in_on;
+    bool in_inv;
+    bool in_level;
+} Esp32GpioSigPath;
+
+void esp32_gpio_sig_path(Esp32GpioState *s, unsigned n, int out_sig,
+                         int in_sig, Esp32GpioSigPath *p);
 
 /*
  * Levels as the last resolution left them: pad n's IO_MUX function
