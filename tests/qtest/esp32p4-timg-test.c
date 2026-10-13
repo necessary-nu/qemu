@@ -94,17 +94,23 @@
 #define TGRT_SEL(s)         (s)
 #define TGRT_DIV(d)         ((uint32_t)(d) << 4)
 #define TGRT_MASK           0x000fffffu
+#define TGRT_CLK_EN         (1u << 31)
 #define RST_EN_CORE1        (1u << 8)
 #define RST_EN_TIMERGRP0    (1u << 6)
 #define TIMERGRP0_APB_CLK_EN (1u << 21)
 
 #define LP_CLKRST           0x50111000
 #define RESET_CAUSE         (LP_CLKRST + 0x10)
+#define LP_HP_CLK_CTRL      (LP_CLKRST + 0x40)
+#define HP_MPLL_500M_CLK_EN (1u << 28)
 #define HPCPU_RESET_CTRL0   (LP_CLKRST + 0x14)
 #define CORE0_CAUSE(v)      (((v) >> 7) & 0x3f)
 #define CORE0_FLAG(v)       (((v) >> 13) & 1)
 #define CORE1_CAUSE(v)      (((v) >> 14) & 0x3f)
 #define CAUSE_CLEAR_ALL     0xf0000000u
+
+#define PMU_RF_PWC          0x5011515c
+#define PMU_MSPI_PHY_XPD    (1u << 24)
 
 #define LP_WDT_SWD_CONFIG   0x5011601c
 #define LP_WDT_SWD_WPROTECT 0x50116020
@@ -796,6 +802,254 @@ static void test_calibration_phase(void)
     qtest_quit(qts);
 }
 
+/* Begin cycling calibrations of @max cycles at the current time. */
+static void cal_cycle(QTestState *qts, uint32_t max)
+{
+    wr(qts, 0, RTCCALICFG, CAL_MAX(max));
+    wr(qts, 0, RTCCALICFG, CAL_MAX(max) | CAL_CYCLING);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG1) & CAL1_VLD, ==, 0);
+}
+
+static void assert_cycling(QTestState *qts, uint32_t value, bool timeout)
+{
+    uint32_t v = rd(qts, 0, RTCCALICFG1);
+
+    g_assert_cmphex(v & CAL1_VLD, ==, CAL1_VLD);
+    g_assert_cmpuint(CAL1_VALUE(v), ==, value);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG2) & CAL2_TIMEOUT, ==, timeout);
+}
+
+/*
+ * A clock change during a measurement: the cycles counted at the old
+ * edges are kept, and the rest are counted at the new ones from the
+ * change. RC_SLOW_CLK's edges are at multiples of 20000/3 ns, and
+ * TIMERGRP0_TGRT_CLK over 1 has them; over 2, from a change at t, its
+ * edges are RC_SLOW_CLK's last edge at or before t and every second one
+ * after. The value is XTAL_CLK's edges, at multiples of 25 ns, after the
+ * first edge and up to the last.
+ *
+ *   - One-shot, 5 cycles from 1000 ns: the first edge at 6666 2/3 ns, one
+ *     cycle ending at 13333 1/3 ns before the divider goes to 2 at
+ *     18000 ns, then edges at 26666 2/3, 40000, 53333 1/3 and 66666 2/3
+ *     ns: it ends there, the value 2400 (6675 to 66650 ns).
+ *   - Cycling, 2 cycles: ends at 20000 and 40000 ns, each counting 534
+ *     (6675 to 20000 ns); the third, from its first edge at 46666 2/3 ns,
+ *     has counted none when the divider goes to 2 at 50000 ns, and ends
+ *     at 73333 1/3 ns, the edge after 60000 ns: 1067 (46675 to 73325 ns).
+ *   - Cycling, 2 cycles, timing out after 1001 XTAL_CLK cycles: the third
+ *     measurement, begun at 40000 ns, has counted none when the clock is
+ *     gated at 50000 ns, and times out at 65025 ns; each begins again 3
+ *     XTAL_CLK cycles after a timeout, at 65100 and 90200 ns, while the
+ *     clock is gated; it runs again from 101000 ns, but the measurement
+ *     begun at 90200 ns times out at 115225 ns before its end at 120000
+ *     ns; the next, begun at 115300 ns, ends at 133333 1/3 ns after its
+ *     first edge at 120000 ns: 533 (120025 to 133325 ns).
+ */
+/* [spec:nuos:req:emu.esp32p4.timers/test] */
+/* [spec:nuos:req:emu.esp32p4.clocks/test] */
+static void test_calibration_clock_change(void)
+{
+    QTestState *qts = start();
+
+    step(qts, 1000);
+    cal_clock(qts, 8, 1);
+    cal_start(qts, 5);
+    step(qts, 18000 - now);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG) & CAL_RDY, ==, 0);
+    cal_clock(qts, 8, 2);
+    step(qts, 66666 - now);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG) & CAL_RDY, ==, 0);
+    g_assert_cmpuint(CAL1_VALUE(rd(qts, 0, RTCCALICFG1)), ==, 0);
+    step(qts, 1);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG) & CAL_RDY, ==, CAL_RDY);
+    g_assert_cmpuint(CAL1_VALUE(rd(qts, 0, RTCCALICFG1)), ==, 2400);
+    qtest_quit(qts);
+
+    qts = start();
+    step(qts, 1000);
+    cal_clock(qts, 8, 1);
+    cal_cycle(qts, 2);
+    step(qts, 19999 - now);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG1) & CAL1_VLD, ==, 0);
+    step(qts, 1);
+    assert_cycling(qts, 534, false);
+    step(qts, 50000 - now);
+    assert_cycling(qts, 534, false);
+    cal_clock(qts, 8, 2);
+    step(qts, 73333 - now);
+    assert_cycling(qts, 534, false);
+    step(qts, 1);
+    assert_cycling(qts, 1067, false);
+    step(qts, 113333 - now);
+    assert_cycling(qts, 1067, false);
+    step(qts, 1);
+    assert_cycling(qts, 1067, false);
+    qtest_quit(qts);
+
+    qts = start();
+    step(qts, 1000);
+    cal_clock(qts, 8, 1);
+    wr(qts, 0, RTCCALICFG2, CAL2_RST_CNT(3) | CAL2_THRES(1000));
+    cal_cycle(qts, 2);
+    step(qts, 50000 - now);
+    assert_cycling(qts, 534, false);
+    qtest_writel(qts, PERI_CLK_CTRL20,
+                 PERI_CLK_CTRL20_RESET & ~TGRT_CLK_EN);
+    step(qts, 65024 - now);
+    assert_cycling(qts, 534, false);
+    step(qts, 1);
+    assert_cycling(qts, 534, true);
+    step(qts, 101000 - now);
+    qtest_writel(qts, PERI_CLK_CTRL20, PERI_CLK_CTRL20_RESET);
+    step(qts, 133333 - now);
+    assert_cycling(qts, 534, true);
+    step(qts, 1);
+    assert_cycling(qts, 533, true);
+    qtest_quit(qts);
+}
+
+/*
+ * What a cycling calibration leaves by @until ns, begun at @begin ns on
+ * TIMERGRP0_TGRT_CLK from RC_SLOW_CLK over 1 with RTC_CALI_MAX @max,
+ * TIMEOUT_THRES @thres and TIMEOUT_RST_CNT @rst: worked out a measurement
+ * at a time, in thirds of a ns, in which RC_SLOW_CLK's edges are at
+ * multiples of 20000 and XTAL_CLK's at multiples of 75. A measurement
+ * begun at b counts from the measured clock's first edge after b, f, to
+ * its edge @max cycles on, e, unless its (THRES + 1)th XTAL_CLK edge
+ * after b, x, comes before e; the next begins at e, or RST_CNT XTAL_CLK
+ * cycles after x.
+ */
+static void cal_reference(int64_t begin, uint32_t max, uint32_t thres,
+                          uint32_t rst, int64_t until, uint32_t *value,
+                          bool *vld, bool *timeout)
+{
+    const int64_t pc = 20000, px = 75;
+    int64_t b = 3 * begin, end = 3 * until;
+
+    *value = 0;
+    *vld = false;
+    *timeout = false;
+    for (;;) {
+        int64_t f = (b / pc + 1) * pc;
+        int64_t e = f + max * pc;
+        int64_t x = (b / px + thres + 1) * px;
+
+        if (e <= x) {
+            if (e > end) {
+                return;
+            }
+            *value = e / px - f / px;
+            *vld = true;
+            b = e;
+        } else {
+            if (x > end) {
+                return;
+            }
+            *timeout = true;
+            b = x + rst * px;
+        }
+    }
+}
+
+/*
+ * Cycling with a threshold close to the measurement's length, so that a
+ * measurement ends or times out by where it begins among the two clocks'
+ * edges, read at far-apart times and at close ones: exactly what working
+ * it out a measurement at a time gives. One cycle of RC_SLOW_CLK lasts
+ * 266 2/3 XTAL_CLK cycles, and with RTC_CALI_MAX 1 a measurement 266 2/3
+ * to 533 1/3: thresholds of 300 and 400 time out some measurements; at
+ * 532 one begun at an RC_SLOW_CLK edge always times out, and one begun
+ * after a timeout never does; at 533 a measurement ends on the edge its
+ * timeout would come at, and so ends; at 534 none times out.
+ */
+/* [spec:nuos:req:emu.esp32p4.timers/test] */
+/* [spec:nuos:req:emu.esp32p4.clocks/test] */
+static void test_calibration_threshold(void)
+{
+    static const uint32_t thres[] = { 266, 300, 400, 532, 533, 534 };
+    static const int64_t reads[] = {
+        5 * US, 13 * US, 14 * US, 30 * US, 1 * MS, 1 * MS + 7 * US,
+        1 * MS + 20 * US, 9 * MS, 9 * MS + 1, 25 * MS, 25 * MS + 13 * US,
+        60 * MS,
+    };
+    QTestState *qts = start();
+    int i, j;
+
+    cal_clock(qts, 8, 1);
+    for (i = 0; i < ARRAY_SIZE(thres); i++) {
+        int64_t begin;
+
+        step(qts, 1234);
+        wr(qts, 0, RTCCALICFG2, CAL2_RST_CNT(3) | CAL2_THRES(thres[i]));
+        cal_cycle(qts, 1);
+        begin = now;
+        for (j = 0; j < ARRAY_SIZE(reads); j++) {
+            uint32_t value, v, want;
+            bool vld, timeout;
+
+            step(qts, begin + reads[j] - now);
+            cal_reference(begin, 1, thres[i], 3, now, &value, &vld,
+                          &timeout);
+            v = rd(qts, 0, RTCCALICFG1);
+            g_assert_cmphex(v & CAL1_VLD, ==, vld);
+            g_assert_cmphex(rd(qts, 0, RTCCALICFG2) & CAL2_TIMEOUT, ==,
+                            timeout);
+            if (vld) {
+                want = value;
+                g_assert_cmpuint(CAL1_VALUE(v), ==, want);
+            }
+        }
+    }
+    qtest_quit(qts);
+}
+
+/*
+ * Cycling from reset on TIMERGRP0_TGRT_CLK, MPLL_CLK over 1: brought up at
+ * 500 MHz, a measurement of one cycle ends every 4 ns. Seconds of it cost
+ * the host no more than microseconds, and the values stay exact: 0 or 1
+ * XTAL_CLK edges in a 2 ns cycle; 2 in 25 cycles, 50 ns, whatever the
+ * phase.
+ */
+/* [spec:nuos:req:emu.esp32p4.timers/test] */
+/* [spec:nuos:req:emu.esp32p4.clocks/test] */
+static void test_calibration_fast_clock(void)
+{
+    QTestState *qts = start();
+    uint32_t v;
+
+    swd_off(qts);
+    qtest_writel(qts, PMU_RF_PWC,
+                 qtest_readl(qts, PMU_RF_PWC) | PMU_MSPI_PHY_XPD);
+    qtest_writel(qts, LP_HP_CLK_CTRL,
+                 qtest_readl(qts, LP_HP_CLK_CTRL) | HP_MPLL_500M_CLK_EN);
+    step(qts, 20 * US);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG), ==, 0x00011000);
+    step(qts, 2000 * MS);
+    v = rd(qts, 0, RTCCALICFG1);
+    g_assert_cmphex(v & CAL1_VLD, ==, CAL1_VLD);
+    g_assert_cmpuint(CAL1_VALUE(v), <=, 1);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG2) & CAL2_TIMEOUT, ==, 0);
+
+    /* The next measurement takes RTC_CALI_MAX as it begins. */
+    wr(qts, 0, RTCCALICFG, CAL_MAX(25) | CAL_CYCLING);
+    step(qts, 100);
+    assert_cycling(qts, 2, false);
+    step(qts, 5000 * MS);
+    assert_cycling(qts, 2, false);
+
+    /*
+     * One-shot, as rtc_clk_cal() measures MPLL_CLK over 4000: 1024 cycles
+     * of 8 us, from a first edge within 8 us of the start.
+     */
+    cal_clock(qts, 0, 4000);
+    cal_start(qts, 1024);
+    step(qts, 8192 * US - 1);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG) & CAL_RDY, ==, 0);
+    step(qts, 8 * US + 1);
+    assert_cal(qts, 327680);
+    qtest_quit(qts);
+}
+
 /*
  * The block's reset line and bus clock; and byte accesses, which read and
  * write their bytes of a register.
@@ -838,6 +1092,12 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/timg/calibration", test_calibration);
     qtest_add_func("/esp32p4/timg/calibration-phase",
                    test_calibration_phase);
+    qtest_add_func("/esp32p4/timg/calibration-clock-change",
+                   test_calibration_clock_change);
+    qtest_add_func("/esp32p4/timg/calibration-threshold",
+                   test_calibration_threshold);
+    qtest_add_func("/esp32p4/timg/calibration-fast-clock",
+                   test_calibration_fast_clock);
     qtest_add_func("/esp32p4/timg/gating", test_gating);
     return g_test_run();
 }

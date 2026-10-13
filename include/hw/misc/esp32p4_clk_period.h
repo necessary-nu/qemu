@@ -503,6 +503,49 @@ static inline uint64_t esp32p4_clk_units_cycles_up(ESP32P4ClkPeriod p,
     return q == UINT64_MAX ? q : q + rem;
 }
 
+/* (@a_hi:@a_lo) * (@b_hi:@b_lo), as the 256-bit r[3]:r[2]:r[1]:r[0]. */
+static inline void esp32p4_mul_128_128(uint64_t r[4], uint64_t a_hi,
+                                       uint64_t a_lo, uint64_t b_hi,
+                                       uint64_t b_lo)
+{
+    uint64_t lo[3], hi[3], c;
+
+    esp32p4_mul_64_128(lo, a_lo, b_hi, b_lo);
+    esp32p4_mul_64_128(hi, a_hi, b_hi, b_lo);
+    r[0] = lo[0];
+    r[1] = lo[1] + hi[0];
+    c = r[1] < hi[0];
+    r[2] = lo[2] + c;
+    c = r[2] < c;
+    r[2] += hi[1];
+    c += r[2] < hi[1];
+    r[3] = hi[2] + c;
+}
+
+/*
+ * Whether @m cycles of a clock of period @p last less than (-1), exactly
+ * as long as (0), or longer than (1) @n cycles of a clock of period @q: a
+ * stopped clock's cycles take no time.
+ */
+static inline int esp32p4_clk_cycles_cmp(ESP32P4ClkPeriod p, uint64_t m,
+                                         ESP32P4ClkPeriod q, uint64_t n)
+{
+    uint64_t a_lo, a_hi, b_lo, b_hi, x[4], y[4];
+    int i;
+
+    /* m * p.num / p.den against n * q.num / q.den, both times both dens. */
+    mulu64(&a_lo, &a_hi, m, q.den);
+    mulu64(&b_lo, &b_hi, n, p.den);
+    esp32p4_mul_128_128(x, a_hi, a_lo, p.num_hi, p.num_lo);
+    esp32p4_mul_128_128(y, b_hi, b_lo, q.num_hi, q.num_lo);
+    for (i = 3; i >= 0; i--) {
+        if (x[i] != y[i]) {
+            return x[i] < y[i] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
 /* Whether a period @p is a whole number of ns, every edge on a whole ns. */
 static inline bool esp32p4_clk_period_whole_ns(ESP32P4ClkPeriod p)
 {

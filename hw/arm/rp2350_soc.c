@@ -2088,7 +2088,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     /*
      * The DMA masters the bus through its own ACCESSCTRL view, and raises
      * DMA_IRQ_0-3 as system IRQs. Each DREQ source drives the DMA input of
-     * its DREQ number.
+     * its DREQ number; the PWM slices, whose DREQs pulse at their wraps,
+     * take whether the DMA counts them.
      */
     /* [spec:nuos:req:emu.dma] */
     {
@@ -2145,6 +2146,10 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
             qdev_connect_gpio_out_named(DEVICE(&s->pwm), RP2350_PWM_DREQ, i,
                 qdev_get_gpio_in_named(dma, RP2350_DMA_DREQ,
                                        RP2350_DREQ_PWM_WRAP0 + i));
+            qdev_connect_gpio_out_named(dma, RP2350_DMA_DREQ_WANTED,
+                RP2350_DREQ_PWM_WRAP0 + i,
+                qdev_get_gpio_in_named(DEVICE(&s->pwm),
+                                       RP2350_PWM_DREQ_WANTED, i));
         }
         for (i = 0; i < RP2350_XIP_NUM_DREQ; i++) {
             qdev_connect_gpio_out_named(DEVICE(&s->xip), "dreq", i,

@@ -119,6 +119,12 @@
 #define TIMER_RST           (1u << 24)
 #define TIMER_TICK_APB      (1u << 25)
 #define TIMER_PARA_UP       (1u << 26)
+#define RTC_WDTCONFIG0      0x3ff4808c
+#define RTC_WDTWPROTECT     0x3ff480a4
+#define RTC_WDT_FLASHBOOT   (1u << 10)
+#define TIMG0_WDTCONFIG0    0x3ff5f048
+#define TIMG0_WDTPROTECT    0x3ff5f064
+#define WDT_WKEY            0x50d83aa1
 #define LEDC_INT_HS0_OVF    (1u << 0)
 #define LEDC_INT_HSCH0_END  (1u << 8)
 
@@ -535,6 +541,52 @@ static void test_ledc_ls(void)
 
 /*
  * [spec:nuos:req:emu.esp32.gpio/test]
+ * A channel stopped as ledc_stop() stops it, SIG_OUT_EN clear, holds
+ * IDLE_LV while its generator runs on: seconds of a 20 MHz PWM cost the
+ * host next to nothing, its fade still ends with DUTY_CHNG_END, and with
+ * SIG_OUT_EN set again the pad follows the generator at once, high for
+ * one tick of 25 ns in two.
+ */
+static void test_ledc_stopped(void)
+{
+    QTestState *qts = qtest_init("-M esp32 -nic none");
+    uint32_t conf = TIMER_RES(1) | TIMER_DIV(1 << 8) | TIMER_TICK_APB;
+    unsigned high = 0;
+
+    /* The boot watchdogs, which would reset the chip meanwhile, off */
+    qtest_writel(qts, RTC_WDTWPROTECT, WDT_WKEY);
+    qtest_writel(qts, RTC_WDTCONFIG0,
+                 qtest_readl(qts, RTC_WDTCONFIG0) & ~RTC_WDT_FLASHBOOT);
+    qtest_writel(qts, TIMG0_WDTPROTECT, WDT_WKEY);
+    qtest_writel(qts, TIMG0_WDTCONFIG0, 0);
+
+    enable(qts, PERIP_LEDC);
+    route_out(qts, IO_MUX_GPIO18, 18, SIG_LEDC_HS0);
+    qtest_writel(qts, LEDC_TIMER(0), conf | TIMER_RST);
+    qtest_writel(qts, LEDC_TIMER(0), conf);
+    qtest_writel(qts, LEDC_CH(0) + LEDC_HPOINT, 0);
+    qtest_writel(qts, LEDC_CH(0) + LEDC_DUTY, 1 << 4);
+    qtest_writel(qts, LEDC_CH(0) + LEDC_CONF0, CH_SIG_OUT_EN);
+    /* A fade of 1000 steps of 1000 cycles of 50 ns: 50 ms */
+    qtest_writel(qts, LEDC_CH(0) + LEDC_CONF1, CONF1_START | CONF1_INC |
+                 CONF1_NUM(1000) | CONF1_CYCLE(1000));
+    qtest_clock_step(qts, 1 * US);
+    qtest_writel(qts, LEDC_CH(0) + LEDC_CONF0, CH_IDLE_LV);
+    qtest_clock_step(qts, 10000ll * MS);
+    g_assert_true(pad(qts, 18));
+    g_assert_true(qtest_readl(qts, LEDC_INT_RAW) & LEDC_INT_HSCH0_END);
+
+    qtest_writel(qts, LEDC_CH(0) + LEDC_CONF0, CH_SIG_OUT_EN);
+    for (int i = 0; i < 160; i++) {
+        high += pad(qts, 18);
+        qtest_clock_step(qts, 25);
+    }
+    g_assert_cmpuint(high, ==, 80);
+    qtest_quit(qts);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio/test]
  * TWAI's TX idles recessive and BUS_OFF low on their pads; CLKOUT is
  * APB_CLK / 2 until CLOCK_OFF. The controller joins the CAN bus backend
  * only while TX goes to a pad and RX comes from one.
@@ -599,6 +651,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32/periph-lines/i2c-routing", test_i2c_routing);
     qtest_add_func("/esp32/periph-lines/ledc-hs", test_ledc_hs);
     qtest_add_func("/esp32/periph-lines/ledc-ls", test_ledc_ls);
+    qtest_add_func("/esp32/periph-lines/ledc-stopped", test_ledc_stopped);
     qtest_add_func("/esp32/periph-lines/twai-lines", test_twai_lines);
     return g_test_run();
 }

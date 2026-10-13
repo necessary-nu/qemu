@@ -21,6 +21,10 @@
  *    peripheral has room or data for one more transfer after every
  *    transfer. Pacing timers (TREQ 59-62) and the permanent request (63)
  *    are internal.
+ *  - Named GPIO output array "dreq-wanted", indexed by DREQ number: high
+ *    while a busy channel paces on that DREQ, the only time its rising
+ *    edges count. A source whose DREQ only pulses at moments of its own
+ *    making (the PWM's counter wraps) need not time the pulses otherwise.
  *
  * A DREQ source must expect the DMA to access its registers from within
  * the qemu_set_irq() that raises its DREQ: the transfer the rising edge
@@ -56,6 +60,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350DMAState, RP2350_DMA)
 #define RP2350_DMA_MPU_REGIONS 8
 
 #define RP2350_DMA_DREQ "dreq"
+#define RP2350_DMA_DREQ_WANTED "dreq-wanted"
 #define RP2350_DMA_NUM_DREQ 55
 
 /* DREQ numbers of the sources the SoC wires (pico-sdk dreq.h). */
@@ -118,6 +123,7 @@ struct RP2350DMAState {
     /* Runs the engine at the end of an access it could not run within. */
     QEMUTimer *defer;
     qemu_irq irq[RP2350_DMA_IRQS];
+    qemu_irq dreq_wanted[RP2350_DMA_NUM_DREQ];
 
     RP2350DMAChannel ch[RP2350_DMA_CHANNELS];
     uint32_t intr;
@@ -136,6 +142,8 @@ struct RP2350DMAState {
 
     /* Levels of the DREQ inputs, bit n for DREQ n. */
     uint64_t dreq_level;
+    /* Levels of the "dreq-wanted" outputs, likewise. */
+    uint64_t dreq_wanted_level;
     /*
      * Set while the engine answers a rising DREQ edge in place: only
      * credits request transfers, not DREQ levels.

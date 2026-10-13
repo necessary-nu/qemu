@@ -103,10 +103,14 @@ struct ESP32P4IspState {
     uint8_t mipi_mode;
     uint16_t out_frames;
     void *pipe;
-    /* The output's events, in order, and the last one's time */
+    /*
+     * The output's events, in order, and the last one's time; the time
+     * those due are being delivered up to
+     */
     GQueue *events;
     QEMUTimer *ev_timer;
     int64_t last_due;
+    int64_t deliver_upto;
 
     /* Statistics' triggers and monitors */
     bool ae_armed;

@@ -31,11 +31,13 @@ static uint64_t esp32_timg_apb_ns(Esp32TimgState *s, uint64_t ticks,
 static void esp32_timg_timer_update_config(Esp32TimgTimerState *ts);
 static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_now);
 static void esp32_timg_timer_reload(Esp32TimgTimerState *ts, uint64_t ns_now);
-static void esp32_timg_cal_write(Esp32TimgState *s, uint32_t value);
-static void esp32_timg_cal_catch_up(Esp32TimgState *s);
-static void esp32_timg_cal_begin(Esp32TimgState *s, bool oneshot);
-static void esp32_timg_cal_fold(Esp32TimgState *s, int64_t now);
-static void esp32_timg_cal_arm(Esp32TimgState *s, int64_t now);
+static void esp32_timg_cal_write(Esp32TimgState *s, uint32_t value,
+                                 int64_t now);
+static void esp32_timg_cal_advance(Esp32TimgState *s, int64_t now);
+static void esp32_timg_cal_begin(Esp32TimgState *s, bool oneshot,
+                                 int64_t now);
+static void esp32_timg_cal_pause(Esp32TimgState *s, int64_t now);
+static void esp32_timg_cal_rebase(Esp32TimgState *s, int64_t now);
 static void esp32_timg_int_update(Esp32TimgState *s);
 static void esp32_timg_timer_cb(void *opaque);
 static void esp32_timg_wdt_cb(void *opaque);
@@ -180,7 +182,7 @@ static uint64_t esp32_timg_read(void *opaque, hwaddr addr, unsigned int size)
         break;
 
     case A_TIMG_RTCCALICFG:
-        esp32_timg_cal_catch_up(s);
+        esp32_timg_cal_advance(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         r = FIELD_DP32(r, TIMG_RTCCALICFG, START, s->rtc_cal_start);
         r = FIELD_DP32(r, TIMG_RTCCALICFG, MAX, s->rtc_cal_max);
         r = FIELD_DP32(r, TIMG_RTCCALICFG, RDY, s->rtc_cal_ready);
@@ -189,7 +191,7 @@ static uint64_t esp32_timg_read(void *opaque, hwaddr addr, unsigned int size)
                        s->rtc_cal_start_cycling);
         break;
     case A_TIMG_RTCCALICFG1:
-        esp32_timg_cal_catch_up(s);
+        esp32_timg_cal_advance(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         r = FIELD_DP32(0, TIMG_RTCCALICFG1, VALUE, s->rtc_cal_value);
         break;
 
@@ -297,10 +299,13 @@ static void esp32_timg_write(void *opaque, hwaddr addr,
         break;
 
 
-    case A_TIMG_RTCCALICFG:
-        esp32_timg_cal_catch_up(s);
-        esp32_timg_cal_write(s, value);
+    case A_TIMG_RTCCALICFG: {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        esp32_timg_cal_advance(s, now);
+        esp32_timg_cal_write(s, value, now);
         break;
+    }
 
     case A_TIMG_INT_ENA:
         s->int_ena = value;
@@ -361,15 +366,13 @@ static void esp32_timg_reset_hold(Object *obj, ResetType type)
     Esp32TimgState *s = ESP32_TIMG(obj);
 
     /* RTCCALICFG resets with cycling mode on: one 8MD256 cycle at a time */
-    timer_del(&s->cal_timer);
     s->rtc_cal_start = false;
     s->rtc_cal_start_cycling = true;
     s->rtc_cal_max = 1;
     s->rtc_cal_clk_sel = ESP32_TIMG_CAL_8MD256;
     s->rtc_cal_ready = false;
     s->rtc_cal_value = 0;
-    s->cal_active = false;
-    esp32_timg_cal_begin(s, false);
+    esp32_timg_cal_begin(s, false, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
     esp32_timg_timer_reset(&s->t0);
     esp32_timg_timer_reset(&s->t1);
@@ -404,11 +407,16 @@ static void esp32_timg_apb_clk_update(void *opaque, ClockEvent event)
     if (event == ClockPreUpdate) {
         s->wdt.count_base = esp32_timg_wdt_get_count(&s->wdt, ns_now);
         s->wdt.ns_base = ns_now;
-        esp32_timg_cal_catch_up(s);
-        esp32_timg_cal_fold(s, ns_now);
+        esp32_timg_cal_advance(s, ns_now);
+        s->cal_apb_was_running = clock_is_enabled(s->apb_clk);
     } else {
         esp32_timg_wdt_arm(&s->wdt, ns_now);
-        esp32_timg_cal_arm(s, ns_now);
+        if (s->cal_apb_was_running && !clock_is_enabled(s->apb_clk)) {
+            esp32_timg_cal_pause(s, ns_now);
+        } else if (!s->cal_apb_was_running &&
+                   clock_is_enabled(s->apb_clk)) {
+            esp32_timg_cal_rebase(s, ns_now);
+        }
     }
 }
 
@@ -420,71 +428,122 @@ static void esp32_timg_apb_clk_update(void *opaque, ClockEvent event)
  * rtc_clk_wait_for_slow_cycle). The group counts XTAL_CLK cycles over
  * RTC_CALI_MAX cycles of the clock RTC_CALI_CLK_SEL picks: 0, RTC_SLOW_CLK
  * as RTC_CNTL selects it; 1, RC_FAST_DIV_CLK (8MD256); 2, XTAL32K_CLK.
- * Counting starts on the measured clock's first edge, so a measurement of
- * RTC_CALI_MAX = 0 just waits for that edge; RTC_CALI_RDY rises when the
- * count is reached, with the XTAL_CLK count in RTC_CALI_VALUE (25 bits,
- * wrapping). A clock that does not run, such as XTAL32K_CLK with no
+ * Counting starts at the measured clock's first edge after the
+ * measurement begins and ends at its RTC_CALI_MAX'th edge after that (at
+ * that first edge for 0, as rtc_clk_wait_for_slow_cycle relies on);
+ * RTC_CALI_RDY rises then, with the count of XTAL_CLK edges between in
+ * RTC_CALI_VALUE (25 bits, wrapping). Each clock's edges are whole
+ * periods apart from time 0, or from its last change of rate, each at its
+ * exact time. A clock that does not run, such as XTAL32K_CLK with no
  * crystal fitted, never completes a measurement: RDY stays low and
- * software's wait times out, as ESP-IDF's does. Nothing counts while the
- * group's clock is stopped.
+ * software's wait times out, as ESP-IDF's does. XTAL_CLK's edges count
+ * while the measured clock is stopped, and a measured clock that changes
+ * rate goes on at its new edges. Nothing counts while the group's clock
+ * (APB_CLK) or XTAL_CLK is stopped: a stop of the group's clock keeps the
+ * whole cycles of the measured clock counted by then, with XTAL_CLK's
+ * edges up to the last of them, and counting goes on from the measured
+ * clock's first edge after the clock runs again, so that the value stays
+ * a count over whole cycles.
  *
  * A rising edge of RTC_CALI_START starts a measurement, dropping RDY; a
  * falling one abandons it. Cycling mode, RTC_CALI_START_CYCLING (set at
- * reset), measures continuously, each completion updating the value and
- * RDY. The clock and cycle count are latched as a measurement starts.
+ * reset), measures continuously, each measurement beginning where the
+ * last ended and each completion updating the value and RDY. The clock
+ * and cycle count are latched as a measurement starts.
+ *
+ * Nothing outside the group sees a measurement end, so the model keeps no
+ * QEMU timer for it: a register access, or a change of a clock it counts,
+ * brings it up to that moment from the clocks' edges
+ * (esp32_timg_cal_advance()), passing over a cycling run's measurements
+ * in one go, so that what it costs the host does not depend on the
+ * clocks' rates.
  */
-static bool esp32_timg_cal_running(Esp32TimgState *s)
+
+/* @ns as Clock units (2^-32 ns), @hi:@lo. */
+static void esp32_timg_cal_units(int64_t ns, uint64_t *hi, uint64_t *lo)
 {
-    return clock_is_enabled(s->apb_clk) && clock_is_enabled(s->xtal_clk) &&
-           clock_is_enabled(s->cal_clk[s->cal_sel]);
+    *lo = (uint64_t)ns << 32;
+    *hi = (uint64_t)ns >> 32;
 }
 
 /*
- * Count the measurement up to now at the clocks' current rates, ahead of a
- * change. Only whole cycles of the measured clock are kept, with the
- * XTAL_CLK cycles up to the last of them, so that the value stays the
- * XTAL_CLK count over a whole number of cycles.
+ * The edges after @origin ns of a clock of @period Clock units with an
+ * edge there, by @hi:@lo Clock units: 0 for a stopped clock.
  */
-static void esp32_timg_cal_fold(Esp32TimgState *s, int64_t now)
+static uint64_t esp32_timg_cal_edges_by(uint64_t period, int64_t origin,
+                                        uint64_t hi, uint64_t lo)
 {
-    if (s->cal_active && s->cal_counting && esp32_timg_cal_running(s)) {
-        Clock *clk = s->cal_clk[s->cal_sel];
-        /* The completion timer has not run: the count is short of the end */
-        uint64_t cycles = MIN(clock_ns_to_ticks(clk, now - s->cal_seg_ns),
-                              s->cal_target - s->cal_cycles - 1);
+    uint64_t o_hi, o_lo;
 
-        s->cal_cycles += cycles;
-        s->cal_xtal += clock_ns_to_ticks(s->xtal_clk,
-                                         clock_ticks_to_ns(clk, cycles));
+    if (!period) {
+        return 0;
     }
-    s->cal_seg_ns = now;
+    esp32_timg_cal_units(origin, &o_hi, &o_lo);
+    if (hi < o_hi || (hi == o_hi && lo <= o_lo)) {
+        return 0;
+    }
+    hi -= o_hi + (lo < o_lo);
+    lo -= o_lo;
+    if (hi >= period) {
+        return UINT64_MAX;
+    }
+    divu128(&lo, &hi, period);
+    return lo;
 }
 
-/* Schedule the measurement's next event: its first edge, or its end. */
-static void esp32_timg_cal_arm(Esp32TimgState *s, int64_t now)
+static bool esp32_timg_cal_counts(Esp32TimgState *s)
 {
-    Clock *clk = s->cal_clk[s->cal_sel];
-
-    timer_del(&s->cal_timer);
-    if (!s->cal_active || !esp32_timg_cal_running(s)) {
-        return;
-    }
-    s->cal_seg_ns = now;
-    if (!s->cal_counting) {
-        uint64_t edge = clock_ns_to_ticks(clk, now) + 1;
-
-        s->cal_event_ns = MAX(clock_ticks_to_ns(clk, edge), now);
-    } else {
-        s->cal_event_ns =
-            now + clock_ticks_to_ns(clk, s->cal_target - s->cal_cycles);
-    }
-    timer_mod(&s->cal_timer, s->cal_event_ns);
+    return clock_is_enabled(s->apb_clk) && clock_is_enabled(s->xtal_clk);
 }
 
-static void esp32_timg_cal_begin(Esp32TimgState *s, bool oneshot)
+/* The measured clock's edges by @now, since its last change. */
+static uint64_t esp32_timg_cal_edges(Esp32TimgState *s, int64_t now)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t hi, lo;
 
+    esp32_timg_cal_units(now, &hi, &lo);
+    return esp32_timg_cal_edges_by(clock_get(s->cal_clk[s->cal_sel]),
+                                   s->cal_origin[s->cal_sel], hi, lo);
+}
+
+static uint64_t esp32_timg_cal_xtal_edges(Esp32TimgState *s, int64_t now)
+{
+    uint64_t hi, lo;
+
+    esp32_timg_cal_units(now, &hi, &lo);
+    return esp32_timg_cal_edges_by(clock_get(s->xtal_clk), s->xtal_origin,
+                                   hi, lo);
+}
+
+/* The time of the measured clock's edge @n, as Clock units @hi:@lo. */
+static void esp32_timg_cal_edge_time(Esp32TimgState *s, uint64_t n,
+                                     uint64_t *hi, uint64_t *lo)
+{
+    uint64_t o_hi, o_lo;
+
+    mulu64(lo, hi, n, clock_get(s->cal_clk[s->cal_sel]));
+    esp32_timg_cal_units(s->cal_origin[s->cal_sel], &o_hi, &o_lo);
+    *lo += o_lo;
+    *hi += o_hi + (*lo < o_lo);
+}
+
+/* XTAL_CLK's edges by the measured clock's edge @n, at its exact time. */
+static uint64_t esp32_timg_cal_xtal_by(Esp32TimgState *s, uint64_t n)
+{
+    uint64_t hi, lo;
+
+    esp32_timg_cal_edge_time(s, n, &hi, &lo);
+    return esp32_timg_cal_edges_by(clock_get(s->xtal_clk), s->xtal_origin,
+                                   hi, lo);
+}
+
+/*
+ * Begin a measurement at Clock units @hi:@lo, of the clock and the cycles
+ * selected now, from that clock's first edge after.
+ */
+static void esp32_timg_cal_begin_at(Esp32TimgState *s, bool oneshot,
+                                    uint64_t hi, uint64_t lo)
+{
     s->cal_active = true;
     s->cal_oneshot = oneshot;
     s->cal_counting = false;
@@ -492,59 +551,157 @@ static void esp32_timg_cal_begin(Esp32TimgState *s, bool oneshot)
     s->cal_target = s->rtc_cal_max;
     s->cal_cycles = 0;
     s->cal_xtal = 0;
+    s->cal_first = esp32_timg_cal_edges_by(clock_get(s->cal_clk[s->cal_sel]),
+                                           s->cal_origin[s->cal_sel],
+                                           hi, lo) + 1;
     if (oneshot) {
         s->rtc_cal_ready = false;
     }
-    esp32_timg_cal_arm(s, now);
 }
 
-static void esp32_timg_cal_stop(Esp32TimgState *s)
+static void esp32_timg_cal_begin(Esp32TimgState *s, bool oneshot,
+                                 int64_t now)
 {
-    timer_del(&s->cal_timer);
-    s->cal_active = false;
+    uint64_t hi, lo;
+
+    esp32_timg_cal_units(now, &hi, &lo);
+    esp32_timg_cal_begin_at(s, oneshot, hi, lo);
 }
 
-static void esp32_timg_cal_cb(void *opaque)
+/*
+ * A cycling measurement has just begun: it and the ones after it end
+ * every RTC_CALI_MAX + 1 edges of the measured clock, those that have by
+ * @now_k passed over at once, the value of the last of them taken from
+ * its edges.
+ */
+static void esp32_timg_cal_skip(Esp32TimgState *s, uint64_t now_k)
 {
-    Esp32TimgState *s = opaque;
-    /* The timer may run late; the event happened when it was due */
-    int64_t now = s->cal_event_ns;
+    uint64_t span = (uint64_t)s->cal_target + 1;
+    uint64_t begin = s->cal_first - 1, e, hi, lo;
 
-    if (!s->cal_counting) {
-        s->cal_counting = true;
-        s->cal_seg_ns = now;
-        if (s->cal_target) {
-            esp32_timg_cal_arm(s, now);
+    if (now_k < begin || now_k - begin < span) {
+        return;
+    }
+    e = begin + (now_k - begin) / span * span;
+    s->rtc_cal_value = extract64(esp32_timg_cal_xtal_by(s, e) -
+                                 esp32_timg_cal_xtal_by(s, e - s->cal_target),
+                                 0, R_TIMG_RTCCALICFG1_VALUE_LENGTH);
+    s->rtc_cal_ready = true;
+    esp32_timg_cal_edge_time(s, e, &hi, &lo);
+    esp32_timg_cal_begin_at(s, false, hi, lo);
+}
+
+/*
+ * Bring the measurement up to @now: every end by then, each at the
+ * measured clock's edge it comes at, with the clocks as they have run
+ * since they last changed.
+ */
+static void esp32_timg_cal_advance(Esp32TimgState *s, int64_t now)
+{
+    uint64_t now_k, e, at_first, hi, lo;
+
+    while (s->cal_active && esp32_timg_cal_counts(s) &&
+           clock_is_enabled(s->cal_clk[s->cal_sel])) {
+        now_k = esp32_timg_cal_edges(s, now);
+        e = s->cal_first + s->cal_target - s->cal_cycles;
+        if (e > now_k) {
             return;
         }
-    } else {
-        s->cal_xtal += clock_ns_to_ticks(s->xtal_clk, now - s->cal_seg_ns);
-    }
-    s->rtc_cal_value = extract64(s->cal_xtal, 0,
-                                 R_TIMG_RTCCALICFG1_VALUE_LENGTH);
-    s->rtc_cal_ready = true;
-    esp32_timg_cal_stop(s);
-    if (s->rtc_cal_start_cycling) {
-        esp32_timg_cal_begin(s, false);
+        at_first = s->cal_counting ? s->cal_xtal_first :
+                   esp32_timg_cal_xtal_by(s, s->cal_first);
+        s->rtc_cal_value = extract64(s->cal_xtal +
+                                     esp32_timg_cal_xtal_by(s, e) - at_first,
+                                     0, R_TIMG_RTCCALICFG1_VALUE_LENGTH);
+        s->rtc_cal_ready = true;
+        s->cal_active = false;
+        if (!s->rtc_cal_start_cycling) {
+            return;
+        }
+        esp32_timg_cal_edge_time(s, e, &hi, &lo);
+        esp32_timg_cal_begin_at(s, false, hi, lo);
+        if (clock_is_enabled(s->cal_clk[s->cal_sel])) {
+            esp32_timg_cal_skip(s, esp32_timg_cal_edges(s, now));
+        }
     }
 }
 
 /*
- * Bring the measurement up to now before software looks at it: a QEMU
- * timer can run after its deadline, but RDY and the value change at the
- * deadline itself.
+ * Ahead of a change at @now of the group's clock, XTAL_CLK or the
+ * measured clock, with the measurement up to then: count its progress so
+ * far, the measured clock's cycles and XTAL_CLK's.
  */
-static void esp32_timg_cal_catch_up(Esp32TimgState *s)
+static void esp32_timg_cal_fold(Esp32TimgState *s, int64_t now)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t now_k;
 
-    while (timer_pending(&s->cal_timer) && s->cal_event_ns <= now) {
-        timer_del(&s->cal_timer);
-        esp32_timg_cal_cb(s);
+    if (!s->cal_active || !esp32_timg_cal_counts(s)) {
+        return;
+    }
+    if (clock_is_enabled(s->cal_clk[s->cal_sel])) {
+        now_k = esp32_timg_cal_edges(s, now);
+        if (!s->cal_counting && s->cal_first <= now_k) {
+            s->cal_counting = true;
+            s->cal_xtal_first = esp32_timg_cal_xtal_by(s, s->cal_first);
+        }
+        if (s->cal_counting) {
+            s->cal_cycles += now_k - s->cal_first;
+        }
+    }
+    if (s->cal_counting) {
+        s->cal_xtal += esp32_timg_cal_xtal_edges(s, now) - s->cal_xtal_first;
     }
 }
 
-static void esp32_timg_cal_write(Esp32TimgState *s, uint32_t value)
+/*
+ * The group's clock stops at @now, with the measurement up to then: keep
+ * its whole cycles, and XTAL_CLK's edges up to the last of them; it goes
+ * on from the measured clock's first edge after the clock runs again.
+ */
+static void esp32_timg_cal_pause(Esp32TimgState *s, int64_t now)
+{
+    uint64_t now_k;
+
+    if (!s->cal_active || !clock_is_enabled(s->xtal_clk)) {
+        return;
+    }
+    if (!clock_is_enabled(s->cal_clk[s->cal_sel])) {
+        if (s->cal_counting) {
+            s->cal_xtal += esp32_timg_cal_xtal_edges(s, now) -
+                           s->cal_xtal_first;
+            s->cal_counting = false;
+        }
+        return;
+    }
+    now_k = esp32_timg_cal_edges(s, now);
+    if (!s->cal_counting) {
+        if (s->cal_first > now_k) {
+            return;
+        }
+        s->cal_xtal_first = esp32_timg_cal_xtal_by(s, s->cal_first);
+    }
+    s->cal_cycles += now_k - s->cal_first;
+    s->cal_xtal += esp32_timg_cal_xtal_by(s, now_k) - s->cal_xtal_first;
+    s->cal_counting = false;
+}
+
+/*
+ * After the change: the measurement goes on from @now at the clocks' new
+ * rates, one waiting for its first edge taking the next one.
+ */
+static void esp32_timg_cal_rebase(Esp32TimgState *s, int64_t now)
+{
+    uint64_t now_k;
+
+    if (!s->cal_active) {
+        return;
+    }
+    now_k = esp32_timg_cal_edges(s, now);
+    s->cal_first = s->cal_counting ? now_k : now_k + 1;
+    s->cal_xtal_first = esp32_timg_cal_xtal_edges(s, now);
+}
+
+static void esp32_timg_cal_write(Esp32TimgState *s, uint32_t value,
+                                 int64_t now)
 {
     bool start = FIELD_EX32(value, TIMG_RTCCALICFG, START);
     bool cycling = FIELD_EX32(value, TIMG_RTCCALICFG, START_CYCLING);
@@ -563,29 +720,62 @@ static void esp32_timg_cal_write(Esp32TimgState *s, uint32_t value)
     s->rtc_cal_max = FIELD_EX32(value, TIMG_RTCCALICFG, MAX);
 
     if (start && !old_start) {
-        esp32_timg_cal_begin(s, true);
+        esp32_timg_cal_begin(s, true, now);
     } else if (!start && old_start && s->cal_active && s->cal_oneshot) {
-        esp32_timg_cal_stop(s);
+        s->cal_active = false;
     }
     if (cycling && !old_cycling && !s->cal_active) {
-        esp32_timg_cal_begin(s, false);
+        esp32_timg_cal_begin(s, false, now);
     } else if (!cycling && old_cycling && s->cal_active && !s->cal_oneshot) {
-        esp32_timg_cal_stop(s);
+        s->cal_active = false;
     }
 }
 
-/* A calibration clock is about to change rate, or has. */
-static void esp32_timg_cal_clk_update(void *opaque, ClockEvent event)
+/*
+ * A clock of the calibration, XTAL_CLK (@sel < 0) or a measured one, is
+ * about to change rate, or has: its edges begin afresh from the change.
+ */
+static void esp32_timg_cal_clk_update(Esp32TimgState *s, int sel,
+                                      ClockEvent event)
 {
-    Esp32TimgState *s = ESP32_TIMG(opaque);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    bool counted = sel < 0 || (s->cal_active && s->cal_sel == sel);
 
     if (event == ClockPreUpdate) {
-        esp32_timg_cal_catch_up(s);
-        esp32_timg_cal_fold(s, now);
-    } else {
-        esp32_timg_cal_arm(s, now);
+        esp32_timg_cal_advance(s, now);
+        if (sel < 0 || (s->cal_active && s->cal_sel == sel)) {
+            esp32_timg_cal_fold(s, now);
+        }
+        return;
     }
+    if (sel < 0) {
+        s->xtal_origin = now;
+    } else {
+        s->cal_origin[sel] = now;
+    }
+    if (counted) {
+        esp32_timg_cal_rebase(s, now);
+    }
+}
+
+static void esp32_timg_xtal_clk_update(void *opaque, ClockEvent event)
+{
+    esp32_timg_cal_clk_update(opaque, -1, event);
+}
+
+static void esp32_timg_rtc_slow_clk_update(void *opaque, ClockEvent event)
+{
+    esp32_timg_cal_clk_update(opaque, ESP32_TIMG_CAL_RTC_MUX, event);
+}
+
+static void esp32_timg_8md256_clk_update(void *opaque, ClockEvent event)
+{
+    esp32_timg_cal_clk_update(opaque, ESP32_TIMG_CAL_8MD256, event);
+}
+
+static void esp32_timg_xtal32k_clk_update(void *opaque, ClockEvent event)
+{
+    esp32_timg_cal_clk_update(opaque, ESP32_TIMG_CAL_32K_XTAL, event);
 }
 
 /*
@@ -941,21 +1131,20 @@ static void esp32_timg_init(Object *obj)
                                     ClockPreUpdate | ClockUpdate);
 
     s->xtal_clk = qdev_init_clock_in(DEVICE(obj), ESP32_TIMG_XTAL_CLK,
-                                     esp32_timg_cal_clk_update, s,
+                                     esp32_timg_xtal_clk_update, s,
                                      ClockPreUpdate | ClockUpdate);
     s->cal_clk[ESP32_TIMG_CAL_RTC_MUX] =
         qdev_init_clock_in(DEVICE(obj), ESP32_TIMG_RTC_SLOW_CLK,
-                           esp32_timg_cal_clk_update, s,
+                           esp32_timg_rtc_slow_clk_update, s,
                            ClockPreUpdate | ClockUpdate);
     s->cal_clk[ESP32_TIMG_CAL_8MD256] =
         qdev_init_clock_in(DEVICE(obj), ESP32_TIMG_8MD256_CLK,
-                           esp32_timg_cal_clk_update, s,
+                           esp32_timg_8md256_clk_update, s,
                            ClockPreUpdate | ClockUpdate);
     s->cal_clk[ESP32_TIMG_CAL_32K_XTAL] =
         qdev_init_clock_in(DEVICE(obj), ESP32_TIMG_XTAL32K_CLK,
-                           esp32_timg_cal_clk_update, s,
+                           esp32_timg_xtal32k_clk_update, s,
                            ClockPreUpdate | ClockUpdate);
-    timer_init_ns(&s->cal_timer, QEMU_CLOCK_VIRTUAL, esp32_timg_cal_cb, s);
 
     esp32_timg_timer_init(s, &s->t0, TIMG_T0_INT);
     esp32_timg_timer_init(s, &s->t1, TIMG_T1_INT);
