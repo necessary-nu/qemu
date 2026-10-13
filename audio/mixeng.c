@@ -346,13 +346,14 @@ t_sample *mixeng_conv_float[2][2] = {
     }
 };
 
+/* The mean of the two channels, as mixeng_template.h's _from_mono. */
 static void clip_natural_float_from_mono(void *dst, const struct st_sample *src,
                                          int samples)
 {
     float *out = dst;
 
     while (samples--) {
-        *out++ = CLIP_NATURAL_FLOAT(src->l + src->r);
+        *out++ = CLIP_NATURAL_FLOAT((src->l + src->r) / 2);
         src++;
     }
 }
@@ -363,7 +364,7 @@ static void clip_swap_float_from_mono(void *dst, const struct st_sample *src,
     uint32_t *out_f32s = dst;
 
     while (samples--) {
-        *out_f32s++ = F32_TO_F32S(CLIP_NATURAL_FLOAT(src->l + src->r));
+        *out_f32s++ = F32_TO_F32S(CLIP_NATURAL_FLOAT((src->l + src->r) / 2));
         src++;
     }
 }
