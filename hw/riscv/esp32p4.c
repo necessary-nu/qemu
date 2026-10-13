@@ -521,7 +521,6 @@ static const struct {
     { "axi-icm-qos",      0x500a4400, 3 * KiB },
 
     /* HP peripherals 1. */
-    { "iomux-mspi-pin",   0x500e1200, 4 * KiB - 0x200 },
     { "mem-monitor",      0x500e3000, 4 * KiB },
     { "audio-addc",       0x500e4000, 4 * KiB },
 
@@ -813,9 +812,9 @@ static const char *esp32p4_flash_part(uint64_t size)
  * is erased unless backed by the first -drive if=mtd.
  *
  * A board with no flash has nothing on the bus. Nothing then drives the
- * controllers' data inputs, which out of reset have no pull-up or
- * pull-down (IOMUX_MSPI_PIN_FLASH_*_WPU and _WPD clear), so this model
- * takes what they read as zero, as a QEMU SSI bus with no device returns.
+ * controllers' data inputs, which read as their pads' pulls hold them
+ * (IOMUX_MSPI_PIN_FLASH_*_WPU and _WPD, clear out of reset, when they
+ * float and read 0; hw/gpio/esp32p4_mspi_iomux.c).
  */
 /* [spec:nuos:req:emu.esp32p4.machine] */
 static void esp32p4_init_flash(ESP32P4MachineState *s)
@@ -1512,6 +1511,8 @@ static void esp32p4_init_mspi(ESP32P4MachineState *s, ESP32P4MSPIState *m,
                              &error_abort);
     object_property_set_link(OBJECT(m), "keymng", OBJECT(&s->keymng),
                              &error_abort);
+    object_property_set_link(OBJECT(m), "pins", OBJECT(&s->mspi_iomux),
+                             &error_abort);
     if (psram) {
         object_property_set_link(OBJECT(m), "psram-mr", OBJECT(&s->psram),
                                  &error_abort);
@@ -1564,10 +1565,12 @@ static void esp32p4_init_mspi(ESP32P4MachineState *s, ESP32P4MSPIState *m,
 }
 
 /*
- * The flash and PSRAM MSPI controllers and the flash, and the caches:
- * their registers behind L1CACHE_CPU_CLK and RST_EN_HP_CACHE, the part of
- * L2MEM the L2 cache occupies over L2MEM at both its addresses, and their
- * views in the HP cores' address space.
+ * The flash and PSRAM MSPI controllers and the flash, with the pads they
+ * read through, IOMUX_MSPI_PIN (in the HP IO MUX's space, behind
+ * IOMUX_APB_CLK and held by RST_EN_IOMUX); and the caches: their
+ * registers behind L1CACHE_CPU_CLK and RST_EN_HP_CACHE, the part of L2MEM
+ * the L2 cache occupies over L2MEM at both its addresses, and their views
+ * in the HP cores' address space.
  */
 /* [spec:nuos:req:emu.esp32p4.memory] */
 static void esp32p4_init_ext_memory(ESP32P4MachineState *s)
@@ -1604,6 +1607,12 @@ static void esp32p4_init_ext_memory(ESP32P4MachineState *s)
                                     qdev_get_gpio_in(
                                         DEVICE(&s->crypto_split[i]), 0));
     }
+    object_initialize_child(OBJECT(s), "mspi-iomux", &s->mspi_iomux,
+                            TYPE_ESP32P4_MSPI_IOMUX);
+    sysbus_realize(SYS_BUS_DEVICE(&s->mspi_iomux), &error_fatal);
+    esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(&s->mspi_iomux), 0,
+                             ESP32P4_MSPI_IOMUX_BASE, ESP32P4_CLK_IOMUX_APB,
+                             ESP32P4_RST_IOMUX, 0);
     esp32p4_init_mspi(s, &s->flash_mspi, false);
     esp32p4_init_mspi(s, &s->psram_mspi, true);
     esp32p4_init_flash(s);

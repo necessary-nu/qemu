@@ -35,7 +35,7 @@ enum {
 #define ESP32P4_GPIO_BASE       0x500e0000
 #define ESP32P4_GPIO_SIZE       0x1000
 #define ESP32P4_IO_MUX_BASE     0x500e1000
-/* IOMUX_MSPI_PIN, the flash and PSRAM pads' block, follows at 0x200. */
+/* IOMUX_MSPI_PIN follows at 0x200 (hw/gpio/esp32p4_mspi_iomux.c). */
 #define ESP32P4_IO_MUX_SIZE     0x200
 #define ESP32P4_LP_GPIO_BASE    0x5012a000
 #define ESP32P4_LP_GPIO_SIZE    0x1000
