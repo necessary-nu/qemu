@@ -49,7 +49,11 @@
  * to run. An alarm happens at the time of the CNT_CLK edge that reaches
  * its value, however late the QEMU timer that runs it: register accesses
  * and clock and stall changes first run the alarms due before them, in
- * order, and the ETM event carries the alarm's time.
+ * order, and the ETM event carries the alarm's time. An alarm nothing
+ * sees (its interrupt not let out, or already raised, and ETM_EN clear)
+ * takes no QEMU timer: what it changes, REAL_TARGETx and TARGETx_INT_RAW,
+ * is worked out as software reads them, so that a period mode nobody
+ * watches costs the host nothing however short its period.
  *
  * Writes to TARGETx_HI, TARGETx_LO, TARGETx_PERIOD, LOAD_HI and LOAD_LO
  * take effect at the next COMPx_LOAD or UNITn_LOAD, as the TRM's
@@ -190,9 +194,62 @@ static void systimer_alarm(ESP32P4SysTimerState *s, int x, int64_t when)
 
 /*
  * [spec:nuos:req:emu.esp32p4.timers]
+ * Whether comparator @x's next alarm is seen when it comes: its interrupt
+ * let out by TARGETx_INT_ENA while TARGETx_INT_RAW is clear (set, the
+ * line is high already), or its ETM event pulsed (SYSTIMER_ETM_EN). An
+ * alarm nothing sees takes no QEMU timer: REAL_TARGET and INT_RAW, which
+ * are all it changes, are worked out as software reads them
+ * (systimer_comp_passed()).
+ */
+static bool systimer_comp_observed(ESP32P4SysTimerState *s, int x)
+{
+    return ((s->int_ena & BIT(x)) && !(s->int_raw & BIT(x))) ||
+           (s->conf & CONF_ETM_EN);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * Comparator @x's alarms that nothing sees, up to CNT_CLK edge @edges, in
+ * one go: in period mode each moves the alarm value on by the period,
+ * from where it was, as the counter, counting on, reaches it; each sets
+ * TARGETx_INT_RAW. A period's worth of alarms or a second's cost the
+ * host the same.
+ */
+static void systimer_comp_passed(ESP32P4SysTimerState *s, int x,
+                                 uint64_t edges)
+{
+    ESP32P4SysTimerComp *c = &s->comp[x];
+    int n = systimer_comp_unit(c);
+    uint64_t passed;
+
+    if (!c->armed || !(s->conf & CONF_TARGET_WORK_EN(x)) ||
+        !clock_is_enabled(s->clk) || !s->unit[n].running ||
+        timer_pending(&c->timer)) {
+        return;
+    }
+    passed = (systimer_unit_value(s, n, edges) - c->real) & COUNT_MASK;
+    if (passed >= PASSED_RANGE) {
+        return;
+    }
+    s->int_raw |= BIT(x);
+    systimer_update_irqs(s);
+    if (!(c->conf & TCONF_PERIOD_MODE) || !c->period) {
+        if (c->conf & TCONF_PERIOD_MODE) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: comparator %d in period "
+                          "mode with a period of 0\n",
+                          TYPE_ESP32P4_SYSTIMER, x);
+        }
+        c->armed = false;
+        return;
+    }
+    c->real = (c->real + (passed / c->period + 1) * c->period) & COUNT_MASK;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
  * Compare comparator @x at CNT_CLK edge @edges, at time @now: alarm if
  * its value has been reached or passed, and schedule its next alarm
- * otherwise.
+ * otherwise, if anything sees it.
  */
 static void systimer_comp_check(ESP32P4SysTimerState *s, int x,
                                 uint64_t edges, int64_t now)
@@ -223,7 +280,7 @@ static void systimer_comp_check(ESP32P4SysTimerState *s, int x,
         /* A counter loaded past several periods resumes from its value. */
         c->real = ((v == c->real ? c->real : v) + c->period) & COUNT_MASK;
     }
-    if (!s->unit[n].running) {
+    if (!s->unit[n].running || !systimer_comp_observed(s, x)) {
         return;
     }
     ahead = (c->real - v) & COUNT_MASK;
@@ -282,12 +339,17 @@ static void systimer_comp_due(ESP32P4SysTimerState *s, int x)
     systimer_comp_check(s, x, systimer_edges(s, c->due_ns), c->due_ns);
 }
 
-/* Run the alarms that fell due by @now, in order. */
+/*
+ * Run the alarms that fell due by @now, in order, those seen at their own
+ * times, then the rest.
+ */
 static void systimer_catch_up(ESP32P4SysTimerState *s, int64_t now)
 {
+    uint64_t edges;
+    int x;
+
     for (;;) {
         int next = -1;
-        int x;
 
         for (x = 0; x < ESP32P4_SYSTIMER_COMPS; x++) {
             ESP32P4SysTimerComp *c = &s->comp[x];
@@ -298,9 +360,13 @@ static void systimer_catch_up(ESP32P4SysTimerState *s, int64_t now)
             }
         }
         if (next < 0) {
-            return;
+            break;
         }
         systimer_comp_due(s, next);
+    }
+    edges = systimer_edges(s, now);
+    for (x = 0; x < ESP32P4_SYSTIMER_COMPS; x++) {
+        systimer_comp_passed(s, x, edges);
     }
 }
 
@@ -546,11 +612,13 @@ static void systimer_write_reg(ESP32P4SysTimerState *s, hwaddr addr,
     case A_INT_ENA:
         s->int_ena = value & INT_MASK;
         systimer_update_irqs(s);
+        systimer_check_all(s, edges, now);
         break;
     case A_INT_RAW:
     case A_INT_CLR:
         s->int_raw &= ~(ones & INT_MASK);
         systimer_update_irqs(s);
+        systimer_check_all(s, edges, now);
         break;
     case A_DATE:
         s->date = value;
