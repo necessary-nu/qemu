@@ -631,9 +631,35 @@ static void esp32p4_i3c_mst_dma_rx_ready(void *opaque)
     esp32p4_i3c_mst_dma_rx(opaque);
 }
 
+static void esp32p4_i3c_mst_timer(void *opaque);
+
+/*
+ * [spec:nuos:req:emu.esp32p4.i2c]
+ * End the transfer's phases whose time has come by now, in order, each at
+ * its own time: without icount their timer can run well after, while
+ * software polls INT_RAW, RESPONSE_BUF and the buffers' levels, or
+ * PRESENT_STATE0's busy bits. A register access, and GDMA's, first do so.
+ * Only a timer that has come is run.
+ */
+static void esp32p4_i3c_mst_catch_up(ESP32P4I3CMstState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    while (timer_pending(&s->timer) && s->phase_due <= now) {
+        timer_del(&s->timer);
+        esp32_line_run_at(s->phase_due, esp32p4_i3c_mst_timer, s);
+    }
+}
+
+static void esp32p4_i3c_mst_dma_sync(void *opaque, int64_t when)
+{
+    esp32p4_i3c_mst_catch_up(opaque);
+}
+
 static const ESP32P4GdmaPeriphOps esp32p4_i3c_mst_dma_ops = {
     .tx_ready = esp32p4_i3c_mst_dma_tx_ready,
     .rx_ready = esp32p4_i3c_mst_dma_rx_ready,
+    .sync = esp32p4_i3c_mst_dma_sync,
 };
 
 /* Master: commands */
@@ -1339,6 +1365,7 @@ static uint64_t esp32p4_i3c_mst_read(void *opaque, hwaddr addr,
     unsigned idx = addr / 4;
     uint32_t v;
 
+    esp32p4_i3c_mst_catch_up(s);
     if (addr >= A_DCT && addr < A_DCT + ESP32P4_I3C_DEVS * 16) {
         return s->dct[(addr - A_DCT) / 16][(addr / 4) % 4];
     }
@@ -1413,6 +1440,7 @@ static void esp32p4_i3c_mst_write(void *opaque, hwaddr addr, uint64_t value,
     unsigned idx = addr / 4;
     uint32_t v = value, old;
 
+    esp32p4_i3c_mst_catch_up(s);
     if (addr >= A_DCT && addr < A_DCT + ESP32P4_I3C_DEVS * 16) {
         s->dct[(addr - A_DCT) / 16][(addr / 4) % 4] = v;
         return;
