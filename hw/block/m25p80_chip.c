@@ -613,6 +613,7 @@ static void write_back_done(void *opaque, int ret)
  */
 static void cells_changed(M25Chip *c, uint32_t off, uint32_t len, bool now)
 {
+    qemu_irq_pulse(c->changed);
     if (c->mem && memory_region_is_romd(c->mem)) {
         memory_region_flush_rom_device(c->mem, off, len);
     } else if (c->mem) {
@@ -714,12 +715,15 @@ static bool answers_reads(M25Chip *c)
 /* [spec:nuos:req:emu.flash-timing] */
 static void update_romd(M25Chip *c)
 {
-    bool romd;
+    bool romd = answers_reads(c);
 
+    if (romd != c->answering) {
+        c->answering = romd;
+        qemu_irq_pulse(c->changed);
+    }
     if (!c->mem) {
         return;
     }
-    romd = answers_reads(c);
     if (memory_region_is_romd(c->mem) != romd) {
         /* The controller remaps around it in the same transaction. */
         memory_region_transaction_begin();
@@ -2210,6 +2214,7 @@ const VMStateDescription vmstate_m25chip = {
         VMSTATE_TIMER_PTR(op_timer, M25Chip),
         VMSTATE_TIMER_PTR(deaf_timer, M25Chip),
         VMSTATE_BOOL_V(hpm, M25Chip, 2),
+        VMSTATE_BOOL_V(answering, M25Chip, 2),
         VMSTATE_END_OF_LIST()
     }
 };

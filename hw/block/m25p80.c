@@ -564,6 +564,7 @@ struct Flash {
     /* A datasheet part's state, when pi->chip names one. */
     M25Chip chip;
     qemu_irq array_mapped;
+    qemu_irq array_changed;
 };
 
 struct M25P80Class {
@@ -1851,6 +1852,12 @@ static void m25p80_realize(SSIPeripheral *ss, Error **errp)
      * part would ignore a read (busy, powered down).
      */
     qdev_init_gpio_out_named(DEVICE(s), &s->array_mapped, "array-mapped", 1);
+    /*
+     * "array-changed": pulsed when a datasheet part's cells change, or
+     * whether it answers reads (busy, powered down, deaf after a reset).
+     */
+    qdev_init_gpio_out_named(DEVICE(s), &s->array_changed, "array-changed",
+                             1);
 
     if (s->pi->chip) {
         assert(m25chip_size(s->pi->chip) == s->size);
@@ -1859,6 +1866,7 @@ static void m25p80_realize(SSIPeripheral *ss, Error **errp)
         s->chip.storage = s->storage;
         s->chip.mem = s->mem;
         s->chip.mapped = s->array_mapped;
+        s->chip.changed = s->array_changed;
         s->chip.blk = s->blk;
         s->chip.wp_level = true;
         m25chip_realize(&s->chip, errp);

@@ -53,6 +53,8 @@ typedef struct M25Chip {
     MemoryRegion *mem;
     /* Raised while `mem` is in ROMD mode, lowered while it is not. */
     qemu_irq mapped;
+    /* Pulsed when the array's cells, or whether it answers reads, change */
+    qemu_irq changed;
     BlockBackend *blk;
     bool max_timing;
     char *uid_prop;
@@ -77,6 +79,8 @@ typedef struct M25Chip {
     bool four_byte;
     /* High performance mode (A3h), which the GD25Q32C's HPF reports */
     bool hpm;
+    /* It answers reads, as `changed` last reported */
+    bool answering;
     uint8_t ear;
     uint8_t read_params;
     uint8_t wrap;
