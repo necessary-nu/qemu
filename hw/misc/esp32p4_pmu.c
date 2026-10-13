@@ -1929,13 +1929,23 @@ static void esp32p4_pmu_set_wakeup(void *opaque, int n, int level)
     pmu_update_outputs(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
+ * A pad of GPIO0 to GPIO15: only those PMU_EXT_WAKEUP_SEL selects take
+ * part, and a write to it or PMU_EXT_WAKEUP_LV looks at every pad again,
+ * so a change elsewhere changes nothing (those pads may carry a fast bus,
+ * an LCD's data, edge by edge).
+ */
 static void esp32p4_pmu_set_ext_pad(void *opaque, int n, int level)
 {
     ESP32P4PMUState *s = opaque;
+    uint32_t was = s->ext_pads;
 
     s->ext_pads = deposit32(s->ext_pads, n, 1, level != 0);
-    pmu_check(s);
-    pmu_update_outputs(s);
+    if ((was ^ s->ext_pads) & s->regs[R(A_EXT_WAKEUP_SEL)]) {
+        pmu_check(s);
+        pmu_update_outputs(s);
+    }
 }
 
 /*

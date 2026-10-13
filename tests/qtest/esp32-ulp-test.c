@@ -44,6 +44,7 @@
 #define SLEEP_CYC(n)            (SENS + 0x18 + 4 * (n))
 #define START_FORCE             (SENS + 0x2c)
 #define SLAVE_ADDR1             (SENS + 0x3c)
+#define SLAVE_ADDR2             (SENS + 0x40)
 #define SLAVE_ADDR3             (SENS + 0x44)
 #define SLAVE_ADDR4             (SENS + 0x48)
 #define TSENS_CTRL              (SENS + 0x4c)
@@ -636,6 +637,56 @@ static void test_i2c(void)
 }
 
 /*
+ * A read through SENS_SAR_I2C_CTRL from slave address @sel, its register
+ * 0, all 8 bits: SENS_I2C_SLAVE_ADDR4 after the transaction.
+ */
+static uint32_t sar_i2c_read(QTestState *qts, unsigned sel)
+{
+    wr(qts, RTC_I2C_INT_CLR, 0xff << 1);
+    wr(qts, SAR_I2C_CTRL, 0);
+    wr(qts, SAR_I2C_CTRL, (sel << 22) | (7u << 19) | SAR_I2C_START_FORCE |
+       SAR_I2C_START);
+    qtest_clock_step(qts, 1 * MS);
+    g_assert_cmphex(rd(qts, SLAVE_ADDR4) & I2C_DONE, ==, I2C_DONE);
+    return rd(qts, SLAVE_ADDR4);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp/test]
+ * The RTC I2C controller and the general call: the board's TMP105, the
+ * bus's one device, takes a general call (slave address 0: every byte
+ * acknowledged, its read giving the 1s of a broadcast nobody drives).
+ * Afterwards an absent address is NACKed and the TMP105 answers its own.
+ */
+static void test_i2c_general_call(void)
+{
+    QTestState *qts = start();
+    uint32_t v;
+
+    rtc_i2c_setup(qts, true);
+    /* SENS_I2C_SLAVE_ADDR0 the TMP105, ADDR1 the general call, ADDR2 nobody */
+    wr(qts, SLAVE_ADDR1, 0x48 << 11);
+    wr(qts, SLAVE_ADDR2, 0x50 << 11);
+    for (int i = 0; i < 2; i++) {
+        v = sar_i2c_read(qts, 1);
+        g_assert_cmphex(I2C_RDATA(v), ==, 0xff);
+        g_assert_cmphex(rd(qts, RTC_I2C_INT_RAW) & I2C_INT_MASTER_COMPLETE,
+                        ==, I2C_INT_MASTER_COMPLETE);
+        v = sar_i2c_read(qts, 2);
+        g_assert_cmphex(I2C_RDATA(v), ==, 0xff);
+        g_assert_cmphex(rd(qts, RTC_I2C_INT_RAW) & I2C_INT_MASTER_COMPLETE,
+                        ==, 0);
+        g_assert_cmphex(rd(qts, RTC_I2C_DEBUG_STATUS) & I2C_ACK_VAL, ==,
+                        I2C_ACK_VAL);
+        v = sar_i2c_read(qts, 0);
+        g_assert_cmphex(I2C_RDATA(v), ==, 0x15);
+        g_assert_cmphex(rd(qts, RTC_I2C_INT_RAW) & I2C_INT_MASTER_COMPLETE,
+                        ==, I2C_INT_MASTER_COMPLETE);
+    }
+    qtest_quit(qts);
+}
+
+/*
  * [spec:nuos:req:emu.esp32.ulp/test]
  * JUMP to the word address in a register, and to an immediate one.
  */
@@ -816,6 +867,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32/ulp/adc", test_adc);
     qtest_add_func("esp32/ulp/tsens", test_tsens);
     qtest_add_func("esp32/ulp/i2c", test_i2c);
+    qtest_add_func("esp32/ulp/i2c-general-call", test_i2c_general_call);
     qtest_add_func("esp32/ulp/fast-clk-switch-mid-wait",
                    test_fast_clk_switch_mid_wait);
     qtest_add_func("esp32/ulp/rc-fast-stopped-mid-run",

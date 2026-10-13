@@ -1415,19 +1415,20 @@ void esp32p4_image_source_connect_pads(ESP32P4ImageSource *s,
     static const ESP32P4DvpSignal sync_sig[SYNCS] = {
         ESP32P4_DVP_VSYNC, ESP32P4_DVP_HSYNC, ESP32P4_DVP_DE,
     };
-    unsigned i;
+    g_autofree char *name = g_strdup_printf("camera %s",
+        object_get_canonical_path_component(OBJECT(s)));
+    unsigned i, d;
 
     assert(!s->pads_connected);
     s->pads_connected = true;
     s->gpio = ESP32P4_GPIO(gpio);
+    d = esp32p4_gpio_ext_driver(s->gpio, name);
     for (i = 0; i < SYNCS; i++) {
         int64_t pad = s->pad[sync_sig[i]];
 
         if (pad >= 0) {
-            s->sync_in[i] = qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_PAD_IN,
-                                                   pad);
-            s->sync_release[i] =
-                qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_PAD_RELEASE, pad);
+            s->sync_in[i] = esp32p4_gpio_ext_in(s->gpio, d, pad);
+            s->sync_release[i] = esp32p4_gpio_ext_release(s->gpio, d, pad);
         }
     }
     if (sync_pads_assigned(s)) {
@@ -1437,8 +1438,7 @@ void esp32p4_image_source_connect_pads(ESP32P4ImageSource *s,
     for (i = 0; i < PINS; i++) {
         if (s->pin_pad[i] >= 0) {
             s->pin_irq[i] = qemu_allocate_irq(image_source_pin, s, i);
-            qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_OUT,
-                                        s->pin_pad[i], s->pin_irq[i]);
+            esp32p4_gpio_watch_pad(s->gpio, s->pin_pad[i], s->pin_irq[i]);
         }
     }
     update_stream(s);

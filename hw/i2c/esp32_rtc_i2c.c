@@ -151,7 +151,16 @@ static bool xfer_send(Xfer *x, uint8_t byte, bool address)
     if (!x->connected) {
         nack = released_sda(s);
     } else if (address) {
+        /*
+         * A NACK ends the core's transfer at once: it leaves a general
+         * call no device takes with its broadcast flag set, which would
+         * make every later START a broadcast, and a repeated START a
+         * device refuses still open.
+         */
         nack = i2c_start_transfer(s->bus, wire >> 1, wire & 1) != 0;
+        if (nack) {
+            i2c_end_transfer(s->bus);
+        }
         x->bus_open = !nack;
     } else {
         nack = i2c_send(s->bus, wire) != 0;
