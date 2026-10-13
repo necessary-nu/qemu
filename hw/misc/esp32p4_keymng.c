@@ -80,6 +80,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_keymng.h"
 #include "migration/vmstate.h"
 
@@ -624,6 +625,7 @@ static uint64_t km_read(void *opaque, hwaddr addr, unsigned size)
     uint8_t huk[32];
     uint8_t *p;
 
+    esp32p4_crypto_timer_sync(&s->op, esp32_line_time());
     switch (reg) {
     case A_CLK:
         v = s->clk_reg;
@@ -709,6 +711,7 @@ static void km_write(void *opaque, hwaddr addr, uint64_t value,
     uint32_t m;
     uint8_t *p;
 
+    esp32p4_crypto_timer_sync(&s->op, esp32_line_time());
     if (s->in_reset || !clock_is_enabled(s->clk)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write at 0x%" HWADDR_PRIx
                       " dropped: the Key Manager is %s\n",

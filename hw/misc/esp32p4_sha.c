@@ -73,6 +73,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_sha.h"
 #include "migration/vmstate.h"
 #include "target/riscv/esp32p4_cpu.h"
@@ -251,6 +252,7 @@ static uint64_t sha_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr reg = addr & ~3;
     uint32_t v = 0;
 
+    esp32p4_crypto_timer_sync(&s->op, esp32_line_time());
     if (s->occupied) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read at 0x%" HWADDR_PRIx
                       " while another block occupies the accelerator\n",
@@ -309,6 +311,7 @@ static MemTxResult sha_write(void *opaque, hwaddr addr, uint64_t value,
     int shift = (addr & 3) * 8;
     uint32_t v = deposit32(0, shift, size * 8, value);
 
+    esp32p4_crypto_timer_sync(&s->op, esp32_line_time());
     if (s->occupied || sha_in_reset(s) || !clock_is_enabled(s->clk)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write at 0x%" HWADDR_PRIx
                       " dropped: the accelerator is %s\n", TYPE_ESP32P4_SHA,
