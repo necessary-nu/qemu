@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/gpio/esp32p4_gpio.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/notify.h"
 #include "qemu/timer.h"
@@ -47,6 +48,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LedcState, ESP32P4_LEDC)
  *   Clock "clk": LEDC_CLK, HP_SYS_CLKRST's "ledc" (its source mux and
  *               gate), which the timers divide. The machine maps the
  *               registers behind LEDC_APB_CLK and the block's reset.
+ *   Link "gpio" and property "sig-base": the GPIO matrix, and the matrix
+ *               output signal of sig_out0 (the others following it), for
+ *               the channels to see whether their outputs reach a pad.
+ *               Without the link every output is taken to reach one.
  *   sysbus IRQ 0: LEDC_INTR.
  */
 #define ESP32P4_LEDC_OUT            "sig-out"
@@ -146,6 +151,11 @@ struct ESP32P4LedcState {
     qemu_irq out[ESP32P4_LEDC_CHANNELS];
     qemu_irq etm_event[ESP32P4_LEDC_ETM_EVENTS];
     Notifier line_source;
+    ESP32P4GpioState *gpio;
+    uint32_t sig_base;
+    Notifier route_notifier;
+    /* Each channel's output reaches a pad, so that its edges are timed */
+    bool out_seen[ESP32P4_LEDC_CHANNELS];
 
     ESP32P4LedcTimer t[ESP32P4_LEDC_TIMERS];
     ESP32P4LedcChannel ch[ESP32P4_LEDC_CHANNELS];

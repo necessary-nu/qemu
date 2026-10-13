@@ -968,6 +968,52 @@ static void test_ledc_close_edges(void)
     qtest_quit(qts);
 }
 
+/*
+ * An LEDC output that reaches no pad: channel 0 at a 1-bit resolution
+ * from XTAL_CLK undivided, a 50 ns period, high for its first count
+ * (HPOINT 0, DUTY 1), 40 million edges a second. None of them is timed:
+ * a second costs the host next to nothing. Routed to pad 20 10 ns into a
+ * period, the pad takes the output's level of the moment, high, and from
+ * then on each edge at its nanosecond; unrouted again, edges stop being
+ * timed, and pad 20, released, no longer follows them.
+ */
+/* [spec:nuos:req:emu.esp32p4.pwm/test] */
+static void test_ledc_unrouted(void)
+{
+    QTestState *qts = start();
+    int64_t c;
+
+    qtest_irq_intercept_out_named(qts, GPIO_PATH, "pad");
+    ledc_timer(qts, 0, 1, 1);
+    /* The update at the first overflow */
+    c = now + 50;
+    lwr(qts, CH_HPOINT(0), 0);
+    lwr(qts, CH_DUTY(0), 1 << 4);
+    lwr(qts, CH_CONF0(0), SIG_OUT_EN | PARA_UP);
+    step_to(qts, c + 1000 * 1000 * 1000 + 10);
+    g_assert_false(qtest_get_irq(qts, 20));
+
+    c += 1000 * 1000 * 1000;
+    pad_out(qts, 20, SIG_LEDC(0));
+    g_assert_true(qtest_get_irq(qts, 20));
+    for (int m = 0; m < 3; m++) {
+        int64_t t = c + 50 * m;
+
+        step_to(qts, t + 24);
+        g_assert_true(qtest_get_irq(qts, 20));
+        step_to(qts, t + 25);
+        g_assert_false(qtest_get_irq(qts, 20));
+        step_to(qts, t + 49);
+        g_assert_false(qtest_get_irq(qts, 20));
+        step_to(qts, t + 50);
+        g_assert_true(qtest_get_irq(qts, 20));
+    }
+
+    qtest_writel(qts, GPIO_FUNC_OUT(20), 256);
+    step_to(qts, now + 1000 * 1000 * 1000);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -978,6 +1024,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4-pwm/ledc/overflow", test_ledc_overflow);
     qtest_add_func("esp32p4-pwm/ledc/etm", test_ledc_etm);
     qtest_add_func("esp32p4-pwm/ledc/close-edges", test_ledc_close_edges);
+    qtest_add_func("esp32p4-pwm/ledc/unrouted", test_ledc_unrouted);
     qtest_add_func("esp32p4-pwm/mcpwm/reset", test_mcpwm_reset);
     qtest_add_func("esp32p4-pwm/mcpwm/clock", test_mcpwm_clock);
     qtest_add_func("esp32p4-pwm/mcpwm/deadtime", test_mcpwm_deadtime);
