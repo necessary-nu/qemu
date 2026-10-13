@@ -2688,6 +2688,14 @@ ESP32P4ClkRstGate *esp32p4_clkrst_map_gated(ESP32P4ClkRstState *s,
     return g;
 }
 
+DeviceState *esp32p4_clkrst_gated_device(MemoryRegion *mr)
+{
+    if (mr->ops != &esp32p4_clkrst_gate_ops) {
+        return NULL;
+    }
+    return ((ESP32P4ClkRstGate *)mr->opaque)->dev;
+}
+
 void esp32p4_clkrst_gate_volatile(ESP32P4ClkRstGate *g, hwaddr offset,
                                   unsigned size)
 {

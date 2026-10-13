@@ -301,6 +301,42 @@ static void update_irq(RP2350DMAState *s)
     }
 }
 
+/* The DREQs a busy channel paces on, bit n for DREQ n. */
+static uint64_t dreqs_wanted(RP2350DMAState *s)
+{
+    uint64_t wanted = 0;
+    unsigned treq;
+    int n;
+
+    for (n = 0; n < RP2350_DMA_CHANNELS; n++) {
+        treq = ctrl_treq(s->ch[n].ctrl);
+        if ((s->ch[n].ctrl & CTRL_BUSY) && treq < RP2350_DMA_NUM_DREQ) {
+            wanted |= 1ull << treq;
+        }
+    }
+    return wanted;
+}
+
+/*
+ * [spec:nuos:req:emu.dma]
+ * The interrupts, and the "dreq-wanted" outputs: a source whose DREQ
+ * pulses only at moments of its own times them only while they count.
+ */
+static void update_outputs(RP2350DMAState *s)
+{
+    uint64_t wanted = dreqs_wanted(s);
+    uint64_t changed = wanted ^ s->dreq_wanted_level;
+    int n;
+
+    update_irq(s);
+    s->dreq_wanted_level = wanted;
+    while (changed) {
+        n = ctz64(changed);
+        changed &= changed - 1;
+        qemu_set_irq(s->dreq_wanted[n], (wanted >> n) & 1);
+    }
+}
+
 /* DREQs and pacing timers. */
 
 /* The block whose ACCESSCTRL register sets the security level of a DREQ. */
@@ -985,7 +1021,7 @@ static bool engine_run(RP2350DMAState *s, EngineMode mode)
         s->cycle++;
     }
     s->running = false;
-    update_irq(s);
+    update_outputs(s);
     return done;
 }
 
@@ -1559,7 +1595,7 @@ static MemTxResult rp2350_dma_write(void *opaque, hwaddr addr, uint64_t value,
     }
     engine_run(s, ENGINE_SYNC);
     r = reg_write(s, addr & ~3, v, access_level(attrs));
-    update_irq(s);
+    update_outputs(s);
     /* A trigger, say, may leave a DREQ-paced channel requesting. */
     if (requesting(s) & dreq_paced(s)) {
         engine_defer(s);
@@ -1641,7 +1677,7 @@ static void rp2350_dma_reset_hold(Object *obj, ResetType type)
 
 static void rp2350_dma_reset_exit(Object *obj, ResetType type)
 {
-    update_irq(RP2350_DMA(obj));
+    update_outputs(RP2350_DMA(obj));
 }
 
 /*
@@ -1680,6 +1716,8 @@ static void rp2350_dma_init(Object *obj)
     }
     qdev_init_gpio_in_named(DEVICE(obj), dreq_set, RP2350_DMA_DREQ,
                             RP2350_DMA_NUM_DREQ);
+    qdev_init_gpio_out_named(DEVICE(obj), s->dreq_wanted,
+                             RP2350_DMA_DREQ_WANTED, RP2350_DMA_NUM_DREQ);
     s->clk = qdev_init_clock_in(DEVICE(obj), "clk", rp2350_dma_clk_changed, s,
                                 ClockPreUpdate | ClockUpdate);
 }
@@ -1715,6 +1753,8 @@ static int rp2350_dma_post_load(void *opaque, int version_id)
 {
     RP2350DMAState *s = opaque;
 
+    /* The sources received their "dreq-wanted" levels with their state. */
+    s->dreq_wanted_level = dreqs_wanted(s);
     if (requesting(s) & dreq_paced(s)) {
         engine_defer(s);
     }

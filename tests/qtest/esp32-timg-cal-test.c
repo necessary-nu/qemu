@@ -313,6 +313,69 @@ static void test_gated(void)
     qtest_quit(qts);
 }
 
+static void assert_ready(QTestState *qts, uint32_t g, uint64_t value)
+{
+    g_assert_cmphex(qtest_readl(qts, RTCCALICFG(g)) & CALI_RDY, ==,
+                    CALI_RDY);
+    g_assert_cmpuint(CALI_VALUE(qtest_readl(qts, RTCCALICFG1(g))), ==,
+                     value);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rtc/test]
+ * [spec:nuos:req:emu.esp32.clock-gating/test]
+ * A change of the measured clock's rate during a measurement: the cycles
+ * counted at its old edges are kept, and the rest are counted at its new
+ * ones, from the change. 8MD256, 31250 Hz from reset, has its edges at
+ * multiples of 32000 ns: a measurement of 10 cycles begun at 1000 ns has
+ * its first edge at 32000 ns and two more by 100000 ns, when CK8M_DIV 0
+ * makes it 62500 Hz, its edges 16000 ns apart from then; the other 8 end
+ * at 228000 ns, and the value is XTAL_CLK's edges from 32025 to 228000 ns.
+ */
+static void test_clock_change(void)
+{
+    QTestState *qts = start(false);
+
+    qtest_clock_step(qts, 1000);
+    cal_start(qts, SEL_8MD256, 10);
+    qtest_clock_step(qts, 99000);
+    qtest_writel(qts, CLK_CONF, qtest_readl(qts, CLK_CONF) & ~CK8M_DIV_MASK);
+    qtest_clock_step(qts, 127999);
+    g_assert_cmphex(qtest_readl(qts, RTCCALICFG(TIMG0)) & CALI_RDY, ==, 0);
+    qtest_clock_step(qts, 1);
+    assert_ready(qts, TIMG0, (228000 - 32000) / 25);
+    qtest_quit(qts);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rtc/test]
+ * Cycling on a fast clock, and with RTC_CALI_MAX 0 on a clock whose edges
+ * fall between nanoseconds, for seconds, which cost the host next to
+ * nothing: 8MD256 undivided (ENB_CK8M_DIV), RC_FAST_CLK at 8 MHz, ends a
+ * measurement of one cycle every 250 ns in both groups, each 5 XTAL_CLK
+ * cycles; RTC_SLOW_CLK, the 150 kHz RC oscillator, ends one of no cycles
+ * at each of its edges, 20000/3 ns apart.
+ */
+static void test_cycling(void)
+{
+    QTestState *qts = start(false);
+    uint32_t cfg = CALI_CLK_SEL(SEL_8MD256) | CALI_MAX(1);
+
+    qtest_writel(qts, CLK_CONF, qtest_readl(qts, CLK_CONF) | ENB_CK8M_DIV);
+    qtest_writel(qts, RTCCALICFG(TIMG0), cfg);
+    qtest_writel(qts, RTCCALICFG(TIMG0), cfg | CALI_START_CYCLING);
+    qtest_clock_step(qts, 10 * NS_PER_S);
+    assert_ready(qts, TIMG0, 5);
+    assert_ready(qts, TIMG1, 5);
+
+    cfg = CALI_CLK_SEL(SEL_RTC_MUX) | CALI_MAX(0);
+    qtest_writel(qts, RTCCALICFG(TIMG0), cfg);
+    qtest_writel(qts, RTCCALICFG(TIMG0), cfg | CALI_START_CYCLING);
+    qtest_clock_step(qts, 10 * NS_PER_S);
+    assert_ready(qts, TIMG0, 0);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -324,6 +387,8 @@ int main(int argc, char **argv)
     qtest_add_func("esp32-timg-cal/no-xtal32k", test_no_xtal32k);
     qtest_add_func("esp32-timg-cal/xtal32k-fitted", test_xtal32k_fitted);
     qtest_add_func("esp32-timg-cal/gated", test_gated);
+    qtest_add_func("esp32-timg-cal/clock-change", test_clock_change);
+    qtest_add_func("esp32-timg-cal/cycling", test_cycling);
 
     return g_test_run();
 }

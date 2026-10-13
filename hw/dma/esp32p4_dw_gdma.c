@@ -110,6 +110,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/gpio/esp32_line.h"
+#include "hw/misc/esp32p4_clkrst.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "migration/vmstate.h"
 
@@ -1553,14 +1554,88 @@ static const MemoryRegionOps esp32p4_dw_gdma_ops = {
 /* Handshake inputs */
 
 /*
- * A handshake input changes at esp32_line_time(), after the rounds due
- * before it.
+ * Whether the memory core would refuse an access to @mr as re-entrant: an
+ * access to a block in the middle of one of its own, directly or through
+ * the clock gate it is mapped behind (esp32p4_clkrst_map_gated()).
  */
+static bool dw_region_in_access(MemoryRegion *mr)
+{
+    DeviceState *gated = esp32p4_clkrst_gated_device(mr);
+
+    if (gated) {
+        return gated->mem_reentrancy_guard.engaged_in_io;
+    }
+    return mr->dev && !mr->disable_reentrancy_guard && !mr->ram &&
+           !mr->ram_device && !mr->rom_device && !mr->readonly &&
+           mr->dev->mem_reentrancy_guard.engaged_in_io;
+}
+
+/*
+ * Whether a running channel's source or destination is a device in the
+ * middle of an access of its own, which the channel's next access would
+ * re-enter.
+ */
+static bool dw_target_in_access(ESP32P4DwGdmaState *s)
+{
+    RCU_READ_LOCK_GUARD();
+
+    for (int n = 0; n < NCH; n++) {
+        ESP32P4DwGdmaChan *c = &s->ch[n];
+        int master[2] = { c->ctl0 & CTL0_SMS ? 1 : 0,
+                          c->ctl0 & CTL0_DMS ? 1 : 0 };
+        uint32_t addr[2] = { c->sar, c->dar };
+        uint32_t hi[2] = { c->sar_hi, c->dar_hi };
+
+        if (!c->enabled) {
+            continue;
+        }
+        for (int i = 0; i < 2; i++) {
+            MemTxAttrs attrs = esp32p4_dma_attrs(
+                ESP32P4_DMA_MASTER_GDMA_CH0 + n,
+                ESP32P4_ICM_ID_AXI(master[i] ? ESP32P4_ICM_CID_VDMA_M2
+                                             : ESP32P4_ICM_CID_VDMA_M1, n));
+            hwaddr xlat, len = 1;
+            MemoryRegion *mr;
+
+            if (hi[i]) {
+                continue;
+            }
+            mr = address_space_translate(s->as, addr[i], &xlat, &len, i == 1,
+                                         attrs);
+            if (dw_region_in_access(mr)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * A handshake input changes at esp32_line_time(), after the rounds due
+ * before it. Those rounds wait for their timer, though, when a channel's
+ * peripheral is in the middle of an access, as when software's write of
+ * a bridge's register changes its request: their accesses to it would be
+ * refused as re-entrant (a bus error the hardware never gives). Rounds
+ * fall due before a register access only on the host's clock, where
+ * QEMU's timers can run late; then those see the change before their
+ * time, and their timer runs them as soon as the access is over.
+ */
+static void dw_hs_catch_up(ESP32P4DwGdmaState *s)
+{
+    int64_t now = esp32_line_time();
+
+    if (timer_pending(s->timer) && dw_due_ns(s) <= now &&
+        dw_target_in_access(s)) {
+        return;
+    }
+    dw_catch_up(s, now);
+}
+
 static void dw_hs_req(void *opaque, int n, int level)
 {
     ESP32P4DwGdmaState *s = opaque;
 
-    dw_catch_up(s, esp32_line_time());
+    dw_hs_catch_up(s);
     s->hs_req[n] = level;
     dw_kick(s);
 }
@@ -1569,7 +1644,7 @@ static void dw_hs_single(void *opaque, int n, int level)
 {
     ESP32P4DwGdmaState *s = opaque;
 
-    dw_catch_up(s, esp32_line_time());
+    dw_hs_catch_up(s);
     s->hs_single[n] = level;
     dw_kick(s);
 }
@@ -1578,7 +1653,7 @@ static void dw_hs_last(void *opaque, int n, int level)
 {
     ESP32P4DwGdmaState *s = opaque;
 
-    dw_catch_up(s, esp32_line_time());
+    dw_hs_catch_up(s);
     s->hs_last[n] = level;
 }
 
