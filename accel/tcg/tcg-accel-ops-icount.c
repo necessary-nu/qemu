@@ -41,7 +41,26 @@
 /* The quantum of CPUs with an icount clock, unless the option sets one. */
 #define ICOUNT_CLOCKED_QUANTUM_NS 1000
 
-/* Virtual time, in ns, to the next timer deadline. */
+/*
+ * Virtual time, in ns, to the next timer deadline: the next
+ * QEMU_CLOCK_VIRTUAL timer's, where the vCPUs' runs end, and which bounds
+ * their budgets and the windows of the CPUs with an icount clock.
+ *
+ * Timers on the host's clocks (QEMU_CLOCK_REALTIME, _HOST, _VIRTUAL_RT: a
+ * display's refresh, a text console's cursor blink, a self-announcement,
+ * block throttling) expire at moments of the host's: runs ending there
+ * would make how the vCPUs interleave, and the virtual times they see,
+ * follow the host. Nor do those timers need a run to end: the main loop
+ * runs them, and the vCPU thread holds nothing it needs while a vCPU
+ * executes (the BQL is dropped for each run, and the replay mutex is
+ * taken only under record/replay).
+ *
+ * Recording is the exception. There the vCPU thread holds the replay mutex
+ * through each run, and the main loop takes it to do anything at all, so
+ * realtime timers end runs too, lest the main loop and the input it takes
+ * wait for a long one. Replay follows the instruction counts the log
+ * keeps, not the deadlines.
+ */
 static int64_t icount_get_deadline(void)
 {
     int64_t deadline;
@@ -52,10 +71,11 @@ static int64_t icount_get_deadline(void)
      */
     deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
                                           QEMU_TIMER_ATTR_ALL);
-    /* Check realtime timers, because they help with input processing */
-    deadline = qemu_soonest_timeout(deadline,
-            qemu_clock_deadline_ns_all(QEMU_CLOCK_REALTIME,
-                                       QEMU_TIMER_ATTR_ALL));
+    if (replay_mode == REPLAY_MODE_RECORD) {
+        deadline = qemu_soonest_timeout(deadline,
+                qemu_clock_deadline_ns_all(QEMU_CLOCK_REALTIME,
+                                           QEMU_TIMER_ATTR_ALL));
+    }
 
     /*
      * Maintain prior (possibly buggy) behaviour where if no deadline
