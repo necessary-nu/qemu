@@ -94,17 +94,26 @@ enum {
  *     (ESP32P4_ICM_ID_AXI()): VDMA ports 5 and 6, GDMA-AXI 8, 2D-DMA 10,
  *     H264 ports 11 and 12.
  *
- *     The DMA APM checks such an access to HP ROM, HP L2MEM and the
- *     external memory windows, as the DMA masters address them
- *     (0x4FC00000, 0x4FF00000, 0x40000000 and 0x48000000), against the
- *     master's read or write permission for the 32 regions; REGDMA's
- *     accesses to the HP and LP peripherals and to LP SRAM go to the HP
- *     or LP APM, against REGDMA_HP_PERI_PMS and REGDMA_LP_PERI_PMS.
+ *     A DMA master reaches HP ROM, HP L2MEM and the external memory
+ *     windows only, at the addresses the bus matrix gives them
+ *     (0x4FC00000, 0x4FF00000, 0x40000000 and 0x48000000), where the DMA
+ *     APM checks it against the master's read or write permission for the
+ *     32 regions. VDMA's master 1 (ICM port ESP32P4_ICM_CID_VDMA_M1) also
+ *     reaches the CSI and DSI bridges' buffers (0x50104000, 0x50105000),
+ *     which no APM checks. REGDMA also reaches the HP and LP peripherals
+ *     and LP SRAM, through the HP or LP APM, against REGDMA_HP_PERI_PMS
+ *     and REGDMA_LP_PERI_PMS.
  *
- * Anything else, MEMTXATTRS_UNSPECIFIED (qtest, the loader, a debugger)
- * included, passes unchecked. A refused access does not reach its
- * target: a read returns a bus error and no data, a write is dropped and
- * returns a bus error, which a core takes as an access fault.
+ * Each master reaches only the slaves its port on the bus matrix has a
+ * path to (hw/misc/esp32p4_pms.c): the cores as TRM figure 9.3-1 maps
+ * them, the DMA masters as above. An access to an address the master
+ * has no path to reaches nothing: it answers with a decode error, and a
+ * DMA master's is recorded by the ICM as an illegal access. Anything
+ * else, MEMTXATTRS_UNSPECIFIED (qtest, the loader, a debugger) included,
+ * passes unchecked. A refused access does not reach its target: a read
+ * returns a bus error and no data, a write is dropped and returns a bus
+ * error, which a core takes as an access fault and a DMA engine reports
+ * as its bus errors.
  */
 #define ESP32P4_REQUESTER_VALID     0x8000
 #define ESP32P4_REQUESTER_IS_DMA    0x4000
@@ -177,6 +186,26 @@ static inline MemTxAttrs esp32p4_dma_attrs(unsigned master, unsigned id)
     };
 }
 
+/*
+ * The records a refusal goes to: the ICM's of the CPUs and AHB masters,
+ * the ICM's of the AXI masters, and LP_SYS's.
+ */
+enum {
+    ESP32P4_PMS_REC_ICM_CPU,
+    ESP32P4_PMS_REC_ICM_SYS,
+    ESP32P4_PMS_REC_LP_SYS,
+    ESP32P4_PMS_RECORDS,
+};
+
+/* A refusal's record, held until a core's block of code ends. */
+typedef struct ESP32P4PmsRecord {
+    bool valid;
+    bool write;
+    bool illegal;
+    uint8_t id;
+    uint32_t addr;
+} ESP32P4PmsRecord;
+
 struct ESP32P4PmsState {
     SysBusDevice parent_obj;
 
@@ -198,6 +227,15 @@ struct ESP32P4PmsState {
     uint32_t regs[ESP32P4_PMS_NUM_BLOCKS][ESP32P4_PMS_MAX_WORDS];
     /* LPPERI_RST_EN_LP_PMS is set. */
     bool lp_held;
+
+    /*
+     * The first refusal for each record made from the middle of a core's
+     * block of translated code (a trace encoder's write as the core
+     * reports an instruction), which raises its interrupt only once the
+     * block ends, as icount requires.
+     */
+    ESP32P4PmsRecord pending[ESP32P4_PMS_RECORDS];
+    QEMUTimer *record_timer;
 
     /* The qtest hook's last result, "<MemTxResult> <data>". */
     char *probe;
