@@ -114,11 +114,14 @@ typedef struct Esp32TimgState {
     uint32_t rtc_cal_max;
     uint32_t rtc_cal_value;
     /*
-     * The measurement in progress, if active: started by RTC_CALI_START
-     * (oneshot) or by cycling mode, on the clock and for the cycle count
-     * latched when it started. It waits for the first edge of the clock
-     * (until counting), then counts cal_cycles of it and cal_xtal XTAL_CLK
-     * cycles before cal_seg_ns, the rest since.
+     * The measurement in progress, if active, as of the last time it was
+     * brought up to date: started by RTC_CALI_START (oneshot) or by
+     * cycling mode, on the clock and for the cycle count latched when it
+     * started. It waits for the measured clock's edge cal_first (until
+     * counting), then counts cal_cycles of it and cal_xtal XTAL_CLK edges
+     * up to the measured clock's edge cal_first and XTAL_CLK's edge
+     * cal_xtal_first, the rest after. Edges are numbered from each clock's
+     * last change of rate, at cal_origin or xtal_origin (ns).
      */
     bool cal_active;
     bool cal_oneshot;
@@ -127,10 +130,12 @@ typedef struct Esp32TimgState {
     uint32_t cal_target;
     uint64_t cal_cycles;
     uint64_t cal_xtal;
-    int64_t cal_seg_ns;
-    /* When the timer is due: the first edge, or the end */
-    int64_t cal_event_ns;
-    QEMUTimer cal_timer;
+    uint64_t cal_first;
+    uint64_t cal_xtal_first;
+    int64_t cal_origin[ESP32_TIMG_CAL_CLK_COUNT];
+    int64_t xtal_origin;
+    /* Whether APB_CLK ran before the change its callbacks are for. */
+    bool cal_apb_was_running;
 } Esp32TimgState;
 
 #define ESP32_TIMG_WDT_CPU_RESET_GPIO   "mwdt-cpu-reset"

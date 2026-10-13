@@ -27,8 +27,9 @@
  * it is observed or changed, and a per-slice timer fires only at the
  * moments something becomes visible outside the block: a wrap whose
  * interrupt is enabled (and not yet raised), an output edge, a B pin edge
- * passing the input synchroniser, or a DREQ. Every edge and every DREQ
- * comes at its own cycle, however close to the next, so that PIO
+ * passing the input synchroniser, or a DREQ while the DMA counts it (a
+ * busy channel paces on it; it counts no other). Every edge and every
+ * DREQ comes at its own cycle, however close to the next, so that PIO
  * sampling a PWM pin, or another slice counting its edges, sees each; the
  * host's work grows with the edges' rate.
  *
@@ -446,7 +447,7 @@ static void pwm_drive(RP2350PWMState *s, int i)
         }
     }
 
-    if (!s->dreq[i]) {
+    if (!s->dreq[i] || !sl->dreq_wanted) {
         sl->dreq_pending = 0;
     }
     while (sl->dreq_pending) {
@@ -513,7 +514,7 @@ static void pwm_schedule(RP2350PWMState *s, int i)
                      0, seg, &wrap);
         if (irq_wrap) {
             due = MIN(due, pwm_ns_at(s, pwm_tick_cycle(sl, wrap)));
-        } else if (s->dreq[i]) {
+        } else if (s->dreq[i] && sl->dreq_wanted) {
             k = wrap;
         }
         for (ch = 0; ch < (mode == DIVMODE_DIV ? 2 : 1); ch++) {
@@ -658,6 +659,27 @@ static void pwm_b_in(void *opaque, int n, int level)
     pwm_sync(s, n, cycle);
     sl->b_in = b;
     sl->b_change = cycle;
+    pwm_update(s, n);
+}
+
+/*
+ * [spec:nuos:req:emu.pwm]
+ * The DMA starts or stops counting slice n's DREQ: its wraps are timed for
+ * the DREQ only while it does, and wraps before, which it would not have
+ * counted, are not signalled.
+ */
+static void pwm_dreq_wanted(void *opaque, int n, int level)
+{
+    RP2350PWMState *s = opaque;
+    RP2350PWMSlice *sl = &s->slice[n];
+
+    if (sl->dreq_wanted == (level != 0)) {
+        return;
+    }
+    pwm_catch_up(s, n, line_time());
+    pwm_sync(s, n, pwm_now_cycle(s));
+    sl->dreq_pending = 0;
+    sl->dreq_wanted = level != 0;
     pwm_update(s, n);
 }
 
@@ -945,6 +967,8 @@ static void rp2350_pwm_init(Object *obj)
                              RP2350_PWM_SLICES);
     qdev_init_gpio_in_named(dev, pwm_b_in, RP2350_PWM_B_IN,
                             RP2350_PWM_SLICES);
+    qdev_init_gpio_in_named(dev, pwm_dreq_wanted, RP2350_PWM_DREQ_WANTED,
+                            RP2350_PWM_SLICES);
     s->clk = qdev_init_clock_in(dev, "clk", rp2350_pwm_clk_update, s,
                                 ClockPreUpdate | ClockUpdate);
     for (i = 0; i < RP2350_PWM_SLICES; i++) {
@@ -966,8 +990,8 @@ static void rp2350_pwm_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_rp2350_pwm_slice = {
     .name = TYPE_RP2350_PWM "-slice",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(timer, RP2350PWMSlice),
         VMSTATE_UINT32(csr, RP2350PWMSlice),
@@ -984,6 +1008,7 @@ static const VMStateDescription vmstate_rp2350_pwm_slice = {
         VMSTATE_BOOL(b_seen, RP2350PWMSlice),
         VMSTATE_UINT64(b_change, RP2350PWMSlice),
         VMSTATE_UINT32(dreq_pending, RP2350PWMSlice),
+        VMSTATE_BOOL(dreq_wanted, RP2350PWMSlice),
         VMSTATE_UINT8_ARRAY(out_level, RP2350PWMSlice, 2),
         VMSTATE_UINT8_ARRAY(oe_level, RP2350PWMSlice, 2),
         VMSTATE_END_OF_LIST()
@@ -1003,8 +1028,8 @@ static int rp2350_pwm_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_rp2350_pwm = {
     .name = TYPE_RP2350_PWM,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .post_load = rp2350_pwm_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, RP2350PWMState),
