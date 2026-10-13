@@ -171,10 +171,14 @@ void esp32_uart_update_irq(ESP32UARTState *s)
 }
 
 
-void esp32_uart_set_rx_timeout(ESP32UARTState *s)
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * The receive timeout runs from @from: the stop bit of the frame just
+ * received, whenever the host decoded it, or the configuration's change.
+ */
+static void uart_set_rx_timeout_from(ESP32UARTState *s, int64_t from)
 {
     if (s->rx_tout_ena && s->baud_rate) {
-        int64_t now = esp32_line_time();
         uint64_t thres = s->rx_tout_thres;
         /*
          * The timeout counter runs from APB_CLK: with REF_TICK as the baud
@@ -184,13 +188,18 @@ void esp32_uart_set_rx_timeout(ESP32UARTState *s)
             thres = muldiv64(thres, clock_get_hz(s->ref_tick_clk),
                              MAX(clock_get_hz(s->apb_clk), 1));
         }
-        int64_t rx_timeout_ns = now +
+        int64_t rx_timeout_ns = from +
             thres * NANOSECONDS_PER_SECOND / s->baud_rate;
         timer_mod_ns(&s->rx_timeout_timer, rx_timeout_ns);
     } else {
         timer_del(&s->rx_timeout_timer);
         s->rxfifo_tout = false;
     }
+}
+
+void esp32_uart_set_rx_timeout(ESP32UARTState *s)
+{
+    uart_set_rx_timeout_from(s, esp32_line_time());
 }
 
 /* The level the receiver sees: RXD, or TXD looped back inside the UART. */
@@ -489,7 +498,7 @@ static void uart_rx_deliver(void *opaque, unsigned data, unsigned flags)
     /* A UHCI attached to this UART takes the data from the RX FIFO. */
     notifier_list_notify(&s->dma_notifiers, s);
 
-    esp32_uart_set_rx_timeout(s);
+    uart_set_rx_timeout_from(s, s->rx.frame_end_ns);
     uart_update_lines(s, true);
     esp32_uart_update_irq(s);
 }
@@ -518,6 +527,12 @@ static void uart_catch_up(ESP32UARTState *s)
         s->rxfifo_tout = true;
         esp32_uart_update_irq(s);
     }
+}
+
+/* [spec:nuos:req:emu.esp32.uhci] */
+void esp32_uart_catch_up(ESP32UARTState *s)
+{
+    uart_catch_up(s);
 }
 
 static uint64_t uart_reg_read(ESP32UARTState *s, hwaddr addr)
