@@ -147,6 +147,13 @@ struct SDCardClass {
      * Return: number of bytes actually read. >= 1
      */
     size_t (*read_data)(SDState *sd, void* buf, size_t len);
+    /*
+     * A block of a write has reached the card failing its CRC check, the
+     * bits the card took off its DAT lines not those the host sent: the
+     * card discards it, and in a multiple block write the blocks after it
+     * until stopped.
+     */
+    void (*write_crc_error)(SDState *sd);
     bool (*receive_ready)(SDState *sd);
     bool (*data_ready)(SDState *sd);
     void (*set_voltage)(SDState *sd, uint16_t millivolts);
@@ -292,6 +299,17 @@ void sdbus_write_data(SDBus *sdbus, const void *buf, size_t length);
  * Read multiple bytes of data on the data lines of a SD bus.
  */
 void sdbus_read_data(SDBus *sdbus, void *buf, size_t length);
+/**
+ * sdbus_write_crc_error: A write block fails the card's CRC check
+ * @sdbus: bus
+ *
+ * A block of a write has crossed the bus, but the card took bits off its
+ * DAT lines other than those the host sent: it discards the block (and,
+ * in a multiple block write, the blocks after it until stopped), as a
+ * card does whose CRC check fails. Instead of sdbus_write_data() for the
+ * block's bytes.
+ */
+void sdbus_write_crc_error(SDBus *sdbus);
 bool sdbus_receive_ready(SDBus *sd);
 bool sdbus_data_ready(SDBus *sd);
 bool sdbus_get_inserted(SDBus *sd);

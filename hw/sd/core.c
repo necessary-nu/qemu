@@ -234,6 +234,19 @@ void sdbus_read_data(SDBus *sdbus, void *buf, size_t length)
     sdbus_read_dump(sdbus_name(sdbus), buf, length);
 }
 
+void sdbus_write_crc_error(SDBus *sdbus)
+{
+    SDState *card = get_card(sdbus);
+
+    if (card) {
+        SDCardClass *sc = SDMMC_COMMON_GET_CLASS(card);
+
+        if (sc->write_crc_error) {
+            sc->write_crc_error(card);
+        }
+    }
+}
+
 bool sdbus_receive_ready(SDBus *sdbus)
 {
     SDState *card = get_card(sdbus);

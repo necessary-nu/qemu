@@ -281,6 +281,11 @@ struct SDState {
     QEMUTimer *vsw_timer;
     /* SDCLK reaches the card. */
     bool sdclk;
+    /*
+     * A block of the multiple block write under way failed its CRC check:
+     * the card ignores the write's further blocks until it is stopped.
+     */
+    bool crc_discard;
     /* The functions a CMD6 switch selects, taken at its status data's end */
     uint8_t function_group_new[6];
     bool function_switch_pending;
@@ -1221,6 +1226,7 @@ static void sd_reset(DeviceState *dev)
     sect = sd_addr_to_wpnum(size) + 1;
 
     sd->state = sd_idle_state;
+    sd->crc_discard = false;
 
     /* card registers */
     sd->rca = sd_is_emmc(sd) ? 0x0001 : 0x0000;
@@ -1415,6 +1421,24 @@ static const VMStateDescription sd_timing_vmstate = {
     },
 };
 
+static bool sd_crc_vmstate_needed(void *opaque)
+{
+    SDState *sd = opaque;
+
+    return sd->crc_discard;
+}
+
+static const VMStateDescription sd_crc_vmstate = {
+    .name = "sd-card/crc-discard",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sd_crc_vmstate_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(crc_discard, SDState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static int sd_vmstate_pre_load(void *opaque)
 {
     SDState *sd = opaque;
@@ -1466,6 +1490,7 @@ static const VMStateDescription sd_vmstate = {
         &emmc_extcsd_vmstate,
         &emmc_rpmb_vmstate,
         &sd_timing_vmstate,
+        &sd_crc_vmstate,
         NULL
     },
 };
@@ -2845,6 +2870,7 @@ static sd_rsp_type_t sd_cmd_to_receivingdata(SDState *sd, SDRequest req,
         return sd_invalid_state_for_cmd(sd, req);
     }
     sd->state = sd_receivingdata_state;
+    sd->crc_discard = false;
     sd->data_start = start;
     sd->data_offset = 0;
     /* sd->data[] used as receive buffer */
@@ -3158,6 +3184,7 @@ static sd_rsp_type_t sd_cmd_STOP_TRANSMISSION(SDState *sd, SDRequest req)
         sd->state = sd_transfer_state;
         return sd_r1b;
     case sd_receivingdata_state:
+        sd->crc_discard = false;
         if (sd->tm.on) {
             return sd_timing_stop_write(sd);
         }
@@ -3695,6 +3722,7 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
             }
 
             sd->state = sd_receivingdata_state;
+            sd->crc_discard = false;
             sd->data_start = addr;
             sd->data_offset = 0;
             sd->blk_written = 0;
@@ -4002,6 +4030,9 @@ static size_t sd_write_data(SDState *sd, const void *buf, size_t length)
 
     if (sd->card_status & (ADDRESS_ERROR | WP_VIOLATION))
         return length;
+    if (sd->crc_discard) {
+        return length;
+    }
 
     sdcard_write_data_dump(sd->proto->name,
                            sd->last_cmd_name,
@@ -4263,7 +4294,34 @@ static bool sd_receive_ready(SDState *sd)
             return false;
         }
     }
-    return sd->state == sd_receivingdata_state;
+    return sd->state == sd_receivingdata_state && !sd->crc_discard;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * A block of a write has reached the card with a CRC that does not match
+ * what the card took off its DAT lines (the SD Physical Layer
+ * Specification, 4.3.4): the card discards the block, answers a negative
+ * CRC status, and ignores all further blocks of a multiple block write
+ * until a stop command; a single block write, its one block discarded,
+ * leaves the card in the transfer state, as do the other writes of one
+ * block (CMD26, CMD27, CMD42, CMD56).
+ */
+static void sd_write_crc_error(SDState *sd)
+{
+    if (sd->tm.unpowered || sd->state != sd_receivingdata_state ||
+        sd->crc_discard) {
+        return;
+    }
+    if (sd->tm.on) {
+        sd_timing_sync(sd);
+    }
+    sd->data_offset = 0;
+    if (sd->current_cmd == 25) {
+        sd->crc_discard = true;
+    } else {
+        sd->state = sd_transfer_state;
+    }
 }
 
 static bool sd_data_ready(SDState *sd)
@@ -4653,6 +4711,7 @@ static void sdmmc_common_class_init(ObjectClass *klass, const void *data)
     sc->write_data = sd_write_data;
     sc->read_data = sd_read_data;
     sc->receive_ready = sd_receive_ready;
+    sc->write_crc_error = sd_write_crc_error;
     sc->data_ready = sd_data_ready;
     sc->get_inserted = sd_get_inserted;
     sc->get_readonly = sd_get_readonly;
