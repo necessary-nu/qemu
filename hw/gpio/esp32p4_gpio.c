@@ -959,9 +959,14 @@ static bool pull_level(uint64_t up, uint64_t down, bool *undefined)
  */
 static void log_contention(ESP32P4GpioState *s, unsigned n)
 {
-    g_autoptr(GString) who = g_string_new(NULL);
+    g_autoptr(GString) who = NULL;
     bool val;
 
+    /* A bus fighting a board's chip changes at its bit rate. */
+    if (!qemu_loglevel_mask(LOG_GUEST_ERROR)) {
+        return;
+    }
+    who = g_string_new(NULL);
     for (unsigned d = 0; d < s->ext_drivers; d++) {
         if (bit64(s->ext_driven[d], n)) {
             g_string_append_printf(who, "%s%s %s", who->len ? ", " : "",
