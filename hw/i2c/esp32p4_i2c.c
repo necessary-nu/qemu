@@ -481,9 +481,13 @@ static int64_t esp32p4_i2c_tp_ns(ESP32P4I2CState *s, ESP32P4I2CTp tp)
     return esp32p4_i2c_tp_ns_at(&s->tp_edges, tp);
 }
 
+/*
+ * The present, or the time of the event or line change being taken,
+ * which a late timer or a catch-up runs past (see esp32p4_i2c_catch_up()).
+ */
 static int64_t esp32p4_i2c_now(void)
 {
-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return esp32_line_time();
 }
 
 /* Interrupts */
@@ -1940,13 +1944,22 @@ static void esp32p4_i2c_in(ESP32P4I2CState *s, int n, int level)
     timer_mod(&s->flt_timer[n], l->pend_ns);
 }
 
+static void esp32p4_i2c_catch_up(ESP32P4I2CState *s, int64_t now);
+
+/*
+ * An edge from the bus: the events due before it first, so that it
+ * reaches the controller as it was then. Those due at the edge's own
+ * time are left to their turn, as their timers would have them.
+ */
 static void esp32p4_i2c_scl_in(void *opaque, int n, int level)
 {
+    esp32p4_i2c_catch_up(opaque, esp32_line_time() - 1);
     esp32p4_i2c_in(opaque, LINE_SCL, level);
 }
 
 static void esp32p4_i2c_sda_in(void *opaque, int n, int level)
 {
+    esp32p4_i2c_catch_up(opaque, esp32_line_time() - 1);
     esp32p4_i2c_in(opaque, LINE_SDA, level);
 }
 
@@ -2067,6 +2080,73 @@ static void esp32p4_i2c_to_timer(void *opaque)
     esp32p4_i2c_to_update(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.i2c]
+ * Take the controller's timed events due by @now, in time order, each at
+ * its own time: the master's steps, the slave's line changes, the
+ * filters passing an edge and the timeouts. Their QEMU timers run when
+ * the host gets to them, which without icount can be after a register
+ * access or an edge from another device at a later time: the access
+ * shows, and the edge reaches, the controller as it is at that time.
+ * Before each event the line sources come up to its time, so that what
+ * another device (a slave's ACK, a peer stretching SCL) put on the bus
+ * before it is on the lines when it runs; the lines the event changes
+ * reach this controller again at the event's time, while its later
+ * events wait their turn.
+ */
+static void esp32p4_i2c_sync_sources(void *opaque)
+{
+    esp32_line_sync();
+}
+
+static void esp32p4_i2c_catch_up(ESP32P4I2CState *s, int64_t now)
+{
+    struct {
+        QEMUTimer *timer;
+        QEMUTimerCB *run;
+    } events[] = {
+        { &s->fsm_timer, esp32p4_i2c_fsm_timer },
+        { &s->slv_timer, esp32p4_i2c_slv_timer },
+        { &s->to_timer, esp32p4_i2c_to_timer },
+        { &s->flt_timer[LINE_SCL], esp32p4_i2c_flt_scl },
+        { &s->flt_timer[LINE_SDA], esp32p4_i2c_flt_sda },
+    };
+
+    if (s->catching_up) {
+        return;
+    }
+    s->catching_up = true;
+    for (;;) {
+        int next = -1;
+        int64_t due = now;
+
+        for (int i = 0; i < ARRAY_SIZE(events); i++) {
+            int64_t t = timer_expire_time_ns(events[i].timer);
+
+            if (timer_pending(events[i].timer) && t <= due &&
+                (next < 0 || t < due)) {
+                next = i;
+                due = t;
+            }
+        }
+        if (next < 0) {
+            break;
+        }
+        timer_del(events[next].timer);
+        esp32_line_run_at(due, esp32p4_i2c_sync_sources, NULL);
+        esp32_line_run_at(due, events[next].run, s);
+    }
+    s->catching_up = false;
+}
+
+/* [spec:nuos:req:emu.esp32p4.i2c] */
+static void esp32p4_i2c_line_sync(Notifier *n, void *data)
+{
+    ESP32P4I2CState *s = container_of(n, ESP32P4I2CState, line_source);
+
+    esp32p4_i2c_catch_up(s, esp32_line_time());
+}
+
 /* Configuration */
 
 /*
@@ -2138,6 +2218,7 @@ static void esp32p4_i2c_clock_update(void *opaque, ClockEvent event)
 {
     ESP32P4I2CState *s = opaque;
 
+    esp32p4_i2c_catch_up(s, esp32_line_time());
     esp32p4_i2c_fsm_rescale(s);
     if (esp32p4_i2c_runs(s)) {
         if (s->upgate_pending) {
@@ -2356,6 +2437,7 @@ static uint64_t esp32p4_i2c_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4I2CState *s = opaque;
 
+    esp32p4_i2c_catch_up(s, esp32_line_time());
     return extract32(esp32p4_i2c_read32(s, addr & ~3), (addr & 3) * 8,
                      size * 8);
 }
@@ -2366,6 +2448,7 @@ static void esp32p4_i2c_write(void *opaque, hwaddr addr, uint64_t value,
     ESP32P4I2CState *s = opaque;
     unsigned shift = (addr & 3) * 8;
 
+    esp32p4_i2c_catch_up(s, esp32_line_time());
     esp32p4_i2c_write32(s, addr & ~3, (uint32_t)value << shift,
                         MAKE_64BIT_MASK(shift, size * 8));
 }
@@ -2487,6 +2570,7 @@ static void esp32p4_i2c_init(Object *obj)
     /* An input the matrix does not route reads high (table 10.12-1). */
     s->line[LINE_SCL].raw = s->line[LINE_SCL].filt = true;
     s->line[LINE_SDA].raw = s->line[LINE_SDA].filt = true;
+    s->line_source.notify = esp32p4_i2c_line_sync;
 }
 
 static void esp32p4_i2c_realize(DeviceState *dev, Error **errp)
@@ -2494,6 +2578,7 @@ static void esp32p4_i2c_realize(DeviceState *dev, Error **errp)
     ESP32P4I2CState *s = ESP32P4_I2C(dev);
 
     s->bus = i2c_init_bus(dev, s->bus_name ? s->bus_name : "i2c");
+    esp32_line_add_source(&s->line_source);
 }
 
 static const VMStateDescription vmstate_esp32p4_i2c_line = {
