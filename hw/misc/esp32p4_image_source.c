@@ -1005,8 +1005,14 @@ static void run_until(ESP32P4ImageSource *s, int64_t now)
     s->in_run = false;
 }
 
-/* How far the host may fall behind the stream before the stream slips. */
-#define IMAGE_MAX_LAG_NS    (10 * SCALE_MS)
+/*
+ * How far the host may fall behind the stream before the stream slips: a
+ * second, far longer than the host's own pauses (a busy host can hold
+ * QEMU's main loop up for tens of milliseconds), which a sensor never
+ * drops frames for; only a stream the host cannot keep up with at all
+ * falls that far behind.
+ */
+#define IMAGE_MAX_LAG_NS    NANOSECONDS_PER_SECOND
 
 static void update_stream(ESP32P4ImageSource *s);
 
