@@ -52,6 +52,7 @@
 struct DisasContext {
     DisasContextBase base;
     const XtensaConfig *config;
+    CPUXtensaState *env;
     uint32_t pc;
     int cring;
     int ring;
@@ -857,6 +858,9 @@ static void disas_xtensa_insn(CPUXtensaState *env, DisasContext *dc)
     }
 
     dc->base.pc_next = dc->pc + len;
+    if (env->ext_hooks && env->ext_hooks->fetch) {
+        env->ext_hooks->fetch(env->ext_opaque, env, dc->pc, len, true);
+    }
     for (i = 1; i < len; ++i) {
         b[i] = translator_ldub(env, &dc->base, dc->pc + i);
     }
@@ -1124,6 +1128,7 @@ static void xtensa_tr_init_disas_context(DisasContextBase *dcbase,
     uint32_t tb_flags = dc->base.tb->flags;
 
     dc->config = cpu_env(cpu)->config;
+    dc->env = cpu_env(cpu);
     dc->pc = dc->base.pc_first;
     dc->ring = tb_flags & XTENSA_TBFLAG_RING_MASK;
     dc->cring = (tb_flags & XTENSA_TBFLAG_EXCM) ? 0 : dc->ring;
@@ -1704,7 +1709,13 @@ static void translate_l32r(DisasContext *dc, const OpcodeArg arg[],
         tmp = tcg_temp_new();
         tcg_gen_addi_i32(tmp, cpu_SR[LITBASE], arg[1].raw_imm - 1);
     } else {
+        CPUXtensaState *env = dc->env;
+
         tmp = tcg_constant_i32(arg[1].imm);
+        if (env->ext_hooks && env->ext_hooks->fetch) {
+            env->ext_hooks->fetch(env->ext_opaque, env, arg[1].imm, 4,
+                                  false);
+        }
     }
     tcg_gen_qemu_ld_i32(arg[0].out, tmp, dc->cring, MO_TEUL);
 }

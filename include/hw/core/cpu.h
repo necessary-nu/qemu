@@ -472,6 +472,9 @@ struct qemu_work_item;
  *   periods of its clock its instructions have taken, from an edge of the
  *   clock (icount_window_align()).
  * @icount_realign: Its clock's period changed since it was put on an edge.
+ * @icount_stall: Under icount, the instructions' periods the CPU is still to
+ *   spend stalled, which its next runs' budgets take before it executes
+ *   (icount_stall()).
  * @cpu_ases: Pointer to array of CPUAddressSpaces (which define the
  *            AddressSpaces this CPU has)
  * @as: Pointer to the first AddressSpace, for the convenience of targets which
@@ -549,6 +552,7 @@ struct CPUState {
     bool icount_window_idle;
     bool icount_realign;
     int64_t icount_own;
+    int64_t icount_stall;
     uint64_t random_seed;
     sigjmp_buf jmp_env;
 

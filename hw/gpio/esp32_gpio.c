@@ -314,6 +314,24 @@ static const IomuxFunc iomux_funcs[ESP32_GPIO_PIN_COUNT]
 static const IomuxFunc iomux_none = F_NONE;
 
 /*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * GPIO_SPI_SWAP (GPIO_SIGMADELTA_MISC_REG bit 31, which the TRM leaves
+ * undescribed) swaps the signals of IO_MUX function 1 between the flash's
+ * pads and HSPI's: SPICLK, SPIQ, SPID, SPIHD, SPIWP and SPICS0 go to
+ * GPIO14, 12, 13, 4, 2 and 15, and HSPICLK, HSPIQ, HSPID, HSPIHD, HSPIWP
+ * and HSPICS0 to GPIO6 to GPIO11. That is how the ROM uses it: its pad
+ * setup for a flash on HSPI's pads (spi_flash_attach() with ishspi set,
+ * at 0x40061f84 in the v3 ROM) puts GPIO14, 12, 13 and 15 on function 1
+ * and sets the bit; for the flash's own pads it clears it.
+ */
+static const IomuxFunc iomux_spi_swapped[ESP32_GPIO_PIN_COUNT] = {
+    [6] = F_IO(8), [7] = F_IO(9), [8] = F_IO(10),
+    [9] = F_IO(12), [10] = F_IO(13), [11] = F_IO(11),
+    [14] = F_IO(0), [12] = F_IO(1), [13] = F_IO(2),
+    [4] = F_IO(3), [2] = F_IO(4), [15] = F_IO(5),
+};
+
+/*
  * The "Default Value If Unassigned" column of TRM table 6.9-1: the level an
  * input signal sees when it bypasses the GPIO matrix and no pad's IO_MUX
  * function carries it.
@@ -389,6 +407,10 @@ static const IomuxFunc *pad_func(Esp32GpioState *s, unsigned n,
     *func = f;
     if (f >= ESP32_IOMUX_FUNC_COUNT) {
         return &iomux_none;
+    }
+    if (f == 1 && (s->sdm_misc & GPIO_SPI_SWAP) &&
+        iomux_spi_swapped[n].kind == IOMUX_SIG) {
+        return &iomux_spi_swapped[n];
     }
     return &iomux_funcs[n][f];
 }
@@ -1203,6 +1225,7 @@ void esp32_gpio_sig_path(Esp32GpioState *s, unsigned n, int out_sig,
         src = sel < ESP32_GPIO_PIN_COUNT ? sel : -1;
         p->in_inv = FIELD_EX32(s->func_in_sel[in_sig],
                                GPIO_FUNC0_IN_SEL_CFG, IN_INV_SEL);
+        p->in_matrix = true;
     } else {
         for (unsigned i = 0; i < ESP32_GPIO_PIN_COUNT && src < 0; i++) {
             const IomuxFunc *fn = pad_func(s, i, &f);
@@ -1215,6 +1238,7 @@ void esp32_gpio_sig_path(Esp32GpioState *s, unsigned n, int out_sig,
     }
     if (src != (int)n) {
         p->in_inv = false;
+        p->in_matrix = false;
         p->in_level = s->sig_in[in_sig];
         return;
     }
@@ -1287,7 +1311,8 @@ static uint64_t gpio_reg_read(Esp32GpioState *s, hwaddr addr)
     case A_GPIO_STATUS1_W1TC:
         return 0;
     case A_GPIO_STRAP:
-        return s->strap_mode & 0xffff;
+        /* Bit 5 is MTDI's, latched at reset (the SoC's) */
+        return (s->strap_mode & 0xffff) | (s->strap_mtdi ? BIT(5) : 0);
     case A_GPIO_IN:
         esp32_gpio_sample(s);
         return (uint32_t)s->in_level;
@@ -1490,11 +1515,8 @@ static void gpio_reg_write(Esp32GpioState *s, hwaddr addr, uint64_t value)
         s->sdm_cg = v & GPIO_SD_CLK_EN;
         break;
     case A_GPIO_SIGMADELTA_MISC:
+        route = (s->sdm_misc ^ v) & GPIO_SPI_SWAP;
         s->sdm_misc = v & GPIO_SPI_SWAP;
-        if (v & GPIO_SPI_SWAP) {
-            qemu_log_mask(LOG_UNIMP,
-                          "esp32_gpio: GPIO_SPI_SWAP not implemented\n");
-        }
         break;
     case A_GPIO_SIGMADELTA_VERSION:
         s->sdm_version = v & GPIO_SD_DATE_MASK;
@@ -2010,7 +2032,7 @@ static const Property esp32_gpio_properties[] = {
 
 static const VMStateDescription vmstate_esp32_gpio = {
     .name = TYPE_ESP32_GPIO,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(apb_clk, Esp32GpioState),
@@ -2066,6 +2088,7 @@ static const VMStateDescription vmstate_esp32_gpio = {
         VMSTATE_UINT32_ARRAY_V(board_pull_down, Esp32GpioState,
                                ESP32_GPIO_PIN_COUNT, 3),
         VMSTATE_UINT64_V(undefined, Esp32GpioState, 3),
+        VMSTATE_BOOL_V(strap_mtdi, Esp32GpioState, 4),
         VMSTATE_END_OF_LIST()
     }
 };

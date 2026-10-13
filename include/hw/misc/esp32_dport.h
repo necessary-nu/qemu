@@ -20,6 +20,17 @@ typedef struct Esp32CacheState Esp32CacheState;
 #define ESP32_CACHE_MMU_ENTRY_CHANGED   0x200     /* not a hardware flag; used here to check if the page data needs to be updated */
 #define ESP32_CACHE_MAX_PHYS_PAGES      0x100
 
+/* A cache block, which a miss fills (TRM 3.3.4) */
+#define ESP32_CACHE_BLOCK_SIZE          32
+#define ESP32_CACHE_REGION_BLOCKS       (ESP32_CACHE_REGION_SIZE / \
+                                         ESP32_CACHE_BLOCK_SIZE)
+/* The page a CPU's TLB maps, fast once all its blocks are held */
+#define ESP32_CACHE_TLB_PAGE            0x1000
+#define ESP32_CACHE_TLB_PAGES           (ESP32_CACHE_REGION_SIZE / \
+                                         ESP32_CACHE_TLB_PAGE)
+#define ESP32_CACHE_TLB_PAGE_BLOCKS     (ESP32_CACHE_TLB_PAGE / \
+                                         ESP32_CACHE_BLOCK_SIZE)
+
 typedef enum Esp32CacheRegionType {
     ESP32_DCACHE_FLASH,
     ESP32_ICACHE_FLASH,
@@ -36,6 +47,18 @@ typedef struct Esp32CacheRegionState {
     bool illegal_access_trap_en;
     bool illegal_access_status;
     uint16_t mmu_table[ESP32_CACHE_PAGES_PER_REGION];
+    /*
+     * The flash regions' blocks: held (valid), and of those, held without
+     * their first fetch seen (spec: filled with the rest of their TLB page
+     * as it went to the fast path); a TLB page's hits on the slow path
+     * since it was last emptied; and the slow path (miss_mem), which the
+     * CPU's TLB maps a page's data reads to while not all its blocks are
+     * held.
+     */
+    DECLARE_BITMAP(valid, ESP32_CACHE_REGION_BLOCKS);
+    DECLARE_BITMAP(spec, ESP32_CACHE_REGION_BLOCKS);
+    uint16_t hits[ESP32_CACHE_TLB_PAGES];
+    MemoryRegion miss_mem;
 } Esp32CacheRegionState;
 
 typedef struct Esp32CacheState {
@@ -83,8 +106,10 @@ typedef struct Esp32CacheState {
 #define ESP32_FLASH_PAGES_BASE      0x0e000000
 #define ESP32_FLASH_PAGES           256
 #define ESP32_FLASH_PAGES_SIZE      (ESP32_FLASH_PAGES * ESP32_CACHE_PAGE_SIZE)
-#define ESP32_MPU_HIDDEN_END        (ESP32_FLASH_PAGES_BASE + \
-                                     ESP32_FLASH_PAGES_SIZE)
+/* The slow paths of a CPU's DROM0 and IRAM0 regions, in turn */
+#define ESP32_CACHE_MISS_BASE       0x0f000000
+#define ESP32_MPU_HIDDEN_END        (ESP32_CACHE_MISS_BASE + \
+                                     2 * ESP32_CACHE_REGION_SIZE)
 
 /* A CPU access as the TLB will map it; see esp32_dport_mpu_filter() */
 typedef struct Esp32MpuMapping {
@@ -95,9 +120,16 @@ typedef struct Esp32MpuMapping {
 
 typedef unsigned (*Esp32DportGetPid)(void *opaque, int cpu);
 
-/* A cache fill's read of the flash, through SPI0 and the flash's pads */
-typedef void (*Esp32DportFlashRead)(void *opaque, uint32_t addr, uint8_t *buf,
-                                    uint32_t len);
+/*
+ * A cache fill's read of the 32-byte block at flash address addr, through
+ * SPI0 and the flash's pads; returns the time it takes, in ns.
+ */
+typedef int64_t (*Esp32DportFlashRead)(void *opaque, uint32_t addr,
+                                       uint8_t *buf);
+/* The time a fill takes, as SPI0 is set up now, in ns */
+typedef int64_t (*Esp32DportFillTime)(void *opaque);
+/* Stall CPU cpu, on its own thread, for ns */
+typedef void (*Esp32DportStall)(void *opaque, int cpu, int64_t ns);
 
 typedef struct Esp32DportState {
     SysBusDevice parent_obj;
@@ -110,7 +142,10 @@ typedef struct Esp32DportState {
     BlockBackend *flash_blk;
     /* How a cache fill reads flash_blk; NULL, the array as it is */
     Esp32DportFlashRead flash_read;
+    Esp32DportFillTime fill_time;
     void *flash_read_opaque;
+    Esp32DportStall stall;
+    void *stall_opaque;
     qemu_irq appcpu_stall_req;
     qemu_irq appcpu_reset_req;
     qemu_irq clk_update_req;
@@ -173,6 +208,22 @@ void esp32_dport_mpu_cache_flushed(Esp32DportState *s);
 void esp32_dport_update_cache_irq(Esp32DportState *s);
 
 void esp32_dport_clear_ill_trap_state(Esp32DportState* s);
+
+/*
+ * The per-block cache: a TLB fill for PIDs 0 and 1 in a CPU's DROM0 or
+ * IRAM0 region (esp32_dport_mpu_filter() hands it on), and the code a
+ * CPU's translator fetches from them.
+ */
+void esp32_dport_cache_filter(Esp32DportState *s, int cpu, uint32_t vaddr,
+                              MMUAccessType access_type, Esp32MpuMapping *map);
+void esp32_dport_cache_fetch(Esp32DportState *s, int cpu, uint32_t vaddr,
+                             unsigned len);
+/* What SPI0 reads of the flash may have changed: see esp32_dport.c */
+void esp32_dport_cache_refresh(Esp32DportState *s);
+
+/* A 64 KB flash page's 32-byte blocks through SPI0, as a fill reads them */
+void esp32_dport_flash_read_page(Esp32DportState *s, uint32_t phys,
+                                 uint8_t *buf);
 
 #define ESP32_DPORT_APPCPU_STALL_GPIO   "appcpu-stall"
 #define ESP32_DPORT_APPCPU_RESET_GPIO   "appcpu-reset"

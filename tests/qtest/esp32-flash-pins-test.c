@@ -6,7 +6,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * The module's flash, a GD25Q32 here, is on GPIO6 to GPIO11 (CLK, DO,
+ * The module's flash, a GD25Q32C here, is on GPIO6 to GPIO11 (CLK, DO,
  * DI, HOLD#, WP#, CS#). From reset the pads are on the SDIO slave's
  * function 0 and SPI1 does not reach the flash; set up as the ROM sets
  * them up (IO_MUX function 1) or as ESP-IDF's bootloader does (the GPIO
@@ -17,17 +17,19 @@
  * input not routed, reads 0s (the "default value if unassigned" of
  * SPIQ_in); in DIO mode a DO that does not carry SPI1's address bits
  * gives the flash another address; HOLD# held low pauses the flash; WP#
- * held low protects its status register.
+ * held low protects its status register. SPI1 reads in the ROM's modes:
+ * 03h, or BBh with a 24-bit address and four dummy clocks, which give the
+ * flash its mode bits off the released lines (esp32-spi-flash.h).
  */
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "esp32-flash-pins.h"
+#include "esp32-spi-flash.h"
 
 #define SPI1                    0x3ff42000
 #define SPI_CMD                 (SPI1 + 0x00)
 #define SPI_ADDR                (SPI1 + 0x04)
-#define SPI_CTRL                (SPI1 + 0x08)
 #define SPI_RD_STATUS           (SPI1 + 0x10)
 #define SPI_USER                (SPI1 + 0x1c)
 #define SPI_USER2               (SPI1 + 0x24)
@@ -38,7 +40,6 @@
 #define CMD_RDID                (1u << 28)
 #define CMD_RDSR                (1u << 27)
 #define CMD_WRSR                (1u << 26)
-#define CTRL_FREAD_DIO          (1u << 23)
 
 #define GPIO_OUT_W1TS           (FP_GPIO + 0x08)
 #define GPIO_OUT_W1TC           (FP_GPIO + 0x0c)
@@ -79,8 +80,37 @@ static QTestState *start(void)
 
 static uint32_t spi1(QTestState *qts, uint32_t cmd)
 {
-    qtest_writel(qts, SPI_CMD, cmd);
+    sf_cmd(qts, cmd);
     return qtest_readl(qts, SPI_W0);
+}
+
+/* SPI1 in the ROM's DIO mode: BBh, 24 address bits, four dummy clocks */
+static void dio(QTestState *qts)
+{
+    sf_read_mode(qts, SF_DIO, 0);
+    qtest_writel(qts, SPI_USER, SF_USER_COMMAND | SF_USER_ADDR |
+                 SF_USER_DUMMY | SF_USER_MISO);
+    qtest_writel(qts, SF_SPI1 + SF_USER1, SF_USER1_VAL(24, 4));
+}
+
+/*
+ * The flash's pins as the ROM sets them up, SPI1 in its 03h mode at its
+ * first clock, APB_CLK / 4, where a matrix input's delay is under a clock
+ * and needs no dummy clocks.
+ */
+static void pins_rom(QTestState *qts)
+{
+    flash_pins_rom(qts);
+    qtest_writel(qts, SF_SPI1 + SF_CLOCK, 0x3043);
+    sf_read_mode(qts, SF_SLOW, 0);
+}
+
+/* As ESP-IDF's bootloader routes them, SPI1 likewise */
+static void pins_idf(QTestState *qts)
+{
+    flash_pins_idf(qts);
+    qtest_writel(qts, SF_SPI1 + SF_CLOCK, 0x3043);
+    sf_read_mode(qts, SF_SLOW, 0);
 }
 
 static uint32_t rdid(QTestState *qts)
@@ -89,12 +119,10 @@ static uint32_t rdid(QTestState *qts)
     return spi1(qts, CMD_RDID) & 0xffffff;
 }
 
-/* SPI1's READ of four bytes at a, in the read mode CTRL sets */
+/* SPI1's READ of four bytes at a, in the read mode it is set to */
 static uint32_t read_word(QTestState *qts, uint32_t a)
 {
-    qtest_writel(qts, SPI_ADDR, a | (4u << 24));
-    qtest_writel(qts, SPI_MISO_DLEN, 31);
-    return spi1(qts, CMD_READ);
+    return sf_read_word(qts, a);
 }
 
 static void func_sel(QTestState *qts, unsigned pin, unsigned func)
@@ -130,20 +158,21 @@ static void test_setups(void)
 {
     QTestState *qts = start();
 
+    sf_read_mode(qts, SF_SLOW, 0);
     g_assert_cmphex(rdid(qts), ==, 0);
     g_assert_cmphex(read_word(qts, 0x1234), ==, 0);
-    flash_pins_rom(qts);
+    pins_rom(qts);
     g_assert_cmphex(rdid(qts), ==, FLASH_ID);
     g_assert_cmphex(read_word(qts, 0x1234), ==, flash_word(0x1234));
-    qtest_writel(qts, SPI_CTRL, CTRL_FREAD_DIO);
+    dio(qts);
     g_assert_cmphex(read_word(qts, 0x5678), ==, flash_word(0x5678));
     qtest_quit(qts);
 
     qts = start();
-    flash_pins_idf(qts);
+    pins_idf(qts);
     g_assert_cmphex(rdid(qts), ==, FLASH_ID);
     g_assert_cmphex(read_word(qts, 0x1234), ==, flash_word(0x1234));
-    qtest_writel(qts, SPI_CTRL, CTRL_FREAD_DIO);
+    dio(qts);
     g_assert_cmphex(read_word(qts, 0x5678), ==, flash_word(0x5678));
     qtest_quit(qts);
 }
@@ -158,7 +187,7 @@ static void test_clk(void)
 {
     QTestState *qts = start();
 
-    flash_pins_rom(qts);
+    pins_rom(qts);
     func_sel(qts, FLASH_PIN_CLK, 2);
     g_assert_cmphex(rdid(qts), ==, 0xffffff);
     g_assert_cmphex(read_word(qts, 0x40), ==, 0xffffffff);
@@ -183,7 +212,7 @@ static void test_cs(void)
     QTestState *qts = start();
     uint32_t pad = flash_pin[FLASH_PIN_CS].pad;
 
-    flash_pins_rom(qts);
+    pins_rom(qts);
     func_sel(qts, FLASH_PIN_CS, 2);
     g_assert_cmphex(rdid(qts), ==, 0xffffff);
     drive(qts, FLASH_PIN_CS, false);
@@ -214,18 +243,18 @@ static void test_q(void)
     const uint32_t a = 0x10404, far = (a | 0xaaaaaa) % FLASH_SIZE;
     uint32_t pad = flash_pin[FLASH_PIN_Q].pad;
 
-    flash_pins_rom(qts);
+    pins_rom(qts);
     func_sel(qts, FLASH_PIN_Q, 2);
     g_assert_cmphex(rdid(qts), ==, 0);
     g_assert_cmphex(read_word(qts, a), ==, 0);
 
-    qtest_writel(qts, SPI_CTRL, CTRL_FREAD_DIO);
+    dio(qts);
     g_assert_cmphex(read_word(qts, a), ==, flash_word(far) & 0x55555555);
     qtest_writel(qts, FP_FUNC_IN(FP_SIG_SPIQ), FP_IN_SIG_IN_SEL | pad);
     g_assert_cmphex(read_word(qts, a), ==, flash_word(far));
     qtest_writel(qts, FP_FUNC_OUT(pad), FP_SIG_SPIQ);
     g_assert_cmphex(read_word(qts, a), ==, flash_word(a));
-    qtest_writel(qts, SPI_CTRL, 0);
+    sf_read_mode(qts, SF_SLOW, 0);
     g_assert_cmphex(rdid(qts), ==, FLASH_ID);
 
     qtest_writel(qts, FP_FUNC_IN(FP_SIG_SPIQ), 0);
@@ -249,7 +278,7 @@ static void test_d(void)
     QTestState *qts = start();
     uint32_t pad = flash_pin[FLASH_PIN_D].pad;
 
-    flash_pins_rom(qts);
+    pins_rom(qts);
     func_sel(qts, FLASH_PIN_D, 2);
     g_assert_cmphex(rdid(qts), ==, 0xffffff);
     g_assert_cmphex(read_word(qts, 0x100), ==, 0xffffffff);
@@ -272,7 +301,7 @@ static void test_hold(void)
 {
     QTestState *qts = start();
 
-    flash_pins_rom(qts);
+    pins_rom(qts);
     drive(qts, FLASH_PIN_HD, true);
     g_assert_cmphex(rdid(qts), ==, FLASH_ID);
     drive(qts, FLASH_PIN_HD, false);
@@ -293,26 +322,25 @@ static void test_wp(void)
 {
     QTestState *qts = start();
 
-    flash_pins_rom(qts);
+    pins_rom(qts);
     spi1(qts, CMD_WREN);
     qtest_writel(qts, SPI_RD_STATUS, SR_SRWD);
     spi1(qts, CMD_WRSR);
-    spi1(qts, CMD_RDSR);
-    g_assert_cmphex(qtest_readl(qts, SPI_RD_STATUS) & 0xff, ==, SR_SRWD);
+    sf_wait_idle(qts);
+    g_assert_cmphex(sf_rdsr(qts), ==, SR_SRWD);
 
     drive(qts, FLASH_PIN_WP, false);
     spi1(qts, CMD_WREN);
     qtest_writel(qts, SPI_RD_STATUS, 0);
     spi1(qts, CMD_WRSR);
-    spi1(qts, CMD_RDSR);
-    g_assert_cmphex(qtest_readl(qts, SPI_RD_STATUS) & 0xff, ==,
-                    SR_SRWD | SR_WEL);
+    sf_wait_idle(qts);
+    g_assert_cmphex(sf_rdsr(qts), ==, SR_SRWD | SR_WEL);
 
     release(qts, FLASH_PIN_WP);
     qtest_writel(qts, SPI_RD_STATUS, 0);
     spi1(qts, CMD_WRSR);
-    spi1(qts, CMD_RDSR);
-    g_assert_cmphex(qtest_readl(qts, SPI_RD_STATUS) & 0xff, ==, 0);
+    sf_wait_idle(qts);
+    g_assert_cmphex(sf_rdsr(qts), ==, 0);
     qtest_quit(qts);
 }
 
@@ -326,7 +354,7 @@ static void test_idle_lines(void)
     QTestState *qts = start();
     uint32_t in;
 
-    flash_pins_rom(qts);
+    pins_rom(qts);
     in = qtest_readl(qts, GPIO_IN);
     g_assert_cmphex(in & (1u << 6), ==, 0);
     g_assert_cmphex(in & (1u << 7), ==, 1u << 7);

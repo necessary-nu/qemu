@@ -4,11 +4,16 @@
  * Copyright (c) 2026 Necessary Innovations AB
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * SPI1's transactions take their SPI clocks, the DMA moving their data as
+ * they end, and the flash its erase and program times, the tests waiting
+ * for them (esp32-spi-flash.h).
  */
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "esp32-flash-pins.h"
+#include "esp32-spi-flash.h"
 
 #define DPORT_PERIP_CLK_EN      0x3ff000c0
 #define DPORT_PERIP_RST_EN      0x3ff000c4
@@ -136,11 +141,13 @@ static void flash_read_usr(QTestState *qts, uint32_t off, uint32_t n)
     qtest_writel(qts, SPI1 + SPI_ADDR, off << 8);
     qtest_writel(qts, SPI1 + SPI_MISO_DLEN, n * 8 - 1);
     qtest_writel(qts, SPI1 + SPI_CMD, CMD_USR);
+    sf_wait(qts, SF_SPI1);
 }
 
 static void flash_wren(QTestState *qts)
 {
     qtest_writel(qts, SPI1 + SPI_CMD, CMD_WREN);
+    sf_wait(qts, SF_SPI1);
 }
 
 /* [spec:nuos:req:emu.esp32.spi-dma/test] */
@@ -385,6 +392,8 @@ static void test_outlink_program_flash(void)
     flash_wren(qts);
     qtest_writel(qts, SPI1 + SPI_ADDR, FLASH_SCRATCH);
     qtest_writel(qts, SPI1 + SPI_CMD, CMD_SE);
+    sf_wait(qts, SF_SPI1);
+    sf_wait_idle(qts);
 
     /*
      * Two packets of 24 and 16 bytes: the first spans two descriptors,
@@ -408,6 +417,7 @@ static void test_outlink_program_flash(void)
     qtest_writel(qts, SPI1 + SPI_ADDR, FLASH_SCRATCH << 8);
     qtest_writel(qts, SPI1 + SPI_MOSI_DLEN, 24 * 8 - 1);
     qtest_writel(qts, SPI1 + SPI_CMD, CMD_USR);
+    sf_wait(qts, SF_SPI1);
 
     /* The first packet is out; the engine waits on the second. */
     g_assert_cmphex(dma_rd(qts, SPI1, DMA_INT_RAW), ==,
@@ -422,11 +432,14 @@ static void test_outlink_program_flash(void)
     g_assert_cmphex(qtest_readl(qts, DSCR_C), ==,
                     DW0_OWNER | DW0_EOF | DW0(16, 16));
     dma_wr(qts, SPI1, DMA_INT_CLR, 0x1ff);
+    sf_wait_idle(qts);
 
     flash_wren(qts);
+    qtest_writel(qts, SPI1 + SPI_USER, USER_COMMAND | USER_ADDR | USER_MOSI);
     qtest_writel(qts, SPI1 + SPI_ADDR, (FLASH_SCRATCH + 24) << 8);
     qtest_writel(qts, SPI1 + SPI_MOSI_DLEN, 16 * 8 - 1);
     qtest_writel(qts, SPI1 + SPI_CMD, CMD_USR);
+    sf_wait(qts, SF_SPI1);
     g_assert_cmphex(dma_rd(qts, SPI1, DMA_INT_RAW), ==,
                     INT_OUT_DONE | INT_OUT_EOF | INT_OUT_TOTAL_EOF);
     g_assert_cmphex(dma_rd(qts, SPI1, OUT_EOF_DES_ADDR), ==, DSCR_C);
@@ -434,6 +447,7 @@ static void test_outlink_program_flash(void)
     g_assert_cmphex(dma_rd(qts, SPI1, DMA_RSTATUS), ==,
                     (1u << 31) | (DSCR_C & 0xfffff));
     dma_wr(qts, SPI1, DMA_INT_CLR, 0x1ff);
+    sf_wait_idle(qts);
 
     /* Read it back through the inlink. */
     put_dscr(qts, DSCR_A, DW0_OWNER | DW0(64, 0), BUF_A, 0);

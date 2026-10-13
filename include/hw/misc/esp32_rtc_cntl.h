@@ -41,6 +41,8 @@ typedef struct Esp32RtcIoState Esp32RtcIoState;
  *   touch sensor's timer start measurements.
  * - ESP32_RTC_ULP_TIMER_GPIO: RTC_CNTL_ULP_CP_SLP_TIMER_EN, which lets the
  *   ULP timer start the ULP coprocessor.
+ * - ESP32_RTC_VDD_SDIO_GPIO: RTC_CNTL_SDIO_CONF, the flash regulator's
+ *   set-up, was written.
  *
  * Inputs, from blocks that wake the chip or interrupt through RTC_CNTL:
  * - ESP32_RTC_WAKEUP_IN (ESP32_RTC_WAKEUP_COUNT lines, indexed by the
@@ -58,6 +60,7 @@ typedef struct Esp32RtcIoState Esp32RtcIoState;
 #define ESP32_RTC_SLEEP_RESET_GPIO  "sleep-reset"
 #define ESP32_RTC_CPU_RESET_GPIO    "cpu-reset"
 #define ESP32_RTC_CPU_STALL_GPIO    "cpu-stall"
+#define ESP32_RTC_VDD_SDIO_GPIO     "vdd-sdio-update"
 #define ESP32_RTC_CLK_UPDATE_GPIO   "clk-update"
 #define ESP32_RTC_TOUCH_TIMER_GPIO  "touch-timer-en"
 #define ESP32_RTC_ULP_TIMER_GPIO    "ulp-timer-en"
@@ -250,6 +253,10 @@ REG32(RTC_CNTL_CLK_CONF, 0x70)
     FIELD(RTC_CNTL_CLK_CONF, ENB_CK8M, 6, 1)
     FIELD(RTC_CNTL_CLK_CONF, CK8M_DIV, 4, 2)
 REG32(RTC_CNTL_SDIO_CONF, 0x74)
+    FIELD(RTC_CNTL_SDIO_CONF, SDIO_PD_EN, 21, 1)
+    FIELD(RTC_CNTL_SDIO_CONF, SDIO_FORCE, 22, 1)
+    FIELD(RTC_CNTL_SDIO_CONF, SDIO_TIEH, 23, 1)
+    FIELD(RTC_CNTL_SDIO_CONF, XPD_SDIO_REG, 31, 1)
 REG32(RTC_CNTL_BIAS_CONF, 0x78)
 REG32(RTC_CNTL_VREG, 0x7c)
 REG32(RTC_CNTL_PWC, 0x80)
@@ -344,6 +351,7 @@ typedef struct Esp32RtcCntlState {
     qemu_irq cpu_reset_req[ESP32_CPU_COUNT];
     qemu_irq cpu_stall_req[ESP32_CPU_COUNT];
     qemu_irq clk_update;
+    qemu_irq vdd_sdio_update;
     qemu_irq touch_timer_en;
     qemu_irq ulp_timer_en;
 
