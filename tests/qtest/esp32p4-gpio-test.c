@@ -436,8 +436,8 @@ static void test_strap(void)
 
 /*
  * A pad's level: the chip's driver with its output enabled, an outside
- * driver over it, the pulls, open drain; and GPIO_IN only with the input
- * enabled.
+ * driver, the two agreeing or fighting, the pulls, open drain; and
+ * GPIO_IN only with the input enabled.
  */
 /* [spec:nuos:req:emu.esp32p4.gpio/test] */
 static void test_pad_levels(void)
@@ -456,7 +456,25 @@ static void test_pad_levels(void)
     g_assert_false(gpio_in(qts, 20));
     g_assert_false(qtest_get_irq(qts, 20));
 
-    /* Driven from outside, over the chip's own driver */
+    /*
+     * Driven from outside as well: at the chip's level the two agree; at
+     * the other they fight, mid-rail, and the pad reads low.
+     */
+    pad_in(qts, 20, 0);
+    g_assert_false(gpio_in(qts, 20));
+    qtest_writel(qts, GPIO_OUT_W1TS, 1u << 20);
+    g_assert_false(gpio_in(qts, 20));
+    g_assert_false(qtest_get_irq(qts, 20));
+    pad_in(qts, 20, 1);
+    g_assert_true(gpio_in(qts, 20));
+    g_assert_true(qtest_get_irq(qts, 20));
+    pad_release(qts, 20);
+    g_assert_true(gpio_in(qts, 20));
+    qtest_writel(qts, GPIO_OUT_W1TC, 1u << 20);
+    g_assert_false(gpio_in(qts, 20));
+
+    /* Driven from outside alone */
+    qtest_writel(qts, GPIO_ENABLE_W1TC, 1u << 20);
     pad_in(qts, 20, 1);
     g_assert_true(gpio_in(qts, 20));
     g_assert_true(qtest_get_irq(qts, 20));
@@ -471,7 +489,6 @@ static void test_pad_levels(void)
     pad_release(qts, 20);
 
     /* Pulls on an undriven pad */
-    qtest_writel(qts, GPIO_ENABLE_W1TC, 1u << 20);
     gpio_mode(qts, 20, FUN_WPU);
     g_assert_true(gpio_in(qts, 20));
     gpio_mode(qts, 20, FUN_WPD);
