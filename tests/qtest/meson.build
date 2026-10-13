@@ -392,7 +392,7 @@ qtests_riscv32 = \
      'esp32p4-lp-core-test', 'esp32p4-boot-test', 'esp32p4-boot-secure-test',
      'esp32p4-boot-uart-test', 'esp32p4-boot-esptool-test',
      'esp32p4-boot-usb-test', 'esp32p4-adc-test',
-     'esp32p4-tsens-test', 'esp32p4-touch-test',
+     'esp32p4-tsens-test', 'esp32p4-touch-test', 'esp32p4-touch-pads-test',
      'esp32p4-ana-cmpr-test', 'esp32p4-lp-rom-test',
      'esp32p4-image-source-test', 'esp32p4-jpeg-test',
      'esp32p4-dma2d-test', 'esp32p4-ppa-test',

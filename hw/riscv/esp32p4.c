@@ -3864,7 +3864,9 @@ static void esp32p4_init_rmt_pcnt(ESP32P4MachineState *s)
  *     registers and its timer PMU_TOUCH_PWR_CNTL, on LP_DYN_FAST_CLK and
  *     LP_DYN_SLOW_CLK, measuring only its sleep channel while the PMU has
  *     the chip in LP_SLEEP, its interrupt LP_TOUCH_INTR (source 14), its
- *     wakeup the PMU's source 11.
+ *     wakeup the PMU's source 11; its channels' pads GPIO2 to GPIO15,
+ *     whose drivers and pulls load them and whose input buffers see its
+ *     sawtooth.
  *   - The analog voltage comparators, configured by LP_SYSTEM's PAD_COMPn,
  *     comparing the pads GPIO51 to GPIO54, whose digital drive they
  *     watch, into GPIO_EXT's "ana-comp", which raises GPIO_PAD_COMP_INTR
@@ -3943,6 +3945,8 @@ static void esp32p4_init_analog(ESP32P4MachineState *s)
                              &error_abort);
     object_property_set_link(OBJECT(dev), "pmu", OBJECT(&s->pmu),
                              &error_abort);
+    object_property_set_link(OBJECT(dev), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
     qdev_connect_clock_in(dev, "fast",
                           qdev_get_clock_out(clkrst, "lp-dyn-fast"));
     qdev_connect_clock_in(dev, "slow",
@@ -3961,6 +3965,11 @@ static void esp32p4_init_analog(ESP32P4MachineState *s)
                                 qdev_get_gpio_in_named(pmu,
                                     ESP32P4_PMU_WAKEUP,
                                     ESP32P4_PMU_WAKE_TOUCH));
+    for (n = ESP32P4_TOUCH_FIRST; n < ESP32P4_TOUCH_SLOTS; n++) {
+        qdev_connect_gpio_out_named(dev, ESP32P4_TOUCH_PAD_ANALOG, n,
+                                    qdev_get_gpio_in_named(gpio,
+                                        ESP32P4_GPIO_PAD_ANALOG, n + 1));
+    }
     qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_TOUCH_PWR, 0,
                                 qdev_get_gpio_in_named(dev,
                                     ESP32P4_TOUCH_TIMER_UPDATE, 0));
