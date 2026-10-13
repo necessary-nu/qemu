@@ -554,6 +554,40 @@ static void test_ext_wakeup(void)
 }
 
 /*
+ * The EXT wakeup on pads the board's serial ports watch too: ports 1 and 5
+ * put on GPIO10/11 and GPIO14/15, their terminals attached, watching
+ * GPIO10 and GPIO14 for their UARTs' TXD; the PMU still sees each pad.
+ */
+/* [spec:nuos:req:emu.esp32p4.low-power/test] */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+static void test_ext_wakeup_terminal_pads(void)
+{
+    static const unsigned pads[] = { 10, 14 };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(pads); i++) {
+        unsigned pad = pads[i];
+        QTestState *qts = start("-serial null -serial null -serial null "
+                                "-serial null -serial null -serial null "
+                                "-M serial1-pads=10:11,serial5-pads=14:15");
+
+        light_sleep_config(qts);
+        wr(qts, SLP_WAKEUP_CNTL2, 1u << WAKE_EXT);
+        wr(qts, EXT_WAKEUP_SEL, 1u << pad);
+        wr(qts, EXT_WAKEUP_LV, 1u << pad);
+        qtest_set_irq_in(qts, GPIO_PATH, "pad-in", pad, 0);
+        wr(qts, SLP_WAKEUP_CNTL0, SLEEP_REQ);
+        qtest_clock_step(qts, 1 * MS);
+        g_assert_cmphex(current_state(qts), ==, STATE_LP_SLEEP);
+        qtest_set_irq_in(qts, GPIO_PATH, "pad-in", pad, 1);
+        qtest_clock_step(qts, 200 * US);
+        g_assert_cmphex(current_state(qts), ==, STATE_ACTIVE);
+        g_assert_cmphex(rd(qts, SLP_WAKEUP_STATUS0), ==, 1u << WAKE_EXT);
+        g_assert_cmphex(rd(qts, EXT_WAKEUP_ST), ==, 1u << pad);
+        qtest_quit(qts);
+    }
+}
+
+/*
  * The LP CPU's power: released by an enabled wakeup source (the HP CPU's
  * trigger), recording the cause and raising PMU_LP_CPU_WAKEUP_INT; its
  * sleep request rejected while a reject-enabled source is active, or
@@ -902,6 +936,8 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/pmu/deep-sleep", test_deep_sleep);
     qtest_add_func("/esp32p4/pmu/min-sleep", test_min_sleep);
     qtest_add_func("/esp32p4/pmu/ext-wakeup", test_ext_wakeup);
+    qtest_add_func("/esp32p4/pmu/ext-wakeup-terminal-pads",
+                   test_ext_wakeup_terminal_pads);
     qtest_add_func("/esp32p4/pmu/lp-cpu", test_lp_cpu);
     qtest_add_func("/esp32p4/pmu/immediate", test_immediate);
     qtest_add_func("/esp32p4/pmu/ldo-counter", test_ldo_counter);

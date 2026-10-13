@@ -117,15 +117,13 @@ static void codec_route_changed(Notifier *n, void *data)
 static void board_pin_update(ESP32P4MachineState *s, unsigned pin)
 {
     ESP32P4BoardAudio *a = &s->audio;
-    DeviceState *gpio = DEVICE(&s->gpio);
-    unsigned pad = a->pin_pad[pin];
+    unsigned pad = a->pin_pad[pin], d = a->pin_driver[pin];
 
     if (a->pin_oe[pin]) {
-        qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_PAD_IN, pad),
+        qemu_set_irq(esp32p4_gpio_ext_in(&s->gpio, d, pad),
                      a->pin_level[pin]);
     } else {
-        qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_PAD_RELEASE,
-                                            pad), 1);
+        qemu_set_irq(esp32p4_gpio_ext_release(&s->gpio, d, pad), 1);
     }
 }
 
@@ -174,33 +172,6 @@ static void board_codec_pull_up(void *opaque, int n, int level)
                  level ? ESP32P4_BOARD_CODEC_PULL_UP : 0);
 }
 
-/* A pad's level, for the board and whatever already listened to it. */
-static void board_pad(void *opaque, int n, int level)
-{
-    ESP32P4MachineState *s = opaque;
-    ESP32P4BoardAudio *a = &s->audio;
-
-    if (a->pad_prev[n]) {
-        qemu_set_irq(a->pad_prev[n], level);
-    }
-    if (a->pad_sink[n]) {
-        qemu_set_irq(a->pad_sink[n], level);
-    }
-}
-
-static void board_watch_pad(ESP32P4MachineState *s, unsigned pad,
-                            qemu_irq sink)
-{
-    ESP32P4BoardAudio *a = &s->audio;
-    DeviceState *gpio = DEVICE(&s->gpio);
-
-    a->pad_prev[pad] = qdev_get_gpio_out_connector(gpio, ESP32P4_GPIO_PAD_OUT,
-                                                   pad);
-    a->pad_sink[pad] = sink;
-    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_OUT, pad,
-                                qemu_allocate_irq(board_pad, s, pad));
-}
-
 /*
  * [spec:nuos:req:emu.esp32p4.i2s]
  * [spec:nuos:req:emu.esp32p4.i2c]
@@ -230,6 +201,7 @@ void esp32p4_init_audio(ESP32P4MachineState *s)
     ESP32P4BoardAudio *a = &s->audio;
     DeviceState *gpio = DEVICE(&s->gpio), *clkrst = DEVICE(&s->clkrst);
     DeviceState *codec, *amp, *wires;
+    unsigned codec_driver;
     ESP32P4I2sPeer peer = {
         .sclk_pad = ESP32P4_BOARD_CODEC_SCLK_PAD,
         .lrck_pad = ESP32P4_BOARD_CODEC_LRCK_PAD,
@@ -241,6 +213,9 @@ void esp32p4_init_audio(ESP32P4MachineState *s)
 
     a->machine = s;
     a->pin_pad[ESP32P4_BOARD_PIN_SDA] = ESP32P4_BOARD_I2C_SDA_PAD;
+    a->pin_driver[ESP32P4_BOARD_PIN_SDA] =
+        esp32p4_gpio_ext_driver(&s->gpio, "the ESP_I2C wires' devices");
+    codec_driver = esp32p4_gpio_ext_driver(&s->gpio, "the ES8311");
 
     /* The ESP_I2C wires and their pull-ups */
     object_initialize_child(OBJECT(s), "esp-i2c", &a->esp_i2c,
@@ -250,9 +225,9 @@ void esp32p4_init_audio(ESP32P4MachineState *s)
     sysbus_realize(SYS_BUS_DEVICE(wires), &error_fatal);
     qdev_connect_gpio_out_named(wires, I2C_WIRE_BUS_SDA_PULL, 0,
                                 qemu_allocate_irq(board_sda_pull, s, 0));
-    board_watch_pad(s, ESP32P4_BOARD_I2C_SCL_PAD,
+    esp32p4_gpio_watch_pad(&s->gpio, ESP32P4_BOARD_I2C_SCL_PAD,
                     qdev_get_gpio_in_named(wires, I2C_WIRE_BUS_SCL, 0));
-    board_watch_pad(s, ESP32P4_BOARD_I2C_SDA_PAD,
+    esp32p4_gpio_watch_pad(&s->gpio, ESP32P4_BOARD_I2C_SDA_PAD,
                     qdev_get_gpio_in_named(wires, I2C_WIRE_BUS_SDA, 0));
     qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_BOARD_PULL_UP,
                                         ESP32P4_BOARD_I2C_SCL_PAD),
@@ -285,6 +260,7 @@ void esp32p4_init_audio(ESP32P4MachineState *s)
     qdev_realize(codec, BUS(a->esp_i2c.bus), &error_fatal);
     for (i = 0; i < ARRAY_SIZE(pins); i++) {
         a->pin_pad[pins[i].pin] = pins[i].pad;
+        a->pin_driver[pins[i].pin] = codec_driver;
         qdev_connect_gpio_out_named(codec, pins[i].out, 0,
                                     qemu_allocate_irq(board_pin_level, s,
                                                       pins[i].pin));
@@ -294,11 +270,11 @@ void esp32p4_init_audio(ESP32P4MachineState *s)
     }
     qdev_connect_gpio_out_named(codec, ES8311_PULL_UP, 0,
                                 qemu_allocate_irq(board_codec_pull_up, s, 0));
-    board_watch_pad(s, ESP32P4_BOARD_CODEC_SCLK_PAD,
+    esp32p4_gpio_watch_pad(&s->gpio, ESP32P4_BOARD_CODEC_SCLK_PAD,
                     qdev_get_gpio_in_named(codec, ES8311_SCLK, 0));
-    board_watch_pad(s, ESP32P4_BOARD_CODEC_LRCK_PAD,
+    esp32p4_gpio_watch_pad(&s->gpio, ESP32P4_BOARD_CODEC_LRCK_PAD,
                     qdev_get_gpio_in_named(codec, ES8311_LRCK, 0));
-    board_watch_pad(s, ESP32P4_BOARD_CODEC_DSDIN_PAD,
+    esp32p4_gpio_watch_pad(&s->gpio, ESP32P4_BOARD_CODEC_DSDIN_PAD,
                     qdev_get_gpio_in_named(codec, ES8311_DSDIN, 0));
     peer.opaque = &a->codec;
     for (i = 0; i < ESP32P4_I2S_COUNT; i++) {
@@ -312,7 +288,7 @@ void esp32p4_init_audio(ESP32P4MachineState *s)
     qdev_connect_gpio_out_named(amp, NS4150_ON, 0,
                                 qdev_get_gpio_in_named(codec,
                                                        ES8311_OUT_PATH, 0));
-    board_watch_pad(s, ESP32P4_BOARD_PA_CTRL_PAD,
+    esp32p4_gpio_watch_pad(&s->gpio, ESP32P4_BOARD_PA_CTRL_PAD,
                     qdev_get_gpio_in_named(amp, NS4150_CTRL, 0));
     qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_BOARD_PULL_DOWN,
                                         ESP32P4_BOARD_PA_CTRL_PAD),

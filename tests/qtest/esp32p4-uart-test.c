@@ -125,6 +125,7 @@
 #define FRAME_NS            (10 * BIT_NS)
 
 #define GPIO                0x500e0000
+#define GPIO_IN             (GPIO + 0x03c)
 #define GPIO_FUNC_IN(s)     (GPIO + 0x158 + 4 * (s))
 #define GPIO_FUNC_OUT(n)    (GPIO + 0x558 + 4 * (n))
 #define IN_SIG_IN_SEL       (1u << 7)
@@ -1172,6 +1173,97 @@ static void test_serial_port(void)
 }
 
 /*
+ * The serial ports' pads. Port 1 by default on GPIO20 (TXD) and GPIO21
+ * (RXD), which only the board's 40-pin header has: UART1's frames routed
+ * to GPIO20 reach its chardev, and its terminal holds GPIO21 high, while
+ * GPIO11, UART1's IO MUX RXD pad, is the codec's ASDOUT alone (low out
+ * of reset) and nothing fights over a pad. Put on UART1's IO MUX pads
+ * with serial1-pads, the port watches GPIO10 beside the codec's LRCK
+ * input, and its idle-high RXD fights the codec's ASDOUT on GPIO11: the
+ * pad reads low, a guest error naming both. The board's USB-UART bridge
+ * on GPIO38 and a driver from outside agree high, and fight low.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+/* [spec:nuos:req:emu.esp32p4.gpio/test] */
+static void test_board_serial_pads(void)
+{
+    g_autofree char *dir = g_dir_make_tmp("esp32p4-serial-XXXXXX", NULL);
+    g_autofree char *log = g_build_filename(dir, "qemu.log", NULL);
+    g_autofree char *port1 = g_build_filename(dir, "port1", NULL);
+    const struct {
+        const char *pads;
+        int tx;
+    } runs[] = {
+        { "", 20 },
+        { ",serial1-pads=10:11", 10 },
+    };
+    uint32_t in;
+
+    for (int r = 0; r < ARRAY_SIZE(runs); r++) {
+        QTestState *qts;
+        g_autofree char *text = NULL, *got = NULL;
+        size_t len;
+
+        qts = qtest_initf("-M esp32p4,flash-size=16M%s -d guest_errors "
+                          "-D %s -serial null -serial file:%s", runs[r].pads,
+                          log, port1);
+        qtest_writel(qts, IO_MUX_GPIO(runs[r].tx),
+                     MCU_SEL_GPIO | FUN_DRV(2));
+        qtest_writel(qts, GPIO_FUNC_OUT(runs[r].tx), SIG_UART1_TXD);
+        qtest_writel(qts, IO_MUX_GPIO(11), MCU_SEL_GPIO | FUN_IE);
+        qtest_writel(qts, IO_MUX_GPIO(21), MCU_SEL_GPIO | FUN_IE);
+        setup(qts, UART(1), CONF0_8N1);
+        /*
+         * The undriven pad read low from reset, a start bit to the
+         * terminal at UART1's reset baud rate: let that frame go by.
+         */
+        qtest_clock_step(qts, 200 * 1000);
+        wr(qts, UART(1), FIFO, 'P');
+        wr(qts, UART(1), FIFO, '4');
+        qtest_clock_step(qts, 3 * FRAME_NS);
+        g_assert(g_file_get_contents(port1, &got, &len, NULL));
+        g_assert_cmpmem(got, len, "P4", 2);
+
+        in = qtest_readl(qts, GPIO_IN);
+        g_assert_true(g_file_get_contents(log, &text, NULL, NULL));
+        if (r == 0) {
+            g_assert_cmphex(in & ((1u << 11) | (1u << 21)), ==, 1u << 21);
+            g_assert_null(strstr(text, "driven high and low"));
+        } else {
+            g_assert_cmphex(in & (1u << 11), ==, 0);
+            g_assert_nonnull(strstr(text, "GPIO11 is driven high and low at "
+                                    "once (serial port 1 high, the ES8311 "
+                                    "low)"));
+        }
+        qtest_quit(qts);
+        unlink(port1);
+        unlink(log);
+    }
+
+    {
+        QTestState *qts = qtest_initf("-M esp32p4,flash-size=16M -d "
+                                      "guest_errors -D %s -serial null",
+                                      log);
+        g_autofree char *text = NULL;
+
+        qtest_writel(qts, IO_MUX_GPIO(38), MCU_SEL_GPIO | FUN_IE);
+        g_assert_true(qtest_readl(qts, GPIO_IN + 4) & (1u << 6));
+        qtest_set_irq_in(qts, GPIO_PATH, "pad-in", 38, 1);
+        g_assert_true(qtest_readl(qts, GPIO_IN + 4) & (1u << 6));
+        qtest_set_irq_in(qts, GPIO_PATH, "pad-in", 38, 0);
+        g_assert_false(qtest_readl(qts, GPIO_IN + 4) & (1u << 6));
+        g_assert_true(g_file_get_contents(log, &text, NULL, NULL));
+        g_assert_nonnull(strstr(text, "GPIO38 is driven high and low at once "
+                                "(outside low, serial port 0 high)"));
+        qtest_set_irq_in(qts, GPIO_PATH, "pad-release", 38, 1);
+        g_assert_true(qtest_readl(qts, GPIO_IN + 4) & (1u << 6));
+        qtest_quit(qts);
+        unlink(log);
+    }
+    rmdir(dir);
+}
+
+/*
  * The boot ROM, run from reset with a blank 16 MiB flash, prints its
  * banner on UART0, through GPIO37 to serial port 0, and reports the
  * flash's invalid image header. The log is read while the ROM prints, a
@@ -1436,7 +1528,6 @@ static void test_uhci_rx(void)
 #define USJ_INT_GET_LINE    (1u << 14)
 #define USJ_INT_SET_LINE    (1u << 15)
 #define USJ_PAD_ENABLE      (1u << 14)
-#define GPIO_IN             (GPIO + 0x03c)
 #define MS                  1000000
 
 /*
@@ -1752,6 +1843,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/uart/wakeup", test_wakeup);
     qtest_add_func("esp32p4/uart/pmu_wakeup", test_pmu_wakeup);
     qtest_add_func("esp32p4/uart/serial_port", test_serial_port);
+    qtest_add_func("esp32p4/uart/board-serial-pads", test_board_serial_pads);
     qtest_add_func("esp32p4/uart/uhci_tx", test_uhci_tx);
     qtest_add_func("esp32p4/uart/uhci_rx", test_uhci_rx);
     qtest_add_func("esp32p4/uart/usj_registers", test_usj_registers);
