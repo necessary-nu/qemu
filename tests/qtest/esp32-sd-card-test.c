@@ -9,12 +9,14 @@
  *
  * Card 1's clock is the CIU's 80 MHz divided by 4, 20 MHz; the card a raw
  * image of 16 MiB, SDSC, Class 4: its access and programming times are
- * both its TAAC, 70 us.
+ * both its TAAC, 70 us. Slot 1's pins are set up as ESP-IDF sets them up
+ * (esp32-sd-pins.h): the card answers only through them.
  */
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
+#include "esp32-sd-pins.h"
 
 #define DPORT_WIFI_CLK_EN       0x3ff000cc
 #define DPORT_CORE_RST_EN       0x3ff000d0
@@ -114,6 +116,7 @@ static void stop_watchdogs(QTestState *qts)
 static void sdmmc_setup(QTestState *qts)
 {
     stop_watchdogs(qts);
+    sd_pins(qts);
     qtest_writel(qts, DPORT_WIFI_CLK_EN,
                  qtest_readl(qts, DPORT_WIFI_CLK_EN) | WIFI_CLK_SDIO_HOST);
     qtest_writel(qts, DPORT_CORE_RST_EN,
