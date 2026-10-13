@@ -187,7 +187,9 @@
  *   - The USB Serial/JTAG controller (TRM chapter 54) at 0x500D2000,
  *     behind USB_DEVICE_APB_CLK and LP_CLKRST's USB_DEVICE reset, its USB
  *     side on USB_DEVICE_48M_CLK, its interrupt source 22, its PHY's
- *     pull-ups on GPIO24 and GPIO25. Its CDC-ACM serial port reaches a
+ *     pads and pull-ups on GPIO24 and GPIO25 (GPIO26 and GPIO27 with the
+ *     PHYs swapped), the PHY's while USB_PAD_ENABLE is set, as it is
+ *     from reset. Its CDC-ACM serial port reaches a
  *     chardev, a computer at the other end of the board's USB cable,
  *     which enumerates the device as the boot ROM starts and reads and
  *     writes the port while the chardev is open; with none, no cable:
@@ -245,7 +247,9 @@
  *     USB_WRAP (0x50080000) controls, behind their bus clocks and resets,
  *     their DMA through the DMA access permission manager, their
  *     interrupts sources 93, 94 and 103, OTG_FS's OTG signals through the
- *     GPIO matrix. In host mode QEMU's USB devices plug into a
+ *     GPIO matrix, its PHY's pads GPIO26 and GPIO27 (or GPIO24 and GPIO25)
+ *     the PHY's while USB_WRAP's USB_PAD_ENABLE is set. In host mode
+ *     QEMU's USB devices plug into a
  *     controller's port, the bus named after it: usb-otg-hs.0 and
  *     usb-otg-fs.0,
  *
@@ -4430,15 +4434,31 @@ static void esp32p4_init_usb(ESP32P4MachineState *s)
                                 qdev_get_gpio_in_named(fs, DWC2_OTG_SENSE,
                                     DWC2_OTG_SENSE_SESSEND));
     /*
-     * The D+ pull-up OTG_FS's PHY puts on its pad: GPIO27, of the PHY the
-     * OTG has by default. GPIO25's pull-up is USB Serial/JTAG's line.
+     * The full-speed PHYs' pads, GPIO24 to GPIO27, as USB_WRAP routes the
+     * OTG's and USB Serial/JTAG's PHYs to them: their pull-ups, and whether
+     * each PHY has its pads.
      */
     qdev_connect_gpio_out_named(fs, DWC2_OTG_DP_PULLUP, 0,
                                 qdev_get_gpio_in_named(wrap,
                                     ESP32P4_USB_WRAP_CORE_DP_PULLUP, 0));
-    qdev_connect_gpio_out_named(wrap, ESP32P4_USB_WRAP_PHY_DP_PULLUP, 1,
-                                qdev_get_gpio_in_named(gpio,
-                                    ESP32P4_GPIO_PAD_PULL_UP, 27));
+    for (i = 0; i < 2; i++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->usj), ESP32P4_USJ_PAD_PULL_UP,
+                                    i, qdev_get_gpio_in_named(wrap,
+                                        ESP32P4_USB_WRAP_USJ_PULL_UP, i));
+    }
+    qdev_connect_gpio_out_named(DEVICE(&s->usj), ESP32P4_USJ_PAD_ENABLE, 0,
+                                qdev_get_gpio_in_named(wrap,
+                                    ESP32P4_USB_WRAP_USJ_PAD_ENABLE, 0));
+    for (i = 0; i < ESP32P4_USB_FS_PADS; i++) {
+        qdev_connect_gpio_out_named(wrap, ESP32P4_USB_WRAP_PAD_PULL_UP, i,
+                                    qdev_get_gpio_in_named(gpio,
+                                        ESP32P4_GPIO_PAD_PULL_UP,
+                                        ESP32P4_USB_FS_PAD0 + i));
+        qdev_connect_gpio_out_named(wrap, ESP32P4_USB_WRAP_PAD_PHY, i,
+                                    qdev_get_gpio_in_named(gpio,
+                                        ESP32P4_GPIO_PAD_PHY,
+                                        ESP32P4_USB_FS_PAD0 + i));
+    }
     for (i = 0; i < ARRAY_SIZE(esp32p4_usb_fs_ctl); i++) {
         qdev_connect_gpio_out_named(fs, DWC2_OTG_CTL,
                                     esp32p4_usb_fs_ctl[i].line,
@@ -4642,12 +4662,13 @@ static void esp32p4_init_uart(ESP32P4MachineState *s)
 /*
  * The USB Serial/JTAG controller: its registers behind
  * USB_DEVICE_APB_CLK and its reset, its USB side on USB_DEVICE_48M_CLK,
- * its D- and D+ pull-ups on GPIO24 and GPIO25.
+ * its PHY's pads and pull-ups through USB_WRAP's PHY selection
+ * (esp32p4_init_usb()).
  */
 /* [spec:nuos:req:emu.esp32p4.uart] */
 static void esp32p4_init_usb_serial_jtag(ESP32P4MachineState *s)
 {
-    DeviceState *dev, *gpio = DEVICE(&s->gpio);
+    DeviceState *dev;
 
     object_initialize_child(OBJECT(s), "usb-serial-jtag", &s->usj,
                             TYPE_ESP32P4_USB_SERIAL_JTAG);
@@ -4661,12 +4682,6 @@ static void esp32p4_init_usb_serial_jtag(ESP32P4MachineState *s)
                              ESP32P4_RST_USB_DEVICE, 0);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        esp32p4_intr_source(s, ESP32P4_INTR_USB_SERIAL_JTAG));
-    qdev_connect_gpio_out_named(dev, ESP32P4_USJ_PAD_PULL_UP, 0,
-                                qdev_get_gpio_in_named(gpio,
-                                    ESP32P4_GPIO_PAD_PULL_UP, 24));
-    qdev_connect_gpio_out_named(dev, ESP32P4_USJ_PAD_PULL_UP, 1,
-                                qdev_get_gpio_in_named(gpio,
-                                    ESP32P4_GPIO_PAD_PULL_UP, 25));
 }
 
 /*

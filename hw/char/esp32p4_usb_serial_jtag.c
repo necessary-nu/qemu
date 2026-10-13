@@ -215,9 +215,12 @@ static bool usj_usb_running(ESP32P4UsjState *s)
 
 /*
  * [spec:nuos:req:emu.esp32p4.uart]
- * With USB_PAD_ENABLE the PHY pulls D+ up, as a full-speed device
- * attaches, or with PAD_PULL_OVERRIDE as DP_PULLUP and DM_PULLUP say; D+
- * is GPIO25 and D- GPIO24, the other way round with EXCHG_PINS.
+ * [spec:nuos:req:emu.esp32p4.usb]
+ * With USB_PAD_ENABLE the PHY has its pads, and pulls D+ up, as a
+ * full-speed device attaches, or with PAD_PULL_OVERRIDE as DP_PULLUP and
+ * DM_PULLUP say; D- is its first pad and D+ its second (GPIO24 and GPIO25
+ * for PHY 0), the other way round with EXCHG_PINS. Which PHY is this
+ * controller's is USB_WRAP's to route (hw/usb/esp32p4_usb.c).
  */
 static void usj_pulls(ESP32P4UsjState *s, bool *dp, bool *dm)
 {
@@ -244,6 +247,7 @@ static void usj_update_pulls(ESP32P4UsjState *s)
     usj_pulls(s, &dp, &dm);
     qemu_set_irq(s->pull_up[swap ? 1 : 0], dm);
     qemu_set_irq(s->pull_up[swap ? 0 : 1], dp);
+    qemu_set_irq(s->pad_enable, !!(c & CONF0_PAD_ENABLE));
 }
 
 /* ---- Endpoints ---- */
@@ -871,6 +875,7 @@ static void usj_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
     qdev_init_gpio_out_named(dev, s->pull_up, ESP32P4_USJ_PAD_PULL_UP, 2);
+    qdev_init_gpio_out_named(dev, &s->pad_enable, ESP32P4_USJ_PAD_ENABLE, 1);
     s->usb48 = qdev_init_clock_in(dev, "usb48", usj_usb48_update, s,
                                   ClockUpdate);
     timer_init_ns(&s->host_timer, QEMU_CLOCK_VIRTUAL, usj_host_timer_cb, s);
