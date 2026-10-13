@@ -395,6 +395,12 @@ static int64_t chan_fade_end_time(Esp32LEDCState *s, unsigned n)
                                   (uint64_t)ch->fade_num * ch->fade_cycle, 0));
 }
 
+/* Whether the channel's output follows its generator (SIG_OUT_EN). */
+static bool chan_sig_out(Esp32LedcChannel *ch)
+{
+    return FIELD_EX32(ch->conf0, LEDC_CH_CONF0, SIG_OUT_EN);
+}
+
 /*
  * [spec:nuos:req:emu.esp32.gpio]
  * Drive the channel's output signal: the generator's level while
@@ -403,7 +409,7 @@ static int64_t chan_fade_end_time(Esp32LEDCState *s, unsigned n)
 static void chan_drive(Esp32LEDCState *s, unsigned n, int64_t when)
 {
     Esp32LedcChannel *ch = &s->ch[n];
-    bool level = FIELD_EX32(ch->conf0, LEDC_CH_CONF0, SIG_OUT_EN) ?
+    bool level = chan_sig_out(ch) ?
                  ch->gen_level : FIELD_EX32(ch->conf0, LEDC_CH_CONF0, IDLE_LV);
 
     if (level != ch->out_level) {
@@ -494,21 +500,32 @@ static void chan_rebase(Esp32LEDCState *s, unsigned n, uint64_t k_old,
  * [spec:nuos:req:emu.esp32.gpio]
  * Run a channel up to limit (and including it with inclusive): its loads,
  * its fade's end and its output changes, coalesced as the header comment
- * describes.
+ * describes. While SIG_OUT_EN is clear the output holds IDLE_LV, and the
+ * generator's edges change nothing outside: its level is taken only where
+ * a load, or the caller, needs it.
  */
 static void chan_eval(Esp32LEDCState *s, unsigned n, int64_t limit,
                       bool inclusive)
 {
     Esp32LedcChannel *ch = &s->ch[n];
+    bool out = chan_sig_out(ch);
 
     for (;;) {
         int64_t e_load = chan_load_time(s, n);
         int64_t e_fend = chan_fade_end_time(s, n);
         int64_t e_struct = MIN(e_load, e_fend);
-        int64_t e = chan_next_edge(s, n, ch->eval_ns);
+        int64_t e = out ? chan_next_edge(s, n, ch->eval_ns) : INT64_MAX;
         int64_t next;
 
-        if (e != INT64_MAX && e < e_struct && e < limit - LEDC_CATCHUP_NS) {
+        if (!out) {
+            int64_t x = MIN(inclusive ? limit : limit - 1, e_struct - 1);
+
+            if (x > ch->eval_ns) {
+                ch->eval_ns = x;
+                ch->gen_level = chan_level_at(s, n, x);
+            }
+        } else if (e != INT64_MAX && e < e_struct &&
+                   e < limit - LEDC_CATCHUP_NS) {
             int64_t x = MIN(limit - LEDC_CATCHUP_NS, e_struct - 1);
 
             ch->eval_ns = x;
@@ -660,7 +677,8 @@ static void ledc_schedule(Esp32LEDCState *s)
     }
     for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
         Esp32LedcChannel *ch = &s->ch[n];
-        int64_t e = chan_next_edge(s, n, ch->eval_ns);
+        int64_t e = chan_sig_out(ch) ? chan_next_edge(s, n, ch->eval_ns) :
+                                       INT64_MAX;
         int64_t next;
 
         if (e != INT64_MAX) {
