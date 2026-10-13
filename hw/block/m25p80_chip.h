@@ -20,6 +20,7 @@ typedef struct M25ChipInfo M25ChipInfo;
 extern const M25ChipInfo m25chip_w25q16jv;
 extern const M25ChipInfo m25chip_w25q32rv;
 extern const M25ChipInfo m25chip_gd25q256e;
+extern const M25ChipInfo m25chip_gd25q32c;
 
 #define M25CHIP_PAGE_SIZE       256
 #define M25CHIP_SECREGS         3
@@ -52,6 +53,8 @@ typedef struct M25Chip {
     MemoryRegion *mem;
     /* Raised while `mem` is in ROMD mode, lowered while it is not. */
     qemu_irq mapped;
+    /* Pulsed when the array's cells, or whether it answers reads, change */
+    qemu_irq changed;
     BlockBackend *blk;
     bool max_timing;
     char *uid_prop;
@@ -74,6 +77,10 @@ typedef struct M25Chip {
     bool reset_enable;
     bool qpi;
     bool four_byte;
+    /* High performance mode (A3h), which the GD25Q32C's HPF reports */
+    bool hpm;
+    /* It answers reads, as `changed` last reported */
+    bool answering;
     uint8_t ear;
     uint8_t read_params;
     uint8_t wrap;
@@ -113,6 +120,10 @@ extern const VMStateDescription vmstate_m25chip;
 bool m25chip_realize(M25Chip *c, Error **errp);
 void m25chip_unrealize(M25Chip *c);
 void m25chip_reset(M25Chip *c);
+void m25chip_power_on(M25Chip *c);
+bool m25chip_quad_enabled(M25Chip *c);
+bool m25chip_drives_output(M25Chip *c);
+uint8_t m25chip_continuous_cmd(M25Chip *c);
 void m25chip_set_cs(M25Chip *c, bool high);
 uint8_t m25chip_transfer(M25Chip *c, uint8_t tx);
 int64_t m25chip_busy_until(M25Chip *c);

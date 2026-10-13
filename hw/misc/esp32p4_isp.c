@@ -442,15 +442,27 @@ static void ev_deliver(void *opaque)
     if (ev->kind == EV_LINE && !ev->pass && s->bridge &&
         esp32p4_csi_bridge_almost_full(s->bridge)) {
         int64_t d = MAX(ev->due - ev->start, 1);
+        int64_t k = 1;
 
-        /* The bridge holds the rows back: every one waits a row longer. */
+        /*
+         * The bridge holds the rows back: every one waits a row longer,
+         * and a row longer again each time the bridge is still full. Those
+         * times up to the one the events are being delivered up to go by
+         * at once, with nothing to change the bridge as this sees it
+         * between them: one by one, each re-arming the timer in the past
+         * when it runs late, as it can on the host's clock, they could not
+         * catch up with the present.
+         */
+        if (ev->due + d <= s->deliver_upto) {
+            k = (s->deliver_upto - ev->due) / d + 1;
+        }
         for (GList *l = s->events->head; l; l = l->next) {
             IspEvent *e = l->data;
 
-            e->due += d;
-            e->start += d;
+            e->due += k * d;
+            e->start += k * d;
         }
-        s->last_due += d;
+        s->last_due += k * d;
         ev_arm(s);
         return;
     }
@@ -495,6 +507,7 @@ static void ev_timer_cb(void *opaque)
     IspEvent *ev = g_queue_peek_head(s->events);
 
     if (ev) {
+        s->deliver_upto = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         esp32_line_run_at(ev->due, ev_deliver, s);
     }
 }
@@ -508,6 +521,7 @@ static void isp_sync(ESP32P4IspState *s)
     IspEvent *ev;
 
     upd_run(s);
+    s->deliver_upto = now;
     while ((ev = g_queue_peek_head(s->events)) && ev->due <= now) {
         timer_del(s->ev_timer);
         esp32_line_run_at(ev->due, ev_deliver, s);
@@ -524,6 +538,7 @@ static void pass_event(ESP32P4IspState *s, IspEvent *ev)
     if (g_queue_is_empty(s->events)) {
         ev->due = now;
         g_queue_push_tail(s->events, ev);
+        s->deliver_upto = now;
         ev_deliver(s);
         return;
     }

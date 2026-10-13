@@ -283,6 +283,9 @@ qtests_xtensa = \
     ['esp32-clock-test',
      'esp32-spi-dma-test',
      'esp32-flash-pins-test',
+     'esp32-flash-protocol-test',
+     'esp32-vdd-sdio-test',
+     'esp32-uart-terminal-pads-test',
      'esp32-gpio-test',
      'esp32-uhci-test',
      'esp32-pid-test',
@@ -301,6 +304,7 @@ qtests_xtensa = \
      'esp32-timg-cal-test',
      'esp32-board-reset-test',
      'esp32-ulp-test',
+     'esp32-i2c-test',
      'esp32-efuse-test',
      'esp32-wdt-test'] : [])
 

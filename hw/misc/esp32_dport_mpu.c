@@ -527,7 +527,11 @@ static uint32_t cache_mmu_entry(Esp32DportState *s, int cpu, unsigned idx)
     return s->cache_mmu_table[cpu][idx];
 }
 
-/* Load a 64 KB flash page into the page store, decrypted if need be. */
+/*
+ * Load a 64 KB flash page into the page store, decrypted if need be, as
+ * SPI0 reads it through the flash's pads (the store's pages are filled
+ * whole, for every CPU, and take no fill time).
+ */
 static hwaddr flash_page(Esp32DportState *s, unsigned page)
 {
     if (!test_bit(page, s->flash_page_valid)) {
@@ -539,10 +543,8 @@ static hwaddr flash_page(Esp32DportState *s, unsigned page)
             uint32_t *buf = (uint32_t *)(data + page * ESP32_CACHE_PAGE_SIZE);
             hwaddr phys = (hwaddr)page * ESP32_CACHE_PAGE_SIZE;
 
-            if (blk_pread(s->flash_blk, phys, ESP32_CACHE_PAGE_SIZE, buf,
-                          0) < 0) {
-                memset(buf, 0xff, ESP32_CACHE_PAGE_SIZE);
-            } else if (enc && esp32_flash_decryption_enabled(enc)) {
+            esp32_dport_flash_read_page(s, phys, (uint8_t *)buf);
+            if (enc && esp32_flash_decryption_enabled(enc)) {
                 esp32_flash_decrypt_inplace(enc, phys, buf,
                                             ESP32_CACHE_PAGE_SIZE / 4);
             }
@@ -580,7 +582,8 @@ static bool cache_port_enabled(Esp32CacheState *cs, unsigned mask_shift)
  * (TRM 4.3.2.2, tables 4.3-10 to 4.3-13).
  */
 static void flash_cache_filter(Esp32DportState *s, int cpu, unsigned pid,
-                               uint32_t vaddr, Esp32MpuMapping *map)
+                               uint32_t vaddr, MMUAccessType access_type,
+                               Esp32MpuMapping *map)
 {
     Esp32CacheState *cs = &s->cache_state[cpu];
     bool single = FIELD_EX32(cs->cache_ctrl_reg, DPORT_PRO_CACHE_CTRL,
@@ -594,6 +597,7 @@ static void flash_cache_filter(Esp32DportState *s, int cpu, unsigned pid,
     page = (vaddr % VADDR_REGION_SIZE) / ESP32_CACHE_PAGE_SIZE;
     if (vaddr < VADDRRAM_BASE) {
         if (pid <= 1) {
+            esp32_dport_cache_filter(s, cpu, vaddr, access_type, map);
             return;
         }
         if (vaddr >= VADDR0_BASE + VADDR4_SIZE) {
@@ -604,6 +608,7 @@ static void flash_cache_filter(Esp32DportState *s, int cpu, unsigned pid,
         mask_shift = R_DPORT_PRO_CACHE_CTRL1_MASK_DROM0_SHIFT;
     } else if (vaddr < VADDR2_BASE) {
         if (pid <= 1) {
+            esp32_dport_cache_filter(s, cpu, vaddr, access_type, map);
             return;
         }
         if (!single) {
@@ -727,7 +732,7 @@ void esp32_dport_mpu_filter(Esp32DportState *s, int cpu, unsigned pid,
         if (in(paddr, VADDRRAM_BASE, VADDR_REGION_SIZE)) {
             psram_cache_filter(s, cpu, pid, paddr, map);
         } else if (s->flash_blk) {
-            flash_cache_filter(s, cpu, pid, paddr, map);
+            flash_cache_filter(s, cpu, pid, paddr, access_type, map);
         }
         return;
     }

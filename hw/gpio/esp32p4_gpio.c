@@ -20,12 +20,18 @@
  * LP_IOMUX_EXT_WAKEUP0_SEL, which the TRM leaves out, are there; and the
  * GPIO55 and GPIO56 slots exist in every per-pad register file.
  *
- * Pads. Each of GPIO0 to GPIO54 takes its level from, in order: a driver
- * outside the chip; the chip's output driver while its output enable is
- * set (an open-drain pad, GPIO_PINn_PAD_DRIVER or LP_GPIO_PINn_PAD_DRIVER,
- * drives only low); otherwise from its pulls, as a divider: the pad's own
- * weak pull-up and pull-down (FUN_WPU and FUN_WPD, or the LP IO MUX's RUE
- * and RDE), 45 kOhm each (the datasheet's RPU and RPD, table 5-4),
+ * Pads. Each of GPIO0 to GPIO54 takes its level from its drivers: those
+ * outside the chip, each driving the pad at a level of its own, and the
+ * chip's output driver while its output enable is set (an open-drain pad,
+ * GPIO_PINn_PAD_DRIVER or LP_GPIO_PINn_PAD_DRIVER, drives only low), the
+ * level they agree on. Drivers at different levels, two push-pull outputs
+ * fighting, make a divider of like strengths, each a strong pull to its
+ * rail: the pad sits mid-rail, its level undefined, and it reads low,
+ * logged as a guest error naming the drivers (as npcm7xx_gpio.c takes a
+ * pin driven both ways). An undriven pad takes its level from its pulls,
+ * as a divider: the pad's own weak pull-up and pull-down (FUN_WPU and
+ * FUN_WPD, or the LP IO MUX's RUE and RDE), 45 kOhm each (the
+ * datasheet's RPU and RPD, table 5-4),
  * IO_MUX_GPIOn_I3C_RUE_EN's 0.3 to 2.4 kOhm (I3C_RU) on GPIO32 and GPIO33,
  * a pull another block makes on it (a USB PHY's D+ pull-up), as strong as
  * a driver, and the board's resistors to its supply or ground. The pad
@@ -949,6 +955,37 @@ static bool pull_level(uint64_t up, uint64_t down, bool *undefined)
 
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
+ * Pad n's drivers are at odds: name them, and their levels.
+ */
+static void log_contention(ESP32P4GpioState *s, unsigned n)
+{
+    g_autoptr(GString) who = NULL;
+    bool val;
+
+    /* A bus fighting a board's chip changes at its bit rate. */
+    if (!qemu_loglevel_mask(LOG_GUEST_ERROR)) {
+        return;
+    }
+    who = g_string_new(NULL);
+    for (unsigned d = 0; d < s->ext_drivers; d++) {
+        if (bit64(s->ext_driven[d], n)) {
+            g_string_append_printf(who, "%s%s %s", who->len ? ", " : "",
+                                   s->ext_name[d],
+                                   bit64(s->ext_level[d], n) ? "high" :
+                                                               "low");
+        }
+    }
+    if (pad_driven_by_chip(s, n, &val)) {
+        g_string_append_printf(who, ", its own output %s",
+                               val ? "high" : "low");
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "%s: GPIO%u is driven high and low at "
+                  "once (%s): its level is undefined; it reads low\n",
+                  TYPE_ESP32P4_GPIO, n, who->str);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
  * Resolve the pads' levels and input buffers: the drive, pulls and input
  * enable of the pads in dirty, every pad when all, and the level of each
  * pad on a wire with one of those; the others stand as last resolved. A
@@ -969,7 +1006,7 @@ static void resolve(ESP32P4GpioState *s, uint64_t dirty, bool all,
     uint64_t pad, nets = 0, ie_mask = s->ie_mask;
     uint64_t drv_low = s->drive_low, drv_high = s->drive_high;
     uint64_t held = s->held, undefined = 0, analog = 0, load = 0;
-    uint64_t phy_blocked = s->phy_blocked;
+    uint64_t phy_blocked = s->phy_blocked, contended = s->contended;
 
     if (all) {
         held = (s->ext_hold | s->lp_pad_hold) & PAD_MASK;
@@ -985,7 +1022,7 @@ static void resolve(ESP32P4GpioState *s, uint64_t dirty, bool all,
     for (uint64_t m = dirty & PAD_MASK; m; m &= m - 1) {
         unsigned n = ctz64(m);
         uint64_t up, down;
-        bool drive, val, ie;
+        bool drive, val, ie, hi, lo;
 
         if (bit64(held, n) && !bit64(s->held, n)) {
             PadCtl c;
@@ -1025,9 +1062,24 @@ static void resolve(ESP32P4GpioState *s, uint64_t dirty, bool all,
             down += PULL_NS(s->board_pull_down[n]);
         }
 
-        if (bit64(s->ext_driven, n)) {
-            drive = true;
-            val = bit64(s->ext_level, n);
+        hi = bit64(s->ext_high, n) || (drive && val);
+        lo = bit64(s->ext_low, n) || (drive && !val);
+        contended = deposit64(contended, n, 1, hi && lo);
+        if (hi && lo) {
+            unsigned nh = drive && val, nl = drive && !val;
+
+            for (unsigned d = 0; d < s->ext_drivers; d++) {
+                if (bit64(s->ext_driven[d], n)) {
+                    nh += bit64(s->ext_level[d], n);
+                    nl += !bit64(s->ext_level[d], n);
+                }
+            }
+            up += nh * PULL_STRONG_NS;
+            down += nl * PULL_STRONG_NS;
+            drive = false;
+        } else {
+            drive = hi || lo;
+            val = hi;
         }
         if (bit64(drv_high, n) != (drive && val) ||
             bit64(drv_low, n) != (drive && !val) ||
@@ -1055,12 +1107,10 @@ static void resolve(ESP32P4GpioState *s, uint64_t dirty, bool all,
         bool level, undef = false;
 
         /*
-         * An outside driver wins over the pad's own; on a wire, a low
-         * driver wins, then a high one. Undriven, the pulls decide.
+         * The pad's drivers, or on a wire a low driver, then a high one.
+         * Undriven, or its drivers at odds, the pulls decide.
          */
-        if (!s->pad_wire[n] && bit64(s->ext_driven, n)) {
-            level = bit64(s->ext_level, n);
-        } else if (drv_low & net) {
+        if (drv_low & net) {
             level = false;
         } else if (drv_high & net) {
             level = true;
@@ -1079,6 +1129,11 @@ static void resolve(ESP32P4GpioState *s, uint64_t dirty, bool all,
         pad |= (uint64_t)level << n;
         undefined |= (uint64_t)undef << n;
     }
+    for (uint64_t m = contended & ~s->contended; m; m &= m - 1) {
+        log_contention(s, ctz64(m));
+    }
+    s->contended = contended;
+    undefined &= ~contended;
     for (uint64_t m = undefined & nets & ~s->undefined; m; m &= m - 1) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: GPIO%u's pulls hold it between "
                       "VIL and VIH, at an undefined level; it reads low\n",
@@ -1919,6 +1974,9 @@ static void propagate(ESP32P4GpioState *s)
         unsigned n = ctz64(m);
 
         qemu_set_irq(s->pad_out[n], bit64(pad, n));
+        for (unsigned w = 0; w < s->pad_watches[n]; w++) {
+            qemu_set_irq(s->pad_watch[n][w], bit64(pad, n));
+        }
     }
     changed = (drv_high ^ s->drive_high) | (drv_low ^ s->drive_low);
     s->drive_high = drv_high;
@@ -2144,19 +2202,25 @@ static void esp32p4_gpio_update(ESP32P4GpioState *s)
 
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
- * Whether a change to an input, which fn(s, n, level) takes, comes in
- * while a round resolves at another time: it is then held back, to be
+ * Whether a change to an input, which fn(opaque, n, level) takes, comes
+ * in while a round resolves at another time: it is then held back, to be
  * resolved at its own time. Such a change is, for one, the edge of a
  * source that was behind and catches up as it takes the round's change.
  */
-static bool esp32p4_gpio_held_back(ESP32P4GpioState *s, LineInput *fn,
-                                   int n, int level)
+static bool held_back(ESP32P4GpioState *s, LineInput *fn, void *opaque,
+                      int n, int level)
 {
     if (!s->updating || esp32_line_time() == s->round_ns) {
         return false;
     }
-    line_defer(&s->deferred, fn, s, n, level, esp32_line_time());
+    line_defer(&s->deferred, fn, opaque, n, level, esp32_line_time());
     return true;
+}
+
+static bool esp32p4_gpio_held_back(ESP32P4GpioState *s, LineInput *fn,
+                                   int n, int level)
+{
+    return held_back(s, fn, s, n, level);
 }
 
 /* A filter output change, at the time it falls due, esp32_line_time(). */
@@ -2339,14 +2403,20 @@ void esp32p4_gpio_add_route_notifier(ESP32P4GpioState *s, Notifier *n)
 /* [spec:nuos:req:emu.esp32p4.gpio] */
 bool esp32p4_gpio_pad_driven(ESP32P4GpioState *s, unsigned n, bool *level)
 {
+    bool hi, lo, val;
+
     if (n >= ESP32P4_GPIO_PADS) {
         return false;
     }
-    if (bit64(s->ext_driven, n)) {
-        *level = bit64(s->ext_level, n);
-        return true;
+    hi = bit64(s->ext_high, n);
+    lo = bit64(s->ext_low, n);
+    if (pad_driven_by_chip(s, n, &val)) {
+        hi |= val;
+        lo |= !val;
     }
-    return pad_driven_by_chip(s, n, level);
+    /* Drivers at odds leave the pad undefined, reading low. */
+    *level = hi && !lo;
+    return hi || lo;
 }
 
 /* [spec:nuos:req:emu.esp32p4.gpio] */
@@ -2392,7 +2462,7 @@ bool esp32p4_gpio_sig_in_source(ESP32P4GpioState *s, unsigned sig,
     } else {
         pad = iomux_in_pad(s, sig);
     }
-    if (pad < 0 || lp_owned(s, pad) || bit64(s->ext_driven, pad) ||
+    if (pad < 0 || lp_owned(s, pad) || bit64(s->ext_high | s->ext_low, pad) ||
         bit64(s->held, pad) || s->pad_wire[pad]) {
         return false;
     }
@@ -2513,9 +2583,9 @@ void esp32p4_gpio_pad_out_path(ESP32P4GpioState *s, unsigned n, int sig,
         (sig < 0 && func >= ESP32P4_IOMUX_FUNCS)) {
         return;
     }
-    if (bit64(s->ext_driven, n)) {
+    if (bit64(s->ext_high | s->ext_low, n)) {
         *off = true;
-        *off_level = bit64(s->ext_level, n);
+        *off_level = !bit64(s->ext_low, n);
         return;
     }
     if (bit64(s->held, n)) {
@@ -3462,6 +3532,39 @@ static const MemoryRegionOps esp32p4_gpio_ops = {
 
 /* Inputs */
 
+/* Of every outside driver, the pads one drives high and those one low. */
+static void ext_update(ESP32P4GpioState *s)
+{
+    s->ext_high = 0;
+    s->ext_low = 0;
+    for (unsigned d = 0; d < ESP32P4_GPIO_EXT_DRIVERS; d++) {
+        s->ext_high |= s->ext_driven[d] & s->ext_level[d];
+        s->ext_low |= s->ext_driven[d] & ~s->ext_level[d];
+    }
+}
+
+/* Outside driver @d drives pad n at @level, or (@release) stops. */
+static void ext_drive(ESP32P4GpioState *s, unsigned d, unsigned n,
+                      bool release, bool level)
+{
+    uint64_t driven = s->ext_driven[d], lvl = s->ext_level[d];
+
+    if (release) {
+        driven &= ~BIT_ULL(n);
+    } else {
+        driven |= BIT_ULL(n);
+        lvl = deposit64(lvl, n, 1, level);
+    }
+    if (driven == s->ext_driven[d] && lvl == s->ext_level[d]) {
+        return;
+    }
+    filters_catch_up(s, esp32_line_time());
+    s->ext_driven[d] = driven;
+    s->ext_level[d] = lvl;
+    ext_update(s);
+    esp32p4_gpio_update_pads(s, BIT_ULL(n));
+}
+
 static void esp32p4_gpio_pad_in(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
@@ -3469,10 +3572,7 @@ static void esp32p4_gpio_pad_in(void *opaque, int n, int level)
     if (esp32p4_gpio_held_back(s, esp32p4_gpio_pad_in, n, level)) {
         return;
     }
-    filters_catch_up(s, esp32_line_time());
-    s->ext_driven |= 1ULL << n;
-    s->ext_level = deposit64(s->ext_level, n, 1, level != 0);
-    esp32p4_gpio_update_pads(s, 1ULL << n);
+    ext_drive(s, 0, n, false, level != 0);
 }
 
 static void esp32p4_gpio_pad_release(void *opaque, int n, int level)
@@ -3483,10 +3583,70 @@ static void esp32p4_gpio_pad_release(void *opaque, int n, int level)
         return;
     }
     if (level) {
-        filters_catch_up(s, esp32_line_time());
-        s->ext_driven &= ~(1ULL << n);
-        esp32p4_gpio_update_pads(s, 1ULL << n);
+        ext_drive(s, 0, n, true, false);
     }
+}
+
+static void esp32p4_gpio_ext_in_line(void *opaque, int n, int level)
+{
+    ESP32P4GpioExtDriver *e = opaque;
+
+    if (held_back(e->s, esp32p4_gpio_ext_in_line, e, n, level)) {
+        return;
+    }
+    ext_drive(e->s, e->id, n, false, level != 0);
+}
+
+static void esp32p4_gpio_ext_release_line(void *opaque, int n, int level)
+{
+    ESP32P4GpioExtDriver *e = opaque;
+
+    if (held_back(e->s, esp32p4_gpio_ext_release_line, e, n, level)) {
+        return;
+    }
+    if (level) {
+        ext_drive(e->s, e->id, n, true, false);
+    }
+}
+
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+unsigned esp32p4_gpio_ext_driver(ESP32P4GpioState *s, const char *name)
+{
+    unsigned d = s->ext_drivers++;
+    ESP32P4GpioExtDriver *e = &s->ext[d];
+
+    g_assert(d < ESP32P4_GPIO_EXT_DRIVERS);
+    s->ext_name[d] = g_strdup(name);
+    e->s = s;
+    e->id = d;
+    e->in = qemu_allocate_irqs(esp32p4_gpio_ext_in_line, e,
+                               ESP32P4_GPIO_PADS);
+    e->release = qemu_allocate_irqs(esp32p4_gpio_ext_release_line, e,
+                                    ESP32P4_GPIO_PADS);
+    return d;
+}
+
+qemu_irq esp32p4_gpio_ext_in(ESP32P4GpioState *s, unsigned d, unsigned n)
+{
+    g_assert(d > 0 && d < s->ext_drivers && n < ESP32P4_GPIO_PADS);
+    return s->ext[d].in[n];
+}
+
+qemu_irq esp32p4_gpio_ext_release(ESP32P4GpioState *s, unsigned d,
+                                  unsigned n)
+{
+    g_assert(d > 0 && d < s->ext_drivers && n < ESP32P4_GPIO_PADS);
+    return s->ext[d].release[n];
+}
+
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+void esp32p4_gpio_watch_pad(ESP32P4GpioState *s, unsigned n, qemu_irq irq)
+{
+    g_assert(n < ESP32P4_GPIO_PADS &&
+             s->pad_watches[n] < ESP32P4_GPIO_PAD_WATCHES);
+    /* Held for this block's life, as a connected output holds its input. */
+    object_ref(OBJECT(irq));
+    s->pad_watch[n][s->pad_watches[n]++] = irq;
 }
 
 static void esp32p4_gpio_set_sig_out(void *opaque, int n, int level)
@@ -3950,8 +4110,8 @@ static void esp32p4_gpio_reset_hold(Object *obj, ResetType type)
     s->strap = 0;
     for (unsigned i = 0; i < ESP32P4_GPIO_STRAP_PINS; i++) {
         unsigned pad = 38 - i;
-        bool v = bit64(s->ext_driven, pad) ? bit64(s->ext_level, pad)
-                                           : extract32(s->strap_mode, i, 1);
+        bool v = bit64(s->ext_high | s->ext_low, pad) ?
+                 !bit64(s->ext_low, pad) : extract32(s->strap_mode, i, 1);
 
         s->strap |= (uint32_t)v << i;
     }
@@ -4021,8 +4181,8 @@ static void esp32p4_gpio_get_mask(Object *obj, Visitor *v, const char *name,
                                   void *opaque, Error **errp)
 {
     ESP32P4GpioState *s = ESP32P4_GPIO(obj);
-    uint64_t value = strcmp(name, "pad-ext-driven") ? s->ext_level
-                                                     : s->ext_driven;
+    uint64_t value = strcmp(name, "pad-ext-driven") ? s->ext_level[0]
+                                                     : s->ext_driven[0];
 
     visit_type_uint64(v, name, &value, errp);
 }
@@ -4042,10 +4202,11 @@ static void esp32p4_gpio_set_mask(Object *obj, Visitor *v, const char *name,
         return;
     }
     if (strcmp(name, "pad-ext-driven")) {
-        s->ext_level = value;
+        s->ext_level[0] = value;
     } else {
-        s->ext_driven = value;
+        s->ext_driven[0] = value;
     }
+    ext_update(s);
     if (DEVICE(obj)->realized) {
         esp32p4_gpio_update(s);
     }
@@ -4156,6 +4317,8 @@ static void esp32p4_gpio_init(Object *obj)
     notifier_list_init(&s->route_notifiers);
     notifier_list_init(&s->load_notifiers);
     s->line_source.notify = esp32p4_gpio_line_sync;
+    s->ext_name[0] = g_strdup("outside");
+    s->ext_drivers = 1;
 
     qdev_init_gpio_in_named(dev, esp32p4_gpio_pad_in, ESP32P4_GPIO_PAD_IN,
                             ESP32P4_GPIO_PADS);
@@ -4288,14 +4451,15 @@ static int esp32p4_gpio_post_load(void *opaque, int version_id)
 {
     ESP32P4GpioState *s = opaque;
 
+    ext_update(s);
     s->dirty_all = true;
     return 0;
 }
 
 static const VMStateDescription vmstate_esp32p4_gpio = {
     .name = TYPE_ESP32P4_GPIO,
-    .version_id = 6,
-    .minimum_version_id = 6,
+    .version_id = 7,
+    .minimum_version_id = 7,
     .post_load = esp32p4_gpio_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(iomux_clk, ESP32P4GpioState),
@@ -4368,8 +4532,10 @@ static const VMStateDescription vmstate_esp32p4_gpio = {
                             ESP32P4_GPIO_ANA_COMPS),
         VMSTATE_INT64_ARRAY(ana_comp_int_ns, ESP32P4GpioState,
                             ESP32P4_GPIO_ANA_COMPS),
-        VMSTATE_UINT64(ext_driven, ESP32P4GpioState),
-        VMSTATE_UINT64(ext_level, ESP32P4GpioState),
+        VMSTATE_UINT64_ARRAY(ext_driven, ESP32P4GpioState,
+                             ESP32P4_GPIO_EXT_DRIVERS),
+        VMSTATE_UINT64_ARRAY(ext_level, ESP32P4GpioState,
+                             ESP32P4_GPIO_EXT_DRIVERS),
         VMSTATE_UINT64(ext_pull_up, ESP32P4GpioState),
         VMSTATE_UINT64(ext_phy, ESP32P4GpioState),
         VMSTATE_UINT64(ext_analog, ESP32P4GpioState),
@@ -4465,7 +4631,12 @@ static void esp32p4_gpio_class_init(ObjectClass *klass, const void *data)
 
 static void esp32p4_gpio_finalize(Object *obj)
 {
-    line_deferred_finalize(&ESP32P4_GPIO(obj)->deferred);
+    ESP32P4GpioState *s = ESP32P4_GPIO(obj);
+
+    line_deferred_finalize(&s->deferred);
+    for (unsigned d = 0; d < s->ext_drivers; d++) {
+        g_free(s->ext_name[d]);
+    }
 }
 
 /* [spec:nuos:req:emu.esp32p4.gpio] */

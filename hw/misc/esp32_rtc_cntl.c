@@ -1215,7 +1215,12 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
     case A_RTC_CNTL_TIMER2 ... A_RTC_CNTL_TIMER5:
     case A_RTC_CNTL_STORE0 ... A_RTC_CNTL_EXT_XTL_CONF:
     case A_RTC_CNTL_CPU_PERIOD_CONF ... A_RTC_CNTL_SDIO_ACT_CONF:
-    case A_RTC_CNTL_SDIO_CONF ... A_RTC_CNTL_VREG:
+    case A_RTC_CNTL_SDIO_CONF:
+        *r = v & writable;
+        qemu_irq_pulse(s->vdd_sdio_update);
+        break;
+
+    case A_RTC_CNTL_BIAS_CONF ... A_RTC_CNTL_VREG:
     case A_RTC_CNTL_DIG_PWC:
     case A_RTC_CNTL_WDTWPROTECT ... A_RTC_CNTL_TEST_MUX:
     case A_RTC_CNTL_STORE4 ... A_RTC_CNTL_STORE7:
@@ -1375,6 +1380,8 @@ static void esp32_rtc_cntl_init(Object *obj)
                              ESP32_RTC_CPU_STALL_GPIO, ESP32_CPU_COUNT);
     qdev_init_gpio_out_named(dev, &s->clk_update,
                              ESP32_RTC_CLK_UPDATE_GPIO, 1);
+    qdev_init_gpio_out_named(dev, &s->vdd_sdio_update,
+                             ESP32_RTC_VDD_SDIO_GPIO, 1);
     qdev_init_gpio_out_named(dev, &s->touch_timer_en,
                              ESP32_RTC_TOUCH_TIMER_GPIO, 1);
     qdev_init_gpio_out_named(dev, &s->ulp_timer_en,

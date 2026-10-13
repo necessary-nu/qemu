@@ -182,6 +182,9 @@ struct ESP32P4I3CMstState {
     int64_t free_at;
     bool dev_active;
     bool dev_i2c;
+    /* A legacy I2C device took i2c_addr: its transfer is open. */
+    bool i2c_open;
+    uint8_t i2c_addr;
 
     /* IBIs: the one being taken from a target, and those to report. */
     ESP32P4I3CIbi ibi_in;

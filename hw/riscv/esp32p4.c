@@ -164,12 +164,21 @@
  *     set to, as a USB-serial bridge matched to the chip would; a byte gets
  *     through only where software has routed the UART to those pads. Port
  *     0 (-serial, the console) is on UART0's IO MUX pads, U0TXD GPIO37 and
- *     U0RXD GPIO38, where the boot ROM prints; port 1 on UART1's IO MUX
- *     pads, GPIO10 (TXD) and GPIO11 (RXD); ports 2 to 4, for UART2 to
- *     UART4, which have no IO MUX pads, on GPIO16/17, GPIO18/19 and
- *     GPIO20/21 (TXD/RXD), which the matrix can route them to; port 5 on
- *     the LP UART's LP IO MUX pads, GPIO14 (TXD) and GPIO15 (RXD). A port
- *     drives its RXD pad, idle high, only while its chardev is connected:
+ *     U0RXD GPIO38, where the board's USB-UART bridge is and the boot ROM
+ *     prints. The board wires no other UART: ports 1 to 4, for UART1 to
+ *     UART4, are on GPIO20/21, GPIO22/23, GPIO32/33 and GPIO46/47
+ *     (TXD/RXD), and port 5, the LP UART's, on LP pads GPIO4/5, pads
+ *     nothing on the board but the 40-pin header uses, which software
+ *     routes the UARTs to through the matrices (esp32p4_serial_pads[]).
+ *     The serialN-pads properties put port N elsewhere, onto pads the
+ *     board uses too if wanted, its terminal then one of the pad's
+ *     drivers (UART1 on its IO MUX pads, which carry the codec's LRCK and
+ *     ASDOUT, here):
+ *
+ *       -M esp32p4,serial1-pads=10:11
+ *
+ *     A port drives its RXD pad, idle high, only while its chardev is
+ *     connected:
  *
  *       -serial stdio -serial null -serial file:uart2.log
  *
@@ -2203,10 +2212,9 @@ static void esp32p4_init_emac(ESP32P4MachineState *s)
                                         s->emac.pad_mdio), 1);
     qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_PAD_PULL_UP,
                                         ESP32P4_BOARD_PHY_RESET_PAD), 1);
-    qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_OUT,
-                                ESP32P4_BOARD_PHY_RESET_PAD,
-                                qemu_irq_invert(qdev_get_gpio_in_named(phy,
-                                    IP101_PHY_RESET, 0)));
+    esp32p4_gpio_watch_pad(&s->gpio, ESP32P4_BOARD_PHY_RESET_PAD,
+                           qemu_irq_invert(qdev_get_gpio_in_named(phy,
+                               IP101_PHY_RESET, 0)));
 }
 
 /*
@@ -2411,8 +2419,7 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
          * [spec:nuos:req:emu.esp32p4.gpio]
          * A card in slot 1 stands where the ESP32-C6 is, and with it the
          * board's pull-ups on its lines (R15 to R21, to ESP_3V3); with
-         * the C6 not modelled, those pads otherwise serve the machine's
-         * other uses (the serial ports on GPIO16 to GPIO19).
+         * the C6 not modelled and no card, those pads have neither.
          */
         if (slot == 1 && dinfo) {
             ESP32P4SdmmcState *sd = &s->sdmmc;
@@ -2825,9 +2832,9 @@ static void esp32p4_init_low_power(ESP32P4MachineState *s)
                                     ESP32P4_PMU_WAKEUP,
                                     ESP32P4_PMU_WAKE_RTC_TIMER1));
     for (i = 0; i < ESP32P4_PMU_EXT_PADS; i++) {
-        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_OUT, i,
-                                    qdev_get_gpio_in_named(pmu,
-                                        ESP32P4_PMU_EXT_PAD, i));
+        esp32p4_gpio_watch_pad(&s->gpio, i,
+                               qdev_get_gpio_in_named(pmu,
+                                                      ESP32P4_PMU_EXT_PAD, i));
     }
 
     object_initialize_child(OBJECT(s), "lp-ana", &s->lp_ana,
@@ -4501,33 +4508,28 @@ static void esp32p4_init_uart(ESP32P4MachineState *s)
 {
     static const struct {
         int txd, rts, dtr, rxd, cts, dsr;
-        int tx_pad, rx_pad;
     } lines[ESP32P4_UART_COUNT] = {
         { ESP32P4_SIG_UART0_TXD_PAD_OUT, ESP32P4_SIG_UART0_RTS_PAD_OUT,
           ESP32P4_SIG_UART0_DTR_PAD_OUT, ESP32P4_SIG_UART0_RXD_PAD_IN,
-          ESP32P4_SIG_UART0_CTS_PAD_IN, ESP32P4_SIG_UART0_DSR_PAD_IN,
-          37, 38 },
+          ESP32P4_SIG_UART0_CTS_PAD_IN, ESP32P4_SIG_UART0_DSR_PAD_IN },
         { ESP32P4_SIG_UART1_TXD_PAD_OUT, ESP32P4_SIG_UART1_RTS_PAD_OUT,
           ESP32P4_SIG_UART1_DTR_PAD_OUT, ESP32P4_SIG_UART1_RXD_PAD_IN,
-          ESP32P4_SIG_UART1_CTS_PAD_IN, ESP32P4_SIG_UART1_DSR_PAD_IN,
-          10, 11 },
+          ESP32P4_SIG_UART1_CTS_PAD_IN, ESP32P4_SIG_UART1_DSR_PAD_IN },
         { ESP32P4_SIG_UART2_TXD_PAD_OUT, ESP32P4_SIG_UART2_RTS_PAD_OUT,
           ESP32P4_SIG_UART2_DTR_PAD_OUT, ESP32P4_SIG_UART2_RXD_PAD_IN,
-          ESP32P4_SIG_UART2_CTS_PAD_IN, ESP32P4_SIG_UART2_DSR_PAD_IN,
-          16, 17 },
+          ESP32P4_SIG_UART2_CTS_PAD_IN, ESP32P4_SIG_UART2_DSR_PAD_IN },
         { ESP32P4_SIG_UART3_TXD_PAD_OUT, ESP32P4_SIG_UART3_RTS_PAD_OUT,
           ESP32P4_SIG_UART3_DTR_PAD_OUT, ESP32P4_SIG_UART3_RXD_PAD_IN,
-          ESP32P4_SIG_UART3_CTS_PAD_IN, ESP32P4_SIG_UART3_DSR_PAD_IN,
-          18, 19 },
+          ESP32P4_SIG_UART3_CTS_PAD_IN, ESP32P4_SIG_UART3_DSR_PAD_IN },
         { ESP32P4_SIG_UART4_TXD_PAD_OUT, ESP32P4_SIG_UART4_RTS_PAD_OUT,
           ESP32P4_SIG_UART4_DTR_PAD_OUT, ESP32P4_SIG_UART4_RXD_PAD_IN,
-          ESP32P4_SIG_UART4_CTS_PAD_IN, ESP32P4_SIG_UART4_DSR_PAD_IN,
-          20, 21 },
+          ESP32P4_SIG_UART4_CTS_PAD_IN, ESP32P4_SIG_UART4_DSR_PAD_IN },
     };
     DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
     DeviceState *pmu = DEVICE(&s->pmu), *wake_en, *lp_wake;
     DeviceState *dev, *term;
     ESP32P4ClkRstGate *g;
+    uint64_t used = 0;
     int i;
 
     object_initialize_child(OBJECT(s), "uart-wakeup-en-split",
@@ -4638,9 +4640,21 @@ static void esp32p4_init_uart(ESP32P4MachineState *s)
                                     ESP32P4_UART_DSR, 0));
 
     for (i = 0; i < ESP32P4_SERIAL_PORTS; i++) {
+        for (int k = 0; k < 2; k++) {
+            if (used & BIT_ULL(s->serial_pad[i][k])) {
+                error_report("esp32p4: serial%d-pads: GPIO%u is another "
+                             "serial port's", i, s->serial_pad[i][k]);
+                exit(1);
+            }
+            used |= BIT_ULL(s->serial_pad[i][k]);
+        }
+    }
+    for (i = 0; i < ESP32P4_SERIAL_PORTS; i++) {
         bool lp = i == ESP32P4_UART_COUNT;
-        int tx_pad = lp ? 14 : lines[i].tx_pad;
-        int rx_pad = lp ? 15 : lines[i].rx_pad;
+        int tx_pad = s->serial_pad[i][ESP32P4_SERIAL_TX];
+        int rx_pad = s->serial_pad[i][ESP32P4_SERIAL_RX];
+        g_autofree char *name = g_strdup_printf("serial port %d", i);
+        unsigned d = esp32p4_gpio_ext_driver(&s->gpio, name);
 
         object_initialize_child(OBJECT(s), "terminal[*]", &s->terminal[i],
                                 TYPE_ESP32_UART_TERMINAL);
@@ -4649,12 +4663,11 @@ static void esp32p4_init_uart(ESP32P4MachineState *s)
         object_property_set_link(OBJECT(term), "uart",
                                  OBJECT(lp ? &s->lp_uart : &s->uart[i]),
                                  &error_abort);
-        qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_OUT, tx_pad,
-                                    qdev_get_gpio_in_named(term,
-                                        ESP32_UART_TERMINAL_RX, 0));
+        esp32p4_gpio_watch_pad(&s->gpio, tx_pad,
+                               qdev_get_gpio_in_named(term,
+                                   ESP32_UART_TERMINAL_RX, 0));
         qdev_connect_gpio_out_named(term, ESP32_UART_TERMINAL_TX, 0,
-                                    qdev_get_gpio_in_named(gpio,
-                                        ESP32P4_GPIO_PAD_IN, rx_pad));
+                                    esp32p4_gpio_ext_in(&s->gpio, d, rx_pad));
         qdev_realize(term, NULL, &error_fatal);
     }
 
@@ -5178,6 +5191,73 @@ static void esp32p4_set_strap_mode(Object *obj, Visitor *v,
     ESP32P4_MACHINE(obj)->strap_mode = value;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.uart]
+ * The serial ports' pads by default. The board wires one UART, UART0 on
+ * its IO MUX pads, GPIO37 (U0TXD) and GPIO38 (U0RXD), to its CH343P
+ * USB-UART bridge, its UART header H2 and the 40-pin header's TXD and
+ * RXD pins. The other ports have pads the board connects to nothing but
+ * the 40-pin header, where software routes their UARTs through the GPIO
+ * matrix (the LP UART through the LP matrix, to LP pads): UART1's IO MUX
+ * pads, GPIO10 and GPIO11, carry the ES8311's LRCK and ASDOUT, and the LP
+ * UART's, GPIO14 and GPIO15, like GPIO16 to GPIO19, the ESP32-C6's SDIO
+ * lines; GPIO0 and GPIO1 hold the 32 kHz crystal.
+ */
+static const uint8_t esp32p4_serial_pads[ESP32P4_SERIAL_PORTS][2] = {
+    { 37, 38 }, { 20, 21 }, { 22, 23 }, { 32, 33 }, { 46, 47 }, { 4, 5 },
+};
+
+/* The port a serialN-pads property is for */
+static unsigned esp32p4_serial_port(const char *name)
+{
+    return name[strlen("serial")] - '0';
+}
+
+static void esp32p4_get_serial_pads(Object *obj, Visitor *v,
+                                    const char *name, void *opaque,
+                                    Error **errp)
+{
+    ESP32P4MachineState *s = ESP32P4_MACHINE(obj);
+    unsigned port = esp32p4_serial_port(name);
+    g_autofree char *value =
+        g_strdup_printf("%u:%u", s->serial_pad[port][ESP32P4_SERIAL_TX],
+                        s->serial_pad[port][ESP32P4_SERIAL_RX]);
+
+    visit_type_str(v, name, &value, errp);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.uart]
+ * "TX:RX": two pads, LP pads for the LP UART's port 5. That no pad is
+ * two ports' is checked as the machine is built.
+ */
+static void esp32p4_set_serial_pads(Object *obj, Visitor *v,
+                                    const char *name, void *opaque,
+                                    Error **errp)
+{
+    ESP32P4MachineState *s = ESP32P4_MACHINE(obj);
+    unsigned port = esp32p4_serial_port(name);
+    unsigned max = port == ESP32P4_UART_COUNT ? ESP32P4_GPIO_LP_PADS
+                                              : ESP32P4_GPIO_PADS;
+    g_autofree char *value = NULL;
+    unsigned tx, rx;
+    char end;
+
+    if (!visit_type_str(v, name, &value, errp)) {
+        return;
+    }
+    if (sscanf(value, "%u:%u%c", &tx, &rx, &end) != 2 || tx >= max ||
+        rx >= max || tx == rx) {
+        error_setg(errp, "%s: '%s' is not TX:RX, two pads from GPIO0 to "
+                   "GPIO%u%s", name, value, max - 1,
+                   port == ESP32P4_UART_COUNT ? ", the LP UART's LP pads" :
+                                                "");
+        return;
+    }
+    s->serial_pad[port][ESP32P4_SERIAL_TX] = tx;
+    s->serial_pad[port][ESP32P4_SERIAL_RX] = rx;
+}
+
 static char *esp32p4_get_lp_rom(Object *obj, Error **errp)
 {
     return g_strdup(ESP32P4_MACHINE(obj)->lp_rom_file);
@@ -5198,6 +5278,7 @@ static void esp32p4_machine_instance_init(Object *obj)
     ESP32P4MachineState *s = ESP32P4_MACHINE(obj);
 
     s->strap_mode = ESP32P4_GPIO_STRAP_SPI_BOOT;
+    memcpy(s->serial_pad, esp32p4_serial_pads, sizeof(s->serial_pad));
     /* Early, for the clock tree to take the EMAC's and I2S's pad clocks. */
     object_initialize_child(obj, "emac", &s->emac, TYPE_ESP32P4_EMAC);
     object_initialize_child(obj, "phy", &s->phy, TYPE_IP101_PHY);
@@ -5266,6 +5347,19 @@ static void esp32p4_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "strap-mode",
         "The board's strapping of GPIO38 (bit 0) to GPIO34 (bit 4), which "
         "GPIO_STRAP latches at reset (default 0x08: SPI boot)");
+    for (unsigned i = 0; i < ESP32P4_SERIAL_PORTS; i++) {
+        g_autofree char *name = g_strdup_printf("serial%u-pads", i);
+        g_autofree char *uart = i == ESP32P4_UART_COUNT ?
+            g_strdup("the LP UART's TXD:RXD, LP pads") :
+            g_strdup_printf("UART%u's TXD:RXD", i);
+        g_autofree char *desc = g_strdup_printf(
+            "Serial port %u's pads: %s (default %u:%u)", i, uart,
+            esp32p4_serial_pads[i][0], esp32p4_serial_pads[i][1]);
+
+        object_class_property_add(oc, name, "str", esp32p4_get_serial_pads,
+                                  esp32p4_set_serial_pads, NULL, NULL);
+        object_class_property_set_description(oc, name, desc);
+    }
     object_class_property_add_str(oc, "lp-rom", esp32p4_get_lp_rom,
                                   esp32p4_set_lp_rom);
     object_class_property_set_description(oc, "lp-rom",

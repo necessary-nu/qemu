@@ -63,4 +63,22 @@ int64_t m25p80_busy_until(DeviceState *dev);
  */
 bool m25p80_hold_enabled(DeviceState *dev);
 
+/*
+ * For a board that clocks the part's lines itself: whether the part
+ * drives its data outputs for the next byte the bus clocks (it is
+ * selected, has taken a command that reads, and answers it), and the
+ * read command a continuous read mode (M5-4 = 10b) keeps for its next
+ * transaction, which then starts with the address (0: none).
+ */
+bool m25p80_drives_output(DeviceState *dev);
+uint8_t m25p80_continuous_cmd(DeviceState *dev);
+
+/*
+ * The part's supply leaves its operating range: whatever program or erase
+ * it was running is cut short. It comes back: the part starts again as at
+ * power-up, a datasheet part also taking no command for its tVSL.
+ */
+void m25p80_power_off(DeviceState *dev);
+void m25p80_power_on(DeviceState *dev);
+
 #endif

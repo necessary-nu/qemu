@@ -139,11 +139,24 @@ enum {
  * ==========================
  *
  *   ESP32P4_GPIO_PAD_IN, "pad-in" (input, ESP32P4_GPIO_PADS lines): drive
- *     pad n from outside the chip at the level given. An outside driver
- *     wins over the chip's driver and pulls.
+ *     pad n from outside the chip at the level given, as outside driver
+ *     0, "outside" (a test, or the board's fixed wiring below).
  *   ESP32P4_GPIO_PAD_RELEASE, "pad-release" (input): a high level stops
- *     driving pad n from outside.
- *   ESP32P4_GPIO_PAD_OUT, "pad" (output): the level on pad n.
+ *     driver 0 driving pad n.
+ *   esp32p4_gpio_ext_driver() (below): another driver outside the chip,
+ *     a board's chip or connector, with lines of its own to drive pads
+ *     and release them.
+ *   A driver, outside the chip or its own output driver (output enabled,
+ *     push-pull, or open drain driving low), wins over every pull. Pad n
+ *     takes the level of its drivers while they agree; drivers at
+ *     different levels make a divider of like strengths, each a strong
+ *     pull to its rail: the pad is mid-rail, between VIL and VIH, its
+ *     level undefined, and it reads low, logged as a guest error naming
+ *     the drivers.
+ *   ESP32P4_GPIO_PAD_OUT, "pad" (output): the level on pad n, for a test
+ *     to watch. The blocks and board devices that follow a pad's level
+ *     watch it with esp32p4_gpio_watch_pad() (below), as many as there
+ *     are on it.
  *   ESP32P4_GPIO_PAD_DRIVE_HIGH, "pad-drive-high", and _PAD_DRIVE_LOW,
  *     "pad-drive-low" (outputs): high while a digital driver, from outside
  *     or the pad's own (esp32p4_gpio_pad_driven()), holds pad n high, or
@@ -345,6 +358,21 @@ typedef struct ESP32P4GpioFilter {
     uint64_t tick;
 } ESP32P4GpioFilter;
 
+/*
+ * Drivers outside the chip, each with its own level on each pad it drives
+ * (driver 0 the "pad-in" lines), and the most watchers a pad's level has.
+ */
+#define ESP32P4_GPIO_EXT_DRIVERS 16
+#define ESP32P4_GPIO_PAD_WATCHES 8
+
+/* An outside driver's lines: drive pad n at a level, release pad n. */
+typedef struct ESP32P4GpioExtDriver {
+    ESP32P4GpioState *s;
+    unsigned id;
+    qemu_irq *in;
+    qemu_irq *release;
+} ESP32P4GpioExtDriver;
+
 /* Words of a bitmap of the HP signals */
 #define ESP32P4_GPIO_SIG_WORDS  (ESP32P4_GPIO_SIGS / 64)
 /* Values of GPIO_PINn_INT_TYPE and LP_GPIO_PINn_INT_TYPE, 3-bit fields */
@@ -496,9 +524,22 @@ struct ESP32P4GpioState {
     uint8_t ana_comp[ESP32P4_GPIO_ANA_COMPS];
     int64_t ana_comp_int_ns[ESP32P4_GPIO_ANA_COMPS];
 
-    /* Levels driven into the block from outside */
-    uint64_t ext_driven;
-    uint64_t ext_level;
+    /*
+     * Levels driven into the block from outside: the pads each outside
+     * driver drives and their levels, driver 0 the "pad-in" lines' and
+     * the board's fixed wiring's; of them all, the pads one drives high
+     * and those one drives low; and each driver's name and lines.
+     */
+    uint64_t ext_driven[ESP32P4_GPIO_EXT_DRIVERS];
+    uint64_t ext_level[ESP32P4_GPIO_EXT_DRIVERS];
+    uint64_t ext_high;
+    uint64_t ext_low;
+    unsigned ext_drivers;
+    char *ext_name[ESP32P4_GPIO_EXT_DRIVERS];
+    ESP32P4GpioExtDriver ext[ESP32P4_GPIO_EXT_DRIVERS];
+    /* The irqs that follow each pad's level */
+    qemu_irq pad_watch[ESP32P4_GPIO_PADS][ESP32P4_GPIO_PAD_WATCHES];
+    uint8_t pad_watches[ESP32P4_GPIO_PADS];
     uint64_t ext_pull_up;
     /* The pads a USB PHY has, and those an analog block holds mid-rail */
     uint64_t ext_phy;
@@ -582,6 +623,8 @@ struct ESP32P4GpioState {
     uint64_t pull_down_ns[ESP32P4_GPIO_PADS];
     uint64_t ie_mask;
     uint64_t undefined;
+    /* The pads driven high and low at once, as resolved */
+    uint64_t contended;
     /*
      * The pads whose output a USB PHY keeps off them while software
      * enables it, and those whose input buffer sees an analog block's
@@ -704,6 +747,30 @@ bool esp32p4_gpio_pad_level(ESP32P4GpioState *s, unsigned n);
  */
 bool esp32p4_gpio_pad_load(ESP32P4GpioState *s, unsigned n, bool *level,
                            uint64_t *up_ns, uint64_t *down_ns);
+
+/*
+ * A new driver outside the chip, @name in its guest errors ("the
+ * ES8311", "serial port 1"): returns its number, @d, for its lines.
+ * Pads it drives take part in the pads' resolution as "pad-in"'s do,
+ * each driver with its own level. Call it while building the machine.
+ */
+unsigned esp32p4_gpio_ext_driver(ESP32P4GpioState *s, const char *name);
+
+/*
+ * Outside driver @d's lines for pad n: a level on the first drives the
+ * pad at that level, a high level on the second stops driving it.
+ */
+qemu_irq esp32p4_gpio_ext_in(ESP32P4GpioState *s, unsigned d, unsigned n);
+qemu_irq esp32p4_gpio_ext_release(ESP32P4GpioState *s, unsigned d,
+                                  unsigned n);
+
+/*
+ * Make @irq follow pad n's level, as "pad" does, set at each change
+ * (timed as esp32_line.h describes) and at every reset of this block:
+ * each block or board device that watches a pad, a wakeup input, a
+ * terminal, a chip on the board, has its own.
+ */
+void esp32p4_gpio_watch_pad(ESP32P4GpioState *s, unsigned n, qemu_irq irq);
 
 /*
  * Notifier n is told of each change to the load on any pad, in the

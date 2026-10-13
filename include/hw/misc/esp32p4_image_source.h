@@ -419,8 +419,8 @@ void esp32p4_image_source_connect_xclk(ESP32P4ImageSource *s, Clock *cam_clk);
 
 /*
  * Board wiring, for the machine: drive VSYNC, HSYNC and DE onto their
- * pads, and watch PWDN and RESETB, through the GPIO block's "pad-in",
- * "pad-release" and "pad" lines.
+ * pads, as an outside driver of the GPIO block's own, and watch PWDN and
+ * RESETB (esp32p4_gpio_ext_driver(), esp32p4_gpio_watch_pad()).
  */
 void esp32p4_image_source_connect_pads(ESP32P4ImageSource *s,
                                        DeviceState *gpio);

@@ -870,6 +870,13 @@ void esp32p4_clkrst_gate_volatile(ESP32P4ClkRstGate *g, hwaddr offset,
                                   unsigned size);
 
 /*
+ * The block a gated mapping's region @mr leads to, or NULL for a region
+ * that is not one: for a DMA master that must see whether the block is in
+ * the middle of an access, which the gate has no owner to show.
+ */
+DeviceState *esp32p4_clkrst_gated_device(MemoryRegion *mr);
+
+/*
  * Record a reset of the cores in @cores (ESP32P4_CLKRST_CORE_*) with
  * @cause: the LP_CLKRST_*_RESET_CAUSE code, and the reset flag set.
  */

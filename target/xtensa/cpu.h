@@ -337,6 +337,15 @@ typedef struct XtensaExtHooks {
     void (*vector)(void *opaque, CPUXtensaState *env, uint32_t pc);
     /* Called before the instruction at which countdown n runs out. */
     void (*countdown_expired)(void *opaque, CPUXtensaState *env, unsigned n);
+    /*
+     * Called as code is translated, for the bytes the core fetches: each
+     * instruction's, and an L32R's literal at a constant address. The
+     * translation precedes the code's first execution, and a translated
+     * block runs again without fetching, so this is the code's fetch from
+     * the memory as a cache would see it miss.
+     */
+    void (*fetch)(void *opaque, CPUXtensaState *env, uint32_t vaddr,
+                  unsigned len, bool insn);
 } XtensaExtHooks;
 #endif
 

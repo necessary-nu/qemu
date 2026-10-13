@@ -324,6 +324,7 @@ uint64_t icount_window_start(uint64_t units, int cpus)
     timers_state.window_units = units;
     timers_state.window_cpus = cpus;
     timers_state.window_running = cpus;
+    timers_state.window_bias = timers_state.qemu_icount_bias;
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
                          &timers_state.vm_clock_lock);
     return moved;
@@ -679,9 +680,24 @@ void icount_start_warp_timer(void)
         }
     }
 
-    /* We want to use the earliest deadline from ALL vm_clocks */
+    /*
+     * The earliest deadline of the QEMU_CLOCK_VIRTUAL timers, those with
+     * QEMU_TIMER_ATTR_EXTERNAL among them: the timers of what lies outside
+     * the machine, such as the user-mode network's (its router
+     * advertisements) and the input queue's (send-key's held keys). With
+     * every vCPU idle nothing else moves virtual time on to them, so left
+     * out they would fire only at the machine's next timer, or never if it
+     * has none.
+     *
+     * Record/replay leaves them out. Replay moves virtual time by the
+     * recording's warps only by computing the same deadlines again, and
+     * external timers are not part of what is recorded: the network's
+     * advertisement interval, for one, is drawn at random afresh.
+     */
     clock = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT);
     deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
+                                          replay_mode == REPLAY_MODE_NONE ?
+                                          QEMU_TIMER_ATTR_ALL :
                                           ~QEMU_TIMER_ATTR_EXTERNAL);
     if (deadline < 0) {
         if (!icount_sleep) {
@@ -893,6 +909,26 @@ void icount_set_cpu_clock(CPUState *cpu, Clock *clk)
     clock_set_source(cpu->icount_clock, clk);
     qatomic_set(&cpu->icount_period, clock_get(cpu->icount_clock));
     cpu->icount_period_den = 1;
+}
+
+void icount_stall_take(CPUState *cpu)
+{
+    int64_t n = MIN(cpu->icount_stall,
+                    cpu->icount_extra + cpu->neg.icount_decr.u16.low);
+    int64_t extra = MIN(n, cpu->icount_extra);
+
+    cpu->icount_extra -= extra;
+    cpu->neg.icount_decr.u16.low -= n - extra;
+    cpu->icount_stall -= n;
+}
+
+void icount_stall(CPUState *cpu, int64_t insns)
+{
+    if (!icount_enabled() || insns <= 0) {
+        return;
+    }
+    cpu->icount_stall += insns;
+    icount_stall_take(cpu);
 }
 
 void icount_notify_exit(void)

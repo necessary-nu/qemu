@@ -211,6 +211,23 @@ static void icount_window_update(int64_t quantum)
     quantum_units = quantum > 0 ? (uint64_t)quantum << 32 : UINT64_MAX;
     icount_window_waiting = false;
 
+    /*
+     * Virtual time warped on while every CPU in the window was idle. Their
+     * own times in it are where they went idle, the warp not counted, and
+     * off their clocks' edges after it: the window is over, and each CPU
+     * starts afresh as it wakes, on its clock's next edge from the present.
+     * So it does whether or not a timer that woke none of them fired
+     * meanwhile, whose round, with every CPU idle, starts a window of none.
+     */
+    if (timers_state.window_cpus &&
+        qatomic_read(&timers_state.qemu_icount_bias) !=
+        timers_state.window_bias) {
+        CPU_FOREACH(cpu) {
+            icount_window_leave(cpu);
+        }
+        icount_window_start(0, 0);
+    }
+
     CPU_FOREACH(cpu) {
         bool idle;
 
@@ -396,6 +413,7 @@ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
         cpu->icount_insn_frac = 0;
         icount_set_budget(cpu, MIN(icount_get_limit(), cpu_budget));
     }
+    icount_stall_take(cpu);
 }
 
 bool icount_run_left(CPUState *cpu)
@@ -456,6 +474,7 @@ void icount_resume_run(CPUState *cpu, bool go_on)
         budget = MIN(budget, icount_budget_to_deadline(cpu));
     }
     icount_set_budget(cpu, budget);
+    icount_stall_take(cpu);
 }
 
 void icount_process_data(CPUState *cpu)
