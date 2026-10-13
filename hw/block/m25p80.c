@@ -2104,6 +2104,14 @@ BlockBackend *m25p80_get_blk(DeviceState *dev)
     return M25P80(dev)->blk;
 }
 
+/* [spec:nuos:req:emu.flash-chip] */
+bool m25p80_hold_enabled(DeviceState *dev)
+{
+    Flash *s = (Flash *)object_dynamic_cast(OBJECT(dev), TYPE_M25P80);
+
+    return s && !s->quad_enable;
+}
+
 /* [spec:nuos:req:emu.flash-timing] */
 int64_t m25p80_busy_until(DeviceState *dev)
 {
