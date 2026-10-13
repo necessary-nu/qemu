@@ -171,6 +171,8 @@ static void timer_restart(RP2350TimerState *s)
  * the change at the old rate, then start the next count afresh at the
  * new one.
  */
+static void timer_fire_due(RP2350TimerState *s, int64_t now);
+
 static void timer_clock_changed(RP2350TimerState *s, Clock *clk,
                                 ClockEvent event)
 {
@@ -178,6 +180,12 @@ static void timer_clock_changed(RP2350TimerState *s, Clock *clk,
         return;
     }
     if (event == ClockPreUpdate) {
+        /*
+         * An alarm the count has reached by the change, its timer late
+         * without icount, fires at the old rate: re-armed at the new one
+         * it would wait for the count to wrap.
+         */
+        timer_fire_due(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         timer_sync(s);
         return;
     }
