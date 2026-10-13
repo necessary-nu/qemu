@@ -72,9 +72,11 @@
  * does the same and then disables it, raising CH_DISABLED; aborting
  * drops the FIFO and disables it at once, raising CH_ABORTED. A bus error
  * (an access the DMA APM refuses, SLV_ERR, or an address its AXI master
- * cannot reach, DEC_ERR) raises the SRC_, DST_ or LLI_ error and ends the
- * transfer: the channel is disabled. Master 2 reaches the memories only
- * (0x40000000 to 0x4FFFFFFF); master 1 everything.
+ * has no path to, DEC_ERR) raises the SRC_, DST_ or LLI_ error and ends
+ * the transfer: the channel is disabled. Both masters reach the memories
+ * at their 0x4... addresses, master 1 also the CSI and DSI bridges'
+ * buffers (TRM 7.4, 9.3.4): the bus decides (hw/misc/esp32p4_pms.c), and
+ * an address above 32 bits reaches nothing.
  *
  * Every access is DMA master GDMA_CHn (n the channel less one) on the bus
  * through the APMs (include/hw/misc/esp32p4_pms.h), recorded by the ICM
@@ -252,13 +254,6 @@
 #define LLI_BLOCK_TFR_DONE  BIT(30)
 #define LLI_DMA_TFR_DONE    BIT(31)
 
-/* The AXI master interfaces' ports on the interconnect. */
-#define ICM_CID_MASTER1     5
-#define ICM_CID_MASTER2     6
-/* What master 2 reaches: the memories. */
-#define MASTER2_START       0x40000000u
-#define MASTER2_END         0x50000000u
-
 #define LLI_CYCLES          5
 #define WB_CYCLES           3
 
@@ -430,12 +425,12 @@ static bool ch_bus(ESP32P4DwGdmaState *s, int n, int master, uint32_t hi,
                    uint32_t dec, uint32_t slv)
 {
     MemTxAttrs attrs = esp32p4_dma_attrs(ESP32P4_DMA_MASTER_GDMA_CH0 + n,
-        ESP32P4_ICM_ID_AXI(master ? ICM_CID_MASTER2 : ICM_CID_MASTER1, n));
+        ESP32P4_ICM_ID_AXI(master ? ESP32P4_ICM_CID_VDMA_M2
+                                  : ESP32P4_ICM_CID_VDMA_M1, n));
     MemTxResult r;
     const char *why;
 
-    if (hi || (master && (addr < MASTER2_START ||
-                          (uint64_t)addr + len > MASTER2_END))) {
+    if (hi) {
         r = MEMTX_DECODE_ERROR;
     } else {
         r = address_space_rw(s->as, addr, attrs, buf, len, write);

@@ -42,6 +42,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4IcmState, ESP32P4_ICM)
 #define ESP32P4_ICM_ID_AHB_PDMA(sel) (16 + (sel))
 /* An AXI master's ID: its ICM port (CID) and the unit within it (UID). */
 #define ESP32P4_ICM_ID_AXI(cid, uid) (((cid) << 4) | (uid))
+#define ESP32P4_ICM_ID_CID(id)      (((id) >> 4) & 0xf)
+/*
+ * VDMA's two AXI master ports: master 1, which reaches the memories and
+ * the CSI and DSI bridges' buffers, and master 2, the memories only.
+ */
+#define ESP32P4_ICM_CID_VDMA_M1     5
+#define ESP32P4_ICM_CID_VDMA_M2     6
 
 struct ESP32P4IcmState {
     SysBusDevice parent_obj;
@@ -69,10 +76,10 @@ struct ESP32P4IcmState {
 
 /*
  * An access the bus refused: one an APM did not permit (@illegal false)
- * or one to an address nothing decodes (@illegal true), by the master
- * with ID @id, at @addr. @sys selects the record of the AXI masters
- * (ICM_SYS_ADDRHOLE_INT) over that of the CPUs and AHB masters
- * (ICM_CPU_ADDRHOLE_INT).
+ * or one to an address the master's port on the matrix does not decode
+ * (@illegal true), by the master with ID @id, at @addr. @sys selects the
+ * record of the AXI masters (ICM_SYS_ADDRHOLE_INT) over that of the CPUs
+ * and AHB masters (ICM_CPU_ADDRHOLE_INT).
  */
 void esp32p4_icm_addrhole(ESP32P4IcmState *s, bool sys, uint32_t addr,
                           uint8_t id, bool write, bool illegal);

@@ -5,6 +5,7 @@ slow_qtests = {
   'cdrom-test' : 610,
   'device-introspect-test' : 720,
   'esp32p4-migration-test' : 240,
+  'esp32p4-sd-card-test' : 180,
   'ide-test' : 120,
   'migration-test' : 480,
   'npcm7xx_pwm-test': 300,
@@ -373,6 +374,7 @@ qtests_riscv32 = \
   (config_all_devices.has_key('CONFIG_ESP32P4') ?
     ['esp32p4-machine-test', 'esp32p4-clocks-test', 'esp32p4-efuse-test',
      'esp32p4-clic-test', 'esp32p4-intmatrix-test', 'esp32p4-pms-test',
+     'esp32p4-bus-reach-test',
      'esp32p4-gpio-test', 'esp32p4-mmu-test', 'esp32p4-spimem-test',
      'esp32p4-gd25q256e-test',
      'esp32p4-systimer-test', 'esp32p4-timg-test', 'esp32p4-lpwdt-test',

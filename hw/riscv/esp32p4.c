@@ -84,7 +84,12 @@
  *     with their registers HP_PERI_PMS, LP2HP_PERI_PMS, HP_DMA_PMS,
  *     LP_PERI_PMS and HP2LP_PERI_PMS; an access they refuse answers with a
  *     bus error and is recorded by the AXI ICM's registers (0x500A4000),
- *     raising SYS_ICM_INTR, or by LP_SYS's, raising LP_SYSREG_INTR.
+ *     raising SYS_ICM_INTR, or by LP_SYS's, raising LP_SYSREG_INTR. Each
+ *     master reaches only the slaves its port on the bus matrix has a path
+ *     to (TRM chapter 1, 9.3.4): a DMA master the memories at their
+ *     0x4... addresses, not their 0x8... aliases, LP SRAM or a register;
+ *     another address answers with a decode error, and the ICM records a
+ *     DMA master's as illegal.
  *   - Every other peripheral block the chip decodes, as an unimplemented
  *     device named after the block. Addresses the chip does not decode,
  *     the reserved ranges of TRM table 9.3-1 and the unassigned slots
