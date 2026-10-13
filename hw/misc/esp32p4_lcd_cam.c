@@ -163,6 +163,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "exec/icount.h"
 #include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -1740,8 +1741,12 @@ static void lcd_schedule(ESP32P4LcdCamState *s)
     }
 }
 
-/* How far the host may fall behind RGB frames before they slip. */
-#define LCD_MAX_LAG_NS          (10 * SCALE_MS)
+/*
+ * How far the host may fall behind RGB frames before they slip: a
+ * second, far longer than the host's own pauses (a busy host holds QEMU's
+ * main loop up for tens of milliseconds), as the image source has it.
+ */
+#define LCD_MAX_LAG_NS          NANOSECONDS_PER_SECOND
 
 /* RGB frames restart at the present, the ones between dropped. */
 static void rgb_slip(void *opaque)
@@ -1761,12 +1766,15 @@ static void rgb_slip(void *opaque)
 }
 
 /*
- * The timer takes the event at its deadline and no later ones, so that
- * the LCD's events and every other device's run in order of time. On the
- * host's clock RGB frames faster than the host can follow fall ever
- * further behind: once they are LCD_MAX_LAG_NS behind they slip to the
- * present rather than hold the system back for ever. (Under icount
- * virtual time waits for them.)
+ * Under icount the timer takes the event at its deadline and no later
+ * ones, so that the LCD's events and every other device's run in order
+ * of time. On the host's clock the timer comes late, by the main loop's
+ * latency: it takes every event due by the present, each at its own
+ * time, as software sampling the pads does (lcd_cam_line_sync()), since
+ * one event a callback falls ever further behind a stream of lines. RGB
+ * frames faster than the host can follow still fall behind: once they
+ * are LCD_MAX_LAG_NS behind they slip to the present rather than hold
+ * the system back for ever.
  */
 static void lcd_timer_cb(void *opaque)
 {
@@ -1783,7 +1791,7 @@ static void lcd_timer_cb(void *opaque)
         if (s->lcd_state == LCD_RGB && now - t > LCD_MAX_LAG_NS) {
             esp32_line_run_at(now, rgb_slip, s);
         } else {
-            lcd_run(s, t);
+            lcd_run(s, icount_enabled() ? t : MAX(t, now));
         }
     }
     lcd_schedule(s);

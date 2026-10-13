@@ -941,10 +941,14 @@ static void dw_mst_do_step(DesignWareI2CState *s, DesignWareI2CStep step)
         }
         s->mst_owned = true;
         if (i2c_start_transfer(s->bus, addr, read)) {
-            if (s->mst_xfer_open) {
-                i2c_end_transfer(s->bus);
-                s->mst_xfer_open = false;
-            }
+            /*
+             * Nothing to end on the wires before the STOP, but QEMU's
+             * core leaves a general call no target took with its
+             * broadcast flag set, which would make the next START a
+             * broadcast, and a refused repeated START open: end both.
+             */
+            i2c_end_transfer(s->bus);
+            s->mst_xfer_open = false;
             dw_mst_abort(s, gcall ? ABRT_GCALL_NOACK :
                             ten ? ABRT_10ADDR1_NOACK : ABRT_7B_ADDR_NOACK);
             return;

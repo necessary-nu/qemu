@@ -9,16 +9,17 @@
  *
  * References: Winbond W25Q32RV datasheet (revision E, November 2025),
  * W25Q16JV datasheet (revision G, March 2018), GigaDevice GD25Q256E
- * datasheet; the parts are the Raspberry Pi Pico 2's W25Q32RVXHJQ, the
- * Waveshare RP2350-USB-C's W25Q16JVUXIQ and the Waveshare
- * ESP32-P4-WIFI6-POE-ETH's GD25Q256EYIGR.
+ * datasheet, GD25Q32C datasheet (revision 4.1); the parts are the
+ * Raspberry Pi Pico 2's W25Q32RVXHJQ, the Waveshare RP2350-USB-C's
+ * W25Q16JVUXIQ, the Waveshare ESP32-P4-WIFI6-POE-ETH's GD25Q256EYIGR and
+ * the ESP32-WROOM-32E's 4 MiB GD25Q32C.
  *
  * The M25P80 model hands the chip entries that name one of these parts
- * (w25q16jv, w25q32rv, gd25q256e) to this file, which replaces its generic
- * command decoder for them; its other entries behave as before. The
- * bus is QEMU's byte-wide SSI bus, so a phase of dummy clocks counts as
- * the bytes those clocks carry on the phase's lines, and the line count of
- * a command (SPI, dual, quad, QPI) is not seen.
+ * (w25q16jv, w25q32rv, gd25q256e, gd25q32c) to this file, which replaces
+ * its generic command decoder for them; its other entries behave as
+ * before. The bus is QEMU's byte-wide SSI bus, so a phase of dummy clocks
+ * counts as the bytes those clocks carry on the phase's lines, and the
+ * line count of a command (SPI, dual, quad, QPI) is not seen.
  *
  * Commands and registers, per part, as the datasheets' instruction tables
  * give them: the three status registers with their volatile and
@@ -27,19 +28,27 @@
  * protection (SRP, SRL or SRP1/SRP0 with /WP while QE=0), the block
  * protection of BP/TB/SEC/CMP (Winbond) and BP4-BP0 (GigaDevice), the
  * W25Q16JV's individual block locks (WPS, 36h/39h/3Dh/7Eh/98h), the
- * security registers (3 of 256 bytes, or 2048 on the GD25Q256E, with
- * their OTP lock bits), the unique ID (64 bits, 128 on the GD25Q256E;
- * the "unique-id" property, as hex digits, sets it), JEDEC and device
- * IDs (9Fh, 90h, 92h, 94h, ABh), power-down, software reset, continuous
- * read mode (M5-4 = 10b after BBh/EBh), burst with wrap (77h), the
- * W25Q32RV's QPI mode and read parameters (38h/FFh, C0h, 0Ch), and the
- * GD25Q256E's 3- and 4-byte addressing (B7h/E9h, ADS, ADP, the extended
- * address register's A24 and the 4-byte-address commands) and its dummy
- * cycle configuration (DC1/DC0). Commands that must not be clocked past
- * their last byte (program, erase and status register writes) are not
- * executed when they are. The SFDP table is not published (Winbond refers
- * to an application note, GigaDevice to its sales), so 5Ah reads 0xff
- * after its address and dummy byte, a table with no signature.
+ * security registers (3 of 256 bytes, 1024 on the GD25Q32C or 2048 on the
+ * GD25Q256E, with their OTP lock bits), the unique ID (64 bits, 128 on the
+ * GigaDevice parts; the "unique-id" property, as hex digits, sets it),
+ * JEDEC and device IDs (9Fh, 90h, 92h, 94h, ABh), power-down, software
+ * reset, continuous read mode (M5-4 = 10b after BBh/EBh/E7h), burst with
+ * wrap (77h), the W25Q32RV's QPI mode and read parameters (38h/FFh, C0h,
+ * 0Ch), the GD25Q256E's 3- and 4-byte addressing (B7h/E9h, ADS, ADP, the
+ * extended address register's A24 and the 4-byte-address commands) and
+ * its dummy cycle configuration (DC1/DC0), and the GD25Q32C's quad I/O
+ * word read (E7h), fast page program (F2h) and high performance mode
+ * (A3h, HPF). Commands that must not be clocked past their last byte
+ * (program, erase and status register writes) are not executed when they
+ * are. The GD25Q32C's datasheet publishes its SFDP table, which 5Ah reads;
+ * the others' is not published (Winbond refers to an application note,
+ * GigaDevice to its sales), so 5Ah reads 0xff after its address and dummy
+ * byte, a table with no signature.
+ *
+ * The GD25Q32C lays its status registers out as the Winbond parts do
+ * (BP4 and BP3 as SEC and TB, CMP in S14, SRP1 in S8), with GigaDevice's
+ * SRP1/SRP0 protection modes and SUS1/SUS2 bits; each of 01h, 31h and 11h
+ * writes one register, a second byte leaving the write not executed.
  *
  * Busy times: page program, sector, 32 KiB and 64 KiB block erase, chip
  * erase, status register write and the security registers' program and
@@ -120,6 +129,12 @@ enum {
 #define F_WPS           BIT(1)  /* WPS and the individual block locks */
 #define F_4BYTE         BIT(2)  /* 3- and 4-byte addressing */
 #define F_WRSR_2B       BIT(3)  /* 01h writes SR1 and SR2 */
+#define F_SR3_EPE       BIT(4)  /* SR3's PE and EE program/erase errors */
+/* SR1's BP4/BP3 are SEC/TB, SR2's S14 is CMP and S8 SRP1 (Winbond's) */
+#define F_WB_SR         BIT(5)
+#define F_HPM           BIT(6)  /* A3h high performance mode, HPF in S20 */
+#define F_WORD_READ     BIT(7)  /* E7h quad I/O word fast read */
+#define F_FPP           BIT(8)  /* F2h fast page program */
 
 /* Typical and maximum times, ns. */
 enum { TYP, MAX };
@@ -154,6 +169,11 @@ struct M25ChipInfo {
     int64_t t_dp;
     int64_t t_res1;
     int64_t t_res2;
+    /* VCC (min) to CS# low: deaf for that long after its power comes up */
+    int64_t t_vsl;
+    /* The SFDP table, where the datasheet publishes it */
+    const uint8_t *sfdp;
+    uint16_t sfdp_len;
 };
 
 #define US  1000LL
@@ -188,6 +208,7 @@ struct M25ChipInfo {
 #define G_SR3_PE        0x04
 #define G_SR3_EE        0x08
 #define G_SR3_ADP       0x10
+#define G_SR3_HPF       0x10
 
 /* W25Q32RV-JQ: the Pico 2's W25Q32RVXHJQ. */
 /* [spec:nuos:req:emu.flash-chip] */
@@ -265,7 +286,7 @@ const M25ChipInfo m25chip_gd25q256e = {
     .jedec = { 0xc8, 0x40, 0x19 },
     .dev_id = 0x18,
     .size = 32 * MiB,
-    .flags = F_4BYTE,
+    .flags = F_4BYTE | F_SR3_EPE,
     .sr_default = { 0x00, 0x00, 0x20 },
     .sr_writable = { 0xfc, G_SR2_SRP1 | SR2_LB | SR2_QE, 0xf3 },
     .sr_otp = { 0x00, SR2_LB, 0x00 },
@@ -287,6 +308,71 @@ const M25ChipInfo m25chip_gd25q256e = {
     .t_dp = 3 * US,
     .t_res1 = 30 * US,
     .t_res2 = 30 * US,
+};
+
+/*
+ * The GD25Q32C's SFDP table (datasheet tables 3 to 5): the header, the
+ * JEDEC parameter table at 30h and GigaDevice's at 60h; the rest of the
+ * space reads FFh.
+ */
+static const uint8_t gd25q32c_sfdp[] = {
+    0x53, 0x46, 0x44, 0x50, 0x00, 0x01, 0x01, 0xff,
+    0x00, 0x00, 0x01, 0x09, 0x30, 0x00, 0x00, 0xff,
+    0xc8, 0x00, 0x01, 0x03, 0x60, 0x00, 0x00, 0xff,
+    [0x18 ... 0x2f] = 0xff,
+    0xe5, 0x20, 0xf1, 0xff, 0xff, 0xff, 0xff, 0x01,
+    0x44, 0xeb, 0x08, 0x6b, 0x08, 0x3b, 0x42, 0xbb,
+    0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff,
+    0xff, 0xff, 0x00, 0xff, 0x0c, 0x20, 0x0f, 0x52,
+    0x10, 0xd8, 0x00, 0xff,
+    [0x54 ... 0x5f] = 0xff,
+    0x00, 0x36, 0x00, 0x27, 0x9e, 0xf9, 0x77, 0x64,
+    0xfc, 0xeb, 0xff, 0xff,
+};
+
+/*
+ * GD25Q32C, temperature range I (-40 to 85 C): the 4 MiB flash of the
+ * ESP32-WROOM-32E's N4 variant, the part Espressif's ESP32 modules have
+ * carried from the first (XMC's XM25QE32C is a second source since
+ * Espressif's PCN20220402; the module's datasheet names no part, and its
+ * table 17 gives the envelope of the qualified parts, which the GD25Q32C's
+ * own times fall within). The status registers ship as 00h but DRV0
+ * (S21), so QE is clear and IO3 is HOLD#. VCC is 2.7 to 3.6 V.
+ */
+/* [spec:nuos:req:emu.flash-chip] */
+/* [spec:nuos:req:emu.flash-timing] */
+const M25ChipInfo m25chip_gd25q32c = {
+    .name = "GD25Q32C",
+    .vendor = VENDOR_GIGADEVICE,
+    .jedec = { 0xc8, 0x40, 0x16 },
+    .dev_id = 0x15,
+    .size = 4 * MiB,
+    .flags = F_WB_SR | F_HPM | F_WORD_READ | F_FPP,
+    .sr_default = { 0x00, 0x00, 0x20 },
+    /* Not S23, S20-S15, S10, S1 or S0 (7.5); LB3-LB1 are OTP. */
+    .sr_writable = { 0xfc, W_SR2_CMP | SR2_LB | SR2_QE | W_SR2_SRL, 0x60 },
+    .sr_otp = { 0x00, SR2_LB, 0x00 },
+    .secreg_size = 1024,
+    .uid_len = 16,
+    .uid_default = "c8401652e19a7f03b64d2c8e1a5f9037",
+    .t_w = { 5 * MS, 30 * MS },
+    .t_pp = { 600 * US, 2400 * US },
+    .t_bp1 = { 30 * US, 50 * US },
+    .t_bp2 = { 2500, 12 * US },
+    .t_se = { 50 * MS, 300 * MS },
+    .t_be32 = { 150 * MS, 1600 * MS },
+    .t_be64 = { 250 * MS, 2000 * MS },
+    .t_ce = { 15 * S, 30 * S },
+    .t_sus = 20 * US,
+    .t_sus_gap = 100 * US,
+    .t_rst = 30 * US,
+    .t_rst_erase = 12 * MS,
+    .t_dp = 20 * US,
+    .t_res1 = 20 * US,
+    .t_res2 = 20 * US,
+    .t_vsl = 1800 * US,
+    .sfdp = gd25q32c_sfdp,
+    .sfdp_len = sizeof(gd25q32c_sfdp),
 };
 
 uint32_t m25chip_size(const M25ChipInfo *info)
@@ -330,6 +416,18 @@ static bool winbond(M25Chip *c)
 static bool has(M25Chip *c, uint32_t flag)
 {
     return c->info->flags & flag;
+}
+
+/* The Winbond status register layout: SEC/TB in SR1, CMP and SRP1 in SR2 */
+static bool wb_sr(M25Chip *c)
+{
+    return winbond(c) || has(c, F_WB_SR);
+}
+
+/* A GigaDevice part's SRP1, where its layout puts it */
+static uint8_t gd_srp1(M25Chip *c)
+{
+    return has(c, F_WB_SR) ? W_SR2_SRL : G_SR2_SRP1;
 }
 
 static int64_t t(M25Chip *c, const int64_t *times)
@@ -379,9 +477,18 @@ static uint8_t sr_read(M25Chip *c, int n)
             v &= ~W_SR2_SUS;
             v |= sus_erase || sus_prog ? W_SR2_SUS : 0;
         } else {
-            v &= ~(G_SR2_SUS1 | G_SR2_SUS2 | G_SR2_ADS);
-            v |= (sus_erase ? G_SR2_SUS1 : 0) | (sus_prog ? G_SR2_SUS2 : 0) |
-                 (c->four_byte ? G_SR2_ADS : 0);
+            v &= ~(G_SR2_SUS1 | G_SR2_SUS2);
+            v |= (sus_erase ? G_SR2_SUS1 : 0) | (sus_prog ? G_SR2_SUS2 : 0);
+            if (has(c, F_4BYTE)) {
+                v &= ~G_SR2_ADS;
+                v |= c->four_byte ? G_SR2_ADS : 0;
+            }
+        }
+        break;
+    case 2:
+        if (has(c, F_HPM)) {
+            v &= ~G_SR3_HPF;
+            v |= c->hpm ? G_SR3_HPF : 0;
         }
         break;
     }
@@ -401,7 +508,7 @@ static bool bp_range(M25Chip *c, uint32_t *lo, uint32_t *hi)
     uint32_t size = c->info->size;
     uint32_t len;
 
-    if (winbond(c)) {
+    if (wb_sr(c)) {
         unsigned bp = extract32(c->sr[0], 2, 3);
         unsigned all_bp = ctz32(size / (64 * KiB)) + 1;
 
@@ -464,7 +571,7 @@ static bool protected(M25Chip *c, uint32_t addr, uint32_t len)
     if (!bp_range(c, &lo, &hi)) {
         lo = hi = 0;
     }
-    if (winbond(c) && (c->sr[1] & W_SR2_CMP)) {
+    if (wb_sr(c) && (c->sr[1] & W_SR2_CMP)) {
         /* The complement: everything outside [lo, hi). */
         return addr < lo || addr + len > hi;
     }
@@ -506,6 +613,7 @@ static void write_back_done(void *opaque, int ret)
  */
 static void cells_changed(M25Chip *c, uint32_t off, uint32_t len, bool now)
 {
+    qemu_irq_pulse(c->changed);
     if (c->mem && memory_region_is_romd(c->mem)) {
         memory_region_flush_rom_device(c->mem, off, len);
     } else if (c->mem) {
@@ -607,12 +715,15 @@ static bool answers_reads(M25Chip *c)
 /* [spec:nuos:req:emu.flash-timing] */
 static void update_romd(M25Chip *c)
 {
-    bool romd;
+    bool romd = answers_reads(c);
 
+    if (romd != c->answering) {
+        c->answering = romd;
+        qemu_irq_pulse(c->changed);
+    }
     if (!c->mem) {
         return;
     }
-    romd = answers_reads(c);
     if (memory_region_is_romd(c->mem) != romd) {
         /* The controller remaps around it in the same transaction. */
         memory_region_transaction_begin();
@@ -676,10 +787,8 @@ static void op_start(M25Chip *c, uint8_t kind, uint32_t addr, uint32_t len,
     if (!winbond(c) && kind != OP_WRSR) {
         /* "At some unspecified time before the cycle is completed." */
         c->wel = false;
-        if (program_kind(kind)) {
-            c->sr[2] &= ~G_SR3_PE;
-        } else {
-            c->sr[2] &= ~G_SR3_EE;
+        if (has(c, F_SR3_EPE)) {
+            c->sr[2] &= ~(program_kind(kind) ? G_SR3_PE : G_SR3_EE);
         }
     }
     op_schedule(c);
@@ -789,14 +898,15 @@ static bool ops_cut(M25Chip *c, bool now)
 static void reset_volatile(M25Chip *c)
 {
     memcpy(c->sr, c->sr_nv, sizeof(c->sr));
-    if (!winbond(c)) {
+    if (has(c, F_SR3_EPE)) {
         c->sr[2] &= ~(G_SR3_PE | G_SR3_EE);
     }
     c->wel = false;
     c->vsr_we = false;
     c->reset_enable = false;
     c->qpi = false;
-    c->four_byte = !winbond(c) && (c->sr[2] & G_SR3_ADP);
+    c->four_byte = has(c, F_4BYTE) && (c->sr[2] & G_SR3_ADP);
+    c->hpm = false;
     c->ear = 0;
     c->read_params = 0;
     c->wrap = 0x10;
@@ -812,9 +922,9 @@ static void power_up(M25Chip *c)
     if (winbond(c)) {
         c->sr_nv[1] &= ~W_SR2_SRL;
     } else if ((c->sr_nv[0] & G_SR1_SRP0) == 0 &&
-               (c->sr_nv[1] & G_SR2_SRP1)) {
+               (c->sr_nv[1] & gd_srp1(c))) {
         /* SRP1, SRP0 = 1, 0: locked down until the next power cycle. */
-        c->sr_nv[1] &= ~G_SR2_SRP1;
+        c->sr_nv[1] &= ~gd_srp1(c);
     }
     reset_volatile(c);
     c->deaf_until = 0;
@@ -863,6 +973,7 @@ static bool is_program_cmd(uint8_t cmd)
     case 0x12:
     case 0x32:
     case 0x34:
+    case 0xf2:
         return true;
     }
     return false;
@@ -914,13 +1025,16 @@ static bool needs_qe(M25Chip *c, uint8_t cmd)
     case 0x32:
     case 0x77:
         return !c->qpi;
+    case 0xe7:
+        return true;
     case 0x94:
+        return wb_sr(c);
     case 0x38:
         return winbond(c);
     case 0x6c:
     case 0xec:
     case 0x34:
-        return !winbond(c);
+        return has(c, F_4BYTE);
     }
     return false;
 }
@@ -1025,11 +1139,26 @@ static CmdShape shape(M25Chip *c, uint8_t cmd)
     case 0x77:
         sh.skip = 3;
         break;
+    case 0xe7:
+        /* A, then M7-M0 and two dummy clocks on four lines */
+        sh.known = has(c, F_WORD_READ);
+        sh.addr = a3;
+        sh.skip = 2;
+        sh.next = PH_ARRAY;
+        break;
+    case 0xf2:
+        sh.known = has(c, F_FPP);
+        sh.addr = a3;
+        break;
+    case 0xa3:
+        sh.known = has(c, F_HPM);
+        sh.skip = 3;
+        break;
     default:
         sh.known = false;
         break;
     }
-    if (sh.known || !winbond(c)) {
+    if (sh.known || has(c, F_4BYTE)) {
         if (!sh.known) {
             sh.known = true;
             switch (cmd) {
@@ -1070,11 +1199,13 @@ static CmdShape shape(M25Chip *c, uint8_t cmd)
     sh.known = true;
     switch (cmd) {
     case 0x92:
+        sh.known = wb_sr(c);
         sh.addr = 3;
         sh.skip = 1;
         sh.next = PH_OUT;
         break;
     case 0x94:
+        sh.known = wb_sr(c);
         sh.addr = 3;
         sh.skip = 3;
         sh.next = PH_OUT;
@@ -1208,6 +1339,15 @@ static void data_phase(M25Chip *c)
         buf[0] = c->locks[lock_index(c, c->addr & (c->info->size - 1))];
         set_out(c, buf, 1);
         break;
+    case 0xe7:
+        /* "The lowest address bit (A0) must equal 0": the part ignores it. */
+        if (c->addr & 1) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: E7h at odd address 0x%"
+                          PRIx32 "; A0 taken as 0\n", c->info->name,
+                          c->addr);
+            c->addr &= ~1u;
+        }
+        break;
     case 0x48:
     case 0x5a:
     default:
@@ -1260,7 +1400,7 @@ static unsigned read_wrap(M25Chip *c)
     if (c->cmd == 0x0c && winbond(c)) {
         return 8 << extract32(c->read_params, 0, 2);
     }
-    if ((c->cmd == 0xeb || c->cmd == 0xec) && !c->qpi &&
+    if ((c->cmd == 0xeb || c->cmd == 0xec || c->cmd == 0xe7) && !c->qpi &&
         !(c->wrap & 0x10)) {
         return 8 << extract32(c->wrap, 5, 2);
     }
@@ -1352,7 +1492,7 @@ uint8_t m25chip_transfer(M25Chip *c, uint8_t tx)
     case PH_SKIP:
         if (c->mode == 0xff && c->addr_len &&
             (c->cmd == 0xbb || c->cmd == 0xbc || c->cmd == 0xeb ||
-             c->cmd == 0xec)) {
+             c->cmd == 0xec || c->cmd == 0xe7)) {
             /* The first byte after the address is M7-M0. */
             c->mode = tx & 0x30;
         }
@@ -1384,7 +1524,8 @@ uint8_t m25chip_transfer(M25Chip *c, uint8_t tx)
         c->count++;
         break;
     case PH_SFDP:
-        r = 0xff;
+        r = c->addr < c->info->sfdp_len ? c->info->sfdp[c->addr] : 0xff;
+        c->addr = (c->addr + 1) & 0xffffff;
         c->count++;
         break;
     case PH_DATA:
@@ -1443,7 +1584,7 @@ static bool may_write(M25Chip *c, uint32_t addr, uint32_t len, bool erase)
         qemu_log_mask(LOG_GUEST_ERROR, "%s: %s of protected cells at "
                       "0x%" PRIx32 "; ignored\n", c->info->name,
                       erase ? "erase" : "program", addr);
-        if (!winbond(c)) {
+        if (has(c, F_SR3_EPE)) {
             c->sr[2] |= erase ? G_SR3_EE : G_SR3_PE;
         }
         return false;
@@ -1482,7 +1623,7 @@ static void exec_program(M25Chip *c)
         if (c->sr[1] & (W_SR2_LB0 << (n + 1))) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: program of locked security "
                           "register %d ignored\n", c->info->name, n + 1);
-            if (!winbond(c)) {
+            if (has(c, F_SR3_EPE)) {
                 c->sr[2] |= G_SR3_PE;
             }
             return;
@@ -1563,7 +1704,7 @@ static void exec_secreg_erase(M25Chip *c)
     if (c->sr[1] & (W_SR2_LB0 << (n + 1))) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: erase of locked security "
                       "register %d ignored\n", c->info->name, n + 1);
-        if (!winbond(c)) {
+        if (has(c, F_SR3_EPE)) {
             c->sr[2] |= G_SR3_EE;
         }
         return;
@@ -1585,7 +1726,7 @@ static bool sr_writable(M25Chip *c)
         }
         return !((c->sr[0] & W_SR1_SRP) && hw);
     }
-    switch (((c->sr[1] & G_SR2_SRP1) ? 2 : 0) |
+    switch (((c->sr[1] & gd_srp1(c)) ? 2 : 0) |
             ((c->sr[0] & G_SR1_SRP0) ? 1 : 0)) {
     case 0:
         return true;
@@ -1750,7 +1891,8 @@ static void execute(M25Chip *c)
      * transaction, which starts with its address; anything else in M ends
      * it. M is not latched until it is clocked in.
      */
-    if ((cmd == 0xbb || cmd == 0xbc || cmd == 0xeb || cmd == 0xec) &&
+    if ((cmd == 0xbb || cmd == 0xbc || cmd == 0xeb || cmd == 0xec ||
+         cmd == 0xe7) &&
         c->mode != 0xff) {
         c->cont_cmd = c->mode == 0x20 ? cmd : 0;
     }
@@ -1773,6 +1915,7 @@ static void execute(M25Chip *c)
     case 0x12:
     case 0x32:
     case 0x34:
+    case 0xf2:
     case 0x42:
         exec_program(c);
         break;
@@ -1805,13 +1948,21 @@ static void execute(M25Chip *c)
     case 0xb9:
         if (c->count == 0) {
             c->powered_down = true;
+            c->hpm = false;
             deafen(c, c->info->t_dp);
         }
         break;
     case 0xab:
+        c->hpm = false;
         if (c->powered_down) {
             c->powered_down = false;
             deafen(c, c->count ? c->info->t_res2 : c->info->t_res1);
+        }
+        break;
+    case 0xa3:
+        /* Its three dummy bytes clocked in */
+        if (c->phase == PH_DATA) {
+            c->hpm = true;
         }
         break;
     case 0x38:
@@ -1877,6 +2028,35 @@ void m25chip_set_cs(M25Chip *c, bool high)
     }
 }
 
+/* Whether IO2 and IO3 are data lines (QE set) rather than WP# and HOLD# */
+bool m25chip_quad_enabled(M25Chip *c)
+{
+    return quad_enabled(c);
+}
+
+/* Whether the chip drives its outputs for the next byte clocked */
+bool m25chip_drives_output(M25Chip *c)
+{
+    catch_up(c);
+    if (!c->selected) {
+        return false;
+    }
+    switch (c->phase) {
+    case PH_OUT:
+    case PH_ARRAY:
+    case PH_SECREG:
+    case PH_SFDP:
+        return true;
+    }
+    return false;
+}
+
+/* The read command continuous read mode keeps for the next transaction */
+uint8_t m25chip_continuous_cmd(M25Chip *c)
+{
+    return c->cont_cmd;
+}
+
 /* [spec:nuos:req:emu.flash-timing] */
 int64_t m25chip_busy_until(M25Chip *c)
 {
@@ -1899,6 +2079,19 @@ void m25chip_reset(M25Chip *c)
     ops_cut(c, false);
     power_up(c);
     update_romd(c);
+}
+
+/*
+ * The chip's supply comes up after having been off: as a power cycle, and
+ * the chip takes no command before tVSL.
+ */
+/* [spec:nuos:req:emu.flash-power-cut] */
+void m25chip_power_on(M25Chip *c)
+{
+    m25chip_reset(c);
+    if (c->info->t_vsl) {
+        deafen(c, c->info->t_vsl);
+    }
 }
 
 /* QEMU shuts down: the chip loses power. */
@@ -1978,7 +2171,7 @@ static int m25chip_post_load(void *opaque, int version_id)
 
 const VMStateDescription vmstate_m25chip = {
     .name = "m25p80-chip",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = m25chip_post_load,
     .fields = (const VMStateField[]) {
@@ -2020,6 +2213,8 @@ const VMStateDescription vmstate_m25chip = {
         VMSTATE_UINT8_ARRAY(pp_set, M25Chip, M25CHIP_PAGE_SIZE / 8),
         VMSTATE_TIMER_PTR(op_timer, M25Chip),
         VMSTATE_TIMER_PTR(deaf_timer, M25Chip),
+        VMSTATE_BOOL_V(hpm, M25Chip, 2),
+        VMSTATE_BOOL_V(answering, M25Chip, 2),
         VMSTATE_END_OF_LIST()
     }
 };

@@ -216,6 +216,8 @@ typedef struct Esp32GpioState {
     qemu_irq wakeup_out;
 
     uint32_t strap_mode;
+    /* MTDI's level as the strapping latch took it at the last chip reset */
+    bool strap_mtdi;
 
     /* GPIO matrix registers */
     uint32_t bt_select;
@@ -350,7 +352,10 @@ bool esp32_gpio_iomux_in_selected(Esp32GpioState *s, unsigned n,
  *   driving the pad while the peripheral's output is off, so that the
  *   chip on the pad reaches it; in_inv: inverted on the way (IN_INV_SEL);
  * - in_level: in_sig's level while the peripheral's output is off and the
- *   chip on pad n drives nothing.
+ *   chip on pad n drives nothing;
+ * - in_matrix: in_sig takes pad n's input through the GPIO matrix
+ *   (SIG_IN_SEL), which delays it by two APB_CLK cycles (TRM 20.4.2),
+ *   rather than through the pad's IO_MUX function.
  */
 typedef struct Esp32GpioSigPath {
     bool out_on;
@@ -359,6 +364,7 @@ typedef struct Esp32GpioSigPath {
     bool in_on;
     bool in_inv;
     bool in_level;
+    bool in_matrix;
 } Esp32GpioSigPath;
 
 void esp32_gpio_sig_path(Esp32GpioState *s, unsigned n, int out_sig,

@@ -105,8 +105,10 @@ struct Esp32SocState {
     Esp32CrosscoreInt crosscore_int;
     Esp32TWAIState twai;
     ESP32UARTState uart[ESP32_UART_COUNT];
-    /* The board's terminals on the UARTs' default pads, behind -serial */
+    /* The board's terminals, behind -serial, and the pads they are on */
     Esp32UartTerminalState terminal[ESP32_UART_COUNT];
+    uint8_t terminal_tx_pad[ESP32_UART_COUNT];
+    uint8_t terminal_rx_pad[ESP32_UART_COUNT];
     Esp32UhciState uhci[ESP32_UHCI_COUNT];
     Esp32I2sState i2s[ESP32_I2S_COUNT];
     Esp32GpioState gpio;
@@ -158,6 +160,13 @@ struct Esp32SocState {
     /* CPU_CLK, APB_CLK and REF_TICK as the clock tree selects them */
     Clock *cpu_clk;
     uint32_t apb_hz;
+    /*
+     * VDD_SDIO, the flash regulator's output, in mV (0: off); the board
+     * hears of its changes through vdd_sdio_changed.
+     */
+    uint32_t vdd_sdio_mv;
+    void (*vdd_sdio_changed)(void *opaque);
+    void *vdd_sdio_opaque;
     uint32_t ref_tick_hz;
     /* PLL_F160M_CLK: 160 MHz while the BBPLL runs */
     uint32_t f160m_hz;
@@ -171,6 +180,7 @@ struct Esp32SocState {
     Clock *frc_apb_clk[ESP32_FRC_COUNT];
     Clock *timg_apb_clk[ESP32_TIMG_COUNT];
     Clock *spi_dma_clk[ESP32_SPI_DMA_COUNT];
+    Clock *spi_apb_clk[ESP32_SPI_COUNT];
     Clock *rmt_apb_clk;
     Clock *rmt_ref_tick_clk;
     Clock *emac_apb_clk;

@@ -131,6 +131,22 @@ void icount_set_cpu_clock(CPUState *cpu, Clock *clk);
  */
 void icount_set_cpu_period_frac(CPUState *cpu, uint64_t frac, uint64_t den);
 
+/**
+ * icount_stall: stall a CPU for some of its instructions' periods
+ * @cpu: the CPU, on its own thread
+ * @insns: how many
+ *
+ * Under icount, the CPU's time moves on by @insns of its instructions'
+ * periods without it executing any, as a core waiting on a memory does:
+ * they count as instructions its run executed, out of its budget, and
+ * what the run's budget does not cover out of the runs that follow,
+ * before it executes again. Without icount the stall takes no time.
+ */
+void icount_stall(CPUState *cpu, int64_t insns);
+
+/* Take what a run's budget covers of the CPU's stall (icount_stall()) */
+void icount_stall_take(CPUState *cpu);
+
 /* if the CPUs are idle, start accounting real time to virtual clock. */
 void icount_start_warp_timer(void);
 void icount_account_warp_timer(void);

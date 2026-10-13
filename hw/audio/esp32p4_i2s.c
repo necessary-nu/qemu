@@ -1656,7 +1656,7 @@ static bool i2s_pad_source(ESP32P4I2sState *c, int pad,
             }
         }
     }
-    if (pads & (g->ext_driven | g->held)) {
+    if (pads & (g->ext_high | g->ext_low | g->held)) {
         return false;
     }
     for (unsigned k = 0; k < ESP32P4_I2S_COUNT; k++) {

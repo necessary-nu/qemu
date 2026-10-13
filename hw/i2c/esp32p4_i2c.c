@@ -657,44 +657,45 @@ static unsigned esp32p4_i2c_thres(ESP32P4I2CState *s, int n)
 
 /* QEMU bus devices */
 
-/*
- * [spec:nuos:req:emu.esp32p4.i2c]
- * Address the bus's devices with the byte after a START. A repeated
- * START to the device already in the transfer continues it, as QEMU's
- * I2C devices expect of a write-then-read; any other address ends it
- * and selects afresh. Returns true for a NACK.
- */
-static bool esp32p4_i2c_dev_start(ESP32P4I2CState *s, uint8_t addr, bool rd)
-{
-    I2CNode *node;
-    int ret;
-
-    if (!s->connected) {
-        if (s->dev_active) {
-            i2c_end_transfer(s->bus);
-            s->dev_active = false;
-        }
-        return true;
-    }
-    if (s->dev_active) {
-        node = QLIST_FIRST(&s->bus->current_devs);
-        if (!node || node->elt->address != addr) {
-            i2c_end_transfer(s->bus);
-            s->dev_active = false;
-        }
-    }
-    ret = i2c_start_transfer(s->bus, addr, rd);
-    s->dev_active = ret == 0;
-    s->dev_addr = addr;
-    return ret != 0;
-}
-
 static void esp32p4_i2c_dev_end(ESP32P4I2CState *s)
 {
     if (s->dev_active) {
         i2c_end_transfer(s->bus);
         s->dev_active = false;
     }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.i2c]
+ * Address the bus's devices with the byte after a START. A repeated
+ * START to the address already in the transfer continues it, as QEMU's
+ * I2C devices expect of a write-then-read; any other address ends it
+ * and selects afresh: a general call (address 0) is no device's address.
+ * A NACK ends the core's transfer at once, as the STOP after it would:
+ * QEMU's core leaves to the caller a continued transfer whose device
+ * refuses the START, and a general call no device takes, its broadcast
+ * flag set, which would make every later START a broadcast. Returns true
+ * for a NACK, which the master answers as for any address (NACK_INT
+ * where ack_check_en expects an ACK, then a STOP).
+ */
+static bool esp32p4_i2c_dev_start(ESP32P4I2CState *s, uint8_t addr, bool rd)
+{
+    int ret;
+
+    if (!s->connected) {
+        esp32p4_i2c_dev_end(s);
+        return true;
+    }
+    if (s->dev_active && s->dev_addr != addr) {
+        esp32p4_i2c_dev_end(s);
+    }
+    ret = i2c_start_transfer(s->bus, addr, rd);
+    if (ret) {
+        i2c_end_transfer(s->bus);
+    }
+    s->dev_active = ret == 0;
+    s->dev_addr = addr;
+    return ret != 0;
 }
 
 

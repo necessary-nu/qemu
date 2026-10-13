@@ -515,7 +515,25 @@ static uint8_t esp32p4_i3c_mst_dev_addr(ESP32P4I3CMstState *s, unsigned dev)
     return DAT_I2C(dat) ? DAT_STATIC(dat) : DAT_DYNAMIC(dat);
 }
 
-/* Address a device: false for a NACK. */
+static void esp32p4_i3c_mst_end_i2c(ESP32P4I3CMstState *s)
+{
+    if (s->i2c_open) {
+        legacy_i2c_end_transfer(s->bus);
+        s->i2c_open = false;
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.i2c]
+ * Address a device: false for a NACK. QEMU's I2C core takes a START
+ * while a transfer is open as a repeated START to the devices already in
+ * it, so a legacy I2C device's transfer ends at a repeated START to any
+ * other address, a general call (address 0) included, whichever devices
+ * took it. A NACKed legacy address ends the core's transfer at once: it
+ * leaves a general call no device takes with its broadcast flag set,
+ * which would make every later START a broadcast, and a repeated START
+ * a device refuses still open.
+ */
 static bool esp32p4_i3c_mst_start_dev(ESP32P4I3CMstState *s, uint8_t addr,
                                       bool rnw, bool i2c)
 {
@@ -524,8 +542,16 @@ static bool esp32p4_i3c_mst_start_dev(ESP32P4I3CMstState *s, uint8_t addr,
     if (!s->connected) {
         return false;
     }
+    if (s->i2c_open && (!i2c || addr != s->i2c_addr)) {
+        esp32p4_i3c_mst_end_i2c(s);
+    }
     if (i2c) {
         ret = legacy_i2c_start_transfer(s->bus, addr, rnw);
+        if (ret) {
+            legacy_i2c_end_transfer(s->bus);
+        }
+        s->i2c_open = ret == 0;
+        s->i2c_addr = addr;
     } else {
         ret = i3c_start_transfer(s->bus, addr, rnw);
     }
@@ -537,7 +563,7 @@ static bool esp32p4_i3c_mst_start_dev(ESP32P4I3CMstState *s, uint8_t addr,
 static void esp32p4_i3c_mst_end_dev(ESP32P4I3CMstState *s)
 {
     if (s->dev_active) {
-        legacy_i2c_end_transfer(s->bus);
+        esp32p4_i3c_mst_end_i2c(s);
         i3c_end_transfer(s->bus);
         s->dev_active = false;
     }
@@ -1558,6 +1584,7 @@ static void esp32p4_i3c_mst_reset_hold(Object *obj, ResetType type)
     s->in_txn = false;
     s->connected = false;
     s->dev_active = false;
+    s->i2c_open = false;
     s->cmd_l = 0;
     s->cmd_h = 0;
     s->byte_cnt = 0;
@@ -1640,8 +1667,8 @@ static const VMStateDescription vmstate_esp32p4_i3c_ibi = {
 
 static const VMStateDescription vmstate_esp32p4_i3c_mst = {
     .name = TYPE_ESP32P4_I3C_MST,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4I3CMstState),
         VMSTATE_TIMER(timer, ESP32P4I3CMstState),
@@ -1692,6 +1719,8 @@ static const VMStateDescription vmstate_esp32p4_i3c_mst = {
         VMSTATE_INT64(free_at, ESP32P4I3CMstState),
         VMSTATE_BOOL(dev_active, ESP32P4I3CMstState),
         VMSTATE_BOOL(dev_i2c, ESP32P4I3CMstState),
+        VMSTATE_BOOL(i2c_open, ESP32P4I3CMstState),
+        VMSTATE_UINT8(i2c_addr, ESP32P4I3CMstState),
         VMSTATE_STRUCT(ibi_in, ESP32P4I3CMstState, 1, vmstate_esp32p4_i3c_ibi,
                        ESP32P4I3CIbi),
         VMSTATE_STRUCT(ibi_pend, ESP32P4I3CMstState, 1,

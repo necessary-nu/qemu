@@ -111,6 +111,7 @@
 
 #define ABRT_7B_ADDR_NOACK      (1u << 0)
 #define ABRT_10ADDR2_NOACK      (1u << 2)
+#define ABRT_GCALL_NOACK        (1u << 4)
 #define ABRT_GCALL_READ         (1u << 5)
 #define ABRT_SBYTE_NORSTRT      (1u << 9)
 #define ABRT_10B_RD_NORSTRT     (1u << 10)
@@ -178,13 +179,12 @@
 
 static char *rom_path;
 
-static QTestState *start(void)
+static QTestState *start_with(const char *devices)
 {
     QTestState *qts = qtest_initf(
-        "-M rp2350 -bios %s "
-        "-device at24c-eeprom,bus=i2c0,address=0x%x,rom-size=256 "
+        "-M rp2350 -bios %s %s "
         "-device designware-i2c-target,bus=i2c0,controller=/machine/soc/i2c[1]",
-        rom_path, EEPROM);
+        rom_path, devices);
 
     qtest_irq_intercept_in(qts, "/machine/soc/armv7m[0]");
     rp2350_clocks_init(qts);
@@ -261,6 +261,14 @@ static void eeprom_write(QTestState *qts, uint8_t at, const uint8_t *data,
     }
     settle(qts);
     g_assert_cmphex(rd(qts, I2C0, IC_RAW_INTR_STAT) & INTR_TX_ABRT, ==, 0);
+}
+
+static QTestState *start(void)
+{
+    g_autofree char *eeprom = g_strdup_printf(
+        "-device at24c-eeprom,bus=i2c0,address=0x%x,rom-size=256", EEPROM);
+
+    return start_with(eeprom);
 }
 
 /* [spec:nuos:req:emu.i2c/test] */
@@ -943,6 +951,61 @@ static void test_target_10bit_gcall(void)
     qtest_quit(qts);
 }
 
+/*
+ * A general call no target takes: I2C1's target with ACK_GEN_CALL clear,
+ * and nothing else on the bus. The controller aborts with
+ * ABRT_GCALL_NOACK; afterwards the bus is no longer in a general call:
+ * the target takes its own address, and, ACK_GEN_CALL set, still not an
+ * address nobody has.
+ */
+/* [spec:nuos:req:emu.i2c/test] */
+static void test_general_call_unanswered(void)
+{
+    QTestState *qts = start_with("");
+    int i;
+
+    route_i2c0(qts);
+    master_init(qts, I2C0);
+    target_init(qts, TARGET, 0);
+    wr(qts, I2C1, IC_ACK_GENERAL_CALL, 0);
+    for (i = 0; i < 2; i++) {
+        rd(qts, I2C0, IC_CLR_INTR);
+        rd(qts, I2C1, IC_CLR_INTR);
+        wr(qts, I2C0, IC_ENABLE, 0);
+        wr(qts, I2C0, IC_TAR, TAR_SPECIAL);
+        wr(qts, I2C0, IC_ENABLE, ENABLE);
+        wr(qts, I2C0, IC_DATA_CMD, 0x06 | CMD_STOP);
+        settle(qts);
+        g_assert_cmphex(rd(qts, I2C0, IC_TX_ABRT_SOURCE), ==,
+                        ABRT_GCALL_NOACK);
+        g_assert_cmphex(rd(qts, I2C1, IC_RAW_INTR_STAT) & INTR_GEN_CALL, ==,
+                        0);
+        rd(qts, I2C0, IC_CLR_TX_ABRT);
+
+        master_target(qts, TARGET);
+        wr(qts, I2C0, IC_DATA_CMD, 0x5a | CMD_STOP);
+        settle(qts);
+        g_assert_cmphex(rd(qts, I2C0, IC_RAW_INTR_STAT) & INTR_TX_ABRT, ==, 0);
+        g_assert_cmphex(rd(qts, I2C1, IC_DATA_CMD), ==,
+                        0x5a | FIRST_DATA_BYTE);
+    }
+
+    wr(qts, I2C0, IC_ENABLE, 0);
+    wr(qts, I2C0, IC_TAR, TAR_SPECIAL);
+    wr(qts, I2C0, IC_ENABLE, ENABLE);
+    wr(qts, I2C0, IC_DATA_CMD, 0x06 | CMD_STOP);
+    settle(qts);
+    g_assert_cmphex(rd(qts, I2C0, IC_TX_ABRT_SOURCE), ==, ABRT_GCALL_NOACK);
+    rd(qts, I2C0, IC_CLR_TX_ABRT);
+    wr(qts, I2C1, IC_ACK_GENERAL_CALL, 1);
+    master_target(qts, MISSING);
+    wr(qts, I2C0, IC_DATA_CMD, 0x5a | CMD_STOP);
+    settle(qts);
+    g_assert_cmphex(rd(qts, I2C0, IC_TX_ABRT_SOURCE), ==, ABRT_7B_ADDR_NOACK);
+    g_assert_cmpuint(rd(qts, I2C1, IC_RXFLR), ==, 0);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     static const uint32_t blank[2];
@@ -967,6 +1030,8 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/i2c/dma", test_dma);
     qtest_add_func("/rp2350/i2c/target", test_target);
     qtest_add_func("/rp2350/i2c/target-10bit-gcall", test_target_10bit_gcall);
+    qtest_add_func("/rp2350/i2c/general-call-unanswered",
+                   test_general_call_unanswered);
 
     ret = g_test_run();
     unlink(rom_path);
