@@ -1115,18 +1115,16 @@ static void esp32_spi_write(void *opaque, hwaddr addr,
         s->user_reg = value;
         break;
     case A_SPI_USER1:
-        s->user1_reg = value & (R_SPI_USER1_ADDR_BITLEN_MASK |
-                                R_SPI_USER1_DUMMY_CYCLELEN_MASK);
+        s->user1_reg = value;
         break;
     case A_SPI_USER2:
-        s->user2_reg = value & (R_SPI_USER2_COMMAND_BITLEN_MASK |
-                                R_SPI_USER2_COMMAND_VALUE_MASK);
+        s->user2_reg = value;
         break;
     case A_SPI_MOSI_DLEN:
-        s->mosi_dlen_reg = value & R_SPI_MOSI_DLEN_DBITLEN_MASK;
+        s->mosi_dlen_reg = value;
         break;
     case A_SPI_MISO_DLEN:
-        s->miso_dlen_reg = value & R_SPI_MISO_DLEN_DBITLEN_MASK;
+        s->miso_dlen_reg = value;
         break;
     case A_SPI_SLV_WR_STATUS:
         s->slv_wr_status_reg = value;
