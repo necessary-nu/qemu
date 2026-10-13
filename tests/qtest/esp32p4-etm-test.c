@@ -145,8 +145,12 @@
 #define PDMA_AXI_TASK_OUT_START(c)    (194 + (c))
 
 #define DATE_RESET          0x02303031u
+/*
+ * Pads the board leaves free: GPIO7 has ESP_I2C's 2.2 kOhm pull-up, which
+ * holds it high.
+ */
 #define TASK_PAD            5
-#define EVENT_PAD           7
+#define EVENT_PAD           6
 
 /*
  * A board strapped for Joint Download Boot (GPIO36 high, GPIO35 low), so

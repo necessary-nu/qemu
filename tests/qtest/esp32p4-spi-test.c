@@ -6,7 +6,8 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * The board has a W25Q32 flash on GP-SPI2's bus (-device w25q32,bus=spi2),
- * reached through the IO MUX's SPI2 pads, GPIO6 to GPIO11; the two
+ * reached through the IO MUX's SPI2 pads, GPIO6 to GPIO11 (where the
+ * board's codec drives GPIO11 until told to let go); the two
  * controllers reach each other through pads the GPIO matrix routes, each
  * pad's output signal read back by the other controller's input. Virtual
  * time steps as the transfers run, at clk_spi_mst's 40 MHz (the crystal)
@@ -15,6 +16,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "esp32p4-board-codec.h"
 
 #define SPI2            0x500d0000
 #define SPI3            0x500d1000
@@ -399,6 +401,7 @@ static void test_flash_rw(void)
         0x44332211, 0x88776655, 0xccbbaa99, 0x00ffeedd,
     };
 
+    esp32p4_codec_release_gpio11(qts);
     spi2_iomux(qts);
     flash_cmd(qts, 0x06, 0, 0, 0, 0, 0, 0);
     for (int i = 0; i < 4; i++) {
@@ -433,8 +436,9 @@ static void test_flash_rw(void)
 
 /*
  * The flash is wired to whichever pad carries CS0: not routed to any, it
- * is not selected and the data input reads the floating pad; routed
- * through the matrix to another pad, the flash answers again.
+ * is not selected and the data input reads the pad, GPIO10, which the
+ * board's codec pulls up (its LRCK pin, PULLUP_SE); routed through the
+ * matrix to another pad, the flash answers again.
  */
 /* [spec:nuos:req:emu.esp32p4.spi/test] */
 static void test_cs_routing(void)
@@ -446,7 +450,7 @@ static void test_cs_routing(void)
     qtest_writel(qts, GPIO_FUNC_OUT(7), 0x100);
     wr(qts, SPI2, W(0), 0x12345678);
     flash_cmd(qts, 0x9f, 0, 0, USR_MISO, 0, 0, 24);
-    g_assert_cmphex(rd(qts, SPI2, W(0)), ==, 0x12000000);
+    g_assert_cmphex(rd(qts, SPI2, W(0)), ==, 0x12ffffff);
     wire(qts, 20, SIG_SPI2_CS, -1);
     flash_cmd(qts, 0x9f, 0, 0, USR_MISO, 0, 0, 24);
     g_assert_cmphex(rd(qts, SPI2, W(0)), ==, 0x12000000 | W25Q32_ID);
@@ -455,7 +459,7 @@ static void test_cs_routing(void)
     wire(qts, 20, 63, -1);
     wr(qts, SPI2, W(0), 0);
     flash_cmd(qts, 0x9f, 0, 0, USR_MISO, 0, 0, 24);
-    g_assert_cmphex(rd(qts, SPI2, W(0)), ==, 0);
+    g_assert_cmphex(rd(qts, SPI2, W(0)), ==, 0xffffff);
     qtest_quit(qts);
 }
 
@@ -930,6 +934,7 @@ static void test_octal(void)
 {
     QTestState *qts = start();
 
+    esp32p4_codec_release_gpio11(qts);
     spi2_iomux(qts);
     for (int pad = 34; pad <= 37; pad++) {
         qtest_writel(qts, IO_MUX(pad), MCU_SEL(2) | FUN_IE | (2u << 10));

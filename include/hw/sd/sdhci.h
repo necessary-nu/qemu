@@ -30,6 +30,29 @@
 #include "hw/sd/sd.h"
 #include "qom/object.h"
 
+/*
+ * The lines between the host and its card where a board joins them through
+ * something other than wires, such as another chip's pads that software
+ * sets up: bit SDHCI_LINE_CLK, SDHCI_LINE_CMD or SDHCI_LINE_DAT(n) set in
+ * to_card where the host's output reaches the card's input, in to_host
+ * where the card's output reaches the host's input, and in card_level and
+ * host_level, for the lines that do not, the level that input reads (for
+ * the others, the level of the line while neither end drives it).
+ */
+#define SDHCI_LINE_CLK          0x001
+#define SDHCI_LINE_CMD          0x002
+#define SDHCI_LINE_DAT(n)       (0x004 << (n))
+#define SDHCI_LINES_ALL         0x3ff
+
+typedef struct SDHCILines {
+    uint16_t to_card;
+    uint16_t to_host;
+    uint16_t card_level;
+    uint16_t host_level;
+} SDHCILines;
+
+typedef void SDHCILinesFunc(void *opaque, SDHCILines *l);
+
 /* SD/MMC host controller state */
 struct SDHCIState {
     /*< private >*/
@@ -107,8 +130,19 @@ struct SDHCIState {
     bool sdma_boundary_paused;
     /* An SDIO card's interrupt request, which a host reset leaves alone */
     bool card_irq;
+    /* The board's lines to the card (sdhci_set_lines()); NULL: wires */
+    SDHCILinesFunc *lines_fn;
+    void *lines_opaque;
 };
 typedef struct SDHCIState SDHCIState;
+
+/*
+ * The board joins the host to its card as @fn says, which the host asks
+ * at every command, data block and look at its lines; the board calls
+ * sdhci_lines_changed() when what @fn would say changes.
+ */
+void sdhci_set_lines(SDHCIState *s, SDHCILinesFunc *fn, void *opaque);
+void sdhci_lines_changed(SDHCIState *s);
 
 /*
  * Controller does not provide transfer-complete interrupt when not

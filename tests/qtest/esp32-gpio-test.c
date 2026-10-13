@@ -60,6 +60,8 @@
 #define IO_MUX_GPIO1        (IO_MUX + 0x88)
 #define IO_MUX_GPIO2        (IO_MUX + 0x40)
 #define IO_MUX_GPIO3        (IO_MUX + 0x84)
+#define IO_MUX_GPIO4        (IO_MUX + 0x48)
+#define IO_MUX_GPIO15       (IO_MUX + 0x3c)
 #define IO_MUX_GPIO16       (IO_MUX + 0x4c)
 #define IO_MUX_GPIO18       (IO_MUX + 0x70)
 #define IO_MUX_GPIO19       (IO_MUX + 0x74)
@@ -74,6 +76,11 @@
 #define MCU_SEL(f)          ((f) << 12)
 #define PIN_FUNC_GPIO       2
 
+/* RTCIO's TOUCH_PAD0, GPIO4's RTC controls */
+#define RTCIO_TOUCH_PAD0    0x3ff48494
+#define RTC_RUE             (1u << 27)
+#define RTC_RDE             (1u << 28)
+
 #define SIG_U0RXD           14
 #define SIG_HSPICS0         11
 #define SIG_I2CEXT0_SCL     29
@@ -87,6 +94,9 @@
 #define PAD_OUT             "esp32-gpio-pad"
 #define SIG_OUT             "esp32-gpio-sig-out"
 #define SIG_IN              "esp32-gpio-sig-in"
+#define IOMUX_IN            "esp32-iomux-func-in"
+#define BOARD_PULL_UP       "esp32-gpio-board-pull-up"
+#define BOARD_PULL_DOWN     "esp32-gpio-board-pull-down"
 
 /* The block's sysbus IRQs */
 #define IRQ_PRO             0
@@ -537,6 +547,80 @@ static void test_sigma_delta(void)
     qtest_quit(qts);
 }
 
+/*
+ * An undriven pad's level from its pulls together, as a divider: its own
+ * 45 kOhm pull-up and pull-down both on hold it at half its supply,
+ * between VIL and VIH, which reads low; a board's 10 kOhm pull-up against
+ * the pad's pull-down reads high, a board's 10 kOhm pull-down against its
+ * pull-up low. On GPIO4, a pad with an RTC function, the IO_MUX's FUN_WPU
+ * and FUN_WPD do nothing (errata [GPIO-3.6]): RTCIO's RUE and RDE pull it.
+ */
+/* [spec:nuos:req:emu.esp32.gpio/test] */
+static void test_pulls(void)
+{
+    QTestState *qts = start();
+
+    qtest_writel(qts, IO_MUX_GPIO19, MCU_SEL(PIN_FUNC_GPIO) | FUN_IE |
+                 FUN_WPU | FUN_WPD);
+    g_assert_false(in_bit(qts, 19));
+    qtest_writel(qts, IO_MUX_GPIO19, MCU_SEL(PIN_FUNC_GPIO) | FUN_IE |
+                 FUN_WPD);
+    qtest_set_irq_in(qts, GPIO_PATH, BOARD_PULL_UP, 19, 10000);
+    g_assert_true(in_bit(qts, 19));
+    qtest_set_irq_in(qts, GPIO_PATH, BOARD_PULL_UP, 19, 0);
+    g_assert_false(in_bit(qts, 19));
+    qtest_writel(qts, IO_MUX_GPIO19, MCU_SEL(PIN_FUNC_GPIO) | FUN_IE |
+                 FUN_WPU);
+    g_assert_true(in_bit(qts, 19));
+    qtest_set_irq_in(qts, GPIO_PATH, BOARD_PULL_DOWN, 19, 10000);
+    g_assert_false(in_bit(qts, 19));
+    qtest_set_irq_in(qts, GPIO_PATH, BOARD_PULL_DOWN, 19, 0);
+
+    /* GPIO4 from reset: RTCIO's RDE on, as the IO_MUX's FUN_WPD reads */
+    g_assert_cmphex(qtest_readl(qts, RTCIO_TOUCH_PAD0) & (RTC_RUE | RTC_RDE),
+                    ==, RTC_RDE);
+    qtest_writel(qts, IO_MUX_GPIO4, MCU_SEL(PIN_FUNC_GPIO) | FUN_IE |
+                 FUN_WPU);
+    g_assert_false(in_bit(qts, 4));
+    qtest_writel(qts, RTCIO_TOUCH_PAD0,
+                 (qtest_readl(qts, RTCIO_TOUCH_PAD0) & ~RTC_RDE) | RTC_RUE);
+    g_assert_true(in_bit(qts, 4));
+    qtest_writel(qts, IO_MUX_GPIO4, MCU_SEL(PIN_FUNC_GPIO) | FUN_IE |
+                 FUN_WPD);
+    g_assert_true(in_bit(qts, 4));
+    qtest_quit(qts);
+}
+
+/*
+ * An IO_MUX function's own input line, while its pad is on another
+ * function, as its type has it: HS2_CMD on GPIO15 and HS2_DATA1 on GPIO4,
+ * I1 inputs, read 1; MTMS, an I0 input, 0; on their function, the pad's
+ * input (MTMS on GPIO14 from reset, pulled up), 0 with the input
+ * disabled.
+ */
+/* [spec:nuos:req:emu.esp32.gpio/test] */
+static void test_iomux_inputs(void)
+{
+    QTestState *qts = start();
+
+    qtest_irq_intercept_out_named(qts, GPIO_PATH, IOMUX_IN);
+    qtest_system_reset(qts);
+    g_assert_true(qtest_get_irq(qts, 15 * 6 + 3));
+    g_assert_true(qtest_get_irq(qts, 4 * 6 + 3));
+    g_assert_true(qtest_get_irq(qts, 14 * 6 + 0));
+    qtest_writel(qts, IO_MUX + 0x30, MCU_SEL(PIN_FUNC_GPIO) | FUN_IE);
+    g_assert_false(qtest_get_irq(qts, 14 * 6 + 0));
+    qtest_writel(qts, IO_MUX_GPIO15, MCU_SEL(3));
+    g_assert_false(qtest_get_irq(qts, 15 * 6 + 3));
+    qtest_writel(qts, IO_MUX_GPIO15, MCU_SEL(3) | FUN_IE);
+    g_assert_true(qtest_get_irq(qts, 15 * 6 + 3));
+    drive(qts, 15, 0);
+    g_assert_false(qtest_get_irq(qts, 15 * 6 + 3));
+    qtest_writel(qts, IO_MUX_GPIO15, MCU_SEL(PIN_FUNC_GPIO) | FUN_IE);
+    g_assert_true(qtest_get_irq(qts, 15 * 6 + 3));
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -545,6 +629,8 @@ int main(int argc, char **argv)
     qtest_add_func("esp32-gpio/strap", test_strap);
     qtest_add_func("esp32-gpio/output-readback", test_output_readback);
     qtest_add_func("esp32-gpio/pads", test_pads);
+    qtest_add_func("esp32-gpio/pulls", test_pulls);
+    qtest_add_func("esp32-gpio/iomux-inputs", test_iomux_inputs);
     qtest_add_func("esp32-gpio/input-routing", test_input_routing);
     qtest_add_func("esp32-gpio/output-routing", test_output_routing);
     qtest_add_func("esp32-gpio/interrupts", test_interrupts);

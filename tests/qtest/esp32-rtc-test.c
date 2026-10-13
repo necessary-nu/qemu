@@ -495,6 +495,7 @@ static void test_light_sleep_wakeups(void)
 }
 
 /* [spec:nuos:req:emu.esp32.rtc/test] */
+/* [spec:nuos:req:emu.esp32.gpio/test] */
 static void test_rtcio_pads(void)
 {
     QTestState *qts = start();
@@ -502,15 +503,18 @@ static void test_rtcio_pads(void)
     qtest_irq_intercept_out_named(qts, GPIO_PATH, PAD_OUT);
 
     /*
-     * Under the IO_MUX, GPIO25 has its input off, and RTCIO's pull-up does
-     * not apply. GPIO0, GPIO14 and GPIO15 come out of reset with input and
-     * pull-up on.
+     * Under the IO_MUX, GPIO25 has its input off, but RTCIO's pull-up
+     * pulls it all the same: on a pad with an RTC function the IO_MUX's
+     * pulls do nothing and RTCIO's RUE and RDE are the pad's pulls
+     * (errata [GPIO-3.6]). GPIO0, GPIO14 and GPIO15 come out of reset
+     * with input and pull-up on.
      */
     g_assert_cmphex(rd(qts, RTC_GPIO_IN), ==,
                     RTC_BIT(11) | RTC_BIT(13) | RTC_BIT(16));
+    g_assert_false(qtest_get_irq(qts, PAD_DAC1));
     wr(qts, RTCIO_PAD_DAC1, rd(qts, RTCIO_PAD_DAC1) | PDAC_RUE);
     g_assert_cmphex(rd(qts, RTC_GPIO_IN) & RTC_BIT(RTC_DAC1), ==, 0);
-    g_assert_false(qtest_get_irq(qts, PAD_DAC1));
+    g_assert_true(qtest_get_irq(qts, PAD_DAC1));
 
     /* MUX_SEL hands it to the RTC IO MUX: pulled up, input on */
     wr(qts, RTCIO_PAD_DAC1, rd(qts, RTCIO_PAD_DAC1) | PDAC_MUX_SEL |

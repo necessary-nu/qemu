@@ -51,3 +51,11 @@ config VIRTIO_SND
     bool
     default y
     depends on VIRTIO
+
+config ES8311
+    bool
+    select I2C
+    select ESP32_LINE
+
+config NS4150
+    bool

@@ -95,6 +95,10 @@ typedef struct Esp32MpuMapping {
 
 typedef unsigned (*Esp32DportGetPid)(void *opaque, int cpu);
 
+/* A cache fill's read of the flash, through SPI0 and the flash's pads */
+typedef void (*Esp32DportFlashRead)(void *opaque, uint32_t addr, uint8_t *buf,
+                                    uint32_t len);
+
 typedef struct Esp32DportState {
     SysBusDevice parent_obj;
 
@@ -104,6 +108,9 @@ typedef struct Esp32DportState {
     Esp32CacheState cache_state[ESP32_CPU_COUNT];
     MemoryRegion psram;         /* Shared between the CPUs: the actual memory region for PSRAM */
     BlockBackend *flash_blk;
+    /* How a cache fill reads flash_blk; NULL, the array as it is */
+    Esp32DportFlashRead flash_read;
+    void *flash_read_opaque;
     qemu_irq appcpu_stall_req;
     qemu_irq appcpu_reset_req;
     qemu_irq clk_update_req;

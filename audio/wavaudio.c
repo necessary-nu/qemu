@@ -44,6 +44,19 @@ typedef struct WAVVoiceOut {
     int total_samples;
 } WAVVoiceOut;
 
+/*
+ * The capture stream: the samples of the file in-path names, at its own
+ * rate, channels and format and paced by the virtual clock as the
+ * playback stream is, then silence; silence throughout without one.
+ */
+typedef struct WAVVoiceIn {
+    HWVoiceIn hw;
+    FILE *f;
+    RateCtl rate;
+    /* Bytes left in the file's data chunk */
+    uint32_t left;
+} WAVVoiceIn;
+
 static size_t wav_write_out(HWVoiceOut *hw, void *buf, size_t len)
 {
     WAVVoiceOut *wav = (WAVVoiceOut *) hw;
@@ -184,14 +197,147 @@ static void wav_enable_out(HWVoiceOut *hw, bool enable)
     }
 }
 
+static uint32_t le_load(const uint8_t *buf, int len)
+{
+    uint32_t v = 0;
+
+    for (int i = len - 1; i >= 0; i--) {
+        v = (v << 8) | buf[i];
+    }
+    return v;
+}
+
+/*
+ * Read a RIFF WAVE file's header up to its data: PCM, 8-bit unsigned or
+ * 16-bit signed samples, mono or stereo. Returns the data's length, or
+ * -1 for a file it cannot take.
+ */
+static int64_t wav_read_header(FILE *f, const char *path,
+                               struct audsettings *as)
+{
+    uint8_t hdr[12], chunk[8], fmt[16];
+    bool have_fmt = false;
+
+    if (fread(hdr, sizeof(hdr), 1, f) != 1 || memcmp(hdr, "RIFF", 4) ||
+        memcmp(hdr + 8, "WAVE", 4)) {
+        error_report("wav: '%s' is not a RIFF WAVE file", path);
+        return -1;
+    }
+    while (fread(chunk, sizeof(chunk), 1, f) == 1) {
+        uint32_t len = le_load(chunk + 4, 4);
+
+        if (!memcmp(chunk, "fmt ", 4) && len >= sizeof(fmt)) {
+            unsigned bits;
+
+            if (fread(fmt, sizeof(fmt), 1, f) != 1) {
+                break;
+            }
+            bits = le_load(fmt + 14, 2);
+            if (le_load(fmt, 2) != 1 || (bits != 8 && bits != 16) ||
+                le_load(fmt + 2, 2) < 1 || le_load(fmt + 2, 2) > 2) {
+                error_report("wav: '%s' is not 8- or 16-bit PCM, mono or "
+                             "stereo", path);
+                return -1;
+            }
+            as->nchannels = le_load(fmt + 2, 2);
+            as->freq = le_load(fmt + 4, 4);
+            as->fmt = bits == 8 ? AUDIO_FORMAT_U8 : AUDIO_FORMAT_S16;
+            as->big_endian = false;
+            have_fmt = true;
+            len -= sizeof(fmt);
+        } else if (!memcmp(chunk, "data", 4)) {
+            if (!have_fmt) {
+                break;
+            }
+            return len;
+        }
+        /* Chunks are padded to an even length. */
+        if (fseek(f, len + (len & 1), SEEK_CUR)) {
+            break;
+        }
+    }
+    error_report("wav: '%s' has no format and data chunks", path);
+    return -1;
+}
+
+static int wav_init_in(HWVoiceIn *hw, struct audsettings *as)
+{
+    WAVVoiceIn *wav = (WAVVoiceIn *) hw;
+    Audiodev *dev = hw->s->dev;
+    AudiodevWavOptions *wopts = &dev->u.wav;
+    struct audsettings wav_as = audiodev_to_audsettings(dev->u.wav.in);
+
+    wav->f = NULL;
+    wav->left = 0;
+    if (wopts->in_path) {
+        int64_t len;
+
+        wav->f = fopen(wopts->in_path, "rb");
+        if (!wav->f) {
+            error_report("wav: failed to open wave file '%s': %s",
+                         wopts->in_path, strerror(errno));
+            return -1;
+        }
+        len = wav_read_header(wav->f, wopts->in_path, &wav_as);
+        if (len < 0) {
+            fclose(wav->f);
+            wav->f = NULL;
+            return -1;
+        }
+        wav->left = len;
+    }
+    audio_pcm_init_info(&hw->info, &wav_as);
+    hw->samples = 1024;
+    audio_rate_start(&wav->rate);
+    return 0;
+}
+
+static void wav_fini_in(HWVoiceIn *hw)
+{
+    WAVVoiceIn *wav = (WAVVoiceIn *) hw;
+
+    if (wav->f) {
+        fclose(wav->f);
+        wav->f = NULL;
+    }
+}
+
+static size_t wav_read(HWVoiceIn *hw, void *buf, size_t size)
+{
+    WAVVoiceIn *wav = (WAVVoiceIn *) hw;
+    size_t bytes = audio_rate_get_bytes(&wav->rate, &hw->info, size);
+    size_t want = MIN(bytes, wav->left), got = 0;
+
+    want -= want % hw->info.bytes_per_frame;
+    if (wav->f && want) {
+        got = fread(buf, 1, want, wav->f);
+        got -= got % hw->info.bytes_per_frame;
+        wav->left = got < want ? 0 : wav->left - got;
+    }
+    if (got < bytes) {
+        audio_pcm_info_clear_buf(&hw->info, (uint8_t *)buf + got,
+                                 (bytes - got) / hw->info.bytes_per_frame);
+    }
+    return bytes;
+}
+
+static void wav_enable_in(HWVoiceIn *hw, bool enable)
+{
+    WAVVoiceIn *wav = (WAVVoiceIn *) hw;
+
+    if (enable) {
+        audio_rate_start(&wav->rate);
+    }
+}
+
 static void audio_wav_class_init(ObjectClass *klass, const void *data)
 {
     AudioMixengBackendClass *k = AUDIO_MIXENG_BACKEND_CLASS(klass);
 
     k->max_voices_out = 1;
-    k->max_voices_in = 0;
+    k->max_voices_in = 1;
     k->voice_size_out = sizeof(WAVVoiceOut);
-    k->voice_size_in = 0;
+    k->voice_size_in = sizeof(WAVVoiceIn);
 
     k->init_out = wav_init_out;
     k->fini_out = wav_fini_out;
@@ -199,6 +345,12 @@ static void audio_wav_class_init(ObjectClass *klass, const void *data)
     k->buffer_get_free = audio_generic_buffer_get_free;
     k->run_buffer_out = audio_generic_run_buffer_out;
     k->enable_out = wav_enable_out;
+
+    k->init_in = wav_init_in;
+    k->fini_in = wav_fini_in;
+    k->read = wav_read;
+    k->run_buffer_in = audio_generic_run_buffer_in;
+    k->enable_in = wav_enable_in;
 }
 
 static const TypeInfo audio_types[] = {

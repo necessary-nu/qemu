@@ -14,6 +14,7 @@
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/core/sysbus.h"
@@ -28,8 +29,9 @@
 #include "exec/watchpoint.h"
 #include "system/address-spaces.h"
 #include "hw/misc/ssi_psram.h"
-#include "hw/sd/dwc_sdmmc.h"
+#include "hw/sd/esp32_sdmmc.h"
 #include "hw/sd/sdhci.h"
+#include "hw/block/flash.h"
 #include "core-esp32/core-isa.h"
 #include "qemu/datadir.h"
 #include "system/system.h"
@@ -254,6 +256,28 @@ static void esp32_soc_board_buses(Esp32SocState *s, void (*fn)(BusState *))
     fn(qdev_get_child_bus(DEVICE(&s->sdmmc), "sd-bus1"));
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * SPI0 and SPI1's shared lines between transactions, as the pads see
+ * them: SPICLK low, SPICS0 high, SPID driven, SPIQ released (an input,
+ * the flash's DO), and SPIWP and SPIHD driven high, holding the flash's
+ * WP# and HOLD# inactive (CTRL's SPI_WP, "the write-protection signal
+ * output when SPI is idle", resets to 1 and ESP-IDF never clears it; that
+ * SPIHD idles high too is the model's reading, the TRM not saying). The
+ * transactions are above single pad transitions (hw/ssi/esp32_spi.c).
+ */
+static void esp32_soc_spi_idle_lines(Esp32SocState *s)
+{
+    DeviceState *gpio = DEVICE(&s->gpio);
+
+    qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32_GPIO_SIG_OE,
+                                        ESP32_SIG_SPIQ), 0);
+    qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32_GPIO_SIG_OUT,
+                                        ESP32_SIG_SPIWP), 1);
+    qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32_GPIO_SIG_OUT,
+                                        ESP32_SIG_SPIHD), 1);
+}
+
 static void esp32_soc_reset(DeviceState *dev)
 {
     Esp32SocState *s = ESP32_SOC(dev);
@@ -313,6 +337,7 @@ static void esp32_soc_reset(DeviceState *dev)
         for (int i = 0; i < ESP32_SPI_COUNT; ++i) {
             device_cold_reset(DEVICE(&s->spi[i]));
         }
+        esp32_soc_spi_idle_lines(s);
         for (int i = 0; i < ESP32_SPI_DMA_COUNT; ++i) {
             device_cold_reset(DEVICE(&s->spi_dma[i]));
         }
@@ -810,6 +835,82 @@ static void esp32_soc_add_periph_device(MemoryRegion *dest, void *dev,
                                         hwaddr dport_base_addr)
 {
     esp32_soc_add_periph_region(dest, dev, 0, dport_base_addr);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * The SD/MMC host's signals: CLK, CMD and DAT on its IO_MUX functions
+ * (function 3 of each slot's pads, hw/sd/esp32_sdmmc.c), and through the
+ * GPIO matrix its card detect, write protect and interrupt inputs
+ * (signals 97 to 102, unrouted 0: a card present, writable, an SDIO
+ * interrupt asserted, until software routes them as ESP-IDF does) and its
+ * CMD open-drain pull-up enable and card resets out (97 to 99).
+ *
+ * No card can be in slot 0: its CLK, CMD and DAT0 to DAT3, GPIO6 to
+ * GPIO11, are the ESP32-WROOM-32E's flash lines, inside the module and not
+ * led out, so its bus takes none (-device sd-card,bus=sd-bus0 finds it
+ * full).
+ */
+static void esp32_soc_connect_sdmmc(Esp32SocState *s)
+{
+    static const uint8_t pads[DWC_SDMMC_MAX_SLOTS][DWC_SDMMC_LINES] = {
+        ESP32_SDMMC_SLOT0_PADS,
+        ESP32_SDMMC_SLOT1_PADS,
+    };
+    DeviceState *gpio = DEVICE(&s->gpio), *dev = DEVICE(&s->sdmmc);
+
+    for (int slot = 0; slot < DWC_SDMMC_MAX_SLOTS; slot++) {
+        for (int i = 0; i < DWC_SDMMC_LINES; i++) {
+            int n = slot * DWC_SDMMC_LINES + i;
+            int line = pads[slot][i] * ESP32_IOMUX_FUNC_COUNT +
+                       ESP32_SDMMC_FUNC;
+
+            if (pads[slot][i] == ESP32_SDMMC_NO_PAD) {
+                continue;
+            }
+            qdev_connect_gpio_out_named(dev, ESP32_SDMMC_PAD_OUT, n,
+                qdev_get_gpio_in_named(gpio, ESP32_GPIO_IOMUX_OUT, line));
+            qdev_connect_gpio_out_named(dev, ESP32_SDMMC_PAD_OE, n,
+                qdev_get_gpio_in_named(gpio, ESP32_GPIO_IOMUX_OE, line));
+        }
+        qdev_connect_gpio_out_named(gpio, ESP32_GPIO_SIG_IN,
+            ESP32_SIG_HOST_CARD_DETECT_N_1 + slot,
+            qdev_get_gpio_in_named(dev, DWC_SDMMC_CARD_DETECT_N, slot));
+        qdev_connect_gpio_out_named(gpio, ESP32_GPIO_SIG_IN,
+            ESP32_SIG_HOST_CARD_WRITE_PRT_1 + slot,
+            qdev_get_gpio_in_named(dev, DWC_SDMMC_CARD_WRITE_PRT, slot));
+        qdev_connect_gpio_out_named(gpio, ESP32_GPIO_SIG_IN,
+            ESP32_SIG_HOST_CARD_INT_N_1 + slot,
+            qdev_get_gpio_in_named(dev, DWC_SDMMC_CARD_INT_N, slot));
+        qdev_connect_gpio_out_named(dev, DWC_SDMMC_CARD_RST_N, slot,
+            qdev_get_gpio_in_named(gpio, ESP32_GPIO_SIG_OUT,
+                                   ESP32_SIG_HOST_RST_N_1 + slot));
+    }
+    qdev_connect_gpio_out_named(dev, DWC_SDMMC_CCMD_OD_PULLUP_EN_N, 0,
+        qdev_get_gpio_in_named(gpio, ESP32_GPIO_SIG_OUT,
+                               ESP32_SIG_HOST_CCMD_OD_PULLUP_EN_N));
+    qbus_mark_full(qdev_get_child_bus(dev, "sd-bus0"));
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.sdio-slave]
+ * [spec:nuos:req:emu.esp32.gpio]
+ * The SDIO slave's lines between transfers on its IO_MUX functions,
+ * function 4 of slot 1's pads (hw/sd/esp32_sdio_slave.c).
+ */
+static void esp32_soc_connect_sdio(Esp32SocState *s)
+{
+    static const uint8_t pads[ESP32_SDIO_LINES] = ESP32_SDIO_SLOT1_PADS;
+    DeviceState *gpio = DEVICE(&s->gpio), *dev = DEVICE(&s->sdio);
+
+    for (int i = 0; i < ESP32_SDIO_LINES; i++) {
+        int line = pads[i] * ESP32_IOMUX_FUNC_COUNT + ESP32_SDIO_FUNC;
+
+        qdev_connect_gpio_out_named(dev, ESP32_SDIO_PAD_OUT, i,
+            qdev_get_gpio_in_named(gpio, ESP32_GPIO_IOMUX_OUT, line));
+        qdev_connect_gpio_out_named(dev, ESP32_SDIO_PAD_OE, i,
+            qdev_get_gpio_in_named(gpio, ESP32_GPIO_IOMUX_OE, line));
+    }
 }
 
 /*
@@ -1636,13 +1737,17 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     /*
      * The SD/MMC host: its bus interface on APB_CLK, its card interface on
-     * PLL_F160M_CLK divided by CLK_EDGE_SEL's N + 1.
+     * PLL_F160M_CLK divided by CLK_EDGE_SEL's N + 1, its cards on its
+     * IO_MUX pads (hw/sd/esp32_sdmmc.c).
      */
     qdev_prop_set_uint32(DEVICE(&s->sdmmc), "ctrl-reset", 0x01000000);
     qdev_prop_set_uint32(DEVICE(&s->sdmmc), "clk-edge-mask", 0x001fffff);
     qdev_prop_set_uint32(DEVICE(&s->sdmmc), "clk-edge-reset", 0x00020200);
     qdev_prop_set_bit(DEVICE(&s->sdmmc), "clk-edge-div", true);
+    object_property_set_link(OBJECT(&s->sdmmc), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
     qdev_realize(DEVICE(&s->sdmmc), &s->periph_bus, &error_abort);
+    esp32_soc_connect_sdmmc(s);
     {
         Esp32PeriphGate *g = esp32_soc_add_gated_device(
             s, &s->sdmmc, DR_REG_SDMMC_BASE, ESP32_GATE_WIFI,
@@ -1687,7 +1792,10 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
      */
     object_property_set_link(OBJECT(&s->sdio), "dma-mr", OBJECT(sys_mem),
                              &error_abort);
+    object_property_set_link(OBJECT(&s->sdio), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
     qdev_realize(DEVICE(&s->sdio), &s->periph_bus, &error_fatal);
+    esp32_soc_connect_sdio(s);
     {
         Esp32PeriphGate *g = esp32_soc_add_gated_device(
             s, &s->sdio, DR_REG_SLC_BASE, ESP32_GATE_WIFI,
@@ -1880,10 +1988,18 @@ static void esp32_soc_init(Object *obj)
     MachineState *ms = MACHINE(qdev_get_machine());
     char name[16];
 
+    /*
+     * The SoC sits on the main system bus, so that -device finds the buses
+     * below it (an SD card's sd-bus1); its own buses are reset domains of
+     * their own, which only esp32_soc_reset() resets, part by part, as the
+     * chip's resets reach them, never QEMU's reset of the system bus.
+     */
     qbus_init(&s->periph_bus, sizeof(s->periph_bus),
                         TYPE_SYSTEM_BUS, DEVICE(s), "esp32-periph-bus");
     qbus_init(&s->rtc_bus, sizeof(s->rtc_bus),
                         TYPE_SYSTEM_BUS, DEVICE(s), "esp32-rtc-bus");
+    qbus_set_reset_domain(&s->periph_bus);
+    qbus_set_reset_domain(&s->rtc_bus);
 
     /* CPU_CLK after reset: XTAL_CLK, undivided */
     s->cpu_clk = clock_new(obj, "cpu-clk");
@@ -2070,7 +2186,7 @@ static void esp32_soc_init(Object *obj)
 
     object_initialize_child(obj, "flash_enc", &s->flash_enc, TYPE_ESP32_FLASH_ENCRYPTION);
 
-    object_initialize_child(obj, "sdmmc", &s->sdmmc, TYPE_DWC_SDMMC);
+    object_initialize_child(obj, "sdmmc", &s->sdmmc, TYPE_ESP32_SDMMC);
     s->sdmmc_apb_clk = clock_new(obj, "sdmmc-apb");
     qdev_connect_clock_in(DEVICE(&s->sdmmc), "hclk", s->sdmmc_apb_clk);
     s->sdmmc_f160m_clk = clock_new(obj, "sdmmc-f160m");
@@ -2114,7 +2230,7 @@ static void esp32_soc_class_init(ObjectClass *klass, const void *data)
 
 static const TypeInfo esp32_soc_info = {
     .name = TYPE_ESP32_SOC,
-    .parent = TYPE_DEVICE,
+    .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(Esp32SocState),
     .instance_init = esp32_soc_init,
     .class_init = esp32_soc_class_init
@@ -2146,15 +2262,108 @@ struct Esp32MachineState {
 
     Esp32SocState esp32;
     DeviceState *flash_dev;
+    Notifier flash_route;
     bool sdio_host;
+    uint32_t sd_pull_up;
+    /* The SDIO slave's host, and what tells it its lines changed */
+    SDHCIState *sdio_sdhci;
+    Notifier sdio_route;
 };
 #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
 
 OBJECT_DECLARE_SIMPLE_TYPE(Esp32MachineState, ESP32_MACHINE)
 
 
-static void esp32_machine_init_spi_flash(Esp32SocState *ss, BlockBackend* blk)
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * The ESP32-WROOM-32E's flash, inside the module, on GPIO6 to GPIO11
+ * (the module datasheet's schematic and pin table, note 2; ESP-IDF's
+ * MSPI_IOMUX_PIN_NUM_*): CLK GPIO6, DO (IO1) GPIO7, DI (IO0) GPIO8,
+ * HOLD# (IO3) GPIO9, WP# (IO2) GPIO10, CS# GPIO11. SPI0 and SPI1 reach it
+ * only through those pads carrying their signals (SPICLK, SPIQ, SPID,
+ * SPIHD, SPIWP, SPICS0): on IO_MUX function 1, or through the matrix on
+ * the GPIO function, as the ROM's spi_flash_attach() and ESP-IDF's
+ * bootloader_flash_gpio_config() set them up (the ROM, booting in DIO
+ * mode, puts CLK, Q, D and CS0 on function 1 and leaves HD and WP on
+ * function 0 with their pull-ups; ESP-IDF's bootloader routes Q, D, HD,
+ * WP and CS0 through the matrix and keeps CLK on function 1). eFuse
+ * BLK0's SPI_PAD_CONFIG_* only tell that software which pads to route
+ * the signals to; the flash stays on GPIO6 to GPIO11, so a remap leaves
+ * the module without its flash, as on the board.
+ *
+ * A line takes the controller's output to the flash where the pad
+ * carries it (esp32_gpio_sig_path()), else the flash's pin is at the
+ * pad's level; it takes the flash's output to the controller where the
+ * controller's input is routed from the pad, its input enabled and
+ * nothing else driving it, else the input reads what it reads. HOLD# is
+ * the pad's level, holding the flash while low and its quad enable clear,
+ * and WP# likewise.
+ */
+static void esp32_flash_lines(void *opaque, Esp32SpiFlashLines *l)
 {
+    static const struct {
+        uint8_t pad;
+        uint8_t sig;
+    } io[] = {
+        { 8, ESP32_SIG_SPID },
+        { 7, ESP32_SIG_SPIQ },
+        { 10, ESP32_SIG_SPIWP },
+        { 9, ESP32_SIG_SPIHD },
+    };
+    Esp32MachineState *ms = opaque;
+    Esp32GpioState *g = &ms->esp32.gpio;
+    Esp32GpioSigPath p;
+
+    memset(l, 0, sizeof(*l));
+    esp32_gpio_sig_path(g, 6, ESP32_SIG_SPICLK, -1, &p);
+    l->clk = p.out_on;
+    esp32_gpio_sig_path(g, 11, ESP32_SIG_SPICS0, -1, &p);
+    l->cs = p.out_on;
+    l->cs_inv = p.out_inv;
+    l->cs_level = p.pad_level;
+    for (unsigned n = 0; n < ARRAY_SIZE(io); n++) {
+        esp32_gpio_sig_path(g, io[n].pad, io[n].sig, io[n].sig, &p);
+        l->to_flash |= p.out_on << n;
+        l->flash_inv |= p.out_inv << n;
+        l->flash_level |= p.pad_level << n;
+        l->to_ctrl |= p.in_on << n;
+        l->ctrl_inv |= p.in_inv << n;
+        l->ctrl_level |= p.in_level << n;
+    }
+    l->wp_level = esp32_gpio_pad_level(g, 10);
+    l->hold = !esp32_gpio_pad_level(g, 9) && ms->flash_dev &&
+              m25p80_hold_enabled(ms->flash_dev);
+}
+
+/* [spec:nuos:req:emu.esp32.gpio] */
+static void esp32_flash_cache_read(void *opaque, uint32_t addr, uint8_t *buf,
+                                   uint32_t len)
+{
+    Esp32MachineState *ms = opaque;
+
+    esp32_spi_flash_cache_read(&ms->esp32.spi[0], ms->esp32.dport.flash_blk,
+                               addr, buf, len);
+}
+
+static void esp32_flash_route_changed(Notifier *n, void *data)
+{
+    Esp32MachineState *ms = container_of(n, Esp32MachineState, flash_route);
+
+    esp32_spi_flash_lines_changed(&ms->esp32.spi[1]);
+}
+
+/* CS#'s pad, which the flash follows where SPICS0 does not reach it */
+static void esp32_flash_cs_pad_changed(void *opaque, int n, int level)
+{
+    Esp32MachineState *ms = opaque;
+
+    esp32_spi_flash_lines_changed(&ms->esp32.spi[1]);
+}
+
+static void esp32_machine_init_spi_flash(Esp32MachineState *ms,
+                                         BlockBackend *blk)
+{
+    Esp32SocState *ss = &ms->esp32;
     /* "main" flash chip is attached to SPI1, CS0 */
     DeviceState *spi_master = DEVICE(&ss->spi[1]);
     BusState* spi_bus = qdev_get_child_bus(spi_master, "spi");
@@ -2176,6 +2385,19 @@ static void esp32_machine_init_spi_flash(Esp32SocState *ss, BlockBackend* blk)
     qdev_realize_and_unref(flash_dev, spi_bus, &error_fatal);
     qdev_connect_gpio_out_named(spi_master, SSI_GPIO_CS, 0,
                                 qdev_get_gpio_in_named(flash_dev, SSI_GPIO_CS, 0));
+    qdev_connect_gpio_out_named(spi_master, ESP32_SPI_FLASH_WP, 0,
+                                qdev_get_gpio_in_named(flash_dev, "WP#", 0));
+    ms->flash_dev = flash_dev;
+    for (int i = 0; i < 2; i++) {
+        esp32_spi_set_flash_lines(&ss->spi[i], esp32_flash_lines, ms);
+    }
+    ss->dport.flash_read = esp32_flash_cache_read;
+    ss->dport.flash_read_opaque = ms;
+    ms->flash_route.notify = esp32_flash_route_changed;
+    esp32_gpio_add_route_notifier(&ss->gpio, &ms->flash_route);
+    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), ESP32_GPIO_PAD_OUT, 11,
+                                qemu_allocate_irq(esp32_flash_cs_pad_changed,
+                                                  ms, 0));
 }
 
 static void esp32_machine_init_psram(Esp32SocState *ss, uint32_t size_mbytes)
@@ -2193,13 +2415,7 @@ static void esp32_machine_init_psram(Esp32SocState *ss, uint32_t size_mbytes)
 
 static void esp32_machine_init_i2c(Esp32SocState *s)
 {
-    /* It should be possible to create an I2C device from the command line,
-     * however for this to work the I2C bus must be reachable from sysbus-default.
-     * At the moment the peripherals are added to an unrelated bus, to avoid being
-     * reset on CPU reset.
-     * If we find a way to decouple peripheral reset from sysbus reset,
-     * we can move them to the sysbus and thus enable creation of i2c devices.
-     */
+    /* The board's TMP105, at 0x48 on I2C0 */
     DeviceState *i2c_master = DEVICE(&s->i2c[0]);
     I2CBus* i2c_bus = I2C_BUS(qdev_get_child_bus(i2c_master, "i2c"));
     I2CSlave* tmp105 = i2c_slave_create_simple(i2c_bus, "tmp105", 0x48);
@@ -2217,24 +2433,42 @@ static void esp32_machine_init_i2c(Esp32SocState *s)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * [spec:nuos:req:emu.sd-card-timing]
  * The board's SD card, -drive if=sd, in the SD/MMC host's slot 1 (or
- * -device sd-card,bus=sd-bus1): slot 0's pads (GPIO6 to GPIO11) carry the
- * flash on a module, so a board's card socket is on slot 1, where ESP-IDF
- * looks for it by default. Every SD card takes time as one that just
- * meets its registers (hw/sd/sd.c, the sd-card "timing" property, which
- * the machine sets). The socket's supply is the board's 3.3 V, not
- * switched.
+ * -device sd-card,bus=sd-bus1), wired to slot 1's IO_MUX pads, GPIO14,
+ * GPIO15, GPIO2, GPIO4, GPIO12 and GPIO13 (CLK, CMD, DAT0 to DAT3): slot
+ * 0's pads (GPIO6 to GPIO11) carry the module's flash, so a board's card
+ * socket is on slot 1, where ESP-IDF looks for it by default. The card
+ * answers only through pads set up as ESP-IDF sets them up
+ * (hw/sd/esp32_sdmmc.c). The bare module has no pull-ups on the lines: a
+ * board's, on CMD and DAT0 to DAT3 (not CLK), are the machine's
+ * "sd-pull-up", in ohms (ESP-IDF's documentation asks for 10 kOhm); on
+ * the board, a pull-up on GPIO12 (MTDI) would also strap VDD_SDIO to
+ * 1.8 V at reset, which the machine does not model. Every SD card takes
+ * time as one that just meets its registers (hw/sd/sd.c, the sd-card
+ * "timing" property, which the machine sets). The socket's supply is the
+ * board's 3.3 V, not switched.
  */
-static void esp32_machine_init_sd(Esp32SocState *ss)
+static const uint8_t esp32_sd_pulled_pads[] = { 15, 2, 4, 12, 13 };
+
+static void esp32_machine_init_sd(Esp32MachineState *ms)
 {
+    Esp32SocState *ss = &ms->esp32;
     DriveInfo *dinfo = drive_get(IF_SD, 0, 0);
+
+    for (int i = 0; i < ARRAY_SIZE(esp32_sd_pulled_pads); i++) {
+        qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&ss->gpio),
+                                            ESP32_GPIO_BOARD_PULL_UP,
+                                            esp32_sd_pulled_pads[i]),
+                     ms->sd_pull_up);
+    }
     if (dinfo) {
         DeviceState *card;
 
         card = qdev_new(TYPE_SD_CARD);
         qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(dinfo),
                                 &error_fatal);
-        /* See the comment on not using sysbus-default in esp32_machine_init_i2c */
         DeviceState *sdmmc = DEVICE(&ss->sdmmc);
         SDBus* sd_bus = SD_BUS(qdev_get_child_bus(sdmmc, "sd-bus1"));
         qdev_realize_and_unref(card, BUS(sd_bus), &error_fatal);
@@ -2244,24 +2478,78 @@ static void esp32_machine_init_sd(Esp32SocState *ss)
 /*
  * [spec:nuos:req:emu.esp32.sdio-slave]
  * An SD host for the SDIO slave. Nothing in the ESP32 can be the slave's
- * host (its SD/MMC host's second slot uses the same pads), so with
+ * host (its SD/MMC host's slot 1 uses the same pads), so with
  * sdio-host=on the machine adds a standard SD host controller (SDHCI)
- * outside the ESP32's address map, standing for an external host wired
- * to the slave's pins, and plugs the slave's card into it. The
- * controller's interrupt is its sysbus IRQ 0, wired to nothing.
+ * outside the ESP32's address map, standing for an external host whose
+ * CLK, CMD and DAT0 to DAT3 the board wires to slot 1's pads (GPIO14,
+ * GPIO15, GPIO2, GPIO4, GPIO12, GPIO13), and plugs the slave's card into
+ * it. The host reaches the slave only as those pads are set up
+ * (esp32_sdio_slave_lines(), hw/sd/sdhci.c's lines): what the host then
+ * sees is no response (a command timeout) where CMD is held high, a
+ * response of 0s (CRC and end bit errors) where it is held low, a data
+ * timeout where a read's DAT0 is held high, a data CRC error where
+ * another DAT line does not follow the slave or a write block fails the
+ * slave's CRC check, and its card interrupt as DAT1's pad holds it. The
+ * board's pull-ups on those pads are the machine's "sd-pull-up", as for an
+ * SD card on slot 1, which the board then cannot also have: the machine
+ * takes no SD card with sdio-host=on. The controller's interrupt is its
+ * sysbus IRQ 0, wired to nothing.
  */
 #define ESP32_SDIO_TEST_HOST_BASE 0x22000000
 
+static void esp32_sdio_host_lines(void *opaque, SDHCILines *l)
+{
+    Esp32SdioLines sl;
+
+    esp32_sdio_slave_lines(opaque, &sl);
+    l->to_card = sl.to_slave;
+    l->to_host = sl.to_host;
+    l->card_level = sl.slave_level;
+    l->host_level = sl.host_level;
+}
+
+static void esp32_sdio_route_changed(Notifier *n, void *data)
+{
+    Esp32MachineState *ms = container_of(n, Esp32MachineState, sdio_route);
+
+    sdhci_lines_changed(ms->sdio_sdhci);
+}
+
+/* DAT1's pad, which the host watches for the slave's interrupt */
+static void esp32_sdio_dat1_changed(void *opaque, int n, int level)
+{
+    Esp32MachineState *ms = opaque;
+
+    sdhci_lines_changed(ms->sdio_sdhci);
+}
+
 static void esp32_machine_init_sdio_host(Esp32MachineState *ms)
 {
+    static const uint8_t pads[ESP32_SDIO_LINES] = ESP32_SDIO_SLOT1_PADS;
     Esp32SocState *ss = &ms->esp32;
     DeviceState *host = qdev_new(TYPE_SYSBUS_SDHCI);
+    BusState *bus;
 
+    if (drive_get(IF_SD, 0, 0)) {
+        error_report("sdio-host=on wires an SD host to slot 1's pads, where "
+                     "the board's SD card would be: give one or the other");
+        exit(1);
+    }
+    qbus_mark_full(qdev_get_child_bus(DEVICE(&ss->sdmmc), "sd-bus1"));
     object_property_add_child(OBJECT(ms), "sdio-sdhci", OBJECT(host));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(host), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(host), 0, ESP32_SDIO_TEST_HOST_BASE);
-    esp32_sdio_slave_attach(&ss->sdio,
-                            SD_BUS(qdev_get_child_bus(host, "sd-bus")));
+    bus = qdev_get_child_bus(host, "sd-bus");
+    esp32_sdio_slave_attach(&ss->sdio, SD_BUS(bus));
+    qbus_mark_full(bus);
+    ms->sdio_sdhci = SYSBUS_SDHCI(host);
+    sdhci_set_lines(ms->sdio_sdhci, esp32_sdio_host_lines, &ss->sdio);
+    ms->sdio_route.notify = esp32_sdio_route_changed;
+    esp32_gpio_add_route_notifier(&ss->gpio, &ms->sdio_route);
+    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), ESP32_GPIO_PAD_OUT,
+                                pads[ctz32(ESP32_SDIO_LINE_DAT(1))],
+                                qemu_allocate_irq(esp32_sdio_dat1_changed,
+                                                  ms, 0));
 }
 
 static void esp32_machine_init(MachineState *machine)
@@ -2299,10 +2587,10 @@ static void esp32_machine_init(MachineState *machine)
         qdev_prop_set_bit(DEVICE(&ss->dport), "has_psram", true);
     }
 
-    qdev_realize(DEVICE(ss), NULL, &error_fatal);
+    sysbus_realize(SYS_BUS_DEVICE(ss), &error_fatal);
 
     if (blk) {
-        esp32_machine_init_spi_flash(ss, blk);
+        esp32_machine_init_spi_flash(ms, blk);
     }
 
     if (machine->ram_size > 0) {
@@ -2311,7 +2599,7 @@ static void esp32_machine_init(MachineState *machine)
 
     esp32_machine_init_i2c(ss);
 
-    esp32_machine_init_sd(ss);
+    esp32_machine_init_sd(ms);
 
     if (ms->sdio_host) {
         esp32_machine_init_sdio_host(ms);
@@ -2396,6 +2684,29 @@ static void esp32_machine_set_sdio_host(Object *obj, bool value, Error **errp)
     ESP32_MACHINE(obj)->sdio_host = value;
 }
 
+static void esp32_machine_get_sd_pull_up(Object *obj, Visitor *v,
+                                         const char *name, void *opaque,
+                                         Error **errp)
+{
+    visit_type_uint32(v, name, &ESP32_MACHINE(obj)->sd_pull_up, errp);
+}
+
+static void esp32_machine_set_sd_pull_up(Object *obj, Visitor *v,
+                                         const char *name, void *opaque,
+                                         Error **errp)
+{
+    uint32_t ohms;
+
+    if (!visit_type_uint32(v, name, &ohms, errp)) {
+        return;
+    }
+    if (ohms > INT32_MAX) {
+        error_setg(errp, "sd-pull-up must be at most %d ohms", INT32_MAX);
+        return;
+    }
+    ESP32_MACHINE(obj)->sd_pull_up = ohms;
+}
+
 /*
  * [spec:nuos:req:emu.sd-card-timing]
  * Every SD card in the machine, from -drive if=sd or -device sd-card,
@@ -2420,7 +2731,15 @@ static void esp32_machine_class_init(ObjectClass *oc, const void *data)
                                    esp32_machine_get_sdio_host,
                                    esp32_machine_set_sdio_host);
     object_class_property_set_description(oc, "sdio-host",
-        "Add an SDHCI at 0x22000000 as the SDIO slave's host");
+        "Wire an SD host, an SDHCI at 0x22000000, to the SDIO slave's slot 1 "
+        "pads (GPIO14, 15, 2, 4, 12, 13), in place of an SD card");
+    object_class_property_add(oc, "sd-pull-up", "uint32",
+                              esp32_machine_get_sd_pull_up,
+                              esp32_machine_set_sd_pull_up, NULL, NULL);
+    object_class_property_set_description(oc, "sd-pull-up",
+        "The board's pull-ups on the SD card's, or with sdio-host the SDIO "
+        "host's, CMD and DAT0-3 (GPIO15, 2, 4, 12, 13), in ohms; 0 (the "
+        "default, as on the bare module): none");
     machine_add_audiodev_property(mc);
     compat_props_add(mc->compat_props, esp32_sd_card_timing,
                      ARRAY_SIZE(esp32_sd_card_timing));

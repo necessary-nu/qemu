@@ -35,6 +35,8 @@
 #define IO_MUX_GPIO(n)      (0x500e1000 + 0x004 + 4 * (n))
 #define FUN_IE              (1u << 9)
 #define MCU_SEL_GPIO        (1u << 12)
+#define USJ_CONF0           0x500d2018u
+#define USJ_PAD_ENABLE      (1u << 14)
 
 /*
  * The probe's records
@@ -1679,6 +1681,12 @@ static void test_pads(void)
 
     cam_start(&c, "dvp-camera=cam0", 1, &src, &port);
     qts = c.qts;
+    /*
+     * GPIO24 taken from the USB Serial/JTAG PHY, which has it from reset,
+     * as ESP-IDF's gpio_ll_func_sel() does.
+     */
+    qtest_writel(qts, USJ_CONF0,
+                 qtest_readl(qts, USJ_CONF0) & ~USJ_PAD_ENABLE);
     for (n = 20; n <= 24; n++) {
         qtest_writel(qts, IO_MUX_GPIO(n), MCU_SEL_GPIO | FUN_IE);
     }

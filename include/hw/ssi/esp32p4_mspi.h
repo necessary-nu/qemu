@@ -12,6 +12,7 @@
 #include "qemu/units.h"
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/gpio/esp32p4_mspi_iomux.h"
 #include "hw/misc/esp32p4_keymng.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/ssi/ssi.h"
@@ -40,6 +41,11 @@ enum {
 #define ESP32P4_MSPI_PSRAM_MRS      16
 
 /*
+ * Link "pins": IOMUX_MSPI_PIN (hw/gpio/esp32p4_mspi_iomux.c), the pads its
+ * reads go through: the flash's pulls on data lines nothing drives, and
+ * the PSRAM's strobes and delay lines in a DDR read. Without it a read
+ * sees the memory as it is, and an undriven line reads 0.
+ *
  * Named GPIO inputs:
  *
  * "apb-reset", "axi-reset": HP_SYS_CLKRST's RST_EN_MSPI_APB and
@@ -78,6 +84,8 @@ struct ESP32P4MSPIState {
     ESP32P4EfuseState *efuse;
     /* The Key Manager, whose encryption key it takes when selected. */
     ESP32P4KeyMngState *keymng;
+    /* IOMUX_MSPI_PIN, the pads' configuration its reads go through. */
+    ESP32P4MspiIomuxState *pins;
 
     SSIBus *bus;
     qemu_irq cs[2];

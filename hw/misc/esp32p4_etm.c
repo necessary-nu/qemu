@@ -495,13 +495,21 @@ void esp32p4_etm_connect_task(ESP32P4EtmState *s, int id, DeviceState *dev,
 }
 
 /* [spec:nuos:req:emu.esp32p4.etm] */
+/*
+ * The clocks are counted from their periods at reset: a clock set before
+ * the ETM was connected to it, and unchanged since, gives no update.
+ */
 static void esp32p4_etm_reset_hold(Object *obj, ResetType type)
 {
     ESP32P4EtmState *s = ESP32P4_ETM(obj);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    etm_tick_fold(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    etm_tick_fold(s, now);
     etm_reset_registers(s);
     timer_del(&s->tick_timer);
+    esp32p4_clk_count_start(&s->clk_count, s->clk, now);
+    esp32p4_clk_count_start(&s->tick_count, s->rtc_tick, now);
+    s->tick_seen = 0;
 }
 
 static void esp32p4_etm_reset_exit(Object *obj, ResetType type)

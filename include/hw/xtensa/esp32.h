@@ -35,7 +35,7 @@
 #include "hw/xtensa/esp32_pid.h"
 #include "hw/misc/esp32_flash_enc.h"
 #include "hw/net/can/esp32_twai.h"
-#include "hw/sd/dwc_sdmmc.h"
+#include "hw/sd/esp32_sdmmc.h"
 #include "hw/sd/esp32_sdio_slave.h"
 #include "hw/display/esp_rgb.h"
 #include "hw/net/esp32_emac.h"
@@ -94,7 +94,7 @@ struct Esp32PeriphGate {
 
 struct Esp32SocState {
     /*< private >*/
-    DeviceState parent_obj;
+    SysBusDevice parent_obj;
 
     /*< public >*/
     XtensaCPU cpu[ESP32_CPU_COUNT];
@@ -133,7 +133,7 @@ struct Esp32SocState {
     Esp32FlashEncryptionState flash_enc;
     ESPRgbState rgb;
 
-    DWCSDMMCState sdmmc;
+    Esp32SdmmcState sdmmc;
     Esp32EmacState emac;
     IP101PhyState phy;
     Esp32SdioSlaveState sdio;

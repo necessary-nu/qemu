@@ -10,7 +10,9 @@
 #define HW_RISCV_ESP32P4_H
 
 #include "qemu/units.h"
+#include "hw/audio/es8311.h"
 #include "hw/audio/esp32p4_i2s.h"
+#include "hw/audio/ns4150.h"
 #include "hw/core/boards.h"
 #include "hw/char/esp32_uart_terminal.h"
 #include "hw/char/esp32p4_uart.h"
@@ -26,7 +28,9 @@
 #include "hw/dma/esp32p4_gdma.h"
 #include "hw/dma/esp32p4_uhci.h"
 #include "hw/gpio/esp32p4_gpio.h"
+#include "hw/gpio/esp32p4_mspi_iomux.h"
 #include "hw/i2c/esp32p4_i2c.h"
+#include "hw/i2c/i2c_wire_bus.h"
 #include "hw/i3c/esp32p4_i3c.h"
 #include "hw/intc/esp32p4_clic.h"
 #include "hw/intc/esp32p4_clint.h"
@@ -175,6 +179,51 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
  */
 #define ESP32P4_BOARD_SD_PULL_UP    51000
 
+/*
+ * The board's audio (hw/riscv/esp32p4_audio.c): the ESP_I2C wires and
+ * their pull-ups (R48, R50); the ES8311 codec's pads; its pull-ups on
+ * SCLK and LRCK, whose strength is not documented (ohms); PA_CTRL, the
+ * NS4150B's CTRL, and R74 pulling it down.
+ */
+#define ESP32P4_BOARD_I2C_SDA_PAD       7
+#define ESP32P4_BOARD_I2C_SCL_PAD       8
+#define ESP32P4_BOARD_I2C_PULL_UP       2200
+#define ESP32P4_BOARD_CODEC_DSDIN_PAD   9
+#define ESP32P4_BOARD_CODEC_LRCK_PAD    10
+#define ESP32P4_BOARD_CODEC_ASDOUT_PAD  11
+#define ESP32P4_BOARD_CODEC_SCLK_PAD    12
+#define ESP32P4_BOARD_CODEC_MCLK_PAD    13
+#define ESP32P4_BOARD_CODEC_PULL_UP     50000
+#define ESP32P4_BOARD_PA_CTRL_PAD       53
+#define ESP32P4_BOARD_PA_CTRL_PULL_DOWN 10000
+
+/* The pins the board drives from outside the chip */
+enum {
+    ESP32P4_BOARD_PIN_SDA,
+    ESP32P4_BOARD_PIN_SCLK,
+    ESP32P4_BOARD_PIN_LRCK,
+    ESP32P4_BOARD_PIN_ASDOUT,
+    ESP32P4_BOARD_PINS,
+};
+
+typedef struct ESP32P4BoardAudio {
+    ESP32P4MachineState *machine;
+    I2CWireBusState esp_i2c;
+    ES8311State codec;
+    NS4150State amp;
+    /* The clock on GPIO13, and the I2S controllers' MCLK_out it can be */
+    Clock *codec_mclk;
+    Clock *i2s_mclk[ESP32P4_I2S_HP_COUNT];
+    Notifier route_notifier;
+    /* Each pin the board drives: its pad, level and enable */
+    uint8_t pin_pad[ESP32P4_BOARD_PINS];
+    bool pin_level[ESP32P4_BOARD_PINS];
+    bool pin_oe[ESP32P4_BOARD_PINS];
+    /* The pads' levels the board takes, and who took them before it */
+    qemu_irq pad_prev[ESP32P4_GPIO_PADS];
+    qemu_irq pad_sink[ESP32P4_GPIO_PADS];
+} ESP32P4BoardAudio;
+
 /* The crypto block resets that hold more than their own block. */
 #define ESP32P4_CRYPTO_RST_SPLITS   4
 
@@ -301,6 +350,7 @@ struct ESP32P4MachineState {
 
     ESP32P4MSPIState flash_mspi;
     ESP32P4MSPIState psram_mspi;
+    ESP32P4MspiIomuxState mspi_iomux;
     /* HP_SYSTEM_CRYPTO_CTRL's enables, to the flash's and PSRAM's MSPI. */
     SplitIRQ crypto_split[ESP32P4_HP_SYS_CRYPTO_CTRL_LINES];
     MemoryRegion flash_window_alias;
@@ -335,6 +385,7 @@ struct ESP32P4MachineState {
 
     /* I2S0 to I2S2, then the LP I2S */
     ESP32P4I2sState i2s[ESP32P4_I2S_COUNT];
+    ESP32P4BoardAudio audio;
 
     /* The cryptography blocks. */
     ESP32P4AesState aes;
@@ -384,6 +435,7 @@ typedef struct ESP32P4KernelSegment {
  * ROM's loader refuses a segment at @addr of @size bytes.
  */
 void esp32p4_boot_core0(ESP32P4MachineState *s);
+void esp32p4_init_audio(ESP32P4MachineState *s);
 void esp32p4_present_rom_handoff(ESP32P4MachineState *s);
 bool esp32p4_rom_refuses_segment(uint32_t addr, uint32_t size);
 

@@ -32,24 +32,36 @@
 OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4UsbWrapState, ESP32P4_USB_WRAP)
 
 /*
- * USB_WRAP, the full-speed OTG's PHY control (0x50080000, 4 KiB).
+ * USB_WRAP, the full-speed OTG's PHY control (0x50080000, 4 KiB), and the
+ * selection of which of the two full-speed PHYs, PHY 0 on GPIO24 (D-) and
+ * GPIO25 (D+) and PHY 1 on GPIO26 and GPIO27, the OTG and USB
+ * Serial/JTAG each have.
  *
  * Named GPIO inputs: "phy-sel" [2], LP_SYS_USB_CTRL's SW_HW_USB_PHY_SEL
  * and SW_USB_PHY_SEL; "sessend-in", the session-end signal from the GPIO
- * matrix; "core-dp-pullup", the core's D+ pull-up. Named GPIO outputs:
+ * matrix; "core-dp-pullup", the core's D+ pull-up; "usj-pull-up" [2] and
+ * "usj-pad-enable", USB Serial/JTAG's D- and D+ pull-ups and its
+ * USB_PAD_ENABLE, for the PHY it has. Named GPIO outputs:
  * "phy-connected" and "pull-override" [2], to the full-speed core's
  * inputs of those names; "sessend", the session end the core sees
  * (SRP_SESSEND_OVERRIDE's, or the matrix's); "otg-phy", which of the two
- * full-speed PHYs the OTG has: 0 the one on GPIO24/25, 1 the one on
- * GPIO26/27 (USB Serial/JTAG has the other); "phy-dp-pullup" [2], the D+
- * pull-up the OTG puts on PHY 0's pad (GPIO25) and PHY 1's (GPIO27).
+ * PHYs the OTG has (USB Serial/JTAG has the other); "pad-pull-up" [4] and
+ * "pad-phy" [4], for GPIO24 to GPIO27, the pull-up each PHY puts on its
+ * pads and whether the PHY has them, for the GPIO block's inputs of
+ * those names.
  */
 #define ESP32P4_USB_WRAP_PHY_SEL    "phy-sel"
 #define ESP32P4_USB_WRAP_SESSEND_IN "sessend-in"
 #define ESP32P4_USB_WRAP_SESSEND    "sessend"
 #define ESP32P4_USB_WRAP_OTG_PHY    "otg-phy"
 #define ESP32P4_USB_WRAP_CORE_DP_PULLUP "core-dp-pullup"
-#define ESP32P4_USB_WRAP_PHY_DP_PULLUP  "phy-dp-pullup"
+#define ESP32P4_USB_WRAP_USJ_PULL_UP    "usj-pull-up"
+#define ESP32P4_USB_WRAP_USJ_PAD_ENABLE "usj-pad-enable"
+#define ESP32P4_USB_WRAP_PAD_PULL_UP    "pad-pull-up"
+#define ESP32P4_USB_WRAP_PAD_PHY        "pad-phy"
+/* The two PHYs' pads, D- then D+, from GPIO24. */
+#define ESP32P4_USB_FS_PAD0         24
+#define ESP32P4_USB_FS_PADS         4
 
 struct ESP32P4UsbWrapState {
     SysBusDevice parent_obj;
@@ -59,7 +71,8 @@ struct ESP32P4UsbWrapState {
     qemu_irq pull_override[2];
     qemu_irq otg_phy;
     qemu_irq sessend;
-    qemu_irq phy_dp_pullup[2];
+    qemu_irq pad_pull_up[ESP32P4_USB_FS_PADS];
+    qemu_irq pad_phy[ESP32P4_USB_FS_PADS];
     ESP32P4EfuseState *efuse;
 
     uint32_t otg_conf;
@@ -68,6 +81,8 @@ struct ESP32P4UsbWrapState {
     bool sw_phy_val;
     bool sessend_in;
     bool core_dp_pullup;
+    bool usj_pull_up[2];
+    bool usj_pad_enable;
 };
 
 #define TYPE_ESP32P4_USB_UTMI "esp32p4-usb-utmi"

@@ -155,12 +155,19 @@
 #define SIG_I2C0_SDA        69
 #define SIG_I2C1_SCL        70
 #define SIG_I2C1_SDA        71
+#define SIG_GPIO_OUT        256
 #define LP_SIG_I2C_SCL      0
 #define LP_SIG_I2C_SDA      1
 
-/* The pads the board wires the bus to */
-#define PAD_SCL             7
-#define PAD_SDA             8
+/*
+ * The pads the board wires the bus to, ESP_I2C (GPIO8 SCL, GPIO7 SDA, with
+ * R48 and R50, 2.2 kOhm pull-ups, and the ES8311 at 0x18 on them); I2C1's,
+ * wired to them where a test says so.
+ */
+#define PAD_SCL             8
+#define PAD_SDA             7
+#define PAD_SLV_SCL         10
+#define PAD_SLV_SDA         9
 #define LP_PAD_SCL          4
 #define LP_PAD_SDA          5
 
@@ -653,8 +660,8 @@ static void test_unrouted(void)
 
     master0(qts);
     /* SDA's input from another pad, pulled up */
-    od_pad(qts, 11);
-    qtest_writel(qts, GPIO_FUNC_IN(SIG_I2C0_SDA), IN_SIG_IN_SEL | 11);
+    od_pad(qts, 20);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_I2C0_SDA), IN_SIG_IN_SEL | 20);
     g_assert_false(write_bytes(qts, TMP105_ADDR, &reg, 1));
 
     /* Routed again, it does. */
@@ -664,10 +671,15 @@ static void test_unrouted(void)
     wr(qts, I2C0, FIFO_CONF, rd(qts, I2C0, FIFO_CONF) & ~FIFO_TX_RST);
     g_assert_true(write_bytes(qts, TMP105_ADDR, &reg, 1));
 
-    /* Unpowered pull-ups leave SCL low: the bus never goes idle. */
+    /*
+     * On pads the board has no pull-ups on, without the pads' own SCL
+     * stays low: the bus never goes idle.
+     */
     step_cycles(qts, 100);
-    qtest_writel(qts, IO_MUX_GPIO(PAD_SCL), MCU_SEL_GPIO | FUN_IE |
-                 FUN_DRV(2));
+    qtest_writel(qts, GPIO_FUNC_OUT(PAD_SCL), SIG_GPIO_OUT);
+    qtest_writel(qts, GPIO_FUNC_OUT(PAD_SDA), SIG_GPIO_OUT);
+    route(qts, SIG_I2C0_SCL, SIG_I2C0_SDA, 21, 20);
+    qtest_writel(qts, IO_MUX_GPIO(21), MCU_SEL_GPIO | FUN_IE | FUN_DRV(2));
     wr(qts, I2C0, INT_CLR, 0x7ffff);
     wr(qts, I2C0, DATA, TMP105_ADDR << 1);
     trans_start(qts, I2C0);
@@ -801,10 +813,10 @@ static void test_arbitration(void)
     qtest_quit(qts);
 }
 
-/* I2C1 as a slave at 0x28 on pads 9 and 10, wired to I2C0's 7 and 8. */
+/* I2C1 as a slave at 0x28 on pads 10 and 9, wired to I2C0's 8 and 7. */
 static void slave1(QTestState *qts, uint32_t ctr, uint32_t stretch)
 {
-    route(qts, SIG_I2C1_SCL, SIG_I2C1_SDA, 9, 10);
+    route(qts, SIG_I2C1_SCL, SIG_I2C1_SDA, PAD_SLV_SCL, PAD_SLV_SDA);
     timing(qts, I2C1);
     wr(qts, I2C1, SLAVE_ADDR, SLAVE_ADDR7);
     wr(qts, I2C1, SCL_STRETCH_CONF, stretch);
@@ -813,7 +825,7 @@ static void slave1(QTestState *qts, uint32_t ctr, uint32_t stretch)
     wr(qts, I2C1, INT_CLR, 0x7ffff);
 }
 
-#define WIRES "-global esp32p4-gpio.pad-wires=7:9,8:10"
+#define WIRES "-global esp32p4-gpio.pad-wires=8:10,7:9"
 
 /* I2C0 writes to I2C1 as a slave, and reads back from it. */
 /* [spec:nuos:req:emu.esp32p4.i2c/test] */
@@ -947,22 +959,22 @@ static void test_filter(void)
     QTestState *qts = start(NULL);
 
     hp_enable(qts);
-    route(qts, SIG_I2C1_SCL, SIG_I2C1_SDA, 9, 10);
+    route(qts, SIG_I2C1_SCL, SIG_I2C1_SDA, PAD_SLV_SCL, PAD_SLV_SDA);
     timing(qts, I2C1);
     wr(qts, I2C1, FILTER_CFG, FILTER_SCL_EN | FILTER_SDA_EN | (10 << 4) | 10);
     wr(qts, I2C1, CTR, CTR_CONF_UPGATE);
     wr(qts, I2C1, INT_CLR, 0x7ffff);
-    pad_in(qts, 10, 0);
+    pad_in(qts, PAD_SLV_SDA, 0);
     qtest_clock_step(qts, 9 * CYCLE_NS);
-    pad_release(qts, 10);
+    pad_release(qts, PAD_SLV_SDA);
     step_cycles(qts, 20);
     g_assert_cmphex(rd(qts, I2C1, INT_RAW) & INT_DET_START, ==, 0);
-    pad_in(qts, 10, 0);
+    pad_in(qts, PAD_SLV_SDA, 0);
     step_cycles(qts, 10);
     g_assert_cmphex(rd(qts, I2C1, INT_RAW) & INT_DET_START, ==,
                     INT_DET_START);
     g_assert_cmphex(rd(qts, I2C1, SR) & SR_BUS_BUSY, ==, SR_BUS_BUSY);
-    pad_release(qts, 10);
+    pad_release(qts, PAD_SLV_SDA);
     step_cycles(qts, 10);
     g_assert_cmphex(rd(qts, I2C1, SR) & SR_BUS_BUSY, ==, 0);
     qtest_quit(qts);

@@ -166,6 +166,8 @@
 #define IO_MUX_GPIO(n)      (0x500e1004 + 4 * (n))
 #define FUN_IE              (1u << 9)
 #define MCU_SEL_GPIO        (1u << 12)
+#define USJ_CONF0           0x500d2018u
+#define USJ_PAD_ENABLE      (1u << 14)
 #define LP_GPIO_FUNC_IN(s)  (0x5012a074 + 4 * (s))
 #define LP_SIG_IN_SEL       (1u << 1)
 
@@ -288,9 +290,17 @@ static uint32_t i2s_r(QTestState *qts, int n, uint32_t reg)
     return qtest_readl(qts, I2S(n) + reg);
 }
 
-/* Pad @pad, its input enabled, driven by output signal @out_sig. */
+/*
+ * Pad @pad, its input enabled, driven by output signal @out_sig; GPIO24
+ * and GPIO25 taken from the USB Serial/JTAG PHY first, which has them from
+ * reset, as ESP-IDF's gpio_ll_func_sel() does.
+ */
 static void pad_out(QTestState *qts, int pad, int out_sig)
 {
+    if (pad == 24 || pad == 25) {
+        qtest_writel(qts, USJ_CONF0,
+                     qtest_readl(qts, USJ_CONF0) & ~USJ_PAD_ENABLE);
+    }
     qtest_writel(qts, IO_MUX_GPIO(pad), MCU_SEL_GPIO | FUN_IE);
     qtest_writel(qts, GPIO_FUNC_OUT(pad), out_sig);
 }
@@ -1310,9 +1320,9 @@ static void test_lp_from_hp(void)
 
 /*
  * [spec:nuos:req:emu.esp32p4.i2s/test]
- * The audio backend as a codec on the bus: a master transmitter's frames
- * play at the rate and in the format the guest configures, here 16-bit
- * stereo at 31250 Hz into a WAV file, sample for sample.
+ * The machine's audiodev is the board's speaker behind its codec: a
+ * master transmitter on pads that reach no codec plays nothing there,
+ * whatever it sends (the WAV file stays empty).
  */
 static void test_audio_out(void)
 {
@@ -1321,8 +1331,8 @@ static void test_audio_out(void)
     g_autofree gchar *wav = NULL;
     QTestState *qts;
     int16_t tx[256];
-    gsize len;
-    int fd, start = -1;
+    gsize len = 0;
+    int fd;
 
     fd = g_file_open_tmp("esp32p4-i2s-XXXXXX.wav", &path, NULL);
     g_assert(fd >= 0);
@@ -1336,6 +1346,9 @@ static void test_audio_out(void)
         tx[2 * k + 1] = -(0x1000 + 3 * k);
     }
     clocks_on(qts, 0);
+    pad_out(qts, 20, SIG_O_BCK(0));
+    pad_out(qts, 21, SIG_O_WS(0));
+    pad_out(qts, 22, SIG_SD(0));
     fill(qts, MEM + 0x1000, (uint8_t *)tx, sizeof(tx));
     unit_setup(qts, 0, true, TX_BASE | C_TDM_EN | C_BCK_DIV(8), STD_CONF1,
                STD_TDM);
@@ -1343,27 +1356,12 @@ static void test_audio_out(void)
     qtest_clock_step(qts, 1000);
     unit_start(qts, 0, true, TX_BASE | C_TDM_EN | C_BCK_DIV(8));
     qtest_clock_step(qts, 100 * 1000 * 1000);
+    g_assert_cmphex(i2s_r(qts, 0, INT_RAW) & INT_TX_DONE, ==, INT_TX_DONE);
     qtest_quit(qts);
 
-    g_assert_true(g_file_get_contents(path, &wav, &len, NULL));
+    g_file_get_contents(path, &wav, &len, NULL);
     unlink(path);
-    g_assert_cmpuint(len, >=, 44 + sizeof(tx));
-    /* The header: PCM, two channels, 31250 Hz, 16 bits */
-    g_assert_cmpuint(lduw_le_p(wav + 22), ==, 2);
-    g_assert_cmpuint(ldl_le_p(wav + 24), ==, 31250);
-    g_assert_cmpuint(lduw_le_p(wav + 34), ==, 16);
-    for (gsize i = 44; i + 4 <= len; i += 4) {
-        if ((int16_t)lduw_le_p(wav + i) == tx[0] &&
-            (int16_t)lduw_le_p(wav + i + 2) == tx[1]) {
-            start = i;
-            break;
-        }
-    }
-    g_assert_cmpint(start, >=, 44);
-    g_assert_cmpuint(len - start, >=, sizeof(tx));
-    for (int k = 0; k < 256; k++) {
-        g_assert_cmpint((int16_t)lduw_le_p(wav + start + 2 * k), ==, tx[k]);
-    }
+    g_assert_cmpuint(len, <=, 44);
 }
 
 /*
@@ -1423,9 +1421,9 @@ static void test_lp_pdm(void)
 
 /*
  * [spec:nuos:req:emu.esp32p4.i2s/test]
- * The LP I2S as master receiver on LP_I2S_RX_CLK with nothing of the chip
- * on its data input: it records from the audio backend (silence from
- * "none"), and its VAD takes the frames: VAD_DONE, no energy, no speech.
+ * The LP I2S as master receiver on LP_I2S_RX_CLK with nothing on its data
+ * input: whatever the audiodev, it records the unrouted input's level,
+ * silence, and its VAD takes the frames: VAD_DONE, no energy, no speech.
  */
 static void test_lp_master_audio(void)
 {

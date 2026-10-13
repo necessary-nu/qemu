@@ -48,6 +48,60 @@
  * the code: function 2 exists (HINF has its IDs and enables) but its data
  * path and SLC1's DMA are undocumented and logged as unimplemented; the
  * CIS is the model's, built from HINF's IDs and its 32 configurable bytes.
+ *
+ * [spec:nuos:req:emu.esp32.sdio-slave]
+ * [spec:nuos:req:emu.esp32.gpio]
+ * The slave's CLK, CMD and DAT0 to DAT3 are IO_MUX functions of their own,
+ * with no GPIO matrix signal (TRM table 6.9-1 has none; ESP-IDF's
+ * sdio_slave driver selects the function on fixed pins): function 4 of
+ * slot 1's pads, GPIO14 (CLK), GPIO15 (CMD), GPIO2, GPIO4, GPIO12 and
+ * GPIO13 (DAT0 to DAT3), and function 0 of slot 0's, GPIO6, GPIO11 and
+ * GPIO7 to GPIO10, which on the ESP32-WROOM-32E are the module's flash
+ * lines, so a host can only be wired to slot 1's, where ESP-IDF's driver
+ * puts the slave. Their types in the datasheet's IO_MUX table: SD_CLK I0,
+ * SD_CMD and SD_DATAn I1/O/T (but SD_DATA3 on GPIO10, I0), an input reading
+ * 0 or 1 while its pad is on another function (hw/gpio/esp32_gpio.c). A
+ * line joins the slave to its host (esp32_sdio_slave_lines()) as the pads
+ * are set up:
+ *
+ *   - the host's output reaches the slave's input while the pad is on
+ *     function 4 with its input enabled (FUN_IE, or RTCIO's with MUX_SEL
+ *     set; slot 1's pads are all RTC pads) and nothing in the chip, nor an
+ *     outside driver, drives the pad against the host;
+ *   - the slave's output reaches the pad, the host's input, while the pad
+ *     takes it when the slave drives it: on function 4, not handed to the
+ *     RTC IO MUX, its enable the slave's (OEN_SEL clear) or GPIO_ENABLE's
+ *     as OEN_INV_SEL leaves it, an open-drain pad only where its pulls hold
+ *     it high, no outside driver;
+ *   - an input the host does not reach reads 0 with its input disabled, 1
+ *     or 0 off its function as its type has it, else the pad's level; the
+ *     host reads a pad the slave's output does not reach at the pad's
+ *     level: another driver, or the pulls: RTCIO's RUE and RDE (errata
+ *     [GPIO-3.6]) and the board's (the machine's "sd-pull-up"). With none
+ *     a line floats, and reads low.
+ *
+ * The SD protocol has CMD push-pull throughout for an SD or SDIO card (its
+ * open-drain identification is MMC's): nothing needs PAD_DRIVER, which on
+ * CMD or a DAT line passes the slave's highs only as the pulls hold them.
+ * ESP-IDF sets each pin up (sdio_slave_hw_init(), configure_pin()) with
+ * its input enabled, function 4, drive strength 3 and the pull-down off,
+ * and with SDIO_SLAVE_FLAG_INTERNAL_PULLUP the pad's pull-up on CMD and DAT
+ * (for these RTC pads, through RTCIO), which its documentation calls no
+ * substitute for the board's 10 kOhm ones; SDIO_SLAVE_FLAG_DAT2_DISABLED
+ * and _HOST_INTR_DISABLED leave DAT2 and DAT1 alone.
+ *
+ * The host is outside the chip, a QEMU SD host (hw/sd/sdhci.c, which the
+ * machine joins to the slave as these lines say), whose transfers are
+ * modelled above single pad transitions; between them the slave holds CMD
+ * and DAT released and drives DAT1 low while it interrupts the host, on
+ * its pad outputs. The slave counts the write blocks that reach it with a
+ * DAT line's bits not the host's (SLC_SDIO_CRC_ST0) and discards them.
+ *
+ * Not modelled: the pads' drive strength, the IO_MUX's sleep settings, the
+ * slave's inputs on slot 0's pads (which no host can reach on this module;
+ * the TRM does not say how two pads on one function combine), its outputs
+ * there, and SLC_SDIO_CRC_ST1's count of commands failing their CRC, which
+ * stays 0.
  */
 
 #include "qemu/osdep.h"
@@ -102,6 +156,7 @@
 #define A_SLC_0_LENGTH          0x0e8
 #define A_SLC_SEQ_POSITION      0x114
 #define A_SLC_0_DSCR_REC_CONF   0x118
+#define A_SLC_SDIO_CRC_ST0      0x11c
 #define A_SLC_SDIO_CRC_ST1      0x120
 #define A_SLC_0_LEN_LIM_CONF    0x138
 #define A_SLC_0INT_ST1          0x13c
@@ -173,6 +228,9 @@
 #define LEN_INC                 BIT(21)
 #define LEN_INC_MORE            BIT(22)
 #define LEN_CONF_UNMODELLED     0x1f800000u
+
+/* SLC_SDIO_CRC_ST1 */
+#define CRC_ST1_ERR_CNT_CLR     BIT(31)
 
 /* RX_STATUS and TX_STATUS */
 #define FIFO_FULL               BIT(0)
@@ -358,6 +416,44 @@ typedef enum {
 
 static void sdio_kick_send(Esp32SdioSlaveState *s);
 
+static const uint8_t esp32_sdio_pads[ESP32_SDIO_LINES] = ESP32_SDIO_SLOT1_PADS;
+
+/* [spec:nuos:req:emu.esp32.sdio-slave] */
+void esp32_sdio_slave_lines(Esp32SdioSlaveState *s, Esp32SdioLines *l)
+{
+    Esp32GpioState *g = s->gpio;
+
+    if (!g) {
+        l->to_slave = MAKE_64BIT_MASK(0, ESP32_SDIO_LINES);
+        l->to_host = l->to_slave;
+        l->slave_level = l->to_slave;
+        l->host_level = l->to_slave;
+        return;
+    }
+    l->to_slave = 0;
+    l->to_host = 0;
+    l->slave_level = 0;
+    l->host_level = 0;
+    for (unsigned i = 0; i < ESP32_SDIO_LINES; i++) {
+        unsigned pad = esp32_sdio_pads[i];
+        uint16_t bit = 1u << i;
+        bool on, off, off_level;
+
+        esp32_gpio_iomux_out_path(g, pad, ESP32_SDIO_FUNC, &on, &off,
+                                  &off_level);
+        if (bit != ESP32_SDIO_LINE_CLK && on) {
+            l->to_host |= bit;
+        }
+        l->host_level |= esp32_gpio_pad_level(g, pad) ? bit : 0;
+        if (esp32_gpio_iomux_in_selected(g, pad, ESP32_SDIO_FUNC) && !off) {
+            l->to_slave |= bit;
+        }
+        if (esp32_gpio_iomux_in_level(g, pad, ESP32_SDIO_FUNC)) {
+            l->slave_level |= bit;
+        }
+    }
+}
+
 static bool sdio_running(Esp32SdioSlaveState *s)
 {
     return clock_is_enabled(s->apb_clk);
@@ -419,6 +515,7 @@ static void sdio_update_irq(Esp32SdioSlaveState *s)
     bus = sdio_card_bus(s);
     if (level != s->card_irq) {
         s->card_irq = level;
+        qemu_set_irq(s->pad_oe[ctz32(ESP32_SDIO_LINE_DAT(1))], level);
         if (bus) {
             sdbus_set_irq(bus, level);
         }
@@ -968,6 +1065,8 @@ static uint32_t slc_read_word(Esp32SdioSlaveState *s, hwaddr a)
         return s->slc1_token[1] << TOKEN_SHIFT;
     case A_SLC_0_LENGTH:
         return s->slc0_len;
+    case A_SLC_SDIO_CRC_ST0:
+        return ldl_le_p(s->dat_crc_err);
     case A_SLC_0INT_CLR:
     case A_SLC_1INT_CLR:
     case A_SLC_INTVEC_TOHOST:
@@ -1064,7 +1163,15 @@ static void slc_write_word(Esp32SdioSlaveState *s, hwaddr a, uint32_t v,
         }
         break;
     case A_SLC_SDIO_CRC_ST1:
-        /* ERR_CNT_CLR: the CRC error counts are always 0. */
+        /*
+         * ERR_CNT_CLR, read back as written, clears the CRC error counts;
+         * the command count is never raised.
+         */
+        *r = (*r & ~(mask & CRC_ST1_ERR_CNT_CLR)) |
+             (v & mask & CRC_ST1_ERR_CNT_CLR);
+        if (*r & CRC_ST1_ERR_CNT_CLR) {
+            memset(s->dat_crc_err, 0, sizeof(s->dat_crc_err));
+        }
         break;
     default:
         if (slc_wmask(a)) {
@@ -1587,6 +1694,8 @@ static void sdio_card_reset_state(Esp32SdioSlaveState *s)
     s->xfer_write = false;
     s->xfer_inc = false;
     s->xfer_endless = false;
+    s->xfer_block = false;
+    s->xfer_discard = false;
     s->xfer_fn = 0;
     s->xfer_addr = 0;
     s->xfer_left = 0;
@@ -1619,6 +1728,7 @@ static void fn0_write(Esp32SdioSlaveState *s, uint32_t addr, uint8_t v)
             sdio_card_reset_state(s);
         } else if (s->xfer_active && (v & ABORT_AS_MASK) == s->xfer_fn) {
             s->xfer_active = false;
+            s->xfer_discard = false;
             s->card_state = CARD_CMD;
         }
         break;
@@ -1763,6 +1873,8 @@ static uint32_t card_cmd53(Esp32SdioSlaveState *s, uint32_t arg)
         return state | R5_FUNCTION_NUMBER;
     }
     s->xfer_endless = false;
+    s->xfer_discard = false;
+    s->xfer_block = arg & IO_BLOCK;
     if (arg & IO_BLOCK) {
         if (s->blksize[fn] == 0 || s->blksize[fn] > CIS_MAX_BLOCK) {
             qemu_log_mask(LOG_GUEST_ERROR, "esp32_sdio: block mode CMD53 "
@@ -1791,6 +1903,7 @@ static void card_xfer_advance(Esp32SdioSlaveState *s)
     }
     if (!s->xfer_endless && --s->xfer_left == 0) {
         s->xfer_active = false;
+        s->xfer_discard = false;
         s->card_state = CARD_CMD;
     }
 }
@@ -1902,12 +2015,57 @@ static size_t card_write_data(SDState *sd, const void *buf, size_t length)
                           "the card is not receiving\n");
             break;
         }
-        fn_write(s, s->xfer_fn, s->xfer_addr, p[i]);
+        if (!s->xfer_discard) {
+            fn_write(s, s->xfer_fn, s->xfer_addr, p[i]);
+        }
         card_xfer_advance(s);
     }
     sdio_kick_send(s);
     sdio_update_irq(s);
     return length;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.sdio-slave]
+ * A write block reached the slave with bits on a DAT line other than the
+ * host sent (its pad not passing the host's output,
+ * esp32_sdio_slave_lines()): its CRC check fails on that line of the bus's
+ * width, which SLC_SDIO_CRC_ST0 counts, and the slave discards the block.
+ * A byte mode CMD53, its one block lost, ends; in block mode the slave
+ * drops the blocks after it too, until the
+ * transfer's count ends it or the host aborts it (CCCR ABORT), as an SD
+ * card ignores a multiple block write's later blocks. That the SDIO
+ * slave's hardware drops the rest rather than taking the next good block
+ * is the model's reading of the SD protocol; the TRM does not say.
+ */
+static void card_write_crc_error(SDState *sd)
+{
+    Esp32SdioSlaveState *s = card_slave(sd);
+    Esp32SdioLines l;
+    unsigned width;
+
+    if (!s->xfer_active || !s->xfer_write || s->xfer_discard) {
+        return;
+    }
+    esp32_sdio_slave_lines(s, &l);
+    width = (s->bus_if & BUS_IF_WIDTH_MASK) == BUS_IF_WIDTH_4 ? 4 : 1;
+    for (unsigned n = 0; n < width; n++) {
+        if (!(l.to_slave & ESP32_SDIO_LINE_DAT(n)) &&
+            !(*slc_reg(s, A_SLC_SDIO_CRC_ST1) & CRC_ST1_ERR_CNT_CLR)) {
+            s->dat_crc_err[n]++;
+        }
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "esp32_sdio: a write block fails its CRC "
+                  "check, as the slave's pads are set up: it is discarded\n");
+    if (!s->xfer_block) {
+        s->xfer_active = false;
+        s->card_state = CARD_CMD;
+        return;
+    }
+    s->xfer_discard = true;
+    for (uint32_t i = 0; i < s->blksize[s->xfer_fn] && s->xfer_active; i++) {
+        card_xfer_advance(s);
+    }
 }
 
 static bool card_data_ready(SDState *sd)
@@ -1976,6 +2134,7 @@ static void card_class_init(ObjectClass *klass, const void *data)
     sc->do_command = card_do_command;
     sc->read_data = card_read_data;
     sc->write_data = card_write_data;
+    sc->write_crc_error = card_write_crc_error;
     sc->data_ready = card_data_ready;
     sc->receive_ready = card_receive_ready;
     sc->get_inserted = card_get_inserted;
@@ -2019,10 +2178,28 @@ static void esp32_sdio_reset_hold(Object *obj, ResetType type)
     s->slc0_len = 0;
     s->pkt_len_latch = 0;
     s->undoc_logged = false;
+    memset(s->dat_crc_err, 0, sizeof(s->dat_crc_err));
     send_reset(s);
     recv_reset(s);
     sdio_card_reset_state(s);
     sdio_update_irq(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.sdio-slave]
+ * The lines between transfers, as the pads see them: CMD and DAT released,
+ * DAT1 driven low while the slave interrupts its host. The transfers
+ * themselves are above single pad transitions.
+ */
+static void esp32_sdio_reset_exit(Object *obj, ResetType type)
+{
+    Esp32SdioSlaveState *s = ESP32_SDIO_SLAVE(obj);
+
+    for (unsigned i = 0; i < ESP32_SDIO_LINES; i++) {
+        qemu_set_irq(s->pad_out[i], ESP32_SDIO_LINE_DAT(1) != 1u << i);
+        qemu_set_irq(s->pad_oe[i],
+                     ESP32_SDIO_LINE_DAT(1) == 1u << i && s->card_irq);
+    }
 }
 
 static void esp32_sdio_clk_update(void *opaque, ClockEvent event)
@@ -2052,6 +2229,10 @@ static void esp32_sdio_init(Object *obj)
     }
     s->apb_clk = qdev_init_clock_in(DEVICE(obj), "apb", esp32_sdio_clk_update,
                                     s, ClockUpdate);
+    qdev_init_gpio_out_named(DEVICE(obj), s->pad_out, ESP32_SDIO_PAD_OUT,
+                             ESP32_SDIO_LINES);
+    qdev_init_gpio_out_named(DEVICE(obj), s->pad_oe, ESP32_SDIO_PAD_OE,
+                             ESP32_SDIO_LINES);
 }
 
 static void esp32_sdio_realize(DeviceState *dev, Error **errp)
@@ -2068,6 +2249,8 @@ static void esp32_sdio_realize(DeviceState *dev, Error **errp)
 static const Property esp32_sdio_properties[] = {
     DEFINE_PROP_LINK("dma-mr", Esp32SdioSlaveState, dma_mr,
                      TYPE_MEMORY_REGION, MemoryRegion *),
+    DEFINE_PROP_LINK("gpio", Esp32SdioSlaveState, gpio, TYPE_ESP32_GPIO,
+                     Esp32GpioState *),
 };
 
 static const VMStateDescription vmstate_esp32_sdio_send = {
@@ -2117,7 +2300,7 @@ static const VMStateDescription vmstate_esp32_sdio_recv = {
 
 static const VMStateDescription vmstate_esp32_sdio = {
     .name = TYPE_ESP32_SDIO_SLAVE,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(slc, Esp32SdioSlaveState, ESP32_SDIO_SLC_WORDS),
@@ -2151,6 +2334,9 @@ static const VMStateDescription vmstate_esp32_sdio = {
         VMSTATE_UINT32(xfer_left, Esp32SdioSlaveState),
         VMSTATE_BOOL(card_irq, Esp32SdioSlaveState),
         VMSTATE_CLOCK(apb_clk, Esp32SdioSlaveState),
+        VMSTATE_BOOL_V(xfer_block, Esp32SdioSlaveState, 2),
+        VMSTATE_BOOL_V(xfer_discard, Esp32SdioSlaveState, 2),
+        VMSTATE_UINT8_ARRAY_V(dat_crc_err, Esp32SdioSlaveState, 4, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -2161,6 +2347,7 @@ static void esp32_sdio_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     rc->phases.hold = esp32_sdio_reset_hold;
+    rc->phases.exit = esp32_sdio_reset_exit;
     dc->realize = esp32_sdio_realize;
     dc->vmsd = &vmstate_esp32_sdio;
     device_class_set_props(dc, esp32_sdio_properties);

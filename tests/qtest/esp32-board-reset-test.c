@@ -8,6 +8,8 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "esp32-flash-pins.h"
+#include "esp32-sd-pins.h"
 
 #define DPORT_PERIP_CLK_EN      0x3ff000c0
 #define DPORT_PERIP_RST_EN      0x3ff000c4
@@ -323,27 +325,34 @@ static void test_flash(void)
     const uint32_t set = FLASH_SR_BP1 | FLASH_SR_BP0 | FLASH_SR_WEL;
     QTestState *qts = start();
 
+    /* Each reset takes the pins back, which the ROM then sets up again. */
     stop_watchdogs(qts);
+    flash_pins_rom(qts);
     g_assert_cmphex(flash_status(qts), ==, 0);
     flash_set_status(qts);
     g_assert_cmphex(flash_status(qts), ==, set);
 
     sw_reset(qts);
+    flash_pins_rom(qts);
     g_assert_cmphex(flash_status(qts), ==, set);
     rtc_reset(qts);
+    flash_pins_rom(qts);
     g_assert_cmphex(flash_status(qts), ==, set);
 
     power_cycle(qts);
+    flash_pins_rom(qts);
     g_assert_cmphex(flash_status(qts), ==, 0);
     qtest_quit(qts);
 }
 
 /*
- * Clock the SD/MMC host and give card 1 its clock: the CIU's 80 MHz
- * divided by 2 * 2, handed to the CIU by a clock update.
+ * Set slot 1's pins up as ESP-IDF does (esp32-sd-pins.h), clock the SD/MMC
+ * host and give card 1 its clock: the CIU's 80 MHz divided by 2 * 2,
+ * handed to the CIU by a clock update.
  */
 static void sdmmc_setup(QTestState *qts)
 {
+    sd_pins(qts);
     qtest_writel(qts, DPORT_WIFI_CLK_EN,
                  qtest_readl(qts, DPORT_WIFI_CLK_EN) | WIFI_CLK_SDIO_HOST);
     qtest_writel(qts, DPORT_CORE_RST_EN,

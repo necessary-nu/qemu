@@ -64,7 +64,12 @@ REG32(GPIO_STRAP, 0x0038)
  * - ESP32_GPIO_IOMUX_OUT, ESP32_GPIO_IOMUX_OE (gpio-in): the peripheral's
  *   output and output enable for that pad and function.
  * - ESP32_GPIO_IOMUX_IN (gpio-out): the pad's input while the pad has that
- *   function selected, otherwise low.
+ *   function selected (low with its input disabled); while the pad is on
+ *   another function, as the function's input type in the datasheet's
+ *   IO_MUX table has it: the pad's input still for an I input (the
+ *   EMAC's), 1 for an I1 input (the SD/MMC host's HS1_* and HS2_* data
+ *   and command, the SDIO slave's SD_* but its clocks and SD_DATA3 on
+ *   GPIO10, MTDI, MTCK), else 0.
  *
  * Pads, for boards and tests:
  *
@@ -74,14 +79,21 @@ REG32(GPIO_STRAP, 0x0038)
  * - ESP32_GPIO_PAD_RELEASE (gpio-in): a high level stops driving pad n
  *   from outside.
  * - ESP32_GPIO_PAD_OUT (gpio-out): the level on pad n.
+ * - ESP32_GPIO_BOARD_PULL_UP, ESP32_GPIO_BOARD_PULL_DOWN (gpio-in): a
+ *   resistor the board has from pad n to the pad's supply, or to ground,
+ *   the level its resistance in ohms (0: none). With the pad's own 45 kOhm
+ *   pulls they make a divider (hw/gpio/esp32_gpio.c).
  *
  * The RTC pads, from the RTC IO MUX (RTCIO), indexed by GPIO number:
  *
  * - ESP32_GPIO_RTC_MUX (gpio-in): high hands the pad to the RTC IO MUX, its
- *   MUX_SEL. The IO_MUX's input enable and pulls and the GPIO matrix's
- *   output then no longer apply to it; instead
- * - ESP32_GPIO_RTC_OUT, ESP32_GPIO_RTC_OE, ESP32_GPIO_RTC_PU,
- *   ESP32_GPIO_RTC_PD, ESP32_GPIO_RTC_IE (gpio-in) drive it.
+ *   MUX_SEL. The IO_MUX's input enable and the GPIO matrix's output then
+ *   no longer apply to it; instead
+ * - ESP32_GPIO_RTC_OUT, ESP32_GPIO_RTC_OE, ESP32_GPIO_RTC_IE (gpio-in)
+ *   drive it.
+ * - ESP32_GPIO_RTC_PU, ESP32_GPIO_RTC_PD (gpio-in): the RTC pad's RUE and
+ *   RDE, its pulls whatever MUX_SEL says (the IO_MUX's FUN_WPU and FUN_WPD
+ *   do nothing on these pads, errata [GPIO-3.6]).
  * - ESP32_GPIO_RTC_IN (gpio-out): the pad's input as its input buffer
  *   delivers it, whoever controls the pad; low while the buffer is off.
  * - ESP32_GPIO_WAKEUP (gpio-out): a pad with GPIO_PINn_WAKEUP_ENABLE is at
@@ -99,6 +111,8 @@ REG32(GPIO_STRAP, 0x0038)
 #define ESP32_GPIO_PAD_IN       "esp32-gpio-pad-in"
 #define ESP32_GPIO_PAD_RELEASE  "esp32-gpio-pad-release"
 #define ESP32_GPIO_PAD_OUT      "esp32-gpio-pad"
+#define ESP32_GPIO_BOARD_PULL_UP   "esp32-gpio-board-pull-up"
+#define ESP32_GPIO_BOARD_PULL_DOWN "esp32-gpio-board-pull-down"
 #define ESP32_GPIO_RTC_MUX      "esp32-gpio-rtc-mux"
 #define ESP32_GPIO_RTC_OUT      "esp32-gpio-rtc-out"
 #define ESP32_GPIO_RTC_OE       "esp32-gpio-rtc-oe"
@@ -113,6 +127,12 @@ REG32(GPIO_STRAP, 0x0038)
  * line with the same number in and out (U0RXD_in and U0TXD_out, ...) shares
  * one constant.
  */
+/* SPI0 and SPI1's shared lines, the flash's: SPICLK, SPIQ, SPID, ... */
+#define ESP32_SIG_SPICLK        0
+#define ESP32_SIG_SPIQ          1
+#define ESP32_SIG_SPID          2
+#define ESP32_SIG_SPIHD         3
+#define ESP32_SIG_SPIWP         4
 #define ESP32_SIG_SPICS0        5
 #define ESP32_SIG_HSPICS0       11
 #define ESP32_SIG_U0RXD_IN      14
@@ -138,6 +158,16 @@ REG32(GPIO_STRAP, 0x0038)
 /* LEDC_HS_SIG_OUT0-7, then LEDC_LS_SIG_OUT0-7 */
 #define ESP32_SIG_LEDC_HS0      71
 #define ESP32_SIG_TWAI_RX       94
+/*
+ * The SD/MMC host's: in, host_card_detect_n_1 and _2, host_card_write_prt_1
+ * and _2, host_card_int_n_1 and _2; out, host_ccmd_od_pullup_en_n,
+ * host_rst_n_1 and _2.
+ */
+#define ESP32_SIG_HOST_CARD_DETECT_N_1  97
+#define ESP32_SIG_HOST_CARD_WRITE_PRT_1 99
+#define ESP32_SIG_HOST_CARD_INT_N_1     101
+#define ESP32_SIG_HOST_CCMD_OD_PULLUP_EN_N 97
+#define ESP32_SIG_HOST_RST_N_1          98
 #define ESP32_SIG_I2CEXT1_SCL   95
 #define ESP32_SIG_I2CEXT1_SDA   96
 #define ESP32_SIG_GPIO_SD0_OUT  100
@@ -222,6 +252,9 @@ typedef struct Esp32GpioState {
     /* Levels driven into the block from outside */
     uint64_t ext_driven;
     uint64_t ext_level;
+    /* The board's pull resistors on each pad, ohms (0: none) */
+    uint32_t board_pull_up[ESP32_GPIO_PIN_COUNT];
+    uint32_t board_pull_down[ESP32_GPIO_PIN_COUNT];
     uint8_t sig_out[ESP32_GPIO_SIG_COUNT];
     uint8_t sig_oe[ESP32_GPIO_SIG_COUNT];
     uint8_t iomux_func_out[ESP32_GPIO_PIN_COUNT * ESP32_IOMUX_FUNC_COUNT];
@@ -242,6 +275,8 @@ typedef struct Esp32GpioState {
     uint8_t iomux_in[ESP32_GPIO_PIN_COUNT * ESP32_IOMUX_FUNC_COUNT];
     uint8_t irq_level[ESP32_GPIO_IRQ_COUNT];
     bool wakeup_level;
+    /* The pads whose pulls hold them between VIL and VIH, as resolved */
+    uint64_t undefined;
     /* Drive every output line on the next update, not only changed ones */
     bool resync;
     bool updating;
@@ -253,8 +288,12 @@ typedef struct Esp32GpioState {
     int64_t round_ns;
     LineDeferred deferred;
 
-    /* Told after software changes how signals are routed to pads */
+    /*
+     * Told after software or the board changes how signals are routed to
+     * pads or how the pads are set up, once the change is resolved.
+     */
     NotifierList route_notifiers;
+    bool setup_changed;
 } Esp32GpioState;
 
 typedef struct Esp32GpioClass {
@@ -266,10 +305,71 @@ typedef struct Esp32GpioClass {
  * line (a QEMU bus): the pads output signal sig drives with their output
  * enabled, and the pad input signal sig takes its level from (-1 when it
  * takes a constant or its default, or the pad's input is disabled).
+ * A route notifier is told after every change to the routing or to a
+ * pad's set-up (the GPIO matrix's and IO_MUX's registers, RTCIO's pad
+ * controls, the board's pulls, an outside driver), once it is resolved.
  */
 uint64_t esp32_gpio_sig_out_pads(Esp32GpioState *s, unsigned sig);
 int esp32_gpio_sig_in_pad(Esp32GpioState *s, unsigned sig);
 void esp32_gpio_add_route_notifier(Esp32GpioState *s, Notifier *n);
+
+/*
+ * For a peripheral on IO_MUX functions of its own that drives an output
+ * only at times (the SD/MMC host's CMD and DAT, which it drives only
+ * while it sends), modelled above single pad transitions: whether pad n
+ * carries function func's output while the peripheral enables it (*on:
+ * the function selected, OEN_SEL and its inversion, open drain against
+ * the pad's pulls, the RTC IO MUX, an outside driver, all as they stand),
+ * and whether the chip or an outside driver still drives the pad, and at
+ * what *off_level, while the peripheral does not (*off).
+ */
+void esp32_gpio_iomux_out_path(Esp32GpioState *s, unsigned n, unsigned func,
+                               bool *on, bool *off, bool *off_level);
+
+/*
+ * Whether pad n's IO_MUX function func takes the pad's input: the pad on
+ * that function with its input buffer on.
+ */
+bool esp32_gpio_iomux_in_selected(Esp32GpioState *s, unsigned n,
+                                  unsigned func);
+
+/*
+ * For a peripheral on GPIO matrix signals, modelled above single pad
+ * transitions, whose output out_sig and input in_sig are one line to a
+ * chip on pad n (an SPI flash's data line; -1 for a line that is only an
+ * output or only an input), with the peripheral's output enable for
+ * out_sig forced on and off:
+ *
+ * - out_on: pad n carries out_sig's output while the peripheral enables
+ *   it, through its IO_MUX function or the matrix, OEN_SEL and its
+ *   inversion, open drain against the pulls, the RTC IO MUX and an outside
+ *   driver as they stand; out_inv: inverted on the way (OUT_INV_SEL);
+ * - pad_level: the pad's level while the peripheral's output is off: an
+ *   outside driver, another of the chip's, else its pulls;
+ * - in_on: in_sig takes pad n's input, its input enabled, with nothing
+ *   driving the pad while the peripheral's output is off, so that the
+ *   chip on the pad reaches it; in_inv: inverted on the way (IN_INV_SEL);
+ * - in_level: in_sig's level while the peripheral's output is off and the
+ *   chip on pad n drives nothing.
+ */
+typedef struct Esp32GpioSigPath {
+    bool out_on;
+    bool out_inv;
+    bool pad_level;
+    bool in_on;
+    bool in_inv;
+    bool in_level;
+} Esp32GpioSigPath;
+
+void esp32_gpio_sig_path(Esp32GpioState *s, unsigned n, int out_sig,
+                         int in_sig, Esp32GpioSigPath *p);
+
+/*
+ * Levels as the last resolution left them: pad n's IO_MUX function
+ * func's input line (ESP32_GPIO_IOMUX_IN), and pad n itself.
+ */
+bool esp32_gpio_iomux_in_level(Esp32GpioState *s, unsigned n, unsigned func);
+bool esp32_gpio_pad_level(Esp32GpioState *s, unsigned n);
 
 /*
  * Whether pad n is driven digitally, from outside the chip or by its own

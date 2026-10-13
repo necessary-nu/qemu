@@ -227,13 +227,73 @@ static bool sdhci_update_irq(SDHCIState *s)
     return pending;
 }
 
+/* The lines to the card as the board joins them (sdhci_set_lines()). */
+static void sdhci_lines(SDHCIState *s, SDHCILines *l)
+{
+    l->to_card = SDHCI_LINES_ALL;
+    l->to_host = SDHCI_LINES_ALL;
+    l->card_level = SDHCI_LINES_ALL;
+    l->host_level = SDHCI_LINES_ALL;
+    if (s->lines_fn) {
+        s->lines_fn(s->lines_opaque, l);
+    }
+}
+
+/* The DAT lines of the bus's width, bit n for DATn */
+static uint8_t sdhci_dat_width(SDHCIState *s)
+{
+    if (s->hostctl1 & SDHC_CTRL_8BITBUS) {
+        return 0xff;
+    }
+    return s->hostctl1 & SDHC_CTRL_4BITBUS ? 0x0f : 0x01;
+}
+
+/*
+ * DAT0 to DAT3 and CMD as the host's inputs read them: where a line
+ * follows the card, low while the card drives it low, else as the line is
+ * held; where it does not, as the board holds the host's input.
+ */
+static uint8_t sdhci_dat_lines(SDHCIState *s)
+{
+    SDHCILines l;
+    uint8_t follow;
+
+    sdhci_lines(s, &l);
+    follow = l.to_host >> 2;
+    return (sdbus_get_dat_lines(&s->sdbus) | ~follow) & (l.host_level >> 2) &
+           0xf;
+}
+
+static bool sdhci_cmd_line(SDHCIState *s)
+{
+    SDHCILines l;
+    bool card;
+
+    sdhci_lines(s, &l);
+    card = !(l.to_host & SDHCI_LINE_CMD) || sdbus_get_cmd_line(&s->sdbus);
+    return card && (l.host_level & SDHCI_LINE_CMD);
+}
+
+/*
+ * An SDIO card interrupts its host by holding DAT1 low: the host sees the
+ * card's request where DAT1 follows the card, and DAT1 held low otherwise.
+ */
+static bool sdhci_card_irq_seen(SDHCIState *s)
+{
+    SDHCILines l;
+
+    sdhci_lines(s, &l);
+    return (s->card_irq && (l.to_host & SDHCI_LINE_DAT(1))) ||
+           !(l.host_level & SDHCI_LINE_DAT(1));
+}
+
 /*
  * An SDIO card's interrupt is a level: Card Interrupt status follows it
  * while its status enable is set, and writing 1 to it does not clear it.
  */
 static void sdhci_update_cardint(SDHCIState *s)
 {
-    if (s->card_irq && (s->norintstsen & SDHC_NISEN_CARDINT)) {
+    if (sdhci_card_irq_seen(s) && (s->norintstsen & SDHC_NISEN_CARDINT)) {
         s->norintsts |= SDHC_NIS_CARDINT;
     } else {
         s->norintsts &= ~SDHC_NIS_CARDINT;
@@ -246,6 +306,157 @@ static void sdhci_set_card_irq(DeviceState *dev, bool level)
 
     s->card_irq = level;
     sdhci_update_cardint(s);
+    sdhci_update_irq(s);
+}
+
+void sdhci_set_lines(SDHCIState *s, SDHCILinesFunc *fn, void *opaque)
+{
+    s->lines_fn = fn;
+    s->lines_opaque = opaque;
+    sdhci_lines_changed(s);
+}
+
+void sdhci_lines_changed(SDHCIState *s)
+{
+    sdhci_update_cardint(s);
+    sdhci_update_irq(s);
+}
+
+/* Error interrupts, as their status enables let them set */
+static void sdhci_set_error(SDHCIState *s, uint16_t err)
+{
+    err &= s->errintstsen;
+    if (err) {
+        s->errintsts |= err;
+        s->norintsts |= SDHC_NIS_ERR;
+    }
+}
+
+/*
+ * A command, which the card takes only where CLK and CMD both reach it
+ * (CMD held low at its input is a start bit and a command of 0s, whose CRC
+ * fails). Its response reaches the host only where CMD follows the card;
+ * without one the host reads CMD as the line holds it: high, no start bit
+ * (a timeout); low, a response of 0s, whose CRC and end bit are wrong
+ * (*cmd_low).
+ */
+static size_t sdhci_card_command(SDHCIState *s, SDRequest *req,
+                                 uint8_t *resp, size_t size, bool *cmd_low)
+{
+    SDHCILines l;
+    size_t rlen = 0;
+
+    sdhci_lines(s, &l);
+    if ((l.to_card & (SDHCI_LINE_CLK | SDHCI_LINE_CMD)) ==
+        (SDHCI_LINE_CLK | SDHCI_LINE_CMD)) {
+        rlen = sdbus_do_command(&s->sdbus, req, resp, size);
+    }
+    if (!(l.to_host & SDHCI_LINE_CMD)) {
+        rlen = 0;
+    }
+    *cmd_low = !rlen && !sdhci_cmd_line(s);
+    return rlen;
+}
+
+/* Each byte's bits on the DAT lines in @stuck made their line's @level. */
+static void sdhci_force_lines(uint8_t *buf, size_t len, uint8_t width,
+                              uint8_t stuck, uint8_t level)
+{
+    unsigned n = width == 0xff ? 8 : width == 0x0f ? 4 : 1;
+    uint8_t clear = 0, set = 0;
+
+    for (unsigned k = 0; k < n; k++) {
+        uint8_t bits = n == 8 ? BIT(k) : n == 4 ? 0x11 << k : 0xff;
+
+        if (stuck & BIT(k)) {
+            clear |= bits;
+            set |= (level & BIT(k)) ? bits : 0;
+        }
+    }
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = (buf[i] & ~clear) | set;
+    }
+}
+
+/*
+ * A data block from the card, as the host takes it off the DAT lines of
+ * the bus's width: a line that does not follow the card, or every line
+ * where CLK does not reach the card (which then sends nothing), reads as
+ * the board holds the host's input. Returns the errors the host finds:
+ * DAT0 held high shows no start bit (a data timeout); any other line that
+ * does not follow fails the block's CRC, and its end bit where it is held
+ * low.
+ */
+static uint16_t sdhci_card_read(SDHCIState *s, uint8_t *buf, size_t len)
+{
+    uint8_t width = sdhci_dat_width(s);
+    uint8_t stuck, level;
+    SDHCILines l;
+
+    sdhci_lines(s, &l);
+    if (l.to_card & SDHCI_LINE_CLK) {
+        sdbus_read_data(&s->sdbus, buf, len);
+        stuck = width & ~(l.to_host >> 2);
+    } else {
+        stuck = width;
+    }
+    if (!stuck) {
+        return 0;
+    }
+    level = (l.host_level >> 2) & stuck;
+    sdhci_force_lines(buf, len, width, stuck, level);
+    if ((stuck & level) & 1) {
+        return SDHC_EIS_DATATIMEOUT;
+    }
+    return SDHC_EIS_DATACRC | ((stuck & ~level) ? SDHC_EIS_DATAEND : 0);
+}
+
+/*
+ * A data block to the card. The card takes it only with CLK reaching it
+ * and a start bit on DAT0 (DAT0 reaching it, or its input held low); with
+ * a DAT line of the bus's width not reaching it, it takes other bits than
+ * the host sends, its CRC check fails, and it discards the block
+ * (sdbus_write_crc_error()). Its CRC status comes back on DAT0: where DAT0
+ * does not follow the card, or the card took no block, the host reads DAT0
+ * as the line holds it, high (no status: a data timeout) or low (a status
+ * of 0s: a CRC error); a negative status is a CRC error.
+ */
+static uint16_t sdhci_card_write(SDHCIState *s, uint8_t *buf, size_t len)
+{
+    uint16_t mask = sdhci_dat_width(s) << 2;
+    bool takes, crc_ok;
+    SDHCILines l;
+
+    sdhci_lines(s, &l);
+    takes = (l.to_card & SDHCI_LINE_CLK) &&
+            ((l.to_card & SDHCI_LINE_DAT(0)) ||
+             !(l.card_level & SDHCI_LINE_DAT(0)));
+    crc_ok = (l.to_card & mask) == mask;
+    if (takes) {
+        if (crc_ok) {
+            sdbus_write_data(&s->sdbus, buf, len);
+        } else {
+            sdbus_write_crc_error(&s->sdbus);
+        }
+    }
+    if (!takes || !(l.to_host & SDHCI_LINE_DAT(0))) {
+        return (l.host_level & SDHCI_LINE_DAT(0)) ? SDHC_EIS_DATATIMEOUT :
+                                                     SDHC_EIS_DATACRC;
+    }
+    return crc_ok ? 0 : SDHC_EIS_DATACRC;
+}
+
+/*
+ * A data error stops the transfer: no more blocks cross the bus, Transfer
+ * Complete is not set, and the DAT line stays inhibited until software
+ * resets it (Software Reset for DAT Line).
+ */
+static void sdhci_data_error(SDHCIState *s, uint16_t err)
+{
+    sdhci_set_error(s, err);
+    s->data_count = 0;
+    s->prnsts &= ~(SDHC_DOING_READ | SDHC_DOING_WRITE | SDHC_DAT_LINE_ACTIVE |
+                   SDHC_SPACE_AVAILABLE | SDHC_DATA_AVAILABLE);
     sdhci_update_irq(s);
 }
 
@@ -380,6 +591,7 @@ static void sdhci_send_command(SDHCIState *s)
     uint8_t response[16];
     size_t rlen;
     bool timeout = false;
+    bool cmd_low;
 
     s->errintsts = 0;
     s->acmd12errsts = 0;
@@ -387,10 +599,20 @@ static void sdhci_send_command(SDHCIState *s)
     request.arg = s->argument;
 
     trace_sdhci_send_command(request.cmd, request.arg);
-    rlen = sdbus_do_command(&s->sdbus, &request, response, sizeof(response));
+    rlen = sdhci_card_command(s, &request, response, sizeof(response),
+                              &cmd_low);
 
     if (s->cmdreg & SDHC_CMD_RESPONSE) {
-        if (rlen == 4) {
+        if (rlen != 4 && rlen != 16 && cmd_low) {
+            /* A response of 0s: its end bit, CRC and index wrong */
+            timeout = true;
+            memset(s->rspreg, 0, sizeof(s->rspreg));
+            sdhci_set_error(s, SDHC_EIS_CMDEND |
+                            ((s->cmdreg & SDHC_CMD_CRC_CHECK) ?
+                             SDHC_EIS_CMDCRC : 0) |
+                            ((s->cmdreg & SDHC_CMD_INDEX_CHECK) && request.cmd ?
+                             SDHC_EIS_CMDIDX : 0));
+        } else if (rlen == 4) {
             s->rspreg[0] = ldl_be_p(response);
             s->rspreg[1] = s->rspreg[2] = s->rspreg[3] = 0;
             trace_sdhci_response4(s->rspreg[0]);
@@ -438,10 +660,13 @@ static void sdhci_end_transfer(SDHCIState *s)
         SDRequest request;
         uint8_t response[16];
 
+        bool cmd_low;
+
         request.cmd = 0x0C;
         request.arg = 0;
         trace_sdhci_end_transfer(request.cmd, request.arg);
-        sdbus_do_command(&s->sdbus, &request, response, sizeof(response));
+        memset(response, 0, sizeof(response));
+        sdhci_card_command(s, &request, response, sizeof(response), &cmd_low);
         /* Auto CMD12 response goes to the upper Response register */
         s->rspreg[3] = ldl_be_p(response);
     }
@@ -466,6 +691,7 @@ static void sdhci_end_transfer(SDHCIState *s)
 static void sdhci_read_block_from_card(SDHCIState *s)
 {
     const uint16_t blk_size = s->blksize & BLOCK_SIZE_MASK;
+    uint16_t err;
 
     if ((s->trnmod & SDHC_TRNS_MULTI) &&
             (s->trnmod & SDHC_TRNS_BLK_CNT_EN) && (s->blkcnt == 0)) {
@@ -474,7 +700,11 @@ static void sdhci_read_block_from_card(SDHCIState *s)
 
     if (!FIELD_EX32(s->hostctl2, SDHC_HOSTCTL2, EXECUTE_TUNING)) {
         /* Device is not in tuning */
-        sdbus_read_data(&s->sdbus, s->fifo_buffer, blk_size);
+        err = sdhci_card_read(s, s->fifo_buffer, blk_size);
+        if (err) {
+            sdhci_data_error(s, err);
+            return;
+        }
     }
 
     if (FIELD_EX32(s->hostctl2, SDHC_HOSTCTL2, EXECUTE_TUNING)) {
@@ -560,6 +790,8 @@ static uint32_t sdhci_read_dataport(SDHCIState *s, unsigned size)
 /* Write data from host controller FIFO to card */
 static void sdhci_write_block_to_card(SDHCIState *s)
 {
+    uint16_t err;
+
     if (s->prnsts & SDHC_SPACE_AVAILABLE) {
         if (s->norintstsen & SDHC_NISEN_WBUFRDY) {
             s->norintsts |= SDHC_NIS_WBUFRDY;
@@ -576,7 +808,11 @@ static void sdhci_write_block_to_card(SDHCIState *s)
         }
     }
 
-    sdbus_write_data(&s->sdbus, s->fifo_buffer, s->blksize & BLOCK_SIZE_MASK);
+    err = sdhci_card_write(s, s->fifo_buffer, s->blksize & BLOCK_SIZE_MASK);
+    if (err) {
+        sdhci_data_error(s, err);
+        return;
+    }
 
     /* Next data can be written through BUFFER DATORT register */
     s->prnsts |= SDHC_SPACE_AVAILABLE;
@@ -681,6 +917,7 @@ static void sdhci_sdma_transfer_multi_blocks(SDHCIState *s)
     uint32_t boundary_chk = 1 << (((s->blksize & ~BLOCK_SIZE_MASK) >> 12) + 12);
     uint64_t sdma_address = sdhci_sdma_address(s);
     uint32_t boundary_count = boundary_chk - (sdma_address % boundary_chk);
+    uint16_t err;
 
     if (!(s->trnmod & SDHC_TRNS_BLK_CNT_EN) || !s->blkcnt) {
         qemu_log_mask(LOG_UNIMP, "infinite transfer is not supported\n");
@@ -701,7 +938,11 @@ static void sdhci_sdma_transfer_multi_blocks(SDHCIState *s)
         s->prnsts |= SDHC_DOING_READ;
         while (s->blkcnt) {
             if (s->data_count == 0) {
-                sdbus_read_data(&s->sdbus, s->fifo_buffer, block_size);
+                err = sdhci_card_read(s, s->fifo_buffer, block_size);
+                if (err) {
+                    sdhci_data_error(s, err);
+                    return;
+                }
             }
             begin = s->data_count;
             if (((boundary_count + begin) < block_size) && page_aligned) {
@@ -741,7 +982,11 @@ static void sdhci_sdma_transfer_multi_blocks(SDHCIState *s)
                             s->data_count - begin, MEMTXATTRS_UNSPECIFIED);
             sdhci_advance_sdma_address(s, s->data_count - begin);
             if (s->data_count == block_size) {
-                sdbus_write_data(&s->sdbus, s->fifo_buffer, block_size);
+                err = sdhci_card_write(s, s->fifo_buffer, block_size);
+                if (err) {
+                    sdhci_data_error(s, err);
+                    return;
+                }
                 s->data_count = 0;
                 if (s->trnmod & SDHC_TRNS_BLK_CNT_EN) {
                     s->blkcnt--;
@@ -769,9 +1014,14 @@ static void sdhci_sdma_transfer_multi_blocks(SDHCIState *s)
 static void sdhci_sdma_transfer_single_block(SDHCIState *s)
 {
     uint32_t datacnt = s->blksize & BLOCK_SIZE_MASK;
+    uint16_t err;
 
     if (s->trnmod & SDHC_TRNS_READ) {
-        sdbus_read_data(&s->sdbus, s->fifo_buffer, datacnt);
+        err = sdhci_card_read(s, s->fifo_buffer, datacnt);
+        if (err) {
+            sdhci_data_error(s, err);
+            return;
+        }
         dma_memory_write(s->dma_as, sdhci_sdma_address(s),
                          s->fifo_buffer, datacnt,
                          MEMTXATTRS_UNSPECIFIED);
@@ -779,7 +1029,11 @@ static void sdhci_sdma_transfer_single_block(SDHCIState *s)
         dma_memory_read(s->dma_as, sdhci_sdma_address(s),
                         s->fifo_buffer, datacnt,
                         MEMTXATTRS_UNSPECIFIED);
-        sdbus_write_data(&s->sdbus, s->fifo_buffer, datacnt);
+        err = sdhci_card_write(s, s->fifo_buffer, datacnt);
+        if (err) {
+            sdhci_data_error(s, err);
+            return;
+        }
     }
     s->blkcnt--;
 
@@ -879,6 +1133,7 @@ static void sdhci_do_adma(SDHCIState *s)
     const MemTxAttrs attrs = { .memory = true };
     ADMADescr dscr = {};
     MemTxResult res = MEMTX_ERROR;
+    uint16_t err;
     int i;
 
     if (s->trnmod & SDHC_TRNS_BLK_CNT_EN && !s->blkcnt) {
@@ -917,7 +1172,11 @@ static void sdhci_do_adma(SDHCIState *s)
                 s->prnsts |= SDHC_DOING_READ;
                 while (length) {
                     if (s->data_count == 0) {
-                        sdbus_read_data(&s->sdbus, s->fifo_buffer, block_size);
+                        err = sdhci_card_read(s, s->fifo_buffer, block_size);
+                        if (err) {
+                            sdhci_data_error(s, err);
+                            return;
+                        }
                     }
                     begin = s->data_count;
                     if ((length + begin) < block_size) {
@@ -965,7 +1224,11 @@ static void sdhci_do_adma(SDHCIState *s)
                     }
                     dscr.addr += s->data_count - begin;
                     if (s->data_count == block_size) {
-                        sdbus_write_data(&s->sdbus, s->fifo_buffer, block_size);
+                        err = sdhci_card_write(s, s->fifo_buffer, block_size);
+                        if (err) {
+                            sdhci_data_error(s, err);
+                            return;
+                        }
                         s->data_count = 0;
                         if (s->trnmod & SDHC_TRNS_BLK_CNT_EN) {
                             s->blkcnt--;
@@ -1160,10 +1423,8 @@ static uint64_t sdhci_read(void *opaque, hwaddr offset, unsigned size)
         break;
     case SDHC_PRNSTS:
         ret = s->prnsts;
-        ret = FIELD_DP32(ret, SDHC_PRNSTS, DAT_LVL,
-                         sdbus_get_dat_lines(&s->sdbus));
-        ret = FIELD_DP32(ret, SDHC_PRNSTS, CMD_LVL,
-                         sdbus_get_cmd_line(&s->sdbus));
+        ret = FIELD_DP32(ret, SDHC_PRNSTS, DAT_LVL, sdhci_dat_lines(s));
+        ret = FIELD_DP32(ret, SDHC_PRNSTS, CMD_LVL, sdhci_cmd_line(s));
         break;
     case SDHC_HOSTCTL:
         ret = s->hostctl1 | (s->pwrcon << 8) | (s->blkgap << 16) |

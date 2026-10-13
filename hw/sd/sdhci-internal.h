@@ -51,6 +51,8 @@
 /* R/W Command Register 0x0 */
 #define SDHC_CMDREG                    0x0E
 #define SDHC_CMD_RSP_WITH_BUSY         (3 << 0)
+#define SDHC_CMD_CRC_CHECK             (1 << 3)
+#define SDHC_CMD_INDEX_CHECK           (1 << 4)
 #define SDHC_CMD_DATA_PRESENT          (1 << 5)
 #define SDHC_CMD_SUSPEND               (1 << 6)
 #define SDHC_CMD_RESUME                (1 << 7)
@@ -153,8 +155,13 @@ FIELD(SDHC_TIMEOUTCON, COUNTER,        0, 4);
 /* ROC/RW1C Error Interrupt Status Register 0x0 */
 #define SDHC_ERRINTSTS                 0x32
 #define SDHC_EIS_CMDTIMEOUT            0x0001
+#define SDHC_EIS_CMDCRC                0x0002
+#define SDHC_EIS_CMDEND                0x0004
 #define SDHC_EIS_BLKGAP                0x0004
 #define SDHC_EIS_CMDIDX                0x0008
+#define SDHC_EIS_DATATIMEOUT           0x0010
+#define SDHC_EIS_DATACRC               0x0020
+#define SDHC_EIS_DATAEND               0x0040
 #define SDHC_EIS_CMD12ERR              0x0100
 #define SDHC_EIS_ADMAERR               0x0200
 
