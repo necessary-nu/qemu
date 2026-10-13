@@ -518,10 +518,17 @@ static void rtcio_access_read(void *opaque)
     a->value = rtcio_reg_read(a->s, a->addr);
 }
 
+/*
+ * A write first brings the line sources up to its moment, as a GPIO
+ * matrix write does: one whose events due before the write have not yet
+ * run (its timer late) takes them as the pads were, not as the write
+ * leaves them.
+ */
 static void rtcio_access_write(void *opaque)
 {
     RtcioAccess *a = opaque;
 
+    esp32_line_sync();
     rtcio_reg_write(a->s, a->addr, a->value);
 }
 
