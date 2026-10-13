@@ -214,6 +214,9 @@ static const FlashPartInfo known_devices[] = {
 
     /* GigaDevice */
     { INFO("gd25q32",     0xc84016,      0,  64 << 10,  64, ER_4K) },
+    /* [spec:nuos:req:emu.flash-chip] */
+    { INFO("gd25q32c",    0xc84016,      0,  64 << 10,  64, ER_4K | ER_32K),
+      .chip = &m25chip_gd25q32c },
     { INFO("gd25q64",     0xc84017,      0,  64 << 10, 128, ER_4K) },
     /* [spec:nuos:req:emu.esp32p4.flash-chip] */
     { INFO("gd25q256e",   0xc84019,      0,  64 << 10, 512, ER_4K | ER_32K),
@@ -884,6 +887,7 @@ static void complete_collecting_data(Flash *s)
     case WRSR2:
         switch (get_man(s)) {
         case MAN_WINBOND:
+        case MAN_GIGADEVICE:
             s->quad_enable = !!(s->data[0] & 0x02);
             break;
         default:
@@ -1134,6 +1138,8 @@ static void decode_fast_read_cmd(Flash *s)
         s->needed_bytes += 1;
         break;
     case MAN_WINBOND:
+    case MAN_GIGADEVICE:
+        /* Eight dummy clocks after 0Bh, 3Bh and 6Bh's address */
         s->needed_bytes += 1;
         break;
     case MAN_NUMONYX:
@@ -1416,6 +1422,11 @@ static void decode_new_cmd(Flash *s, uint32_t value)
 
         switch (get_man(s)) {
         case MAN_WINBOND:
+        case MAN_GIGADEVICE:
+            /*
+             * GigaDevice parts write SR2 (S15-S8, QE in S9) with 31h, one
+             * byte; their 01h writes SR1 only.
+             */
             s->needed_bytes = 1;
             s->state = STATE_COLLECTING_DATA;
             s->pos = 0;
@@ -1598,6 +1609,7 @@ static void decode_new_cmd(Flash *s, uint32_t value)
             s->quad_enable = true;
             break;
         case MAN_WINBOND:
+        case MAN_GIGADEVICE:
             s->data[0] = (!!s->quad_enable) << 1;
             s->pos = 0;
             s->len = 1;
@@ -2109,7 +2121,48 @@ bool m25p80_hold_enabled(DeviceState *dev)
 {
     Flash *s = (Flash *)object_dynamic_cast(OBJECT(dev), TYPE_M25P80);
 
-    return s && !s->quad_enable;
+    if (!s) {
+        return false;
+    }
+    return s->pi->chip ? !m25chip_quad_enabled(&s->chip) : !s->quad_enable;
+}
+
+/* [spec:nuos:req:emu.flash-chip] */
+bool m25p80_drives_output(DeviceState *dev)
+{
+    Flash *s = (Flash *)object_dynamic_cast(OBJECT(dev), TYPE_M25P80);
+
+    if (!s) {
+        return false;
+    }
+    if (s->pi->chip) {
+        return m25chip_drives_output(&s->chip);
+    }
+    return s->state == STATE_READ || s->state == STATE_READING_DATA ||
+           s->state == STATE_READING_SFDP;
+}
+
+/* [spec:nuos:req:emu.flash-chip] */
+uint8_t m25p80_continuous_cmd(DeviceState *dev)
+{
+    Flash *s = (Flash *)object_dynamic_cast(OBJECT(dev), TYPE_M25P80);
+
+    return s && s->pi->chip ? m25chip_continuous_cmd(&s->chip) : 0;
+}
+
+/* [spec:nuos:req:emu.flash-power-cut] */
+void m25p80_power_on(DeviceState *dev)
+{
+    Flash *s = (Flash *)object_dynamic_cast(OBJECT(dev), TYPE_M25P80);
+
+    if (!s) {
+        return;
+    }
+    if (s->pi->chip) {
+        m25chip_power_on(&s->chip);
+        return;
+    }
+    device_cold_reset(dev);
 }
 
 /* [spec:nuos:req:emu.flash-timing] */
