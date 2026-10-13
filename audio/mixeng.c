@@ -346,6 +346,7 @@ t_sample *mixeng_conv_float[2][2] = {
     }
 };
 
+/* [spec:nuos:req:emu.esp32p4.i2s] */
 /* The mean of the two channels, as mixeng_template.h's _from_mono. */
 static void clip_natural_float_from_mono(void *dst, const struct st_sample *src,
                                          int samples)

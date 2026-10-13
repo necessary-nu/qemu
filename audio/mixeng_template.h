@@ -137,6 +137,7 @@ static void glue (glue (clip_, ET), _from_stereo)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32p4.i2s]
  * The mixer's samples are stereo, a mono stream in both channels at its
  * level (_to_mono): a mono output takes the mean of the two, which gives
  * a mono stream back at its level and mixes a stereo one down at half of
