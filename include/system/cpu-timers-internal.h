@@ -76,6 +76,11 @@ typedef struct TimersState {
     uint64_t window_units;
     int window_cpus;
     int window_running;
+    /*
+     * qemu_icount_bias as the window started. Virtual time warps on only
+     * while every vCPU is idle; a warp under a window ends it.
+     */
+    int64_t window_bias;
 
     /*
      * How many times icount's state has been loaded (an incoming
