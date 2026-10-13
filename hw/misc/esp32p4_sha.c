@@ -212,8 +212,21 @@ static void sha_gdma_ready(void *opaque)
     sha_pump(opaque);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.crypto]
+ * GDMA's register access: the blocks whose cycles have run by then are
+ * done, as their DMA descriptors and EOF show then.
+ */
+static void sha_gdma_sync(void *opaque, int64_t when)
+{
+    ESP32P4ShaDevState *s = opaque;
+
+    esp32p4_crypto_timer_sync(&s->op, when);
+}
+
 static const ESP32P4GdmaPeriphOps sha_gdma_ops = {
     .tx_ready = sha_gdma_ready,
+    .sync = sha_gdma_sync,
 };
 
 /* [spec:nuos:req:emu.esp32p4.crypto] */

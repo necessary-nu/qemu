@@ -1285,9 +1285,26 @@ static void rx_dma_ready(void *opaque)
     update_irq(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.rmt-pcnt]
+ * GDMA's register access: the channels' events due by then, which their
+ * timer, late without icount, has yet to run, as a register access of
+ * the RMT's takes them. Only a timer that has come is run.
+ */
+static void rmt_dma_sync(void *opaque, int64_t when)
+{
+    ESP32P4RmtState *s = opaque;
+
+    if (timer_pending(&s->timer) && timer_expire_time_ns(&s->timer) <= when) {
+        rmt_catch_up(s);
+        rmt_schedule(s);
+    }
+}
+
 static const ESP32P4GdmaPeriphOps esp32p4_rmt_dma_ops = {
     .tx_ready = tx_dma_ready,
     .rx_ready = rx_dma_ready,
+    .sync = rmt_dma_sync,
 };
 
 /* Registers */

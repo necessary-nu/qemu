@@ -478,9 +478,22 @@ static void aes_gdma_ready(void *opaque)
     aes_pump(opaque);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.crypto]
+ * GDMA's register access: the blocks whose cycles have run by then are
+ * done, their output in GDMA's channel and its EOF.
+ */
+static void aes_gdma_sync(void *opaque, int64_t when)
+{
+    ESP32P4AesState *s = opaque;
+
+    esp32p4_crypto_timer_sync(&s->op, when);
+}
+
 static const ESP32P4GdmaPeriphOps aes_gdma_ops = {
     .tx_ready = aes_gdma_ready,
     .rx_ready = aes_gdma_ready,
+    .sync = aes_gdma_sync,
 };
 
 /* [spec:nuos:req:emu.esp32p4.crypto] */
