@@ -127,6 +127,8 @@
 #define IO_MUX_GPIO(n)      (0x500e1004 + 4 * (n))
 #define FUN_IE              (1u << 9)
 #define MCU_SEL_GPIO        (1u << 12)
+#define USJ_CONF0           0x500d2018u
+#define USJ_PAD_ENABLE      (1u << 14)
 
 #define SIG_LCD_CS          144
 #define SIG_LCD_DC          145
@@ -223,8 +225,17 @@ static void cam_clock(QTestState *qts, unsigned div, bool on)
     qtest_writel(qts, PERI_CLK_CTRL119, v | (on ? 1u << 29 : 0));
 }
 
+/*
+ * ESP-IDF's gpio_ll_func_sel(): GPIO24 and GPIO25 are taken from the USB
+ * Serial/JTAG PHY, which has them from reset, before their function is
+ * selected.
+ */
 static void pad_out(QTestState *qts, int pad, int sig, uint32_t extra)
 {
+    if (pad == 24 || pad == 25) {
+        qtest_writel(qts, USJ_CONF0,
+                     qtest_readl(qts, USJ_CONF0) & ~USJ_PAD_ENABLE);
+    }
     qtest_writel(qts, IO_MUX_GPIO(pad), MCU_SEL_GPIO | FUN_IE);
     qtest_writel(qts, GPIO_FUNC_OUT(pad), sig | extra);
 }

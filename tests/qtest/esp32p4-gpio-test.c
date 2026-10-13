@@ -149,6 +149,9 @@
 #define LP_PAD_FILTER_EN    (1u << 11)
 #define LP_PAD_LP_GPIO      (LP_PAD_MUX_SEL | LP_PAD_FUN_SEL(1))
 
+#define USJ_CONF0           0x500d2018
+#define USJ_PAD_ENABLE      (1u << 14)
+
 #define INTMTX_STATUS(w)    (0x500d6200 + 4 * (w))
 /* GPIO_INTR0 to _3 and GPIO_PAD_COMP: sources 74 to 78, word 2 */
 #define SRC_GPIO_BIT(k)     (1u << (10 + (k)))
@@ -219,9 +222,17 @@ static bool lp_in(QTestState *qts, int n)
     return (qtest_readl(qts, LP_GPIO_IN) >> n) & 1;
 }
 
-/* Make pad n a plain GPIO with its input enabled, driving nothing. */
+/*
+ * Make pad n a plain GPIO with its input enabled, driving nothing; as
+ * ESP-IDF's gpio_ll_func_sel() does, GPIO24 and GPIO25 taken from the USB
+ * Serial/JTAG PHY, which has them from reset.
+ */
 static void gpio_mode(QTestState *qts, int n, uint32_t extra)
 {
+    if (n == 24 || n == 25) {
+        qtest_writel(qts, USJ_CONF0,
+                     qtest_readl(qts, USJ_CONF0) & ~USJ_PAD_ENABLE);
+    }
     qtest_writel(qts, IO_MUX_GPIO(n), MCU_SEL_GPIO | FUN_IE | FUN_DRV(2) |
                  extra);
     qtest_writel(qts, GPIO_FUNC_OUT(n), SIG_GPIO_OUT);
@@ -1342,14 +1353,15 @@ static void test_light_sleep(void)
 
 /*
  * GPIO25, the USB Serial/JTAG PHY's D+, is pulled up by the PHY out of
- * reset; the PHY's "pad-pull-up" hook releases it.
+ * reset, its input read with the PHY keeping the pad; the PHY's
+ * "pad-pull-up" hook releases it.
  */
 /* [spec:nuos:req:emu.esp32p4.gpio/test] */
 static void test_usb_pull_up(void)
 {
     QTestState *qts = start_plain();
 
-    gpio_mode(qts, 25, 0);
+    qtest_writel(qts, IO_MUX_GPIO(25), MCU_SEL_GPIO | FUN_IE | FUN_DRV(2));
     g_assert_true(gpio_in(qts, 25));
     qtest_set_irq_in(qts, GPIO_PATH, "pad-pull-up", 25, 0);
     g_assert_false(gpio_in(qts, 25));

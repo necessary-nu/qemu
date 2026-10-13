@@ -93,6 +93,8 @@
 #define IN_SIG_IN_SEL       (1u << 7)
 #define IO_MUX_GPIO(n)      (0x500e1004u + 4 * (n))
 #define MCU_SEL_GPIO        (1u << 12)
+#define USJ_CONF0           0x500d2018u
+#define USJ_PAD_ENABLE      (1u << 14)
 #define FUN_IE              (1u << 9)
 #define FUN_DRV2            (2u << 10)
 #define SIG_TX(n)           (80 + 3 * (n))
@@ -160,8 +162,17 @@ static void clocks_on(void)
                  TWAI_CLK_EN(0) | TWAI_CLK_EN(1) | TWAI_CLK_EN(2));
 }
 
+/*
+ * ESP-IDF's gpio_ll_func_sel(): GPIO24 and GPIO25 are taken from the USB
+ * Serial/JTAG PHY, which has them from reset, before their function is
+ * selected.
+ */
 static void pad_gpio(int pad)
 {
+    if (pad == 24 || pad == 25) {
+        qtest_writel(qts, USJ_CONF0,
+                     qtest_readl(qts, USJ_CONF0) & ~USJ_PAD_ENABLE);
+    }
     qtest_writel(qts, IO_MUX_GPIO(pad), MCU_SEL_GPIO | FUN_IE | FUN_DRV2);
 }
 

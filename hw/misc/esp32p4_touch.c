@@ -37,6 +37,42 @@
  * TOUCH_TIMEOUT_INT, and gives no data and no done. The TRM's two
  * counting methods (TOUCH_OUT_SEL) count the same here.
  *
+ * [spec:nuos:req:emu.esp32p4.analog]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * The pad (TRM 63.3.3, 10.7.2). The sensor charges channel ch's pad,
+ * GPIO(ch + 1), with its current source from a lower threshold to an
+ * upper one and discharges it back, a pulse a cycle. No document gives
+ * the thresholds: the model takes them 0.5 V apart, so that a cycle lasts
+ * C x 1 V / I, the period above, about half of VDD_LP's 3.3 V: 1.4 V and
+ * 1.9 V. The TRM (10.7.2) has software leave a pad it uses for an analog
+ * function floating, FUN_IE, FUN_WPU and FUN_WPD clear and its output
+ * disabled; ESP-IDF's touch driver does so with gpio_config_as_analog()
+ * (the GPIO function, input, output and pulls off, and the pad handed
+ * back from the LP IO MUX). The P4's IO MUX has no analog function to
+ * select: the sensor reaches the pad whatever its digital side does, and
+ * what that side does to the pad changes the measurement:
+ *
+ *   - a pad a digital driver holds (its output enabled through any
+ *     function or the sleep configuration, a held drive, an outside
+ *     driver) never crosses a threshold: no pulse comes, and the
+ *     measurement ends only by its timeout, the TRM's sign of a "circuit
+ *     abnormality", or a forced done;
+ *   - pulls on the pad (its own 45 kOhm, the LP IO MUX's, another block's,
+ *     the board's, as the GPIO block resolves them) add their current: a
+ *     charge from VL to VH takes (C / G) ln((I + G (Vp - VL)) /
+ *     (I + G (Vp - VH))) and a discharge (C / G) ln((I - G (Vp - VH)) /
+ *     (I - G (Vp - VL))), G their conductance and Vp the level they pull
+ *     to, so the count grows; where their current at a threshold is the
+ *     source's or more, the pad never reaches it and no pulse comes;
+ *   - its input buffer left on sees the sawtooth, between VIL and VIH:
+ *     the pad reads undefined, low, while the sensor measures it (the
+ *     "pad-analog" lines), and the count is the same.
+ *
+ * These act as they change: the pulses come at the rate the pad's load
+ * gives from each change on, the GPIO block telling the sensor of every
+ * change to its channels' pads' drivers and pulls. With TOUCH_EN_CAL the
+ * pad is disconnected, and its load counts for nothing.
+ *
  * Which channel: with TOUCH_FSM_EN, the next channel of
  * TOUCH_SCAN_PAD_MAP, round, skipping channel 0, which has no pad, and,
  * with TOUCH_SHIELD_PAD_EN, the shield channels TOUCH_BUFSEL drives;
@@ -122,6 +158,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/gpio/esp32_line.h"
+#include "hw/gpio/esp32p4_gpio.h"
 #include "hw/misc/esp32p4_lp_ana.h"
 #include "hw/misc/esp32p4_pmu.h"
 #include "hw/misc/esp32p4_touch.h"
@@ -239,6 +276,12 @@
 #define DRV_LS_UA               1.0
 #define DCAP_CAL_FF             20
 #define DEFAULT_PAD_FF          10000
+/* The pad's supply, VDD_LP, and the thresholds the sensor swings it to. */
+#define PAD_VDD_V               3.3
+#define SWING_LO_V              1.4
+#define SWING_HI_V              1.9
+/* The measurement's pulses still to come are counted in 2^-20ths. */
+#define LEFT_FRAC               20
 
 static uint32_t touch_ana(ESP32P4TouchState *s, hwaddr offset)
 {
@@ -530,11 +573,14 @@ static void touch_meas_arm(ESP32P4TouchState *s)
     }
 }
 
+static void touch_update_analog(ESP32P4TouchState *s);
+
 static void touch_abort(ESP32P4TouchState *s)
 {
     esp32p4_clkwait_stop(&s->xpd_wait);
     timer_del(&s->meas_timer);
     s->fsm_phase = ESP32P4_TOUCH_FSM_IDLE;
+    touch_update_analog(s);
 }
 
 static void touch_timer_set(ESP32P4TouchState *s, int phase, uint32_t cycles,
@@ -570,6 +616,162 @@ static bool touch_powered(ESP32P4TouchState *s)
     return MUX1_XPD(touch_ana(s, A_MUX1)) & BIT(s->cur_ch);
 }
 
+/* The GPIO the channel being measured is on. */
+static unsigned touch_cur_pad(ESP32P4TouchState *s)
+{
+    return s->cur_ch + 1;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.analog]
+ * The period of the measurement's pulses, in fs, with the mode's driver
+ * current, the capacitance it charges and the pad's load as they are; or
+ * 0 if none comes, *why saying why (see the top of the file).
+ */
+static uint64_t touch_pulse_fs(ESP32P4TouchState *s, uint8_t *why)
+{
+    uint32_t ana = touch_ana(s, A_ANA_PARA);
+    double ua = DRV_HS_UA * (PARA_DRV_HS(s->cur_para) + 1) +
+                DRV_LS_UA * PARA_DRV_LS(s->cur_para);
+    double cap, ns;
+    uint64_t up = 0, down = 0;
+    bool level;
+
+    if (!(touch_ana(s, A_WORK) & WORK_OUT_GATE)) {
+        *why = ESP32P4_TOUCH_NO_OUT_GATE;
+        return 0;
+    }
+    if (!touch_powered(s)) {
+        *why = ESP32P4_TOUCH_NO_XPD;
+        return 0;
+    }
+    *why = ESP32P4_TOUCH_PULSES;
+    if (ana & ANA_EN_CAL) {
+        cap = ANA_DCAP_CAL(ana) * DCAP_CAL_FF;
+    } else {
+        cap = s->cap_ff[s->cur_ch];
+        if (s->gpio && esp32p4_gpio_pad_load(s->gpio, touch_cur_pad(s),
+                                             &level, &up, &down)) {
+            *why = ESP32P4_TOUCH_PAD_DRIVEN;
+            return 0;
+        }
+    }
+    if (!up && !down) {
+        ns = cap / ua;
+    } else {
+        /* The pulls as one conductance (uS) to the level they pull to. */
+        double g = (double)(up + down) / 1000;
+        double vp = PAD_VDD_V * up / (up + down);
+        double dv = SWING_HI_V - SWING_LO_V;
+        double charge = ua + g * (vp - SWING_HI_V);
+        double discharge = ua - g * (vp - SWING_LO_V);
+
+        if (charge <= 0 || discharge <= 0) {
+            *why = ESP32P4_TOUCH_PAD_PULLED;
+            return 0;
+        }
+        ns = cap / g * (log1p(g * dv / charge) + log1p(g * dv / discharge));
+    }
+    return MAX(llround(ns * 1e6), 1);
+}
+
+/* When the pulses still to come will have come, or INT64_MAX. */
+static int64_t touch_meas_end(ESP32P4TouchState *s)
+{
+    if (!s->meas_period_fs) {
+        return INT64_MAX;
+    }
+    return s->meas_seg_ns +
+           llround(ldexp((double)s->meas_left, -LEFT_FRAC) *
+                   s->meas_period_fs / 1e6);
+}
+
+/* The sensor's sawtooth is on the pad it measures, connected and powered. */
+static void touch_update_analog(ESP32P4TouchState *s)
+{
+    int ch = -1;
+
+    if (s->fsm_phase == ESP32P4_TOUCH_FSM_MEAS && touch_powered(s) &&
+        !(touch_ana(s, A_ANA_PARA) & ANA_EN_CAL)) {
+        ch = s->cur_ch;
+    }
+    if (ch == s->analog_ch) {
+        return;
+    }
+    if (s->analog_ch >= 0) {
+        qemu_irq_lower(s->pad_analog[s->analog_ch]);
+    }
+    s->analog_ch = ch;
+    if (ch >= 0) {
+        qemu_irq_raise(s->pad_analog[ch]);
+    }
+}
+
+static void touch_log_no_pulse(ESP32P4TouchState *s)
+{
+    switch (s->meas_why) {
+    case ESP32P4_TOUCH_NO_OUT_GATE:
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: TOUCH_OUT_GATE stops the touch "
+                      "clock: channel %u's measurement counts no pulse\n",
+                      TYPE_ESP32P4_TOUCH, s->cur_ch);
+        break;
+    case ESP32P4_TOUCH_NO_XPD:
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: channel %u is measured with its "
+                      "TOUCH_XPD bit clear: no pulse comes\n",
+                      TYPE_ESP32P4_TOUCH, s->cur_ch);
+        break;
+    case ESP32P4_TOUCH_PAD_DRIVEN:
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: channel %u's pad, GPIO%u, is "
+                      "driven: the sensor cannot charge it, and no pulse "
+                      "comes\n", TYPE_ESP32P4_TOUCH, s->cur_ch,
+                      touch_cur_pad(s));
+        break;
+    case ESP32P4_TOUCH_PAD_PULLED:
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: channel %u's pad, GPIO%u, is "
+                      "pulled harder than the sensor's current: it never "
+                      "reaches a threshold, and no pulse comes\n",
+                      TYPE_ESP32P4_TOUCH, s->cur_ch, touch_cur_pad(s));
+        break;
+    default:
+        break;
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.analog]
+ * What the pulses' rate depends on may have changed at @t: the pulses
+ * that have come at the old rate are counted off, and the rest come at
+ * the new one.
+ */
+static void touch_meas_retime(ESP32P4TouchState *s, int64_t t)
+{
+    uint8_t why;
+    uint64_t fs;
+
+    if (s->fsm_phase != ESP32P4_TOUCH_FSM_MEAS) {
+        return;
+    }
+    fs = touch_pulse_fs(s, &why);
+    if (fs != s->meas_period_fs || why != s->meas_why) {
+        if (s->meas_period_fs && t > s->meas_seg_ns) {
+            double done = ldexp((double)(t - s->meas_seg_ns) * 1e6 /
+                                s->meas_period_fs, LEFT_FRAC);
+
+            s->meas_left = done >= s->meas_left ? 0
+                                                : s->meas_left - (uint64_t)done;
+        }
+        s->meas_seg_ns = MAX(t, s->meas_seg_ns);
+        s->meas_period_fs = fs;
+        if (why != s->meas_why) {
+            s->meas_why = why;
+            touch_log_no_pulse(s);
+        }
+        s->meas_end_ns = touch_meas_end(s);
+        touch_meas_arm(s);
+    }
+    touch_update_analog(s);
+}
+
 /*
  * [spec:nuos:req:emu.esp32p4.analog]
  * Measure the current mode: count LP_DYN_FAST_CLK until the divided
@@ -578,36 +780,23 @@ static bool touch_powered(ESP32P4TouchState *s)
 static void touch_meas_begin(ESP32P4TouchState *s, int64_t when)
 {
     unsigned f = s->cur_freq;
-    uint32_t para = touch_ana(s, A_FREQ_PARA(f));
     uint32_t work = touch_ana(s, A_WORK);
-    uint32_t ana = touch_ana(s, A_ANA_PARA);
     bool prox = touch_prox_of(s, s->cur_ch, s->cur_slp) >= 0;
     uint32_t n = MEAS_NUM(touch_ana(s, prox ? A_APPROACH_MEAS_NUM
                                             : A_WORK_MEAS_NUM), f);
     uint32_t div = WORK_DIV_NUM(work, f) + 1;
-    double cap = (ana & ANA_EN_CAL) ? ANA_DCAP_CAL(ana) * DCAP_CAL_FF
-                                    : s->cap_ff[s->cur_ch];
-    double ua = DRV_HS_UA * (PARA_DRV_HS(para) + 1) +
-                DRV_LS_UA * PARA_DRV_LS(para);
 
-    s->cur_para = para;
+    s->cur_para = touch_ana(s, A_FREQ_PARA(f));
     s->fsm_phase = ESP32P4_TOUCH_FSM_MEAS;
     esp32p4_clk_count_start(&s->meas_edges, s->fast, when);
     s->meas_count = 0;
-    if (!(work & WORK_OUT_GATE)) {
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: TOUCH_OUT_GATE stops the touch "
-                      "clock: channel %u's measurement counts no pulse\n",
-                      TYPE_ESP32P4_TOUCH, s->cur_ch);
-        s->meas_end_ns = INT64_MAX;
-    } else if (!touch_powered(s)) {
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: channel %u is measured with its "
-                      "TOUCH_XPD bit clear: no pulse comes\n",
-                      TYPE_ESP32P4_TOUCH, s->cur_ch);
-        s->meas_end_ns = INT64_MAX;
-    } else {
-        s->meas_end_ns = when + llround((double)n * div * cap / ua);
-    }
+    s->meas_left = (uint64_t)n * div << LEFT_FRAC;
+    s->meas_seg_ns = when;
+    s->meas_period_fs = touch_pulse_fs(s, &s->meas_why);
+    touch_log_no_pulse(s);
+    s->meas_end_ns = touch_meas_end(s);
     touch_meas_arm(s);
+    touch_update_analog(s);
 }
 
 static void touch_xpd_run(void *opaque)
@@ -675,6 +864,7 @@ static void touch_meas_run(void *opaque)
     count = touch_count_at(s, when);
     if (when < s->meas_end_ns) {
         s->fsm_phase = ESP32P4_TOUCH_FSM_IDLE;
+        touch_update_analog(s);
         touch_raise(s, INT_TIMEOUT);
         return;
     }
@@ -692,6 +882,7 @@ static void touch_meas_run(void *opaque)
     } else {
         touch_finish(s, when);
     }
+    touch_update_analog(s);
 }
 
 /* The next channel of the scan after the last one, or -1. */
@@ -974,9 +1165,34 @@ void esp32p4_touch_ana_write(ESP32P4TouchState *s, hwaddr offset,
     case A_FILTER2:
         touch_update_wakeup(s);
         break;
+    case A_WORK:
+    case A_MUX1:
+    case A_ANA_PARA:
+        /* TOUCH_OUT_GATE, XPD, EN_CAL and DCAP_CAL act mid-measurement. */
+        touch_meas_retime(s, now);
+        break;
     default:
         break;
     }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.analog]
+ * The drivers or pulls on pads changed, at esp32_line_time(): on the pad
+ * being measured, the pulses come at the rate they give from then on.
+ */
+static void touch_load_changed(Notifier *n, void *data)
+{
+    ESP32P4TouchState *s = container_of(n, ESP32P4TouchState, load_notifier);
+    uint64_t pads = *(uint64_t *)data;
+    int64_t now = esp32_line_time();
+
+    if (s->fsm_phase == ESP32P4_TOUCH_FSM_IDLE ||
+        !(pads & BIT_ULL(touch_cur_pad(s)))) {
+        return;
+    }
+    touch_catch_up(s, now);
+    touch_meas_retime(s, now);
 }
 
 void esp32p4_touch_ana_reset(ESP32P4TouchState *s)
@@ -1276,6 +1492,10 @@ static void esp32p4_touch_init(Object *obj)
     qdev_init_gpio_in_named(dev, touch_timer_update,
                             ESP32P4_TOUCH_TIMER_UPDATE, 1);
     qdev_init_gpio_out_named(dev, &s->wakeup, ESP32P4_TOUCH_WAKEUP, 1);
+    qdev_init_gpio_out_named(dev, s->pad_analog, ESP32P4_TOUCH_PAD_ANALOG,
+                             ESP32P4_TOUCH_SLOTS);
+    s->load_notifier.notify = touch_load_changed;
+    s->analog_ch = -1;
     s->fast = qdev_init_clock_in(dev, "fast", touch_fast_update, s,
                                  ClockPreUpdate | ClockUpdate);
     s->slow = qdev_init_clock_in(dev, "slow", touch_slow_update, s,
@@ -1303,6 +1523,10 @@ static void esp32p4_touch_realize(DeviceState *dev, Error **errp)
     if (!s->lp_ana || !s->pmu) {
         error_setg(errp, "%s: the lp-ana and pmu links must be set",
                    TYPE_ESP32P4_TOUCH);
+        return;
+    }
+    if (s->gpio) {
+        esp32p4_gpio_add_load_notifier(s->gpio, &s->load_notifier);
     }
 }
 
@@ -1328,8 +1552,8 @@ static const VMStateDescription vmstate_esp32p4_touch_chan = {
 
 static const VMStateDescription vmstate_esp32p4_touch = {
     .name = TYPE_ESP32P4_TOUCH,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(int_raw, ESP32P4TouchState),
         VMSTATE_UINT32(int_ena, ESP32P4TouchState),
@@ -1357,6 +1581,11 @@ static const VMStateDescription vmstate_esp32p4_touch = {
         VMSTATE_UINT64(meas_count, ESP32P4TouchState),
         VMSTATE_INT64(meas_end_ns, ESP32P4TouchState),
         VMSTATE_INT64(meas_due_ns, ESP32P4TouchState),
+        VMSTATE_UINT64(meas_left, ESP32P4TouchState),
+        VMSTATE_INT64(meas_seg_ns, ESP32P4TouchState),
+        VMSTATE_UINT64(meas_period_fs, ESP32P4TouchState),
+        VMSTATE_UINT8(meas_why, ESP32P4TouchState),
+        VMSTATE_INT8(analog_ch, ESP32P4TouchState),
         VMSTATE_UINT8(timer_phase, ESP32P4TouchState),
         VMSTATE_ESP32P4_CLKWAIT(timer_wait, ESP32P4TouchState),
         VMSTATE_UINT32(pwr_cntl, ESP32P4TouchState),
@@ -1375,6 +1604,8 @@ static const Property esp32p4_touch_properties[] = {
                      ESP32P4LPAnaState *),
     DEFINE_PROP_LINK("pmu", ESP32P4TouchState, pmu, TYPE_ESP32P4_PMU,
                      ESP32P4PMUState *),
+    DEFINE_PROP_LINK("gpio", ESP32P4TouchState, gpio, TYPE_ESP32P4_GPIO,
+                     ESP32P4GpioState *),
 };
 
 static void esp32p4_touch_class_init(ObjectClass *klass, const void *data)

@@ -42,11 +42,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4UsjState, ESP32P4_USB_SERIAL_JTAG)
  * USB_DEVICE_APB_CLK and the USB_DEVICE reset. Sysbus IRQ 0 is
  * USB_DEVICE_INTR.
  *
- * Named GPIO output ESP32P4_USJ_PAD_PULL_UP: lines 0 and 1 the pull-ups
- * the PHY puts on GPIO24 (D-) and GPIO25 (D+), the GPIO block's
- * "pad-pull-up" inputs for those pads.
+ * Named GPIO outputs, to the full-speed PHY the controller has, which
+ * USB_WRAP routes (hw/usb/esp32p4_usb.c): ESP32P4_USJ_PAD_PULL_UP, lines
+ * 0 and 1 the pull-ups the PHY puts on its first pad (D-; GPIO24 on PHY
+ * 0) and its second (D+; GPIO25); ESP32P4_USJ_PAD_ENABLE, high while
+ * USB_PAD_ENABLE gives the PHY its pads.
  */
 #define ESP32P4_USJ_PAD_PULL_UP "pad-pull-up"
+#define ESP32P4_USJ_PAD_ENABLE  "pad-enable"
 
 /* The host's view of the device, from plug-in to configured. */
 enum {
@@ -64,6 +67,7 @@ struct ESP32P4UsjState {
     MemoryRegion iomem;
     qemu_irq irq;
     qemu_irq pull_up[2];
+    qemu_irq pad_enable;
     Clock *usb48;
     CharFrontend chr;
 

@@ -84,6 +84,15 @@
 #define PWR_SLEEP(n)        ((uint32_t)(n) << 14)
 #define PWR_TIMER_EN        (1u << 31)
 
+#define GPIO_ENABLE_W1TC    0x500e0028u
+#define GPIO_FUNC_OUT(n)    (0x500e0558u + 4 * (n))
+#define SIG_GPIO_OUT        0x100
+#define OEN_SEL             (1u << 10)
+#define IO_MUX_GPIO(n)      (0x500e1004u + 4 * (n))
+#define MCU_SEL_GPIO_DRV2   (1u << 12 | 2u << 10)
+#define LP_IOMUX_PAD(n)     (0x5012b008u + 4 * (n))
+#define LP_PAD_MUX_SEL      (1u << 4)
+
 #define LPPERI_RESET_EN     0x50120008u
 #define RST_EN_LP_TOUCH     (1u << 22)
 #define CLKRST_PATH         "/machine/clkrst"
@@ -140,11 +149,28 @@ static uint32_t expect(uint32_t n, uint32_t div, uint32_t ff)
     return (uint64_t)ns * fast_hz / 1000000000ull;
 }
 
+/*
+ * touch_channel_pin_init()'s gpio_config_as_analog(): the pad floating,
+ * its input, output and pulls off, on the GPIO function, back from the LP
+ * IO MUX.
+ */
+static void config_as_analog(int pad)
+{
+    wr(GPIO_ENABLE_W1TC, 1u << pad);
+    wr(GPIO_FUNC_OUT(pad), SIG_GPIO_OUT | OEN_SEL);
+    wr(IO_MUX_GPIO(pad), MCU_SEL_GPIO_DRV2);
+    wr(LP_IOMUX_PAD(pad), rd(LP_IOMUX_PAD(pad)) & ~LP_PAD_MUX_SEL);
+}
+
 static void start(void)
 {
     qts = qtest_init("-M esp32p4,strap-mode=0");
     fast_hz = clk_hz("lp-dyn-fast");
     g_assert_cmpuint(fast_hz, >, 0);
+    /* The channels the tests measure, T2 to T7: GPIO3 to GPIO8. */
+    for (int pad = 3; pad <= 8; pad++) {
+        config_as_analog(pad);
+    }
     /* touch_hal_config_controller(), with one sample configuration. */
     wr(WORK, OUT_GATE | OUT_SEL | DIV_NUM(0, 0));
     wr(WORK_MEAS_NUM, MEAS_NUM(0, 500));

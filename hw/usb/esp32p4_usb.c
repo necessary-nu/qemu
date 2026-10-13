@@ -57,9 +57,25 @@
  * are not in test mode (USB_WRAP_TEST_CONF); PAD_PULL_OVERRIDE's D+
  * pull-up decides whether a host sees the device, as TinyUSB uses it to
  * disconnect, and the D+ pull-up shows on the PHY's pad (GPIO27, or
- * GPIO25 when the OTG has that PHY). SRP_SESSEND_OVERRIDE replaces the session-end input. D+/D-
- * exchange (EXCHG_PINS, eFuse USB_OTG11_EXCHG_PINS) is not modelled and
- * logged as such.
+ * GPIO25 when the OTG has that PHY). SRP_SESSEND_OVERRIDE replaces the
+ * session-end input. D+/D- exchange (EXCHG_PINS, eFuse
+ * USB_OTG11_EXCHG_PINS) is not modelled and logged as such.
+ *
+ * [spec:nuos:req:emu.esp32p4.usb]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * The PHYs' pads. While its controller's USB_PAD_ENABLE is set
+ * (USB_WRAP_OTG_CONF's for the OTG's PHY, USB_SERIAL_JTAG_CONF0's for
+ * USB Serial/JTAG's, which resets to 1) a PHY has its two pads: the PHY's
+ * transceiver drives them, and the pads' own output drivers are off them,
+ * so that a GPIO output software enables there drives nothing (the GPIO
+ * block's "pad-phy"); the pads' pulls and input buffers stay as set (the
+ * TRM's table 10.14-1 note: a USB pad's pull-up is its own or its PHY's).
+ * ESP-IDF's gpio_ll_func_sel() clears the controller's USB_PAD_ENABLE
+ * before it gives one of these pads an IO MUX function, and so takes the
+ * pads from the PHY; the device then detaches, the PHY's pull-up gone
+ * (USB Serial/JTAG's host sees no D+ pull-up; the OTG's PHY disconnects).
+ * Software that takes the pads without clearing it gets no output on
+ * them, the USB untouched.
  */
 
 #include "qemu/osdep.h"
@@ -225,12 +241,25 @@ static void wrap_update(ESP32P4UsbWrapState *s)
     qemu_set_irq(s->sessend, (s->otg_conf & OTG_CONF_SRP_SESSEND_OVERRIDE)
                              ? !!(s->otg_conf & OTG_CONF_SRP_SESSEND_VALUE)
                              : s->sessend_in);
-    /* The PHY's D+ pull-up on its pad: the override's, or the core's. */
+    /* The PHY's D+ pull-up: the override's, or the core's. */
     pullup = connected && ((s->otg_conf & OTG_CONF_PAD_PULL_OVERRIDE)
                            ? !!(s->otg_conf & OTG_CONF_DP_PULLUP)
                            : s->core_dp_pullup);
-    qemu_set_irq(s->phy_dp_pullup[0], pullup && wrap_otg_phy(s) == 0);
-    qemu_set_irq(s->phy_dp_pullup[1], pullup && wrap_otg_phy(s) == 1);
+    for (int phy = 0; phy < 2; phy++) {
+        bool otg = wrap_otg_phy(s) == phy;
+        bool own = otg ? !!(s->otg_conf & OTG_CONF_USB_PAD_ENABLE)
+                       : s->usj_pad_enable;
+        bool dm = otg ? connected &&
+                        (s->otg_conf & OTG_CONF_PAD_PULL_OVERRIDE) &&
+                        (s->otg_conf & OTG_CONF_DM_PULLUP)
+                      : s->usj_pull_up[0];
+        bool dp = otg ? pullup : s->usj_pull_up[1];
+
+        qemu_set_irq(s->pad_phy[2 * phy], own);
+        qemu_set_irq(s->pad_phy[2 * phy + 1], own);
+        qemu_set_irq(s->pad_pull_up[2 * phy], dm);
+        qemu_set_irq(s->pad_pull_up[2 * phy + 1], dp);
+    }
 }
 
 /* The pads as the test mode reads them: driven by it, or by the pulls. */
@@ -345,6 +374,24 @@ static void wrap_core_dp_pullup_in(void *opaque, int n, int level)
     wrap_update(s);
 }
 
+/* [spec:nuos:req:emu.esp32p4.usb] */
+static void wrap_usj_pull_up_in(void *opaque, int n, int level)
+{
+    ESP32P4UsbWrapState *s = opaque;
+
+    s->usj_pull_up[n] = level;
+    wrap_update(s);
+}
+
+/* [spec:nuos:req:emu.esp32p4.usb] */
+static void wrap_usj_pad_enable_in(void *opaque, int n, int level)
+{
+    ESP32P4UsbWrapState *s = opaque;
+
+    s->usj_pad_enable = level;
+    wrap_update(s);
+}
+
 static void wrap_reset_hold(Object *obj, ResetType type)
 {
     ESP32P4UsbWrapState *s = ESP32P4_USB_WRAP(obj);
@@ -378,14 +425,24 @@ static void wrap_init(Object *obj)
     qdev_init_gpio_out_named(dev, &s->sessend, ESP32P4_USB_WRAP_SESSEND, 1);
     qdev_init_gpio_in_named(dev, wrap_core_dp_pullup_in,
                             ESP32P4_USB_WRAP_CORE_DP_PULLUP, 1);
-    qdev_init_gpio_out_named(dev, s->phy_dp_pullup,
-                             ESP32P4_USB_WRAP_PHY_DP_PULLUP, 2);
+    qdev_init_gpio_in_named(dev, wrap_usj_pull_up_in,
+                            ESP32P4_USB_WRAP_USJ_PULL_UP, 2);
+    qdev_init_gpio_in_named(dev, wrap_usj_pad_enable_in,
+                            ESP32P4_USB_WRAP_USJ_PAD_ENABLE, 1);
+    qdev_init_gpio_out_named(dev, s->pad_pull_up,
+                             ESP32P4_USB_WRAP_PAD_PULL_UP,
+                             ESP32P4_USB_FS_PADS);
+    qdev_init_gpio_out_named(dev, s->pad_phy, ESP32P4_USB_WRAP_PAD_PHY,
+                             ESP32P4_USB_FS_PADS);
+    /* USB Serial/JTAG's PHY has its pads, and pulls D+ up, from reset. */
+    s->usj_pad_enable = true;
+    s->usj_pull_up[1] = true;
 }
 
 static const VMStateDescription vmstate_wrap = {
     .name = TYPE_ESP32P4_USB_WRAP,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(otg_conf, ESP32P4UsbWrapState),
         VMSTATE_UINT32(test_conf, ESP32P4UsbWrapState),
@@ -393,6 +450,8 @@ static const VMStateDescription vmstate_wrap = {
         VMSTATE_BOOL(sw_phy_val, ESP32P4UsbWrapState),
         VMSTATE_BOOL(sessend_in, ESP32P4UsbWrapState),
         VMSTATE_BOOL(core_dp_pullup, ESP32P4UsbWrapState),
+        VMSTATE_BOOL_ARRAY(usj_pull_up, ESP32P4UsbWrapState, 2),
+        VMSTATE_BOOL(usj_pad_enable, ESP32P4UsbWrapState),
         VMSTATE_END_OF_LIST()
     },
 };

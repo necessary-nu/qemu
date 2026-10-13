@@ -71,6 +71,8 @@
 #define IN_SIG_IN_SEL       (1u << 7)
 #define IO_MUX_GPIO(n)      (0x500e1004u + 4 * (n))
 #define MCU_SEL_GPIO        (1u << 12)
+#define USJ_CONF0           0x500d2018u
+#define USJ_PAD_ENABLE      (1u << 14)
 #define FUN_IE              (1u << 9)
 #define FUN_DRV2            (2u << 10)
 #define GPIO_PATH           "/machine/gpio"
@@ -413,6 +415,11 @@ static void test_rmt_pulses(void)
     wr(SOC_CLK_CTRL2, rd(SOC_CLK_CTRL2) | RMT_SYS_CLK_EN);
     wr(PERI_CLK_CTRL22, RMT_CLK_EN);
     wr(RMT_SYS_CONF, rd(RMT_SYS_CONF) | 1);
+    /*
+     * GPIO24 taken from the USB Serial/JTAG PHY, which has it from reset,
+     * as ESP-IDF's gpio_ll_func_sel() does.
+     */
+    wr(USJ_CONF0, rd(USJ_CONF0) & ~USJ_PAD_ENABLE);
     wr(IO_MUX_GPIO(24), MCU_SEL_GPIO | FUN_IE | FUN_DRV2);
     qtest_set_irq_in(qts, GPIO_PATH, "pad-release", 24, 1);
     wr(GPIO_FUNC_OUT(24), 246);

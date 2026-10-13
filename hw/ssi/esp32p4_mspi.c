@@ -85,6 +85,19 @@
  * keeps its contents and takes no command until a transaction, or SPI1's
  * MISC_CS_KEEP_ACTIVE with its chip select enabled, wakes it.
  *
+ * The pads (hw/gpio/esp32p4_mspi_iomux.c, the "pins" link). A DDR read of
+ * the die, SPI1's or SPI0's (their DDR registers' DDR_EN set, DQS_LOOP
+ * clear), captures each beat on the die's strobe through IOMUX_MSPI_PIN:
+ * at the strobe's phase and delay lines, less each data line's, for the
+ * SPI clock the read runs at (the core clock over CLOCK's divider for
+ * SPI1, SRAM_CLK's for SPI0); a line sampled outside its beat's valid
+ * window takes the bit of a neighbouring beat, and with the strobe's
+ * input powered down a line captures 0. An SDR read samples on the SPI
+ * clock, which the timing tuning registers below would place, and reads
+ * the die as it is. The flash's data lines, where no flash drives them
+ * (no flash on the bus, or chip select 1 alone), read as their pads'
+ * pulls hold them.
+ *
  * External memory encryption (TRM chapter 34): XTS-AES with 128-byte
  * data units, the tweak (type << 30) | (address & 0x3FFFFF80), type 0 for
  * flash and 1 for PSRAM, and each unit byte-reversed before and after the
@@ -176,6 +189,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/block/flash.h"
+#include "hw/gpio/esp32p4_mspi_iomux.h"
 #include "hw/ssi/esp32p4_mspi.h"
 #include "migration/vmstate.h"
 #include "system/memory.h"
@@ -569,8 +583,11 @@ static const ESP32P4MSPIReg esp32p4_spi1_psram_regs[ESP32P4_MSPI_NREGS] = {
 #undef REG
 
 /* SPI0's registers. */
+#define R0_CTRL                 (0x008 / 4)
 #define R0_CTRL1                (0x00c / 4)
 #define R0_CACHE_FCTRL          (0x03c / 4)
+#define R0_SRAM_CLK             (0x050 / 4)
+#define R0_SMEM_DDR             (0x0d8 / 4)
 #define R0_INT_ENA              (0x0c0 / 4)
 #define R0_INT_CLR              (0x0c4 / 4)
 #define R0_INT_RAW              (0x0c8 / 4)
@@ -760,6 +777,7 @@ enum {
 #define SUS_PER_COMMAND(v)      extract32((v), 16, 16)
 #define DDR_FMEM_DDR_EN         BIT(0)
 #define DDR_FMEM_DDR_CMD_DIS    BIT(4)
+#define DDR_DQS_LOOP            BIT(21)
 
 #define INT1_PER_END            BIT(0)
 #define INT1_PES_END            BIT(1)
@@ -797,6 +815,8 @@ enum {
 #define PSRAM_BURST_WRITE   0xa0a0
 #define PSRAM_REG_WRITE     0xc0c0
 #define PSRAM_HALFSLEEP     0xf0
+/* MR8's X16: the die's data on DQ0 to DQ15, else on DQ0 to DQ7. */
+#define PSRAM_MR8_X16       BIT(6)
 
 /* The key purposes of TRM table 9.4-2 and ESP-IDF's for v3. */
 #define PURPOSE_XTS_AES_256_KEY_1       2
@@ -1135,6 +1155,68 @@ static void psram_access(ESP32P4MSPIState *s, uint32_t addr, uint8_t *buf,
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.memory]
+ * The `len` bytes the die sends in a read, as the controller captures them
+ * through the pads in a DDR read (SPI1's DDR, or SPI0's SMEM_DDR, with
+ * DDR_EN set and DDR_DQS_LOOP clear), on the strobes' edges at their
+ * phase and delay lines (hw/gpio/esp32p4_mspi_iomux.c): each data line
+ * sampled outside its beat's valid window takes the bit of the beat
+ * before or after, and one whose strobe is powered down captures 0. Beats
+ * are two bytes on DQ0 to DQ15 with `x16`, the even byte on DQ0 to DQ7,
+ * else a byte on DQ0 to DQ7; the first is on a rising strobe edge.
+ */
+static void psram_capture(ESP32P4MSPIState *s, bool spi1, bool x16,
+                          uint8_t *buf, uint32_t len)
+{
+    uint32_t ddr = spi1 ? s->spi1[R1_DDR] : s->spi0[R0_SMEM_DDR];
+    uint32_t clk = spi1 ? s->spi1[R1_CLOCK] : s->spi0[R0_SRAM_CLK];
+    uint64_t div = clk & CLOCK_CLK_EQU_SYSCLK ? 1 : CLOCK_CLKCNT_N(clk) + 1;
+    uint64_t hz = clock_get_hz(s->core_clk);
+    unsigned width = x16 ? 2 : 1, beats = DIV_ROUND_UP(len, width);
+    ESP32P4MspiSample how[ESP32P4_MSPI_IOMUX_PSRAM_DQ][2];
+    g_autofree uint8_t *sent = NULL;
+    bool good = true;
+
+    if (!s->pins || !len || !hz || !(ddr & DDR_FMEM_DDR_EN) ||
+        (ddr & DDR_DQS_LOOP)) {
+        return;
+    }
+    for (unsigned dq = 0; dq < 8 * width; dq++) {
+        for (unsigned edge = 0; edge < 2; edge++) {
+            how[dq][edge] = esp32p4_mspi_iomux_psram_sample(s->pins, dq,
+                                edge, div * 1000000000000ull / hz);
+            good &= how[dq][edge] == ESP32P4_MSPI_SAMPLE_GOOD;
+        }
+    }
+    if (good) {
+        return;
+    }
+    sent = g_memdup2(buf, len);
+    for (unsigned i = 0; i < len; i++) {
+        unsigned lane = i % width, beat = i / width;
+        uint8_t v = 0;
+
+        for (unsigned bit = 0; bit < 8; bit++) {
+            ESP32P4MspiSample h = how[8 * lane + bit][beat & 1];
+            int src = beat + (h == ESP32P4_MSPI_SAMPLE_EARLY ? -1 :
+                              h == ESP32P4_MSPI_SAMPLE_LATE ? 1 : 0);
+
+            if (h != ESP32P4_MSPI_SAMPLE_NONE && src >= 0 && src < beats &&
+                src * width + lane < len) {
+                v |= sent[src * width + lane] & BIT(bit);
+            }
+        }
+        buf[i] = v;
+    }
+}
+
+/* Whether the die's data reads are 16 lines wide (MR8's X16). */
+static bool psram_x16(ESP32P4MSPIState *s)
+{
+    return s->psram_mr_regs[8] & PSRAM_MR8_X16;
+}
+
 /* [spec:nuos:req:emu.esp32p4.memory] */
 static void psram_reset_mrs(ESP32P4MSPIState *s)
 {
@@ -1174,6 +1256,60 @@ static void psram_write_mr(ESP32P4MSPIState *s, unsigned mr, uint8_t v)
 
 /* The flash on the SSI bus */
 
+/* The data lines a read's data phase uses, from CTRL and CACHE_FCTRL. */
+static unsigned din_lines(uint32_t ctrl, uint32_t fctrl)
+{
+    if (ctrl & CTRL_FDIN_OCT) {
+        return 8;
+    }
+    if ((ctrl & (CTRL_FREAD_QIO | CTRL_FREAD_QUAD)) ||
+        (fctrl & FCTRL_FDIN_QUAD)) {
+        return 4;
+    }
+    if ((ctrl & (CTRL_FREAD_DIO | CTRL_FREAD_DUAL)) ||
+        (fctrl & FCTRL_FDIN_DUAL)) {
+        return 2;
+    }
+    return 1;
+}
+
+/* Whether a flash chip is on the bus. */
+static bool flash_present(ESP32P4MSPIState *s)
+{
+    return !QTAILQ_EMPTY(&BUS(s->bus)->children);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.memory]
+ * A byte read over `lines` data lines that nothing drives: each line at
+ * the level its pad's pulls give it (hw/gpio/esp32p4_mspi_iomux.c), the
+ * highest-numbered line first each clock, MISO (IO1) alone with one line.
+ */
+static uint8_t flash_idle_byte(ESP32P4MSPIState *s, unsigned lines)
+{
+    unsigned clock = 0;
+
+    if (!s->pins) {
+        return 0;
+    }
+    if (lines == 1) {
+        return esp32p4_mspi_iomux_flash_idle(s->pins, 1) ? 0xff : 0;
+    }
+    for (unsigned io = 0; io < MIN(lines, ESP32P4_MSPI_IOMUX_FLASH_IOS);
+         io++) {
+        clock |= (unsigned)esp32p4_mspi_iomux_flash_idle(s->pins, io) << io;
+    }
+    switch (lines) {
+    case 2:
+        return clock * 0x55;
+    case 4:
+        return clock * 0x11;
+    default:
+        /* The flash has no IO4 to IO7 pads. */
+        return clock;
+    }
+}
+
 static void flash_select(ESP32P4MSPIState *s, int cs, bool selected)
 {
     qemu_set_irq(s->cs[cs], !selected);
@@ -1195,6 +1331,12 @@ static void flash_read(ESP32P4MSPIState *s, uint32_t addr, uint8_t *buf,
     bool four = s->spi0[R0_CACHE_FCTRL] & CACHE_FCTRL_USR_ADDR_4BYTE;
     uint32_t i;
 
+    if (!flash_present(s)) {
+        memset(buf, flash_idle_byte(s, din_lines(s->spi0[R0_CTRL],
+                                                 s->spi0[R0_CACHE_FCTRL])),
+               len);
+        return;
+    }
     spi1_release_cs(s);
     flash_select(s, 0, true);
     ssi_transfer(s->bus, four ? FLASH_READ4 : FLASH_READ);
@@ -1256,6 +1398,7 @@ static void axi_mem_read(ESP32P4MSPIState *s, uint32_t paddr, uint8_t *buf,
 
     if (s->psram) {
         psram_access(s, start, tmp, end - start, false);
+        psram_capture(s, false, psram_x16(s), tmp, end - start);
     } else {
         flash_read(s, start, tmp, end - start);
     }
@@ -1471,21 +1614,7 @@ static unsigned spi1_addr_lines(ESP32P4MSPIState *s)
 
 static unsigned spi1_din_lines(ESP32P4MSPIState *s)
 {
-    uint32_t ctrl = s->spi1[R1_CTRL];
-    uint32_t fctrl = s->spi1[R1_CACHE_FCTRL];
-
-    if (ctrl & CTRL_FDIN_OCT) {
-        return 8;
-    }
-    if ((ctrl & (CTRL_FREAD_QIO | CTRL_FREAD_QUAD)) ||
-        (fctrl & FCTRL_FDIN_QUAD)) {
-        return 4;
-    }
-    if ((ctrl & (CTRL_FREAD_DIO | CTRL_FREAD_DUAL)) ||
-        (fctrl & FCTRL_FDIN_DUAL)) {
-        return 2;
-    }
-    return 1;
+    return din_lines(s->spi1[R1_CTRL], s->spi1[R1_CACHE_FCTRL]);
 }
 
 static unsigned spi1_dout_lines(ESP32P4MSPIState *s)
@@ -1647,14 +1776,23 @@ static bool spi1_pms_check(ESP32P4MSPIState *s, const ESP32P4MSPIXfer *x)
     return false;
 }
 
-/* Run a transaction on the flash's bus, chip select `cs`. */
+/*
+ * Run a transaction on the flash's bus, chip select `cs`. Nothing is on
+ * chip select 1, nor on chip select 0 of a board without flash: unless the
+ * flash drives them, selected too, the data lines read as their pads'
+ * pulls hold them.
+ */
 static void spi1_flash_xfer(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x, int cs)
 {
     unsigned dummy_bytes = DIV_ROUND_UP(x->dummy * x->addr_lines, 8);
     unsigned i;
 
-    if (cs != 0) {
-        /* Nothing is on chip select 1: the data lines read as zero. */
+    if (cs != 0 || !flash_present(s)) {
+        if (cs == 0 || (s->spi1[R1_MISC] & MISC_CS0_DIS) ||
+            !flash_present(s)) {
+            memset(x->miso, flash_idle_byte(s, x->din_lines),
+                   x->miso_bytes);
+        }
         return;
     }
     if (x->mosi_bytes && x->addr_bits) {
@@ -1702,6 +1840,7 @@ static void spi1_psram_xfer(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x, int cs)
     case PSRAM_SYNC_READ:
     case PSRAM_BURST_READ:
         psram_access(s, x->addr, x->miso, x->miso_bytes, false);
+        psram_capture(s, true, psram_x16(s), x->miso, x->miso_bytes);
         break;
     case PSRAM_SYNC_WRITE:
     case PSRAM_BURST_WRITE:
@@ -1714,6 +1853,8 @@ static void spi1_psram_xfer(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x, int cs)
             x->miso[i] = mr < ESP32P4_MSPI_PSRAM_MRS ? s->psram_mr_regs[mr]
                                                      : 0;
         }
+        /* The die sends its registers on DQ0 to DQ7. */
+        psram_capture(s, true, false, x->miso, x->miso_bytes);
         break;
     case PSRAM_REG_WRITE:
         for (i = 0; i < x->mosi_bytes; i++) {
@@ -2577,6 +2718,8 @@ static const Property esp32p4_mspi_properties[] = {
                      TYPE_MEMORY_REGION, MemoryRegion *),
     DEFINE_PROP_LINK("keymng", ESP32P4MSPIState, keymng, TYPE_ESP32P4_KEYMNG,
                      ESP32P4KeyMngState *),
+    DEFINE_PROP_LINK("pins", ESP32P4MSPIState, pins, TYPE_ESP32P4_MSPI_IOMUX,
+                     ESP32P4MspiIomuxState *),
     DEFINE_PROP_LINK("efuse", ESP32P4MSPIState, efuse, TYPE_ESP32P4_EFUSE,
                      ESP32P4EfuseState *),
 };
