@@ -158,6 +158,13 @@ struct Esp32SocState {
     /* CPU_CLK, APB_CLK and REF_TICK as the clock tree selects them */
     Clock *cpu_clk;
     uint32_t apb_hz;
+    /*
+     * VDD_SDIO, the flash regulator's output, in mV (0: off); the board
+     * hears of its changes through vdd_sdio_changed.
+     */
+    uint32_t vdd_sdio_mv;
+    void (*vdd_sdio_changed)(void *opaque);
+    void *vdd_sdio_opaque;
     uint32_t ref_tick_hz;
     /* PLL_F160M_CLK: 160 MHz while the BBPLL runs */
     uint32_t f160m_hz;

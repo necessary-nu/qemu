@@ -216,6 +216,8 @@ typedef struct Esp32GpioState {
     qemu_irq wakeup_out;
 
     uint32_t strap_mode;
+    /* MTDI's level as the strapping latch took it at the last chip reset */
+    bool strap_mtdi;
 
     /* GPIO matrix registers */
     uint32_t bt_select;

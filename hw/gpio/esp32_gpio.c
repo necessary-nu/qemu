@@ -1311,7 +1311,8 @@ static uint64_t gpio_reg_read(Esp32GpioState *s, hwaddr addr)
     case A_GPIO_STATUS1_W1TC:
         return 0;
     case A_GPIO_STRAP:
-        return s->strap_mode & 0xffff;
+        /* Bit 5 is MTDI's, latched at reset (the SoC's) */
+        return (s->strap_mode & 0xffff) | (s->strap_mtdi ? BIT(5) : 0);
     case A_GPIO_IN:
         esp32_gpio_sample(s);
         return (uint32_t)s->in_level;
@@ -2031,7 +2032,7 @@ static const Property esp32_gpio_properties[] = {
 
 static const VMStateDescription vmstate_esp32_gpio = {
     .name = TYPE_ESP32_GPIO,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(apb_clk, Esp32GpioState),
@@ -2087,6 +2088,7 @@ static const VMStateDescription vmstate_esp32_gpio = {
         VMSTATE_UINT32_ARRAY_V(board_pull_down, Esp32GpioState,
                                ESP32_GPIO_PIN_COUNT, 3),
         VMSTATE_UINT64_V(undefined, Esp32GpioState, 3),
+        VMSTATE_BOOL_V(strap_mtdi, Esp32GpioState, 4),
         VMSTATE_END_OF_LIST()
     }
 };

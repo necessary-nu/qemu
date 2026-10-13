@@ -2159,6 +2159,21 @@ uint8_t m25p80_continuous_cmd(DeviceState *dev)
 }
 
 /* [spec:nuos:req:emu.flash-power-cut] */
+void m25p80_power_off(DeviceState *dev)
+{
+    Flash *s = (Flash *)object_dynamic_cast(OBJECT(dev), TYPE_M25P80);
+
+    if (!s) {
+        return;
+    }
+    if (s->pi->chip) {
+        m25chip_reset(&s->chip);
+        return;
+    }
+    device_cold_reset(dev);
+}
+
+/* [spec:nuos:req:emu.flash-power-cut] */
 void m25p80_power_on(DeviceState *dev)
 {
     Flash *s = (Flash *)object_dynamic_cast(OBJECT(dev), TYPE_M25P80);

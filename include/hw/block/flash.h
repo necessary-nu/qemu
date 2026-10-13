@@ -74,11 +74,11 @@ bool m25p80_drives_output(DeviceState *dev);
 uint8_t m25p80_continuous_cmd(DeviceState *dev);
 
 /*
- * The part's supply comes back after having been out of its operating
- * range: it starts again as at power-up (a datasheet part also taking no
- * command for its tVSL), whatever program or erase it was running left
- * undone.
+ * The part's supply leaves its operating range: whatever program or erase
+ * it was running is cut short. It comes back: the part starts again as at
+ * power-up, a datasheet part also taking no command for its tVSL.
  */
+void m25p80_power_off(DeviceState *dev);
 void m25p80_power_on(DeviceState *dev);
 
 #endif
