@@ -148,12 +148,26 @@
  * VREF x MUL from their ANA register: VREF 0.5 V + 50 mV x DREF up to
  * DREF 8, then 1.0 V + 100 mV x (DREF - 9); MUL 1 + MUL / 4 (TRM, and
  * ldo_ll.h's ideal formula, the eFuse calibration constants describing
- * silicon's departure from it), no more than VDD_LDO. The mode is
- * TIEH_SEL's input of the figure's mux, its select FORCE_TIEH_SEL ?
- * TIEH_SEL : 0: 0, the regulator's TIEH (1: bypass); 2, bypass; 1 and 3,
- * the SD/MMC host's card 0 and card 1 signals, which the model takes as
- * bypass while the host's UHS_REG.VOLT_REG bit for the card is clear and
- * LDO mode while it is set (the host asking 1.8 V of the card's pads).
+ * silicon's departure from it), no more than VDD_LDO. The mode is the
+ * output of the figure's second mux, TIEH_SEL (0: LDO mode, 1: bypass),
+ * its select FORCE_TIEH_SEL ? TIEH_SEL : 0 (the figure's first mux, whose
+ * input 0 is a constant 0 for VO2 to VO4; ldo_ll.h: "force_tieh_sel: 0:
+ * efuse, i.e. by hardware; 1: tieh_sel, i.e. by software"; the TRM's
+ * register text for VO2 to VO4's FORCE_TIEH_SEL repeats TIEH_SEL's
+ * options instead): 0, the regulator's TIEH (1: bypass); 2, bypass; 1
+ * and 3, the SD/MMC host's card 0 and card 1 signals (TRM: SDMMC_0 and
+ * SDMMC_1; ldo_ll.h: "1: sdmmc0_tieh; 2: 3.3V; 3: sdmmc1_tieh"). Those
+ * signals are TIEH's kind, 1 for bypass: ldo_ll.h names them for it,
+ * whose "tieh" is "1: 3.3V", and the eFuse's EFUSE_0PXA_TIEH_SEL_0 (VO1's
+ * TIEH_SEL as the eFuses give it, its values the register's with bit 1
+ * inverted) calls the SDMMC peripheral a source of the regulator's
+ * "pull-high (tieh)". So each is its card's UHS_REG.VOLT_REG inverted:
+ * VOLT_REG, "0: 3.3 V VDD, 1: 1.8 V VDD" (TRM register SDHOST_UHS_REG),
+ * clear gives bypass, VDD_LDO's 3.3 V, and set LDO mode, the voltage
+ * DREF and MUL give, as the TRM's example of VO4 switching an SD card's
+ * pads has them (15.4.2.9.2: bypass for 3.3 V, LDO mode at 0.9 V x 2.0
+ * for 1.8 V). ESP-IDF itself switches VO4 by TIEH instead
+ * (sd_pwr_ctrl_by_on_chip_ldo.c, ldo_ll_set_owner()'s TIEH_SEL 0).
  * TIEH_SEL's values 4 to 7 select as their low two bits do (logged).
  * Each voltage is the "ldo-mv" output line of its channel, in mV, as
  * soon as software sets it; VO1, the flash supply, which the state machine
