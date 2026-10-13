@@ -673,9 +673,15 @@ static void uhci_catch_up(ESP32P4UhciState *s)
     }
 }
 
+/* GDMA's register access, while a channel of the UHCI's runs. */
 static void uhci_gdma_sync(void *opaque, int64_t when)
 {
-    uhci_catch_up(opaque);
+    ESP32P4UhciState *s = opaque;
+
+    if (esp32p4_gdma_tx_flowing(s->gdma, ESP32P4_GDMA_AHB_UHCI0) ||
+        esp32p4_gdma_rx_flowing(s->gdma, ESP32P4_GDMA_AHB_UHCI0)) {
+        uhci_catch_up(s);
+    }
 }
 
 static const ESP32P4GdmaPeriphOps uhci_gdma_ops = {
