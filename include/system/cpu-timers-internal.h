@@ -77,6 +77,13 @@ typedef struct TimersState {
     int window_cpus;
     int window_running;
 
+    /*
+     * How many times icount's state has been loaded (an incoming
+     * migration, loadvm), with the VM stopped: TCG's round-robin vCPU
+     * thread then starts its schedule afresh, as at the machine's start.
+     */
+    unsigned loads;
+
     /* for adjusting icount */
     QEMUTimer *icount_rt_timer;
     QEMUTimer *icount_vm_timer;

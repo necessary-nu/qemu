@@ -25,9 +25,11 @@
 
 #include "qemu/osdep.h"
 #include "qemu/lockable.h"
+#include "qemu/seqlock.h"
 #include "system/tcg.h"
 #include "system/replay.h"
 #include "exec/icount.h"
+#include "system/cpu-timers-internal.h"
 #include "qemu/main-loop.h"
 #include "qemu/notify.h"
 #include "qemu/guest-random.h"
@@ -38,14 +40,59 @@
 #include "tcg-accel-ops-rr.h"
 #include "tcg-accel-ops-icount.h"
 
+/*
+ * Under icount, outside record/replay, what the vCPUs do follows from the
+ * guest and the virtual times of its inputs alone, and so must the
+ * round-robin schedule: whose turn it is, how far each turn runs, and the
+ * windows the CPUs with an icount clock run through (tcg-accel-ops-icount.c).
+ * A kick from another thread comes at a moment of the host's: a monitor
+ * stopping or continuing the VM, work queued on a vCPU (run_on_cpu(), or
+ * the main loop moving a timer earlier), an interrupt a device raises as
+ * it takes input on the main loop, the RCU thread hurrying this thread
+ * through a grace period. It pauses the schedule without changing it
+ * (rr_pause()): the running vCPU leaves its run at the end of a
+ * translation block, this thread does what was asked with the BQL held,
+ * waiting while the VM is stopped, and the vCPU goes on with the rest of
+ * its run in the same turn. No timer runs, no window moves and no turn
+ * ends at the pause that would not have otherwise; the only change is
+ * where a timer set meanwhile, as a device takes input, cuts the run
+ * short, as any timer does. A kick this thread gives itself, as the vCPUs
+ * execute or their timers run (an inter-processor interrupt, a timer
+ * moved, the guest stopping the VM), comes at the guest's time: it ends
+ * the running vCPU's turn, and every other's as the round comes to it,
+ * as an exit request always has (cpu->rr_exit_request).
+ */
+static bool rr_pause_on_kick(void)
+{
+    return icount_enabled() && replay_mode == REPLAY_MODE_NONE;
+}
+
+/* Another thread has kicked since this thread last took its requests. */
+static bool rr_host_request;
+/*
+ * This thread is doing what other threads asked of it, or waking the main
+ * loop: a kick it gives itself meanwhile (queuing a bottom half kicks the
+ * vCPU under icount, see aio_bh_enqueue()) is theirs, not the guest's.
+ */
+static bool rr_taking_requests;
+/* timers_state.loads as this thread last started its schedule afresh. */
+static unsigned rr_loads;
+
 /* Kick all RR vCPUs */
 void rr_kick_vcpu_thread(CPUState *unused)
 {
+    bool own = qemu_in_vcpu_thread() && !rr_taking_requests;
     CPUState *cpu;
 
+    if (!own) {
+        qatomic_set_mb(&rr_host_request, true);
+    }
     CPU_FOREACH(cpu) {
+        if (own) {
+            cpu->rr_exit_request = true;
+        }
         tcg_kick_vcpu_thread(cpu);
-    };
+    }
 }
 
 /*
@@ -121,9 +168,168 @@ bool rr_vcpu_thread_waiting(void)
     return rr_waiting;
 }
 
+/*
+ * With the BQL held, do what other threads have asked of the vCPUs (stop,
+ * queued work), and drop the exit requests their kicks left, which end no
+ * turn. A kick whose exit requests are dropped before it sets
+ * rr_host_request is taken again; one that sets it after it is cleared
+ * leaves its exit requests in place, to be taken at the next pause.
+ */
+static void rr_take_host_requests(void)
+{
+    CPUState *cpu;
+
+    rr_taking_requests = true;
+    do {
+        CPU_FOREACH(cpu) {
+            if (!cpu->rr_exit_request) {
+                qatomic_set(&cpu->exit_request, false);
+            }
+        }
+        CPU_FOREACH(cpu) {
+            qemu_process_cpu_events_common(cpu);
+        }
+    } while (qatomic_xchg(&rr_host_request, false));
+    rr_taking_requests = false;
+}
+
+/* Whether another thread has asked something of the vCPUs, as @cpu shows. */
+static bool rr_host_requested(CPUState *cpu)
+{
+    return qatomic_read(&rr_host_request) || cpu->stop ||
+           !cpu_work_list_empty(cpu) || qatomic_read(&cpu->exit_request);
+}
+
+static bool rr_all_stopped(void)
+{
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        if (!cpu_is_stopped(cpu)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * With the BQL held, between two runs or in the middle of one: take other
+ * threads' requests, waiting while they have the VM stopped. Returns false
+ * if state was loaded meanwhile, so that the schedule starts afresh.
+ */
+static bool rr_pause(void)
+{
+    for (;;) {
+        rr_take_host_requests();
+        if (!rr_all_stopped()) {
+            break;
+        }
+        qemu_cond_wait_bql(first_cpu->halt_cond);
+    }
+    return qatomic_read(&timers_state.loads) == rr_loads;
+}
+
+/*
+ * Start the schedule afresh, as the machine starts it: a round from the
+ * first vCPU, with no exit request pending and the kick timer a period
+ * on. State loaded (an incoming migration, loadvm) carries none of the
+ * schedule, so it goes on the same in a running QEMU as in a new one; the
+ * CPUs with an icount clock start a window afresh too.
+ */
+static CPUState *rr_restart(void)
+{
+    CPUState *cpu;
+
+    rr_loads = qatomic_read(&timers_state.loads);
+    CPU_FOREACH(cpu) {
+        cpu->rr_exit_request = false;
+        qatomic_set(&cpu->exit_request, false);
+    }
+    rr_stop_kick_timer();
+    rr_start_kick_timer();
+    return first_cpu;
+}
+
+/*
+ * @cpu's run left cpu_exec() with @excp. Where a kick from another thread
+ * rather than the run's end made it leave, pause and go on with the rest
+ * of the run, in the same turn; returns how the run finally left. Called
+ * without the BQL. Sets *@restart if the schedule is to start afresh.
+ */
+static int rr_run_through_kicks(CPUState *cpu, int excp, bool *restart)
+{
+    while (rr_pause_on_kick() && excp == EXCP_INTERRUPT &&
+           !cpu->rr_exit_request && icount_run_left(cpu)) {
+        bool go_on;
+
+        icount_pause_run(cpu);
+        bql_lock();
+        go_on = rr_pause();
+        *restart = !go_on;
+        go_on = go_on && cpu_can_run(cpu);
+        if (go_on) {
+            qemu_clock_enable(QEMU_CLOCK_VIRTUAL,
+                              (cpu->singlestep_flags & SSTEP_NOTIMER) == 0);
+        }
+        icount_resume_run(cpu, go_on);
+        bql_unlock();
+        if (!go_on) {
+            break;
+        }
+        excp = tcg_cpu_exec(cpu);
+    }
+    return excp;
+}
+
+/* Every vCPU waits for an event of the guest's, whether stopped or not. */
+static bool rr_all_halted(void)
+{
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        if (!cpu->halted || cpu_has_work(cpu)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void rr_wait_io_event(void)
 {
     CPUState *cpu;
+
+    if (rr_pause_on_kick()) {
+        /*
+         * Other threads' requests are taken here too, at the round's end,
+         * and a wake that leaves every vCPU idle (a cont, a stop, work
+         * done at once) leaves the thread waiting, rather than taking a
+         * round, and starting a window, that it would not have otherwise.
+         * A timer due ends the wait, to run in the round. Each wait wakes
+         * the main loop, which may then move virtual time on. The kick
+         * timer stops only while the vCPUs wait for the guest: stopped
+         * and started again for the VM's stop, it would expire, and its
+         * restart kick this thread, at the moments of a monitor's.
+         */
+        for (;;) {
+            rr_take_host_requests();
+            if (!all_cpu_threads_idle() ||
+                qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
+                                           QEMU_TIMER_ATTR_ALL) == 0) {
+                break;
+            }
+            if (rr_all_halted()) {
+                rr_stop_kick_timer();
+            }
+            rr_waiting = true;
+            rr_taking_requests = true;
+            qemu_notify_event();
+            rr_taking_requests = false;
+            qemu_cond_wait_bql(first_cpu->halt_cond);
+            rr_waiting = false;
+        }
+        rr_start_kick_timer();
+        return;
+    }
 
     while (all_cpu_threads_idle()) {
         rr_stop_kick_timer();
@@ -226,12 +432,14 @@ static void *rr_cpu_thread_fn(void *arg)
     }
 
     rr_start_kick_timer();
+    rr_loads = qatomic_read(&timers_state.loads);
 
     cpu = first_cpu;
 
     while (1) {
         /* Only used for icount_enabled() */
         int64_t cpu_budget = 0;
+        bool restart = false;
 
         if (cpu) {
             /*
@@ -240,9 +448,16 @@ static void *rr_cpu_thread_fn(void *arg)
              * there's no advantage in doing so.
              */
             qatomic_set(&cpu->exit_request, false);
+            cpu->rr_exit_request = false;
         }
 
-        if (icount_enabled() && all_cpu_threads_idle()) {
+        /*
+         * Under rr_pause_on_kick(), only for idleness of the guest's: waking
+         * the main loop kicks this thread (aio_bh_enqueue()), and the VM's
+         * stop leaves every vCPU idle at a moment of the host's.
+         */
+        if (icount_enabled() &&
+            (rr_pause_on_kick() ? rr_all_halted() : all_cpu_threads_idle())) {
             /*
              * When all cpus are sleeping (e.g in WFI), to avoid a deadlock
              * in the main_loop, wake it up in order to start the warp timer.
@@ -251,11 +466,25 @@ static void *rr_cpu_thread_fn(void *arg)
         }
 
         rr_wait_io_event();
+        if (rr_pause_on_kick() &&
+            qatomic_read(&timers_state.loads) != rr_loads) {
+            cpu = rr_restart();
+            continue;
+        }
         rr_deal_with_unplugged_cpus();
 
-        bql_unlock();
-        replay_mutex_lock();
-        bql_lock();
+        /*
+         * Under rr_pause_on_kick() there is no replay mutex to take, and the
+         * BQL stays held from the wait, which has taken other threads'
+         * requests, through the timers, the windows and each run's budget:
+         * a stop coming between would have them counted with the virtual
+         * clock disabled and the vCPUs about to stop.
+         */
+        if (!rr_pause_on_kick()) {
+            bql_unlock();
+            replay_mutex_lock();
+            bql_lock();
+        }
 
         if (icount_enabled()) {
             int cpu_count = rr_cpu_count();
@@ -271,21 +500,32 @@ static void *rr_cpu_thread_fn(void *arg)
             cpu_budget = icount_percpu_budget(cpu_count);
         }
 
-        replay_mutex_unlock();
+        if (!rr_pause_on_kick()) {
+            replay_mutex_unlock();
+        }
 
         if (!cpu) {
             cpu = first_cpu;
         }
 
-        while (cpu && cpu_work_list_empty(cpu)) {
+        while (cpu) {
             /*
              * Store rr_current_cpu before evaluating cpu->exit_request.
              * Pairs with rr_kick_next_cpu().
              */
             qatomic_set_mb(&rr_current_cpu, cpu);
 
-            /* Pairs with store-release in cpu_exit.  */
-            if (qatomic_load_acquire(&cpu->exit_request)) {
+            if (rr_pause_on_kick()) {
+                if (cpu->rr_exit_request) {
+                    break;
+                }
+                if (rr_host_requested(cpu) && !rr_pause()) {
+                    cpu = rr_restart();
+                    break;
+                }
+            } else if (!cpu_work_list_empty(cpu) ||
+                       qatomic_load_acquire(&cpu->exit_request)) {
+                /* Pairs with store-release in cpu_exit.  */
                 break;
             }
             current_cpu = cpu;
@@ -303,17 +543,25 @@ static void *rr_cpu_thread_fn(void *arg)
                  */
                 qemu_clock_enable(QEMU_CLOCK_VIRTUAL,
                                   (cpu->singlestep_flags & SSTEP_NOTIMER) == 0);
+                /* Under rr_pause_on_kick(), with the BQL held, as above. */
+                if (icount_enabled() && rr_pause_on_kick()) {
+                    icount_prepare_for_run(cpu, cpu_budget);
+                }
                 bql_unlock();
-                if (icount_enabled()) {
+                if (icount_enabled() && !rr_pause_on_kick()) {
                     icount_prepare_for_run(cpu, cpu_budget);
                 }
                 excp = tcg_cpu_exec(cpu);
+                excp = rr_run_through_kicks(cpu, excp, &restart);
                 if (icount_enabled()) {
                     icount_process_data(cpu);
                 }
                 bql_lock();
 
-                if (excp == EXCP_DEBUG) {
+                if (restart) {
+                    cpu = rr_restart();
+                    break;
+                } else if (excp == EXCP_DEBUG) {
                     cpu_handle_guest_debug(cpu);
                     break;
                 } else if (excp == EXCP_ATOMIC) {

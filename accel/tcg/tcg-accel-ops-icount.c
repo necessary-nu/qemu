@@ -164,6 +164,19 @@ static void icount_window_leave(CPUState *cpu)
     cpu->icount_own = 0;
 }
 
+/*
+ * Whether @cpu is idle as its window counts it: halted with nothing of the
+ * guest's to wake it, or stopped. Unlike cpu_thread_is_idle(), a CPU is
+ * not taken out of idle by a stop or work another thread has asked for
+ * and the vCPU thread has yet to take: those come at moments of the
+ * host's, and the vCPUs' schedule follows the guest alone
+ * (tcg-accel-ops-rr.c). Called with the BQL held.
+ */
+static bool icount_cpu_idle(CPUState *cpu)
+{
+    return cpu->stopped || (cpu->halted && !cpu_has_work(cpu));
+}
+
 static void icount_window_update(int64_t quantum)
 {
     uint64_t quantum_units, moved;
@@ -185,7 +198,7 @@ static void icount_window_update(int64_t quantum)
             icount_window_leave(cpu);
             continue;
         }
-        idle = cpu_thread_is_idle(cpu);
+        idle = icount_cpu_idle(cpu);
         if (cpu->icount_in_window && idle != cpu->icount_window_idle) {
             icount_window_set_idle(cpu, idle);
         }
@@ -199,7 +212,7 @@ static void icount_window_update(int64_t quantum)
     if (!done && timers_state.window_cpus) {
         CPU_FOREACH(cpu) {
             if (icount_cpu_clocked(cpu) && !cpu->icount_in_window &&
-                !cpu_thread_is_idle(cpu)) {
+                !icount_cpu_idle(cpu)) {
                 icount_window_join(cpu, quantum_units);
             }
         }
@@ -213,7 +226,7 @@ static void icount_window_update(int64_t quantum)
     width = MIN(width, INT32_MAX / MAX(runnable, 1));
     moved = icount_window_start((uint64_t)width << 32, runnable);
     CPU_FOREACH(cpu) {
-        if (!icount_cpu_clocked(cpu) || cpu_thread_is_idle(cpu)) {
+        if (!icount_cpu_clocked(cpu) || icount_cpu_idle(cpu)) {
             icount_window_leave(cpu);
         } else if (cpu->icount_in_window && !cpu->icount_window_idle &&
                    moved != UINT64_MAX) {
@@ -273,10 +286,48 @@ static int64_t icount_insns_in(CPUState *cpu, uint64_t own, uint64_t period)
     return n;
 }
 
+/*
+ * A run paused for another thread's request (icount_pause_run()): the rest
+ * of its budget, and the time of the next QEMU_CLOCK_VIRTUAL timer as the
+ * budget was counted to it.
+ */
+static int64_t icount_paused_budget;
+static int64_t icount_run_timer;
+
+/* The virtual time of the next QEMU_CLOCK_VIRTUAL timer, or INT64_MAX. */
+static int64_t icount_next_timer(void)
+{
+    int64_t deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
+                                                  QEMU_TIMER_ATTR_ALL);
+
+    if (deadline < 0) {
+        return INT64_MAX;
+    }
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + deadline;
+}
+
+/*
+ * Let @cpu's run execute @budget instructions; with none, because virtual
+ * time is at the next deadline, the timers due run first.
+ */
+static void icount_set_budget(CPUState *cpu, int64_t budget)
+{
+    int insns_left = MIN(0xffff, budget);
+
+    cpu->icount_budget = budget;
+    cpu->neg.icount_decr.u16.low = insns_left;
+    cpu->icount_extra = budget - insns_left;
+
+    if (budget == 0) {
+        /* Timer handlers need the BQL, which the caller may not hold. */
+        BQL_LOCK_GUARD();
+
+        icount_notify_aio_contexts();
+    }
+}
+
 void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
 {
-    int insns_left;
-
     /*
      * These should always be cleared by icount_process_data after
      * each vCPU execution. However u16.high can be raised
@@ -286,6 +337,7 @@ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
     g_assert(cpu->icount_extra == 0);
 
     replay_mutex_lock();
+    icount_run_timer = icount_next_timer();
 
     if (icount_cpu_clocked(cpu)) {
         /*
@@ -318,25 +370,72 @@ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
         cpu->icount_insn_time = period;
         cpu->icount_insn_den = qatomic_read(&cpu->icount_period_den);
         cpu->icount_insn_frac = qatomic_read(&cpu->icount_period_frac);
-        cpu->icount_budget = icount_insns_in(cpu, left, period);
+        icount_set_budget(cpu, icount_insns_in(cpu, left, period));
     } else {
         cpu->icount_insn_time = 0;
         cpu->icount_insn_frac = 0;
-        cpu->icount_budget = MIN(icount_get_limit(), cpu_budget);
+        icount_set_budget(cpu, MIN(icount_get_limit(), cpu_budget));
     }
-    insns_left = MIN(0xffff, cpu->icount_budget);
-    cpu->neg.icount_decr.u16.low = insns_left;
-    cpu->icount_extra = cpu->icount_budget - insns_left;
+}
 
-    if (cpu->icount_budget == 0) {
-        /*
-         * We're called without the BQL, so must take it while
-         * we're calling timer handlers.
-         */
-        bql_lock();
-        icount_notify_aio_contexts();
-        bql_unlock();
+bool icount_run_left(CPUState *cpu)
+{
+    return cpu->neg.icount_decr.u16.low + cpu->icount_extra > 0;
+}
+
+void icount_pause_run(CPUState *cpu)
+{
+    /*
+     * Account for what the run has executed, as a device reading the clock
+     * in the middle of a run does: a run accounted for in parts takes the
+     * same time as one accounted for at its end.
+     */
+    icount_update(cpu);
+    icount_paused_budget = cpu->icount_budget;
+    cpu->neg.icount_decr.u16.low = 0;
+    cpu->icount_extra = 0;
+    cpu->icount_budget = 0;
+    replay_mutex_unlock();
+}
+
+/*
+ * The instructions @cpu's run may execute until virtual time reaches the
+ * next deadline, as icount_prepare_for_run() counts them.
+ */
+static int64_t icount_budget_to_deadline(CPUState *cpu)
+{
+    if (cpu->icount_insn_time) {
+        uint64_t n = MAX(timers_state.window_running, 1);
+        uint64_t deadline = icount_deadline_units();
+
+        if (deadline > UINT64_MAX / n) {
+            return INT64_MAX;
+        }
+        return icount_insns_in(cpu, deadline * n, cpu->icount_insn_time);
     }
+    return icount_get_limit();
+}
+
+void icount_resume_run(CPUState *cpu, bool go_on)
+{
+    int64_t budget = icount_paused_budget;
+    int64_t timer;
+
+    replay_mutex_lock();
+    if (!go_on) {
+        return;
+    }
+    /*
+     * A timer set meanwhile (as a device took input on the main loop) may
+     * come before the end of the run: the run stops where virtual time
+     * reaches it, as it does for any other.
+     */
+    timer = icount_next_timer();
+    if (timer < icount_run_timer) {
+        icount_run_timer = timer;
+        budget = MIN(budget, icount_budget_to_deadline(cpu));
+    }
+    icount_set_budget(cpu, budget);
 }
 
 void icount_process_data(CPUState *cpu)
@@ -353,11 +452,11 @@ void icount_process_data(CPUState *cpu)
     if (icount_cpu_clocked(cpu)) {
         if (cpu->icount_in_window && !cpu->icount_window_idle) {
             if (cpu->halted) {
-                bql_lock();
-                if (cpu_thread_is_idle(cpu)) {
+                BQL_LOCK_GUARD();
+
+                if (icount_cpu_idle(cpu)) {
                     icount_window_set_idle(cpu, true);
                 }
-                bql_unlock();
             }
         } else if (!cpu->halted) {
             icount_window_waiting = true;

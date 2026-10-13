@@ -228,8 +228,12 @@ static int icount_timers_post_load(void *opaque, int version_id)
         s->qemu_icount_time = s->qemu_icount << s->icount_time_shift;
         s->qemu_icount_time_frac = 0;
     }
-    /* The CPUs with an icount clock start a window afresh. */
+    /*
+     * The CPUs with an icount clock start a window afresh, and the
+     * round-robin vCPU thread its schedule (tcg-accel-ops-rr.c).
+     */
     s->window_cpus = 0;
+    qatomic_inc(&s->loads);
     return 0;
 }
 

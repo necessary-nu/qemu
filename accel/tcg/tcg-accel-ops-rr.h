@@ -12,7 +12,11 @@
 
 #define TCG_KICK_PERIOD (NANOSECONDS_PER_SECOND / 10)
 
-/* Kick all RR vCPUs. */
+/*
+ * Kick all RR vCPUs. Under icount, a kick from another thread pauses the
+ * vCPUs' schedule, and one the round-robin thread gives itself ends the
+ * running vCPU's turn (tcg-accel-ops-rr.c).
+ */
 void rr_kick_vcpu_thread(CPUState *unused);
 
 /*

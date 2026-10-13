@@ -46,6 +46,21 @@ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget);
 int64_t icount_percpu_budget(int cpu_count);
 void icount_process_data(CPUState *cpu);
 
+/*
+ * A run of @cpu that left cpu_exec() early, at a request from another
+ * thread, pauses rather than ends: icount_run_left() says whether it has
+ * instructions left. icount_pause_run() accounts for those it executed,
+ * and keeps the rest of its budget, so that icount_resume_run() lets it
+ * execute them, up to where virtual time reaches a timer set meanwhile,
+ * as if it had not left; with @go_on false the run ends there instead,
+ * having executed no more (icount_process_data() follows either way).
+ * Neither touches a window or the vCPU's turn, nor runs a timer but one
+ * set meanwhile that is already due, as the start of a run would.
+ */
+bool icount_run_left(CPUState *cpu);
+void icount_pause_run(CPUState *cpu);
+void icount_resume_run(CPUState *cpu, bool go_on);
+
 void icount_handle_interrupt(CPUState *cpu, int mask);
 
 #endif /* TCG_ACCEL_OPS_ICOUNT_H */

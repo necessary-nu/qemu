@@ -433,6 +433,10 @@ struct qemu_work_item;
  *   the one provided by cpu_exit(), especially when processing interrupt
  *   flags.  In this case, the write and read happen in the same thread
  *   and the write therefore can use qemu_atomic_set().
+ * @rr_exit_request: An exit request TCG's round-robin vCPU thread made
+ *   itself, as the vCPUs executed or their timers ran: at the guest's
+ *   time, unlike a kick from another thread (tcg-accel-ops-rr.c). Read and
+ *   written only by that thread.
  * @interrupt_request: Indicates a pending interrupt request.
  *   Only used by system emulation.
  * @halted: Nonzero if the CPU is in suspended state.
@@ -526,6 +530,7 @@ struct CPUState {
     bool unplug;
     bool crash_occurred;
     bool exit_request;
+    bool rr_exit_request;
     int exclusive_context_count;
     uint32_t cflags_next_tb;
     uint32_t interrupt_request;
