@@ -13,7 +13,8 @@
  * (25 ns), card 0's clock 400 kHz (2.5 us) for identification and 10 MHz
  * (100 ns) for data, 4 bits wide, slot 0's pads powered at 3.3 V on the
  * PMU's regulator VO4 (bypass), as ESP-IDF's on-chip LDO power control
- * powers them. The SDSC card is a raw image of 1 MiB:
+ * powers them, its pins set up as ESP-IDF sets them up
+ * (esp32p4-sd-pins.h). The SDSC card is a raw image of 1 MiB:
  * Class 4, so its access and programming times are both its TAAC, 70 us,
  * its AU 512 KiB. The SDHC card is 4 GiB of zeros that keeps no writes.
  */
@@ -21,6 +22,7 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
+#include "esp32p4-sd-pins.h"
 
 #define SD                  0x50083000
 #define SD_CTRL             (SD + 0x000)
@@ -170,6 +172,7 @@ static void clocks_on(QTestState *qts)
 {
     uint32_t edges = (3u << 17) | (3u << 9) | (1u << 13) | (7u << 27);
 
+    sd_pins(qts, 0);
     qtest_writel(qts, PMU_EXT_LDO_VO4,
                  qtest_readl(qts, PMU_EXT_LDO_VO4) | VO4_ON_3V3);
     qtest_writel(qts, SOC_CLK_CTRL1,

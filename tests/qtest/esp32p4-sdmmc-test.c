@@ -10,12 +10,14 @@
  * card 0's clock divided by 2 * 50 to 400 kHz (2.5 us) for identification
  * or by 2 to 10 MHz for data. Slot 0's pads are on the PMU's regulator
  * VO4, off from reset, which the tests power at 3.3 V (bypass), as
- * ESP-IDF's on-chip LDO power control does. The cards are raw images of
- * 1 MiB, standard capacity, byte addressed.
+ * ESP-IDF's on-chip LDO power control does; both slots' pins are set up
+ * as ESP-IDF's SD/MMC host driver sets them up (esp32p4-sd-pins.h). The
+ * cards are raw images of 1 MiB, standard capacity, byte addressed.
  */
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "esp32p4-sd-pins.h"
 
 #define SD                  0x50083000
 #define SD_CTRL             (SD + 0x000)
@@ -198,12 +200,18 @@ static QTestState *start(const char *img0, const char *img1)
 #define PMU_EXT_LDO_VO4     0x501151d8
 #define VO4_ON_3V3          ((1u << 7) | (1u << 8) | (1u << 14))
 
-/* SDMMC_SYS_CLK, the SDIO_LS clocks at 40 MHz, and slot 0's pads. */
+/*
+ * SDMMC_SYS_CLK, the SDIO_LS clocks at 40 MHz, slot 0's pads powered, and
+ * both slots' pins.
+ */
 static void clocks_on(QTestState *qts)
 {
     qtest_writel(qts, PMU_EXT_LDO_VO4,
                  qtest_readl(qts, PMU_EXT_LDO_VO4) | VO4_ON_3V3);
     uint32_t edges = (3u << 17) | (3u << 9) | (1u << 13) | (7u << 27);
+
+    sd_pins(qts, 0);
+    sd_pins(qts, 1);
 
     qtest_writel(qts, SOC_CLK_CTRL1,
                  qtest_readl(qts, SOC_CLK_CTRL1) | SDMMC_SYS_CLK_EN);

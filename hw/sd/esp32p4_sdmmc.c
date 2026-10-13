@@ -57,6 +57,53 @@
  * 2.5 ns) phases 1 and 2 sample within the window and 0 and 3 do not;
  * at DDR50 (50 MHz, phases of 5 ns) only phase 1 does on both CMD and
  * DAT; Default Speed and High Speed work at phase 0 up to 25 and 50 MHz.
+ *
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * Pads. Slot 0's lines are IO MUX functions only (SD1_CCLK, SD1_CCMD,
+ * SD1_CDATA0 to 7, function 0 of GPIO43, GPIO44, GPIO39 to GPIO42 and
+ * GPIO45 to GPIO48: TRM table 10.14-1, ESP-IDF's sdmmc_pins.h; ESP-IDF's
+ * sdmmc_ll.h has SDMMC_LL_SLOT_SUPPORT_GPIO_MATRIX(0) 0); slot 1's are
+ * GPIO matrix signals only (0 to 9, SD_CARD_CCLK_2 to SD_CARD_CDATA7_2:
+ * table 10.12-1, sdmmc_periph.c). A line joins the host to its card as
+ * the pads between them are set up (the GPIO model's routing,
+ * hw/gpio/esp32p4_gpio.c), on the pads the board wires the card to:
+ *
+ *   - the host's output reaches the card's pin while the pad takes it
+ *     when the host drives it: slot 0's pad on function 0 (MCU_SEL), its
+ *     output enable then the host's own; slot 1's pad with
+ *     GPIO_FUNCn_OUT_SEL the host's signal and the enable the host's
+ *     (OEN_SEL clear) or, with OEN_SEL set, GPIO_ENABLE's, as inverted by
+ *     OEN_INV_SEL; neither held, nor driven from outside;
+ *   - the card's output reaches the host's input while the input takes
+ *     the card's pad with its input enabled (FUN_IE): slot 0's pad on
+ *     function 0, slot 1's through the matrix (SIG_IN_SEL, IN_SEL the
+ *     pad, IN_INV_SEL clear), the chip not driving the pad while the host
+ *     releases it;
+ *   - an input that does not take the card's pad reads what the GPIO
+ *     model gives it: 0 on slot 0's pad on its function with its input
+ *     disabled, 1 (an I1 input) on a pad on another function; slot 1's
+ *     signals their default, 1, bypassing the matrix, or the pad or
+ *     constant the matrix selects; and a pin the host's output does not
+ *     reach sees its pad's level: the board's pull-ups, the pad's own
+ *     pulls, another output on it (hw/sd/dwc_sdmmc.c has what each makes
+ *     of the bus).
+ *
+ * The microSD socket has slot 0's CLK, CMD and DAT0 to DAT3, so a card
+ * there never sees DAT4 to DAT7 (GPIO45 is the socket's supply switch);
+ * the board's 51 kOhm pull-ups on CMD and DAT0 to DAT3, to VO4, are the
+ * machine's. Slot 1's card stands where the board's ESP32-C6 is, its CLK,
+ * CMD and DAT0 to DAT3 on GPIO18, GPIO19 and GPIO14 to GPIO17 (the
+ * board's schematic, as ESP-Hosted wires its SDIO), each with a 51 kOhm
+ * pull-up to 3.3 V. ESP-IDF's sd_host_sdmmc.c sets slot 0's pins up with
+ * configure_pin_iomux() (function 0, input enabled, pull-down off, drive
+ * strength 3) and slot 1's with configure_pin_gpio_matrix().
+ *
+ * The pads' drive strength (FUN_DRV) is not modelled: the datasheet gives
+ * only each setting's current (5 to 40 mA, table 10.14-1), not the edge
+ * rates or delays it gives into the card's load, so nothing ties it to
+ * the sample window above, whose 4.0 ns round trip stands for the pads at
+ * ESP-IDF's strength 3.
  */
 
 #include "qemu/osdep.h"
@@ -66,6 +113,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "hw/sd/esp32p4_sdmmc.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_icm.h"
 #include "migration/vmstate.h"
 
@@ -97,6 +145,93 @@ static bool esp32p4_sdmmc_vendor_read(DWCSDMMCState *d, hwaddr offset,
     default:
         return false;
     }
+}
+
+/* Slot 0's IO MUX pads, by line */
+static const uint8_t slot0_pads[DWC_SDMMC_LINES] = ESP32P4_SDMMC_SLOT0_PADS;
+
+/* The board pad slot @slot's line @i is wired to on the card, or -1. */
+static int esp32p4_sdmmc_card_pad(ESP32P4SdmmcState *s, unsigned slot,
+                                  unsigned i)
+{
+    unsigned pad;
+
+    if (slot == 0) {
+        return i < 2 + s->slot0_dat_lines ? slot0_pads[i] : -1;
+    }
+    pad = s->slot1_pad[i];
+    return pad < ESP32P4_GPIO_PADS ? pad : -1;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * Slot @slot's lines as the GPIO matrix and IO MUX join the host and its
+ * card: see "Pads" above.
+ */
+static void esp32p4_sdmmc_lines(DWCSDMMCState *d, unsigned slot,
+                                DWCSDMMCLines *l)
+{
+    ESP32P4SdmmcState *s = ESP32P4_SDMMC(d);
+    ESP32P4GpioState *g = s->gpio;
+
+    if (!g) {
+        return;
+    }
+    l->to_card = 0;
+    l->to_host = 0;
+    l->host_level = 0;
+    l->card_level = 0;
+    for (unsigned i = 0; i < DWC_SDMMC_LINES; i++) {
+        int pad = esp32p4_sdmmc_card_pad(s, slot, i);
+        uint16_t bit = 1u << i;
+        bool on = false, off = false, off_level, in, level;
+
+        if (pad >= 0) {
+            esp32p4_gpio_pad_out_path(g, pad, slot ? (int)i : -1,
+                                      ESP32P4_SDMMC_SLOT0_FUNC, &on, &off,
+                                      &off_level);
+            l->to_card |= on ? bit : 0;
+            l->card_level |= esp32p4_gpio_pad_level(g, pad) ? bit : 0;
+        }
+        if (bit == DWC_SDMMC_LINE_CLK) {
+            continue;
+        }
+        if (slot == 0) {
+            in = pad >= 0 &&
+                 esp32p4_gpio_iomux_in_selected(g, pad,
+                                                ESP32P4_SDMMC_SLOT0_FUNC);
+            level = esp32p4_gpio_iomux_in_level(g, slot0_pads[i],
+                                                ESP32P4_SDMMC_SLOT0_FUNC);
+        } else {
+            in = pad >= 0 && esp32p4_gpio_sig_in_pad(g, i) == pad &&
+                 !esp32p4_gpio_sig_in_inverted(g, i);
+            level = esp32p4_gpio_sig_in_level(g, i);
+        }
+        l->to_host |= in && !off ? bit : 0;
+        l->host_level |= level ? bit : 0;
+    }
+}
+
+/* [spec:nuos:req:emu.esp32p4.sdmmc] */
+/* The routing changed: the controller follows the pads as they now are. */
+static void esp32p4_sdmmc_route_changed(Notifier *n, void *data)
+{
+    ESP32P4SdmmcState *s = container_of(n, ESP32P4SdmmcState,
+                                        route_notifier);
+
+    dwc_sdmmc_lines_changed(DWC_SDMMC(s));
+}
+
+/*
+ * The pads are about to change, or are sampled: the controller first
+ * takes its events due by then, as the pads were.
+ */
+static void esp32p4_sdmmc_line_sync(Notifier *n, void *data)
+{
+    ESP32P4SdmmcState *s = container_of(n, ESP32P4SdmmcState, line_source);
+
+    dwc_sdmmc_catch_up(DWC_SDMMC(s));
 }
 
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */
@@ -197,6 +332,12 @@ static void esp32p4_sdmmc_init(Object *obj)
     s->sam_clk = qdev_init_clock_in(DEVICE(obj), "sam",
                                     esp32p4_sdmmc_clock_update, s,
                                     ClockPreUpdate | ClockUpdate);
+    qdev_init_gpio_out_named(DEVICE(obj), s->pad_out, ESP32P4_SDMMC_PAD_OUT,
+                             DWC_SDMMC_MAX_SLOTS * DWC_SDMMC_LINES);
+    qdev_init_gpio_out_named(DEVICE(obj), s->pad_oe, ESP32P4_SDMMC_PAD_OE,
+                             DWC_SDMMC_MAX_SLOTS * DWC_SDMMC_LINES);
+    s->route_notifier.notify = esp32p4_sdmmc_route_changed;
+    s->line_source.notify = esp32p4_sdmmc_line_sync;
     d->num_slots = 2;
     d->fifo_depth = 512;
     d->cmd_mask = 0xb0ffffff;
@@ -218,10 +359,29 @@ static void esp32p4_sdmmc_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "%s: the pms link is not set", TYPE_ESP32P4_SDMMC);
         return;
     }
+    if (s->slot0_dat_lines > 8) {
+        error_setg(errp, "%s: slot0-dat-lines %u is more than 8",
+                   TYPE_ESP32P4_SDMMC, s->slot0_dat_lines);
+        return;
+    }
     d->dma_as = esp32p4_pms_bus_as(s->pms);
     d->dma_attrs = esp32p4_dma_attrs(ESP32P4_DMA_MASTER_SDMMC,
                                      ESP32P4_ICM_ID_SDMMC);
     DWC_SDMMC_GET_CLASS(d)->parent_realize(dev, errp);
+    if (s->gpio) {
+        esp32p4_gpio_add_route_notifier(s->gpio, &s->route_notifier);
+        esp32_line_add_source(&s->line_source);
+    }
+}
+
+static void esp32p4_sdmmc_unrealize(DeviceState *dev)
+{
+    ESP32P4SdmmcState *s = ESP32P4_SDMMC(dev);
+
+    if (s->gpio) {
+        notifier_remove(&s->route_notifier);
+        notifier_remove(&s->line_source);
+    }
 }
 
 static void esp32p4_sdmmc_reset_hold(Object *obj, ResetType type)
@@ -235,6 +395,35 @@ static void esp32p4_sdmmc_reset_hold(Object *obj, ResetType type)
     }
     s->dll_clk_conf = 0;
     s->dll_conf = 0;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * The lines between transfers, as the pads see them: CMD and DAT
+ * released to the board's pull-ups, and SDCLK low, its enable off, as the
+ * IO MUX's GPIO43 is high impedance from reset (table 10.14-1); slot 1's
+ * SDCLK has no enable of its own (1'd1 in the matrix, table 10.12-1),
+ * and drives its pad low wherever the matrix routes it. The transfers
+ * themselves are above single pad transitions (hw/sd/dwc_sdmmc.c).
+ */
+static void esp32p4_sdmmc_reset_exit(Object *obj, ResetType type)
+{
+    ESP32P4SdmmcState *s = ESP32P4_SDMMC(obj);
+    ResettableClass *prc = RESETTABLE_CLASS(
+        object_class_get_parent(object_get_class(obj)));
+
+    if (prc->phases.exit) {
+        prc->phases.exit(obj, type);
+    }
+    for (unsigned slot = 0; slot < DWC_SDMMC_MAX_SLOTS; slot++) {
+        for (unsigned i = 0; i < DWC_SDMMC_LINES; i++) {
+            unsigned n = slot * DWC_SDMMC_LINES + i;
+            bool clk = (1u << i) == DWC_SDMMC_LINE_CLK;
+
+            qemu_set_irq(s->pad_out[n], !clk);
+            qemu_set_irq(s->pad_oe[n], 0);
+        }
+    }
 }
 
 static const VMStateDescription vmstate_esp32p4_sdmmc = {
@@ -257,8 +446,26 @@ static const Property esp32p4_sdmmc_properties[] = {
                      ESP32P4PmsState *),
     DEFINE_PROP_LINK("clkrst", ESP32P4SdmmcState, clkrst,
                      TYPE_ESP32P4_CLKRST, ESP32P4ClkRstState *),
+    DEFINE_PROP_LINK("gpio", ESP32P4SdmmcState, gpio, TYPE_ESP32P4_GPIO,
+                     ESP32P4GpioState *),
     DEFINE_PROP_UINT32("board-delay-ps", ESP32P4SdmmcState, board_delay_ps,
                        4000),
+    DEFINE_PROP_UINT8("slot0-dat-lines", ESP32P4SdmmcState, slot0_dat_lines,
+                      4),
+    DEFINE_PROP_UINT8("slot1-pad-clk", ESP32P4SdmmcState, slot1_pad[0], 18),
+    DEFINE_PROP_UINT8("slot1-pad-cmd", ESP32P4SdmmcState, slot1_pad[1], 19),
+    DEFINE_PROP_UINT8("slot1-pad-d0", ESP32P4SdmmcState, slot1_pad[2], 14),
+    DEFINE_PROP_UINT8("slot1-pad-d1", ESP32P4SdmmcState, slot1_pad[3], 15),
+    DEFINE_PROP_UINT8("slot1-pad-d2", ESP32P4SdmmcState, slot1_pad[4], 16),
+    DEFINE_PROP_UINT8("slot1-pad-d3", ESP32P4SdmmcState, slot1_pad[5], 17),
+    DEFINE_PROP_UINT8("slot1-pad-d4", ESP32P4SdmmcState, slot1_pad[6],
+                      ESP32P4_SDMMC_NO_PAD),
+    DEFINE_PROP_UINT8("slot1-pad-d5", ESP32P4SdmmcState, slot1_pad[7],
+                      ESP32P4_SDMMC_NO_PAD),
+    DEFINE_PROP_UINT8("slot1-pad-d6", ESP32P4SdmmcState, slot1_pad[8],
+                      ESP32P4_SDMMC_NO_PAD),
+    DEFINE_PROP_UINT8("slot1-pad-d7", ESP32P4SdmmcState, slot1_pad[9],
+                      ESP32P4_SDMMC_NO_PAD),
 };
 
 static void esp32p4_sdmmc_class_init(ObjectClass *klass, const void *data)
@@ -269,14 +476,17 @@ static void esp32p4_sdmmc_class_init(ObjectClass *klass, const void *data)
 
     device_class_set_parent_realize(dc, esp32p4_sdmmc_realize,
                                     &sc->parent_realize);
+    dc->unrealize = esp32p4_sdmmc_unrealize;
     dc->vmsd = &vmstate_esp32p4_sdmmc;
     device_class_set_props(dc, esp32p4_sdmmc_properties);
     rc->phases.hold = esp32p4_sdmmc_reset_hold;
+    rc->phases.exit = esp32p4_sdmmc_reset_exit;
     sc->vendor_read = esp32p4_sdmmc_vendor_read;
     sc->vendor_write = esp32p4_sdmmc_vendor_write;
     sc->cclk_period = esp32p4_sdmmc_cclk_period;
     sc->clock_after = esp32p4_sdmmc_clock_after;
     sc->sample_ok = esp32p4_sdmmc_sample_ok;
+    sc->lines = esp32p4_sdmmc_lines;
 }
 
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */

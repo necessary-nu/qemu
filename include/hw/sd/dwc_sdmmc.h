@@ -66,6 +66,35 @@ OBJECT_DECLARE_TYPE(DWCSDMMCState, DWCSDMMCClass, DWC_SDMMC)
 #define DWC_SDMMC_VOLT_REG          "volt-reg"
 #define DWC_SDMMC_PAD_MV            "pad-mv"
 
+/*
+ * A slot's lines, as bits: CLK, CMD, and DAT0 to DAT7.
+ */
+#define DWC_SDMMC_LINE_CLK      0x001
+#define DWC_SDMMC_LINE_CMD      0x002
+#define DWC_SDMMC_LINE_DAT(n)   (0x004 << (n))
+#define DWC_SDMMC_LINES         10
+#define DWC_SDMMC_LINES_ALL     0x3ff
+
+/*
+ * How a slot's lines join the host to its card through the pads between
+ * them, as an integration has them set up (the class's lines()):
+ *   to_card: the lines on which the host's output, while it drives it,
+ *     reaches the card's pin (CLK, CMD, DAT);
+ *   to_host: the lines on which the card's output reaches the host's
+ *     input (CMD, DAT), nothing else driving the pad while the host does
+ *     not;
+ *   host_level: on the lines not in to_host, the level the host's input
+ *     reads throughout;
+ *   card_level: on the lines not in to_card, the level the card's pin
+ *     sees.
+ */
+typedef struct DWCSDMMCLines {
+    uint16_t to_card;
+    uint16_t to_host;
+    uint16_t host_level;
+    uint16_t card_level;
+} DWCSDMMCLines;
+
 /* An integration's own registers, at 0x800 up, for a subclass to decode. */
 struct DWCSDMMCClass {
     SysBusDeviceClass parent_class;
@@ -99,6 +128,13 @@ struct DWCSDMMCClass {
      * matter deciding it (dwc_sdmmc_card_div() gives the card clock).
      */
     bool (*sample_ok)(DWCSDMMCState *s, unsigned slot, bool dat);
+    /*
+     * Slot @slot's lines as the pads between the host and its card join
+     * them; by default (NULL) every line joins them. An integration whose
+     * pads software sets up tells the controller of each change with
+     * dwc_sdmmc_lines_changed().
+     */
+    void (*lines)(DWCSDMMCState *s, unsigned slot, DWCSDMMCLines *l);
 };
 
 /* The command the CIU has on the bus, or is about to take. */
@@ -282,6 +318,14 @@ struct DWCSDMMCState {
     uint8_t shift_carry;
     /* How the host samples the read chunk on the bus (dwc_rx_fault()) */
     uint32_t chunk_fault;
+    /*
+     * The read chunk's DAT lines whose input does not follow the card, a
+     * bit per line, and the levels those read.
+     */
+    uint8_t chunk_stuck;
+    uint8_t chunk_level;
+    /* The write block on the bus fails the card's CRC check. */
+    bool blk_card_crc;
 
     /* The FIFO, a byte ring */
     uint8_t fifo[DWC_SDMMC_MAX_FIFO_WORDS * 4];
@@ -321,5 +365,12 @@ uint64_t dwc_sdmmc_card_div(DWCSDMMCState *s, unsigned slot);
  * at the present: the controller sees the card as it was up to then.
  */
 void dwc_sdmmc_set_card_power(DWCSDMMCState *s, unsigned slot, bool on);
+
+/*
+ * The pads between the host and its cards changed at the present (the
+ * class's lines() now answers otherwise): the card clocks, a command
+ * waiting for DAT0 and the voltage switch follow.
+ */
+void dwc_sdmmc_lines_changed(DWCSDMMCState *s);
 
 #endif /* DWC_SDMMC_H */

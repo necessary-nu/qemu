@@ -121,8 +121,12 @@
  *     outputs matrix signals 126 to 131 and 146 to 148. A card on slot N
  *     is -drive if=sd,index=N, or -device sd-card,bus=sd-busN: the
  *     board's microSD socket is slot 0, on the IO MUX pads GPIO39 to
- *     GPIO44; slot 1 is where the board's ESP32-C6 sits, as an SDIO
- *     slave, and has no card unless given one:
+ *     GPIO44 (SD1_*, function 0); slot 1 is where the board's ESP32-C6
+ *     sits, as an SDIO slave, on GPIO14 to GPIO19 through the GPIO
+ *     matrix, and has no card unless given one. A card answers only
+ *     through pads set up as the hardware needs them: their function, the
+ *     matrix's routing both ways, input enables, output enables, the
+ *     pulls, the board's 51 kOhm pull-ups (hw/sd/esp32p4_sdmmc.c):
  *
  *       -drive if=sd,index=0,format=raw,file=sd.img
  *
@@ -2186,18 +2190,34 @@ static void esp32p4_init_emac(ESP32P4MachineState *s)
  * GPIO48 and so of SDMMC slot 0's IO MUX pins (CLK GPIO43, CMD GPIO44,
  * D0 to D3 GPIO39 to GPIO42, as the board's microSD socket has them),
  * from ESP_LDO_VO4, the PMU's regulator VO4, which also takes the
- * slot's 51 kOhm pull-ups; the SD/MMC host's UHS_REG.VOLT_REG bits are
- * the regulators' mode inputs SDMMC_0 and SDMMC_1. Slot 1's pads, which
- * the GPIO matrix routes, are on the board's 3.3 V.
+ * slot's 51 kOhm pull-ups (R5 to R9 on CMD and D0 to D3; CLK has none):
+ * with VO4 off they hold those pads to ground. The SD/MMC host's
+ * UHS_REG.VOLT_REG bits are the regulators' mode inputs SDMMC_0 and
+ * SDMMC_1 (hw/misc/esp32p4_pmu.c). Slot 1's pads, which the GPIO matrix
+ * routes, are on the board's 3.3 V.
  */
 static void esp32p4_sd_supply_update(ESP32P4MachineState *s);
+
+static const uint8_t esp32p4_sd_pulled_pads[] = { 44, 39, 40, 41, 42 };
 
 static void esp32p4_sd_pads(void *opaque, int n, int mv)
 {
     ESP32P4MachineState *s = opaque;
+    DeviceState *gpio = DEVICE(&s->gpio);
 
     qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->sdmmc), DWC_SDMMC_PAD_MV,
                                         0), mv);
+    for (unsigned i = 0; i < ARRAY_SIZE(esp32p4_sd_pulled_pads); i++) {
+        unsigned pad = esp32p4_sd_pulled_pads[i];
+
+        qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_BOARD_PULL_UP,
+                                            pad),
+                     mv > 0 ? ESP32P4_BOARD_SD_PULL_UP : 0);
+        qemu_set_irq(qdev_get_gpio_in_named(gpio,
+                                            ESP32P4_GPIO_BOARD_PULL_DOWN,
+                                            pad),
+                     mv > 0 ? 0 : ESP32P4_BOARD_SD_PULL_UP);
+    }
     esp32p4_sd_supply_update(s);
 }
 
@@ -2205,6 +2225,8 @@ static void esp32p4_init_sd_power(ESP32P4MachineState *s)
 {
     DeviceState *pmu = DEVICE(&s->pmu), *sd = DEVICE(&s->sdmmc);
 
+    /* VO4 is off until software powers it. */
+    esp32p4_sd_pads(s, 0, 0);
     qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LDO_MV,
                                 ESP32P4_BOARD_SD_PAD_LDO - 1,
                                 qemu_allocate_irq(esp32p4_sd_pads, s, 0));
@@ -2260,10 +2282,19 @@ static void esp32p4_sd_supply(void *opaque, int n, int level)
  * inputs and outputs are GPIO matrix signals: SD_CARD_DETECT_N_1 and _2,
  * SD_CARD_INT_N_1 and _2, SD_CARD_WRITE_PRT_1 and _2 in, SD_RST_N_1 and _2
  * and SD_CCMD_OD_PULLUP_EN_N out (slot 0 is the matrix's card 1).
+ *
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * The cards' lines go through the pads (hw/sd/esp32p4_sdmmc.c): slot 0's
+ * the IO MUX functions SD1_* of GPIO39 to GPIO48, slot 1's the matrix
+ * signals 0 to 9, SD_CARD_CCLK_2 to SD_CARD_CDATA7_2, the host's idle
+ * levels driven onto them; the microSD socket on slot 0's pads, slot 1's
+ * card where the ESP32-C6 is, on GPIO14 to GPIO19, with its pull-ups.
  */
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */
 static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
 {
+    static const uint8_t slot0_pads[DWC_SDMMC_LINES] =
+        ESP32P4_SDMMC_SLOT0_PADS;
     DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
     DeviceState *dev;
     ESP32P4ClkRstGate *g;
@@ -2275,6 +2306,8 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
     object_property_set_link(OBJECT(dev), "pms", OBJECT(&s->pms),
                              &error_abort);
     object_property_set_link(OBJECT(dev), "clkrst", OBJECT(&s->clkrst),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "gpio", OBJECT(&s->gpio),
                              &error_abort);
     qdev_connect_clock_in(dev, "hclk",
                           qdev_get_clock_out(clkrst, "sdmmc-sys"));
@@ -2306,6 +2339,32 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
         qdev_connect_gpio_out_named(dev, DWC_SDMMC_CARD_RST_N, slot,
             qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
                                    ESP32P4_SIG_SD_RST_N_1_PAD_OUT + slot));
+        for (unsigned i = 0; i < DWC_SDMMC_LINES; i++) {
+            unsigned n = slot * DWC_SDMMC_LINES + i;
+
+            if (slot == 0) {
+                unsigned line = ESP32P4_GPIO_IOMUX_LINE(slot0_pads[i],
+                                    ESP32P4_SDMMC_SLOT0_FUNC);
+
+                qdev_connect_gpio_out_named(dev, ESP32P4_SDMMC_PAD_OUT, n,
+                    qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_IOMUX_OUT,
+                                           line));
+                qdev_connect_gpio_out_named(dev, ESP32P4_SDMMC_PAD_OE, n,
+                    qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_IOMUX_OE,
+                                           line));
+            } else {
+                qdev_connect_gpio_out_named(dev, ESP32P4_SDMMC_PAD_OUT, n,
+                    qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
+                                           ESP32P4_SIG_SD_CARD_CCLK_2_PAD_OUT
+                                           + i));
+                /* SD_CARD_CCLK_2's enable is 1'd1 (table 10.12-1). */
+                if (i) {
+                    qdev_connect_gpio_out_named(dev, ESP32P4_SDMMC_PAD_OE,
+                        n, qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OE,
+                               ESP32P4_SIG_SD_CARD_CCLK_2_PAD_OUT + i));
+                }
+            }
+        }
 
         /* The card resets at power-on only, not with the controller. */
         qbus_set_reset_domain(bus);
@@ -2323,6 +2382,25 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
             }
             qdev_realize_and_unref(card, bus, &error_fatal);
         }
+        /*
+         * [spec:nuos:req:emu.esp32p4.gpio]
+         * A card in slot 1 stands where the ESP32-C6 is, and with it the
+         * board's pull-ups on its lines (R15 to R21, to ESP_3V3); with
+         * the C6 not modelled, those pads otherwise serve the machine's
+         * other uses (the serial ports on GPIO16 to GPIO19).
+         */
+        if (slot == 1 && dinfo) {
+            ESP32P4SdmmcState *sd = &s->sdmmc;
+
+            for (unsigned i = 0; i < DWC_SDMMC_LINES; i++) {
+                if (sd->slot1_pad[i] < ESP32P4_GPIO_PADS) {
+                    qemu_set_irq(qdev_get_gpio_in_named(gpio,
+                                     ESP32P4_GPIO_BOARD_PULL_UP,
+                                     sd->slot1_pad[i]),
+                                 ESP32P4_BOARD_SD_PULL_UP);
+                }
+            }
+        }
     }
     qdev_connect_gpio_out_named(dev, DWC_SDMMC_CCMD_OD_PULLUP_EN_N, 0,
         qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
@@ -2330,6 +2408,11 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
     qdev_connect_gpio_out_named(gpio, ESP32P4_GPIO_PAD_DRIVE_HIGH,
                                 ESP32P4_BOARD_SD_POWER_PAD,
                                 qemu_allocate_irq(esp32p4_sd_supply, s, 0));
+    /* [spec:nuos:req:emu.esp32p4.gpio] */
+    /* R27, the supply switch's gate pull-down, on GPIO45 */
+    qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_BOARD_PULL_DOWN,
+                                        ESP32P4_BOARD_SD_POWER_PAD),
+                 ESP32P4_BOARD_SD_POWER_PULL_DOWN);
 }
 
 /*
