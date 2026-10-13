@@ -108,6 +108,9 @@ struct ESP32P4AnaState {
     ESP32P4ClkEdges ref_edges[ESP32P4_ANA_NUM_PLLS];
     QEMUTimer *lock_timer[ESP32P4_ANA_NUM_PLLS];
     QEMUTimer *cal_timer[ESP32P4_ANA_NUM_PLLS];
+    /* When each PLL locks, and its calibration ends, while they run. */
+    int64_t lock_due[ESP32P4_ANA_NUM_PLLS];
+    int64_t cal_due[ESP32P4_ANA_NUM_PLLS];
     ESP32P4AnaPllTimer timer_ctx[ESP32P4_ANA_NUM_PLLS];
 };
 
