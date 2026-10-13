@@ -311,12 +311,42 @@ static void tsens_xpd_done(void *opaque)
     tsens_schedule(s, when);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.analog]
+ * Take the power-up wait's end and the monitor's sample due by @now, in
+ * time order, each at its own time: without icount their timers can run
+ * well after, while software polls CTRL's READY, as ESP-IDF does after
+ * powering the sensor up, or reads INT_RAW and OVER_UPPER_TH. A sample
+ * taken late skips the ones the host has missed, as its timer does.
+ */
+static void tsens_catch_up(ESP32P4TsensState *s, int64_t now)
+{
+    for (;;) {
+        int64_t xpd = timer_pending(&s->xpd_wait.timer) ?
+                      esp32p4_clkwait_end(&s->xpd_wait) : INT64_MAX;
+        int64_t smp = timer_pending(&s->sample_timer) ? s->next_ns
+                                                      : INT64_MAX;
+
+        if (MIN(xpd, smp) > now) {
+            return;
+        }
+        if (xpd <= smp) {
+            timer_del(&s->xpd_wait.timer);
+            esp32_line_run_at(xpd, tsens_xpd_done, s);
+        } else {
+            timer_del(&s->sample_timer);
+            esp32_line_run_at(smp, tsens_sample, s);
+        }
+    }
+}
+
 static uint64_t tsens_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4TsensState *s = opaque;
     hwaddr reg = addr & ~3;
     uint32_t v;
 
+    tsens_catch_up(s, esp32_line_time());
     if (reg >= ESP32P4_TSENS_NREGS * 4) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of reserved offset 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_TSENS, addr);
@@ -354,6 +384,7 @@ static void tsens_write(void *opaque, hwaddr addr, uint64_t value,
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t *r, old, rw;
 
+    tsens_catch_up(s, now);
     if (reg >= ESP32P4_TSENS_NREGS * 4) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write of reserved offset 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_TSENS, addr);
@@ -435,6 +466,7 @@ static void tsens_etm_task(void *opaque, int n, int level)
     ESP32P4TsensState *s = opaque;
 
     if (level) {
+        tsens_catch_up(s, esp32_line_time() - 1);
         tsens_set_sampling(s, n == ESP32P4_TSENS_TASK_START_SAMPLE,
                            esp32_line_time());
     }
@@ -456,6 +488,7 @@ static void tsens_clk_update(void *opaque, ClockEvent event)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (event == ClockPreUpdate) {
+        tsens_catch_up(s, esp32_line_time() - 1);
         esp32p4_clkwait_fold(&s->xpd_wait, now);
         return;
     }
