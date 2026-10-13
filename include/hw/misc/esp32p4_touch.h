@@ -47,9 +47,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4TouchState, ESP32P4_TOUCH)
  *   - Named GPIO output ESP32P4_TOUCH_WAKEUP: the PMU's wakeup source 11,
  *     high while a channel whose output TOUCH_OUTEN enables, or the sleep
  *     channel, is touched.
+ *   - Named GPIO output ESP32P4_TOUCH_PAD_ANALOG [ESP32P4_TOUCH_SLOTS]:
+ *     line ch high while the sensor charges and discharges channel ch's
+ *     pad, GPIO(ch + 1), between its thresholds, for the GPIO block's
+ *     "pad-analog" input of that pad.
  *   - Sysbus IRQ 0: LP_TOUCH_INTR (interrupt matrix source 14).
  *   - Links: "lp-ana", LP_ANALOG_PERI, whose TOUCH_* registers configure
- *     the sensor; "pmu", whose PMU_TOUCH_PWR_CNTL configures its timer.
+ *     the sensor; "pmu", whose PMU_TOUCH_PWR_CNTL configures its timer;
+ *     "gpio", the GPIO block, whose pads' drivers and pulls load the
+ *     channels' pads (optional: without it the pads carry nothing but
+ *     their capacitance).
  *
  * Each pad's capacitance, in femtofarads, is a property, "ch1-ff" to
  * "ch14-ff" (GPIO2 to GPIO15), 10 pF by default, settable with -global
@@ -62,9 +69,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4TouchState, ESP32P4_TOUCH)
 #define ESP32P4_TOUCH_SLEEP         "sleep"
 #define ESP32P4_TOUCH_TIMER_UPDATE  "timer-update"
 #define ESP32P4_TOUCH_WAKEUP        "wakeup"
+#define ESP32P4_TOUCH_PAD_ANALOG    "pad-analog"
 
 typedef struct ESP32P4LPAnaState ESP32P4LPAnaState;
 typedef struct ESP32P4PMUState ESP32P4PMUState;
+typedef struct ESP32P4GpioState ESP32P4GpioState;
 
 /*
  * A channel's data, per frequency mode: the last count, the smoothed
@@ -98,17 +107,29 @@ typedef enum ESP32P4TouchFsmPhase {
     ESP32P4_TOUCH_FSM_MEAS,
 } ESP32P4TouchFsmPhase;
 
+/* Why a measurement gets no pulse, or that it does (_PULSES). */
+typedef enum ESP32P4TouchNoPulse {
+    ESP32P4_TOUCH_PULSES,
+    ESP32P4_TOUCH_NO_OUT_GATE,
+    ESP32P4_TOUCH_NO_XPD,
+    ESP32P4_TOUCH_PAD_DRIVEN,
+    ESP32P4_TOUCH_PAD_PULLED,
+} ESP32P4TouchNoPulse;
+
 struct ESP32P4TouchState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     qemu_irq irq;
     qemu_irq wakeup;
+    qemu_irq pad_analog[ESP32P4_TOUCH_SLOTS];
     Clock *fast;
     Clock *slow;
 
     ESP32P4LPAnaState *lp_ana;
     ESP32P4PMUState *pmu;
+    ESP32P4GpioState *gpio;
+    Notifier load_notifier;
 
     /* RTC_TOUCH's own state. */
     uint32_t int_raw;
@@ -147,6 +168,17 @@ struct ESP32P4TouchState {
     int64_t meas_end_ns;
     /* When the timer is due: the end, or the timeout. */
     int64_t meas_due_ns;
+    /*
+     * The pulses the measurement still waits for, in 2^-20ths, as of
+     * meas_seg_ns, since when they have come every meas_period_fs (0:
+     * none comes), and why none comes (ESP32P4TouchNoPulse).
+     */
+    uint64_t meas_left;
+    int64_t meas_seg_ns;
+    uint64_t meas_period_fs;
+    uint8_t meas_why;
+    /* The channel whose pad carries the sensor's sawtooth, or -1. */
+    int8_t analog_ch;
 
     /* The touch timer. */
     uint8_t timer_phase;

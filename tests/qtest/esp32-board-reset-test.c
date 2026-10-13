@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "esp32-sd-pins.h"
 
 #define DPORT_PERIP_CLK_EN      0x3ff000c0
 #define DPORT_PERIP_RST_EN      0x3ff000c4
@@ -339,11 +340,13 @@ static void test_flash(void)
 }
 
 /*
- * Clock the SD/MMC host and give card 1 its clock: the CIU's 80 MHz
- * divided by 2 * 2, handed to the CIU by a clock update.
+ * Set slot 1's pins up as ESP-IDF does (esp32-sd-pins.h), clock the SD/MMC
+ * host and give card 1 its clock: the CIU's 80 MHz divided by 2 * 2,
+ * handed to the CIU by a clock update.
  */
 static void sdmmc_setup(QTestState *qts)
 {
+    sd_pins(qts);
     qtest_writel(qts, DPORT_WIFI_CLK_EN,
                  qtest_readl(qts, DPORT_WIFI_CLK_EN) | WIFI_CLK_SDIO_HOST);
     qtest_writel(qts, DPORT_CORE_RST_EN,

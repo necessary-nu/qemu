@@ -35,7 +35,7 @@ enum {
 #define ESP32P4_GPIO_BASE       0x500e0000
 #define ESP32P4_GPIO_SIZE       0x1000
 #define ESP32P4_IO_MUX_BASE     0x500e1000
-/* IOMUX_MSPI_PIN, the flash and PSRAM pads' block, follows at 0x200. */
+/* IOMUX_MSPI_PIN follows at 0x200 (hw/gpio/esp32p4_mspi_iomux.c). */
 #define ESP32P4_IO_MUX_SIZE     0x200
 #define ESP32P4_LP_GPIO_BASE    0x5012a000
 #define ESP32P4_LP_GPIO_SIZE    0x1000
@@ -183,6 +183,18 @@ enum {
  *     pull-ups on GPIO25 and GPIO27. GPIO25's is high until driven: the
  *     USB Serial/JTAG controller pulls D+ up out of reset (table 10.14-1,
  *     reset "3*").
+ *   ESP32P4_GPIO_PAD_PHY, "pad-phy" (input): high while a USB full-speed
+ *     PHY has pad n (GPIO24 to GPIO27, its controller's USB_PAD_ENABLE):
+ *     the pad's own output driver is then off it, whatever drives it
+ *     through the GPIO matrix, the IO MUX or the sleep configuration;
+ *     its pulls and its input buffer stay as set. GPIO24's and GPIO25's
+ *     are high until driven: USB Serial/JTAG has its PHY's pads out of
+ *     reset (USB_SERIAL_JTAG_USB_PAD_ENABLE resets to 1).
+ *   ESP32P4_GPIO_PAD_ANALOG, "pad-analog" (input): high while an analog
+ *     block holds pad n between VIL and VIH: the touch sensor's sawtooth
+ *     on the pad of the channel it measures. Undriven, the pad's level is
+ *     then undefined: it reads low, logged as a guest error while its
+ *     input buffer is on.
  *   ESP32P4_GPIO_PAD_HOLD, "pad-hold" (input): pad n held, from
  *     HP_SYSTEM_GPIO_O_HOLD_CTRL*, LP_SYSTEM_REG_PAD_RTC_HOLD_CTRL* and the
  *     PMU's hold-all (TRM 10.9), ORed by whoever drives it. A held pad
@@ -254,6 +266,8 @@ enum {
 #define ESP32P4_GPIO_PAD_DRIVE_LOW  "pad-drive-low"
 #define ESP32P4_GPIO_RESET          "reset"
 #define ESP32P4_GPIO_PAD_PULL_UP    "pad-pull-up"
+#define ESP32P4_GPIO_PAD_PHY        "pad-phy"
+#define ESP32P4_GPIO_PAD_ANALOG     "pad-analog"
 #define ESP32P4_GPIO_BOARD_PULL_UP  "board-pull-up"
 #define ESP32P4_GPIO_BOARD_PULL_DOWN "board-pull-down"
 #define ESP32P4_GPIO_PAD_HOLD       "pad-hold"
@@ -398,6 +412,7 @@ struct ESP32P4GpioState {
     qemu_irq spi_boot_out;
     Notifier line_source;
     NotifierList route_notifiers;
+    NotifierList load_notifiers;
 
     uint32_t strap_mode;
 
@@ -483,6 +498,9 @@ struct ESP32P4GpioState {
     uint64_t ext_driven;
     uint64_t ext_level;
     uint64_t ext_pull_up;
+    /* The pads a USB PHY has, and those an analog block holds mid-rail */
+    uint64_t ext_phy;
+    uint64_t ext_analog;
     /* The board's pull resistors on each pad, ohms (0: none) */
     uint32_t board_pull_up[ESP32P4_GPIO_PADS];
     uint32_t board_pull_down[ESP32P4_GPIO_PADS];
@@ -560,6 +578,13 @@ struct ESP32P4GpioState {
     uint64_t pull_down_ns[ESP32P4_GPIO_PADS];
     uint64_t ie_mask;
     uint64_t undefined;
+    /*
+     * The pads whose output a USB PHY keeps off them while software
+     * enables it, and those whose input buffer sees an analog block's
+     * mid-rail level, as resolved, for their guest errors.
+     */
+    uint64_t phy_blocked;
+    uint64_t analog_undefined;
 };
 
 /*
@@ -652,5 +677,24 @@ bool esp32p4_gpio_sig_in_level(ESP32P4GpioState *s, unsigned sig);
 bool esp32p4_gpio_iomux_in_level(ESP32P4GpioState *s, unsigned n,
                                  unsigned func);
 bool esp32p4_gpio_pad_level(ESP32P4GpioState *s, unsigned n);
+
+/*
+ * The load on pad n as an analog block that drives it sees it, as the
+ * last resolution left it: whether a digital driver holds the pad (its
+ * own, an outside one, or one on its board wire), and at what *level;
+ * if not, the conductances, in nS, of every pull on it (and on its wire)
+ * to its supply, *up_ns, and to ground, *down_ns: its own, other blocks'
+ * and the board's.
+ */
+bool esp32p4_gpio_pad_load(ESP32P4GpioState *s, unsigned n, bool *level,
+                           uint64_t *up_ns, uint64_t *down_ns);
+
+/*
+ * Notifier n is told of each change to the load on any pad, in the
+ * resolution that makes it (at esp32_line_time()), with a pointer to a
+ * uint64_t mask of the pads whose load changed: for an analog block whose
+ * measurement runs while the pad's drivers and pulls change.
+ */
+void esp32p4_gpio_add_load_notifier(ESP32P4GpioState *s, Notifier *n);
 
 #endif

@@ -28,6 +28,7 @@
 #include "hw/dma/esp32p4_gdma.h"
 #include "hw/dma/esp32p4_uhci.h"
 #include "hw/gpio/esp32p4_gpio.h"
+#include "hw/gpio/esp32p4_mspi_iomux.h"
 #include "hw/i2c/esp32p4_i2c.h"
 #include "hw/i2c/i2c_wire_bus.h"
 #include "hw/i3c/esp32p4_i3c.h"
@@ -349,6 +350,7 @@ struct ESP32P4MachineState {
 
     ESP32P4MSPIState flash_mspi;
     ESP32P4MSPIState psram_mspi;
+    ESP32P4MspiIomuxState mspi_iomux;
     /* HP_SYSTEM_CRYPTO_CTRL's enables, to the flash's and PSRAM's MSPI. */
     SplitIRQ crypto_split[ESP32P4_HP_SYS_CRYPTO_CTRL_LINES];
     MemoryRegion flash_window_alias;

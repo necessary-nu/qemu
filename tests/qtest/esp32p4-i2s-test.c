@@ -166,6 +166,8 @@
 #define IO_MUX_GPIO(n)      (0x500e1004 + 4 * (n))
 #define FUN_IE              (1u << 9)
 #define MCU_SEL_GPIO        (1u << 12)
+#define USJ_CONF0           0x500d2018u
+#define USJ_PAD_ENABLE      (1u << 14)
 #define LP_GPIO_FUNC_IN(s)  (0x5012a074 + 4 * (s))
 #define LP_SIG_IN_SEL       (1u << 1)
 
@@ -288,9 +290,17 @@ static uint32_t i2s_r(QTestState *qts, int n, uint32_t reg)
     return qtest_readl(qts, I2S(n) + reg);
 }
 
-/* Pad @pad, its input enabled, driven by output signal @out_sig. */
+/*
+ * Pad @pad, its input enabled, driven by output signal @out_sig; GPIO24
+ * and GPIO25 taken from the USB Serial/JTAG PHY first, which has them from
+ * reset, as ESP-IDF's gpio_ll_func_sel() does.
+ */
 static void pad_out(QTestState *qts, int pad, int out_sig)
 {
+    if (pad == 24 || pad == 25) {
+        qtest_writel(qts, USJ_CONF0,
+                     qtest_readl(qts, USJ_CONF0) & ~USJ_PAD_ENABLE);
+    }
     qtest_writel(qts, IO_MUX_GPIO(pad), MCU_SEL_GPIO | FUN_IE);
     qtest_writel(qts, GPIO_FUNC_OUT(pad), out_sig);
 }

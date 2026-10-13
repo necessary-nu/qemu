@@ -33,9 +33,17 @@
  * and low at 0.25 or less (VIL); between the two, a pull-down against a
  * pull-up of like strength (a pad's own 45 kOhm pull-down against a board's
  * 51 kOhm pull-up rests at 0.47), the level is undefined: it reads low,
- * logged as a guest error. A pad with no pull floats, and reads low. Its
+ * logged as a guest error. A pad with no pull floats, and reads low. A pad
+ * an analog block holds between VIL and VIH while no digital driver
+ * drives it (the touch sensor's sawtooth on the pad of the channel it
+ * measures, "pad-analog") is undefined too. Its
  * input buffer delivers that level while its input is enabled, and low
- * otherwise. GPIO0 to GPIO15 belong to the HP IO MUX unless
+ * otherwise. While a USB full-speed PHY has one of its pads, GPIO24 to
+ * GPIO27 ("pad-phy", the controller's USB_PAD_ENABLE), the pad's own
+ * output driver is off it: a GPIO output enabled there drives nothing,
+ * logged as a guest error, as ESP-IDF's gpio_ll_func_sel() clears
+ * USB_PAD_ENABLE before it gives those pads an IO MUX function. GPIO0 to
+ * GPIO15 belong to the HP IO MUX unless
  * LP_IOMUX_PADn_MUX_SEL hands them to the LP IO MUX, whose register then
  * gives the pad's function, pulls, input enable and open drain, its
  * output coming from the LP GPIO matrix; either way the one input buffer
@@ -720,7 +728,8 @@ static uint64_t i3c_pull_ns(uint32_t mux)
 
 /*
  * What controls a pad: its output driver's level and enable, its own
- * pulls (their conductances, nS) and its input enable.
+ * pulls (their conductances, nS) and its input enable; and whether a USB
+ * PHY keeps the output software enables off the pad.
  */
 typedef struct PadCtl {
     bool val;
@@ -729,6 +738,7 @@ typedef struct PadCtl {
     uint64_t pull_up;
     uint64_t pull_down;
     bool ie;
+    bool phy_blocked;
 } PadCtl;
 
 /*
@@ -777,8 +787,8 @@ static int lp_pad_drive(ESP32P4GpioState *s, unsigned n, bool *val_out,
  * the pad itself, enable and all (ESP-IDF's gpio_ll: "otherwise the oe
  * can only be controlled by peripheral").
  */
-static int pad_drive(ESP32P4GpioState *s, unsigned n, bool *val_out,
-                     bool *oe_out)
+static int pad_drive_cfg(ESP32P4GpioState *s, unsigned n, bool *val_out,
+                         bool *oe_out)
 {
     bool val = false, oe_p = false, oe = false;
     uint32_t cfg;
@@ -834,10 +844,31 @@ static int pad_drive(ESP32P4GpioState *s, unsigned n, bool *val_out,
 
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
+ * [spec:nuos:req:emu.esp32p4.usb]
+ * The drive of pad n as it reaches the pad: none while a USB PHY has it,
+ * whose own transceiver then drives it (see the top of the file).
+ */
+static int pad_drive(ESP32P4GpioState *s, unsigned n, bool *val_out,
+                     bool *oe_out)
+{
+    int sig = pad_drive_cfg(s, n, val_out, oe_out);
+
+    if (n < ESP32P4_GPIO_PADS && bit64(s->ext_phy, n)) {
+        *val_out = false;
+        *oe_out = false;
+        return -1;
+    }
+    return sig;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
  * Everything that controls pad n but its hold, with the sleep
  * configuration of TRM table 10.8-1 in light sleep: IO_MUX_GPIOn_MCU_*
  * (or LP_IOMUX_PADn_SLP_IE and _OE) in place of the normal input enable,
- * output enable and pulls, for a pad with SLP_SEL set.
+ * output enable and pulls, for a pad with SLP_SEL set. A USB PHY that has
+ * the pad keeps the output enable off it, whichever configuration gives
+ * it.
  */
 static void pad_ctl(ESP32P4GpioState *s, unsigned n, PadCtl *c)
 {
@@ -845,7 +876,8 @@ static void pad_ctl(ESP32P4GpioState *s, unsigned n, PadCtl *c)
     uint64_t i3c_pu;
     bool wpu, wpd;
 
-    pad_drive(s, n, &c->val, &c->oe);
+    pad_drive_cfg(s, n, &c->val, &c->oe);
+    c->phy_blocked = false;
     if (lp_owned(s, n)) {
         uint32_t pad = s->lp_pad[n];
 
@@ -874,6 +906,10 @@ static void pad_ctl(ESP32P4GpioState *s, unsigned n, PadCtl *c)
     }
     c->pull_up = (wpu ? PULL_WEAK_NS : 0) + i3c_pu;
     c->pull_down = wpd ? PULL_WEAK_NS : 0;
+    if (bit64(s->ext_phy, n)) {
+        c->phy_blocked = c->oe;
+        c->oe = false;
+    }
 }
 
 /* Whether pad n's own driver drives it, and *level at what. */
@@ -921,15 +957,19 @@ static bool pull_level(uint64_t up, uint64_t down, bool *undefined)
  * blocks and of the board are not the pad's, and are not held. Pads the
  * board wires together ("pad-wires") share one level: low while any of
  * them is driven low, from outside or by its own driver; else high while
- * any is driven high; else as the pulls of all of them give it.
+ * any is driven high; else undefined while an analog block holds one of
+ * them mid-rail; else as the pulls of all of them give it. *load_out
+ * gets the pads whose drivers or pulls change, with their wires.
  */
 static void resolve(ESP32P4GpioState *s, uint64_t dirty, bool all,
                     uint64_t *pad_out, uint64_t *raw_out,
-                    uint64_t *drv_high_out, uint64_t *drv_low_out)
+                    uint64_t *drv_high_out, uint64_t *drv_low_out,
+                    uint64_t *load_out)
 {
     uint64_t pad, nets = 0, ie_mask = s->ie_mask;
     uint64_t drv_low = s->drive_low, drv_high = s->drive_high;
-    uint64_t held = s->held, undefined = 0;
+    uint64_t held = s->held, undefined = 0, analog = 0, load = 0;
+    uint64_t phy_blocked = s->phy_blocked;
 
     if (all) {
         held = (s->ext_hold | s->lp_pad_hold) & PAD_MASK;
@@ -973,6 +1013,7 @@ static void resolve(ESP32P4GpioState *s, uint64_t dirty, bool all,
             up = c.pull_up;
             down = c.pull_down;
             ie = c.ie;
+            phy_blocked = deposit64(phy_blocked, n, 1, c.phy_blocked);
         }
         if (bit64(s->ext_pull_up, n)) {
             up += PULL_STRONG_NS;
@@ -988,6 +1029,12 @@ static void resolve(ESP32P4GpioState *s, uint64_t dirty, bool all,
             drive = true;
             val = bit64(s->ext_level, n);
         }
+        if (bit64(drv_high, n) != (drive && val) ||
+            bit64(drv_low, n) != (drive && !val) ||
+            s->pull_up_ns[n] != (drive ? 0 : up) ||
+            s->pull_down_ns[n] != (drive ? 0 : down)) {
+            load |= s->routes.wire_net[n] | BIT_ULL(n);
+        }
         drv_high = deposit64(drv_high, n, 1, drive && val);
         drv_low = deposit64(drv_low, n, 1, drive && !val);
         s->pull_up_ns[n] = drive ? 0 : up;
@@ -995,6 +1042,12 @@ static void resolve(ESP32P4GpioState *s, uint64_t dirty, bool all,
         ie_mask = deposit64(ie_mask, n, 1, ie);
         nets |= s->routes.wire_net[n];
     }
+    for (uint64_t m = phy_blocked & ~s->phy_blocked; m; m &= m - 1) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: GPIO%u's output is enabled while "
+                      "a USB PHY has the pad (USB_PAD_ENABLE); it drives "
+                      "nothing\n", TYPE_ESP32P4_GPIO, ctz64(m));
+    }
+    s->phy_blocked = phy_blocked;
     pad = s->pad_level & ~nets;
     for (uint64_t m = nets; m; m &= m - 1) {
         unsigned n = ctz64(m);
@@ -1011,6 +1064,9 @@ static void resolve(ESP32P4GpioState *s, uint64_t dirty, bool all,
             level = false;
         } else if (drv_high & net) {
             level = true;
+        } else if (s->ext_analog & net) {
+            level = false;
+            analog |= BIT_ULL(n);
         } else {
             uint64_t up = 0, down = 0;
 
@@ -1028,13 +1084,22 @@ static void resolve(ESP32P4GpioState *s, uint64_t dirty, bool all,
                       "VIL and VIH, at an undefined level; it reads low\n",
                       TYPE_ESP32P4_GPIO, ctz64(m));
     }
+    analog &= ie_mask;
+    for (uint64_t m = analog & nets & ~s->analog_undefined; m; m &= m - 1) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: GPIO%u's input is enabled while "
+                      "an analog block (the touch sensor) holds the pad "
+                      "between VIL and VIH; it reads low\n",
+                      TYPE_ESP32P4_GPIO, ctz64(m));
+    }
     s->undefined = (s->undefined & ~nets) | undefined;
+    s->analog_undefined = (s->analog_undefined & ~nets) | (analog & nets);
     s->held = held;
     s->ie_mask = ie_mask;
     *pad_out = pad;
     *raw_out = pad & ie_mask;
     *drv_high_out = drv_high;
     *drv_low_out = drv_low;
+    *load_out = load;
 }
 
 /* Filters */
@@ -1709,8 +1774,9 @@ static void routes_build(ESP32P4GpioState *s)
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
  * One resolution: the modulators up to now, the pads, the input chains at
- * the time of the change being propagated, the interrupts they latch, and
- * every output that changed.
+ * the time of the change being propagated, the interrupts they latch,
+ * every output that changed, and, to the load notifiers, the pads whose
+ * drivers or pulls changed.
  *
  * A round recomputes only what the changes since the last can reach: the
  * drive of the pads they name (dirty_pads) and of the pads a modulator's
@@ -1730,7 +1796,7 @@ static void propagate(ESP32P4GpioState *s)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t t = esp32_line_time();
     const ESP32P4GpioRoutes *r = &s->routes;
-    uint64_t pad, raw, pf, hp, changed, drv_high, drv_low;
+    uint64_t pad, raw, pf, hp, changed, drv_high, drv_low, load;
     uint64_t raw_ch, hp_ch, sigs[ESP32P4_GPIO_SIG_WORDS];
     uint64_t dirty = s->dirty_pads;
     uint32_t lp, lp_ch, lp_sigs;
@@ -1755,7 +1821,7 @@ static void propagate(ESP32P4GpioState *s)
         }
     }
 
-    resolve(s, dirty, all, &pad, &raw, &drv_high, &drv_low);
+    resolve(s, dirty, all, &pad, &raw, &drv_high, &drv_low, &load);
     raw_ch = raw ^ s->raw_in;
     run_chains(s, raw, all || filters ? PAD_MASK : raw_ch, t, &pf, &hp, &lp);
     hp_ch = hp ^ s->hp_in;
@@ -1874,6 +1940,10 @@ static void propagate(ESP32P4GpioState *s)
             s->irq_level[i] = irq[i];
             qemu_set_irq(s->irq[i], irq[i]);
         }
+    }
+
+    if (load) {
+        notifier_list_notify(&s->load_notifiers, &load);
     }
 }
 
@@ -2400,6 +2470,39 @@ bool esp32p4_gpio_iomux_in_level(ESP32P4GpioState *s, unsigned n,
 bool esp32p4_gpio_pad_level(ESP32P4GpioState *s, unsigned n)
 {
     return n < ESP32P4_GPIO_PADS && bit64(s->pad_level, n);
+}
+
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+/* [spec:nuos:req:emu.esp32p4.analog] */
+bool esp32p4_gpio_pad_load(ESP32P4GpioState *s, unsigned n, bool *level,
+                           uint64_t *up_ns, uint64_t *down_ns)
+{
+    uint64_t net;
+
+    *level = false;
+    *up_ns = 0;
+    *down_ns = 0;
+    if (n >= ESP32P4_GPIO_PADS) {
+        return false;
+    }
+    net = s->routes.wire_net[n] | BIT_ULL(n);
+    if (s->drive_low & net) {
+        return true;
+    }
+    if (s->drive_high & net) {
+        *level = true;
+        return true;
+    }
+    for (uint64_t w = net; w; w &= w - 1) {
+        *up_ns += s->pull_up_ns[ctz64(w)];
+        *down_ns += s->pull_down_ns[ctz64(w)];
+    }
+    return false;
+}
+
+void esp32p4_gpio_add_load_notifier(ESP32P4GpioState *s, Notifier *n)
+{
+    notifier_list_add(&s->load_notifiers, n);
 }
 
 /* Register blocks */
@@ -3386,6 +3489,47 @@ static void esp32p4_gpio_set_pull_up(void *opaque, int n, int level)
     esp32p4_gpio_update_pads(s, 1ULL << n);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * [spec:nuos:req:emu.esp32p4.usb]
+ * A USB PHY takes pad n or lets it go: which outputs reach the pad
+ * changes, for the routing's users too.
+ */
+static void esp32p4_gpio_set_phy(void *opaque, int n, int level)
+{
+    ESP32P4GpioState *s = opaque;
+
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_phy, n, level)) {
+        return;
+    }
+    if (bit64(s->ext_phy, n) == (level != 0)) {
+        return;
+    }
+    filters_catch_up(s, esp32_line_time());
+    s->ext_phy = deposit64(s->ext_phy, n, 1, level != 0);
+    esp32p4_gpio_update(s);
+    notify_route(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * [spec:nuos:req:emu.esp32p4.analog]
+ */
+static void esp32p4_gpio_set_analog(void *opaque, int n, int level)
+{
+    ESP32P4GpioState *s = opaque;
+
+    if (esp32p4_gpio_held_back(s, esp32p4_gpio_set_analog, n, level)) {
+        return;
+    }
+    if (bit64(s->ext_analog, n) == (level != 0)) {
+        return;
+    }
+    filters_catch_up(s, esp32_line_time());
+    s->ext_analog = deposit64(s->ext_analog, n, 1, level != 0);
+    esp32p4_gpio_update_pads(s, 1ULL << n);
+}
+
 /* [spec:nuos:req:emu.esp32p4.gpio] */
 static void esp32p4_gpio_set_board_pull_up(void *opaque, int n, int level)
 {
@@ -3920,6 +4064,7 @@ static void esp32p4_gpio_init(Object *obj)
     timer_init_ns(&s->filter_timer, QEMU_CLOCK_VIRTUAL,
                   esp32p4_gpio_filter_timer, s);
     notifier_list_init(&s->route_notifiers);
+    notifier_list_init(&s->load_notifiers);
     s->line_source.notify = esp32p4_gpio_line_sync;
 
     qdev_init_gpio_in_named(dev, esp32p4_gpio_pad_in, ESP32P4_GPIO_PAD_IN,
@@ -3954,6 +4099,10 @@ static void esp32p4_gpio_init(Object *obj)
                             ESP32P4_GPIO_RESETS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_pull_up,
                             ESP32P4_GPIO_PAD_PULL_UP, ESP32P4_GPIO_PADS);
+    qdev_init_gpio_in_named(dev, esp32p4_gpio_set_phy, ESP32P4_GPIO_PAD_PHY,
+                            ESP32P4_GPIO_PADS);
+    qdev_init_gpio_in_named(dev, esp32p4_gpio_set_analog,
+                            ESP32P4_GPIO_PAD_ANALOG, ESP32P4_GPIO_PADS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_board_pull_up,
                             ESP32P4_GPIO_BOARD_PULL_UP, ESP32P4_GPIO_PADS);
     qdev_init_gpio_in_named(dev, esp32p4_gpio_set_board_pull_down,
@@ -3991,8 +4140,15 @@ static void esp32p4_gpio_init(Object *obj)
         s->lp_sig_out[sig] = lp_sig_out_idle(sig);
         s->lp_sig_oe[sig] = 1;
     }
-    /* The USB Serial/JTAG PHY's D+ pull-up, on out of reset */
+    /* The USB Serial/JTAG PHY has its pads, and pulls D+ up, from reset */
     s->ext_pull_up = 1ULL << 25;
+    s->ext_phy = (1ULL << 24) | (1ULL << 25);
+    /*
+     * The registers at their reset values from the start, for the pads
+     * the blocks around them resolve before the machine's reset.
+     */
+    hp_reset(s);
+    lp_reset(s);
     s->dirty_all = true;
 }
 
@@ -4048,8 +4204,8 @@ static int esp32p4_gpio_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_esp32p4_gpio = {
     .name = TYPE_ESP32P4_GPIO,
-    .version_id = 5,
-    .minimum_version_id = 5,
+    .version_id = 6,
+    .minimum_version_id = 6,
     .post_load = esp32p4_gpio_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(iomux_clk, ESP32P4GpioState),
@@ -4125,6 +4281,8 @@ static const VMStateDescription vmstate_esp32p4_gpio = {
         VMSTATE_UINT64(ext_driven, ESP32P4GpioState),
         VMSTATE_UINT64(ext_level, ESP32P4GpioState),
         VMSTATE_UINT64(ext_pull_up, ESP32P4GpioState),
+        VMSTATE_UINT64(ext_phy, ESP32P4GpioState),
+        VMSTATE_UINT64(ext_analog, ESP32P4GpioState),
         VMSTATE_UINT32_ARRAY(board_pull_up, ESP32P4GpioState,
                              ESP32P4_GPIO_PADS),
         VMSTATE_UINT32_ARRAY(board_pull_down, ESP32P4GpioState,
