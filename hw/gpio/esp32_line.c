@@ -80,9 +80,9 @@ void esp32_line_sync(void)
 
 /* [spec:nuos:req:emu.esp32.gpio] */
 /* [spec:nuos:req:emu.esp32p4.gpio] */
-uint64_t esp32_sig_out_pads(Object *matrix, unsigned sig)
+bool esp32_sig_out_watched(Object *matrix, unsigned sig)
 {
-    return ESP32_SIG_ROUTES_GET_CLASS(matrix)->sig_out_pads(matrix, sig);
+    return ESP32_SIG_ROUTES_GET_CLASS(matrix)->sig_out_watched(matrix, sig);
 }
 
 void esp32_sig_add_route_notifier(Object *matrix, Notifier *n)

@@ -44,7 +44,8 @@ OBJECT_DECLARE_TYPE(Esp32McpwmState, Esp32McpwmClass, ESP32_MCPWM)
  * Link "gpio" and property "sig-base": the GPIO matrix (either chip's,
  * TYPE_ESP32_SIG_ROUTES), and the matrix output signal of PWM0A, the
  * other outputs following it, for the block to see which of its outputs
- * reach a pad. Without the link every output is taken to reach one.
+ * reach a pad something watches. Without the link every output is taken
+ * to.
  */
 #define ESP32_MCPWM_OUT         "pwm-out"
 #define ESP32_MCPWM_SYNC_IN     "sync-in"
@@ -235,7 +236,7 @@ struct Esp32McpwmState {
     DeviceState *gpio;
     uint32_t sig_base;
     Notifier route_notifier;
-    /* The outputs that reach a pad, bit n for output n */
+    /* The outputs that reach a pad something watches, bit n for output n */
     uint8_t out_seen;
     bool updating;
     bool update_pending;

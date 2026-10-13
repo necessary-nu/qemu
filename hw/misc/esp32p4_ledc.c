@@ -96,9 +96,9 @@
  * changes at every one of its edges' exact times, however close together,
  * stamped on the line (hw/gpio/esp32_line.h), so that a capture, a pulse
  * counter or an ETM event that an edge reaches sees each; the host's work
- * grows with the edges' rate while the output reaches a pad (an output
- * reaching none, below, costs nothing). Whenever software samples the pads the
- * outputs are brought to their exact levels at that moment. Updates, fade
+ * grows with the edges' rate while something watches them (below).
+ * Whenever software samples the pads the outputs are brought to their
+ * exact levels at that moment. Updates, fade
  * ends, fade pauses and the timers' own updates are handled in time order at
  * their overflows; a QEMU timer fires for them, for the edges, and for
  * the overflows, matches and counts that an enabled interrupt or ETM
@@ -109,9 +109,12 @@
  * time, slower than the edges it is to drive) skips to its level shortly
  * before the present, stamped with the moment that level began: the edges
  * in between are lost, but no edge carries a time other than its own. An
- * output that reaches no pad is not timed edge by edge: nothing sees its
- * edges, and it takes its level of the moment whenever the controller is
- * brought up to date, so that it costs the host nothing however fast.
+ * output that reaches no pad something watches (an input a modelled block
+ * takes from it, an interrupt type, an ETM channel, a line the board
+ * listens to: esp32p4_gpio_sig_out_watched()) is not timed edge by edge:
+ * nothing sees its edges, and it takes its level of the moment whenever
+ * the controller is brought up to date, so that it costs the host nothing
+ * however fast.
  *
  * Not modelled: the light-sleep output (TRM 58.2), which needs the PMU;
  * LEDC_CLK_EN and GAMMA_RAM_CLK_EN, clock gating that software cannot
@@ -791,8 +794,8 @@ static void chan_eval(ESP32P4LedcState *s, int n, int64_t limit,
         return;
     }
     /*
-     * An output that reaches no pad has no edge anyone sees: it takes its
-     * level of the moment, as a sample does.
+     * An output that reaches no pad something watches has no edge anyone
+     * sees: it takes its level of the moment, as a sample does.
      */
     if (!s->out_seen[n]) {
         chan_sample(s, n, inclusive ? limit : limit - 1);
@@ -1403,8 +1406,9 @@ static void ledc_line_sync(Notifier *notifier, void *data)
  * [spec:nuos:req:emu.esp32p4.pwm]
  * [spec:nuos:req:emu.esp32p4.gpio]
  * Which channels' outputs reach a pad, through the GPIO matrix or an IO
- * MUX function, with the pad's output enabled: only theirs are timed edge
- * by edge. The others, which nothing sees, are brought to their level of
+ * MUX function, with the pad's output enabled, whose level something but
+ * software sampling the pads sees (esp32p4_gpio_sig_out_watched()): only
+ * theirs are timed edge by edge. The others are brought to their level of
  * the moment whenever the controller is, as when software samples the
  * pads, so that an output nobody watches costs the host nothing however
  * fast it runs. A pad taking one up gets its level at that moment, the
@@ -1417,7 +1421,7 @@ static void ledc_routes_changed(ESP32P4LedcState *s)
     ledc_advance(s, now);
     for (int n = 0; n < ESP32P4_LEDC_CHANNELS; n++) {
         bool seen = !s->gpio ||
-                    esp32p4_gpio_sig_out_pads(s->gpio, s->sig_base + n) != 0;
+                    esp32p4_gpio_sig_out_watched(s->gpio, s->sig_base + n);
 
         if (seen && !s->out_seen[n]) {
             chan_sample(s, n, now);

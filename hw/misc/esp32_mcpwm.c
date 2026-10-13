@@ -30,13 +30,14 @@
  * case for a free-running configuration) skips whole repetitions at once.
  * A timer fires only at the moments something becomes visible outside the
  * block: an output edge or a rising interrupt line, found by running a copy
- * of the state ahead. Every edge of an output that reaches a pad is driven
- * at its own cycle, however close to others: a capture, a pulse counter
- * or an ETM event that an edge reaches sees each, so the host's work
- * grows with the edges' rate, and on the host's clock a host that cannot
- * keep up skips ahead (below). An output that reaches no pad has no edge
- * anyone sees: it is driven at its level of the moment whenever the block
- * is brought up to date (mcpwm_routes_run()), and costs nothing.
+ * of the state ahead. Every edge of an output that reaches a pad something
+ * watches is driven at its own cycle, however close to others: a capture,
+ * a pulse counter or an ETM event that an edge reaches sees each, so the
+ * host's work grows with the edges' rate, and on the host's clock a host
+ * that cannot keep up skips ahead (below). An output that reaches no such
+ * pad has no edge anyone sees: it is driven at its level of the moment
+ * whenever the block is brought up to date (mcpwm_routes_run()), and
+ * costs nothing.
  *
  * The capture timer counts APB_CLK and is computed in closed form; capture
  * inputs, fault inputs and GPIO sync inputs act at the moment their level
@@ -2107,8 +2108,11 @@ static void mcpwm_line_sync_run(void *opaque)
  * [spec:nuos:req:emu.esp32.mcpwm]
  * [spec:nuos:req:emu.esp32p4.pwm]
  * Which outputs reach a pad, through the GPIO matrix or an IO MUX
- * function, with the pad's output enabled: only their edges are looked
- * ahead for and timed. The others, which nothing sees, are driven at
+ * function, with the pad's output enabled, whose level something but
+ * software sampling the pads sees (an input a modelled block takes from
+ * it, an interrupt type, an ETM channel, a line the board listens to:
+ * TYPE_ESP32_SIG_ROUTES): only their edges are looked ahead for and
+ * timed. The others, which nothing sees, are driven at
  * their level of the moment whenever the block is brought up to date (a
  * register access, a firing for what is seen, software sampling the
  * pads), so that an output nobody watches costs the host nothing however
@@ -2124,7 +2128,7 @@ static void mcpwm_routes_run(void *opaque)
     mcpwm_update(s);
     for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
         if (!s->gpio ||
-            esp32_sig_out_pads(OBJECT(s->gpio), s->sig_base + n)) {
+            esp32_sig_out_watched(OBJECT(s->gpio), s->sig_base + n)) {
             seen |= BIT(n);
         }
     }

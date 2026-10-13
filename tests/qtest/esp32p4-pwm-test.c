@@ -142,6 +142,10 @@
 
 #define GPIO                0x500e0000
 #define GPIO_IN             (GPIO + 0x03c)
+#define GPIO_STATUS         (GPIO + 0x044)
+#define GPIO_STATUS_W1TC    (GPIO + 0x04c)
+#define GPIO_PIN(n)         (GPIO + 0x074 + 4 * (n))
+#define PIN_INT_RISING      (1u << 7)
 #define GPIO_FUNC_IN(s)     (GPIO + 0x158 + 4 * (s))
 #define GPIO_FUNC_OUT(n)    (GPIO + 0x558 + 4 * (n))
 #define IN_SIG_IN_SEL       (1u << 7)
@@ -1055,6 +1059,47 @@ static void test_ledc_unrouted(void)
     qtest_quit(qts);
 }
 
+/*
+ * An LEDC output on a pad nothing watches: channel 0 as in ledc/unrouted
+ * (a 50 ns period, high for its first 25 ns) on pad 22, whose line
+ * nothing on the board listens to and from which no block takes an input
+ * (pad 20, UART4's TXD, has the serial port's terminal listening). Its edges
+ * are not timed: a second of them costs the host next to nothing, and
+ * GPIO_IN reads the exact level at the moment software samples it. Given
+ * a rising-edge interrupt type, the pad is watched: GPIO_STATUS latches
+ * the next rising edge at its nanosecond.
+ */
+/* [spec:nuos:req:emu.esp32p4.pwm/test] */
+/* [spec:nuos:req:emu.esp32p4.gpio/test] */
+static void test_ledc_unwatched_pad(void)
+{
+    QTestState *qts = start();
+    int64_t c;
+
+    pad_out(qts, 22, SIG_LEDC(0));
+    ledc_timer(qts, 0, 1, 1);
+    c = now + 50;
+    lwr(qts, CH_HPOINT(0), 0);
+    lwr(qts, CH_DUTY(0), 1 << 4);
+    lwr(qts, CH_CONF0(0), SIG_OUT_EN | PARA_UP);
+    c += 1000 * 1000 * 1000;
+    step_to(qts, c + 10);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 22), ==, 1u << 22);
+    step_to(qts, c + 30);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 22), ==, 0);
+    step_to(qts, c + 74);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 22), ==, 1u << 22);
+
+    qtest_writel(qts, GPIO_PIN(22), PIN_INT_RISING);
+    qtest_writel(qts, GPIO_STATUS_W1TC, 1u << 22);
+    step_to(qts, c + 99);
+    g_assert_cmphex(qtest_readl(qts, GPIO_STATUS) & (1u << 22), ==, 0);
+    step_to(qts, c + 100);
+    g_assert_cmphex(qtest_readl(qts, GPIO_STATUS) & (1u << 22), ==,
+                    1u << 22);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1066,6 +1111,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4-pwm/ledc/etm", test_ledc_etm);
     qtest_add_func("esp32p4-pwm/ledc/close-edges", test_ledc_close_edges);
     qtest_add_func("esp32p4-pwm/ledc/unrouted", test_ledc_unrouted);
+    qtest_add_func("esp32p4-pwm/ledc/unwatched-pad", test_ledc_unwatched_pad);
     qtest_add_func("esp32p4-pwm/mcpwm/unrouted", test_mcpwm_unrouted);
     qtest_add_func("esp32p4-pwm/mcpwm/reset", test_mcpwm_reset);
     qtest_add_func("esp32p4-pwm/mcpwm/clock", test_mcpwm_clock);

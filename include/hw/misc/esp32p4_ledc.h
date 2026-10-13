@@ -50,7 +50,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4LedcState, ESP32P4_LEDC)
  *               registers behind LEDC_APB_CLK and the block's reset.
  *   Link "gpio" and property "sig-base": the GPIO matrix, and the matrix
  *               output signal of sig_out0 (the others following it), for
- *               the channels to see whether their outputs reach a pad.
+ *               the channels to see whether their outputs reach a pad
+ *               something watches (esp32p4_gpio_sig_out_watched()).
  *               Without the link every output is taken to reach one.
  *   sysbus IRQ 0: LEDC_INTR.
  */
@@ -154,7 +155,10 @@ struct ESP32P4LedcState {
     ESP32P4GpioState *gpio;
     uint32_t sig_base;
     Notifier route_notifier;
-    /* Each channel's output reaches a pad, so that its edges are timed */
+    /*
+     * Each channel's output reaches a pad something watches, so that its
+     * edges are timed
+     */
     bool out_seen[ESP32P4_LEDC_CHANNELS];
 
     ESP32P4LedcTimer t[ESP32P4_LEDC_TIMERS];
