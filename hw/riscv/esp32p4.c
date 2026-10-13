@@ -2419,8 +2419,7 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
          * [spec:nuos:req:emu.esp32p4.gpio]
          * A card in slot 1 stands where the ESP32-C6 is, and with it the
          * board's pull-ups on its lines (R15 to R21, to ESP_3V3); with
-         * the C6 not modelled, those pads otherwise serve the machine's
-         * other uses (the serial ports on GPIO16 to GPIO19).
+         * the C6 not modelled and no card, those pads have neither.
          */
         if (slot == 1 && dinfo) {
             ESP32P4SdmmcState *sd = &s->sdmmc;
