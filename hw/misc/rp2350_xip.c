@@ -59,6 +59,7 @@
 #include "qapi/error.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_xip.h"
@@ -970,8 +971,8 @@ static void rp2350_xip_stream_schedule(RP2350XIPState *s)
     if (s->stream_ctr && !fifo32_is_full(&s->stream_fifo) &&
         !(s->direct_csr & CSR_EN) && !timer_pending(s->stream_timer) &&
         clock_is_enabled(s->clk)) {
-        timer_mod(s->stream_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                                   sysclk_ns(s, cycles));
+        s->stream_due = line_time() + sysclk_ns(s, cycles);
+        timer_mod(s->stream_timer, s->stream_due);
     }
 }
 
@@ -1009,6 +1010,49 @@ static void rp2350_xip_stream_tick(void *opaque)
     s->stream_ctr--;
     rp2350_xip_update_dreq(s);
     rp2350_xip_stream_schedule(s);
+}
+
+/*
+ * A streamed word is read at its time however late the timer runs, and
+ * the next counts from then (line_time()).
+ */
+static void rp2350_xip_stream_cb(void *opaque)
+{
+    RP2350XIPState *s = opaque;
+
+    line_run_at(s->stream_due, rp2350_xip_stream_tick, s);
+}
+
+/*
+ * [spec:nuos:req:emu.xip+1]
+ * Take what has come by the access being made, earliest first: the
+ * streamed words read by then, each at its time, and a direct transfer's
+ * end dropping its AUTO_CSxN chip select. Without icount their timers can
+ * run well after, while software or the DMA reads STREAM_FIFO, STAT or
+ * STREAM_CTR, or pushes DIRECT_TX, whose next frame would otherwise run on
+ * from the last with the chip select still held. Only a timer that has
+ * come is run.
+ */
+static void rp2350_xip_catch_up(RP2350XIPState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (;;) {
+        int64_t busy = timer_expire_time_ns(s->busy_timer);
+        bool busy_due = timer_pending(s->busy_timer) && busy <= now;
+        bool stream_due = timer_pending(s->stream_timer) &&
+                          s->stream_due <= now;
+
+        if (busy_due && (!stream_due || busy <= s->stream_due)) {
+            timer_del(s->busy_timer);
+            line_run_at(busy, rp2350_xip_busy_done, s);
+        } else if (stream_due) {
+            timer_del(s->stream_timer);
+            line_run_at(s->stream_due, rp2350_xip_stream_tick, s);
+        } else {
+            return;
+        }
+    }
 }
 
 static uint32_t rp2350_xip_stream_pop(RP2350XIPState *s)
@@ -1057,6 +1101,7 @@ static MemTxResult rp2350_xip_ctrl_read(void *opaque, hwaddr addr,
     RP2350XIPState *s = opaque;
     hwaddr reg = rp2350_atomic_reg(addr);
 
+    rp2350_xip_catch_up(s);
     switch (reg) {
     case A_CTRL:
     case A_STAT:
@@ -1085,8 +1130,10 @@ static MemTxResult rp2350_xip_ctrl_write(void *opaque, hwaddr addr,
 {
     RP2350XIPState *s = opaque;
     hwaddr reg = rp2350_atomic_reg(addr);
-    uint32_t v = rp2350_atomic_apply(addr, rp2350_xip_ctrl_peek(s, reg),
-                                     value);
+    uint32_t v;
+
+    rp2350_xip_catch_up(s);
+    v = rp2350_atomic_apply(addr, rp2350_xip_ctrl_peek(s, reg), value);
 
     switch (reg) {
     case A_CTRL:
@@ -1173,6 +1220,7 @@ static uint64_t rp2350_xip_qmi_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr reg = rp2350_atomic_reg(addr);
     uint32_t mask;
 
+    rp2350_xip_catch_up(s);
     switch (reg) {
     case A_DIRECT_CSR:
         return rp2350_xip_direct_csr(s);
@@ -1199,6 +1247,7 @@ static void rp2350_xip_qmi_write(void *opaque, hwaddr addr, uint64_t value,
     hwaddr reg = rp2350_atomic_reg(addr);
     uint32_t *r, mask, v, old;
 
+    rp2350_xip_catch_up(s);
     switch (reg) {
     case A_DIRECT_CSR:
         old = s->direct_csr;
@@ -1249,6 +1298,7 @@ static uint64_t rp2350_xip_aux_read(void *opaque, hwaddr addr, unsigned size)
 {
     RP2350XIPState *s = opaque;
 
+    rp2350_xip_catch_up(s);
     switch (addr) {
     case A_AUX_STREAM:
         return rp2350_xip_stream_pop(s);
@@ -1268,6 +1318,7 @@ static void rp2350_xip_aux_write(void *opaque, hwaddr addr, uint64_t value,
 {
     RP2350XIPState *s = opaque;
 
+    rp2350_xip_catch_up(s);
     switch (addr) {
     case A_AUX_QMI_DIRECT_TX:
         rp2350_xip_direct_push(s, value);
@@ -1438,7 +1489,7 @@ static void rp2350_xip_realize(DeviceState *dev, Error **errp)
     fifo32_create(&s->direct_tx, DIRECT_FIFO_DEPTH);
     fifo32_create(&s->direct_rx, DIRECT_FIFO_DEPTH);
     s->busy_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rp2350_xip_busy_done, s);
-    s->stream_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rp2350_xip_stream_tick,
+    s->stream_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rp2350_xip_stream_cb,
                                    s);
 
     memory_region_init_io(&s->space_io, obj, &rp2350_xip_space_ops, s,
@@ -1504,8 +1555,8 @@ static int rp2350_xip_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_rp2350_xip = {
     .name = TYPE_RP2350_XIP,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .post_load = rp2350_xip_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, RP2350XIPState),
@@ -1514,6 +1565,7 @@ static const VMStateDescription vmstate_rp2350_xip = {
         VMSTATE_UINT32(ctr_acc, RP2350XIPState),
         VMSTATE_UINT32(stream_addr, RP2350XIPState),
         VMSTATE_UINT32(stream_ctr, RP2350XIPState),
+        VMSTATE_INT64(stream_due, RP2350XIPState),
         VMSTATE_FIFO32(stream_fifo, RP2350XIPState),
         VMSTATE_UINT32(direct_csr, RP2350XIPState),
         VMSTATE_FIFO32(direct_tx, RP2350XIPState),
