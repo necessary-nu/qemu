@@ -667,6 +667,59 @@ static void test_wdt_flashboot(void)
     qtest_quit(qts);
 }
 
+/*
+ * Stage ends nothing sees: four stages of one tick each, prescaler 1 on
+ * the 40 MHz XTAL_CLK, so that a stage ends every 25 ns, only stage 2
+ * interrupting. Enabled at an XTAL_CLK edge, stage 2 first ends 75 ns
+ * later, setting INT_RAW, and every 100 ns after. With INT_ENA clear, or
+ * INT_RAW already set, no end is seen but through INT_RAW, which a read
+ * works out: a second of it costs the host next to nothing. INT_ENA set
+ * with INT_RAW clear, the interrupt comes at the next end of stage 2.
+ */
+/* [spec:nuos:req:emu.esp32p4.timers/test] */
+static void test_wdt_unwatched(void)
+{
+    QTestState *qts = start();
+    int64_t t0, next;
+
+    swd_off(qts);
+    step(qts, 1000 - now);
+    wr(qts, 0, WDTCONFIG1, W_PRESCALE(1));
+    for (int i = 0; i < 4; i++) {
+        wr(qts, 0, WDTCONFIG(i), 1);
+    }
+    wr(qts, 0, WDTCONFIG0, W_STG(2, STG_INT) | W_CONF_UPDATE | W_EN);
+    t0 = now;
+    step(qts, 74);
+    g_assert_cmphex(rd(qts, 0, INT_RAW), ==, 0);
+    step(qts, 1);
+    g_assert_cmphex(rd(qts, 0, INT_RAW), ==, 4);
+    wr(qts, 0, INT_CLR, 4);
+    step(qts, 1000 * MS + 30);
+    g_assert_cmphex(rd(qts, 0, INT_RAW), ==, 4);
+    g_assert_cmphex(rd(qts, 0, INT_ST), ==, 0);
+
+    /* Cleared 30 ns past an end of stage 2: the next is 70 ns on. */
+    wr(qts, 0, INT_CLR, 4);
+    wr(qts, 0, INT_ENA, 4);
+    next = now + 70;
+    g_assert_cmpint((next - t0 - 75) % 100, ==, 0);
+    step(qts, 69);
+    g_assert(!source(qts, SRC_TG0_T0 + 2));
+    step(qts, 1);
+    g_assert(source(qts, SRC_TG0_T0 + 2));
+    g_assert_cmphex(rd(qts, 0, INT_ST), ==, 4);
+    step(qts, 1000 * MS);
+    g_assert(source(qts, SRC_TG0_T0 + 2));
+
+    /* A CPU reset stage that no *_RESET_EN lets out is not seen either. */
+    wr(qts, 0, INT_ENA, 0);
+    wr(qts, 0, WDTCONFIG0, W_STG(0, STG_CPU) | W_CONF_UPDATE | W_EN);
+    step(qts, 1000 * MS);
+    g_assert(!qom_bool(qts, HP_CPU0, "in-reset"));
+    qtest_quit(qts);
+}
+
 /* Start a one-shot calibration of @max cycles of TIMERGRP0_TGRT_CLK. */
 static void cal_start(QTestState *qts, uint32_t max)
 {
@@ -1298,6 +1351,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/timg/wdt-cpu-reset", test_wdt_cpu_reset);
     qtest_add_func("/esp32p4/timg/wdt-core-reset", test_wdt_core_reset);
     qtest_add_func("/esp32p4/timg/wdt-flashboot", test_wdt_flashboot);
+    qtest_add_func("/esp32p4/timg/wdt-unwatched", test_wdt_unwatched);
     qtest_add_func("/esp32p4/timg/calibration", test_calibration);
     qtest_add_func("/esp32p4/timg/calibration-phase",
                    test_calibration_phase);

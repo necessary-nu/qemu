@@ -107,15 +107,17 @@ typedef struct ESP32P4TimgWdt {
      * The current stage and its count as of function clock cycle @synced,
      * counted from when the MWDT last started or its clock changed
      * (@edges), @pre function clock cycles into the current cycle of the
-     * MWDT's clock.
+     * MWDT's clock; and the count at which the stage ends. The count runs
+     * on past @due, through stages nobody watches, until it is settled.
      */
     uint32_t stage;
-    uint32_t count;
+    uint64_t count;
+    uint64_t due;
     uint32_t pre;
     ESP32P4ClkCount edges;
     uint64_t synced;
     bool running;
-    /* When the current stage times out. */
+    /* When the next stage end anything sees comes, its QEMU timer's. */
     int64_t due_ns;
 } ESP32P4TimgWdt;
 

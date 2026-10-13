@@ -64,6 +64,12 @@
  * mode, MWDT0 runs although TIMG_WDT_EN is clear, its stage 0 resetting
  * the HP core. The block's own reset, its reset line or an HP core reset,
  * leaves it as the chip resets it, so flash boot protection runs again.
+ * Only a stage end something sees takes a QEMU timer: a reset, or an
+ * interrupt that INT_ENA lets out while TIMG_WDT_INT_RAW is clear. The
+ * others (off, or an interrupt only INT_RAW would show) are taken as a
+ * register access or a clock change brings the watchdog up to its moment,
+ * whole loops of the stages in one go, so that a watchdog nobody watches
+ * costs the host nothing however short its stages.
  *
  * RTC calibration (TRM 17.3.6, 17.4.5). The unit counts XTAL_CLK over
  * TIMG_RTC_CALI_MAX cycles of the clock it measures, TIMG0_CALI_CLK,
@@ -469,6 +475,11 @@ static uint64_t timg_wdt_cycles(ESP32P4TimgWdt *w, int64_t now)
     return cycles > w->synced ? cycles - w->synced : 0;
 }
 
+/*
+ * Fold the function clock cycles up to @now into the count: past the
+ * current stage's end, if no QEMU timer was armed for it, until
+ * timg_wdt_settle() takes the ends passed.
+ */
 static void timg_wdt_sync(ESP32P4TimgWdt *w, int64_t now)
 {
     uint64_t cycles = timg_wdt_cycles(w, now);
@@ -479,25 +490,91 @@ static void timg_wdt_sync(ESP32P4TimgWdt *w, int64_t now)
     w->synced += cycles;
 }
 
-/* Schedule the current stage's timeout, after a sync. */
+/* The ticks of a stage begun from 0: its hold, 2^32 for a hold of 0. */
+static uint64_t timg_wdt_len(uint32_t hold)
+{
+    return hold ? hold : 1ull << 32;
+}
+
+/*
+ * The ticks from @count until the 32-bit counter, counting on, comes to
+ * @hold: a hold it is at or past is reached after it wraps.
+ */
+static uint64_t timg_wdt_ahead(uint32_t hold, uint64_t count)
+{
+    uint32_t ahead = hold - (uint32_t)count;
+
+    return ahead ? ahead : 1ull << 32;
+}
+
+/* Begin stage @n, its counter at 0. */
+static void timg_wdt_begin_stage(ESP32P4TimgWdt *w, unsigned n)
+{
+    w->stage = n;
+    w->count = 0;
+    w->due = timg_wdt_len(w->act_hold[n]);
+}
+
+static unsigned timg_wdt_action(ESP32P4TimgState *s, unsigned n)
+{
+    return timg_wdt_flashboot(s) ? (n ? STG_OFF : STG_CORE_RESET)
+                                 : WCONF0_STG(s->wdt.act_config0, n);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * Whether the end of stage @n changes anything outside the block, or
+ * anything a register shows other than through TIMG_WDT_INT_RAW and
+ * INT_ST, which a read works out: an interrupt that INT_ENA lets out
+ * while TIMG_WDT_INT_RAW is clear (set, the line is high already), a CPU
+ * reset that a *_RESET_EN lets out, an HP core reset. A QEMU timer fires
+ * only for such ends; the others are taken in passing (timg_wdt_settle()).
+ */
+static bool timg_wdt_observed(ESP32P4TimgState *s, unsigned n)
+{
+    switch (timg_wdt_action(s, n)) {
+    case STG_INT:
+        return (s->int_ena & INT_WDT) && !(s->int_raw & INT_WDT);
+    case STG_CPU_RESET:
+        return s->wdt.act_config0 &
+               (WCONF0_PROCPU_RESET_EN | WCONF0_APPCPU_RESET_EN);
+    case STG_CORE_RESET:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * Schedule the next stage end that timg_wdt_observed() says is seen, the
+ * stages in their loop from the current one; none if none is.
+ */
 static void timg_wdt_schedule(ESP32P4TimgState *s)
 {
     ESP32P4TimgWdt *w = &s->wdt;
     uint64_t ahead;
+    unsigned n;
+    int i;
 
     timer_del(&w->timer);
     if (!w->running) {
         return;
     }
-    ahead = (uint32_t)(w->act_hold[w->stage] - w->count);
-    if (!ahead) {
-        ahead = 1ull << 32;
+    ahead = w->due - w->count;
+    n = w->stage;
+    for (i = 0; i < ESP32P4_TIMG_WDT_STAGES; i++) {
+        if (timg_wdt_observed(s, n)) {
+            w->due_ns = MIN(esp32p4_clk_count_time(&w->edges, w->synced +
+                                                   ahead *
+                                                   timg_wdt_prescale(w) -
+                                                   w->pre),
+                            INT64_MAX / 4);
+            timer_mod(&w->timer, w->due_ns);
+            return;
+        }
+        n = (n + 1) % ESP32P4_TIMG_WDT_STAGES;
+        ahead += timg_wdt_len(w->act_hold[n]);
     }
-    w->due_ns = MIN(esp32p4_clk_count_time(&w->edges, w->synced +
-                                           ahead * timg_wdt_prescale(w) -
-                                           w->pre),
-                    INT64_MAX / 4);
-    timer_mod(&w->timer, w->due_ns);
 }
 
 /* Re-evaluate whether the MWDT runs, after a sync at @now. */
@@ -508,8 +585,7 @@ static void timg_wdt_update(ESP32P4TimgState *s, int64_t now)
     bool running = enabled && clock_is_enabled(w->clk);
 
     if (!enabled) {
-        w->stage = 0;
-        w->count = 0;
+        timg_wdt_begin_stage(w, 0);
         w->pre = 0;
     }
     if (running && !w->running) {
@@ -553,22 +629,84 @@ static void timg_wdt_act(ESP32P4TimgState *s, unsigned action)
 }
 
 /*
+ * The whole loop of stages as many times over as @count holds, from the
+ * start of stage 0, when no stage's end is seen: an interrupt stage sets
+ * TIMG_WDT_INT_RAW, nothing else happens. False if some end is seen.
+ */
+static bool timg_wdt_skip_loops(ESP32P4TimgState *s)
+{
+    ESP32P4TimgWdt *w = &s->wdt;
+    uint64_t loop = 0;
+    bool interrupt = false;
+    unsigned n;
+
+    for (n = 0; n < ESP32P4_TIMG_WDT_STAGES; n++) {
+        if (timg_wdt_observed(s, n)) {
+            return false;
+        }
+        loop += timg_wdt_len(w->act_hold[n]);
+        interrupt |= timg_wdt_action(s, n) == STG_INT;
+    }
+    if (w->count >= loop) {
+        if (interrupt) {
+            s->int_raw |= INT_WDT;
+            timg_update_irqs(s);
+        }
+        w->count %= loop;
+    }
+    return true;
+}
+
+/*
  * [spec:nuos:req:emu.esp32p4.timers]
- * The current stage times out at @due: the next begins, and the stage's
- * action is taken.
+ * Take the stage ends the count has passed since the last settle, in
+ * order: each ends its stage, takes its action and begins the next stage
+ * from 0. Whole loops of stages none of whose ends is seen are passed in
+ * one go, so that a watchdog that nothing watches costs nothing however
+ * short its stages. False if an action reset the block.
+ */
+static bool timg_wdt_settle(ESP32P4TimgState *s)
+{
+    ESP32P4TimgWdt *w = &s->wdt;
+    uint32_t resets = s->reset_count;
+
+    while (w->running && w->count >= w->due) {
+        uint64_t over = w->count - w->due;
+        unsigned action = timg_wdt_action(s, w->stage);
+
+        timg_wdt_begin_stage(w, (w->stage + 1) % ESP32P4_TIMG_WDT_STAGES);
+        w->count = over;
+        timg_wdt_act(s, action);
+        if (s->reset_count != resets) {
+            return false;
+        }
+        if (w->stage == 0) {
+            timg_wdt_skip_loops(s);
+        }
+    }
+    return true;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * The MWDT up to @now: the stage ends by then, each with its action.
+ * False if one reset the block.
+ */
+static bool timg_wdt_advance(ESP32P4TimgState *s, int64_t now)
+{
+    timg_wdt_sync(&s->wdt, now);
+    return timg_wdt_settle(s);
+}
+
+/*
+ * The first seen stage end falls due at @due: the MWDT up to it, then
+ * scheduled again unless the block was reset.
  */
 static void timg_wdt_timeout(ESP32P4TimgState *s, int64_t due)
 {
-    ESP32P4TimgWdt *w = &s->wdt;
-    unsigned action;
-
-    timg_wdt_sync(w, due);
-    action = timg_wdt_flashboot(s) ? (w->stage ? STG_OFF : STG_CORE_RESET)
-                                   : WCONF0_STG(w->act_config0, w->stage);
-    w->stage = (w->stage + 1) % ESP32P4_TIMG_WDT_STAGES;
-    w->count = 0;
-    timg_wdt_schedule(s);
-    timg_wdt_act(s, action);
+    if (timg_wdt_advance(s, due)) {
+        timg_wdt_schedule(s);
+    }
 }
 
 static void timg_wdt_cb(void *opaque)
@@ -578,11 +716,23 @@ static void timg_wdt_cb(void *opaque)
     timg_wdt_timeout(s, s->wdt.due_ns);
 }
 
+/*
+ * Bring the MWDT up to @now: the seen stage end due by then at its own
+ * time, which a QEMU timer running late has passed, then the rest.
+ */
 static void timg_wdt_catch_up(ESP32P4TimgState *s, int64_t now)
 {
+    uint32_t resets = s->reset_count;
+
     if (timer_pending(&s->wdt.timer) && s->wdt.due_ns <= now) {
         timer_del(&s->wdt.timer);
         timg_wdt_timeout(s, s->wdt.due_ns);
+        if (s->reset_count != resets) {
+            return;
+        }
+    }
+    if (timg_wdt_advance(s, now)) {
+        timg_wdt_schedule(s);
     }
 }
 
@@ -594,7 +744,6 @@ static void timg_wdt_clk_update(void *opaque, ClockEvent event)
 
     if (event == ClockPreUpdate) {
         timg_wdt_catch_up(s, now);
-        timg_wdt_sync(&s->wdt, now);
         return;
     }
     esp32p4_clk_count_start(&s->wdt.edges, s->wdt.clk, now);
@@ -609,7 +758,6 @@ static void timg_set_spi_boot(void *opaque, int n, int level)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     timg_wdt_catch_up(s, now);
-    timg_wdt_sync(&s->wdt, now);
     s->spi_boot = level;
     timg_wdt_update(s, now);
 }
@@ -1216,7 +1364,6 @@ static void timg_write_wdt(ESP32P4TimgState *s, hwaddr addr, uint32_t value,
                       TYPE_ESP32P4_TIMG, s->group, addr);
         return;
     }
-    timg_wdt_sync(w, now);
     switch (addr) {
     case A_WDTCONFIG0:
         w->config0 = value & WCONF0_RW;
@@ -1229,6 +1376,8 @@ static void timg_write_wdt(ESP32P4TimgState *s, hwaddr addr, uint32_t value,
             if (w->pre >= timg_wdt_prescale(w)) {
                 w->pre = 0;
             }
+            w->due = w->count + timg_wdt_ahead(w->act_hold[w->stage],
+                                               w->count);
         }
         break;
     case A_WDTCONFIG1:
@@ -1241,8 +1390,7 @@ static void timg_write_wdt(ESP32P4TimgState *s, hwaddr addr, uint32_t value,
         w->hold[(addr - A_WDTCONFIG2) / 4] = value;
         break;
     case A_WDTFEED:
-        w->stage = 0;
-        w->count = 0;
+        timg_wdt_begin_stage(w, 0);
         break;
     }
     timg_wdt_update(s, now);
@@ -1279,11 +1427,13 @@ static void timg_write_reg(ESP32P4TimgState *s, hwaddr addr, uint32_t value,
     case A_INT_ENA:
         s->int_ena = value & INT_MASK;
         timg_update_irqs(s);
+        timg_wdt_schedule(s);
         break;
     case A_INT_RAW:
     case A_INT_CLR:
         s->int_raw &= ~(ones & INT_MASK);
         timg_update_irqs(s);
+        timg_wdt_schedule(s);
         break;
     case A_DATE:
         s->date = value & DATE_MASK;
@@ -1401,8 +1551,7 @@ static void esp32p4_timg_reset_hold(Object *obj, ResetType type)
         w->hold[i] = wdt_hold_reset[i];
         w->act_hold[i] = wdt_hold_reset[i];
     }
-    w->stage = 0;
-    w->count = 0;
+    timg_wdt_begin_stage(w, 0);
     w->pre = 0;
     esp32p4_clk_count_start(&w->edges, w->clk, now);
     w->synced = 0;
@@ -1518,8 +1667,8 @@ static const VMStateDescription vmstate_esp32p4_timg_timer = {
 
 static const VMStateDescription vmstate_esp32p4_timg_wdt = {
     .name = TYPE_ESP32P4_TIMG "/wdt",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4TimgWdt),
         VMSTATE_TIMER(timer, ESP32P4TimgWdt),
@@ -1532,7 +1681,8 @@ static const VMStateDescription vmstate_esp32p4_timg_wdt = {
         VMSTATE_UINT32_ARRAY(act_hold, ESP32P4TimgWdt,
                              ESP32P4_TIMG_WDT_STAGES),
         VMSTATE_UINT32(stage, ESP32P4TimgWdt),
-        VMSTATE_UINT32(count, ESP32P4TimgWdt),
+        VMSTATE_UINT64(count, ESP32P4TimgWdt),
+        VMSTATE_UINT64(due, ESP32P4TimgWdt),
         VMSTATE_UINT32(pre, ESP32P4TimgWdt),
         VMSTATE_ESP32P4_CLK_COUNT(edges, ESP32P4TimgWdt),
         VMSTATE_UINT64(synced, ESP32P4TimgWdt),
@@ -1570,12 +1720,12 @@ static const VMStateDescription vmstate_esp32p4_timg_cal = {
 
 static const VMStateDescription vmstate_esp32p4_timg = {
     .name = TYPE_ESP32P4_TIMG,
-    .version_id = 4,
-    .minimum_version_id = 4,
+    .version_id = 5,
+    .minimum_version_id = 5,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(t, ESP32P4TimgState, ESP32P4_TIMG_TIMERS, 2,
                              vmstate_esp32p4_timg_timer, ESP32P4TimgTimer),
-        VMSTATE_STRUCT(wdt, ESP32P4TimgState, 2, vmstate_esp32p4_timg_wdt,
+        VMSTATE_STRUCT(wdt, ESP32P4TimgState, 3, vmstate_esp32p4_timg_wdt,
                        ESP32P4TimgWdt),
         VMSTATE_STRUCT(cal, ESP32P4TimgState, 4, vmstate_esp32p4_timg_cal,
                        ESP32P4TimgCal),
