@@ -120,9 +120,6 @@ typedef struct ESP32P4TimgWdt {
 } ESP32P4TimgWdt;
 
 typedef struct ESP32P4TimgCal {
-    QEMUTimer timer;
-    QEMUTimer timeout_timer;
-
     /* TIMG_RTCCALICFG_REG's and RTCCALICFG2's R/W fields as stored. */
     uint32_t cfg;
     uint32_t cfg2;
@@ -132,14 +129,14 @@ typedef struct ESP32P4TimgCal {
     uint32_t value;
 
     /*
-     * The measurement under way: one-shot or cycling, whether the measured
-     * clock's first edge has come, the cycles to count, the measured
-     * clock's cycles counted since it did, up to the measured clock's
-     * cycle @first (of the timer group's @cal_edges; the first edge's,
-     * before it comes), XTAL_CLK's edges by that first edge (of the timer
-     * group's @xtal_base on), and the time of its next event; and for its
-     * timeout, XTAL_CLK's cycles since it began, up to XTAL_CLK's cycle
-     * @xtal_first (of @xtal_edges).
+     * The measurement under way, as of the last time the unit was brought
+     * up to date: one-shot or cycling, whether the measured clock's first
+     * edge had come, the cycles to count, the measured clock's cycles
+     * counted since it did, up to the measured clock's cycle @first (of
+     * the timer group's @cal_edges; the first edge's, before it comes),
+     * and XTAL_CLK's edges by that first edge (of the timer group's
+     * @xtal_base on); and for its timeout, XTAL_CLK's cycles since it
+     * began, up to XTAL_CLK's cycle @xtal_first (of @xtal_edges).
      */
     bool active;
     bool oneshot;
@@ -148,11 +145,14 @@ typedef struct ESP32P4TimgCal {
     uint64_t cycles;
     uint64_t xtal_at_first;
     uint64_t first;
-    int64_t event_ns;
     uint64_t since_start;
     uint64_t xtal_first;
-    /* A cycling measurement waits after a timeout before starting again. */
+    /*
+     * A cycling measurement waits after a timeout before starting again,
+     * at XTAL_CLK's cycle @restart_at (of @xtal_edges).
+     */
     bool restart_pending;
+    uint64_t restart_at;
 } ESP32P4TimgCal;
 
 struct ESP32P4TimgState {

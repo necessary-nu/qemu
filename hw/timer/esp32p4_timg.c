@@ -77,16 +77,25 @@
  * A rising edge of TIMG_RTC_CALI_START starts a one-shot measurement,
  * clearing TIMG_RTC_CALI_RDY, which its end sets; clearing START abandons
  * it. TIMG_RTC_CALI_START_CYCLING (set at reset) measures continuously,
- * each end setting TIMG_RTC_CALI_CYCLING_DATA_VLD, which a rising edge of
- * START_CYCLING clears. A measurement that has run more XTAL_CLK cycles
- * than TIMG_RTC_CALI_TIMEOUT_THRES without ending is abandoned with
+ * each measurement beginning where the last ended and each end setting
+ * TIMG_RTC_CALI_CYCLING_DATA_VLD, which a rising edge of START_CYCLING
+ * clears. A measurement that has run more XTAL_CLK cycles than
+ * TIMG_RTC_CALI_TIMEOUT_THRES without ending is abandoned with
  * TIMG_RTC_CALI_TIMEOUT set, which stays set until software starts a
  * measurement; a cycling one starts again TIMG_RTC_CALI_TIMEOUT_RST_CNT
  * XTAL_CLK cycles later. A measured clock that does not run (a source
  * that is powered down or gated, or timer group 1's, which has none) never
  * ends, so only the timeout does. Clock changes during a measurement are
- * folded in. The clock and cycle count are latched as a measurement
- * starts.
+ * folded in, the measurement going on at the new edges from the change.
+ * The clock and cycle count are latched as a measurement starts. Nothing
+ * outside the block sees a measurement end (the unit has no interrupt or
+ * ETM event), so the model keeps no QEMU timer for it: an access to its
+ * registers, or a change of either clock, brings it up to that moment
+ * from the two clocks' edges (timg_cal_advance()). Cycling from reset on
+ * the 500 MHz MPLL_CLK, a measurement ends every 4 ns; the measurements
+ * whose outcome the two clocks' periods settle are passed over in one go,
+ * so that what the unit costs the host does not depend on the clocks'
+ * rates.
  *
  * Interrupts. TIMG_Tx_INT and TIMG_WDT_INT are levels, each its raw bit
  * and enable (sources TGn_T0, TGn_T1 and TGn_WDT of the interrupt matrix).
@@ -599,109 +608,66 @@ static void timg_set_spi_boot(void *opaque, int n, int level)
 
 /* The RTC calibration unit -------------------------------------------- */
 
-static bool timg_cal_counting_clocks(ESP32P4TimgState *s)
+static bool timg_cal_xtal_runs(ESP32P4TimgState *s)
 {
-    return clock_is_enabled(s->xtal) && clock_is_enabled(s->cal_clk);
+    return esp32p4_clk_count_running(&s->xtal_edges);
 }
 
-/*
- * XTAL_CLK's edges since the timer group's reset by the end of the
- * measured clock's cycle @k, at the two clocks' exact edges, whatever
- * their periods and phases.
- */
-static uint64_t timg_cal_xtal_at(ESP32P4TimgState *s, uint64_t k)
+static bool timg_cal_clk_runs(ESP32P4TimgState *s)
 {
-    return s->xtal_base +
-           esp32p4_clk_count_at_cycle(&s->xtal_edges, &s->cal_edges, k);
+    return esp32p4_clk_count_running(&s->cal_edges);
 }
 
-/*
- * Count the measurement up to @now at the clocks' current rates, ahead of
- * a change of rate: once counting, whole cycles of the measured clock;
- * and XTAL_CLK's cycles since the start, for the timeout.
- */
-static void timg_cal_fold(ESP32P4TimgState *s, int64_t now)
+/* XTAL_CLK's cycles (of @xtal_edges) by the end of measured cycle @k. */
+static uint64_t timg_cal_xtal_by(ESP32P4TimgState *s, uint64_t k)
 {
-    ESP32P4TimgCal *c = &s->cal;
-    uint64_t at = esp32p4_clk_count_at(&s->cal_edges, now);
-    uint64_t xtal_at = esp32p4_clk_count_at(&s->xtal_edges, now);
-
-    if (c->active && c->counting && timg_cal_counting_clocks(s) &&
-        at > c->first) {
-        /* The end has not come: the count is short of the target. */
-        c->cycles += MIN(at - c->first, c->target - c->cycles - 1);
-    }
-    c->first = at;
-    if (c->active && xtal_at > c->xtal_first) {
-        c->since_start += xtal_at - c->xtal_first;
-    }
-    c->xtal_first = xtal_at;
+    return esp32p4_clk_count_at_cycle(&s->xtal_edges, &s->cal_edges, k);
 }
 
-/* Schedule the measurement's next event, its first edge or its end. */
-static void timg_cal_arm(ESP32P4TimgState *s, int64_t now)
+/* The measured clock's cycles (of @cal_edges) by XTAL_CLK's cycle @i. */
+static uint64_t timg_cal_clk_by(ESP32P4TimgState *s, uint64_t i)
 {
-    ESP32P4TimgCal *c = &s->cal;
-
-    timer_del(&c->timer);
-    if (!c->active || !timg_cal_counting_clocks(s)) {
-        return;
-    }
-    if (!c->counting) {
-        c->first = esp32p4_clk_count_at(&s->cal_edges, now) + 1;
-        c->event_ns = esp32p4_clk_count_time(&s->cal_edges, c->first);
-    } else {
-        c->event_ns = esp32p4_clk_count_time(&s->cal_edges, c->first +
-                                             c->target - c->cycles);
-    }
-    timer_mod(&c->timer, MIN(c->event_ns, INT64_MAX / 4));
+    return esp32p4_clk_count_at_cycle(&s->cal_edges, &s->xtal_edges, i);
 }
 
-/* Schedule the timeout: when XTAL_CLK's count exceeds the threshold. */
-static void timg_cal_arm_timeout(ESP32P4TimgState *s, int64_t now)
+/* The XTAL_CLK cycles that time a measurement out: one past the threshold. */
+static uint64_t timg_cal_limit(ESP32P4TimgCal *c)
 {
-    ESP32P4TimgCal *c = &s->cal;
-    uint64_t need = (uint64_t)CAL2_THRES(c->cfg2) + 1;
-
-    timer_del(&c->timeout_timer);
-    if (!c->active || !clock_is_enabled(s->xtal)) {
-        return;
-    }
-    if (c->since_start >= need) {
-        timer_mod(&c->timeout_timer, now);
-        return;
-    }
-    timer_mod(&c->timeout_timer,
-              MIN(esp32p4_clk_count_time(&s->xtal_edges, c->xtal_first +
-                                         need - c->since_start),
-                  INT64_MAX / 4));
+    return (uint64_t)CAL2_THRES(c->cfg2) + 1;
 }
 
 static void timg_cal_stop(ESP32P4TimgState *s)
 {
-    timer_del(&s->cal.timer);
-    timer_del(&s->cal.timeout_timer);
     s->cal.active = false;
     s->cal.restart_pending = false;
 }
 
-/*
- * [spec:nuos:req:emu.esp32p4.timers]
- * Begin a measurement; one software starts clears TIMG_RTC_CALI_TIMEOUT.
- */
-static void timg_cal_begin(ESP32P4TimgState *s, bool oneshot,
-                           bool by_software, int64_t now)
+static void timg_cal_start(ESP32P4TimgState *s, bool oneshot)
 {
     ESP32P4TimgCal *c = &s->cal;
 
-    timg_cal_stop(s);
     c->active = true;
+    c->restart_pending = false;
     c->oneshot = oneshot;
     c->counting = false;
     c->target = CAL_MAX(c->cfg);
     c->cycles = 0;
     c->xtal_at_first = 0;
     c->since_start = 0;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * Begin a measurement at @now; one software starts clears
+ * TIMG_RTC_CALI_TIMEOUT.
+ */
+static void timg_cal_begin(ESP32P4TimgState *s, bool oneshot,
+                           bool by_software, int64_t now)
+{
+    ESP32P4TimgCal *c = &s->cal;
+
+    timg_cal_start(s, oneshot);
+    c->first = esp32p4_clk_count_at(&s->cal_edges, now) + 1;
     c->xtal_first = esp32p4_clk_count_at(&s->xtal_edges, now);
     if (by_software) {
         c->timeout = false;
@@ -709,51 +675,54 @@ static void timg_cal_begin(ESP32P4TimgState *s, bool oneshot,
     if (oneshot) {
         c->rdy = false;
     }
-    timg_cal_arm(s, now);
-    timg_cal_arm_timeout(s, now);
+}
+
+/* A cycling measurement begins at the end of measured cycle @k. */
+static void timg_cal_begin_at_clk(ESP32P4TimgState *s, uint64_t k)
+{
+    timg_cal_start(s, false);
+    s->cal.first = k + 1;
+    s->cal.xtal_first = timg_cal_xtal_by(s, k);
+}
+
+/* A cycling measurement begins at the end of XTAL_CLK's cycle @i. */
+static void timg_cal_begin_at_xtal(ESP32P4TimgState *s, uint64_t i)
+{
+    timg_cal_start(s, false);
+    s->cal.first = timg_cal_clk_by(s, i) + 1;
+    s->cal.xtal_first = i;
 }
 
 /*
  * [spec:nuos:req:emu.esp32p4.timers]
- * The measurement's event at @when: its first edge, from which it counts,
- * or its end. A cycling measurement waiting after a timeout starts again.
+ * The measurement ends at the end of measured cycle @e: the value is
+ * XTAL_CLK's edges since its first edge. A cycling one begins again there.
  */
-static void timg_cal_event(ESP32P4TimgState *s, int64_t when)
+static void timg_cal_end(ESP32P4TimgState *s, uint64_t e)
 {
     ESP32P4TimgCal *c = &s->cal;
+    uint64_t at_first = c->counting ? c->xtal_at_first :
+                        s->xtal_base + timg_cal_xtal_by(s, c->first);
 
-    if (!c->active) {
-        if (c->restart_pending && (c->cfg & CAL_START_CYCLING)) {
-            timg_cal_begin(s, false, false, when);
-        }
-        return;
-    }
-    if (!c->counting) {
-        c->counting = true;
-        c->xtal_at_first = timg_cal_xtal_at(s, c->first);
-        if (c->target) {
-            timg_cal_arm(s, when);
-            return;
-        }
-        c->value = 0;
-    } else {
-        c->value = extract64(timg_cal_xtal_at(s, c->first + c->target -
-                                                 c->cycles) -
-                             c->xtal_at_first, 0, CAL_VALUE_BITS);
-    }
+    c->value = extract64(s->xtal_base + timg_cal_xtal_by(s, e) - at_first,
+                         0, CAL_VALUE_BITS);
+    timg_cal_stop(s);
     if (c->oneshot) {
         c->rdy = true;
-    } else {
-        c->vld = true;
+        return;
     }
-    timg_cal_stop(s);
-    if (!c->oneshot && (c->cfg & CAL_START_CYCLING)) {
-        timg_cal_begin(s, false, false, when);
+    c->vld = true;
+    if (c->cfg & CAL_START_CYCLING) {
+        timg_cal_begin_at_clk(s, e);
     }
 }
 
-/* [spec:nuos:req:emu.esp32p4.timers] */
-static void timg_cal_timeout(ESP32P4TimgState *s, int64_t when)
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * The measurement times out at the end of XTAL_CLK's cycle @x. A cycling
+ * one begins again TIMG_RTC_CALI_TIMEOUT_RST_CNT cycles later.
+ */
+static void timg_cal_time_out(ESP32P4TimgState *s, uint64_t x)
 {
     ESP32P4TimgCal *c = &s->cal;
     bool cycling = !c->oneshot;
@@ -762,50 +731,224 @@ static void timg_cal_timeout(ESP32P4TimgState *s, int64_t when)
     c->timeout = true;
     if (cycling && (c->cfg & CAL_START_CYCLING)) {
         c->restart_pending = true;
-        c->event_ns = MAX(esp32p4_clk_count_time(&s->xtal_edges,
-                              esp32p4_clk_count_at(&s->xtal_edges, when) +
-                              CAL2_RST_CNT(c->cfg2)), when);
-        timer_mod(&c->timer, MIN(c->event_ns, INT64_MAX / 4));
+        c->restart_at = x + CAL2_RST_CNT(c->cfg2);
     }
-}
-
-static void timg_cal_cb(void *opaque)
-{
-    ESP32P4TimgState *s = opaque;
-
-    timg_cal_event(s, s->cal.event_ns);
-}
-
-static void timg_cal_timeout_cb(void *opaque)
-{
-    ESP32P4TimgState *s = opaque;
-
-    timg_cal_timeout(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 /*
- * Run the measurement's events that fell due by @now, in order, as of
- * when they did: a QEMU timer can run late, but RDY, the value and the
- * timeout change at their due times.
+ * [spec:nuos:req:emu.esp32p4.clocks]
+ * A cycling measurement has just begun at the end of the measured cycle
+ * at which the last one ended. Its (THRES + 1)th XTAL_CLK edge comes
+ * before its end, RTC_CALI_MAX + 1 measured cycles on, only if THRES
+ * XTAL_CLK cycles last less than those: if they do not, at whatever phase
+ * the two clocks' edges have, no measurement times out, and every one
+ * ends RTC_CALI_MAX + 1 measured cycles after the last. Those that have
+ * ended by measured cycle @now_k are passed over at once, the value of
+ * the last of them taken from its edges.
  */
-static void timg_cal_catch_up(ESP32P4TimgState *s, int64_t now)
+static void timg_cal_skip_ends(ESP32P4TimgState *s, uint64_t now_k)
 {
     ESP32P4TimgCal *c = &s->cal;
+    uint64_t span = (uint64_t)c->target + 1;
+    uint64_t begin = c->first - 1, e;
 
-    for (;;) {
-        int64_t ev = timer_expire_time_ns(&c->timer);
-        int64_t to = timer_expire_time_ns(&c->timeout_timer);
+    if (now_k - begin < span ||
+        esp32p4_clk_cycles_cmp(s->cal_edges.edges.period, span,
+                               s->xtal_edges.edges.period,
+                               timg_cal_limit(c) - 1) > 0) {
+        return;
+    }
+    e = begin + (now_k - begin) / span * span;
+    c->value = extract64(timg_cal_xtal_by(s, e) -
+                         timg_cal_xtal_by(s, e - c->target),
+                         0, CAL_VALUE_BITS);
+    timg_cal_begin_at_clk(s, e);
+}
 
-        if (ev >= 0 && ev <= now && (to < 0 || ev <= to)) {
-            timer_del(&c->timer);
-            timg_cal_event(s, ev);
-        } else if (to >= 0 && to <= now) {
-            timer_del(&c->timeout_timer);
-            timg_cal_timeout(s, to);
-        } else {
+/*
+ * [spec:nuos:req:emu.esp32p4.clocks]
+ * A cycling measurement has just begun at an XTAL_CLK edge, after a
+ * timeout. Its end comes RTC_CALI_MAX measured cycles after the measured
+ * clock's first edge, by its (THRES + 1)th XTAL_CLK edge only if those
+ * last less than THRES + 1 XTAL_CLK cycles: if they do not, or the
+ * measured clock is stopped, no measurement ends, and every one times out
+ * THRES + 1 XTAL_CLK cycles after it begins and begins again
+ * TIMG_RTC_CALI_TIMEOUT_RST_CNT cycles later. Those that have begun again
+ * by XTAL_CLK's cycle @now_x are passed over at once.
+ */
+static void timg_cal_skip_timeouts(ESP32P4TimgState *s, uint64_t now_x)
+{
+    ESP32P4TimgCal *c = &s->cal;
+    uint64_t limit = timg_cal_limit(c);
+    uint64_t period = limit + CAL2_RST_CNT(c->cfg2);
+    uint64_t begin = c->xtal_first;
+
+    if (now_x - begin < period ||
+        (timg_cal_clk_runs(s) &&
+         esp32p4_clk_cycles_cmp(s->cal_edges.edges.period, c->target,
+                                s->xtal_edges.edges.period, limit) < 0)) {
+        return;
+    }
+    timg_cal_begin_at_xtal(s, begin + (now_x - begin) / period * period);
+}
+
+/*
+ * Between those bounds, with THRES within a cycle of either clock of the
+ * measurement's length, whether a cycling measurement ends or times out
+ * depends on where it begins among the two clocks' edges. Each begins at
+ * an edge of one of them, the last one's end or its timeout's restart,
+ * and two that begin at an edge of the same clock, a whole number of both
+ * clocks' periods apart, begin the same sequence of measurements: the
+ * clocks' periods are in a ratio of whole numbers, so the beginnings come
+ * round again. Brent's cycle finding (R. P. Brent, "An improved Monte
+ * Carlo factorization algorithm", BIT 20, 1980) finds the repeat as the
+ * measurements are stepped through, and the whole repeats that have run
+ * by then are passed over at once: the values, CYCLING_DATA_VLD and
+ * TIMEOUT that each leaves are those the first one left.
+ */
+typedef struct TimgCalCycle {
+    /* The marked beginning: at a measured clock edge, or XTAL_CLK's. */
+    bool at_clk;
+    /* Both clocks' cycles by then. */
+    uint64_t k;
+    uint64_t x;
+    uint64_t power;
+    uint64_t len;
+    bool done;
+} TimgCalCycle;
+
+static void timg_cal_cycle_step(ESP32P4TimgState *s, TimgCalCycle *cy,
+                                bool at_clk, uint64_t now_k, uint64_t now_x)
+{
+    ESP32P4TimgCal *c = &s->cal;
+    uint64_t k = c->first - 1, x = c->xtal_first, dk, dx;
+
+    if (cy->done) {
+        return;
+    }
+    if (cy->len && cy->at_clk == at_clk) {
+        dk = k - cy->k;
+        dx = x - cy->x;
+        if (esp32p4_clk_cycles_cmp(s->cal_edges.edges.period, dk,
+                                   s->xtal_edges.edges.period, dx) == 0) {
+            if (at_clk) {
+                timg_cal_begin_at_clk(s, k + (now_k - k) / dk * dk);
+            } else {
+                timg_cal_begin_at_xtal(s, x + (now_x - x) / dx * dx);
+            }
+            cy->done = true;
             return;
         }
     }
+    if (!cy->len || cy->len == cy->power) {
+        if (cy->len) {
+            cy->power *= 2;
+        }
+        cy->at_clk = at_clk;
+        cy->k = k;
+        cy->x = x;
+        cy->len = 0;
+    }
+    cy->len++;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * [spec:nuos:req:emu.esp32p4.clocks]
+ * Bring the unit up to @now: every end and timeout by then, in order,
+ * each at the exact edge it comes at, of the clocks as they have run
+ * since they last changed. Neither counter counts without XTAL_CLK.
+ */
+static void timg_cal_advance(ESP32P4TimgState *s, int64_t now)
+{
+    ESP32P4TimgCal *c = &s->cal;
+    TimgCalCycle cy = { .power = 1 };
+    uint64_t now_k, now_x, limit, x, e;
+
+    if (!timg_cal_xtal_runs(s)) {
+        return;
+    }
+    now_k = esp32p4_clk_count_at(&s->cal_edges, now);
+    now_x = esp32p4_clk_count_at(&s->xtal_edges, now);
+    limit = timg_cal_limit(c);
+    for (;;) {
+        if (!c->active) {
+            if (!c->restart_pending || c->restart_at > now_x) {
+                return;
+            }
+            timg_cal_begin_at_xtal(s, c->restart_at);
+            timg_cal_skip_timeouts(s, now_x);
+            timg_cal_cycle_step(s, &cy, false, now_k, now_x);
+            continue;
+        }
+        x = c->xtal_first + (c->since_start < limit ?
+                             limit - c->since_start : 0);
+        e = c->first + c->target - c->cycles;
+        if (c->since_start < limit && timg_cal_clk_runs(s) &&
+            timg_cal_clk_by(s, x) >= e) {
+            if (e > now_k) {
+                return;
+            }
+            timg_cal_end(s, e);
+            if (c->active) {
+                timg_cal_skip_ends(s, now_k);
+                timg_cal_cycle_step(s, &cy, true, now_k, now_x);
+            }
+        } else {
+            if (x > now_x) {
+                return;
+            }
+            timg_cal_time_out(s, x);
+        }
+    }
+}
+
+/*
+ * Ahead of a change of either clock at @now, with the unit up to then:
+ * count the measurement's progress in the clocks' cycles so far, the
+ * measured clock's in @cycles and XTAL_CLK's in @since_start, and the
+ * XTAL_CLK cycles a restart still waits.
+ */
+static void timg_cal_fold(ESP32P4TimgState *s, int64_t now)
+{
+    ESP32P4TimgCal *c = &s->cal;
+    uint64_t now_k = esp32p4_clk_count_at(&s->cal_edges, now);
+    uint64_t now_x = esp32p4_clk_count_at(&s->xtal_edges, now);
+
+    if (c->restart_pending) {
+        c->restart_at -= now_x;
+    }
+    if (!c->active || !timg_cal_xtal_runs(s)) {
+        return;
+    }
+    if (timg_cal_clk_runs(s)) {
+        if (!c->counting && c->first <= now_k) {
+            c->counting = true;
+            c->xtal_at_first = s->xtal_base +
+                               timg_cal_xtal_by(s, c->first);
+        }
+        if (c->counting) {
+            c->cycles += now_k - c->first;
+        }
+    }
+    c->since_start += now_x - c->xtal_first;
+}
+
+/*
+ * After the change: the measurement goes on from @now at the clocks' new
+ * edges, a measurement waiting for its first edge taking the next one.
+ */
+static void timg_cal_rebase(ESP32P4TimgState *s, int64_t now)
+{
+    ESP32P4TimgCal *c = &s->cal;
+    uint64_t now_k = esp32p4_clk_count_at(&s->cal_edges, now);
+    uint64_t now_x = esp32p4_clk_count_at(&s->xtal_edges, now);
+
+    if (c->restart_pending) {
+        c->restart_at += now_x;
+    }
+    c->first = c->counting ? now_k : now_k + 1;
+    c->xtal_first = now_x;
 }
 
 /* [spec:nuos:req:emu.esp32p4.timers] */
@@ -831,8 +974,30 @@ static void timg_cal_write(ESP32P4TimgState *s, uint32_t value, int64_t now)
 }
 
 /*
- * A clock of the calibration is about to change rate, or has: its cycles
- * begin afresh from the change.
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * A threshold lowered to below the XTAL_CLK cycles a measurement has run
+ * times it out at once.
+ */
+static void timg_cal_write2(ESP32P4TimgState *s, uint32_t value, int64_t now)
+{
+    ESP32P4TimgCal *c = &s->cal;
+    uint64_t now_x;
+
+    c->cfg2 = value & CAL2_RW;
+    if (!c->active || !timg_cal_xtal_runs(s)) {
+        return;
+    }
+    now_x = esp32p4_clk_count_at(&s->xtal_edges, now);
+    if (c->since_start + (now_x - c->xtal_first) >= timg_cal_limit(c)) {
+        timg_cal_time_out(s, now_x);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.clocks]
+ * A clock of the calibration is about to change rate, or has: the
+ * measurement is counted up to the change at the old edges and goes on at
+ * the new.
  */
 static void timg_cal_clock_update(ESP32P4TimgState *s, ClockEvent event,
                                   bool xtal)
@@ -840,7 +1005,7 @@ static void timg_cal_clock_update(ESP32P4TimgState *s, ClockEvent event,
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (event == ClockPreUpdate) {
-        timg_cal_catch_up(s, now);
+        timg_cal_advance(s, now);
         timg_cal_fold(s, now);
         if (xtal) {
             s->xtal_base += esp32p4_clk_count_at(&s->xtal_edges, now);
@@ -849,15 +1014,10 @@ static void timg_cal_clock_update(ESP32P4TimgState *s, ClockEvent event,
     }
     if (xtal) {
         esp32p4_clk_count_start(&s->xtal_edges, s->xtal, now);
-        s->cal.xtal_first = 0;
     } else {
         esp32p4_clk_count_start(&s->cal_edges, s->cal_clk, now);
-        s->cal.first = 0;
     }
-    if (s->cal.active) {
-        timg_cal_arm(s, now);
-        timg_cal_arm_timeout(s, now);
-    }
+    timg_cal_rebase(s, now);
 }
 
 static void timg_xtal_update(void *opaque, ClockEvent event)
@@ -881,9 +1041,17 @@ static bool timg_catch_up(ESP32P4TimgState *s, int64_t now)
     for (x = 0; x < ESP32P4_TIMG_TIMERS; x++) {
         timg_timer_catch_up(s, x, now);
     }
-    timg_cal_catch_up(s, now);
     timg_wdt_catch_up(s, now);
     return s->reset_count == resets;
+}
+
+/* Bring the calibration unit up to @now for an access to its registers. */
+static void timg_cal_access(ESP32P4TimgState *s, hwaddr addr, int64_t now)
+{
+    if (addr == A_RTCCALICFG || addr == A_RTCCALICFG1 ||
+        addr == A_RTCCALICFG2) {
+        timg_cal_advance(s, now);
+    }
 }
 
 /* The register at word offset @addr; false for a reserved offset. */
@@ -971,9 +1139,11 @@ static bool timg_read_reg(ESP32P4TimgState *s, hwaddr addr, uint32_t *v)
 static uint64_t timg_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4TimgState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t v;
 
-    timg_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    timg_catch_up(s, now);
+    timg_cal_access(s, addr & ~3, now);
     if (!timg_read_reg(s, addr & ~3, &v)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s%u: read of reserved offset 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_TIMG, s->group, addr);
@@ -1094,8 +1264,7 @@ static void timg_write_reg(ESP32P4TimgState *s, hwaddr addr, uint32_t value,
         timg_cal_write(s, value, now);
         break;
     case A_RTCCALICFG2:
-        s->cal.cfg2 = value & CAL2_RW;
-        timg_cal_arm_timeout(s, now);
+        timg_cal_write2(s, value, now);
         break;
     case A_INT_ENA:
         s->int_ena = value & INT_MASK;
@@ -1138,6 +1307,7 @@ static void timg_write(void *opaque, hwaddr addr, uint64_t data,
     if (!timg_catch_up(s, now)) {
         return;
     }
+    timg_cal_access(s, addr & ~3, now);
     timg_read_reg(s, addr & ~3, &old);
     timg_write_reg(s, addr & ~3, (old & ~lanes) | ones, ones, now);
 }
@@ -1289,9 +1459,6 @@ static void esp32p4_timg_init(Object *obj)
                       &s->t[i]);
     }
     timer_init_ns(&s->wdt.timer, QEMU_CLOCK_VIRTUAL, timg_wdt_cb, s);
-    timer_init_ns(&s->cal.timer, QEMU_CLOCK_VIRTUAL, timg_cal_cb, s);
-    timer_init_ns(&s->cal.timeout_timer, QEMU_CLOCK_VIRTUAL,
-                  timg_cal_timeout_cb, s);
     for (i = 0; i <= ESP32P4_TIMG_TIMERS; i++) {
         sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[i]);
     }
@@ -1367,11 +1534,9 @@ static const VMStateDescription vmstate_esp32p4_timg_wdt = {
 
 static const VMStateDescription vmstate_esp32p4_timg_cal = {
     .name = TYPE_ESP32P4_TIMG "/cal",
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
-        VMSTATE_TIMER(timer, ESP32P4TimgCal),
-        VMSTATE_TIMER(timeout_timer, ESP32P4TimgCal),
         VMSTATE_UINT32(cfg, ESP32P4TimgCal),
         VMSTATE_UINT32(cfg2, ESP32P4TimgCal),
         VMSTATE_BOOL(rdy, ESP32P4TimgCal),
@@ -1385,24 +1550,24 @@ static const VMStateDescription vmstate_esp32p4_timg_cal = {
         VMSTATE_UINT64(cycles, ESP32P4TimgCal),
         VMSTATE_UINT64(xtal_at_first, ESP32P4TimgCal),
         VMSTATE_UINT64(first, ESP32P4TimgCal),
-        VMSTATE_INT64(event_ns, ESP32P4TimgCal),
         VMSTATE_UINT64(since_start, ESP32P4TimgCal),
         VMSTATE_UINT64(xtal_first, ESP32P4TimgCal),
         VMSTATE_BOOL(restart_pending, ESP32P4TimgCal),
+        VMSTATE_UINT64(restart_at, ESP32P4TimgCal),
         VMSTATE_END_OF_LIST()
     },
 };
 
 static const VMStateDescription vmstate_esp32p4_timg = {
     .name = TYPE_ESP32P4_TIMG,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(t, ESP32P4TimgState, ESP32P4_TIMG_TIMERS, 2,
                              vmstate_esp32p4_timg_timer, ESP32P4TimgTimer),
         VMSTATE_STRUCT(wdt, ESP32P4TimgState, 2, vmstate_esp32p4_timg_wdt,
                        ESP32P4TimgWdt),
-        VMSTATE_STRUCT(cal, ESP32P4TimgState, 3, vmstate_esp32p4_timg_cal,
+        VMSTATE_STRUCT(cal, ESP32P4TimgState, 4, vmstate_esp32p4_timg_cal,
                        ESP32P4TimgCal),
         VMSTATE_CLOCK(xtal, ESP32P4TimgState),
         VMSTATE_CLOCK(cal_clk, ESP32P4TimgState),
