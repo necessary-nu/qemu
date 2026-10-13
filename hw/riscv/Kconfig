@@ -18,12 +18,15 @@ config ESP32P4
     select DWC_SDMMC
     select ESP32_DWMAC
     select ESP32P4_USB
+    select ES8311
     select ESP32_LINE
     select ESP32_MCPWM
     select ESP32_UART_LINE
     select I2C
+    select I2C_WIRE_BUS
     select I3C
     select LCD_PANEL
+    select NS4150
     select OR_IRQ
     select SSI
     select SPLIT_IRQ

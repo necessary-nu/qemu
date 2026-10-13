@@ -123,11 +123,17 @@
  * those that come while a period runs wait for its end and are then
  * taken in the order of their events' times, each at its own.
  *
- * An audio backend (the machine's audiodev) stands for a codec on each
- * controller's bus: it plays the frames a master transmitter sends (the
- * first two TDM channels, or the PCM2PDM converter's input), and gives a
- * master receiver the frames it records when nothing on the chip drives
- * its data input, through a PDM modulator in PDM mode.
+ * Devices on the board whose serial audio pins are pads (the board's
+ * codec, esp32p4_i2s_add_peer()) are clocked through the pads as the
+ * controllers clock each other: a TDM master whose BCK output the
+ * matrices route to a device's SCLK pad runs each of its periods through
+ * it, cycle by cycle, LRCK being the pad's level or, routed there, the
+ * master's WS, and the device's data input the bit of the transmitter on
+ * the same clock whose data output reaches its pad, or the pad's level;
+ * a receiver whose data input the matrices take from the device's data
+ * output pad receives the device's bits, or the pad's level where the
+ * device does not drive it. The pads' inversions apply. A device clocked
+ * by a PDM master takes no part (logged): the PDM clock on WS is no LRCK.
  */
 
 #include "qemu/osdep.h"
@@ -504,6 +510,8 @@ static const char *i2s_name(ESP32P4I2sState *s)
 }
 
 static void i2s_update_units(ESP32P4I2sState *s, bool reanchor);
+static int64_t unit_event_time(ESP32P4I2sState *s, ESP32P4I2sUnit *u,
+                               uint64_t n);
 static void i2s_tx_resume(ESP32P4I2sState *s);
 static void i2s_rx_flush(ESP32P4I2sState *s);
 static void i2s_hung_update(ESP32P4I2sState *s, ESP32P4I2sUnit *u,
@@ -1043,179 +1051,6 @@ static void i2s_rx_hung_cb(void *opaque)
     i2s_raise(s, i2s_is_lp(s) ? LP_INT_RX_HUNG : INT_RX_HUNG);
 }
 
-/* ---- Audio backend ---- */
-
-static void i2s_audio_out_cb(void *opaque, int free)
-{
-    ESP32P4I2sState *s = opaque;
-    int bytes = s->audio_out_bits / 8;
-    int frame = 2 * bytes;
-    uint8_t buf[4096];
-
-    while (s->audio_out_num && free >= frame) {
-        int n = MIN(MIN(s->audio_out_num, free / frame),
-                    (int)sizeof(buf) / frame);
-        size_t done;
-
-        for (int i = 0; i < n; i++) {
-            uint32_t k = (s->audio_out_head + i) % ESP32P4_I2S_AUDIO_FRAMES;
-
-            for (int c = 0; c < 2; c++) {
-                if (bytes == 2) {
-                    stw_le_p(buf + i * frame + c * 2, s->audio_out[k][c]);
-                } else {
-                    stl_le_p(buf + i * frame + c * 4, s->audio_out[k][c]);
-                }
-            }
-        }
-        done = audio_be_write(s->audio_be, s->voice_out, buf, n * frame);
-        n = done / frame;
-        if (n == 0) {
-            break;
-        }
-        s->audio_out_head = (s->audio_out_head + n) %
-                            ESP32P4_I2S_AUDIO_FRAMES;
-        s->audio_out_num -= n;
-        free -= n * frame;
-    }
-}
-
-static void i2s_audio_in_cb(void *opaque, int avail)
-{
-    ESP32P4I2sState *s = opaque;
-    int bytes = s->audio_in_bits / 8;
-    int frame = 2 * bytes;
-    uint8_t buf[4096];
-
-    while (avail >= frame) {
-        int n = MIN(avail, (int)sizeof(buf)) / frame;
-        size_t got = audio_be_read(s->audio_be, s->voice_in, buf, n * frame);
-
-        n = got / frame;
-        if (n == 0) {
-            break;
-        }
-        for (int i = 0; i < n; i++) {
-            uint32_t k;
-
-            if (s->audio_in_num == ESP32P4_I2S_AUDIO_FRAMES) {
-                s->audio_in_head = (s->audio_in_head + 1) %
-                                   ESP32P4_I2S_AUDIO_FRAMES;
-                s->audio_in_num--;
-            }
-            k = (s->audio_in_head + s->audio_in_num) %
-                ESP32P4_I2S_AUDIO_FRAMES;
-            for (int c = 0; c < 2; c++) {
-                s->audio_in[k][c] = bytes == 2 ?
-                    (int16_t)lduw_le_p(buf + i * frame + c * 2) :
-                    (int32_t)ldl_le_p(buf + i * frame + c * 4);
-            }
-            s->audio_in_num++;
-        }
-        avail -= n * frame;
-    }
-}
-
-/*
- * Open the playback or recording voice for frames of the given rate and
- * width, or close it when freq is 0.
- */
-static void i2s_audio_set(ESP32P4I2sState *s, bool out, int freq, int bits)
-{
-    struct audsettings as = {
-        .freq = freq,
-        .nchannels = 2,
-        .fmt = bits == 16 ? AUDIO_FORMAT_S16 : AUDIO_FORMAT_S32,
-        .big_endian = false,
-    };
-    g_autofree char *name = g_strdup_printf("esp32p4.i2s%u.%s", s->id,
-                                            out ? "out" : "in");
-
-    if (!s->audio_be) {
-        return;
-    }
-    if (out) {
-        if (freq == 0) {
-            if (s->voice_out) {
-                audio_be_set_active_out(s->audio_be, s->voice_out, false);
-            }
-            s->audio_out_num = 0;
-            return;
-        }
-        if (!s->voice_out || freq != s->audio_out_freq ||
-            bits != s->audio_out_bits) {
-            s->voice_out = audio_be_open_out(s->audio_be, s->voice_out, name,
-                                             s, i2s_audio_out_cb, &as);
-            s->audio_out_freq = freq;
-            s->audio_out_bits = bits;
-            s->audio_out_num = 0;
-        }
-        if (s->voice_out) {
-            audio_be_set_active_out(s->audio_be, s->voice_out, true);
-        }
-    } else {
-        if (freq == 0) {
-            if (s->voice_in) {
-                audio_be_set_active_in(s->audio_be, s->voice_in, false);
-            }
-            s->audio_in_num = 0;
-            return;
-        }
-        if (!s->voice_in || freq != s->audio_in_freq ||
-            bits != s->audio_in_bits) {
-            s->voice_in = audio_be_open_in(s->audio_be, s->voice_in, name,
-                                           s, i2s_audio_in_cb, &as);
-            s->audio_in_freq = freq;
-            s->audio_in_bits = bits;
-            s->audio_in_num = 0;
-        }
-        if (s->voice_in) {
-            audio_be_set_active_in(s->audio_be, s->voice_in, true);
-        }
-    }
-}
-
-/* Queue a frame for the codec, MSB-aligned; a backend behind loses some. */
-static void i2s_audio_play(ESP32P4I2sState *s, uint32_t l, uint32_t r)
-{
-    uint32_t k;
-
-    if (!s->voice_out) {
-        return;
-    }
-    if (s->audio_out_num == ESP32P4_I2S_AUDIO_FRAMES) {
-        s->audio_out_head = (s->audio_out_head + 1) %
-                            ESP32P4_I2S_AUDIO_FRAMES;
-        s->audio_out_num--;
-    }
-    k = (s->audio_out_head + s->audio_out_num) % ESP32P4_I2S_AUDIO_FRAMES;
-    s->audio_out[k][0] = s->audio_out_bits == 16 ? (int16_t)(l >> 16)
-                                                 : (int32_t)l;
-    s->audio_out[k][1] = s->audio_out_bits == 16 ? (int16_t)(r >> 16)
-                                                 : (int32_t)r;
-    s->audio_out_num++;
-}
-
-/* The next recorded frame, MSB-aligned; silence when none is waiting. */
-static void i2s_audio_record(ESP32P4I2sState *s, uint32_t *l, uint32_t *r)
-{
-    uint32_t k = s->audio_in_head;
-
-    if (s->audio_in_num == 0) {
-        *l = *r = 0;
-        return;
-    }
-    if (s->audio_in_bits == 16) {
-        *l = (uint32_t)(uint16_t)s->audio_in[k][0] << 16;
-        *r = (uint32_t)(uint16_t)s->audio_in[k][1] << 16;
-    } else {
-        *l = s->audio_in[k][0];
-        *r = s->audio_in[k][1];
-    }
-    s->audio_in_head = (s->audio_in_head + 1) % ESP32P4_I2S_AUDIO_FRAMES;
-    s->audio_in_num--;
-}
-
 /* ---- The PDM converters ---- */
 
 /*
@@ -1585,10 +1420,6 @@ static bool pdm_tx_cycle(ESP32P4I2sState *s, const I2sCfg *c, bool master,
                 u->pdm[h].word = d[src[h]] & mask_bits(c->bits);
             }
         }
-        if (master && c->conv) {
-            i2s_audio_play(s, (uint32_t)u->pdm[0].pcm << 16,
-                           (uint32_t)u->pdm[1].pcm << 16);
-        }
     }
     for (int h = 0; h < 2; h++) {
         if (c->conv) {
@@ -1721,11 +1552,10 @@ static void tdm_rx_slot(ESP32P4I2sState *s, const I2sCfg *c, uint32_t k,
 
 /*
  * [spec:nuos:req:emu.esp32p4.i2s]
- * One BCK cycle of a TDM receiver: WS ws, data bit sd. With codec, the
- * audio backend drives the data line, its frame taken at each sync.
+ * One BCK cycle of a TDM receiver: WS ws, data bit sd.
  */
 static void tdm_rx_cycle(ESP32P4I2sState *s, const I2sCfg *c, bool ws,
-                         bool sd, int boundary, bool codec)
+                         bool sd, int boundary)
 {
     ESP32P4I2sUnit *u = &s->rx;
     ESP32P4I2sFrame *f[2] = { &u->prev, &u->cur };
@@ -1733,13 +1563,6 @@ static void tdm_rx_cycle(ESP32P4I2sState *s, const I2sCfg *c, bool ws,
 
     if (frame_sync(u, c, ws, boundary)) {
         frame_new(u, c);
-        if (codec) {
-            uint32_t l, r;
-
-            i2s_audio_record(s, &l, &r);
-            u->codec[0] = l >> (32 - c->cb);
-            u->codec[1] = r >> (32 - c->cb);
-        }
     }
     for (int i = 0; i < 2; i++) {
         int64_t p;
@@ -1754,12 +1577,8 @@ static void tdm_rx_cycle(ESP32P4I2sState *s, const I2sCfg *c, bool ws,
         p = (int64_t)f[i]->pos - shift;
         if (p >= 0 && p < span) {
             uint32_t k = p / c->cb, b = p % c->cb;
-            bool bit = sd;
 
-            if (codec) {
-                bit = k < 2 && ((u->codec[k] >> (c->cb - 1 - b)) & 1);
-            }
-            f[i]->slot[k] |= (uint32_t)bit << (c->cb - 1 - b);
+            f[i]->slot[k] |= (uint32_t)sd << (c->cb - 1 - b);
             if (b == c->cb - 1) {
                 tdm_rx_slot(s, c, k, f[i]->slot[k]);
             }
@@ -1811,23 +1630,6 @@ static void pdm_rx_cycle(ESP32P4I2sState *s, const I2sCfg *c,
             }
         }
     }
-}
-
-/* The audio backend as a PDM microphone: a modulator per channel. */
-static void pdm_codec_cycle(ESP32P4I2sState *s, const I2sCfg *c,
-                            uint8_t bits[2])
-{
-    ESP32P4I2sUnit *u = &s->rx;
-
-    if (u->pdm_bit == 0) {
-        uint32_t l, r;
-
-        i2s_audio_record(s, &l, &r);
-        u->codec_pdm[0].pcm = (int16_t)(l >> 16);
-        u->codec_pdm[1].pcm = (int16_t)(r >> 16);
-    }
-    bits[0] = pdm_mod_bit(&u->codec_pdm[0]);
-    bits[1] = pdm_mod_bit(&u->codec_pdm[1]);
 }
 
 /* ---- The bus between units ---- */
@@ -1979,10 +1781,30 @@ typedef struct BusUnit {
     uint8_t src_line[4];
     bool src_inv[4];
     bool level[4];
-    bool codec;
+    /* Receivers: each data line's device on the pads (index), or -1 */
+    int peer[4];
+    bool peer_inv[4];
     /* Transmitters: this cycle's bits */
     uint8_t bits[2][2];
 } BusUnit;
+
+/* A device on the pads that a master's period clocks */
+typedef struct BusPeer {
+    const ESP32P4I2sPeer *p;
+    /* LRCK: the master's WS (and whether inverted), or the pad's level */
+    bool lrck_ws;
+    bool lrck_inv;
+    bool lrck_level;
+    /* The data input: a transmitter's line (index, line), or the level */
+    int din_src;
+    uint8_t din_line;
+    bool din_inv;
+    bool din_level;
+    /* This cycle's LRCK and data output, and whether the device drives it */
+    bool lrck;
+    bool dout;
+    bool driven;
+} BusPeer;
 
 static const unsigned rx_sd_lines[4] = {
     ESP32P4_I2S_IN_I_SD, ESP32P4_I2S_IN_I_SD1,
@@ -2015,22 +1837,98 @@ static void bus_stopped(BusUnit *tx, unsigned ntx, BusUnit *rx, unsigned nrx)
 }
 
 /*
+ * The pad input line @line of @c takes its level from, through its
+ * matrix, and whether the matrix inverts it on the way in (-1: none).
+ */
+static int i2s_in_pad(ESP32P4I2sState *c, unsigned line, bool *inv)
+{
+    int sig = in_sig[c->id][line];
+
+    *inv = false;
+    if (sig < 0 || !c->gpio) {
+        return -1;
+    }
+    if (i2s_is_lp(c)) {
+        *inv = esp32p4_gpio_lp_sig_in_inverted(c->gpio, sig);
+        return esp32p4_gpio_lp_sig_in_pad(c->gpio, sig);
+    }
+    *inv = esp32p4_gpio_sig_in_inverted(c->gpio, sig);
+    return esp32p4_gpio_sig_in_pad(c->gpio, sig);
+}
+
+/* Whether pad @pad inverts the output signal it carries. */
+static bool i2s_pad_out_inv(ESP32P4I2sState *c, int pad)
+{
+    bool inv = false;
+
+    if (esp32p4_gpio_pad_out_sig(c->gpio, pad, &inv) < 0) {
+        esp32p4_gpio_lp_pad_out_sig(c->gpio, pad, &inv);
+    }
+    return inv;
+}
+
+/*
  * [spec:nuos:req:emu.esp32p4.i2s]
- * A master unit's period, ncycles BCK cycles, through every unit on its
- * clock. Transmitters drive their bits; a receiver takes the bits of the
- * transmitter on the same clock that the pads connect to each of its data
- * inputs, or that input's level, or, with nothing of the chip driving the
- * data input of a master receiver, the audio backend's. The master
- * transmitter's frames also go to the audio backend.
+ * Whether master unit (m, m_tx) clocks device @p on the pads: its BCK on
+ * the device's SCLK pad. If so, *bp says where its LRCK and data input
+ * come from, among @ntx transmitters on the clock.
+ */
+static bool peer_clocked(ESP32P4I2sState *m, bool m_tx,
+                         const ESP32P4I2sPeer *p, BusUnit *tx, unsigned ntx,
+                         BusPeer *bp)
+{
+    ESP32P4GpioState *g = m->gpio;
+    ESP32P4I2sState *src;
+    unsigned bck_out, ws_out, line;
+
+    unit_clock_lines(m, m_tx, &bck_out, &ws_out, false);
+    if (p->sclk_pad < 0 ||
+        !i2s_pad_source(m, p->sclk_pad, &src, &line) || src != m ||
+        line != bck_out) {
+        return false;
+    }
+    *bp = (BusPeer) { .p = p, .din_src = -1 };
+    if (p->lrck_pad >= 0 && i2s_pad_source(m, p->lrck_pad, &src, &line) &&
+        src == m && line == ws_out) {
+        bp->lrck_ws = true;
+        bp->lrck_inv = i2s_pad_out_inv(m, p->lrck_pad);
+    } else if (p->lrck_pad >= 0) {
+        bp->lrck_level = esp32p4_gpio_pad_level(g, p->lrck_pad);
+    }
+    if (p->din_pad >= 0 && i2s_pad_source(m, p->din_pad, &src, &line) &&
+        (line == ESP32P4_I2S_OUT_O_SD || line == ESP32P4_I2S_OUT_O_SD1)) {
+        for (unsigned i = 0; i < ntx; i++) {
+            if (tx[i].c == src) {
+                bp->din_src = i;
+                bp->din_line = line == ESP32P4_I2S_OUT_O_SD1;
+                bp->din_inv = i2s_pad_out_inv(m, p->din_pad);
+            }
+        }
+    }
+    if (bp->din_src < 0 && p->din_pad >= 0) {
+        bp->din_level = esp32p4_gpio_pad_level(g, p->din_pad);
+    }
+    return true;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.i2s]
+ * A master unit's period, ncycles BCK cycles, through every unit and
+ * every device on the pads on its clock. Transmitters drive their bits; a
+ * device takes LRCK and its data input as the pads carry them, and gives
+ * its data output; a receiver takes the bits of the transmitter on the
+ * same clock that the pads connect to each of its data inputs, or of the
+ * device whose output pad its input takes, or that input's level.
  */
 static void i2s_bus_run(ESP32P4I2sState *m, bool m_tx)
 {
     BusUnit tx[ESP32P4_I2S_COUNT], rx[ESP32P4_I2S_COUNT + 1];
-    unsigned ntx = 0, nrx = 0;
+    BusPeer peers[ESP32P4_I2S_PEERS];
+    unsigned ntx = 0, nrx = 0, npeers = 0;
     ESP32P4I2sUnit *mu = m_tx ? &m->tx : &m->rx;
     I2sCfg mc;
     uint32_t ncycles;
-    bool pdm;
+    bool pdm, stopped = false;
 
     unit_cfg(m, mu, &mc);
     pdm = mc.pdm;
@@ -2092,22 +1990,46 @@ static void i2s_bus_run(ESP32P4I2sState *m, bool m_tx)
             }
         }
     }
+    for (unsigned k = 0; k < m->npeers && m->gpio; k++) {
+        if (!peer_clocked(m, m_tx, &m->peers[k], tx, ntx, &peers[npeers])) {
+            continue;
+        }
+        if (pdm) {
+            if (!m->logged_peer_pdm) {
+                qemu_log_mask(LOG_GUEST_ERROR, "esp32p4_i2s: %s's PDM clock "
+                              "reaches the SCLK of a device on the pads, "
+                              "which takes no PDM\n", i2s_name(m));
+                m->logged_peer_pdm = true;
+            }
+            continue;
+        }
+        npeers++;
+    }
     for (unsigned j = 0; j < nrx; j++) {
         BusUnit *r = &rx[j];
-        bool any = false;
 
         for (unsigned l = 0; l < 4; l++) {
             ESP32P4I2sState *src;
             unsigned sl;
+            bool inv;
+            int pad;
 
             r->src[l] = -1;
+            r->peer[l] = -1;
             r->level[l] = in_sig[r->c->id][rx_sd_lines[l]] >= 0 &&
                           i2s_in(r->c, rx_sd_lines[l]);
-            if (!i2s_route(r->c, rx_sd_lines[l], &src, &sl,
+            pad = i2s_in_pad(r->c, rx_sd_lines[l], &inv);
+            for (unsigned k = 0; k < npeers && pad >= 0; k++) {
+                if (peers[k].p->dout_pad == pad) {
+                    r->peer[l] = k;
+                    r->peer_inv[l] = inv;
+                }
+            }
+            if (r->peer[l] >= 0 ||
+                !i2s_route(r->c, rx_sd_lines[l], &src, &sl,
                            &r->src_inv[l])) {
                 continue;
             }
-            any = true;
             for (unsigned i = 0; i < ntx; i++) {
                 if (tx[i].c == src && (sl == ESP32P4_I2S_OUT_O_SD ||
                                        sl == ESP32P4_I2S_OUT_O_SD1)) {
@@ -2116,10 +2038,18 @@ static void i2s_bus_run(ESP32P4I2sState *m, bool m_tx)
                 }
             }
         }
-        r->codec = !any && r->c == m && !m_tx && m->voice_in;
+    }
+    for (unsigned k = 0; k < npeers; k++) {
+        const ESP32P4I2sPeer *p = peers[k].p;
+        int64_t end = esp32_line_time();
+        int64_t start = mu->events ? unit_event_time(m, mu, mu->events - 1)
+                                   : end;
+
+        p->ops->begin(p->opaque, ncycles, start, end,
+                      i2s_pad_out_inv(m, p->sclk_pad));
     }
 
-    for (uint32_t i = 0; i < ncycles; i++) {
+    for (uint32_t i = 0; i < ncycles && !stopped; i++) {
         if (!pdm) {
             bool ws = i < mc.ws_w ? mc.idle_pol : !mc.idle_pol;
             bool stop = false;
@@ -2130,50 +2060,71 @@ static void i2s_bus_run(ESP32P4I2sState *m, bool m_tx)
                                        master ? i == 0 : -1);
 
                 if (bit < 0) {
-                    bus_stopped(tx, ntx, rx, nrx);
-                    return;
+                    stopped = true;
+                    break;
                 }
                 stop |= bit & TX_LAST_CYCLE;
                 tx[t].bits[0][0] = bit & 1;
+            }
+            if (stopped) {
+                break;
+            }
+            for (unsigned k = 0; k < npeers; k++) {
+                BusPeer *bp = &peers[k];
+
+                bp->lrck = bp->lrck_ws ? ws ^ bp->lrck_inv : bp->lrck_level;
+                bp->dout = bp->p->ops->fall(bp->p->opaque, bp->lrck,
+                                            &bp->driven);
             }
             for (unsigned j = 0; j < nrx; j++) {
                 bool sd = rx[j].level[0];
                 bool master = rx[j].c == m && !m_tx;
 
-                if (rx[j].src[0] >= 0) {
+                if (rx[j].peer[0] >= 0) {
+                    BusPeer *bp = &peers[rx[j].peer[0]];
+
+                    if (bp->driven) {
+                        sd = bp->dout ^ rx[j].peer_inv[0];
+                    }
+                } else if (rx[j].src[0] >= 0) {
                     sd = tx[rx[j].src[0]].bits[rx[j].src_line[0]][0] ^
                          rx[j].src_inv[0];
                 }
                 tdm_rx_cycle(rx[j].c, &rx[j].cfg, ws ^ rx[j].inv, sd,
-                             master ? i == 0 : -1, rx[j].codec);
+                             master ? i == 0 : -1);
             }
-            if (stop) {
-                bus_stopped(tx, ntx, rx, nrx);
-                return;
+            for (unsigned k = 0; k < npeers; k++) {
+                BusPeer *bp = &peers[k];
+                bool din = bp->din_level;
+
+                if (bp->din_src >= 0) {
+                    din = tx[bp->din_src].bits[bp->din_line][0] ^
+                          bp->din_inv;
+                }
+                bp->p->ops->rise(bp->p->opaque, bp->lrck, din);
             }
+            stopped = stop;
         } else {
             for (unsigned t = 0; t < ntx; t++) {
                 bool master = tx[t].c == m && m_tx;
 
                 if (!pdm_tx_cycle(tx[t].c, &tx[t].cfg, master,
                                   tx[t].bits)) {
-                    bus_stopped(tx, ntx, rx, nrx);
-                    return;
+                    stopped = true;
+                    break;
                 }
             }
+            if (stopped) {
+                break;
+            }
             for (unsigned j = 0; j < nrx; j++) {
-                uint8_t in[4][2], codec[2];
+                uint8_t in[4][2];
 
-                if (rx[j].codec) {
-                    pdm_codec_cycle(rx[j].c, &rx[j].cfg, codec);
-                }
                 for (unsigned l = 0; l < 4; l++) {
                     for (unsigned h = 0; h < 2; h++) {
                         bool b = rx[j].level[l];
 
-                        if (rx[j].codec) {
-                            b = l == 0 && codec[h];
-                        } else if (rx[j].src[l] >= 0) {
+                        if (rx[j].src[l] >= 0) {
                             b = tx[rx[j].src[l]].bits[rx[j].src_line[l]][h] ^
                                 rx[j].src_inv[l];
                         }
@@ -2183,6 +2134,13 @@ static void i2s_bus_run(ESP32P4I2sState *m, bool m_tx)
                 pdm_rx_cycle(rx[j].c, &rx[j].cfg, in);
             }
         }
+    }
+    for (unsigned k = 0; k < npeers; k++) {
+        peers[k].p->ops->end(peers[k].p->opaque);
+    }
+    if (stopped) {
+        bus_stopped(tx, ntx, rx, nrx);
+        return;
     }
     for (unsigned t = 0; t < ntx; t++) {
         ESP32P4I2sState *c = tx[t].c;
@@ -2194,12 +2152,17 @@ static void i2s_bus_run(ESP32P4I2sState *m, bool m_tx)
             i2s_drive(c, ESP32P4_I2S_OUT_O_SD, last);
         }
     }
-    if (m_tx && !pdm) {
-        uint32_t l = m->tx.cur.slot[0] << (32 - mc.cb);
-        uint32_t r = m->tx.cur.slot[1] << (32 - mc.cb);
+}
 
-        i2s_audio_play(m, l, r);
-    }
+/*
+ * [spec:nuos:req:emu.esp32p4.i2s]
+ * A device on the board on the pads, for every controller that may clock
+ * it to know.
+ */
+void esp32p4_i2s_add_peer(ESP32P4I2sState *s, const ESP32P4I2sPeer *peer)
+{
+    assert(s->npeers < ESP32P4_I2S_PEERS);
+    s->peers[s->npeers++] = *peer;
 }
 
 /* ---- Unit timing ---- */
@@ -2393,8 +2356,6 @@ static void unit_serial_reset(ESP32P4I2sUnit *u)
     memset(&u->prev, 0, sizeof(u->prev));
     u->pdm_bit = 0;
     memset(u->pdm, 0, sizeof(u->pdm));
-    memset(u->codec_pdm, 0, sizeof(u->codec_pdm));
-    u->codec[0] = u->codec[1] = 0;
 }
 
 /*
@@ -2429,13 +2390,6 @@ static unsigned unit_mode(ESP32P4I2sState *s, ESP32P4I2sUnit *u)
     return c.tdm ? MODE_TDM : MODE_PDM;
 }
 
-static int audio_freq(Clock *clk, uint64_t ticks)
-{
-    uint64_t ns = clock_ticks_to_ns(clk, ticks);
-
-    return ns ? (int)((1000000000ull + ns / 2) / ns) : 0;
-}
-
 /*
  * [spec:nuos:req:emu.esp32p4.i2s]
  * Start, stop or retime the units after a change of their configuration,
@@ -2448,7 +2402,6 @@ static void i2s_update_unit(ESP32P4I2sState *s, ESP32P4I2sUnit *u,
     bool tx = u == &s->tx;
     unsigned mode = unit_mode(s, u);
     bool restart = mode != u->mode;
-    Clock *clk = unit_clk(s, u);
     I2sCfg c;
 
     u->mode = mode;
@@ -2496,16 +2449,6 @@ static void i2s_update_unit(ESP32P4I2sState *s, ESP32P4I2sUnit *u,
         u->anchor = now;
         u->events = 0;
         unit_arm(s, u);
-        if (tx) {
-            i2s_audio_set(s, true, mode != MODE_OFF && !c.slave &&
-                          (mode == MODE_TDM || c.conv) ?
-                          audio_freq(clk, u->frame_ticks) : 0,
-                          (mode == MODE_PDM || c.cb <= 16) ? 16 : 32);
-        } else {
-            i2s_audio_set(s, false, mode != MODE_OFF && !c.slave ?
-                          audio_freq(clk, u->frame_ticks) : 0,
-                          (mode == MODE_PDM || c.cb <= 16) ? 16 : 32);
-        }
     }
     i2s_hung_update(s, u, restart);
 }
@@ -2606,7 +2549,7 @@ static void i2s_sig_in(void *opaque, int n, int level)
         unit_clock_lines(s, false, &bck, &ws, true);
         if (c.slave && n == bck && level) {
             tdm_rx_cycle(s, &c, i2s_in(s, ws),
-                         i2s_in(s, ESP32P4_I2S_IN_I_SD), -1, false);
+                         i2s_in(s, ESP32P4_I2S_IN_I_SD), -1);
         }
     }
     i2s_update_irq(s);
@@ -3373,10 +3316,9 @@ static void esp32p4_i2s_reset_hold(Object *obj, ResetType type)
     s->mem_half_valid = false;
     s->mem_half = 0;
     memset(&s->vad, 0, sizeof(s->vad));
-    s->audio_out_num = 0;
-    s->audio_in_num = 0;
     s->logged_conv = false;
     s->logged_slave_clk = false;
+    s->logged_peer_pdm = false;
 }
 
 static void esp32p4_i2s_reset_exit(Object *obj, ResetType type)
@@ -3387,8 +3329,6 @@ static void esp32p4_i2s_reset_exit(Object *obj, ResetType type)
         qemu_set_irq(s->sig_out[i], 0);
     }
     qemu_set_irq(s->wakeup, 0);
-    i2s_audio_set(s, true, 0, 16);
-    i2s_audio_set(s, false, 0, 16);
     i2s_update_irq(s);
 }
 
@@ -3504,8 +3444,8 @@ static const VMStateDescription vmstate_esp32p4_i2s_pdm = {
 
 static const VMStateDescription vmstate_esp32p4_i2s_unit = {
     .name = "esp32p4-i2s.unit",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(conf, ESP32P4I2sUnit),
         VMSTATE_UINT32(conf1, ESP32P4I2sUnit),
@@ -3525,11 +3465,8 @@ static const VMStateDescription vmstate_esp32p4_i2s_unit = {
                        ESP32P4I2sFrame),
         VMSTATE_UINT32_ARRAY(last, ESP32P4I2sUnit, ESP32P4_I2S_SLOTS),
         VMSTATE_UINT32(last_chan, ESP32P4I2sUnit),
-        VMSTATE_UINT32_ARRAY(codec, ESP32P4I2sUnit, 2),
         VMSTATE_UINT32(pdm_bit, ESP32P4I2sUnit),
         VMSTATE_STRUCT_ARRAY(pdm, ESP32P4I2sUnit, ESP32P4_I2S_PDM_CHANS, 1,
-                             vmstate_esp32p4_i2s_pdm, ESP32P4I2sPdmChan),
-        VMSTATE_STRUCT_ARRAY(codec_pdm, ESP32P4I2sUnit, 2, 1,
                              vmstate_esp32p4_i2s_pdm, ESP32P4I2sPdmChan),
         VMSTATE_UINT32(eof_count, ESP32P4I2sUnit),
         VMSTATE_UINT32(words, ESP32P4I2sUnit),
@@ -3567,8 +3504,8 @@ static const VMStateDescription vmstate_esp32p4_i2s_vad = {
 
 static const VMStateDescription vmstate_esp32p4_i2s = {
     .name = TYPE_ESP32P4_I2S,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(apb_clk, ESP32P4I2sState),
         VMSTATE_CLOCK(tx_clk, ESP32P4I2sState),
@@ -3637,7 +3574,6 @@ static const Property esp32p4_i2s_properties[] = {
                      ESP32P4I2sState *),
     DEFINE_PROP_LINK("lp-i2s", ESP32P4I2sState, bus[3], TYPE_ESP32P4_I2S,
                      ESP32P4I2sState *),
-    DEFINE_AUDIO_PROPERTIES(ESP32P4I2sState, audio_be),
 };
 
 static void esp32p4_i2s_class_init(ObjectClass *klass, const void *data)

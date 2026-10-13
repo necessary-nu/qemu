@@ -14,6 +14,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "esp32p4-board-codec.h"
 
 #define PARLIO              0x500cf000
 #define RX_MODE_CFG         (PARLIO + 0x00)
@@ -138,6 +139,8 @@ static QTestState *start(void)
 {
     QTestState *qts = qtest_init("-M esp32p4,flash-size=16M");
 
+    /* GPIO11 carries RXD/TXD 11: the board's codec lets it go. */
+    esp32p4_codec_release_gpio11(qts);
     qtest_writel(qts, SOC_CLK_CTRL1,
                  qtest_readl(qts, SOC_CLK_CTRL1) | PARLIO_SYS_CLK_EN);
     qtest_writel(qts, SOC_CLK_CTRL2,

@@ -13,7 +13,6 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
 #include "hw/misc/esp32p4_clk_period.h"
-#include "qemu/audio.h"
 #include "qemu/notify.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -65,7 +64,8 @@ OBJECT_DECLARE_TYPE(ESP32P4I2sState, ESP32P4I2sClass, ESP32P4_I2S)
  *     (I2Sn_TASK_*), each acting on a rising edge. The LP I2S has neither.
  *   - The LP I2S's named GPIO output "wakeup": LP_I2S_WAKEUP, high while
  *     the VAD is in its voice activity status, for the PMU.
- *   - The audio backend (property "audiodev"): a codec on the bus.
+ *   - Devices on the board on the pads (a codec), esp32p4_i2s_add_peer()
+ *     below: every controller that may clock them knows them.
  */
 #define ESP32P4_I2S_SIG_OUT     "sig-out"
 #define ESP32P4_I2S_SIG_IN      "sig-in"
@@ -126,8 +126,47 @@ enum {
 #define ESP32P4_LP_I2S_MEM_WORDS 256
 /* A VAD frame: 256 samples of 16 bits (TRM 44.2). */
 #define ESP32P4_LP_I2S_VAD_FRAME 256
-/* Frames buffered between a controller and the audio backend. */
-#define ESP32P4_I2S_AUDIO_FRAMES 4096
+/* Devices on the board on the pads, each controller can know */
+#define ESP32P4_I2S_PEERS       2
+
+/*
+ * A device on the board whose serial audio pins are pads (a codec),
+ * which the controllers clock through the pads as they clock each other:
+ * a master whose BCK reaches its SCLK pad runs each of its periods
+ * through it, cycle by cycle (begin(), then for each cycle fall() and
+ * rise(), then end()), with LRCK and the data input as the pads carry
+ * them, the master's WS and its transmitters' bits where the pads take
+ * them; and the receivers whose data input is the device's data output
+ * pad take its bits. Its pads are HP pad numbers (-1: none); a pad the LP
+ * IO MUX holds is reached through the LP matrix.
+ */
+typedef struct ESP32P4I2sPeerOps {
+    /*
+     * A period of @ncycles BCK cycles from @start_ns to @end_ns; BCK
+     * reaches the device's SCLK inverted with @sclk_inverted.
+     */
+    void (*begin)(void *opaque, uint32_t ncycles, int64_t start_ns,
+                  int64_t end_ns, bool sclk_inverted);
+    /*
+     * A cycle's falling edge, LRCK as it leaves it: the device's data
+     * output for the cycle, *driven false while it does not drive it.
+     */
+    bool (*fall)(void *opaque, bool lrck, bool *driven);
+    /* The cycle's rising edge: LRCK and the data input as sampled */
+    void (*rise)(void *opaque, bool lrck, bool din);
+    void (*end)(void *opaque);
+} ESP32P4I2sPeerOps;
+
+typedef struct ESP32P4I2sPeer {
+    int8_t sclk_pad;
+    int8_t lrck_pad;
+    int8_t din_pad;
+    int8_t dout_pad;
+    const ESP32P4I2sPeerOps *ops;
+    void *opaque;
+} ESP32P4I2sPeer;
+
+void esp32p4_i2s_add_peer(ESP32P4I2sState *s, const ESP32P4I2sPeer *peer);
 
 typedef struct ESP32P4I2sFifo {
     uint8_t data[ESP32P4_I2S_FIFO_BYTES];
@@ -149,7 +188,7 @@ typedef struct ESP32P4I2sFrame {
     uint32_t slot[ESP32P4_I2S_SLOTS];
 } ESP32P4I2sFrame;
 
-/* One channel of a PDM converter, or of the PDM codec on the bus. */
+/* One channel of a PDM converter. */
 typedef struct ESP32P4I2sPdmChan {
     /* Sigma-delta: the integrator; decimator: three integrators, combs. */
     int64_t integ[3];
@@ -195,13 +234,10 @@ typedef struct ESP32P4I2sUnit {
     uint32_t last[ESP32P4_I2S_SLOTS];
     /* The last channel data sent, for TX_CHAN_EQUAL. */
     uint32_t last_chan;
-    /* The audio backend's frame, for a receiver it feeds. */
-    uint32_t codec[2];
 
     /* The PDM bit within the current sample, and the converters. */
     uint32_t pdm_bit;
     ESP32P4I2sPdmChan pdm[ESP32P4_I2S_PDM_CHANS];
-    ESP32P4I2sPdmChan codec_pdm[2];
 
     /* Receiver: data stored since the last RX_EOF_NUM run ended. */
     uint32_t eof_count;
@@ -267,9 +303,8 @@ struct ESP32P4I2sState {
     uint8_t id;
     Notifier route_notifier;
     bool mclk_busy;
-    AudioBackend *audio_be;
-    SWVoiceOut *voice_out;
-    SWVoiceIn *voice_in;
+    ESP32P4I2sPeer peers[ESP32P4_I2S_PEERS];
+    unsigned npeers;
 
     /* Registers, as software wrote them. */
     uint32_t int_raw;
@@ -319,18 +354,6 @@ struct ESP32P4I2sState {
     /* The levels of the input signals, as the matrix delivers them. */
     uint32_t in_level;
 
-    /* Frames on their way to and from the audio backend. */
-    int32_t audio_out[ESP32P4_I2S_AUDIO_FRAMES][2];
-    uint32_t audio_out_head;
-    uint32_t audio_out_num;
-    int32_t audio_in[ESP32P4_I2S_AUDIO_FRAMES][2];
-    uint32_t audio_in_head;
-    uint32_t audio_in_num;
-    int audio_out_freq;
-    int audio_out_bits;
-    int audio_in_freq;
-    int audio_in_bits;
-
     /*
      * A master's period is running through the units on its clock; the
      * ETM tasks that come meanwhile wait for its end, keeping the times
@@ -342,6 +365,7 @@ struct ESP32P4I2sState {
 
     bool logged_conv;
     bool logged_slave_clk;
+    bool logged_peer_pdm;
 };
 
 struct ESP32P4I2sClass {
