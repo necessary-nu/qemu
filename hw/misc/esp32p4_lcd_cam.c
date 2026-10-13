@@ -1741,8 +1741,12 @@ static void lcd_schedule(ESP32P4LcdCamState *s)
     }
 }
 
-/* How far the host may fall behind RGB frames before they slip. */
-#define LCD_MAX_LAG_NS          (10 * SCALE_MS)
+/*
+ * How far the host may fall behind RGB frames before they slip: a
+ * second, far longer than the host's own pauses (a busy host holds QEMU's
+ * main loop up for tens of milliseconds), as the image source has it.
+ */
+#define LCD_MAX_LAG_NS          NANOSECONDS_PER_SECOND
 
 /* RGB frames restart at the present, the ones between dropped. */
 static void rgb_slip(void *opaque)
