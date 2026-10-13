@@ -75,18 +75,26 @@
  * XTAL_CLK edges between goes to TIMG_RTC_CALI_VALUE (25 bits, wrapping),
  * each clock's edges at their exact times, at whatever phase to the other.
  * A rising edge of TIMG_RTC_CALI_START starts a one-shot measurement,
- * clearing TIMG_RTC_CALI_RDY, which its end sets; clearing START abandons
- * it. TIMG_RTC_CALI_START_CYCLING (set at reset) measures continuously,
- * each measurement beginning where the last ended and each end setting
+ * clearing TIMG_RTC_CALI_RDY; clearing START abandons it.
+ * TIMG_RTC_CALI_START_CYCLING (set at reset) measures continuously, each
+ * measurement beginning where the last ended and each end setting
  * TIMG_RTC_CALI_CYCLING_DATA_VLD, which a rising edge of START_CYCLING
- * clears. A measurement that has run more XTAL_CLK cycles than
- * TIMG_RTC_CALI_TIMEOUT_THRES without ending is abandoned with
- * TIMG_RTC_CALI_TIMEOUT set, which stays set until software starts a
- * measurement; a cycling one starts again TIMG_RTC_CALI_TIMEOUT_RST_CNT
- * XTAL_CLK cycles later. A measured clock that does not run (a source
- * that is powered down or gated, or timer group 1's, which has none) never
- * ends, so only the timeout does. Clock changes during a measurement are
- * folded in, the measurement going on at the new edges from the change.
+ * clears. The end of every measurement, one-shot or cycling, sets RDY.
+ * The TRM calls RDY the one-shot's, but ESP-IDF's rtc_clk_cal_internal()
+ * waits on RDY for a cycling measurement under way, with RDY clear from
+ * reset, and in its first versions (v4.2 on the ESP32-S2, v4.3 on the C3
+ * and S3) had no other way out of that wait; on the P4, with MPLL_CLK
+ * measured as from reset, no cycling measurement times out at the
+ * threshold of 1 it sets for it. A measurement that has run more
+ * XTAL_CLK cycles than TIMG_RTC_CALI_TIMEOUT_THRES without ending is
+ * abandoned with TIMG_RTC_CALI_TIMEOUT set, which stays set until
+ * software starts a measurement; a cycling one starts again
+ * TIMG_RTC_CALI_TIMEOUT_RST_CNT XTAL_CLK cycles later. Each measurement's
+ * XTAL_CLK cycles are counted from its own beginning. A measured clock
+ * that does not run (a source that is powered down or gated, or timer
+ * group 1's, which has none) never ends, so only the timeout does. Clock
+ * changes during a measurement are folded in, the measurement going on at
+ * the new edges from the change.
  * The clock and cycle count are latched as a measurement starts. Nothing
  * outside the block sees a measurement end (the unit has no interrupt or
  * ETM event), so the model keeps no QEMU timer for it: an access to its
@@ -696,7 +704,9 @@ static void timg_cal_begin_at_xtal(ESP32P4TimgState *s, uint64_t i)
 /*
  * [spec:nuos:req:emu.esp32p4.timers]
  * The measurement ends at the end of measured cycle @e: the value is
- * XTAL_CLK's edges since its first edge. A cycling one begins again there.
+ * XTAL_CLK's edges since its first edge, and RDY is set, by a cycling
+ * measurement as by a one-shot. A cycling one sets CYCLING_DATA_VLD too
+ * and begins again there.
  */
 static void timg_cal_end(ESP32P4TimgState *s, uint64_t e)
 {
@@ -707,8 +717,8 @@ static void timg_cal_end(ESP32P4TimgState *s, uint64_t e)
     c->value = extract64(s->xtal_base + timg_cal_xtal_by(s, e) - at_first,
                          0, CAL_VALUE_BITS);
     timg_cal_stop(s);
+    c->rdy = true;
     if (c->oneshot) {
-        c->rdy = true;
         return;
     }
     c->vld = true;

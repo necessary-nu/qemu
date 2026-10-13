@@ -1003,6 +1003,15 @@ static void test_calibration_threshold(void)
     qtest_quit(qts);
 }
 
+/* MPLL_CLK up at 500 MHz, as esp_clk_tree_mpll_acquire() brings it up. */
+static void mpll_up(QTestState *qts)
+{
+    qtest_writel(qts, PMU_RF_PWC,
+                 qtest_readl(qts, PMU_RF_PWC) | PMU_MSPI_PHY_XPD);
+    qtest_writel(qts, LP_HP_CLK_CTRL,
+                 qtest_readl(qts, LP_HP_CLK_CTRL) | HP_MPLL_500M_CLK_EN);
+}
+
 /*
  * Cycling from reset on TIMERGRP0_TGRT_CLK, MPLL_CLK over 1: brought up at
  * 500 MHz, a measurement of one cycle ends every 4 ns. Seconds of it cost
@@ -1018,12 +1027,10 @@ static void test_calibration_fast_clock(void)
     uint32_t v;
 
     swd_off(qts);
-    qtest_writel(qts, PMU_RF_PWC,
-                 qtest_readl(qts, PMU_RF_PWC) | PMU_MSPI_PHY_XPD);
-    qtest_writel(qts, LP_HP_CLK_CTRL,
-                 qtest_readl(qts, LP_HP_CLK_CTRL) | HP_MPLL_500M_CLK_EN);
+    mpll_up(qts);
     step(qts, 20 * US);
-    g_assert_cmphex(rd(qts, 0, RTCCALICFG), ==, 0x00011000);
+    /* Each end sets RDY as well as CYCLING_DATA_VLD. */
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG), ==, 0x00019000);
     step(qts, 2000 * MS);
     v = rd(qts, 0, RTCCALICFG1);
     g_assert_cmphex(v & CAL1_VLD, ==, CAL1_VLD);
@@ -1047,6 +1054,208 @@ static void test_calibration_fast_clock(void)
     g_assert_cmphex(rd(qts, 0, RTCCALICFG) & CAL_RDY, ==, 0);
     step(qts, 8 * US + 1);
     assert_cal(qts, 327680);
+    qtest_quit(qts);
+}
+
+/*
+ * The wait at the head of ESP-IDF's rtc_clk_cal_internal() for a
+ * calibration already under way: while RTC_CALI_START_CYCLING is set, a
+ * threshold of 1 and a poll of RDY and TIMEOUT every 20 ns, for at most
+ * 1 ms. The two registers as the last poll read them.
+ */
+static void idf_cal_wait(QTestState *qts, uint32_t *cfg, uint32_t *cfg2)
+{
+    int i;
+
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG) & CAL_CYCLING, ==, CAL_CYCLING);
+    wr(qts, 0, RTCCALICFG2,
+       (rd(qts, 0, RTCCALICFG2) & ~CAL2_THRES(0x1ffffff)) | CAL2_THRES(1));
+    for (i = 0; i < 50000; i++) {
+        *cfg = rd(qts, 0, RTCCALICFG);
+        *cfg2 = rd(qts, 0, RTCCALICFG2);
+        if ((*cfg & CAL_RDY) || (*cfg2 & CAL2_TIMEOUT)) {
+            return;
+        }
+        step(qts, 20);
+    }
+}
+
+/*
+ * The rest of rtc_clk_cal_internal(CLK_CAL_RC_SLOW, 1024): the clock and
+ * its divider, cycling off, RTC_CALI_MAX, the threshold (cycles << 10),
+ * START cleared and set, esp_rom_delay_us() of the time 1024 cycles take
+ * at 136 kHz, then the poll: the value, or 0 for a timeout.
+ */
+static uint32_t idf_cal_oneshot(QTestState *qts)
+{
+    uint32_t value = 0;
+    int i;
+
+    qtest_writel(qts, PERI_CLK_CTRL21,
+                 (qtest_readl(qts, PERI_CLK_CTRL21) & ~0xfu) | TGRT_SEL(8));
+    qtest_writel(qts, PERI_CLK_CTRL21,
+                 qtest_readl(qts, PERI_CLK_CTRL21) & ~TGRT_DIV(0xffff));
+    wr(qts, 0, RTCCALICFG, rd(qts, 0, RTCCALICFG) & ~CAL_CYCLING);
+    wr(qts, 0, RTCCALICFG,
+       (rd(qts, 0, RTCCALICFG) & ~CAL_MAX(0x7fff)) | CAL_MAX(1024));
+    wr(qts, 0, RTCCALICFG2,
+       (rd(qts, 0, RTCCALICFG2) & ~CAL2_THRES(0x1ffffff)) |
+       CAL2_THRES(1024 << 10));
+    wr(qts, 0, RTCCALICFG, rd(qts, 0, RTCCALICFG) & ~CAL_START);
+    wr(qts, 0, RTCCALICFG, rd(qts, 0, RTCCALICFG) | CAL_START);
+    step(qts, 1024000000ll / 136000 * US);
+    for (i = 0; i < 100000; i++) {
+        if (rd(qts, 0, RTCCALICFG) & CAL_RDY) {
+            value = CAL1_VALUE(rd(qts, 0, RTCCALICFG1));
+            break;
+        }
+        if (rd(qts, 0, RTCCALICFG2) & CAL2_TIMEOUT) {
+            break;
+        }
+        step(qts, 20);
+    }
+    g_assert_cmpint(i, <, 100000);
+    wr(qts, 0, RTCCALICFG, rd(qts, 0, RTCCALICFG) & ~CAL_START);
+    qtest_writel(qts, PERI_CLK_CTRL21,
+                 qtest_readl(qts, PERI_CLK_CTRL21) & ~TGRT_DIV(0xffff));
+    return value;
+}
+
+/*
+ * ESP-IDF's first rtc_clk_cal(), esp_clk_init()'s of RTC_SLOW_CLK
+ * (RC_SLOW_CLK, 1024 cycles), each register access as rtc_time.c makes
+ * it. TIMG0 calibrates cyclically from reset, RTC_CALI_MAX 1, on
+ * TIMERGRP0_TGRT_CLK, MPLL_CLK over 1, so rtc_clk_cal_internal() first
+ * waits for RDY or TIMEOUT with a threshold of 1. The end of every
+ * measurement, cycling ones too, sets RDY; a measurement whose XTAL_CLK
+ * cycles pass the threshold before it ends sets TIMEOUT.
+ *
+ *   - With MPLL_CLK stopped, as from reset, the measurement under way has
+ *     run far past 2 XTAL_CLK cycles: the threshold of 1 times it out at
+ *     once, and the first poll reads TIMEOUT (RTCCALICFG2 0x99).
+ *   - With MPLL_CLK at 500 MHz, as ESP-IDF's PSRAM bring-up leaves it,
+ *     each measurement ends 4 ns after the last, inside its 2 XTAL_CLK
+ *     cycles: none times out, and the first poll reads RDY (RTCCALICFG
+ *     0x19000), with the value of a 2 ns cycle, 0 or 1 XTAL_CLK edges.
+ *
+ * Either way the one-shot that follows, 1024 cycles of the 150 kHz
+ * RC_SLOW_CLK, 273066 2/3 XTAL_CLK cycles, ends with RDY and 273066 or
+ * 273067, by the phase of the two clocks.
+ */
+/* [spec:nuos:req:emu.esp32p4.timers/test] */
+/* [spec:nuos:req:emu.esp32p4.clocks/test] */
+static void test_calibration_esp_idf(void)
+{
+    uint32_t cfg, cfg2, value;
+    QTestState *qts;
+
+    qts = start();
+    step(qts, 300 * US);
+    idf_cal_wait(qts, &cfg, &cfg2);
+    g_assert_cmphex(cfg, ==, 0x00011000);
+    g_assert_cmphex(cfg2, ==, 0x00000099);
+    value = idf_cal_oneshot(qts);
+    g_assert_cmpuint(value, >=, 273066);
+    g_assert_cmpuint(value, <=, 273067);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG2) & CAL2_TIMEOUT, ==, 0);
+    qtest_quit(qts);
+
+    qts = start();
+    mpll_up(qts);
+    step(qts, 300 * US);
+    idf_cal_wait(qts, &cfg, &cfg2);
+    g_assert_cmphex(cfg, ==, 0x00019000);
+    g_assert_cmphex(cfg2, ==, 0x00000098);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG1) & CAL1_VLD, ==, CAL1_VLD);
+    g_assert_cmpuint(CAL1_VALUE(rd(qts, 0, RTCCALICFG1)), <=, 1);
+    value = idf_cal_oneshot(qts);
+    g_assert_cmpuint(value, >=, 273066);
+    g_assert_cmpuint(value, <=, 273067);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG2) & CAL2_TIMEOUT, ==, 0);
+    qtest_quit(qts);
+}
+
+/*
+ * RDY and TIMEOUT across cycling measurements. RDY is set by the end of
+ * any measurement and cleared only by a rising edge of START; TIMEOUT is
+ * set by a measurement that runs THRES + 1 XTAL_CLK cycles, each
+ * measurement's counted from its own beginning, and cleared only by
+ * software starting a measurement.
+ *
+ *   - Cycling from reset on MPLL_CLK, stopped, then on RC_SLOW_CLK from
+ *     1000 ns: the measurement under way takes RC_SLOW_CLK's next edge,
+ *     at 6666 2/3 ns, as its first and ends at 13333 1/3 ns, setting RDY
+ *     and CYCLING_DATA_VLD (267 XTAL_CLK edges).
+ *   - A rising edge of START_CYCLING clears CYCLING_DATA_VLD, not RDY.
+ *   - A threshold of 1 times out the measurement under way, which has run
+ *     more than 2 XTAL_CLK cycles, and every one after it 2 XTAL_CLK
+ *     cycles after it begins: no RC_SLOW_CLK cycle ends in time, so the
+ *     value, RDY and CYCLING_DATA_VLD stay as they were.
+ *   - A one-shot's rising edge of START clears RDY and TIMEOUT; at a
+ *     threshold of 1 it times out at the second XTAL_CLK edge after it
+ *     begins.
+ *   - On MPLL_CLK at 500 MHz, a threshold of 1 times out none of the
+ *     cycling measurements, each ending 4 ns after it begins, however
+ *     long they run.
+ */
+/* [spec:nuos:req:emu.esp32p4.timers/test] */
+/* [spec:nuos:req:emu.esp32p4.clocks/test] */
+static void test_calibration_rdy_timeout(void)
+{
+    QTestState *qts = start();
+    uint32_t v;
+
+    step(qts, 1000);
+    cal_clock(qts, 8, 1);
+    step(qts, 13333 - now);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG), ==, 0x00011000);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG1) & CAL1_VLD, ==, 0);
+    step(qts, 1);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG), ==, 0x00019000);
+    assert_cycling(qts, 267, false);
+
+    wr(qts, 0, RTCCALICFG, CAL_MAX(1));
+    wr(qts, 0, RTCCALICFG, CAL_MAX(1) | CAL_CYCLING);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG), ==, 0x00019000);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG1), ==, 267u << 7);
+
+    step(qts, 1 * US);
+    wr(qts, 0, RTCCALICFG2, CAL2_RST_CNT(3) | CAL2_THRES(1));
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG2), ==,
+                    CAL2_RST_CNT(3) | CAL2_THRES(1) | CAL2_TIMEOUT);
+    step(qts, 1 * MS);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG), ==, 0x00019000);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG1), ==, 267u << 7);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG2) & CAL2_TIMEOUT, ==, 1);
+
+    /* A one-shot from 10 ns past an XTAL_CLK edge: edges at +15, +40. */
+    step(qts, 25 - now % 25 + 10);
+    wr(qts, 0, RTCCALICFG, CAL_MAX(1));
+    wr(qts, 0, RTCCALICFG, CAL_MAX(1) | CAL_START);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG), ==, CAL_MAX(1) | CAL_START);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG2) & CAL2_TIMEOUT, ==, 0);
+    step(qts, 39);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG2) & CAL2_TIMEOUT, ==, 0);
+    step(qts, 1);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG2) & CAL2_TIMEOUT, ==, 1);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG) & CAL_RDY, ==, 0);
+    qtest_quit(qts);
+
+    qts = start();
+    swd_off(qts);
+    mpll_up(qts);
+    step(qts, 20 * US);
+    wr(qts, 0, RTCCALICFG2, CAL2_RST_CNT(3) | CAL2_THRES(1));
+    wr(qts, 0, RTCCALICFG, CAL_MAX(1));
+    wr(qts, 0, RTCCALICFG, CAL_MAX(1) | CAL_CYCLING);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG2), ==,
+                    CAL2_RST_CNT(3) | CAL2_THRES(1));
+    step(qts, 500 * MS);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG), ==, 0x00019000);
+    v = rd(qts, 0, RTCCALICFG1);
+    g_assert_cmphex(v & CAL1_VLD, ==, CAL1_VLD);
+    g_assert_cmpuint(CAL1_VALUE(v), <=, 1);
+    g_assert_cmphex(rd(qts, 0, RTCCALICFG2) & CAL2_TIMEOUT, ==, 0);
     qtest_quit(qts);
 }
 
@@ -1098,6 +1307,10 @@ int main(int argc, char **argv)
                    test_calibration_threshold);
     qtest_add_func("/esp32p4/timg/calibration-fast-clock",
                    test_calibration_fast_clock);
+    qtest_add_func("/esp32p4/timg/calibration-esp-idf",
+                   test_calibration_esp_idf);
+    qtest_add_func("/esp32p4/timg/calibration-rdy-timeout",
+                   test_calibration_rdy_timeout);
     qtest_add_func("/esp32p4/timg/gating", test_gating);
     return g_test_run();
 }
