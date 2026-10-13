@@ -2278,6 +2278,44 @@ int esp32p4_gpio_pad_out_sig(ESP32P4GpioState *s, unsigned n, bool *inverted)
 }
 
 /* [spec:nuos:req:emu.esp32p4.gpio] */
+int esp32p4_gpio_lp_pad_out_sig(ESP32P4GpioState *s, unsigned n,
+                                bool *inverted)
+{
+    uint32_t cfg;
+    unsigned sel;
+    bool val, oe;
+
+    *inverted = false;
+    if (n >= ESP32P4_GPIO_LP_PADS || !lp_owned(s, n)) {
+        return -1;
+    }
+    lp_pad_drive(s, n, &val, &oe);
+    if (!oe || !lp_func_is_matrix(s, n)) {
+        return -1;
+    }
+    cfg = s->lp_func_out_sel[n];
+    sel = FIELD_EX32(cfg, LP_FUNC_OUT, OUT_SEL);
+    if (sel >= ESP32P4_GPIO_LP_SIGS) {
+        return -1;
+    }
+    *inverted = FIELD_EX32(cfg, LP_FUNC_OUT, OUT_INV_SEL);
+    return sel;
+}
+
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+bool esp32p4_gpio_lp_sig_in_inverted(ESP32P4GpioState *s, unsigned sig)
+{
+    uint32_t cfg;
+
+    if (sig >= LP_IN_SIGS) {
+        return false;
+    }
+    cfg = s->lp_func_in_sel[sig];
+    return FIELD_EX32(cfg, LP_FUNC_IN, SIG_IN_SEL) &&
+           FIELD_EX32(cfg, LP_FUNC_IN, IN_INV_SEL);
+}
+
+/* [spec:nuos:req:emu.esp32p4.gpio] */
 bool esp32p4_gpio_sig_in_inverted(ESP32P4GpioState *s, unsigned sig)
 {
     uint32_t cfg;
