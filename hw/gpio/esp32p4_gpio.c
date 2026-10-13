@@ -4330,10 +4330,24 @@ static const VMStateDescription vmstate_esp32p4_gpio = {
     },
 };
 
+static uint64_t esp32p4_gpio_routes_out_pads(Object *obj, unsigned sig)
+{
+    return esp32p4_gpio_sig_out_pads(ESP32P4_GPIO(obj), sig);
+}
+
+static void esp32p4_gpio_routes_add_notifier(Object *obj, Notifier *n)
+{
+    esp32p4_gpio_add_route_notifier(ESP32P4_GPIO(obj), n);
+}
+
 static void esp32p4_gpio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
+    Esp32SigRoutesClass *src = ESP32_SIG_ROUTES_CLASS(klass);
+
+    src->sig_out_pads = esp32p4_gpio_routes_out_pads;
+    src->add_route_notifier = esp32p4_gpio_routes_add_notifier;
 
     rc->phases.hold = esp32p4_gpio_reset_hold;
     rc->phases.exit = esp32p4_gpio_reset_exit;
@@ -4372,6 +4386,10 @@ static const TypeInfo esp32p4_gpio_info = {
     .instance_init = esp32p4_gpio_init,
     .instance_finalize = esp32p4_gpio_finalize,
     .class_init = esp32p4_gpio_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { TYPE_ESP32_SIG_ROUTES },
+        { }
+    },
 };
 
 static void esp32p4_gpio_register_types(void)

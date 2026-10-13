@@ -12,6 +12,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
 #include "hw/misc/esp32p4_clk_period.h"
+#include "qemu/notify.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -39,6 +40,11 @@ OBJECT_DECLARE_TYPE(Esp32McpwmState, Esp32McpwmClass, ESP32_MCPWM)
  * The block's interrupt is its sysbus IRQ 0. Its clocks are "f160m"
  * (PLL_F160M_CLK, from which PWM_clk is divided) and "apb" (APB_CLK, which
  * drives the capture timer).
+ *
+ * Link "gpio" and property "sig-base": the GPIO matrix (either chip's,
+ * TYPE_ESP32_SIG_ROUTES), and the matrix output signal of PWM0A, the
+ * other outputs following it, for the block to see which of its outputs
+ * reach a pad. Without the link every output is taken to reach one.
  */
 #define ESP32_MCPWM_OUT         "pwm-out"
 #define ESP32_MCPWM_SYNC_IN     "sync-in"
@@ -226,6 +232,11 @@ struct Esp32McpwmState {
     bool schedule_stale;
     /* The latest moment the block has acted at */
     int64_t seen_ns;
+    DeviceState *gpio;
+    uint32_t sig_base;
+    Notifier route_notifier;
+    /* The outputs that reach a pad, bit n for output n */
+    uint8_t out_seen;
     bool updating;
     bool update_pending;
     /* The block is bringing the other line sources up to date. */

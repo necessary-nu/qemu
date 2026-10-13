@@ -77,3 +77,28 @@ void esp32_line_sync(void)
     notifier_list_notify(&line_sources, NULL);
     line_syncing = false;
 }
+
+/* [spec:nuos:req:emu.esp32.gpio] */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+uint64_t esp32_sig_out_pads(Object *matrix, unsigned sig)
+{
+    return ESP32_SIG_ROUTES_GET_CLASS(matrix)->sig_out_pads(matrix, sig);
+}
+
+void esp32_sig_add_route_notifier(Object *matrix, Notifier *n)
+{
+    ESP32_SIG_ROUTES_GET_CLASS(matrix)->add_route_notifier(matrix, n);
+}
+
+static const TypeInfo esp32_sig_routes_info = {
+    .name = TYPE_ESP32_SIG_ROUTES,
+    .parent = TYPE_INTERFACE,
+    .class_size = sizeof(Esp32SigRoutesClass),
+};
+
+static void esp32_line_register_types(void)
+{
+    type_register_static(&esp32_sig_routes_info);
+}
+
+type_init(esp32_line_register_types)

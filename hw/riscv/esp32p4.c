@@ -3240,6 +3240,9 @@ static void esp32p4_init_pwm(ESP32P4MachineState *s)
                                 TYPE_ESP32P4_MCPWM);
         dev = DEVICE(&s->mcpwm[i]);
         qdev_connect_clock_in(dev, "clk", qdev_get_clock_out(clkrst, name));
+        object_property_set_link(OBJECT(dev), "gpio", OBJECT(gpio),
+                                 &error_abort);
+        qdev_prop_set_uint32(dev, "sig-base", sig[i].out);
         sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
         esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
                                  ESP32P4_MCPWM0_BASE +
