@@ -119,7 +119,9 @@ enum {
  *   ESP32P4_GPIO_IOMUX_OUT, _IOMUX_OE (input): the block's output and
  *     output enable for that pad and function.
  *   ESP32P4_GPIO_IOMUX_IN (output): the pad's input while its MCU_SEL
- *     selects that function, otherwise low.
+ *     selects that function (low with its input disabled), otherwise the
+ *     level of the function's input type in the datasheet's table 2-3: 1
+ *     for an I1 input (SD1_CDATA0 to 7 and SD1_CCMD, MTCK, MTDI), else 0.
  *
  * The HP cores' fast GPIO (cpu_gpio_out, _oen, _in) is matrix signals 214
  * to 221 for core 0 and 222 to 229 for core 1 (CORE_GPIO_*_PAD_*0 to 15,
@@ -151,12 +153,17 @@ enum {
  *     pad n: the pads driven from outside and their levels, settable
  *     with -global before the machine starts and with qom-set while it
  *     runs, for a board's fixed wiring.
+ *   ESP32P4_GPIO_BOARD_PULL_UP, "board-pull-up", and
+ *     _BOARD_PULL_DOWN, "board-pull-down" (inputs): a resistor the board
+ *     has from pad n to the pad's supply, or to ground, the level its
+ *     resistance in ohms (0: none). With the pad's own 45 kOhm pulls they
+ *     make a divider (hw/gpio/esp32p4_gpio.c).
  *   Property "pad-wires": pads the board wires together, as groups of
  *     GPIO numbers joined by ':' and separated by ',' ("7:9,8:10" joins
  *     GPIO7 to GPIO9 and GPIO8 to GPIO10). The pads of a wire share its
  *     level, low while any is driven low (open-drain buses through two
- *     controllers' pads), else high while any is driven high or pulled
- *     up.
+ *     controllers' pads), else high while any is driven high, else as the
+ *     pulls of all of them hold it.
  *   Property "strap-mode": the board's strapping of GPIO34 to GPIO38, in
  *     GPIO_STRAP's layout, which GPIO_STRAP latches at reset for each of
  *     those pads not then driven from outside. The default is SPI boot.
@@ -172,9 +179,10 @@ enum {
  *     HP_SYS_CLKRST_RST_EN_IOMUX holds the HP GPIO matrix, IO MUX and
  *     GPIO_EXT in reset; line 1, LPPERI_RST_EN_LP_IOMUX for the LP ones.
  *   ESP32P4_GPIO_PAD_PULL_UP, "pad-pull-up" (input): a pull-up on pad n
- *     from another block, the USB PHYs' D+ pull-ups on GPIO25 and GPIO27.
- *     GPIO25's is high until driven: the USB Serial/JTAG controller pulls
- *     D+ up out of reset (table 10.14-1, reset "3*").
+ *     from another block, as strong as a driver: the USB PHYs' D+
+ *     pull-ups on GPIO25 and GPIO27. GPIO25's is high until driven: the
+ *     USB Serial/JTAG controller pulls D+ up out of reset (table 10.14-1,
+ *     reset "3*").
  *   ESP32P4_GPIO_PAD_HOLD, "pad-hold" (input): pad n held, from
  *     HP_SYSTEM_GPIO_O_HOLD_CTRL*, LP_SYSTEM_REG_PAD_RTC_HOLD_CTRL* and the
  *     PMU's hold-all (TRM 10.9), ORed by whoever drives it. A held pad
@@ -246,6 +254,8 @@ enum {
 #define ESP32P4_GPIO_PAD_DRIVE_LOW  "pad-drive-low"
 #define ESP32P4_GPIO_RESET          "reset"
 #define ESP32P4_GPIO_PAD_PULL_UP    "pad-pull-up"
+#define ESP32P4_GPIO_BOARD_PULL_UP  "board-pull-up"
+#define ESP32P4_GPIO_BOARD_PULL_DOWN "board-pull-down"
 #define ESP32P4_GPIO_PAD_HOLD       "pad-hold"
 #define ESP32P4_GPIO_HOLD_ALL      "hold-all"
 #define ESP32P4_GPIO_LIGHT_SLEEP    "light-sleep"
@@ -473,6 +483,9 @@ struct ESP32P4GpioState {
     uint64_t ext_driven;
     uint64_t ext_level;
     uint64_t ext_pull_up;
+    /* The board's pull resistors on each pad, ohms (0: none) */
+    uint32_t board_pull_up[ESP32P4_GPIO_PADS];
+    uint32_t board_pull_down[ESP32P4_GPIO_PADS];
     uint64_t ext_hold;
     bool hold_all[ESP32P4_GPIO_HOLD_ALLS];
     /* The board's wire each pad is on, numbered from 1; 0 for none. */
@@ -487,12 +500,14 @@ struct ESP32P4GpioState {
 
     /*
      * The held pads, and what they hold: their drive (level and enable,
-     * after open drain), pulls and input enable as the hold began.
+     * after open drain), own pulls (conductances, nS) and input enable as
+     * the hold began.
      */
     uint64_t held;
     uint64_t hold_val;
     uint64_t hold_oe;
-    uint64_t hold_pu;
+    uint64_t hold_pull_up[ESP32P4_GPIO_PADS];
+    uint64_t hold_pull_down[ESP32P4_GPIO_PADS];
     uint64_t hold_ie;
 
     /* LP_GPIO_PINn edge wakeups latched, until EDGE_WAKEUP_CLR */
@@ -536,9 +551,15 @@ struct ESP32P4GpioState {
     bool dirty_all;
     /* The routing, as of the last round that recomputed everything */
     ESP32P4GpioRoutes routes;
-    /* The pads pulled up and with their input enabled, as resolved */
-    uint64_t pulled;
+    /*
+     * Each undriven pad's pulls up and down (conductances, nS; 0 for a
+     * driven pad), the pads with their input enabled, and those whose
+     * pulls hold them at an undefined level, as resolved.
+     */
+    uint64_t pull_up_ns[ESP32P4_GPIO_PADS];
+    uint64_t pull_down_ns[ESP32P4_GPIO_PADS];
     uint64_t ie_mask;
+    uint64_t undefined;
 };
 
 /*
@@ -597,5 +618,29 @@ bool esp32p4_gpio_sig_in_inverted(ESP32P4GpioState *s, unsigned sig);
  */
 bool esp32p4_gpio_iomux_in_selected(ESP32P4GpioState *s, unsigned n,
                                     unsigned func);
+
+/*
+ * For a peripheral that drives an output only at times (an SD host's CMD
+ * and DAT, which it drives only while it sends), modelled above single
+ * pad transitions: whether pad n takes that output, the HP matrix output
+ * signal sig or, with sig negative, the pad's IO MUX function func's,
+ * while the peripheral enables it (*on: matrix routing, OEN_SEL and its
+ * inversion, the function, light sleep's MCU_OE, a hold, an outside
+ * driver all as they stand), and whether the chip or an outside driver
+ * still drives the pad, and at what *off_level, while it does not (*off).
+ */
+void esp32p4_gpio_pad_out_path(ESP32P4GpioState *s, unsigned n, int sig,
+                               unsigned func, bool *on, bool *off,
+                               bool *off_level);
+
+/*
+ * Levels as the last resolution left them: HP input signal sig as the
+ * matrix or IO MUX delivers it; IO MUX function func's input line of pad
+ * n (ESP32P4_GPIO_IOMUX_IN); and pad n itself.
+ */
+bool esp32p4_gpio_sig_in_level(ESP32P4GpioState *s, unsigned sig);
+bool esp32p4_gpio_iomux_in_level(ESP32P4GpioState *s, unsigned n,
+                                 unsigned func);
+bool esp32p4_gpio_pad_level(ESP32P4GpioState *s, unsigned n);
 
 #endif

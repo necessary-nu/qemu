@@ -69,6 +69,25 @@
  * card's, a response fails its CRC check and a data block its CRC, the
  * bits as sampled a bit late.
  *
+ * Pads. The integration says which lines its pads join the host to the
+ * card on, and what a line that does not reads (the class's lines()). A
+ * card whose CLK or CMD the host's output does not reach takes no
+ * command, and the host finds no response (RTO); one whose DAT0 it does
+ * not reach takes no data (a write ends with EBE, the missing CRC
+ * status), and one that takes a block with another of its DAT lines not
+ * reached, or in the other DDR mode, finds the block's CRC wrong: it
+ * discards it (sdbus_write_crc_error()) and answers a negative CRC status
+ * (DCRC). A host input the card does not reach reads the level the
+ * integration gives throughout: CMD low makes every response read all 0
+ * (RE), CMD high none (RTO); a DAT line low makes a read block's bits on
+ * it 0, its CRC matching but its end bit not (EBE), high makes them 1,
+ * failing its CRC (DCRC); DAT0 high hides the block's start bit (DRTO),
+ * DAT0 low takes it at once, the other lines' bits then taken too early
+ * (DCRC), and holds the card busy (STATUS.DATA_BUSY, WAIT_PRVDATA), and a
+ * write's CRC status reads 000 (DCRC) on DAT0 low, nothing (EBE) on DAT0
+ * high. An SDIO card's interrupt on DAT1 reaches the host only where
+ * DAT1 does.
+ *
  * Data. A command with DATA_EXPECTED starts the data path: a read takes
  * BYTCNT bytes (or, with BYTCNT 0, until a stop command) from the card
  * into the FIFO after the command; a write sends them from the FIFO
@@ -145,10 +164,9 @@
  * Not modelled: boot mode, CE-ATA (CCS, CCSD) and MMC CMD40's interrupt
  * response, which are logged as unimplemented; CLKENA's low-power clock
  * gating, the card's clock running while enabled; ENSHIFT and the
- * output phase, which shape signals the card takes at any setting; the
- * pads' function and pull settings, so that a slot's card answers however
- * the pads are muxed; and CRC and start or end bit errors other than the
- * sampling and signal levels give, which a QEMU card never makes.
+ * output phase, which shape signals the card takes at any setting; and
+ * CRC and start or end bit errors other than the sampling, the signal
+ * levels and the pads give, which a QEMU card never makes.
  */
 
 #include "qemu/osdep.h"
@@ -335,6 +353,9 @@
 /* The command index a short response with no CRC (R3, R4) carries */
 #define RESP_INDEX_NONE         0x3f
 
+/* A read chunk's fault: its bits sampled a bit late (no RINTSTS bit) */
+#define FAULT_LATE              BIT(31)
+
 /* What the timeout timer waits for */
 enum {
     TIMEOUT_NONE,
@@ -355,6 +376,7 @@ enum {
 
 static void dwc_sdmmc_update(DWCSDMMCState *s);
 static void dwc_card_watch(DWCSDMMCState *s);
+static void dwc_lines(DWCSDMMCState *s, unsigned slot, DWCSDMMCLines *l);
 
 static uint32_t dwc_fifo_cap(DWCSDMMCState *s)
 {
@@ -601,11 +623,21 @@ static void dwc_raise(DWCSDMMCState *s, uint32_t bits)
     }
 }
 
-/* A slot's SDIO interrupt request: its card's on DAT1, or card-int-n. */
+/*
+ * A slot's SDIO interrupt request: its card's on DAT1, where DAT1 reaches
+ * the host, or card-int-n.
+ */
 static void dwc_sdio_irq_update(DWCSDMMCState *s)
 {
     for (unsigned slot = 0; slot < s->num_slots; slot++) {
-        if ((s->card_irq & BIT(slot)) || !(s->int_n_in & BIT(slot))) {
+        DWCSDMMCLines l;
+        bool dat1 = false;
+
+        if (s->card_irq & BIT(slot)) {
+            dwc_lines(s, slot, &l);
+            dat1 = l.to_host & DWC_SDMMC_LINE_DAT(1);
+        }
+        if (dat1 || !(s->int_n_in & BIT(slot))) {
             s->rintsts |= INT_SDIO(slot);
         }
     }
@@ -645,25 +677,136 @@ static bool dwc_host_hears(DWCSDMMCState *s, unsigned slot)
     return s->pad_mv[slot] && card_mv * 4 >= s->pad_mv[slot] * 3;
 }
 
-/* DAT[3:0] as the host reads them */
+/*
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * Slot @slot's lines as its pads join the host and its card: by default
+ * all of them.
+ */
+static void dwc_lines(DWCSDMMCState *s, unsigned slot, DWCSDMMCLines *l)
+{
+    DWCSDMMCClass *dc = DWC_SDMMC_GET_CLASS(s);
+
+    l->to_card = DWC_SDMMC_LINES_ALL;
+    l->to_host = DWC_SDMMC_LINES_ALL;
+    l->host_level = DWC_SDMMC_LINES_ALL;
+    l->card_level = DWC_SDMMC_LINES_ALL;
+    if (dc->lines && slot < s->num_slots) {
+        dc->lines(s, slot, l);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * Whether the card in @slot takes the host's outputs on the lines in
+ * @mask: they reach its pins, at a voltage it sees.
+ */
+static bool dwc_card_takes(DWCSDMMCState *s, unsigned slot, uint16_t mask)
+{
+    DWCSDMMCLines l;
+
+    dwc_lines(s, slot, &l);
+    return dwc_card_hears(s, slot) && (l.to_card & mask) == mask;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * DAT[3:0] as the host reads them between transfers, where its pads take
+ * them from the card: low where the card holds them low, and where it
+ * releases them (or there is none) as the pulls hold the pad, which the
+ * integration's levels give; elsewhere the integration's levels; all low
+ * on unpowered pads.
+ */
 static uint8_t dwc_dat_lines(DWCSDMMCState *s, unsigned slot)
 {
     SDBus *bus = dwc_bus(s, slot);
+    DWCSDMMCLines l;
+    uint8_t card, follow;
 
     if (!bus || !s->pad_mv[slot]) {
         return 0;
     }
-    if (!sdbus_get_inserted(bus)) {
-        return 0xf;
-    }
-    return sdbus_get_dat_lines(bus) & 0xf;
+    card = sdbus_get_inserted(bus) ? sdbus_get_dat_lines(bus) & 0xf : 0xf;
+    dwc_lines(s, slot, &l);
+    follow = (l.to_host >> 2) & 0xf;
+    return (card | ~follow) & (l.host_level >> 2) & 0xf;
 }
 
+/* [spec:nuos:req:emu.esp32p4.sdmmc] */
+/* CMD as the host reads it between commands, as DAT[3:0] */
 static bool dwc_cmd_line(DWCSDMMCState *s, unsigned slot)
 {
     SDBus *bus = dwc_bus(s, slot);
+    DWCSDMMCLines l;
 
-    return bus && s->pad_mv[slot] && sdbus_get_cmd_line(bus);
+    if (!bus || !s->pad_mv[slot]) {
+        return false;
+    }
+    dwc_lines(s, slot, &l);
+    if (!(l.to_host & DWC_SDMMC_LINE_CMD)) {
+        return l.host_level & DWC_SDMMC_LINE_CMD;
+    }
+    return sdbus_get_cmd_line(bus) && (l.host_level & DWC_SDMMC_LINE_CMD);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * The DAT lines of the bus's width on which the host does not take the
+ * card's output (*stuck, a bit per line), and the level each of those
+ * reads throughout (*level): all of them, low, on pads that read the
+ * card's highs as lows or are unpowered.
+ */
+static void dwc_dat_in(DWCSDMMCState *s, unsigned slot, uint8_t *stuck,
+                       uint8_t *level)
+{
+    uint8_t mask = MAKE_64BIT_MASK(0, dwc_bus_width(s, slot));
+    DWCSDMMCLines l;
+
+    if (!dwc_host_hears(s, slot)) {
+        *stuck = mask;
+        *level = 0;
+        return;
+    }
+    dwc_lines(s, slot, &l);
+    *stuck = ~(l.to_host >> 2) & mask;
+    *level = (l.host_level >> 2) & *stuck;
+}
+
+/* Whether the host can see a read block's start bit: DAT0 not held high. */
+static bool dwc_dat0_seen(DWCSDMMCState *s, unsigned slot)
+{
+    uint8_t stuck, level;
+
+    dwc_dat_in(s, slot, &stuck, &level);
+    return !(stuck & level & 1);
+}
+
+/*
+ * The bits on the lines in @stuck of @n bytes of a data block, at the
+ * bus's width, each made its line's @level.
+ */
+static void dwc_force_lines(DWCSDMMCState *s, uint8_t *buf, uint32_t n,
+                            uint8_t stuck, uint8_t level)
+{
+    unsigned width = dwc_bus_width(s, s->data_slot);
+    uint8_t clear = 0, set = 0;
+
+    for (unsigned k = 0; k < width; k++) {
+        uint8_t bits = width == 8 ? BIT(k) : width == 4 ? 0x11 << k : 0xff;
+
+        if (stuck & BIT(k)) {
+            clear |= bits;
+            set |= level & BIT(k) ? bits : 0;
+        }
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        buf[i] = (buf[i] & ~clear) | set;
+    }
+}
+
+static void dwc_log_pads(DWCSDMMCState *s, unsigned slot, const char *what)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "%s: card %u: %s, as its pads are set "
+                  "up\n", TYPE_DWC_SDMMC, slot, what);
 }
 
 static void dwc_log_mismatch(DWCSDMMCState *s, unsigned slot,
@@ -741,13 +884,15 @@ static bool dwc_data_busy(DWCSDMMCState *s)
 
 /*
  * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
  * Tell each slot's card whether SDCLK reaches it: its clock runs in the
- * CIU, at pads whose highs the card sees.
+ * CIU, through a pad set up to carry it, at a voltage the card sees.
  */
 static void dwc_sdclk_sync(DWCSDMMCState *s)
 {
     for (unsigned slot = 0; slot < s->num_slots; slot++) {
-        bool on = dwc_card_div(s, slot) && dwc_card_hears(s, slot);
+        bool on = dwc_card_div(s, slot) &&
+                  dwc_card_takes(s, slot, DWC_SDMMC_LINE_CLK);
 
         if (on != !!(s->sdclk_on & BIT(slot))) {
             s->sdclk_on ^= BIT(slot);
@@ -821,6 +966,7 @@ static void dwc_data_setup(DWCSDMMCState *s, uint32_t cmd)
     s->chunk_busy = false;
     s->card_error = false;
     s->blk_fault = 0;
+    s->blk_card_crc = false;
     s->tcbcnt = 0;
     s->tbbcnt = 0;
     s->xfer_dir = s->data_write ? XFER_WRITE : XFER_READ;
@@ -882,6 +1028,7 @@ static void dwc_cmd_issue(DWCSDMMCState *s, uint32_t cmd, uint32_t arg,
     SDBus *bus = dwc_bus(s, slot);
     uint64_t cycles, sent;
     uint8_t resp[16];
+    DWCSDMMCLines l;
     SDRequest req;
     size_t rlen = 0;
 
@@ -925,11 +1072,17 @@ static void dwc_cmd_issue(DWCSDMMCState *s, uint32_t cmd, uint32_t arg,
     req.cmd = index;
     req.arg = arg;
     req.crc = 0;
-    if (bus && dwc_card_hears(s, slot)) {
+    if (bus && dwc_card_takes(s, slot, DWC_SDMMC_LINE_CLK |
+                                       DWC_SDMMC_LINE_CMD)) {
         rlen = sdbus_do_command(bus, &req, resp, sizeof(resp));
     } else if (bus && sdbus_get_inserted(bus)) {
-        dwc_log_mismatch(s, slot, "the card does not see the command");
+        if (!dwc_card_hears(s, slot)) {
+            dwc_log_mismatch(s, slot, "the card does not see the command");
+        } else {
+            dwc_log_pads(s, slot, "its CLK or CMD does not reach it");
+        }
     }
+    dwc_lines(s, slot, &l);
 
     sent = (cmd & CMD_SEND_INIT ? INIT_CYCLES : 0) + CMD_CYCLES;
     cycles = sent;
@@ -937,8 +1090,31 @@ static void dwc_cmd_issue(DWCSDMMCState *s, uint32_t cmd, uint32_t arg,
     s->pend_resp_valid = false;
     if (cmd & CMD_RESP_EXPECT) {
         bool want_long = cmd & CMD_RESP_LONG;
+        bool cmd_follows = s->pad_mv[slot] &&
+                           (l.to_host & DWC_SDMMC_LINE_CMD);
+        bool cmd_low = !s->pad_mv[slot] ||
+                       !(l.host_level & DWC_SDMMC_LINE_CMD);
 
-        if (!rlen) {
+        if (!(cmd_follows && rlen) && cmd_low) {
+            /*
+             * CMD reads low with no card driving it: the host takes a
+             * start bit at once, and a response of 0s, whose CRC matches
+             * but whose end bit does not.
+             */
+            if (s->pad_mv[slot] && bus && sdbus_get_inserted(bus)) {
+                dwc_log_pads(s, slot, "CMD reads low at the host");
+            }
+            cycles += NCR_CYCLES + (want_long ? RESP_LONG_CYCLES
+                                              : RESP_SHORT_CYCLES);
+            s->pend_resp_valid = true;
+            memset(s->pend_resp, 0, sizeof(s->pend_resp));
+            s->pend_resp_index = 0;
+            s->pend_rint |= INT_RE;
+        } else if (!rlen || !cmd_follows) {
+            if (rlen) {
+                dwc_log_pads(s, slot, "its response does not reach the "
+                             "host");
+            }
             s->pend_rint |= INT_RTO;
             cycles += extract32(s->tmout, 0, 8);
         } else {
@@ -1161,70 +1337,138 @@ static uint32_t dwc_block_remaining(DWCSDMMCState *s)
 
 /*
  * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
  * How the host samples the data the card sends next, as things stand
- * before it does (a CMD6 switch, say, takes effect at its block's end):
- * INT_EBE where its pads read the card's highs as lows, INT_DCRC where its
- * sample point misses the card's output or its DDR mode is not the card's.
+ * before it does (a CMD6 switch, say, takes effect at its block's end),
+ * the lines that do not follow the card in chunk_stuck and chunk_level:
+ * INT_EBE where a line reads low throughout (its pads read the card's
+ * highs as lows, are unpowered, or do not take the card's output), its
+ * bits 0, their CRC matching, the end bit not; INT_DCRC where one reads
+ * high, its bits 1, or where DAT0 low takes the start bit before the card
+ * sends it; and INT_DCRC with FAULT_LATE where the sample point misses the
+ * card's output or the host's DDR mode is not the card's.
  */
 static uint32_t dwc_rx_fault(DWCSDMMCState *s)
 {
     unsigned slot = s->data_slot;
+    uint8_t mask = MAKE_64BIT_MASK(0, dwc_bus_width(s, slot));
+    uint8_t stuck, level;
+    uint32_t fault = 0;
 
-    if (!dwc_host_hears(s, slot)) {
-        return INT_EBE;
+    dwc_dat_in(s, slot, &stuck, &level);
+    s->chunk_stuck = stuck;
+    s->chunk_level = level;
+    if (stuck & ~level) {
+        fault |= INT_EBE;
     }
-    if (!dwc_ddr_ok(s, slot) || !dwc_sample_ok(s, slot, true)) {
-        return INT_DCRC;
+    if ((stuck & level) || ((stuck & ~level & 1) && (mask & ~stuck))) {
+        fault |= INT_DCRC;
     }
-    return 0;
+    if (stuck != mask &&
+        (!dwc_ddr_ok(s, slot) || !dwc_sample_ok(s, slot, true))) {
+        fault |= INT_DCRC | FAULT_LATE;
+    }
+    return fault;
 }
 
 /*
  * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
  * The @n bytes read into chunk as the host sampled them, by dwc_rx_fault()
- * @fault as it stood when they started: all 0 (their CRC matching, the end
- * bit not) or a bit late on each line.
+ * @fault as it stood when they started: a bit late on each line, and the
+ * lines that do not follow the card at their levels.
  */
 static void dwc_rx_sampled(DWCSDMMCState *s, bool block_start, uint32_t n,
                            uint32_t fault)
-{
-    if (block_start) {
-        s->shift_carry = 0;
-    }
-    if (fault & INT_EBE) {
-        memset(s->chunk, 0, n);
-        if (!(s->blk_fault & INT_EBE)) {
-            dwc_log_mismatch(s, s->data_slot, "its data reads all 0");
-        }
-    } else if (fault & INT_DCRC) {
-        dwc_shift_bits(s, s->chunk, n);
-    }
-    s->blk_fault |= fault;
-}
-
-/*
- * [spec:nuos:req:emu.esp32p4.sd-uhs]
- * The @n bytes going to the card from chunk: taken a bit late on each
- * line by a card in the other DDR mode; and the CRC status token after
- * the block misread (a CRC error) where the host's pads read the card's
- * highs as lows, or its sample point misses the card's output.
- */
-static void dwc_tx_sampled(DWCSDMMCState *s, bool block_start, uint32_t n)
 {
     unsigned slot = s->data_slot;
 
     if (block_start) {
         s->shift_carry = 0;
     }
-    if (!dwc_ddr_ok(s, slot)) {
+    if (fault & FAULT_LATE) {
         dwc_shift_bits(s, s->chunk, n);
-        s->blk_fault |= INT_DCRC;
-    } else if (!dwc_host_hears(s, slot)) {
-        if (!(s->blk_fault & INT_DCRC)) {
-            dwc_log_mismatch(s, slot, "its CRC status reads 000");
+    }
+    if (s->chunk_stuck) {
+        dwc_force_lines(s, s->chunk, n, s->chunk_stuck, s->chunk_level);
+        if (!(s->blk_fault & (INT_EBE | INT_DCRC))) {
+            if (!dwc_host_hears(s, slot)) {
+                dwc_log_mismatch(s, slot, "its data reads all 0");
+            } else {
+                dwc_log_pads(s, slot, "DAT lines the host's inputs do not "
+                             "take read their pads' levels");
+            }
         }
-        s->blk_fault |= INT_DCRC;
-    } else if (!dwc_sample_ok(s, slot, true)) {
+    }
+    s->blk_fault |= fault & INT_ALL;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * A write block about to cross the bus: whether the card takes it at all,
+ * seeing its start bit on DAT0 (the host's DAT0 reaching it, or its pin
+ * held low), and whether its CRC check will fail (blk_card_crc), the card
+ * taking other bits than the host sends: a DAT line of the bus's width
+ * not reaching it, or the card in the other DDR mode.
+ */
+static bool dwc_tx_start(DWCSDMMCState *s)
+{
+    unsigned slot = s->data_slot;
+    SDBus *bus = dwc_bus(s, slot);
+    uint16_t mask = MAKE_64BIT_MASK(0, dwc_bus_width(s, slot)) << 2;
+    DWCSDMMCLines l;
+    bool start;
+
+    dwc_lines(s, slot, &l);
+    start = dwc_card_hears(s, slot) &&
+            ((l.to_card & DWC_SDMMC_LINE_DAT(0)) ||
+             !(l.card_level & DWC_SDMMC_LINE_DAT(0)));
+    if (!(bus && sdbus_receive_ready(bus))) {
+        return false;
+    }
+    if (!start) {
+        dwc_log_pads(s, slot, "DAT0 does not reach it: it takes no data");
+        return false;
+    }
+    s->blk_card_crc = !dwc_ddr_ok(s, slot) || (l.to_card & mask) != mask;
+    if ((l.to_card & mask) != mask) {
+        dwc_log_pads(s, slot, "a DAT line does not reach it: it finds the "
+                     "block's CRC wrong");
+    }
+    return true;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sd-uhs]
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * The CRC status token after a write block, as the host reads it on DAT0:
+ * none (EBE, the write no CRC error) on a DAT0 that reads high throughout;
+ * 000 (a CRC error) on one that reads low, as on pads that read the
+ * card's highs as lows; the card's negative status (a CRC error) for a
+ * block whose CRC it found wrong; and a CRC error where the sample point
+ * misses the card's output.
+ */
+static void dwc_tx_sampled(DWCSDMMCState *s)
+{
+    unsigned slot = s->data_slot;
+    uint8_t stuck, level;
+
+    dwc_dat_in(s, slot, &stuck, &level);
+    if (stuck & 1) {
+        if (level & 1) {
+            s->blk_fault |= INT_EBE;
+        } else {
+            if (!(s->blk_fault & INT_DCRC)) {
+                if (!dwc_host_hears(s, slot)) {
+                    dwc_log_mismatch(s, slot, "its CRC status reads 000");
+                } else {
+                    dwc_log_pads(s, slot, "the CRC status reads 000");
+                }
+            }
+            s->blk_fault |= INT_DCRC;
+        }
+    } else if (s->blk_card_crc || !dwc_sample_ok(s, slot, true)) {
         s->blk_fault |= INT_DCRC;
     }
 }
@@ -1265,7 +1509,8 @@ static void dwc_data_kick(DWCSDMMCState *s)
     block_start = s->data_block_pos == 0;
 
     if (!s->data_write) {
-        if (block_start && !(bus && sdbus_data_ready(bus))) {
+        if (block_start && !(bus && sdbus_data_ready(bus) &&
+                             dwc_dat0_seen(s, s->data_slot))) {
             dwc_timeout_arm(s, TIMEOUT_DRTO);
             return;
         }
@@ -1343,21 +1588,35 @@ static void dwc_data_run(void *opaque)
         dwc_rx_sampled(s, s->data_block_pos == 0, n, s->chunk_fault);
         dwc_fifo_push(s, s->chunk, n);
     } else {
-        if (s->data_block_pos == 0 && !(bus && sdbus_receive_ready(bus))) {
+        if (s->data_block_pos == 0 && !dwc_tx_start(s)) {
             /* The card takes no data, and sends no CRC status. */
             s->tcbcnt += n;
             dwc_data_end(s, INT_EBE, false);
             dwc_sdmmc_update(s);
             return;
         }
-        dwc_tx_sampled(s, s->data_block_pos == 0, n);
-        sdbus_write_data(bus, s->chunk, n);
+        if (!s->blk_card_crc) {
+            sdbus_write_data(bus, s->chunk, n);
+        }
     }
     s->tcbcnt += n;
     s->data_block_pos += n;
     if (!s->data_stream && s->data_blksz &&
         s->data_block_pos >= s->data_blksz) {
         s->data_block_pos = 0;
+        if (s->data_write) {
+            dwc_tx_sampled(s);
+            if (s->blk_card_crc) {
+                sdbus_write_crc_error(bus);
+                s->blk_card_crc = false;
+            }
+            if (s->blk_fault & INT_EBE) {
+                /* No CRC status: the write ends. */
+                dwc_data_end(s, 0, false);
+                dwc_sdmmc_update(s);
+                return;
+            }
+        }
         dwc_block_end(s);
     }
     if (s->data_total && s->tcbcnt >= s->data_total) {
@@ -1371,6 +1630,25 @@ static void dwc_data_timer(void *opaque)
     DWCSDMMCState *s = opaque;
 
     dwc_run_event(s, s->data_due, dwc_data_run, s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * A read block whose start bit the host does not see (its DAT0 reading
+ * high throughout) has crossed the bus all the same: the card has sent it,
+ * and goes on as a card that has.
+ */
+static void dwc_drain_unseen(DWCSDMMCState *s, SDBus *bus)
+{
+    uint32_t n = MIN(dwc_block_remaining(s), dwc_data_remaining(s));
+    uint8_t buf[512];
+
+    while (n) {
+        uint32_t k = MIN(n, sizeof(buf));
+
+        sdbus_read_data(bus, buf, k);
+        n -= k;
+    }
 }
 
 /* The data timeout, at its time, dwc_now(). */
@@ -1387,7 +1665,11 @@ static void dwc_timeout_run(void *opaque)
         SDBus *bus = dwc_bus(s, s->data_slot);
 
         /* A start bit as the count runs out is taken: the data comes. */
-        if (!(bus && sdbus_data_ready(bus))) {
+        if (!(bus && sdbus_data_ready(bus) &&
+              dwc_dat0_seen(s, s->data_slot))) {
+            if (bus && sdbus_data_ready(bus) && s->data_block_pos == 0) {
+                dwc_drain_unseen(s, bus);
+            }
             dwc_data_end(s, INT_DRTO, false);
         }
     } else if (kind == TIMEOUT_HTO) {
@@ -1755,6 +2037,7 @@ static void dwc_controller_reset(DWCSDMMCState *s)
     s->bci_pending = false;
     s->xfer_dir = XFER_NONE;
     s->blk_fault = 0;
+    s->blk_card_crc = false;
     s->volt_wait = 0;
     s->ctrl &= ~(CTRL_READ_WAIT | CTRL_SEND_IRQ_RESPONSE |
                  CTRL_ABORT_READ_DATA);
@@ -2475,6 +2758,14 @@ void dwc_sdmmc_set_card_power(DWCSDMMCState *s, unsigned slot, bool on)
     dwc_sdmmc_update(s);
 }
 
+/* [spec:nuos:req:emu.esp32p4.sdmmc] */
+void dwc_sdmmc_lines_changed(DWCSDMMCState *s)
+{
+    dwc_catch_up(s, dwc_now());
+    dwc_sdclk_sync(s);
+    dwc_sdmmc_update(s);
+}
+
 /* [spec:nuos:req:emu.sd-card-timing] */
 /* The present for a card on the bus: this model's, dwc_now(). */
 static int64_t dwc_bus_get_time(DeviceState *dev)
@@ -2731,6 +3022,9 @@ static void dwc_sdmmc_reset_hold(Object *obj, ResetType type)
     s->xfer_dir = XFER_NONE;
     s->card_error = false;
     s->blk_fault = 0;
+    s->blk_card_crc = false;
+    s->chunk_stuck = 0;
+    s->chunk_level = 0;
     s->shift_carry = 0;
     dwc_fifo_reset(s);
 
@@ -2758,8 +3052,8 @@ static void dwc_sdmmc_reset_exit(Object *obj, ResetType type)
 
 const VMStateDescription vmstate_dwc_sdmmc = {
     .name = TYPE_DWC_SDMMC,
-    .version_id = 5,
-    .minimum_version_id = 5,
+    .version_id = 6,
+    .minimum_version_id = 6,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER(cmd_timer, DWCSDMMCState),
         VMSTATE_TIMER(data_timer, DWCSDMMCState),
@@ -2851,6 +3145,9 @@ const VMStateDescription vmstate_dwc_sdmmc = {
         VMSTATE_UINT32(blk_fault, DWCSDMMCState),
         VMSTATE_UINT8(shift_carry, DWCSDMMCState),
         VMSTATE_UINT32(chunk_fault, DWCSDMMCState),
+        VMSTATE_UINT8(chunk_stuck, DWCSDMMCState),
+        VMSTATE_UINT8(chunk_level, DWCSDMMCState),
+        VMSTATE_BOOL(blk_card_crc, DWCSDMMCState),
         VMSTATE_UINT8_ARRAY(fifo, DWCSDMMCState,
                             DWC_SDMMC_MAX_FIFO_WORDS * 4),
         VMSTATE_UINT32(fifo_head, DWCSDMMCState),

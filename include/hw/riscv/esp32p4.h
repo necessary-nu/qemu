@@ -166,6 +166,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4MachineState, ESP32P4_MACHINE)
  */
 #define ESP32P4_BOARD_SD_SUPPLY_MV  3300
 #define ESP32P4_BOARD_SD_SWITCH_VTH_MV 900
+/* R27, the switch's gate pull-down on GPIO45 (ohms) */
+#define ESP32P4_BOARD_SD_POWER_PULL_DOWN 10000
+/*
+ * The board's pull-ups on the SD lines (ohms): R5 to R9 on the microSD
+ * socket's CMD and DAT0 to DAT3, to VO4; R15 to R21 on the ESP32-C6's
+ * SDIO lines, slot 1's, to ESP_3V3.
+ */
+#define ESP32P4_BOARD_SD_PULL_UP    51000
 
 /* The crypto block resets that hold more than their own block. */
 #define ESP32P4_CRYPTO_RST_SPLITS   4

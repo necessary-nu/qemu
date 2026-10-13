@@ -492,6 +492,39 @@ static void test_pad_levels(void)
     qtest_quit(qts);
 }
 
+/*
+ * An undriven pad's pulls as a divider: the pad's own 45 kOhm pull-up and
+ * pull-down against each other, or against a board's 51 kOhm pull-up,
+ * hold it between VIL and VIH, where it reads low; a board's 10 kOhm
+ * pull-down wins over the pad's pull-up; a driver over all of them.
+ */
+/* [spec:nuos:req:emu.esp32p4.gpio/test] */
+static void test_pad_pulls(void)
+{
+    QTestState *qts = start_plain();
+
+    gpio_mode(qts, 20, FUN_WPU | FUN_WPD);
+    g_assert_false(gpio_in(qts, 20));
+    gpio_mode(qts, 20, 0);
+    qtest_set_irq_in(qts, GPIO_PATH, "board-pull-up", 20, 51000);
+    g_assert_true(gpio_in(qts, 20));
+    gpio_mode(qts, 20, FUN_WPU);
+    g_assert_true(gpio_in(qts, 20));
+    gpio_mode(qts, 20, FUN_WPD);
+    g_assert_false(gpio_in(qts, 20));
+    qtest_writel(qts, GPIO_ENABLE_W1TS, 1u << 20);
+    qtest_writel(qts, GPIO_OUT_W1TS, 1u << 20);
+    g_assert_true(gpio_in(qts, 20));
+    qtest_writel(qts, GPIO_ENABLE_W1TC, 1u << 20);
+    qtest_set_irq_in(qts, GPIO_PATH, "board-pull-up", 20, 0);
+    qtest_set_irq_in(qts, GPIO_PATH, "board-pull-down", 20, 10000);
+    gpio_mode(qts, 20, FUN_WPU);
+    g_assert_false(gpio_in(qts, 20));
+    qtest_set_irq_in(qts, GPIO_PATH, "board-pull-down", 20, 0);
+    g_assert_true(gpio_in(qts, 20));
+    qtest_quit(qts);
+}
+
 /* pad-ext-driven and pad-ext-level drive pads, set while QEMU runs too. */
 /* [spec:nuos:req:emu.esp32p4.gpio/test] */
 static void test_pad_properties(void)
@@ -1325,8 +1358,11 @@ static void test_usb_pull_up(void)
 
 /*
  * The IO MUX functions with lines of their own: GPIO2's MTCK, input
- * enabled from reset, to its "iomux-func-in" line; GPIO5's MTDO driven by
- * its "iomux-func-out" and "-oe" lines.
+ * enabled from reset, to its "iomux-func-in" line, which reads 1 (an I1
+ * input, the datasheet's table 2-3) with the pad on another function;
+ * GPIO44's SD1_CCMD, on its function from reset with its input disabled,
+ * reading 0, and 1 off it; GPIO5's MTDO driven by its "iomux-func-out"
+ * and "-oe" lines.
  */
 /* [spec:nuos:req:emu.esp32p4.gpio/test] */
 static void test_iomux_direct_lines(void)
@@ -1339,9 +1375,22 @@ static void test_iomux_direct_lines(void)
     g_assert_false(qtest_get_irq(qts, 2 * 5 + 0));
     pad_in(qts, 2, 1);
     g_assert_true(qtest_get_irq(qts, 2 * 5 + 0));
+    pad_in(qts, 2, 0);
     qtest_writel(qts, IO_MUX_GPIO(2), MCU_SEL_GPIO | FUN_IE);
-    g_assert_false(qtest_get_irq(qts, 2 * 5 + 0));
+    g_assert_true(qtest_get_irq(qts, 2 * 5 + 0));
     pad_release(qts, 2);
+
+    pad_in(qts, 44, 1);
+    g_assert_false(qtest_get_irq(qts, 44 * 5 + 0));
+    qtest_writel(qts, IO_MUX_GPIO(44), FUN_IE);
+    g_assert_true(qtest_get_irq(qts, 44 * 5 + 0));
+    pad_in(qts, 44, 0);
+    g_assert_false(qtest_get_irq(qts, 44 * 5 + 0));
+    qtest_writel(qts, IO_MUX_GPIO(44), MCU_SEL_GPIO | FUN_IE);
+    g_assert_true(qtest_get_irq(qts, 44 * 5 + 0));
+    /* GPIO50's EMAC_RMII_CLK, an I0 input, off its function: 0 */
+    g_assert_false(qtest_get_irq(qts, 50 * 5 + 3));
+    pad_release(qts, 44);
 
     qtest_writel(qts, IO_MUX_GPIO(5), FUN_IE);
     qtest_set_irq_in(qts, GPIO_PATH, "iomux-func-out", 5 * 5 + 0, 1);
@@ -1440,6 +1489,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/gpio/register_access", test_register_access);
     qtest_add_func("esp32p4/gpio/strap", test_strap);
     qtest_add_func("esp32p4/gpio/pad_levels", test_pad_levels);
+    qtest_add_func("esp32p4/gpio/pad_pulls", test_pad_pulls);
     qtest_add_func("esp32p4/gpio/pad_properties", test_pad_properties);
     qtest_add_func("esp32p4/gpio/output_routing", test_output_routing);
     qtest_add_func("esp32p4/gpio/input_routing", test_input_routing);

@@ -17,12 +17,14 @@
  * identification, the card at 400 kHz (2.5 us); SDR50 and DDR50 take the
  * SDIO PLL's 200 MHz divided by 2 and 4. The cards are sparse raw images
  * of 4 GiB (high capacity, which UHS-I needs) or 1 MiB (standard
- * capacity), their first blocks patterned.
+ * capacity), their first blocks patterned. Both slots' pins are set up as
+ * ESP-IDF's SD/MMC host driver sets them up (esp32p4-sd-pins.h).
  */
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
+#include "esp32p4-sd-pins.h"
 
 #define SD                  0x50083000
 #define SD_CTRL             (SD + 0x000)
@@ -214,11 +216,16 @@ static void vo4_ldo(QTestState *qts, unsigned dref, unsigned mul)
     qtest_writel(qts, PMU_VO4, LDO_RESET | LDO_FORCE_TIEH_SEL | LDO_XPD);
 }
 
-/* SDMMC_SYS_CLK and the SDIO_LS clocks at 40 MHz, slot 0's pads at 3.3 V. */
+/*
+ * SDMMC_SYS_CLK and the SDIO_LS clocks at 40 MHz, slot 0's pads at 3.3 V,
+ * both slots' pins.
+ */
 static void clocks_on(QTestState *qts)
 {
     uint32_t edges = EDGE_N(3) | EDGE_L(3) | EDGE_H(1) | SLF_DRV_SAM_EN;
 
+    sd_pins(qts, 0);
+    sd_pins(qts, 1);
     qtest_writel(qts, SOC_CLK_CTRL1,
                  qtest_readl(qts, SOC_CLK_CTRL1) | SDMMC_SYS_CLK_EN);
     qtest_writel(qts, PERI_CLK_CTRL01, 0x401 | SDIO_LS_EN);
@@ -685,7 +692,8 @@ static void test_ldo(void)
  * A card and pads at different voltages: a 3.3 V card does not see pads
  * at 1.8 V (no response); pads at 3.3 V read a 1.8 V card's highs as
  * lows (responses all 0, a response error; data all 0, an end bit error);
- * unpowered pads read every line low.
+ * unpowered pads read every line low, DAT0 as busy and CMD as a response
+ * of 0s.
  */
 /* [spec:nuos:req:emu.esp32p4.sd-uhs/test] */
 static void test_mismatch(void)
@@ -726,11 +734,11 @@ static void test_mismatch(void)
     for (int i = 0; i < 512; i++) {
         g_assert_cmphex(blk[i], ==, pattern_byte(512 + i));
     }
-    /* Unpowered pads: every line low, DAT0 busy, no response. */
+    /* Unpowered pads: every line low, DAT0 busy, a response of 0s. */
     vo4_off(qts);
     g_assert_cmphex(qtest_readl(qts, SD_STATUS) & STATUS_BUSY, ==,
                     STATUS_BUSY);
-    g_assert_cmphex(cmd(qts, 0, R1, 13, rca << 16), ==, INT_CMDD | INT_RTO);
+    g_assert_cmphex(cmd(qts, 0, R1, 13, rca << 16), ==, INT_CMDD | INT_RE);
     qtest_quit(qts);
     unlink(img);
 }
