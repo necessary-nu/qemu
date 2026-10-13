@@ -961,12 +961,19 @@ static void esp32_rtc_catch_up(Esp32RtcCntlState *s)
     esp32_rtc_catch_up_to(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
+/* [spec:nuos:req:emu.esp32.ulp] */
+void esp32_rtc_cntl_add_access_notifier(Esp32RtcCntlState *s, Notifier *n)
+{
+    notifier_list_add(&s->access_notifiers, n);
+}
+
 static uint64_t esp32_rtc_cntl_read(void *opaque, hwaddr addr,
                                     unsigned int size)
 {
     Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
     uint32_t r;
 
+    notifier_list_notify(&s->access_notifiers, s);
     esp32_rtc_catch_up(s);
     switch (addr) {
     case A_RTC_CNTL_TIME0:
@@ -1024,6 +1031,7 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
     uint32_t old;
     uint32_t writable = reg_info[addr / 4].writable;
 
+    notifier_list_notify(&s->access_notifiers, s);
     esp32_rtc_catch_up(s);
     old = *r;
     switch (addr) {
@@ -1379,6 +1387,7 @@ static void esp32_rtc_cntl_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
     DeviceState *dev = DEVICE(obj);
 
+    notifier_list_init(&s->access_notifiers);
     memory_region_init_io(&s->iomem, obj, &esp32_rtc_cntl_ops, s,
                           TYPE_ESP32_RTC_CNTL, ESP32_RTC_CNTL_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);

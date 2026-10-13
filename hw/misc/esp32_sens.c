@@ -1175,6 +1175,7 @@ static uint64_t esp32_sens_read(void *opaque, hwaddr addr, unsigned size)
                       "\n", addr);
         return 0;
     }
+    notifier_list_notify(&s->access_notifiers, s);
     sens_catch_up(s);
     switch (addr) {
     case A_SENS_SAR_READ_STATUS1:
@@ -1210,6 +1211,7 @@ static void esp32_sens_write(void *opaque, hwaddr addr, uint64_t value,
                       "\n", addr);
         return;
     }
+    notifier_list_notify(&s->access_notifiers, s);
     sens_catch_up(s);
     old = s->regs[idx];
     writable = reg_info[idx].writable;
@@ -1422,12 +1424,19 @@ static void esp32_sens_realize(DeviceState *dev, Error **errp)
     }
 }
 
+/* [spec:nuos:req:emu.esp32.ulp] */
+void esp32_sens_add_access_notifier(Esp32SensState *s, Notifier *n)
+{
+    notifier_list_add(&s->access_notifiers, n);
+}
+
 static void esp32_sens_init(Object *obj)
 {
     Esp32SensState *s = ESP32_SENS(obj);
     DeviceState *dev = DEVICE(obj);
     char name[24];
 
+    notifier_list_init(&s->access_notifiers);
     memory_region_init_io(&s->iomem, obj, &esp32_sens_ops, s,
                           TYPE_ESP32_SENS, ESP32_SENS_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
