@@ -394,6 +394,14 @@ static void esp32_timg_apb_clk_update(void *opaque, ClockEvent event)
     Esp32TimgTimerState *timers[] = { &s->t0, &s->t1, &s->lact };
     uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    /*
+     * The alarms and watchdog stages due by the change, which a timer
+     * running late without icount has yet to take, at the old rate: re-
+     * armed at the new one they would otherwise be lost or come late.
+     */
+    if (event == ClockPreUpdate) {
+        esp32_timg_catch_up(s);
+    }
     for (int i = 0; i < ARRAY_SIZE(timers); i++) {
         Esp32TimgTimerState *ts = timers[i];
 
