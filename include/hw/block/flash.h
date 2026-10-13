@@ -57,4 +57,10 @@ BlockBackend *m25p80_get_blk(DeviceState *dev);
  */
 int64_t m25p80_busy_until(DeviceState *dev);
 
+/*
+ * Whether the part's IO3 pin is its HOLD# input, which pauses it while
+ * low: with its quad enable clear.
+ */
+bool m25p80_hold_enabled(DeviceState *dev);
+
 #endif

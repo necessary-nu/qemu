@@ -1135,6 +1135,95 @@ void esp32_gpio_iomux_out_path(Esp32GpioState *s, unsigned n, unsigned func,
     *oe_line = was;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * Pad n as a line between a peripheral's output out_sig and input in_sig
+ * and a chip on the pad, with the output enable forced on, then off: see
+ * esp32_gpio.h. The input's source is the pad SIG_IN_SEL routes it from,
+ * or the first whose IO_MUX function carries it, as esp32_gpio_sig_in()
+ * resolves it.
+ */
+void esp32_gpio_sig_path(Esp32GpioState *s, unsigned n, int out_sig,
+                         int in_sig, Esp32GpioSigPath *p)
+{
+    uint64_t up, down;
+    bool val, oe, undef, od_high = true, driven, level, ie;
+    uint8_t was;
+    unsigned f;
+    int src;
+
+    memset(p, 0, sizeof(*p));
+    if (n >= ESP32_GPIO_PIN_COUNT || !bit64(PAD_VALID, n)) {
+        p->in_level = in_sig >= 0 && s->sig_in[in_sig];
+        return;
+    }
+    if (out_sig >= 0) {
+        was = s->sig_oe[out_sig];
+        if (pad_open_drain(s, n)) {
+            esp32_gpio_pulls(s, n, &up, &down);
+            od_high = pull_level(up, down, &undef);
+        }
+        s->sig_oe[out_sig] = 1;
+        src = esp32_gpio_pad_drive(s, n, &val, &oe);
+        p->out_on = src == out_sig && oe && od_high &&
+                    !bit64(s->ext_driven, n);
+        p->out_inv = src == out_sig &&
+                     pad_func(s, n, &f)->kind == IOMUX_GPIO &&
+                     FIELD_EX32(s->func_out_sel[n], GPIO_FUNC0_OUT_SEL_CFG,
+                                OUT_INV_SEL);
+        s->sig_oe[out_sig] = 0;
+        esp32_gpio_pad_drive(s, n, &val, &oe);
+        s->sig_oe[out_sig] = was;
+    } else {
+        esp32_gpio_pad_drive(s, n, &val, &oe);
+    }
+    if (pad_open_drain(s, n) && val) {
+        oe = false;
+    }
+    driven = bit64(s->ext_driven, n) || oe;
+    if (bit64(s->ext_driven, n)) {
+        level = bit64(s->ext_level, n);
+    } else if (oe) {
+        level = val;
+    } else {
+        esp32_gpio_pulls(s, n, &up, &down);
+        level = pull_level(up, down, &undef);
+    }
+    p->pad_level = level;
+    if (in_sig < 0) {
+        return;
+    }
+
+    src = -1;
+    if (FIELD_EX32(s->func_in_sel[in_sig], GPIO_FUNC0_IN_SEL_CFG,
+                   SIG_IN_SEL)) {
+        unsigned sel = FIELD_EX32(s->func_in_sel[in_sig],
+                                  GPIO_FUNC0_IN_SEL_CFG, IN_SEL);
+
+        src = sel < ESP32_GPIO_PIN_COUNT ? sel : -1;
+        p->in_inv = FIELD_EX32(s->func_in_sel[in_sig],
+                               GPIO_FUNC0_IN_SEL_CFG, IN_INV_SEL);
+    } else {
+        for (unsigned i = 0; i < ESP32_GPIO_PIN_COUNT && src < 0; i++) {
+            const IomuxFunc *fn = pad_func(s, i, &f);
+
+            if (bit64(PAD_VALID, i) && fn->kind == IOMUX_SIG &&
+                fn->sig_in == in_sig) {
+                src = i;
+            }
+        }
+    }
+    if (src != (int)n) {
+        p->in_inv = false;
+        p->in_level = s->sig_in[in_sig];
+        return;
+    }
+    ie = bit64(s->rtc_mux, n) ? bit64(s->rtc_ie, n) :
+         FIELD_EX32(s->iomux[n], IO_MUX_GPIO36, FUN_IE);
+    p->in_on = ie && !driven;
+    p->in_level = (ie && level) ^ p->in_inv;
+}
+
 /* [spec:nuos:req:emu.esp32.gpio] */
 bool esp32_gpio_iomux_in_selected(Esp32GpioState *s, unsigned n,
                                   unsigned func)

@@ -276,17 +276,20 @@
  *   - I2C0, I2C1 and the LP I2C (TRM chapter 47), and the I3C master and
  *     slave, at the level of their lines through the GPIO matrices, timed
  *     by their function clocks, their interrupts through the interrupt
- *     matrix. Each master's QEMU bus, "i2c0", "i2c1", "lp-i2c" and "i3c"
- *     (with "i3c-legacy-i2c" for I2C devices on the I3C bus), stands for
- *     the board's wires on the pads it is routed to; the board has no
- *     devices on them, and -device puts devices there:
+ *     matrix. The board's ESP_I2C wires, GPIO8 (SCL) and GPIO7 (SDA)
+ *     with their 2.2 kOhm pull-ups, carry its ES8311 codec at 0x18; their
+ *     QEMU bus, "esp-i2c", follows the pads' levels, so that whatever
+ *     drives the pads reaches the codec. Each master's QEMU bus, "i2c0",
+ *     "i2c1", "lp-i2c" and "i3c" (with "i3c-legacy-i2c" for I2C devices on
+ *     the I3C bus), stands for wires on the pads it is routed to, with no
+ *     devices on them; -device puts devices on either kind:
  *
  *       -device tmp105,bus=i2c0,address=0x48
  *
  *     Pads the board wires to each other, so that two of the chip's
  *     controllers share a bus, are the GPIO block's "pad-wires":
  *
- *       -global esp32p4-gpio.pad-wires=7:9,8:10
+ *       -global esp32p4-gpio.pad-wires=20:22,21:23
  *
  *   - I2S0 to I2S2 (TRM chapter 49) at 0x500C6000, each behind its
  *     I2Sn_APB_CLK and reset, its units on I2Sn_TX_CLK and I2Sn_RX_CLK,
@@ -299,7 +302,10 @@
  *     controllers clock and feed each other through whatever pads the
  *     matrices route between them, and I2Sn_MCLK_out reaches another's
  *     I2Sn_MCLK_in, a source of its unit clocks, the same way. The
- *     machine's audiodev stands for a codec on every controller's bus:
+ *     board's ES8311 codec takes I2S signals on GPIO9 to GPIO13, and its
+ *     NS4150B amplifier, enabled by GPIO53, drives the speaker; the
+ *     machine's audiodev is the speaker and the microphone
+ *     (esp32p4_init_audio()):
  *
  *       -audiodev coreaudio,id=snd0 -M esp32p4,audiodev=snd0
  *
@@ -1817,9 +1823,10 @@ static void esp32p4_init_cameras(ESP32P4MachineState *s)
  * 68 to 71; and the LP I2C (0x50122000), behind LPPERI's LP_I2C clock
  * gate and reset, timed by LP_I2C_SCLK, its interrupt source 11 and its
  * lines the LP GPIO matrix's signals 0 and 1. Their QEMU I2C buses,
- * "i2c0", "i2c1" and "lp-i2c", stand for the board's wires on the pads
- * each controller is routed to; the board has nothing on them, and
- * -device puts i2c-slave devices there:
+ * "i2c0", "i2c1" and "lp-i2c", stand for wires on the pads each
+ * controller is routed to, with nothing on them; the board's own devices
+ * are on its ESP_I2C wires, "esp-i2c" (esp32p4_init_audio()). -device
+ * puts i2c-slave devices on any of them:
  *
  *   -device tmp105,bus=i2c0,address=0x48
  */
@@ -3710,7 +3717,6 @@ static void esp32p4_init_i2s(ESP32P4MachineState *s)
     static const char *const links[ESP32P4_I2S_COUNT] = {
         "i2s0", "i2s1", "i2s2", "lp-i2s",
     };
-    MachineState *ms = MACHINE(s);
     DeviceState *clkrst = DEVICE(&s->clkrst), *gpio = DEVICE(&s->gpio);
     ESP32P4ClkRstGate *g;
     int i, k, l;
@@ -3725,9 +3731,6 @@ static void esp32p4_init_i2s(ESP32P4MachineState *s)
         }
         object_property_set_link(OBJECT(dev), "gpio", OBJECT(&s->gpio),
                                  &error_abort);
-        if (ms->audiodev) {
-            qdev_prop_set_string(dev, "audiodev", ms->audiodev);
-        }
         if (lp) {
             qdev_connect_clock_in(dev, "apb",
                                   qdev_get_clock_out(clkrst, "lp-i2s"));
@@ -5080,6 +5083,7 @@ static void esp32p4_init(MachineState *machine)
     esp32p4_init_uart(s);
     esp32p4_init_usb_serial_jtag(s);
     esp32p4_init_i2s(s);
+    esp32p4_init_audio(s);
     esp32p4_init_i3c(s);
     esp32p4_init_twai(s);
     esp32p4_init_pwm(s);

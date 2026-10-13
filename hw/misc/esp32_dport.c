@@ -299,6 +299,15 @@ static const MemoryRegionOps esp32_dport_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * Fill the pages whose MMU entries changed, as the cache would fill them
+ * now: through SPI0 and the flash's pads (flash_read, hw/ssi/esp32_spi.c),
+ * which may give other bytes than the flash holds. The model fills a page
+ * whole when the cache is enabled or flushed, where the hardware fills
+ * each 32-byte block on its first miss after: a pad changed between the
+ * flush and the access is seen by the hardware, not by the model.
+ */
 static void esp32_cache_data_sync(Esp32CacheRegionState* crs)
 {
     if (crs->cache->dport->flash_blk == NULL) {
@@ -323,7 +332,15 @@ static void esp32_cache_data_sync(Esp32CacheRegionState* crs)
             }
         } else {
             uint32_t phys_addr = mmu_entry * ESP32_CACHE_PAGE_SIZE;
-            blk_pread(crs->cache->dport->flash_blk, phys_addr, ESP32_CACHE_PAGE_SIZE, cache_page, 0);
+            Esp32DportState *ds = crs->cache->dport;
+
+            if (ds->flash_read) {
+                ds->flash_read(ds->flash_read_opaque, phys_addr,
+                               (uint8_t *)cache_page, ESP32_CACHE_PAGE_SIZE);
+            } else {
+                blk_pread(ds->flash_blk, phys_addr, ESP32_CACHE_PAGE_SIZE,
+                          cache_page, 0);
+            }
             if (decrypt) {
                 esp32_flash_decrypt_inplace(flash_enc, phys_addr, cache_page, ESP32_CACHE_PAGE_SIZE/4);
             }

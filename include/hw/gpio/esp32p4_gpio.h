@@ -637,6 +637,16 @@ int esp32p4_gpio_pad_out_sig(ESP32P4GpioState *s, unsigned n, bool *inverted);
 bool esp32p4_gpio_sig_in_inverted(ESP32P4GpioState *s, unsigned sig);
 
 /*
+ * The same for the LP matrix: the LP output signal LP pad n carries with
+ * its output enabled while the LP IO MUX holds it (-1: none), with
+ * *inverted set where LP_GPIO_FUNCn_OUT_INV_SEL inverts it; and whether
+ * the LP matrix inverts LP input signal sig (LP_GPIO_FUNCn_IN_INV_SEL).
+ */
+int esp32p4_gpio_lp_pad_out_sig(ESP32P4GpioState *s, unsigned n,
+                                bool *inverted);
+bool esp32p4_gpio_lp_sig_in_inverted(ESP32P4GpioState *s, unsigned sig);
+
+/*
  * Whether HP pad n's IO MUX selects function func, with its input
  * enabled: for a block whose IO MUX function takes a clock from the pad,
  * which no line carries.
