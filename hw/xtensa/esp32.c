@@ -402,8 +402,17 @@ static void esp32_ext_filter(void *opaque, CPUXtensaState *env,
         .page_size = map->page_size,
     };
 
+    /*
+     * A TLB fill in a flash region may fill the cache, which reads the
+     * flash, which reads the clock: under icount, mid-block, the time of
+     * the block's last instruction, at most a block ahead of the access.
+     */
+    bool can_do_io = env_cpu(env)->neg.can_do_io;
+
+    env_cpu(env)->neg.can_do_io = true;
     esp32_dport_mpu_filter(&s->dport, cpu, esp32_pid_current(&s->pid[cpu]),
                            vaddr, access_type, &m);
+    env_cpu(env)->neg.can_do_io = can_do_io;
     map->paddr = m.paddr;
     map->prot = m.prot;
     map->page_size = m.page_size;
@@ -424,11 +433,47 @@ static void esp32_ext_countdown_expired(void *opaque, CPUXtensaState *env,
     esp32_pid_countdown_expired(&s->pid[env_cpu(env)->cpu_index], n);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * Code the translator fetches from the flash cache for the first time,
+ * for PIDs 0 and 1: its blocks' misses (hw/misc/esp32_dport.c).
+ */
+static void esp32_ext_fetch(void *opaque, CPUXtensaState *env,
+                            uint32_t vaddr, unsigned len, bool insn)
+{
+    Esp32SocState *s = ESP32_SOC(opaque);
+    CPUState *cs = env_cpu(env);
+    bool can_do_io = cs->neg.can_do_io;
+
+    if (esp32_pid_current(&s->pid[cs->cpu_index]) <= 1) {
+        /*
+         * The fill reads the flash, which reads the clock: under icount
+         * the time of the run so far, which the translation precedes.
+         */
+        cs->neg.can_do_io = true;
+        esp32_dport_cache_fetch(&s->dport, cs->cpu_index, vaddr, len);
+        cs->neg.can_do_io = can_do_io;
+    }
+}
+
 static const XtensaExtHooks esp32_ext_hooks = {
     .filter = esp32_ext_filter,
     .vector = esp32_ext_vector,
     .countdown_expired = esp32_ext_countdown_expired,
+    .fetch = esp32_ext_fetch,
 };
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * A cache miss stalls the fetching CPU for the fill's time, its CPU_CLK
+ * cycles counted as its instructions' periods under icount.
+ */
+static void esp32_cache_stall(void *opaque, int cpu, int64_t ns)
+{
+    Esp32SocState *s = ESP32_SOC(opaque);
+
+    icount_stall(CPU(&s->cpu[cpu]), clock_ns_to_ticks(s->cpu_clk, ns));
+}
 
 static unsigned esp32_get_pid(void *opaque, int cpu)
 {
@@ -1144,6 +1189,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     s->dport.get_pid = esp32_get_pid;
     s->dport.get_pid_opaque = s;
+    s->dport.stall = esp32_cache_stall;
+    s->dport.stall_opaque = s;
     qdev_realize(DEVICE(&s->dport), &s->periph_bus, &error_fatal);
     MemoryRegion* dport_mem = sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->dport), 0);
 
@@ -1161,6 +1208,10 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
             { &s->dport.mpu_sink, ESP32_MPU_SINK_BASE },
             { &s->dport.mpu_redirect, ESP32_MPU_REDIRECT_BASE },
             { &s->dport.flash_pages, ESP32_FLASH_PAGES_BASE },
+            { &s->dport.cache_state[i].drom0.miss_mem,
+              ESP32_CACHE_MISS_BASE },
+            { &s->dport.cache_state[i].iram0.miss_mem,
+              ESP32_CACHE_MISS_BASE + ESP32_CACHE_REGION_SIZE },
         };
 
         object_property_set_link(OBJECT(&s->pid[i]), "cpu",
@@ -2346,14 +2397,36 @@ static void esp32_flash_lines(void *opaque, Esp32SpiFlashLines *l)
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] */
-static void esp32_flash_cache_read(void *opaque, uint32_t addr, uint8_t *buf,
-                                   uint32_t len)
+static int64_t esp32_flash_cache_read(void *opaque, uint32_t addr,
+                                      uint8_t *buf)
 {
     Esp32MachineState *ms = opaque;
 
-    for (uint32_t off = 0; off < len; off += ESP32_SPI_CACHE_BLOCK) {
-        esp32_spi_flash_cache_read(&ms->esp32.spi[0], addr + off, buf + off);
-    }
+    return esp32_spi_flash_cache_read(&ms->esp32.spi[0], addr, buf);
+}
+
+static int64_t esp32_flash_cache_ns(void *opaque)
+{
+    Esp32MachineState *ms = opaque;
+
+    return esp32_spi_flash_cache_ns(&ms->esp32.spi[0]);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * What SPI0 reads of the flash may have changed: the pads, SPI0's set-up,
+ * SPI1's command, the flash's array or state.
+ */
+static void esp32_flash_changed(void *opaque)
+{
+    Esp32MachineState *ms = opaque;
+
+    esp32_dport_cache_refresh(&ms->esp32.dport);
+}
+
+static void esp32_flash_array_changed(void *opaque, int n, int level)
+{
+    esp32_flash_changed(opaque);
 }
 
 static void esp32_flash_route_changed(Notifier *n, void *data)
@@ -2361,6 +2434,7 @@ static void esp32_flash_route_changed(Notifier *n, void *data)
     Esp32MachineState *ms = container_of(n, Esp32MachineState, flash_route);
 
     esp32_spi_flash_lines_changed(&ms->esp32.spi[1]);
+    esp32_flash_changed(ms);
 }
 
 /* CS#'s pad, which the flash follows where SPICS0 does not reach it */
@@ -2369,6 +2443,7 @@ static void esp32_flash_cs_pad_changed(void *opaque, int n, int level)
     Esp32MachineState *ms = opaque;
 
     esp32_spi_flash_lines_changed(&ms->esp32.spi[1]);
+    esp32_flash_changed(ms);
 }
 
 static void esp32_machine_init_spi_flash(Esp32MachineState *ms,
@@ -2418,7 +2493,15 @@ static void esp32_machine_init_spi_flash(Esp32MachineState *ms,
                             esp32_flash_lines, ms);
     }
     ss->dport.flash_read = esp32_flash_cache_read;
+    ss->dport.fill_time = esp32_flash_cache_ns;
     ss->dport.flash_read_opaque = ms;
+    for (int i = 0; i < 2; i++) {
+        ss->spi[i].changed = esp32_flash_changed;
+        ss->spi[i].changed_opaque = ms;
+    }
+    qdev_connect_gpio_out_named(flash_dev, "array-changed", 0,
+                                qemu_allocate_irq(esp32_flash_array_changed,
+                                                  ms, 0));
     ms->flash_route.notify = esp32_flash_route_changed;
     esp32_gpio_add_route_notifier(&ss->gpio, &ms->flash_route);
     qdev_connect_gpio_out_named(DEVICE(&ss->gpio), ESP32_GPIO_PAD_OUT, 11,

@@ -52,6 +52,9 @@ typedef struct Esp32SpiFlashLines {
 
 typedef void Esp32SpiFlashLinesFunc(void *opaque, Esp32SpiFlashLines *l);
 
+/* What a cache fill reads of the flash may have changed */
+typedef void Esp32SpiChangedFunc(void *opaque);
+
 /* The flash's WP#, which the controller drives at each transaction */
 #define ESP32_SPI_FLASH_WP      "flash-wp"
 
@@ -79,6 +82,12 @@ typedef struct Esp32SpiState {
     Esp32SpiFlashLinesFunc *flash_lines;
     void *flash_lines_opaque;
     qemu_irq flash_wp;
+    /*
+     * Called after a transaction on CS0, and when SPI0's set-up for the
+     * cache changes
+     */
+    Esp32SpiChangedFunc *changed;
+    void *changed_opaque;
 
     /* The command in flight (SPI_CMD's bits) and when it ends */
     uint32_t cmd_reg;
@@ -222,3 +231,6 @@ void esp32_spi_flash_lines_changed(Esp32SpiState *s);
  */
 int64_t esp32_spi_flash_cache_read(Esp32SpiState *s, uint32_t addr,
                                    uint8_t *buf);
+
+/* The time such a fill takes, as SPI0 is set up now, in ns */
+int64_t esp32_spi_flash_cache_ns(Esp32SpiState *s);

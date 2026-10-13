@@ -894,6 +894,9 @@ static void esp32_spi_exchange(Esp32SpiState *s)
     }
     if (s->flash && !FIELD_EX32(s->pin_reg, SPI_PIN, CS0_DIS)) {
         esp32_spi_flash_xfer(s, &t, NULL);
+        if (s->changed) {
+            s->changed(s->changed_opaque);
+        }
     } else {
         esp32_spi_wires(s, &t);
     }
@@ -1057,12 +1060,31 @@ static uint64_t esp32_spi_read(void *opaque, hwaddr addr, unsigned int size)
     return r;
 }
 
+/* SPI0's registers that set up the cache's reads */
+static bool esp32_spi_cache_setup(hwaddr addr)
+{
+    switch (addr) {
+    case A_SPI_CTRL:
+    case A_SPI_CLOCK:
+    case A_SPI_USER:
+    case A_SPI_USER1:
+    case A_SPI_USER2:
+    case A_SPI_PIN:
+    case A_SPI_CACHE_FCTRL:
+        return true;
+    }
+    return false;
+}
+
 static void esp32_spi_write(void *opaque, hwaddr addr,
                        uint64_t value, unsigned int size)
 {
     Esp32SpiState *s = ESP32_SPI(opaque);
 
     esp32_spi_catch_up(s);
+    if (s->changed && s->bus != s && esp32_spi_cache_setup(addr)) {
+        s->changed(s->changed_opaque);
+    }
     switch (addr) {
     case A_SPI_W0 ... A_SPI_W0 + (ESP32_SPI_BUF_WORDS - 1) * sizeof(uint32_t):
         s->data_reg[(addr - A_SPI_W0) / sizeof(uint32_t)] = value;
@@ -1183,10 +1205,10 @@ void esp32_spi_flash_lines_changed(Esp32SpiState *s)
  * transaction in flight crosses the lines first, the cache's coming after
  * it ends.
  */
-int64_t esp32_spi_flash_cache_read(Esp32SpiState *s, uint32_t addr,
-                                   uint8_t *buf)
+static void esp32_spi_cache_xfer(Esp32SpiState *s, uint32_t addr,
+                                 Esp32SpiTransaction *t)
 {
-    Esp32SpiTransaction t = {
+    *t = (Esp32SpiTransaction) {
         .cmd_bits = 8,
         .addr = (uint64_t)(addr & 0xffffff) << 40,
         .addr_bits = FIELD_EX32(s->user1_reg, SPI_USER1, ADDR_BITLEN) + 1,
@@ -1197,15 +1219,31 @@ int64_t esp32_spi_flash_cache_read(Esp32SpiState *s, uint32_t addr,
         .in_w = esp32_spi_fread_data_w(s->ctrl_reg),
         .out_w = 1,
     };
+    if (FIELD_EX32(s->cache_fctrl_reg, SPI_CACHE_FCTRL, CACHE_FLASH_USR_CMD)) {
+        t->cmd = FIELD_EX32(s->user2_reg, SPI_USER2, COMMAND_VALUE);
+        t->cmd_bits = FIELD_EX32(s->user2_reg, SPI_USER2, COMMAND_BITLEN) + 1;
+    } else {
+        t->cmd = esp32_spi_fread_cmd(s->ctrl_reg);
+    }
+}
+
+/* [spec:nuos:req:emu.esp32.clock-gating] */
+int64_t esp32_spi_flash_cache_ns(Esp32SpiState *s)
+{
+    Esp32SpiTransaction t;
+
+    esp32_spi_cache_xfer(s, 0, &t);
+    return esp32_spi_xfer_ns(s, &t);
+}
+
+int64_t esp32_spi_flash_cache_read(Esp32SpiState *s, uint32_t addr,
+                                   uint8_t *buf)
+{
+    Esp32SpiTransaction t;
     int64_t wait = 0, now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t ns;
 
-    if (FIELD_EX32(s->cache_fctrl_reg, SPI_CACHE_FCTRL, CACHE_FLASH_USR_CMD)) {
-        t.cmd = FIELD_EX32(s->user2_reg, SPI_USER2, COMMAND_VALUE);
-        t.cmd_bits = FIELD_EX32(s->user2_reg, SPI_USER2, COMMAND_BITLEN) + 1;
-    } else {
-        t.cmd = esp32_spi_fread_cmd(s->ctrl_reg);
-    }
+    esp32_spi_cache_xfer(s, addr, &t);
     if (s->bus && s->bus->cmd_reg) {
         esp32_spi_exchange(s->bus);
         if (s->bus->done_at != INT64_MAX && s->bus->done_at > now) {
