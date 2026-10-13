@@ -289,6 +289,7 @@ qtests_xtensa = \
      'esp32-rmt-test',
      'esp32-emac-test',
      'esp32-sdio-test',
+     'esp32-sdio-pins-test',
      'esp32-sd-card-test',
      'esp32-sd-pins-test',
      'esp32-mcpwm-test',

@@ -869,6 +869,27 @@ static void esp32_soc_connect_sdmmc(Esp32SocState *s)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32.sdio-slave]
+ * [spec:nuos:req:emu.esp32.gpio]
+ * The SDIO slave's lines between transfers on its IO_MUX functions,
+ * function 4 of slot 1's pads (hw/sd/esp32_sdio_slave.c).
+ */
+static void esp32_soc_connect_sdio(Esp32SocState *s)
+{
+    static const uint8_t pads[ESP32_SDIO_LINES] = ESP32_SDIO_SLOT1_PADS;
+    DeviceState *gpio = DEVICE(&s->gpio), *dev = DEVICE(&s->sdio);
+
+    for (int i = 0; i < ESP32_SDIO_LINES; i++) {
+        int line = pads[i] * ESP32_IOMUX_FUNC_COUNT + ESP32_SDIO_FUNC;
+
+        qdev_connect_gpio_out_named(dev, ESP32_SDIO_PAD_OUT, i,
+            qdev_get_gpio_in_named(gpio, ESP32_GPIO_IOMUX_OUT, line));
+        qdev_connect_gpio_out_named(dev, ESP32_SDIO_PAD_OE, i,
+            qdev_get_gpio_in_named(gpio, ESP32_GPIO_IOMUX_OE, line));
+    }
+}
+
+/*
  * [spec:nuos:req:emu.esp32.gpio]
  * The peripherals' line-level signals go through the GPIO matrix, by their
  * signal numbers, in and out: the UARTs' TXD, RTS and DTR and RXD, CTS and
@@ -1747,7 +1768,10 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
      */
     object_property_set_link(OBJECT(&s->sdio), "dma-mr", OBJECT(sys_mem),
                              &error_abort);
+    object_property_set_link(OBJECT(&s->sdio), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
     qdev_realize(DEVICE(&s->sdio), &s->periph_bus, &error_fatal);
+    esp32_soc_connect_sdio(s);
     {
         Esp32PeriphGate *g = esp32_soc_add_gated_device(
             s, &s->sdio, DR_REG_SLC_BASE, ESP32_GATE_WIFI,
@@ -2216,6 +2240,9 @@ struct Esp32MachineState {
     DeviceState *flash_dev;
     bool sdio_host;
     uint32_t sd_pull_up;
+    /* The SDIO slave's host, and what tells it its lines changed */
+    SDHCIState *sdio_sdhci;
+    Notifier sdio_route;
 };
 #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
 
@@ -2325,24 +2352,78 @@ static void esp32_machine_init_sd(Esp32MachineState *ms)
 /*
  * [spec:nuos:req:emu.esp32.sdio-slave]
  * An SD host for the SDIO slave. Nothing in the ESP32 can be the slave's
- * host (its SD/MMC host's second slot uses the same pads), so with
+ * host (its SD/MMC host's slot 1 uses the same pads), so with
  * sdio-host=on the machine adds a standard SD host controller (SDHCI)
- * outside the ESP32's address map, standing for an external host wired
- * to the slave's pins, and plugs the slave's card into it. The
- * controller's interrupt is its sysbus IRQ 0, wired to nothing.
+ * outside the ESP32's address map, standing for an external host whose
+ * CLK, CMD and DAT0 to DAT3 the board wires to slot 1's pads (GPIO14,
+ * GPIO15, GPIO2, GPIO4, GPIO12, GPIO13), and plugs the slave's card into
+ * it. The host reaches the slave only as those pads are set up
+ * (esp32_sdio_slave_lines(), hw/sd/sdhci.c's lines): what the host then
+ * sees is no response (a command timeout) where CMD is held high, a
+ * response of 0s (CRC and end bit errors) where it is held low, a data
+ * timeout where a read's DAT0 is held high, a data CRC error where
+ * another DAT line does not follow the slave or a write block fails the
+ * slave's CRC check, and its card interrupt as DAT1's pad holds it. The
+ * board's pull-ups on those pads are the machine's "sd-pull-up", as for an
+ * SD card on slot 1, which the board then cannot also have: the machine
+ * takes no SD card with sdio-host=on. The controller's interrupt is its
+ * sysbus IRQ 0, wired to nothing.
  */
 #define ESP32_SDIO_TEST_HOST_BASE 0x22000000
 
+static void esp32_sdio_host_lines(void *opaque, SDHCILines *l)
+{
+    Esp32SdioLines sl;
+
+    esp32_sdio_slave_lines(opaque, &sl);
+    l->to_card = sl.to_slave;
+    l->to_host = sl.to_host;
+    l->card_level = sl.slave_level;
+    l->host_level = sl.host_level;
+}
+
+static void esp32_sdio_route_changed(Notifier *n, void *data)
+{
+    Esp32MachineState *ms = container_of(n, Esp32MachineState, sdio_route);
+
+    sdhci_lines_changed(ms->sdio_sdhci);
+}
+
+/* DAT1's pad, which the host watches for the slave's interrupt */
+static void esp32_sdio_dat1_changed(void *opaque, int n, int level)
+{
+    Esp32MachineState *ms = opaque;
+
+    sdhci_lines_changed(ms->sdio_sdhci);
+}
+
 static void esp32_machine_init_sdio_host(Esp32MachineState *ms)
 {
+    static const uint8_t pads[ESP32_SDIO_LINES] = ESP32_SDIO_SLOT1_PADS;
     Esp32SocState *ss = &ms->esp32;
     DeviceState *host = qdev_new(TYPE_SYSBUS_SDHCI);
+    BusState *bus;
 
+    if (drive_get(IF_SD, 0, 0)) {
+        error_report("sdio-host=on wires an SD host to slot 1's pads, where "
+                     "the board's SD card would be: give one or the other");
+        exit(1);
+    }
+    qbus_mark_full(qdev_get_child_bus(DEVICE(&ss->sdmmc), "sd-bus1"));
     object_property_add_child(OBJECT(ms), "sdio-sdhci", OBJECT(host));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(host), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(host), 0, ESP32_SDIO_TEST_HOST_BASE);
-    esp32_sdio_slave_attach(&ss->sdio,
-                            SD_BUS(qdev_get_child_bus(host, "sd-bus")));
+    bus = qdev_get_child_bus(host, "sd-bus");
+    esp32_sdio_slave_attach(&ss->sdio, SD_BUS(bus));
+    qbus_mark_full(bus);
+    ms->sdio_sdhci = SYSBUS_SDHCI(host);
+    sdhci_set_lines(ms->sdio_sdhci, esp32_sdio_host_lines, &ss->sdio);
+    ms->sdio_route.notify = esp32_sdio_route_changed;
+    esp32_gpio_add_route_notifier(&ss->gpio, &ms->sdio_route);
+    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), ESP32_GPIO_PAD_OUT,
+                                pads[ctz32(ESP32_SDIO_LINE_DAT(1))],
+                                qemu_allocate_irq(esp32_sdio_dat1_changed,
+                                                  ms, 0));
 }
 
 static void esp32_machine_init(MachineState *machine)
@@ -2524,13 +2605,15 @@ static void esp32_machine_class_init(ObjectClass *oc, const void *data)
                                    esp32_machine_get_sdio_host,
                                    esp32_machine_set_sdio_host);
     object_class_property_set_description(oc, "sdio-host",
-        "Add an SDHCI at 0x22000000 as the SDIO slave's host");
+        "Wire an SD host, an SDHCI at 0x22000000, to the SDIO slave's slot 1 "
+        "pads (GPIO14, 15, 2, 4, 12, 13), in place of an SD card");
     object_class_property_add(oc, "sd-pull-up", "uint32",
                               esp32_machine_get_sd_pull_up,
                               esp32_machine_set_sd_pull_up, NULL, NULL);
     object_class_property_set_description(oc, "sd-pull-up",
-        "The board's pull-ups on the SD card's CMD and DAT0-3 (GPIO15, 2, "
-        "4, 12, 13), in ohms; 0 (the default, as on the bare module): none");
+        "The board's pull-ups on the SD card's, or with sdio-host the SDIO "
+        "host's, CMD and DAT0-3 (GPIO15, 2, 4, 12, 13), in ohms; 0 (the "
+        "default, as on the bare module): none");
     machine_add_audiodev_property(mc);
     compat_props_add(mc->compat_props, esp32_sd_card_timing,
                      ARRAY_SIZE(esp32_sd_card_timing));
