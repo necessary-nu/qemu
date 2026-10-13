@@ -221,13 +221,14 @@ static int64_t host_frame_len_ns(DWC2OTGState *s)
 
 static void host_bus_kick(DWC2OTGState *s, int64_t delay)
 {
-    int64_t when = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay;
+    int64_t when = dwc2_otg_now() + delay;
 
     if (s->xact_busy || !host_running(s)) {
         return;
     }
     if (!timer_pending(s->bus_timer) ||
         timer_expire_time_ns(s->bus_timer) > when) {
+        s->bus_due = when;
         timer_mod(s->bus_timer, when);
     }
 }
@@ -242,7 +243,7 @@ static void host_frames_update(DWC2OTGState *s)
     if (host_running(s)) {
         if (!timer_pending(s->frame_timer)) {
             /* The first SOF goes out as the port starts running. */
-            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            int64_t now = dwc2_otg_now();
 
             s->frame_ns = host_frame_len_ns(s);
             s->frame_start_ns = now - s->frame_ns;
@@ -267,8 +268,7 @@ uint32_t dwc2_otg_hfnum_read(DWC2OTGState *s)
 
     if (timer_pending(s->frame_timer) && s->frame_period &&
         s->frame_period == dwc2_otg_phy_period(s)) {
-        done = dwc2_otg_phy_count(s, s->frame_origin_ns,
-                                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        done = dwc2_otg_phy_count(s, s->frame_origin_ns, dwc2_otg_now());
         left = s->frame_ticks > done ? s->frame_ticks - done : 0;
     }
     return s->frnum | (MIN(left, 0xffff) << HFNUM_FRREM_SHIFT);
@@ -856,7 +856,8 @@ static void host_xact_end(DWC2OTGState *s, int result, uint32_t actual,
     s->xact_result = result;
     s->xact_actual = token == DWC2_TOKEN_IN ? actual : s->xact_len;
     ns = host_xact_ns(s, token == DWC2_TOKEN_IN ? actual : s->xact_len);
-    timer_mod(s->bus_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
+    s->bus_due = dwc2_otg_now() + ns;
+    timer_mod(s->bus_timer, s->bus_due);
 }
 
 /* Slave mode and buffer DMA results */
@@ -1411,7 +1412,7 @@ static bool reqq_start(DWC2OTGState *s, int qi)
 
 /* Run the bus: finish the transaction on it, then start the next. */
 /* [spec:nuos:req:emu.esp32p4.usb] */
-static void host_bus(void *opaque)
+void dwc2_otg_host_bus(void *opaque)
 {
     DWC2OTGState *s = opaque;
     int i, ch;
@@ -1493,7 +1494,7 @@ static void host_frame_next(DWC2OTGState *s)
 
 /* A (micro)frame boundary: the SOF, and a new round of transactions. */
 /* [spec:nuos:req:emu.esp32p4.usb] */
-static void host_frame(void *opaque)
+void dwc2_otg_host_frame(void *opaque)
 {
     DWC2OTGState *s = opaque;
     int i;
@@ -1641,6 +1642,21 @@ void dwc2_otg_host_pre_save(DWC2OTGState *s)
     }
 }
 
+/* A frame boundary or bus step runs at its time however late its timer. */
+static void host_frame_cb(void *opaque)
+{
+    DWC2OTGState *s = opaque;
+
+    line_run_at(s->frame_start_ns + s->frame_ns, dwc2_otg_host_frame, s);
+}
+
+static void host_bus_cb(void *opaque)
+{
+    DWC2OTGState *s = opaque;
+
+    line_run_at(s->bus_due, dwc2_otg_host_bus, s);
+}
+
 void dwc2_otg_host_init(DWC2OTGState *s)
 {
     DeviceState *dev = DEVICE(s);
@@ -1665,8 +1681,8 @@ void dwc2_otg_host_init(DWC2OTGState *s)
     }
     usb_register_port(&s->bus, &s->port, s, 0, &dwc2_otg_port_ops, speeds);
     usb_packet_init(&s->packet);
-    s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, host_frame, s);
-    s->bus_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, host_bus, s);
+    s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, host_frame_cb, s);
+    s->bus_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, host_bus_cb, s);
 }
 
 const VMStateDescription vmstate_dwc2_otg_hc = {

@@ -204,13 +204,13 @@ static void dev_activity(DWC2OTGState *s)
         s->gintsts |= GINTSTS_WKUPINT;
         qemu_set_irq(s->suspended_out, 0);
     }
-    timer_mod(s->idle_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + DEV_SUSPEND_NS);
+    s->idle_due = dwc2_otg_now() + DEV_SUSPEND_NS;
+    timer_mod(s->idle_timer, s->idle_due);
 }
 
 /* 3 ms of an idle bus: the device suspends. */
 /* [spec:nuos:req:emu.esp32p4.usb] */
-static void dev_idle(void *opaque)
+void dwc2_otg_dev_idle(void *opaque)
 {
     DWC2OTGState *s = opaque;
 
@@ -224,7 +224,7 @@ static void dev_idle(void *opaque)
 }
 
 /* The end of the periodic frame, DCFG.PerFrInt into it. */
-static void dev_eopf(void *opaque)
+void dwc2_otg_dev_eopf(void *opaque)
 {
     DWC2OTGState *s = opaque;
 
@@ -554,7 +554,7 @@ static void devport_sof(void *opaque, uint16_t frame)
 {
     DWC2OTGState *s = opaque;
     static const uint8_t perfrint[4] = { 80, 85, 90, 95 };
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = dwc2_otg_now();
 
     if (!s->dev_present || s->dev_bus_reset) {
         return;
@@ -565,9 +565,10 @@ static void devport_sof(void *opaque, uint16_t frame)
     }
     s->dev_soffn = frame & 0x7ff;
     s->gintsts |= GINTSTS_SOF;
-    timer_mod(s->eopf_timer, now + FS_FRAME_NS *
-              perfrint[(s->dcfg & DCFG_PERFRINT_MASK) >> DCFG_PERFRINT_SHIFT] /
-              100);
+    s->eopf_due = now + FS_FRAME_NS *
+                  perfrint[(s->dcfg & DCFG_PERFRINT_MASK) >>
+                           DCFG_PERFRINT_SHIFT] / 100;
+    timer_mod(s->eopf_timer, s->eopf_due);
     dwc2_otg_update_irq(s);
 }
 
@@ -1103,11 +1104,26 @@ void dwc2_otg_dev_reset(DWC2OTGState *s)
     usb_devport_changed(&s->devport);
 }
 
+/* The bus's suspend and the frame's end at their times, however late. */
+static void dev_idle_cb(void *opaque)
+{
+    DWC2OTGState *s = opaque;
+
+    line_run_at(s->idle_due, dwc2_otg_dev_idle, s);
+}
+
+static void dev_eopf_cb(void *opaque)
+{
+    DWC2OTGState *s = opaque;
+
+    line_run_at(s->eopf_due, dwc2_otg_dev_eopf, s);
+}
+
 void dwc2_otg_dev_init(DWC2OTGState *s)
 {
     usb_devport_init(&s->devport, s->name, &dwc2_otg_devport_ops, s);
-    s->idle_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dev_idle, s);
-    s->eopf_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dev_eopf, s);
+    s->idle_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dev_idle_cb, s);
+    s->eopf_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dev_eopf_cb, s);
 }
 
 const VMStateDescription vmstate_dwc2_otg_ep = {
