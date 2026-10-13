@@ -812,6 +812,8 @@ struct ESP32P4ClkRstState {
     uint32_t core_pulse_reset_cycles[ESP32P4_CLKRST_HP_CORES];
     uint32_t core_pulse_clk[ESP32P4_CLKRST_HP_CORES];
     bool core_pulse_waiting[ESP32P4_CLKRST_HP_CORES];
+    /* When the current phase ends, while core_timer runs. */
+    int64_t core_pulse_due[ESP32P4_CLKRST_HP_CORES];
     ESP32P4ClkRstCoreTimer core_timer_ctx[ESP32P4_CLKRST_HP_CORES];
 
     /* The levels last driven on the core outputs. */
@@ -825,6 +827,9 @@ struct ESP32P4ClkRstState {
     bool hp_core_reset;
     bool hp_core_reset_level;
     QEMUTimer *hp_core_timer;
+    int64_t hp_core_due;
+    /* Bringing the clock tree up to an access's time. */
+    bool syncing;
     /* The SoC clocks' periods last checked against their limits. */
     uint64_t checked_soc[4];
     /* In the device's own reset, which does not reset the gated blocks. */
@@ -875,6 +880,14 @@ void esp32p4_clkrst_gate_volatile(ESP32P4ClkRstGate *g, hwaddr offset,
  * the middle of an access, which the gate has no owner to show.
  */
 DeviceState *esp32p4_clkrst_gated_device(MemoryRegion *mr);
+
+/*
+ * Bring the clock tree up to @now: the changes its sources (the PLLs) and
+ * its own CPU resets have due by then, each at its own time, which their
+ * QEMU timers, running late, have not made yet. Every access to its
+ * registers and through its gates does so first.
+ */
+void esp32p4_clkrst_sync(ESP32P4ClkRstState *s, int64_t now);
 
 /*
  * Record a reset of the cores in @cores (ESP32P4_CLKRST_CORE_*) with
