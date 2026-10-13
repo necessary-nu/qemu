@@ -9,6 +9,7 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "esp32-flash-pins.h"
+#include "esp32-spi-flash.h"
 #include "esp32-sd-pins.h"
 
 #define DPORT_PERIP_CLK_EN      0x3ff000c0
@@ -302,7 +303,7 @@ static void test_tmp105_dport_reset(void)
 
 static void spi1_cmd(QTestState *qts, uint32_t cmd)
 {
-    qtest_writel(qts, SPI_CMD, cmd);
+    sf_cmd(qts, cmd);
 }
 
 static uint32_t flash_status(QTestState *qts)
@@ -316,10 +317,16 @@ static void flash_set_status(QTestState *qts)
     spi1_cmd(qts, SPI_CMD_WREN);
     qtest_writel(qts, SPI_RD_STATUS, FLASH_SR_BP1 | FLASH_SR_BP0);
     spi1_cmd(qts, SPI_CMD_WRSR);
+    sf_wait_idle(qts);
     spi1_cmd(qts, SPI_CMD_WREN);
 }
 
-/* [spec:nuos:req:emu.esp32.rtc/test] */
+/*
+ * [spec:nuos:req:emu.esp32.rtc/test]
+ * The flash keeps its write enable latch across the ESP32's resets, which
+ * do not reach it; a power cycle clears it, and leaves the GD25Q32C's
+ * block protect bits, which are non-volatile.
+ */
 static void test_flash(void)
 {
     const uint32_t set = FLASH_SR_BP1 | FLASH_SR_BP0 | FLASH_SR_WEL;
@@ -341,7 +348,7 @@ static void test_flash(void)
 
     power_cycle(qts);
     flash_pins_rom(qts);
-    g_assert_cmphex(flash_status(qts), ==, 0);
+    g_assert_cmphex(flash_status(qts), ==, FLASH_SR_BP1 | FLASH_SR_BP0);
     qtest_quit(qts);
 }
 

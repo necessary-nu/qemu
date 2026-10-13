@@ -1601,10 +1601,18 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                      OBJECT(&s->spi_dma[i - 1]),
                                      &error_abort);
         }
+        Esp32PeriphGate *g;
+
         qdev_realize(DEVICE(&s->spi[i]), &s->periph_bus, &error_fatal);
 
-        esp32_soc_add_gated_device(s, &s->spi[i], spi_base[i],
-                                   ESP32_GATE_PERIP, spi_bit[i], spi_bit[i]);
+        /*
+         * [spec:nuos:req:emu.esp32.clock-gating]
+         * The SPI clock divides APB_CLK (TRM 20.4).
+         */
+        g = esp32_soc_add_gated_device(s, &s->spi[i], spi_base[i],
+                                       ESP32_GATE_PERIP, spi_bit[i],
+                                       spi_bit[i]);
+        g->apb_clk = s->spi_apb_clk[i];
 
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi[i]), 0,
                            qdev_get_gpio_in(intmatrix_dev, ETS_SPI0_INTR_SOURCE + i));
@@ -2121,6 +2129,9 @@ static void esp32_soc_init(Object *obj)
     for (int i = 0; i < ESP32_SPI_COUNT; ++i) {
         snprintf(name, sizeof(name), "spi%d", i);
         object_initialize_child(obj, name, &s->spi[i], TYPE_ESP32_SPI);
+        snprintf(name, sizeof(name), "spi%d-apb", i);
+        s->spi_apb_clk[i] = clock_new(obj, name);
+        qdev_connect_clock_in(DEVICE(&s->spi[i]), "apb", s->spi_apb_clk[i]);
     }
 
     for (int i = 0; i < ESP32_SPI_DMA_COUNT; ++i) {
@@ -2292,12 +2303,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(Esp32MachineState, ESP32_MACHINE)
  * the module without its flash, as on the board.
  *
  * A line takes the controller's output to the flash where the pad
- * carries it (esp32_gpio_sig_path()), else the flash's pin is at the
- * pad's level; it takes the flash's output to the controller where the
- * controller's input is routed from the pad, its input enabled and
- * nothing else driving it, else the input reads what it reads. HOLD# is
- * the pad's level, holding the flash while low and its quad enable clear,
- * and WP# likewise.
+ * carries it (esp32_gpio_sig_path()), else, and while the controller's
+ * output is off, the flash's pin is at the pad's level; it takes the
+ * flash's output to the controller where the controller's input is routed
+ * from the pad, its input enabled and nothing else driving it, through the
+ * GPIO matrix or not, else the input reads what it reads. HOLD# and WP#
+ * are the flash's IO3 and IO2 (hw/ssi/esp32_spi.c).
  */
 static void esp32_flash_lines(void *opaque, Esp32SpiFlashLines *l)
 {
@@ -2329,10 +2340,9 @@ static void esp32_flash_lines(void *opaque, Esp32SpiFlashLines *l)
         l->to_ctrl |= p.in_on << n;
         l->ctrl_inv |= p.in_inv << n;
         l->ctrl_level |= p.in_level << n;
+        l->in_matrix |= p.in_matrix << n;
     }
-    l->wp_level = esp32_gpio_pad_level(g, 10);
-    l->hold = !esp32_gpio_pad_level(g, 9) && ms->flash_dev &&
-              m25p80_hold_enabled(ms->flash_dev);
+    l->powered = true;
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] */
@@ -2341,8 +2351,9 @@ static void esp32_flash_cache_read(void *opaque, uint32_t addr, uint8_t *buf,
 {
     Esp32MachineState *ms = opaque;
 
-    esp32_spi_flash_cache_read(&ms->esp32.spi[0], ms->esp32.dport.flash_blk,
-                               addr, buf, len);
+    for (uint32_t off = 0; off < len; off += ESP32_SPI_CACHE_BLOCK) {
+        esp32_spi_flash_cache_read(&ms->esp32.spi[0], addr + off, buf + off);
+    }
 }
 
 static void esp32_flash_route_changed(Notifier *n, void *data)
@@ -2368,15 +2379,29 @@ static void esp32_machine_init_spi_flash(Esp32MachineState *ms,
     DeviceState *spi_master = DEVICE(&ss->spi[1]);
     BusState* spi_bus = qdev_get_child_bus(spi_master, "spi");
 
-    /* select the flash chip based on the image size */
+    /*
+     * [spec:nuos:req:emu.flash-chip]
+     * The flash chip by the image's size: the ESP32-WROOM-32E-N4's 4 MiB
+     * GD25Q32C, as its datasheet gives it; the other sizes' generic parts.
+     */
     int64_t image_size = blk_getlength(blk);
-    const char* flash_chip_model = NULL;
+    const char *flash_chip_model = NULL;
     switch (image_size) {
-        case 2 * 1024 * 1024: flash_chip_model = "w25x16"; break;
-        case 4 * 1024 * 1024: flash_chip_model = "gd25q32"; break;
-        case 8 * 1024 * 1024: flash_chip_model = "gd25q64"; break;
-        case 16 * 1024 * 1024: flash_chip_model = "is25lp128"; break;
-        default: error_report("Error: only 2, 4, 8, 16 MB flash images are supported"); return;
+    case 2 * 1024 * 1024:
+        flash_chip_model = "w25x16";
+        break;
+    case 4 * 1024 * 1024:
+        flash_chip_model = "gd25q32c";
+        break;
+    case 8 * 1024 * 1024:
+        flash_chip_model = "gd25q64";
+        break;
+    case 16 * 1024 * 1024:
+        flash_chip_model = "is25lp128";
+        break;
+    default:
+        error_report("Error: only 2, 4, 8, 16 MB flash images are supported");
+        return;
     }
 
     DeviceState *flash_dev = qdev_new(flash_chip_model);
@@ -2389,7 +2414,8 @@ static void esp32_machine_init_spi_flash(Esp32MachineState *ms,
                                 qdev_get_gpio_in_named(flash_dev, "WP#", 0));
     ms->flash_dev = flash_dev;
     for (int i = 0; i < 2; i++) {
-        esp32_spi_set_flash_lines(&ss->spi[i], esp32_flash_lines, ms);
+        esp32_spi_set_flash(&ss->spi[i], &ss->spi[1], flash_dev,
+                            esp32_flash_lines, ms);
     }
     ss->dport.flash_read = esp32_flash_cache_read;
     ss->dport.flash_read_opaque = ms;
