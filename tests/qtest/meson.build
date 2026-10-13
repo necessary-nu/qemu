@@ -285,6 +285,7 @@ qtests_xtensa = \
      'esp32-flash-pins-test',
      'esp32-flash-protocol-test',
      'esp32-vdd-sdio-test',
+     'esp32-uart-terminal-pads-test',
      'esp32-gpio-test',
      'esp32-uhci-test',
      'esp32-pid-test',

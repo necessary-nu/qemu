@@ -1053,22 +1053,22 @@ static void esp32_soc_connect_sdio(Esp32SocState *s)
  * DSR, the I2C controllers' SCL and SDA, the LEDC channels' outputs and the
  * TWAI's TX, RX, BUS_OFF and CLKOUT.
  *
- * The board's serial terminals sit on the pads of the UARTs' IO_MUX
- * functions: UART0 on U0TXD (GPIO1) and U0RXD (GPIO3), UART1 on GPIO10 and
- * GPIO9, UART2 on GPIO17 and GPIO16.
+ * The board's serial terminals sit on the pads the machine gives them
+ * (terminal_tx_pad, terminal_rx_pad): the terminal takes what the TX pad
+ * carries and drives the RX pad, which the UART reaches only as software
+ * routes it.
  */
 static void esp32_soc_connect_lines(Esp32SocState *s)
 {
     static const struct {
         int txd, rts, dtr, rxd, cts, dsr;
-        int tx_pad, rx_pad;
     } uart_lines[ESP32_UART_COUNT] = {
         { ESP32_SIG_U0TXD_OUT, ESP32_SIG_U0RTS_OUT, ESP32_SIG_U0DTR_OUT,
-          ESP32_SIG_U0RXD_IN, ESP32_SIG_U0CTS_IN, ESP32_SIG_U0DSR_IN, 1, 3 },
+          ESP32_SIG_U0RXD_IN, ESP32_SIG_U0CTS_IN, ESP32_SIG_U0DSR_IN },
         { ESP32_SIG_U1TXD_OUT, ESP32_SIG_U1RTS_OUT, -1,
-          ESP32_SIG_U1RXD_IN, ESP32_SIG_U1CTS_IN, -1, 10, 9 },
+          ESP32_SIG_U1RXD_IN, ESP32_SIG_U1CTS_IN, -1 },
         { ESP32_SIG_U2TXD_OUT, ESP32_SIG_U2RTS_OUT, -1,
-          ESP32_SIG_U2RXD_IN, ESP32_SIG_U2CTS_IN, -1, 17, 16 },
+          ESP32_SIG_U2RXD_IN, ESP32_SIG_U2CTS_IN, -1 },
     };
     static const struct {
         int scl, sda;
@@ -1105,13 +1105,13 @@ static void esp32_soc_connect_lines(Esp32SocState *s)
                                             ESP32_UART_DSR, 0));
         }
         qdev_connect_gpio_out_named(gpio, ESP32_GPIO_PAD_OUT,
-                                    uart_lines[i].tx_pad,
+                                    s->terminal_tx_pad[i],
                                     qdev_get_gpio_in_named(term,
                                         ESP32_UART_TERMINAL_RX, 0));
         qdev_connect_gpio_out_named(term, ESP32_UART_TERMINAL_TX, 0,
                                     qdev_get_gpio_in_named(gpio,
                                         ESP32_GPIO_PAD_IN,
-                                        uart_lines[i].rx_pad));
+                                        s->terminal_rx_pad[i]));
     }
 
     for (int i = 0; i < ESP32_I2C_COUNT; i++) {
@@ -2428,6 +2428,8 @@ struct Esp32MachineState {
     Notifier flash_route;
     bool sdio_host;
     uint32_t sd_pull_up;
+    /* The UART terminals' TX and RX pads (uart1-tx, ...) */
+    uint8_t terminal_pad[ESP32_UART_COUNT][2];
     /* The SDIO slave's host, and what tells it its lines changed */
     SDHCIState *sdio_sdhci;
     Notifier sdio_route;
@@ -2803,6 +2805,55 @@ static void esp32_machine_init_sdio_host(Esp32MachineState *ms)
                                                   ms, 0));
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * The board's serial terminals, -serial's chardevs, on the pads the
+ * ESP32-WROOM-32E brings a UART out on or that collide with nothing on
+ * it: serial0 on the module's TXD0 and RXD0 (GPIO1 and GPIO3, U0TXD and
+ * U0RXD); serial1 on GPIO33 (TX) and GPIO32 (RX), which carry nothing on
+ * the module and are no strapping, JTAG, SD card or Ethernet RMII pins,
+ * UART1's own IO_MUX pads (GPIO10 and GPIO9) being the flash's WP# and
+ * HOLD#, which the module does not bring out; serial2 on UART2's IO_MUX
+ * pads, GPIO17 and GPIO16 (U2TXD and U2RXD), which the module brings out
+ * (on its PSRAM variants GPIO16 is the PSRAM's). The uart1-tx, uart1-rx,
+ * uart2-tx and uart2-rx properties move serial1 and serial2 to other
+ * pads; software routes the UARTs to them through the GPIO matrix.
+ */
+static const uint8_t esp32_terminal_pads[ESP32_UART_COUNT][2] = {
+    { 1, 3 }, { 33, 32 }, { 17, 16 },
+};
+
+/* Pads the board puts something else on, which a terminal may not take */
+static bool esp32_pad_taken(Esp32MachineState *ms, unsigned pad)
+{
+    return (pad >= 6 && pad <= 11) || (ms->sdio_host && pad == 4);
+}
+
+static void esp32_machine_check_terminal_pads(Esp32MachineState *ms)
+{
+    uint64_t used = 0;
+
+    for (int i = 0; i < ESP32_UART_COUNT; i++) {
+        for (int d = 0; d < 2; d++) {
+            unsigned pad = ms->terminal_pad[i][d];
+
+            if (esp32_pad_taken(ms, pad)) {
+                error_report("serial%d's %s pad GPIO%u is the board's %s", i,
+                             d ? "RX" : "TX", pad,
+                             pad == 4 ? "SDIO host's DAT1" :
+                             "module's flash");
+                exit(1);
+            }
+            if (used & BIT_ULL(pad)) {
+                error_report("serial%d's %s pad GPIO%u is another serial "
+                             "terminal's", i, d ? "RX" : "TX", pad);
+                exit(1);
+            }
+            used |= BIT_ULL(pad);
+        }
+    }
+}
+
 static void esp32_machine_init(MachineState *machine)
 {
     BlockBackend* blk = NULL;
@@ -2826,6 +2877,11 @@ static void esp32_machine_init(MachineState *machine)
             qdev_prop_set_string(DEVICE(&ss->i2s[i]), "audiodev",
                                  machine->audiodev);
         }
+    }
+    esp32_machine_check_terminal_pads(ms);
+    for (int i = 0; i < ESP32_UART_COUNT; i++) {
+        ss->terminal_tx_pad[i] = ms->terminal_pad[i][0];
+        ss->terminal_rx_pad[i] = ms->terminal_pad[i][1];
     }
     qdev_prop_set_chr(DEVICE(ss), "serial0", serial_hd(0));
     qdev_prop_set_chr(DEVICE(ss), "serial1", serial_hd(1));
@@ -2958,6 +3014,48 @@ static void esp32_machine_set_sd_pull_up(Object *obj, Visitor *v,
     ESP32_MACHINE(obj)->sd_pull_up = ohms;
 }
 
+/* uartN-tx and uartN-rx: the pad a serial terminal is on */
+static void esp32_machine_get_terminal_pad(Object *obj, Visitor *v,
+                                           const char *name, void *opaque,
+                                           Error **errp)
+{
+    uint8_t *pad = &ESP32_MACHINE(obj)->terminal_pad[0][0] +
+                   (uintptr_t)opaque;
+
+    visit_type_uint8(v, name, pad, errp);
+}
+
+static void esp32_machine_set_terminal_pad(Object *obj, Visitor *v,
+                                           const char *name, void *opaque,
+                                           Error **errp)
+{
+    uint8_t *pad = &ESP32_MACHINE(obj)->terminal_pad[0][0] +
+                   (uintptr_t)opaque;
+    bool tx = (uintptr_t)opaque % 2 == 0;
+    uint8_t n;
+
+    if (!visit_type_uint8(v, name, &n, errp)) {
+        return;
+    }
+    /* GPIO0-19, 21-23, 25-27, 32-39; GPIO34-39 have no output driver */
+    if (n > 39 || n == 20 || n == 24 || (n >= 28 && n <= 31)) {
+        error_setg(errp, "%s: the ESP32 has no GPIO%u", name, n);
+        return;
+    }
+    if (tx && n >= 34) {
+        error_setg(errp, "%s: GPIO%u is input-only", name, n);
+        return;
+    }
+    *pad = n;
+}
+
+static void esp32_machine_instance_init(Object *obj)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+
+    memcpy(ms->terminal_pad, esp32_terminal_pads, sizeof(ms->terminal_pad));
+}
+
 /*
  * [spec:nuos:req:emu.sd-card-timing]
  * Every SD card in the machine, from -drive if=sd or -device sd-card,
@@ -2991,6 +3089,22 @@ static void esp32_machine_class_init(ObjectClass *oc, const void *data)
         "The board's pull-ups on the SD card's, or with sdio-host the SDIO "
         "host's, CMD and DAT0-3 (GPIO15, 2, 4, 12, 13), in ohms; 0 (the "
         "default, as on the bare module): none");
+    for (int i = 1; i < ESP32_UART_COUNT; i++) {
+        for (int d = 0; d < 2; d++) {
+            g_autofree char *name = g_strdup_printf("uart%d-%s", i,
+                                                    d ? "rx" : "tx");
+            g_autofree char *desc = g_strdup_printf(
+                "The GPIO pad serial%d's terminal %s, for UART%d's %s "
+                "(default %u)", i, d ? "drives" : "takes", i,
+                d ? "RXD" : "TXD", esp32_terminal_pads[i][d]);
+
+            object_class_property_add(oc, name, "uint8",
+                                      esp32_machine_get_terminal_pad,
+                                      esp32_machine_set_terminal_pad, NULL,
+                                      (void *)(uintptr_t)(i * 2 + d));
+            object_class_property_set_description(oc, name, desc);
+        }
+    }
     machine_add_audiodev_property(mc);
     compat_props_add(mc->compat_props, esp32_sd_card_timing,
                      ARRAY_SIZE(esp32_sd_card_timing));
@@ -3000,6 +3114,7 @@ static const TypeInfo esp32_info = {
     .name = TYPE_ESP32_MACHINE,
     .parent = TYPE_MACHINE,
     .instance_size = sizeof(Esp32MachineState),
+    .instance_init = esp32_machine_instance_init,
     .class_init = esp32_machine_class_init,
 };
 

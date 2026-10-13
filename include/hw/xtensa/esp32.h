@@ -105,8 +105,10 @@ struct Esp32SocState {
     Esp32CrosscoreInt crosscore_int;
     Esp32TWAIState twai;
     ESP32UARTState uart[ESP32_UART_COUNT];
-    /* The board's terminals on the UARTs' default pads, behind -serial */
+    /* The board's terminals, behind -serial, and the pads they are on */
     Esp32UartTerminalState terminal[ESP32_UART_COUNT];
+    uint8_t terminal_tx_pad[ESP32_UART_COUNT];
+    uint8_t terminal_rx_pad[ESP32_UART_COUNT];
     Esp32UhciState uhci[ESP32_UHCI_COUNT];
     Esp32I2sState i2s[ESP32_I2S_COUNT];
     Esp32GpioState gpio;
