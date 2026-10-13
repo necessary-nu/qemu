@@ -910,7 +910,8 @@ DEF("audiodev", HAS_ARG, QEMU_OPTION_audiodev,
     "-audiodev dbus,id=id[,prop=value[,...]]\n"
 #endif
     "-audiodev wav,id=id[,prop=value[,...]]\n"
-    "                path= path of wav file to record\n",
+    "                path= path of wav file to record\n"
+    "                in-path= path of wav file to capture from\n",
     QEMU_ARCH_ALL)
 SRST
 ``-audiodev [driver=]driver,id=id[,prop=value[,...]]``
@@ -1119,13 +1120,19 @@ SRST
     specific properties.
 
 ``-audiodev wav,id=id[,prop=value[,...]]``
-    Creates a backend that writes audio to a WAV file.
+    Creates a backend that writes audio to a WAV file, and gives the
+    samples of another as its capture stream.
 
     Backend specific options are:
 
     ``path=path``
         Write recorded audio into the specified file. Default is
         ``qemu.wav``.
+
+    ``in-path=path``
+        Capture the samples of the specified WAV file (PCM, 8 or 16 bits,
+        mono or stereo), at its own rate, then silence. Without it the
+        capture stream is silence.
 ERST
 
 DEF("device", HAS_ARG, QEMU_OPTION_device,
