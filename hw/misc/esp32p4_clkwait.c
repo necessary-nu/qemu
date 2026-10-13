@@ -7,12 +7,15 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_clkwait.h"
 
 void esp32p4_clkwait_init(ESP32P4ClkWait *w, Clock *clk, QEMUTimerCB *cb,
                           void *opaque)
 {
     w->clk = clk;
+    w->cb = cb;
+    w->opaque = opaque;
     w->active = false;
     w->ended_ns = INT64_MIN;
     timer_init_ns(&w->timer, QEMU_CLOCK_VIRTUAL, cb, opaque);
@@ -106,6 +109,31 @@ int64_t esp32p4_clkwait_expire(ESP32P4ClkWait *w)
     }
     w->ended_ns = end;
     return end;
+}
+
+/* [spec:nuos:req:emu.esp32p4.analog] */
+void esp32p4_clkwaits_catch_up(ESP32P4ClkWait *const *waits, unsigned n,
+                               int64_t now)
+{
+    for (;;) {
+        ESP32P4ClkWait *next = NULL;
+        int64_t due = now;
+
+        for (unsigned i = 0; i < n; i++) {
+            int64_t end = esp32p4_clkwait_end(waits[i]);
+
+            if (timer_pending(&waits[i]->timer) && end <= due &&
+                (!next || end < due)) {
+                next = waits[i];
+                due = end;
+            }
+        }
+        if (!next) {
+            return;
+        }
+        timer_del(&next->timer);
+        esp32_line_run_at(due, next->cb, next->opaque);
+    }
 }
 
 const VMStateDescription vmstate_esp32p4_clkwait = {

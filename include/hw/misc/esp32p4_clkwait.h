@@ -31,8 +31,10 @@
  */
 typedef struct ESP32P4ClkWait {
     QEMUTimer timer;
-    /* The clock counted; set at the block's init, not migrated. */
+    /* The clock counted, and the wait's end; set at init, not migrated. */
     Clock *clk;
+    QEMUTimerCB *cb;
+    void *opaque;
     ESP32P4ClkCount count;
     uint64_t end;
     int64_t from_ns;
@@ -67,6 +69,16 @@ void esp32p4_clkwait_resched(ESP32P4ClkWait *w);
  * time it was due, which a timer running late has passed.
  */
 int64_t esp32p4_clkwait_expire(ESP32P4ClkWait *w);
+
+/*
+ * End, in time order, the waits of @waits whose ends have come by @now,
+ * each as its timer would at its end (esp32_line_run_at()): without
+ * icount a timer can run well after its time, and a block calls this
+ * before an access shows what its waits lead to. A wait an end starts
+ * that has ended by @now too ends in turn.
+ */
+void esp32p4_clkwaits_catch_up(ESP32P4ClkWait *const *waits, unsigned n,
+                               int64_t now);
 
 extern const VMStateDescription vmstate_esp32p4_clkwait;
 
