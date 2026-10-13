@@ -38,6 +38,42 @@
  *   accesses to the HP and LP peripherals and to LP SRAM are for the HP
  *   and LP APMs, against REGDMA_HP_PERI_PMS and REGDMA_LP_PERI_PMS.
  *
+ * Before any APM, the bus matrix: a master reaches only the slaves its
+ * port has a path to (TRM chapter 1 and figure 1.0-1, 9.3.1 and figure
+ * 9.3-1, 9.3.4, table 20.1-1), and an access to any other address
+ * reaches nothing, as one to an address nothing decodes:
+ *
+ * - The HP cores: the CPU subsystem (CLINT, CLIC), the TCM, the HP CPU
+ *   peripherals, the memories at both their cached (0x4...) and their
+ *   direct (0x8...) addresses, the HP and LP peripherals and LP SRAM; not
+ *   the LP ROM nor the CSI and DSI bridges' buffers, which table 9.3-1
+ *   reserves for them.
+ *
+ * - The LP core: the HP CPU peripherals, the memories at their 0x4...
+ *   addresses only, the HP and LP peripherals, LP SRAM and its LP ROM
+ *   (the latter in its own address space); figure 9.3-1 shades the CPU
+ *   subsystem, the TCM, the bridges' buffers and every 0x8... address as
+ *   out of its reach.
+ *
+ * - A DMA master: HP L2MEM, the external flash and RAM windows and HP ROM,
+ *   at their 0x4... addresses, as the masters' descriptors and buffers
+ *   address them (ESP-IDF hands DMA the cached address, writing
+ *   descriptors through the 0x8... alias and converting back for the
+ *   engine), and nothing else: not the 0x8... aliases ("direct access by
+ *   CPU", table 9.3-1), the TCM, LP SRAM or any register. VDMA's master 1
+ *   also reaches the CSI and DSI bridges' buffers (9.3.4). Table 20.1-1
+ *   and ESP-IDF's GDMA drivers ("AXI-DMA can access L2MEM, L2ROM, MSPI
+ *   Flash, MSPI PSRAM") give the DMA masters HP ROM, which 9.3.4 and
+ *   figure 1.0-1 leave out; the model keeps it, under the DMA APM.
+ *
+ * - REGDMA: the DMA masters' memories, and the HP and LP peripherals and
+ *   LP SRAM that its permission registers in the HP and LP APMs name.
+ *
+ * Such an access answers with a decode error; a DMA master's is recorded
+ * in the ICM's record of its matrix as an illegal access (SECURE 1, TRM
+ * 21.2.1.14), raising SYS_ICM_INTR. A core's, like any access of a core
+ * to an address nothing decodes, is not recorded (below).
+ *
  * A peripheral's slot is decided by one bit of the master's (and mode's)
  * register, ESP-IDF's apm_slave_*_id_t; a slot no bit names (the DDR PHY,
  * the memory monitor, the audio ADDC, LP GPIO, reserved slots) is not
@@ -72,15 +108,18 @@
  * one, a read returning 0.
  *
  * Not modelled: a register's CLK_EN (automatic clock gating, invisible to
- * software but for power) is kept as written; and the buses' record of
- * an access to an address nothing decodes (SECURE 1 in the same records)
- * is not kept, though the access still answers with a bus error.
+ * software but for power) is kept as written; and the buses' record of a
+ * core's access to an address nothing decodes (SECURE 1 in the ICM's CPU
+ * record, LP_SYS's LP_ADDRHOLE or IDBUS_ADDRHOLE), which the TRM leaves
+ * unclear for the cores' own buses, is not kept, though the access still
+ * answers with a bus error.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
 #include "qemu/cutils.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "exec/cputlb.h"
@@ -90,6 +129,7 @@
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/tcg.h"
+#include "target/riscv/esp32p4_cpu.h"
 
 #define PMS_PAGE                0x1000u
 
@@ -310,12 +350,16 @@ static void esp32p4_pms_changed(ESP32P4PmsState *s)
 
 /* Decisions */
 
-/* The APM that refuses an access, or none. */
+/*
+ * The APM that refuses an access, or none; or APM_NO_PATH, the bus
+ * matrix's refusal of an address the master has no path to.
+ */
 enum {
     APM_NONE,
     APM_HP,
     APM_LP,
     APM_DMA,
+    APM_NO_PATH,
 };
 
 /* The directions of an access. */
@@ -324,8 +368,11 @@ enum {
 
 /*
  * The masters as the IOMMU indexes them: accesses no APM checks, each HP
- * core in machine and in user mode, the LP core, and each DMA master.
+ * core in machine and in user mode, the LP core, and each DMA master; a
+ * VDMA channel (DMA master GDMA_CHn) through its master 1, which reaches
+ * more than through its master 2, apart.
  */
+#define VDMA_CHANNELS           4
 enum {
     IDX_OPEN,
     IDX_CORE0_M,
@@ -334,8 +381,17 @@ enum {
     IDX_CORE1_U,
     IDX_LP_CORE,
     IDX_DMA,
-    NUM_IDX = IDX_DMA + ESP32P4_DMA_MASTERS,
+    IDX_VDMA_M1 = IDX_DMA + ESP32P4_DMA_MASTERS,
+    NUM_IDX = IDX_VDMA_M1 + VDMA_CHANNELS,
 };
+
+/* The DMA master (IDX_DMA onwards) whose permissions apply. */
+static int esp32p4_pms_idx_master(int idx)
+{
+    return idx >= IDX_VDMA_M1
+           ? ESP32P4_DMA_MASTER_GDMA_CH0 + idx - IDX_VDMA_M1
+           : idx - IDX_DMA;
+}
 
 /* The groups of slots, the first four the registers k = 0..3. */
 enum {
@@ -479,6 +535,90 @@ static const ESP32P4PmsSlot *esp32p4_pms_slot(uint32_t addr)
     return NULL;
 }
 
+/* Reach: the windows each master's port on the bus matrix decodes. */
+
+typedef struct {
+    uint32_t base;
+    uint32_t size;
+} ESP32P4PmsWindow;
+
+#define WINDOW(b, sz) { (b), (sz) }
+#define W_CPU_SUBSYS    WINDOW(0x20000000, 256 * MiB)
+#define W_TCM           WINDOW(0x30100000, 8 * KiB)
+#define W_CPU_PERI      WINDOW(0x3ff00000, 128 * KiB)
+#define W_FLASH         WINDOW(0x40000000, 64 * MiB)
+#define W_PSRAM         WINDOW(0x48000000, 64 * MiB)
+#define W_HP_ROM        WINDOW(0x4fc00000, 128 * KiB)
+#define W_L2MEM         WINDOW(0x4ff00000, 768 * KiB)
+#define W_HP_PERI       WINDOW(0x50000000, 1 * MiB)
+#define W_CSI_BRG_MEM   WINDOW(0x50104000, 4 * KiB)
+#define W_DSI_BRG_MEM   WINDOW(0x50105000, 4 * KiB)
+#define W_LP_SRAM       WINDOW(0x50108000, 32 * KiB)
+#define W_LP_PERI       WINDOW(0x50110000, 128 * KiB)
+#define W_FLASH_DIRECT  WINDOW(0x80000000, 64 * MiB)
+#define W_PSRAM_DIRECT  WINDOW(0x88000000, 64 * MiB)
+#define W_ROM_DIRECT    WINDOW(0x8fc00000, 128 * KiB)
+#define W_L2MEM_DIRECT  WINDOW(0x8ff00000, 768 * KiB)
+
+/*
+ * Every window starts and ends on a 4 KiB page, so that a page is either
+ * in a master's reach throughout or out of it.
+ */
+static const ESP32P4PmsWindow esp32p4_hp_reach[] = {
+    W_CPU_SUBSYS, W_TCM, W_CPU_PERI, W_FLASH, W_PSRAM, W_HP_ROM, W_L2MEM,
+    W_HP_PERI, W_LP_SRAM, W_LP_PERI, W_FLASH_DIRECT, W_PSRAM_DIRECT,
+    W_ROM_DIRECT, W_L2MEM_DIRECT,
+};
+
+static const ESP32P4PmsWindow esp32p4_lp_reach[] = {
+    W_CPU_PERI, W_FLASH, W_PSRAM, W_HP_ROM, W_L2MEM, W_HP_PERI, W_LP_SRAM,
+    W_LP_PERI,
+};
+
+static const ESP32P4PmsWindow esp32p4_dma_reach[] = {
+    W_FLASH, W_PSRAM, W_HP_ROM, W_L2MEM,
+};
+
+static const ESP32P4PmsWindow esp32p4_vdma_m1_reach[] = {
+    W_FLASH, W_PSRAM, W_HP_ROM, W_L2MEM, W_CSI_BRG_MEM, W_DSI_BRG_MEM,
+};
+
+static const ESP32P4PmsWindow esp32p4_regdma_reach[] = {
+    W_FLASH, W_PSRAM, W_HP_ROM, W_L2MEM, W_HP_PERI, W_LP_SRAM, W_LP_PERI,
+};
+
+static bool esp32p4_pms_in_windows(const ESP32P4PmsWindow *w, size_t n,
+                                   uint32_t addr)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (addr >= w[i].base && addr - w[i].base < w[i].size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+#define IN_WINDOWS(w, addr) esp32p4_pms_in_windows(w, ARRAY_SIZE(w), addr)
+
+/* Whether master @idx (not IDX_OPEN) has a path to @addr. */
+/* [spec:nuos:req:emu.esp32p4.pms] */
+static bool esp32p4_pms_reaches(int idx, uint32_t addr)
+{
+    if (idx >= IDX_VDMA_M1) {
+        return IN_WINDOWS(esp32p4_vdma_m1_reach, addr);
+    }
+    if (idx == IDX_DMA + ESP32P4_DMA_MASTER_REGDMA) {
+        return IN_WINDOWS(esp32p4_regdma_reach, addr);
+    }
+    if (idx >= IDX_DMA) {
+        return IN_WINDOWS(esp32p4_dma_reach, addr);
+    }
+    if (idx == IDX_LP_CORE) {
+        return IN_WINDOWS(esp32p4_lp_reach, addr);
+    }
+    return IN_WINDOWS(esp32p4_hp_reach, addr);
+}
+
 /* The peripheral registers, which the configurable regions apply to. */
 static int esp32p4_pms_peri_apm(uint32_t addr)
 {
@@ -561,9 +701,7 @@ static int esp32p4_pms_check_cpu(ESP32P4PmsState *s, int idx, uint32_t addr)
                                     A_HP_PERI(core, user, sl->group));
         return bits & BIT(sl->bit) ? APM_NONE : APM_HP;
     case SLOT_MEM_DIRECT:
-        if (lp) {
-            return APM_NONE;
-        }
+        /* The HP cores' alone: the LP core has no path here. */
         bits = esp32p4_pms_reg(s, ESP32P4_PMS_MMIO_HP_PERI,
                                A_HP_PERI(core, user, 0));
         return bits & BIT(sl->bit) ? APM_NONE : APM_HP;
@@ -612,7 +750,11 @@ static bool esp32p4_pms_dma_permits(ESP32P4PmsState *s, int m, uint32_t addr,
     return (granted & dirs) == dirs;
 }
 
-/* The DMA APM, and the HP and LP APMs for REGDMA, on a DMA access. */
+/*
+ * The DMA APM, and the HP and LP APMs for REGDMA, on a DMA access within
+ * the master's reach. VDMA's master 1's other slaves, the bridges'
+ * buffers, are no APM's.
+ */
 static int esp32p4_pms_check_dma(ESP32P4PmsState *s, int m, uint32_t addr,
                                  unsigned dirs)
 {
@@ -649,8 +791,9 @@ static int esp32p4_pms_check_dma(ESP32P4PmsState *s, int m, uint32_t addr,
 }
 
 /*
- * The APM that refuses the access by master @idx to the byte at @addr in
- * the directions @dirs, or APM_NONE.
+ * What refuses the access by master @idx to the byte at @addr in the
+ * directions @dirs: the bus matrix (APM_NO_PATH), an APM, or nothing
+ * (APM_NONE).
  */
 /* [spec:nuos:req:emu.esp32p4.pms] */
 static int esp32p4_pms_check(ESP32P4PmsState *s, int idx, uint32_t addr,
@@ -659,8 +802,12 @@ static int esp32p4_pms_check(ESP32P4PmsState *s, int idx, uint32_t addr,
     if (idx == IDX_OPEN) {
         return APM_NONE;
     }
+    if (!esp32p4_pms_reaches(idx, addr)) {
+        return APM_NO_PATH;
+    }
     if (idx >= IDX_DMA) {
-        return esp32p4_pms_check_dma(s, idx - IDX_DMA, addr, dirs);
+        return esp32p4_pms_check_dma(s, esp32p4_pms_idx_master(idx), addr,
+                                     dirs);
     }
     return esp32p4_pms_check_cpu(s, idx, addr);
 }
@@ -723,7 +870,16 @@ static int esp32p4_pms_attrs_to_idx(MemTxAttrs attrs)
     }
     if (rid & ESP32P4_REQUESTER_IS_DMA) {
         m = ESP32P4_REQUESTER_MASTER(rid);
-        return esp32p4_dma_pms_r(m) < 0 ? IDX_OPEN : IDX_DMA + m;
+        if (esp32p4_dma_pms_r(m) < 0) {
+            return IDX_OPEN;
+        }
+        if (m >= ESP32P4_DMA_MASTER_GDMA_CH0 &&
+            m < ESP32P4_DMA_MASTER_GDMA_CH0 + VDMA_CHANNELS &&
+            ESP32P4_ICM_ID_CID(ESP32P4_REQUESTER_ID(rid)) ==
+            ESP32P4_ICM_CID_VDMA_M1) {
+            return IDX_VDMA_M1 + m - ESP32P4_DMA_MASTER_GDMA_CH0;
+        }
+        return IDX_DMA + m;
     }
     switch (ESP32P4_REQUESTER_ID(rid)) {
     case ESP32P4_MASTER_HP_CORE0:
@@ -739,6 +895,66 @@ static int esp32p4_pms_attrs_to_idx(MemTxAttrs attrs)
 
 /* Refusals */
 
+static void esp32p4_pms_apply(ESP32P4PmsState *s, int rec,
+                              const ESP32P4PmsRecord *r)
+{
+    if (rec == ESP32P4_PMS_REC_LP_SYS) {
+        esp32p4_lp_sys_addrhole(s->lp_sys, r->addr, r->id, r->write,
+                                r->illegal);
+    } else {
+        esp32p4_icm_addrhole(s->icm, rec == ESP32P4_PMS_REC_ICM_SYS, r->addr,
+                             r->id, r->write, r->illegal);
+    }
+}
+
+static void esp32p4_pms_flush_records(ESP32P4PmsState *s)
+{
+    for (int i = 0; i < ESP32P4_PMS_RECORDS; i++) {
+        if (s->pending[i].valid) {
+            s->pending[i].valid = false;
+            esp32p4_pms_apply(s, i, &s->pending[i]);
+        }
+    }
+}
+
+static void esp32p4_pms_record_timer(void *opaque)
+{
+    esp32p4_pms_flush_records(opaque);
+}
+
+/*
+ * Record a refusal in record @rec. From the middle of a core's block (a
+ * trace encoder writing as the core reports an instruction) the record,
+ * and the interrupt it raises, wait for the block's end; a record keeps
+ * only the first refusal until software clears it, so only the first
+ * waits.
+ */
+/* [spec:nuos:req:emu.esp32p4.pms] */
+static void esp32p4_pms_record(ESP32P4PmsState *s, int rec, uint32_t addr,
+                               uint8_t id, bool write, bool illegal)
+{
+    ESP32P4PmsRecord r = {
+        .valid = true, .write = write, .illegal = illegal, .id = id,
+        .addr = addr,
+    };
+
+    if (esp32p4_cpu_mid_block()) {
+        if (!s->pending[rec].valid) {
+            s->pending[rec] = r;
+        }
+        timer_mod(s->record_timer, 0);
+        return;
+    }
+    esp32p4_pms_flush_records(s);
+    esp32p4_pms_apply(s, rec, &r);
+}
+
+/*
+ * The refusal of an access by master @idx: logged and recorded where the
+ * hardware records it. A core's access it has no path to is not
+ * recorded, like any of a core's accesses to an address nothing decodes;
+ * a DMA master's is recorded by the ICM as an illegal access.
+ */
 static void esp32p4_pms_refuse(ESP32P4PmsState *s, int apm, int idx,
                                MemTxAttrs attrs, uint32_t addr, bool write)
 {
@@ -753,8 +969,25 @@ static void esp32p4_pms_refuse(ESP32P4PmsState *s, int apm, int idx,
         [IDX_LP_CORE] = "the LP core",
     };
     uint8_t id = ESP32P4_REQUESTER_ID(attrs.requester_id);
-    int m = idx - IDX_DMA;
+    int m = idx >= IDX_DMA ? esp32p4_pms_idx_master(idx) : -1;
 
+    if (apm == APM_NO_PATH && idx >= IDX_DMA) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: DMA master %d (ID 0x%02x) has "
+                      "no path to 0x%08" PRIx32 "; its %s reaches nothing\n",
+                      TYPE_ESP32P4_PMS, m, id, addr,
+                      write ? "write" : "read");
+        esp32p4_pms_record(s, ESP32P4_DMA_MASTER_ON_AHB(m)
+                              ? ESP32P4_PMS_REC_ICM_CPU
+                              : ESP32P4_PMS_REC_ICM_SYS,
+                           addr, id, write, true);
+        return;
+    }
+    if (apm == APM_NO_PATH) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: %s has no path to 0x%08" PRIx32
+                      "; its %s reaches nothing\n", TYPE_ESP32P4_PMS,
+                      cpu_names[idx], addr, write ? "write" : "read");
+        return;
+    }
     if (idx >= IDX_DMA) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: the %s APM refuses DMA master "
                       "%d's %s at 0x%08" PRIx32 "\n", TYPE_ESP32P4_PMS,
@@ -767,14 +1000,18 @@ static void esp32p4_pms_refuse(ESP32P4PmsState *s, int apm, int idx,
 
     switch (apm) {
     case APM_HP:
-        esp32p4_icm_addrhole(s->icm, false, addr, id, write, false);
+        esp32p4_pms_record(s, ESP32P4_PMS_REC_ICM_CPU, addr, id, write,
+                           false);
         break;
     case APM_LP:
-        esp32p4_lp_sys_addrhole(s->lp_sys, addr, id, write, false);
+        esp32p4_pms_record(s, ESP32P4_PMS_REC_LP_SYS, addr, id, write,
+                           false);
         break;
     case APM_DMA:
-        esp32p4_icm_addrhole(s->icm, !ESP32P4_DMA_MASTER_ON_AHB(m), addr, id,
-                             write, false);
+        esp32p4_pms_record(s, ESP32P4_DMA_MASTER_ON_AHB(m)
+                              ? ESP32P4_PMS_REC_ICM_CPU
+                              : ESP32P4_PMS_REC_ICM_SYS,
+                           addr, id, write, false);
         break;
     default:
         g_assert_not_reached();
@@ -804,7 +1041,8 @@ static MemTxResult esp32p4_pms_check_access(ESP32P4PmsState *s, hwaddr addr,
         if (!write) {
             *data = 0;
         }
-        return MEMTX_ERROR;
+        /* AXI's DECERR for no slave, SLVERR for an APM's refusal. */
+        return apm == APM_NO_PATH ? MEMTX_DECODE_ERROR : MEMTX_ERROR;
     }
 
     if (write) {
@@ -1046,6 +1284,8 @@ static void esp32p4_pms_reset_hold(Object *obj, ResetType type)
     for (int i = 0; i < ESP32P4_PMS_NUM_BLOCKS; i++) {
         esp32p4_pms_reset_block(s, i);
     }
+    memset(s->pending, 0, sizeof(s->pending));
+    timer_del(s->record_timer);
 }
 
 static void esp32p4_pms_reset_exit(Object *obj, ResetType type)
@@ -1094,6 +1334,8 @@ static void esp32p4_pms_realize(DeviceState *dev, Error **errp)
      */
     memory_region_init_io(&s->check, NULL, &esp32p4_pms_check_ops, s,
                           "esp32p4.apm-check", 4 * GiB);
+    s->record_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   esp32p4_pms_record_timer, s);
     address_space_init(&s->check_as, &s->check, "esp32p4.apm-check");
     address_space_init(&s->bus_as, &s->bus, "esp32p4.bus");
 }
@@ -1109,6 +1351,40 @@ static int esp32p4_pms_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static const VMStateDescription vmstate_esp32p4_pms_record = {
+    .name = TYPE_ESP32P4_PMS "/record",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(valid, ESP32P4PmsRecord),
+        VMSTATE_BOOL(write, ESP32P4PmsRecord),
+        VMSTATE_BOOL(illegal, ESP32P4PmsRecord),
+        VMSTATE_UINT8(id, ESP32P4PmsRecord),
+        VMSTATE_UINT32(addr, ESP32P4PmsRecord),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool esp32p4_pms_pending_needed(void *opaque)
+{
+    ESP32P4PmsState *s = opaque;
+
+    return timer_pending(s->record_timer);
+}
+
+static const VMStateDescription vmstate_esp32p4_pms_pending = {
+    .name = TYPE_ESP32P4_PMS "/pending",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = esp32p4_pms_pending_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT_ARRAY(pending, ESP32P4PmsState, ESP32P4_PMS_RECORDS, 1,
+                             vmstate_esp32p4_pms_record, ESP32P4PmsRecord),
+        VMSTATE_TIMER_PTR(record_timer, ESP32P4PmsState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_esp32p4_pms = {
     .name = TYPE_ESP32P4_PMS,
     .version_id = 1,
@@ -1119,6 +1395,10 @@ static const VMStateDescription vmstate_esp32p4_pms = {
                                ESP32P4_PMS_MAX_WORDS),
         VMSTATE_BOOL(lp_held, ESP32P4PmsState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_esp32p4_pms_pending,
+        NULL
     },
 };
 

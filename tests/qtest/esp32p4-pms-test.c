@@ -81,6 +81,7 @@ static const uint32_t hp_peri_bits[4] = {
 #define ICM_INT_SYS         0x2
 #define ICM_INT_CPU         0x4
 #define ICM_WR              0x100
+#define ICM_SECURE          0x200
 
 #define LP_SYS_ADDRHOLE_ADDR (LP_SYS + 0x168)
 #define LP_SYS_ADDRHOLE_INFO (LP_SYS + 0x16c)
@@ -129,6 +130,7 @@ static const uint32_t hp_peri_bits[4] = {
 #define SCRATCH             0x4ff40000
 
 #define MEMTX_OK            0
+#define MEMTX_DECODE_ERROR  2
 
 static QTestState *start(void)
 {
@@ -493,7 +495,12 @@ static void test_hp_memory(void)
     g_assert_cmphex(qtest_readl(qts, SCRATCH), ==, 0x55555555);
     g_assert_cmphex(qtest_readl(qts, ICM_CPU_INFO), ==, ICM_WR | 2);
     g_assert_true(can_write(qts, CORE0, false, SCRATCH, 0x77777777));
-    g_assert_true(can_write(qts, LP_CORE, false, L2MEM_DIRECT + off, 0));
+    /* The direct addresses are the HP cores' alone. */
+    clear_records(qts);
+    g_assert_cmpuint(probe(qts, LP_CORE, false, true, L2MEM_DIRECT + off, 0,
+                           NULL), ==, MEMTX_DECODE_ERROR);
+    g_assert_cmphex(qtest_readl(qts, SCRATCH), ==, 0x77777777);
+    g_assert_cmphex(qtest_readl(qts, ICM_INT_RAW), ==, 0);
     qtest_quit(qts);
 }
 
@@ -661,8 +668,8 @@ static void test_lp_clock_reset(void)
  * A DMA master's reads and writes of the memories are checked against the
  * regions its registers open: an address in no region is refused; an AXI
  * master's refusal is recorded in the ICM's system record with its 8-bit
- * ID, an AHB master's in the CPU record. Other addresses are not the DMA
- * APM's.
+ * ID, an AHB master's in the CPU record. A DMA master has no path to any
+ * other address (esp32p4-bus-reach-test.c covers the rest).
  */
 /* [spec:nuos:req:emu.esp32p4.pms/test] */
 static void test_dma(void)
@@ -700,11 +707,25 @@ static void test_dma(void)
     /* Past the region's exclusive end, and below it: in no region. */
     g_assert_false(can_read(qts, ch0, false, SCRATCH + 0x1000));
     g_assert_false(can_read(qts, ch0, false, SCRATCH - 4));
-    /* Not the DMA APM's: the TCM, a peripheral, the direct alias. */
-    g_assert_true(can_write(qts, ch0, false, TCM, 3));
-    g_assert_true(can_read(qts, ch0, false, UART0));
-    g_assert_true(can_read(qts, ch0, false, L2MEM_DIRECT));
-    /* Nor are the CPUs. */
+    /*
+     * No path at all from a DMA master to the TCM, a peripheral or the
+     * direct alias: a decode error, recorded as an illegal access.
+     */
+    clear_records(qts);
+    g_assert_cmpuint(probe(qts, ch0, false, true, TCM, 3, NULL), ==,
+                     MEMTX_DECODE_ERROR);
+    g_assert_cmphex(qtest_readl(qts, TCM), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, ICM_SYS_ADDR), ==, TCM);
+    g_assert_cmphex(qtest_readl(qts, ICM_SYS_INFO), ==,
+                    ICM_SECURE | ICM_WR | 0x51);
+    clear_records(qts);
+    g_assert_cmpuint(probe(qts, ch0, false, false, UART0, 0, NULL), ==,
+                     MEMTX_DECODE_ERROR);
+    g_assert_cmpuint(probe(qts, ch0, false, false, L2MEM_DIRECT, 0, NULL),
+                     ==, MEMTX_DECODE_ERROR);
+    g_assert_cmphex(qtest_readl(qts, ICM_SYS_ADDR), ==, UART0);
+    g_assert_cmphex(qtest_readl(qts, ICM_SYS_INFO), ==, ICM_SECURE | 0x51);
+    /* The CPUs are not the DMA APM's. */
     g_assert_true(can_write(qts, CORE0, true, SCRATCH + 0xffc, 4));
     clear_records(qts);
 

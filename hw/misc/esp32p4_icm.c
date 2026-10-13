@@ -21,8 +21,9 @@
  * software clears the bit, so it is the first refusal since. The three
  * raw bits, as INT_ENA enables them, drive the ICM's interrupt,
  * SYS_ICM_INTR, source 21 of the interrupt matrix. The APMs record their
- * refusals here; the machine's undecoded addresses answer with a bus
- * error but are not recorded.
+ * refusals here, and the bus matrix a DMA master's access to an address
+ * its port has no path to (hw/misc/esp32p4_pms.c); a core's access to an
+ * address nothing decodes answers with a bus error but is not recorded.
  *
  * The other registers, the arbitration priorities and QoS levels and the
  * deadlock timeout, are kept as written: the model has no arbitration and
