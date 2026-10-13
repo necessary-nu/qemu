@@ -34,11 +34,32 @@ static void esp32_efuse_op_start(Esp32EfuseState *s, uint64_t cycles);
 static uint64_t esp32_efuse_read_cycles(Esp32EfuseState *s);
 static uint64_t esp32_efuse_program_cycles(Esp32EfuseState *s);
 
+static void esp32_efuse_timer_cb(void *opaque);
+
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * End the running read or program command if its cycles have run by the
+ * access being made: without icount its timer can run well after that,
+ * while software polls EFUSE_CMD, as the ROM and ESP-IDF do, or reads
+ * INT_RAW. Only a timer that has come is run.
+ */
+static void esp32_efuse_catch_up(Esp32EfuseState *s)
+{
+    if (timer_pending(&s->op_timer) &&
+        timer_expire_time_ns(&s->op_timer) <=
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_del(&s->op_timer);
+        esp32_efuse_timer_cb(s);
+    }
+}
+
 static uint64_t esp32_efuse_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp32EfuseState *s = ESP32_EFUSE(opaque);
     uint64_t r = 0;
     int idx;
+
+    esp32_efuse_catch_up(s);
     switch (addr) {
     case A_EFUSE_BLK0_RDATA0 ... A_EFUSE_BLK0_WDATA0 - 4:
         idx = (addr - A_EFUSE_BLK0_RDATA0) / 4;
@@ -105,6 +126,8 @@ static void esp32_efuse_write(void *opaque, hwaddr addr,
                        uint64_t value, unsigned int size)
 {
     Esp32EfuseState *s = ESP32_EFUSE(opaque);
+
+    esp32_efuse_catch_up(s);
     switch (addr) {
     case A_EFUSE_CLK:
         s->clk_reg = value;
@@ -334,6 +357,9 @@ static void esp32_efuse_apb_clk_update(void *opaque, ClockEvent event)
     Esp32EfuseState *s = ESP32_EFUSE(opaque);
     int64_t now;
 
+    if (event == ClockPreUpdate) {
+        esp32_efuse_catch_up(s);
+    }
     if (!s->cmd_reg) {
         return;
     }
