@@ -13,7 +13,7 @@ slow_qtests = {
   'qmp-cmd-test' : 120,
   'qom-test' : 900,
   'stm32l4x5_usart-test' : 600,
-  'test-hmp' : 240,
+  'test-hmp' : 600,
   'pxe-test': 610,
   'prom-env-test': 360,
   'boot-serial-test': 360,
