@@ -496,6 +496,107 @@ static void test_legacy_i2c(void)
 }
 
 /*
+ * The master in I2C mode and the general call. With only an ES8311 on
+ * the legacy bus, which answers its own address only, a general call is
+ * NACKed (error 5), and afterwards the codec reads its chip ID, an absent
+ * address is NACKed and so is the next general call. With a TMP105 there
+ * too, which takes general calls, a general call and then, after
+ * repeated STARTs (TOC clear), a register read from the codec reach the
+ * codec alone: a repeated START to another address leaves the general
+ * call.
+ */
+#define ES8311_ADDR         0x18
+#define ES8311_CHIP_ID1     0xfd
+
+/* Empty the TX and RX buffers, of what a NACKed command left there. */
+static void reset_data_bufs(QTestState *qts)
+{
+    wr(qts, MST, RESET_CTRL, RST_TX_BUF | RST_RX_BUF);
+}
+
+/* A command to legacy device @dev: write the byte @b, or read one. */
+static uint32_t legacy_xfer(QTestState *qts, int dev, bool rnw, uint8_t b,
+                            bool toc, uint32_t *cmd)
+{
+    if (!rnw) {
+        wr(qts, MST, TX_DATA_PORT, b);
+    }
+    cmd[0] = CMDL(0, dev, 0, 0, dev, 0, rnw, 1, toc);
+    cmd[1] = DL(1);
+    return 2;
+}
+
+static uint32_t legacy_run(QTestState *qts, const uint32_t *cmds, int n,
+                           int responses)
+{
+    uint32_t err = 0;
+    int i;
+
+    run(qts, cmds, n);
+    wait_complete(qts);
+    for (i = 0; i < responses; i++) {
+        err = (err << 4) | RESP_ERR(rd(qts, MST, RESPONSE_BUF_PORT));
+    }
+    qtest_clock_step(qts, 100 * 1000);
+    return err;
+}
+
+static uint8_t legacy_chip_id(QTestState *qts)
+{
+    uint32_t cmds[4];
+
+    reset_data_bufs(qts);
+    legacy_xfer(qts, 1, false, ES8311_CHIP_ID1, false, cmds);
+    legacy_xfer(qts, 1, true, 0, true, cmds + 2);
+    g_assert_cmphex(legacy_run(qts, cmds, 4, 2), ==, 0);
+    return rd(qts, MST, RX_DATA_PORT) & 0xff;
+}
+
+/* [spec:nuos:req:emu.esp32p4.i2c/test] */
+static void test_legacy_general_call(void)
+{
+    QTestState *qts;
+    uint32_t cmds[6];
+    int i;
+
+    qts = qtest_init("-M esp32p4,flash-size=16M "
+                     "-device es8311,bus=i3c-legacy-i2c "
+                     "-global esp32p4-gpio.pad-wires=20:22,21:23");
+    setup(qts);
+    wr(qts, MST, DAT(0), DAT_I2C(0));
+    wr(qts, MST, DAT(1), DAT_I2C(ES8311_ADDR));
+    wr(qts, MST, DAT(2), DAT_I2C(0x33));
+    for (i = 0; i < 2; i++) {
+        reset_data_bufs(qts);
+        legacy_xfer(qts, 0, false, 0x06, true, cmds);
+        g_assert_cmphex(legacy_run(qts, cmds, 2, 1), ==, 5);
+        g_assert_cmphex(legacy_chip_id(qts), ==, 0x83);
+    }
+    reset_data_bufs(qts);
+    legacy_xfer(qts, 0, false, 0x06, true, cmds);
+    g_assert_cmphex(legacy_run(qts, cmds, 2, 1), ==, 5);
+    reset_data_bufs(qts);
+    legacy_xfer(qts, 2, false, 0x06, true, cmds);
+    g_assert_cmphex(legacy_run(qts, cmds, 2, 1), ==, 5);
+    g_assert_cmphex(legacy_chip_id(qts), ==, 0x83);
+    qtest_quit(qts);
+
+    qts = qtest_init("-M esp32p4,flash-size=16M "
+                     "-device es8311,bus=i3c-legacy-i2c "
+                     "-device tmp105,bus=i3c-legacy-i2c,address=0x48 "
+                     "-global esp32p4-gpio.pad-wires=20:22,21:23");
+    setup(qts);
+    wr(qts, MST, DAT(0), DAT_I2C(0));
+    wr(qts, MST, DAT(1), DAT_I2C(ES8311_ADDR));
+    legacy_xfer(qts, 0, false, 0x00, false, cmds);
+    legacy_xfer(qts, 1, false, ES8311_CHIP_ID1, false, cmds + 2);
+    legacy_xfer(qts, 1, true, 0, true, cmds + 4);
+    g_assert_cmphex(legacy_run(qts, cmds, 6, 3), ==, 0);
+    g_assert_cmphex(rd(qts, MST, RX_DATA_PORT) & 0xff, ==, 0x83);
+    qtest_quit(qts);
+}
+
+/*
  * Timing: START, the header open drain, two bytes push-pull, the STOP,
  * at the reset values' counts (OD 26 + 6, PP 6 + 6, START_HOLD 9, STOP
  * PP_LOW 6 + STOP_SETUP 9) of I3C_MST_CLK.
@@ -774,6 +875,8 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/i3c/entdaa", test_entdaa);
     qtest_add_func("esp32p4/i3c/nack", test_nack);
     qtest_add_func("esp32p4/i3c/legacy-i2c", test_legacy_i2c);
+    qtest_add_func("esp32p4/i3c/legacy-general-call",
+                   test_legacy_general_call);
     qtest_add_func("esp32p4/i3c/timing", test_timing);
     qtest_add_func("esp32p4/i3c/ibi", test_ibi);
     qtest_add_func("esp32p4/i3c/slave", test_slave);

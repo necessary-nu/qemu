@@ -336,50 +336,69 @@ static uint64_t wait_int(QTestState *qts, uint32_t base, uint32_t bits,
     return t;
 }
 
-/* Write @n bytes to the device at @addr, with a STOP; true if ACKed. */
+/*
+ * Write @n bytes to the device at @addr through the master at @base, with
+ * a STOP; true if ACKed.
+ */
+static bool ctl_write(QTestState *qts, uint32_t base, uint8_t addr,
+                      const uint8_t *buf, int n)
+{
+    int i;
+
+    fifo_reset(qts, base);
+    wr(qts, base, INT_CLR, 0x7ffff);
+    wr(qts, base, DATA, addr << 1);
+    for (i = 0; i < n; i++) {
+        wr(qts, base, DATA, buf[i]);
+    }
+    wr(qts, base, COMD(0), CMD(CMD_RSTART, 0, 0, 0, 0));
+    wr(qts, base, COMD(1), CMD(CMD_WRITE, n + 1, 1, 0, 0));
+    wr(qts, base, COMD(2), CMD(CMD_STOP, 0, 0, 0, 0));
+    trans_start(qts, base);
+    wait_int(qts, base, INT_TRANS_COMPLETE, 10000000);
+    return !(rd(qts, base, INT_RAW) & INT_NACK);
+}
+
 static bool write_bytes(QTestState *qts, uint8_t addr, const uint8_t *buf,
                         int n)
 {
-    int i;
-
-    fifo_reset(qts, I2C0);
-    wr(qts, I2C0, INT_CLR, 0x7ffff);
-    wr(qts, I2C0, DATA, addr << 1);
-    for (i = 0; i < n; i++) {
-        wr(qts, I2C0, DATA, buf[i]);
-    }
-    wr(qts, I2C0, COMD(0), CMD(CMD_RSTART, 0, 0, 0, 0));
-    wr(qts, I2C0, COMD(1), CMD(CMD_WRITE, n + 1, 1, 0, 0));
-    wr(qts, I2C0, COMD(2), CMD(CMD_STOP, 0, 0, 0, 0));
-    trans_start(qts, I2C0);
-    wait_int(qts, I2C0, INT_TRANS_COMPLETE, 10000000);
-    return !(rd(qts, I2C0, INT_RAW) & INT_NACK);
+    return ctl_write(qts, I2C0, addr, buf, n);
 }
 
-/* Write @reg, then read @n bytes with a repeated START. */
-static void read_reg(QTestState *qts, uint8_t addr, uint8_t reg,
-                     uint8_t *buf, int n)
+/*
+ * Write @reg, then read @n bytes with a repeated START, through the
+ * master at @base.
+ */
+static void ctl_read_reg(QTestState *qts, uint32_t base, uint8_t addr,
+                         uint8_t reg, uint8_t *buf, int n)
 {
     int i;
 
-    wr(qts, I2C0, INT_CLR, 0x7ffff);
-    wr(qts, I2C0, DATA, addr << 1);
-    wr(qts, I2C0, DATA, reg);
-    wr(qts, I2C0, DATA, (addr << 1) | 1);
-    wr(qts, I2C0, COMD(0), CMD(CMD_RSTART, 0, 0, 0, 0));
-    wr(qts, I2C0, COMD(1), CMD(CMD_WRITE, 2, 1, 0, 0));
-    wr(qts, I2C0, COMD(2), CMD(CMD_RSTART, 0, 0, 0, 0));
-    wr(qts, I2C0, COMD(3), CMD(CMD_WRITE, 1, 1, 0, 0));
-    wr(qts, I2C0, COMD(4), CMD(CMD_READ, n - 1, 0, 0, 0));
-    wr(qts, I2C0, COMD(5), CMD(CMD_READ, 1, 0, 0, 1));
-    wr(qts, I2C0, COMD(6), CMD(CMD_STOP, 0, 0, 0, 0));
-    trans_start(qts, I2C0);
-    wait_int(qts, I2C0, INT_TRANS_COMPLETE, 10000000);
-    g_assert_cmphex(rd(qts, I2C0, INT_RAW) & INT_NACK, ==, 0);
-    g_assert_cmpuint(SR_RXFIFO_CNT(rd(qts, I2C0, SR)), ==, n);
+    fifo_reset(qts, base);
+    wr(qts, base, INT_CLR, 0x7ffff);
+    wr(qts, base, DATA, addr << 1);
+    wr(qts, base, DATA, reg);
+    wr(qts, base, DATA, (addr << 1) | 1);
+    wr(qts, base, COMD(0), CMD(CMD_RSTART, 0, 0, 0, 0));
+    wr(qts, base, COMD(1), CMD(CMD_WRITE, 2, 1, 0, 0));
+    wr(qts, base, COMD(2), CMD(CMD_RSTART, 0, 0, 0, 0));
+    wr(qts, base, COMD(3), CMD(CMD_WRITE, 1, 1, 0, 0));
+    wr(qts, base, COMD(4), CMD(CMD_READ, n - 1, 0, 0, 0));
+    wr(qts, base, COMD(5), CMD(CMD_READ, 1, 0, 0, 1));
+    wr(qts, base, COMD(6), CMD(CMD_STOP, 0, 0, 0, 0));
+    trans_start(qts, base);
+    wait_int(qts, base, INT_TRANS_COMPLETE, 10000000);
+    g_assert_cmphex(rd(qts, base, INT_RAW) & INT_NACK, ==, 0);
+    g_assert_cmpuint(SR_RXFIFO_CNT(rd(qts, base, SR)), ==, n);
     for (i = 0; i < n; i++) {
-        buf[i] = rd(qts, I2C0, DATA);
+        buf[i] = rd(qts, base, DATA);
     }
+}
+
+static void read_reg(QTestState *qts, uint8_t addr, uint8_t reg,
+                     uint8_t *buf, int n)
+{
+    ctl_read_reg(qts, I2C0, addr, reg, buf, n);
 }
 
 static void pad_in(QTestState *qts, int pad, int level)
@@ -1251,6 +1270,103 @@ static void test_general_call(void)
 }
 
 /*
+ * A general call no device takes: the ES8311 answers its own address
+ * only. The master sees a NACK as for any other address: NACK_INT,
+ * RESP_REC set, and the STOP. Afterwards the bus is no longer in a
+ * general call: the codec reads its chip ID (a broadcast reads 1s from
+ * nobody), an address nobody has is NACKed, and so is the next general
+ * call. On each controller, on pads of its own: I2C0 and I2C1 on GPIO22
+ * (SCL) and GPIO23 (SDA) with the codec on their QEMU buses, the LP I2C
+ * on LP pads 4 and 5 with the codec on "lp-i2c", and I2C0 on the board's
+ * ESP_I2C wires, GPIO8 and GPIO7, where the board's own codec answers on
+ * the wires (hw/i2c/i2c_wire_bus.c).
+ */
+#define ES8311_ADDR         0x18
+#define ES8311_CHIP_ID1     0xfd
+#define ABSENT_ADDR         0x33
+
+static void gcall_unanswered(QTestState *qts, uint32_t base)
+{
+    uint8_t gcall = 0x06, id = 0;
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        g_assert_false(ctl_write(qts, base, 0, &gcall, 1));
+        g_assert_cmphex(rd(qts, base, INT_RAW) &
+                        (INT_NACK | INT_TRANS_COMPLETE), ==,
+                        INT_NACK | INT_TRANS_COMPLETE);
+        g_assert_cmphex(rd(qts, base, SR) & SR_RESP_REC, ==, SR_RESP_REC);
+        step_cycles(qts, 100);
+        ctl_read_reg(qts, base, ES8311_ADDR, ES8311_CHIP_ID1, &id, 1);
+        g_assert_cmphex(id, ==, 0x83);
+        step_cycles(qts, 100);
+    }
+    g_assert_false(ctl_write(qts, base, 0, &gcall, 1));
+    step_cycles(qts, 100);
+    g_assert_false(ctl_write(qts, base, ABSENT_ADDR, &gcall, 1));
+    g_assert_cmphex(rd(qts, base, INT_RAW) & INT_NACK, ==, INT_NACK);
+    step_cycles(qts, 100);
+    ctl_read_reg(qts, base, ES8311_ADDR, ES8311_CHIP_ID1, &id, 1);
+    g_assert_cmphex(id, ==, 0x83);
+}
+
+/* I2C1 as a master on @scl_pad and @sda_pad, its FIFOs empty. */
+static void master1(QTestState *qts, int scl_pad, int sda_pad)
+{
+    hp_enable(qts);
+    route(qts, SIG_I2C1_SCL, SIG_I2C1_SDA, scl_pad, sda_pad);
+    timing(qts, I2C1);
+    wr(qts, I2C1, CTR, CTR_MS_MODE | CTR_RX_FULL_ACK);
+    wr(qts, I2C1, CTR, CTR_MS_MODE | CTR_RX_FULL_ACK | CTR_CONF_UPGATE);
+    fifo_reset(qts, I2C1);
+}
+
+/* The LP I2C on LP pads @scl_pad and @sda_pad. */
+static void master_lp(QTestState *qts, int scl_pad, int sda_pad)
+{
+    int pads[] = { scl_pad, sda_pad };
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        qtest_writel(qts, LP_IOMUX_PAD(pads[i]), LP_PAD_MUX_SEL |
+                     LP_PAD_FUN_SEL(1) | LP_PAD_FUN_IE | LP_PAD_RUE | 2);
+        qtest_writel(qts, LP_GPIO_PIN(pads[i]), LP_PIN_PAD_DRIVER);
+        qtest_writel(qts, LP_GPIO_FUNC_OUT(pads[i]), LP_OUT_SEL(i));
+        qtest_writel(qts, LP_GPIO_FUNC_IN(i), LP_IN_SIG_IN_SEL |
+                     LP_IN_SEL(pads[i]));
+    }
+    timing(qts, LP_I2C);
+    wr(qts, LP_I2C, CTR, rd(qts, LP_I2C, CTR) | CTR_CONF_UPGATE);
+}
+
+/* [spec:nuos:req:emu.esp32p4.i2c/test] */
+static void test_general_call_unanswered(void)
+{
+    QTestState *qts;
+
+    qts = qtest_init("-M esp32p4,flash-size=16M -device es8311,bus=i2c0");
+    master0(qts);
+    route(qts, SIG_I2C0_SCL, SIG_I2C0_SDA, 22, 23);
+    gcall_unanswered(qts, I2C0);
+    qtest_quit(qts);
+
+    qts = qtest_init("-M esp32p4,flash-size=16M -device es8311,bus=i2c1");
+    master1(qts, 22, 23);
+    gcall_unanswered(qts, I2C1);
+    qtest_quit(qts);
+
+    qts = qtest_init("-M esp32p4,flash-size=16M -device es8311,bus=lp-i2c");
+    master_lp(qts, LP_PAD_SCL, LP_PAD_SDA);
+    gcall_unanswered(qts, LP_I2C);
+    qtest_quit(qts);
+
+    qts = qtest_init("-M esp32p4,flash-size=16M");
+    master0(qts);
+    gcall_unanswered(qts, I2C0);
+    qtest_quit(qts);
+}
+
+/*
  * The LP I2C on LP pads 4 and 5, reading the TMP105 on its own bus, at
  * LP_I2C_SCLK through LP_I2C_CLK_CONF's divider.
  */
@@ -1321,6 +1437,8 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/i2c/slave-stretch", test_slave_stretch);
     qtest_add_func("esp32p4/i2c/slave-10bit", test_slave_10bit);
     qtest_add_func("esp32p4/i2c/general-call", test_general_call);
+    qtest_add_func("esp32p4/i2c/general-call-unanswered",
+                   test_general_call_unanswered);
     qtest_add_func("esp32p4/i2c/filter", test_filter);
     qtest_add_func("esp32p4/i2c/fsm-rst-clear-bus", test_fsm_rst_clear_bus);
     qtest_add_func("esp32p4/i2c/end", test_end);

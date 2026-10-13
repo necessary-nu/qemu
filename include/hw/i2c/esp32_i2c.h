@@ -60,6 +60,11 @@ typedef struct Esp32I2CState {
      * those lines, take part in the transaction.
      */
     bool connected;
+    /*
+     * A device on the QEMU bus acknowledged the address after the last
+     * START: the core's transfer is open, for the bytes up to the STOP.
+     */
+    bool addressed;
 } Esp32I2CState;
 
 

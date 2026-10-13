@@ -10,6 +10,15 @@
 static void esp32_i2c_do_transaction(Esp32I2CState *s);
 static void esp32_i2c_update_irq(Esp32I2CState *s);
 
+/* End the bus's devices' transfer, if a device took the address. */
+static void esp32_i2c_dev_end(Esp32I2CState *s)
+{
+    if (s->addressed) {
+        i2c_end_transfer(s->bus);
+        s->addressed = false;
+    }
+}
+
 static void esp32_i2c_reset_hold(Object *obj, ResetType type)
 {
     Esp32I2CState * s = Esp32_I2C(obj);
@@ -19,9 +28,7 @@ static void esp32_i2c_reset_hold(Object *obj, ResetType type)
      * left open ends for them: the next START the controller puts on the
      * lines makes every device listen for its address again.
      */
-    if (s->trans_ongoing && s->connected) {
-        i2c_end_transfer(s->bus);
-    }
+    esp32_i2c_dev_end(s);
     fifo8_reset(&s->rx_fifo);
     fifo8_reset(&s->tx_fifo);
     s->trans_ongoing = false;
@@ -226,14 +233,37 @@ static void esp32_i2c_stop(Esp32I2CState *s)
 }
 
 /*
- * A bit read with the controller off the QEMU bus: the level SDA reads
- * with the controller releasing it, which for an acknowledge is 0 for an
- * ACK.
+ * A bit read with no device on the QEMU bus answering, the controller off
+ * their lines or none addressed: the level SDA reads with the controller
+ * releasing it, which for an acknowledge is 0 for an ACK.
  */
 static bool esp32_i2c_unconnected_bit(Esp32I2CState *s)
 {
     esp32_i2c_drive(s, false, true);
     return s->sda_in;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * The address byte after a START: true for a NACK. The bus's devices take
+ * part while the controller is on their lines; a device that takes the
+ * address answers the bytes up to the STOP or the next START, and with
+ * none taking it nothing answers them. QEMU's core leaves a general call
+ * no device takes with its broadcast flag set, which would make every
+ * later START a broadcast, until the transfer is ended: a NACK ends it
+ * at once.
+ */
+static bool esp32_i2c_address(Esp32I2CState *s, uint8_t data)
+{
+    if (!s->connected) {
+        return esp32_i2c_unconnected_bit(s);
+    }
+    if (i2c_start_transfer(s->bus, data >> 1, data & 1)) {
+        i2c_end_transfer(s->bus);
+        return esp32_i2c_unconnected_bit(s);
+    }
+    s->addressed = true;
+    return false;
 }
 
 /*
@@ -255,9 +285,7 @@ static void esp32_i2c_do_transaction(Esp32I2CState *s)
 
         switch (opcode) {
         case I2C_OPCODE_RSTART:
-            if (s->trans_ongoing && s->connected) {
-                i2c_end_transfer(s->bus);
-            }
+            esp32_i2c_dev_end(s);
             s->trans_ongoing = false;
             if (!esp32_i2c_start(s)) {
                 stop_or_end = true;
@@ -274,13 +302,8 @@ static void esp32_i2c_do_transaction(Esp32I2CState *s)
                 if (!s->trans_ongoing) {
                     /* The address byte, after a START */
                     s->trans_ongoing = true;
-                    if (s->connected) {
-                        nack = i2c_start_transfer(s->bus, data >> 1,
-                                                  data & 1) != 0;
-                    } else {
-                        nack = esp32_i2c_unconnected_bit(s);
-                    }
-                } else if (s->connected) {
+                    nack = esp32_i2c_address(s, data);
+                } else if (s->addressed) {
                     nack = i2c_send(s->bus, data) != 0;
                 } else {
                     nack = esp32_i2c_unconnected_bit(s);
@@ -289,9 +312,7 @@ static void esp32_i2c_do_transaction(Esp32I2CState *s)
                     /* The controller gives up the bus with a STOP */
                     s->int_raw_reg = FIELD_DP32(s->int_raw_reg, I2C_INT_RAW,
                                                 ACK_ERR, 1);
-                    if (s->connected) {
-                        i2c_end_transfer(s->bus);
-                    }
+                    esp32_i2c_dev_end(s);
                     s->trans_ongoing = false;
                     esp32_i2c_stop(s);
                     stop_or_end = true;
@@ -308,7 +329,7 @@ static void esp32_i2c_do_transaction(Esp32I2CState *s)
                 } else {
                     uint8_t data;
 
-                    if (s->connected) {
+                    if (s->addressed) {
                         data = i2c_recv(s->bus);
                     } else {
                         data = esp32_i2c_unconnected_bit(s) ? 0xff : 0x00;
@@ -319,9 +340,7 @@ static void esp32_i2c_do_transaction(Esp32I2CState *s)
             break;
         }
         case I2C_OPCODE_STOP:
-            if (s->trans_ongoing && s->connected) {
-                i2c_end_transfer(s->bus);
-            }
+            esp32_i2c_dev_end(s);
             s->trans_ongoing = false;
             esp32_i2c_stop(s);
             s->int_raw_reg = FIELD_DP32(s->int_raw_reg, I2C_INT_RAW,
@@ -417,8 +436,8 @@ static void esp32_i2c_reset_exit(Object *obj, ResetType type)
 
 static const VMStateDescription vmstate_esp32_i2c = {
     .name = TYPE_ESP32_I2C,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_FIFO8(rx_fifo, Esp32I2CState),
         VMSTATE_FIFO8(tx_fifo, Esp32I2CState),
@@ -439,6 +458,7 @@ static const VMStateDescription vmstate_esp32_i2c = {
         VMSTATE_BOOL(scl_in, Esp32I2CState),
         VMSTATE_BOOL(sda_in, Esp32I2CState),
         VMSTATE_BOOL(connected, Esp32I2CState),
+        VMSTATE_BOOL(addressed, Esp32I2CState),
         VMSTATE_END_OF_LIST()
     }
 };
