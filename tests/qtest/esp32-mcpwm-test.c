@@ -89,6 +89,10 @@
 
 #define GPIO                0x3ff44000
 #define GPIO_IN             (GPIO + 0x3c)
+#define GPIO_STATUS         (GPIO + 0x44)
+#define GPIO_STATUS_W1TC    (GPIO + 0x4c)
+#define GPIO_PIN(n)         (GPIO + 0x88 + 4 * (n))
+#define PIN_INT_RISING      (1u << 7)
 #define GPIO_FUNC_IN(s)     (GPIO + 0x130 + 4 * (s))
 #define GPIO_FUNC_OUT(n)    (GPIO + 0x530 + 4 * (n))
 #define IN_SIG_IN_SEL       (1u << 7)
@@ -847,6 +851,98 @@ static void test_long_run(void)
     qtest_quit(qts);
 }
 
+/*
+ * PWM0A reaching no pad: PWM_clk at 40 MHz, PLL_F160M_CLK by 4, timer 0
+ * counting up with period 1, TEZ every 50 ns, A high from TEZ and low from
+ * TEA at count 1, 25 ns later: 40 million edges a second, none of them
+ * timed, so that a second costs the host next to nothing. Routed to pad
+ * 18 10 ns into a high phase, the pad is high at once, then follows each
+ * edge at its nanosecond.
+ */
+/* [spec:nuos:req:emu.esp32.mcpwm/test] */
+static void test_unrouted(void)
+{
+    QTestState *qts = start();
+    int64_t now, c;
+
+    /* The flash boot watchdogs would reset the chip within the second. */
+    qtest_writel(qts, TIMG0_WDTCONFIG0, 0);
+    qtest_writel(qts, RTC_WDTWPROTECT, RTC_WDT_WKEY);
+    qtest_writel(qts, RTC_WDTCONFIG0, 0);
+    qtest_irq_intercept_out_named(qts, GPIO_PATH, PAD_OUT);
+    now = clocks_restart(qts);
+    wr(qts, CLK_CFG, 3);
+    wr(qts, OP(0, TSTMP_A), 1);
+    wr(qts, OP(0, GEN_A), ACT(UTEZ, HIGH) | ACT(UTEA, LOW));
+    wr(qts, TIMER_CFG0(0), CFG0(0, 1, 0));
+    wr(qts, TIMER_CFG1(0), CFG1(START_RUN, MOD_UP));
+    c = now + 1000 * 1000 * 1000;
+    now = step_to(qts, now, c + 10);
+    g_assert_false(qtest_get_irq(qts, 18));
+
+    pad_matrix(qts, IO_MUX_GPIO18);
+    qtest_writel(qts, GPIO_FUNC_OUT(18), SIG_PWM0_OUT0A);
+    g_assert_true(qtest_get_irq(qts, 18));
+    for (int m = 0; m < 3; m++) {
+        int64_t t = c + 50 * m;
+
+        now = step_to(qts, now, t + 24);
+        g_assert_true(qtest_get_irq(qts, 18));
+        now = step_to(qts, now, t + 25);
+        g_assert_false(qtest_get_irq(qts, 18));
+        now = step_to(qts, now, t + 49);
+        g_assert_false(qtest_get_irq(qts, 18));
+        now = step_to(qts, now, t + 50);
+        g_assert_true(qtest_get_irq(qts, 18));
+    }
+    qtest_quit(qts);
+}
+
+/*
+ * PWM0A on a pad nothing watches: as in esp32-mcpwm/unrouted (a 50 ns
+ * period, high for its first 25 ns) on pad 18, whose line nothing on the
+ * board listens to and from which no block takes an input. Its edges are
+ * not timed: a second of them costs the host next to nothing, and GPIO_IN
+ * reads the exact level at the moment software samples it. Given a
+ * rising-edge interrupt type, the pad is watched: GPIO_STATUS latches the
+ * next rising edge at its nanosecond.
+ */
+/* [spec:nuos:req:emu.esp32.mcpwm/test] */
+/* [spec:nuos:req:emu.esp32.gpio/test] */
+static void test_unwatched_pad(void)
+{
+    QTestState *qts = start();
+    int64_t now, c;
+
+    qtest_writel(qts, TIMG0_WDTCONFIG0, 0);
+    qtest_writel(qts, RTC_WDTWPROTECT, RTC_WDT_WKEY);
+    qtest_writel(qts, RTC_WDTCONFIG0, 0);
+    pad_matrix(qts, IO_MUX_GPIO18);
+    qtest_writel(qts, GPIO_FUNC_OUT(18), SIG_PWM0_OUT0A);
+    now = clocks_restart(qts);
+    wr(qts, CLK_CFG, 3);
+    wr(qts, OP(0, TSTMP_A), 1);
+    wr(qts, OP(0, GEN_A), ACT(UTEZ, HIGH) | ACT(UTEA, LOW));
+    wr(qts, TIMER_CFG0(0), CFG0(0, 1, 0));
+    wr(qts, TIMER_CFG1(0), CFG1(START_RUN, MOD_UP));
+    c = now + 1000 * 1000 * 1000;
+    now = step_to(qts, now, c + 10);
+    g_assert_true(pad_in(qts, 18));
+    now = step_to(qts, now, c + 30);
+    g_assert_false(pad_in(qts, 18));
+    now = step_to(qts, now, c + 74);
+    g_assert_true(pad_in(qts, 18));
+
+    qtest_writel(qts, GPIO_PIN(18), PIN_INT_RISING);
+    qtest_writel(qts, GPIO_STATUS_W1TC, 1u << 18);
+    now = step_to(qts, now, c + 99);
+    g_assert_cmphex(qtest_readl(qts, GPIO_STATUS) & (1u << 18), ==, 0);
+    now = step_to(qts, now, c + 100);
+    g_assert_cmphex(qtest_readl(qts, GPIO_STATUS) & (1u << 18), ==,
+                    1u << 18);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -864,6 +960,8 @@ int main(int argc, char **argv)
     qtest_add_func("esp32-mcpwm/long-run", test_long_run);
     qtest_add_func("esp32-mcpwm/close-edges", test_close_edges);
     qtest_add_func("esp32-mcpwm/rate-change", test_rate_change);
+    qtest_add_func("esp32-mcpwm/unrouted", test_unrouted);
+    qtest_add_func("esp32-mcpwm/unwatched-pad", test_unwatched_pad);
 
     return g_test_run();
 }

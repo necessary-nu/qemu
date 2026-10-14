@@ -414,6 +414,50 @@ static void test_exact_period(void)
     qtest_quit(qts);
 }
 
+/*
+ * Period mode nobody watches: a period of one count, an alarm at every
+ * CNT_CLK edge, 16 a microsecond, with TARGET2_INT_ENA and ETM_EN clear.
+ * No alarm takes a QEMU timer, and a second of them costs the host next
+ * to nothing; REAL_TARGET2 and INT_RAW read as the alarms leave them,
+ * the alarm value one count past the counter. Let out, the interrupt
+ * comes at the next CNT_CLK edge, 75 ns into a pair of counts.
+ */
+/* [spec:nuos:req:emu.esp32p4.timers/test] */
+static void test_period_unwatched(void)
+{
+    QTestState *qts = start();
+    uint64_t v;
+
+    align(qts);
+    load_unit(qts, 1, 5000);
+    wr(qts, CONF, CONF_RESET | CONF_UNIT_EN(1));
+    wr(qts, TARGET_CONF(2), TCONF_UNIT1 | TCONF_PERIOD_MODE | 1);
+    wr(qts, COMP_LOAD(2), 1);
+    wr(qts, CONF, CONF_RESET | CONF_UNIT_EN(1) | CONF_TARGET_EN(2));
+    g_assert_cmphex(rd(qts, REAL_LO(2)), ==, 5001);
+    step(qts, 1000 * 1000 * 1000);
+    v = unit_value(qts, 1);
+    g_assert_cmpuint(v, ==, 5000 + 16000000);
+    g_assert_cmphex(rd(qts, REAL_LO(2)), ==, (uint32_t)(v + 1));
+    g_assert_cmphex(rd(qts, REAL_HI(2)), ==, 0);
+    g_assert_cmphex(rd(qts, INT_RAW), ==, 4);
+    g_assert(!target_irq(qts, 2));
+
+    wr(qts, INT_CLR, 4);
+    g_assert_cmphex(rd(qts, INT_RAW), ==, 0);
+    wr(qts, INT_ENA, 4);
+    step(qts, 74);
+    g_assert(!target_irq(qts, 2));
+    step(qts, 1);
+    g_assert(target_irq(qts, 2));
+    g_assert_cmphex(rd(qts, REAL_LO(2)), ==, (uint32_t)(v + 2));
+    step(qts, 1000 * 1000 * 1000);
+    g_assert(target_irq(qts, 2));
+    g_assert_cmphex(rd(qts, REAL_LO(2)), ==,
+                    (uint32_t)(unit_value(qts, 1) + 1));
+    qtest_quit(qts);
+}
+
 /* Byte and halfword accesses read and write their bytes of a register. */
 /* [spec:nuos:req:emu.esp32p4.timers/test] */
 static void test_byte_access(void)
@@ -442,6 +486,8 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/systimer/stall", test_stall);
     qtest_add_func("/esp32p4/systimer/clocks", test_clocks);
     qtest_add_func("/esp32p4/systimer/exact-period", test_exact_period);
+    qtest_add_func("/esp32p4/systimer/period-unwatched",
+                   test_period_unwatched);
     qtest_add_func("/esp32p4/systimer/byte-access", test_byte_access);
     return g_test_run();
 }

@@ -142,6 +142,10 @@
 
 #define GPIO                0x500e0000
 #define GPIO_IN             (GPIO + 0x03c)
+#define GPIO_STATUS         (GPIO + 0x044)
+#define GPIO_STATUS_W1TC    (GPIO + 0x04c)
+#define GPIO_PIN(n)         (GPIO + 0x074 + 4 * (n))
+#define PIN_INT_RISING      (1u << 7)
 #define GPIO_FUNC_IN(s)     (GPIO + 0x158 + 4 * (s))
 #define GPIO_FUNC_OUT(n)    (GPIO + 0x558 + 4 * (n))
 #define IN_SIG_IN_SEL       (1u << 7)
@@ -968,6 +972,135 @@ static void test_ledc_close_edges(void)
     qtest_quit(qts);
 }
 
+/*
+ * MCPWM0's PWM0A reaching no pad: PWM_clk at 40 MHz, timer 0 counting up
+ * with period 1, TEZ every 50 ns, A high from TEZ and low from TEA at
+ * count 1, 25 ns later: 40 million edges a second, none of them timed, so
+ * that a second costs the host next to nothing. Routed to pad 21 10 ns
+ * into a high phase, the pad is high at once, then follows each edge at
+ * its nanosecond.
+ */
+/* [spec:nuos:req:emu.esp32p4.pwm/test] */
+static void test_mcpwm_unrouted(void)
+{
+    QTestState *qts = start();
+    int64_t c;
+
+    qtest_irq_intercept_out_named(qts, GPIO_PATH, "pad");
+    pwr(qts, 0, CLK_CFG, 0);
+    pwr(qts, 0, OP(0, TSTMP_A), 1);
+    pwr(qts, 0, OP(0, GEN_A), ACT(UTEZ, HIGH) | ACT(UTEA, LOW));
+    pwr(qts, 0, TIMER_CFG0(0), CFG0(0, 1, 0));
+    pwr(qts, 0, TIMER_CFG1(0), CFG1(START_RUN, MOD_UP));
+    c = now + 1000 * 1000 * 1000;
+    step_to(qts, c + 10);
+    g_assert_false(qtest_get_irq(qts, 21));
+
+    pad_out(qts, 21, SIG_PWM0_OUT(0, 0));
+    g_assert_true(qtest_get_irq(qts, 21));
+    for (int m = 0; m < 3; m++) {
+        int64_t t = c + 50 * m;
+
+        step_to(qts, t + 24);
+        g_assert_true(qtest_get_irq(qts, 21));
+        step_to(qts, t + 25);
+        g_assert_false(qtest_get_irq(qts, 21));
+        step_to(qts, t + 49);
+        g_assert_false(qtest_get_irq(qts, 21));
+        step_to(qts, t + 50);
+        g_assert_true(qtest_get_irq(qts, 21));
+    }
+    qtest_quit(qts);
+}
+
+/*
+ * An LEDC output that reaches no pad: channel 0 at a 1-bit resolution
+ * from XTAL_CLK undivided, a 50 ns period, high for its first count
+ * (HPOINT 0, DUTY 1), 40 million edges a second. None of them is timed:
+ * a second costs the host next to nothing. Routed to pad 20 10 ns into a
+ * period, the pad takes the output's level of the moment, high, and from
+ * then on each edge at its nanosecond; unrouted again, edges stop being
+ * timed, and pad 20, released, no longer follows them.
+ */
+/* [spec:nuos:req:emu.esp32p4.pwm/test] */
+static void test_ledc_unrouted(void)
+{
+    QTestState *qts = start();
+    int64_t c;
+
+    qtest_irq_intercept_out_named(qts, GPIO_PATH, "pad");
+    ledc_timer(qts, 0, 1, 1);
+    /* The update at the first overflow */
+    c = now + 50;
+    lwr(qts, CH_HPOINT(0), 0);
+    lwr(qts, CH_DUTY(0), 1 << 4);
+    lwr(qts, CH_CONF0(0), SIG_OUT_EN | PARA_UP);
+    step_to(qts, c + 1000 * 1000 * 1000 + 10);
+    g_assert_false(qtest_get_irq(qts, 20));
+
+    c += 1000 * 1000 * 1000;
+    pad_out(qts, 20, SIG_LEDC(0));
+    g_assert_true(qtest_get_irq(qts, 20));
+    for (int m = 0; m < 3; m++) {
+        int64_t t = c + 50 * m;
+
+        step_to(qts, t + 24);
+        g_assert_true(qtest_get_irq(qts, 20));
+        step_to(qts, t + 25);
+        g_assert_false(qtest_get_irq(qts, 20));
+        step_to(qts, t + 49);
+        g_assert_false(qtest_get_irq(qts, 20));
+        step_to(qts, t + 50);
+        g_assert_true(qtest_get_irq(qts, 20));
+    }
+
+    qtest_writel(qts, GPIO_FUNC_OUT(20), 256);
+    step_to(qts, now + 1000 * 1000 * 1000);
+    qtest_quit(qts);
+}
+
+/*
+ * An LEDC output on a pad nothing watches: channel 0 as in ledc/unrouted
+ * (a 50 ns period, high for its first 25 ns) on pad 30, whose line
+ * nothing on the board listens to and from which no block takes an input
+ * (the board watches GPIO0 to GPIO15 for the PMU's wakeup, and the serial
+ * ports' TXD pads for their terminals). Its edges
+ * are not timed: a second of them costs the host next to nothing, and
+ * GPIO_IN reads the exact level at the moment software samples it. Given
+ * a rising-edge interrupt type, the pad is watched: GPIO_STATUS latches
+ * the next rising edge at its nanosecond.
+ */
+/* [spec:nuos:req:emu.esp32p4.pwm/test] */
+/* [spec:nuos:req:emu.esp32p4.gpio/test] */
+static void test_ledc_unwatched_pad(void)
+{
+    QTestState *qts = start();
+    int64_t c;
+
+    pad_out(qts, 30, SIG_LEDC(0));
+    ledc_timer(qts, 0, 1, 1);
+    c = now + 50;
+    lwr(qts, CH_HPOINT(0), 0);
+    lwr(qts, CH_DUTY(0), 1 << 4);
+    lwr(qts, CH_CONF0(0), SIG_OUT_EN | PARA_UP);
+    c += 1000 * 1000 * 1000;
+    step_to(qts, c + 10);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 30), ==, 1u << 30);
+    step_to(qts, c + 30);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 30), ==, 0);
+    step_to(qts, c + 74);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 30), ==, 1u << 30);
+
+    qtest_writel(qts, GPIO_PIN(30), PIN_INT_RISING);
+    qtest_writel(qts, GPIO_STATUS_W1TC, 1u << 30);
+    step_to(qts, c + 99);
+    g_assert_cmphex(qtest_readl(qts, GPIO_STATUS) & (1u << 30), ==, 0);
+    step_to(qts, c + 100);
+    g_assert_cmphex(qtest_readl(qts, GPIO_STATUS) & (1u << 30), ==,
+                    1u << 30);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -978,6 +1111,9 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4-pwm/ledc/overflow", test_ledc_overflow);
     qtest_add_func("esp32p4-pwm/ledc/etm", test_ledc_etm);
     qtest_add_func("esp32p4-pwm/ledc/close-edges", test_ledc_close_edges);
+    qtest_add_func("esp32p4-pwm/ledc/unrouted", test_ledc_unrouted);
+    qtest_add_func("esp32p4-pwm/ledc/unwatched-pad", test_ledc_unwatched_pad);
+    qtest_add_func("esp32p4-pwm/mcpwm/unrouted", test_mcpwm_unrouted);
     qtest_add_func("esp32p4-pwm/mcpwm/reset", test_mcpwm_reset);
     qtest_add_func("esp32p4-pwm/mcpwm/clock", test_mcpwm_clock);
     qtest_add_func("esp32p4-pwm/mcpwm/deadtime", test_mcpwm_deadtime);

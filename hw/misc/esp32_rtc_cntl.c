@@ -291,7 +291,6 @@ static void esp32_rtc_wdt_update(Esp32RtcCntlState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint64_t count = esp32_rtc_wdt_count(s, now);
-    uint32_t hold;
 
     s->wdt_count_base = count;
     s->wdt_base_ns = now;
@@ -300,10 +299,25 @@ static void esp32_rtc_wdt_update(Esp32RtcCntlState *s)
     if (!s->wdt_running || !s->rtc_slowclk_freq) {
         return;
     }
-    hold = s->regs[A_RTC_CNTL_WDTCONFIG1 / 4 + s->wdt_stage];
     timer_mod(&s->wdt_timer,
-              hold > count ? esp32_rtc_ticks_to_ns(s, now, hold - count) :
-                             now);
+              s->wdt_due > count ?
+              esp32_rtc_ticks_to_ns(s, now, s->wdt_due - count) : now);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rtc]
+ * Where the current stage ends, from a count of @count: a stage ends when
+ * the 32-bit expiry counter, counting on, reaches the stage's hold (TRM
+ * 11.3.1). A hold the counter is at or past, 0 as a stage begins among
+ * them, is reached after the counter wraps, up to 2^32 cycles on; no
+ * stage ends at the instant it begins.
+ */
+static void esp32_rtc_wdt_set_due(Esp32RtcCntlState *s, uint64_t count)
+{
+    uint32_t hold = s->regs[A_RTC_CNTL_WDTCONFIG1 / 4 + s->wdt_stage];
+    uint32_t ahead = hold - (uint32_t)count;
+
+    s->wdt_due = count + (ahead ? ahead : 1ull << 32);
 }
 
 static void esp32_rtc_wdt_restart(Esp32RtcCntlState *s)
@@ -312,6 +326,7 @@ static void esp32_rtc_wdt_restart(Esp32RtcCntlState *s)
     s->wdt_count_base = 0;
     s->wdt_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->wdt_running = false;
+    esp32_rtc_wdt_set_due(s, 0);
     esp32_rtc_wdt_update(s);
 }
 
@@ -341,10 +356,9 @@ static void esp32_rtc_wdt_cb(void *opaque)
     Esp32RtcCntlState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t cfg = REG(s, RTC_CNTL_WDTCONFIG0);
-    uint32_t hold = s->regs[A_RTC_CNTL_WDTCONFIG1 / 4 + s->wdt_stage];
     unsigned action;
 
-    if (esp32_rtc_wdt_count(s, now) < hold) {
+    if (esp32_rtc_wdt_count(s, now) < s->wdt_due) {
         esp32_rtc_wdt_update(s);
         return;
     }
@@ -353,13 +367,15 @@ static void esp32_rtc_wdt_cb(void *opaque)
      * The next stage counts from when this one ended, not from when the
      * callback, which the host can run late without icount, got to it.
      */
-    if (s->wdt_running && s->rtc_slowclk_freq && hold > s->wdt_count_base) {
+    if (s->wdt_running && s->rtc_slowclk_freq &&
+        s->wdt_due > s->wdt_count_base) {
         now = MIN(now, esp32_rtc_ticks_to_ns(s, s->wdt_base_ns,
-                                             hold - s->wdt_count_base));
+                                             s->wdt_due - s->wdt_count_base));
     }
     s->wdt_stage = (s->wdt_stage + 1) % ESP32_RTC_WDT_STAGES;
     s->wdt_count_base = 0;
     s->wdt_base_ns = now;
+    esp32_rtc_wdt_set_due(s, 0);
     esp32_rtc_wdt_update(s);
 
     switch (action) {
@@ -1141,6 +1157,10 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
         }
         *r = v;
         esp32_rtc_wdt_update(s);
+        if ((addr - A_RTC_CNTL_WDTCONFIG1) / 4 == s->wdt_stage) {
+            esp32_rtc_wdt_set_due(s, s->wdt_count_base);
+            esp32_rtc_wdt_update(s);
+        }
         break;
 
     case A_RTC_CNTL_WDTFEED:
@@ -1297,6 +1317,7 @@ static void esp32_rtc_cntl_reset_hold(Object *obj, ResetType type)
     s->wdt_count_base = 0;
     s->wdt_base_ns = now;
     s->wdt_running = false;
+    esp32_rtc_wdt_set_due(s, 0);
 }
 
 static void esp32_rtc_cntl_reset_exit(Object *obj, ResetType type)
@@ -1408,8 +1429,8 @@ static int esp32_rtc_cntl_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_esp32_rtc_cntl = {
     .name = TYPE_ESP32_RTC_CNTL,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .post_load = esp32_rtc_cntl_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Esp32RtcCntlState,
@@ -1428,6 +1449,7 @@ static const VMStateDescription vmstate_esp32_rtc_cntl = {
         VMSTATE_UINT32(wdt_stage, Esp32RtcCntlState),
         VMSTATE_UINT64(wdt_count_base, Esp32RtcCntlState),
         VMSTATE_INT64(wdt_base_ns, Esp32RtcCntlState),
+        VMSTATE_UINT64(wdt_due, Esp32RtcCntlState),
         VMSTATE_BOOL(wdt_running, Esp32RtcCntlState),
         VMSTATE_UINT32(sleep, Esp32RtcCntlState),
         VMSTATE_BOOL(sleep_reset_pending, Esp32RtcCntlState),
