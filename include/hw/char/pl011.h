@@ -131,6 +131,8 @@ struct PL011State {
     uint8_t ncts_level;
     uint8_t txd;
     uint8_t nrts;
+    /* UARTTXD as a source other receivers sync (line_sync()) */
+    Notifier line_source;
     const unsigned char *id;
     /*
      * Since some users embed this struct directly, we must

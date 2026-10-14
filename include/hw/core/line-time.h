@@ -11,6 +11,7 @@
 
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
+#include "qemu/notify.h"
 
 /*
  * Levels move between devices as qemu_irq level changes, which carry no
@@ -36,6 +37,27 @@
 int64_t line_time(void);
 void line_set_at(qemu_irq line, int level, int64_t when_ns);
 void line_run_at(int64_t when_ns, void (*fn)(void *opaque), void *opaque);
+
+/*
+ * Sources a receiver brings up to its time.
+ *
+ * A transmitter times its bits on QEMU timers of its own, which without
+ * icount run late, so a receiver in another device would see a line as
+ * the host had got to it. A source registers with line_add_source(); its
+ * notifier puts out every change of its outputs due by line_time(), each
+ * at its own time (line_set_at()), and nothing else: not what it takes
+ * in, as a receiver it is brought up to time by its own accesses. A
+ * receiver's register access calls line_sync() before it takes its own
+ * events due, so that what it shows is what its lines brought by then.
+ * line_sync() fixes the moment, line_time() as it is called, for every
+ * source and returns it: the receiver takes its own events up to that
+ * same moment, not to one read afresh afterwards, which without icount
+ * lies later and would see samples taken ahead of bits a source has yet
+ * to put out.
+ */
+void line_add_source(Notifier *n);
+void line_remove_source(Notifier *n);
+int64_t line_sync(void);
 
 /*
  * Changes that reach a device while it resolves another.

@@ -19,6 +19,8 @@
  * receiver can answer a stamped change with a change of its own.
  */
 static int64_t line_stamp = INT64_MIN;
+static NotifierList line_sources = NOTIFIER_LIST_INITIALIZER(line_sources);
+static bool line_syncing;
 
 int64_t line_time(void)
 {
@@ -44,6 +46,40 @@ void line_run_at(int64_t when_ns, void (*fn)(void *opaque), void *opaque)
     line_stamp = when_ns;
     fn(opaque);
     line_stamp = outer;
+}
+
+void line_add_source(Notifier *n)
+{
+    notifier_list_add(&line_sources, n);
+}
+
+void line_remove_source(Notifier *n)
+{
+    notifier_remove(n);
+}
+
+static void line_notify_sources(void *opaque)
+{
+    notifier_list_notify(&line_sources, NULL);
+}
+
+/*
+ * Bring every source's outputs up to line_time(), the moment it returns,
+ * which each source sees as its line_time(). A change a source puts out
+ * can reach a receiver that syncs again: that inner sync sees the
+ * sources as they are.
+ */
+int64_t line_sync(void)
+{
+    int64_t now = line_time();
+
+    if (line_syncing) {
+        return now;
+    }
+    line_syncing = true;
+    line_run_at(now, line_notify_sources, NULL);
+    line_syncing = false;
+    return now;
 }
 
 /* A change held back, to be replayed at its time: fn(opaque, n, level). */
