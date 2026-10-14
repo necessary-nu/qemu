@@ -40,8 +40,18 @@
  *     into MEM_CLK, then SYS_CLK, then APB_CLK, each by an integer and a
  *     fraction, (DIV_NUM + 1) + NUMERATOR / DENOMINATOR, none with a
  *     denominator of 0. Writing SOC_CLK_DIV_UPDATE takes all four dividers
- *     from ROOT_CLK_CTRL0..3 at once; until then the ones in effect stay,
- *     and CPU_CLK_STATUS0 shows CPU_CLK's. The source mux changes at once.
+ *     from ROOT_CLK_CTRL0..3 at once, the update ending before the bit
+ *     reads 0 again (ESP-IDF's clk_ll_bus_update() waits for that); until
+ *     then the ones in effect stay. CPU_CLK_STATUS0 shows CPU_CLK's: the
+ *     divider in effect (*_CUR), whether ROOT_CLK is from the CPU PLL
+ *     (CPU_SRC_IS_CPLL), ASIC_OR_FPGA 0 (an ASIC), and DIV_EFFECT set:
+ *     the chip reads it set from reset, with CPU_CLK undivided, where
+ *     ESP-IDF's header gives 0 and "0: Divider bypass, 1: Divider takes
+ *     effect". It is taken to say that the divider is in CPU_CLK's path,
+ *     its divisors those in effect, whatever they are; nothing software
+ *     sets bypasses the divider, and an update has taken effect by the
+ *     time software sees SOC_CLK_DIV_UPDATE clear, so it never reads 0.
+ *     The source mux changes at once.
  *     The TRM limits CPU_CLK to 400 MHz on v3.x, MEM_CLK and SYS_CLK to
  *     200 MHz and APB_CLK to 100 MHz; a configuration above them is logged
  *     as a guest error and runs as configured, as what the hardware then
@@ -500,6 +510,8 @@ static const ESP32P4ClkRstReg esp32p4_clkrst_regs[ESP32P4_CLKRST_NREGS] = {
 #define LP_UART_WAKEUP_EN           BIT(29)
 #define ROOT_CLK_SRC_CPLL           1
 #define CAUSE_PMU_LP_CPU            0x0a
+#define CPU_DIV_EFFECT              BIT(1)
+#define CPU_SRC_IS_CPLL             BIT(2)
 
 /* The cause and flag fields of each core in LP_CLKRST_RESET_CAUSE. */
 static const struct {
@@ -2167,6 +2179,7 @@ void esp32p4_clkrst_sync(ESP32P4ClkRstState *s, int64_t now)
 }
 
 /* The value a read of register @idx returns. */
+/* [spec:nuos:req:emu.esp32p4.clocks] */
 static uint32_t esp32p4_clkrst_value(ESP32P4ClkRstState *s, unsigned idx)
 {
     uint32_t v = s->regs[idx];
@@ -2190,9 +2203,10 @@ static uint32_t esp32p4_clkrst_value(ESP32P4ClkRstState *s, unsigned idx)
             NANOSECONDS_PER_SECOND);
         return (hz * 4 + 500000) / 1000000;
     case R_CPU_CLK_STATUS0:
-        v = (s->soc_div[0][0] || (s->soc_div[0][2] && s->soc_div[0][1])) << 1;
-        v |= (extract32(s->regs[R_LP_HP_CLK_CTRL], 0, 2) ==
-              ROOT_CLK_SRC_CPLL) << 2;
+        v = CPU_DIV_EFFECT;
+        if (extract32(s->regs[R_LP_HP_CLK_CTRL], 0, 2) == ROOT_CLK_SRC_CPLL) {
+            v |= CPU_SRC_IS_CPLL;
+        }
         v |= s->soc_div[0][0] << 3;
         v |= s->soc_div[0][1] << 11;
         v |= s->soc_div[0][2] << 19;
