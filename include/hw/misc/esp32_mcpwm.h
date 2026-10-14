@@ -233,6 +233,8 @@ struct Esp32McpwmState {
     bool schedule_stale;
     /* The latest moment the block has acted at */
     int64_t seen_ns;
+    /* Edges have been lost to a host too slow for them (logged once) */
+    bool lag_logged;
     DeviceState *gpio;
     uint32_t sig_base;
     Notifier route_notifier;

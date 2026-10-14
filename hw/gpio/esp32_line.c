@@ -88,9 +88,21 @@ void esp32_line_sync(void)
  */
 bool esp32_line_lags(int64_t due_ns)
 {
-    return !icount_enabled() &&
-           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - due_ns >
-           ESP32_LINE_MAX_LAG_NS;
+    return due_ns < esp32_line_lag_horizon();
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * The earliest time an event of a stream may be due at without lagging:
+ * ESP32_LINE_MAX_LAG_NS before the present, INT64_MIN under icount.
+ */
+int64_t esp32_line_lag_horizon(void)
+{
+    if (icount_enabled()) {
+        return INT64_MIN;
+    }
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - ESP32_LINE_MAX_LAG_NS;
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] */

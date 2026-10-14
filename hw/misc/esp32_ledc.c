@@ -26,6 +26,15 @@
  * one change per interval. Whenever software samples the pads the outputs
  * are brought to their exact level at that moment, so sampling a pad
  * measures the duty cycle faithfully at any frequency.
+ *
+ * Without icount the host can run the timers late, by tens of
+ * milliseconds under load: every change that fell due is then replayed
+ * at its own time, so that a block timing the edges (PCNT's filter, an
+ * RMT receiver) sees the pulses the channel made. Only changes more than
+ * ESP32_LINE_MAX_LAG_NS (1 s) behind the present as the channel comes to
+ * them (include/hw/gpio/esp32_line.h), a host slower than the edges it is
+ * to drive, are lost: the output skips to its level at
+ * esp32_line_lag_horizon() and goes on change by change from there.
  */
 
 #include "qemu/osdep.h"
@@ -92,15 +101,6 @@ REG32(LEDC_DATE, 0x1fc)
 
 /* Output changes closer together than this are coalesced */
 #define LEDC_EDGE_MIN_NS        10000
-/*
- * An output this far behind the present skips to the level shortly before
- * it rather than replaying every coalesced change: a bound of 100000
- * changes on the work of one catch-up. Without icount the host can run
- * the timers late, by milliseconds under load; every change short of the
- * bound is replayed at its own time, so that a block timing the edges
- * (PCNT's filter, an RMT receiver) sees the pulses the channel made.
- */
-#define LEDC_CATCHUP_NS         (100000 * LEDC_EDGE_MIN_NS)
 /*
  * Cycles looked ahead for a channel's next edge: two show a steady output's
  * pattern, seventeen a dithered one's (DUTY[3:0] repeats every sixteen),
@@ -502,13 +502,15 @@ static void chan_rebase(Esp32LEDCState *s, unsigned n, uint64_t k_old,
  * its fade's end and its output changes, coalesced as the header comment
  * describes. While SIG_OUT_EN is clear the output holds IDLE_LV, and the
  * generator's edges change nothing outside: its level is taken only where
- * a load, or the caller, needs it.
+ * a load, or the caller, needs it. An edge that lags (esp32_line_lags())
+ * skips the output to its level at esp32_line_lag_horizon().
  */
 static void chan_eval(Esp32LEDCState *s, unsigned n, int64_t limit,
                       bool inclusive)
 {
     Esp32LedcChannel *ch = &s->ch[n];
     bool out = chan_sig_out(ch);
+    int64_t last = inclusive ? limit : limit - 1;
 
     for (;;) {
         int64_t e_load = chan_load_time(s, n);
@@ -518,16 +520,23 @@ static void chan_eval(Esp32LEDCState *s, unsigned n, int64_t limit,
         int64_t next;
 
         if (!out) {
-            int64_t x = MIN(inclusive ? limit : limit - 1, e_struct - 1);
+            int64_t x = MIN(last, e_struct - 1);
 
             if (x > ch->eval_ns) {
                 ch->eval_ns = x;
                 ch->gen_level = chan_level_at(s, n, x);
             }
-        } else if (e != INT64_MAX && e < e_struct &&
-                   e < limit - LEDC_CATCHUP_NS) {
-            int64_t x = MIN(limit - LEDC_CATCHUP_NS, e_struct - 1);
+        } else if (e != INT64_MAX && e < e_struct && e <= last &&
+                   esp32_line_lags(e)) {
+            int64_t x = MIN(MIN(esp32_line_lag_horizon(), last),
+                            e_struct - 1);
 
+            if (!s->lag_logged) {
+                s->lag_logged = true;
+                qemu_log_mask(LOG_UNIMP, "esp32_ledc: the host is too slow "
+                              "for channel %u's edges: those a second "
+                              "behind are lost\n", n);
+            }
             ch->eval_ns = x;
             ch->gen_level = chan_level_at(s, n, x);
             chan_drive(s, n, x);

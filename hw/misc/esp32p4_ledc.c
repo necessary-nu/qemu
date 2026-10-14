@@ -104,12 +104,14 @@
  * the overflows, matches and counts that an enabled interrupt or ETM
  * event waits for; the rest are accounted when software looks. An ETM
  * event is pulsed stamped with its time, in time order with the edges,
- * and a task acts at the time its pulse is stamped with. An output more
- * than 10 ms behind the present (the host running that far behind virtual
- * time, slower than the edges it is to drive) skips to its level shortly
- * before the present, stamped with the moment that level began: the edges
- * in between are lost, but no edge carries a time other than its own. An
- * output that reaches no pad something watches (an input a modelled block
+ * and a task acts at the time its pulse is stamped with. On the host's
+ * clock an output the host held up catches up edge by edge, each at its
+ * own time; only its edges more than ESP32_LINE_MAX_LAG_NS (1 s) behind
+ * the present as it comes to them (the host slower than the edges it is
+ * to drive, include/hw/gpio/esp32_line.h) are lost, the output taking up
+ * its level at esp32_line_lag_horizon(), stamped with the moment that
+ * level began, so that no edge carries a time other than its own; under
+ * icount none is. An output that reaches no pad something watches (an input a modelled block
  * takes from it, an interrupt type, an ETM channel, a line the board
  * listens to: esp32p4_gpio_sig_out_watched()) is not timed edge by edge:
  * nothing sees its edges, and it takes its level of the moment whenever
@@ -245,12 +247,6 @@ static const struct {
 #define OP_RESUME           (1u << 1)
 #define OP_RESTART          (1u << 2)
 
-/*
- * An output this far behind the present (the host running far behind
- * virtual time) skips to the level shortly before it rather than
- * replaying every change.
- */
-#define CATCHUP_NS          (10 * 1000 * 1000)
 /* How far back a skip first looks for the edge its level began at */
 #define SKIP_WINDOW_NS      (100 * 1000)
 /*
@@ -774,23 +770,26 @@ static int64_t chan_last_edge(ESP32P4LedcState *s, int n, int64_t from,
 }
 
 /*
+ * [spec:nuos:req:emu.esp32p4.pwm]
  * Run a channel's output up to limit (and including it with inclusive),
- * each edge at its own time. An edge more than CATCHUP_NS behind limit
- * skips the output to its level at CATCHUP_NS before limit, stamped with
- * the edge that began that level.
+ * each edge at its own time. On the host's clock an edge more than
+ * ESP32_LINE_MAX_LAG_NS behind the present as the output comes to it
+ * (esp32_line_lags()) is lost with every other that lags: the output
+ * skips to its level at esp32_line_lag_horizon(), stamped with the edge
+ * that began that level, and goes on edge by edge from there.
  */
 static void chan_eval(ESP32P4LedcState *s, int n, int64_t limit,
                       bool inclusive)
 {
     ESP32P4LedcChannel *ch = &s->ch[n];
-    int64_t catchup = CATCHUP_NS;
+    int64_t last = inclusive ? limit : limit - 1;
 
     /*
      * An output showing IDLE_LV follows no edges; the generator's level is
      * worked out afresh as SIG_OUT_EN comes back into effect.
      */
     if (!ch->sig_out_en) {
-        ch->eval_ns = MAX(ch->eval_ns, inclusive ? limit : limit - 1);
+        ch->eval_ns = MAX(ch->eval_ns, last);
         return;
     }
     /*
@@ -798,25 +797,32 @@ static void chan_eval(ESP32P4LedcState *s, int n, int64_t limit,
      * sees: it takes its level of the moment, as a sample does.
      */
     if (!s->out_seen[n]) {
-        chan_sample(s, n, inclusive ? limit : limit - 1);
+        chan_sample(s, n, last);
         return;
     }
     for (;;) {
         int64_t e = chan_next_edge(s, n, ch->eval_ns);
 
-        if (e != INT64_MAX && e < limit - catchup) {
-            int64_t x = limit - catchup;
+        if (e == INT64_MAX || e > last) {
+            break;
+        }
+        if (esp32_line_lags(e)) {
+            /* e <= x: e lags, and it is no later than last */
+            int64_t x = MIN(esp32_line_lag_horizon(), last);
             bool level = chan_level_at(s, n, x);
             int64_t began = level == ch->out_level ? x :
                             chan_last_edge(s, n, ch->eval_ns, x);
 
+            if (!s->lag_logged) {
+                s->lag_logged = true;
+                qemu_log_mask(LOG_UNIMP, "esp32p4_ledc: the host is too "
+                              "slow for channel %d's edges: those a second "
+                              "behind are lost\n", n);
+            }
             ch->eval_ns = x;
             ch->gen_level = level;
             chan_drive(s, n, began == INT64_MIN ? x : began);
             continue;
-        }
-        if (e == INT64_MAX || e > limit || (e == limit && !inclusive)) {
-            break;
         }
         ch->eval_ns = e;
         ch->gen_level = chan_level_at(s, n, e);
