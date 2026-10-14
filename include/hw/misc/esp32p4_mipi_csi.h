@@ -50,7 +50,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4CsiBridgeState, ESP32P4_CSI_BRIDGE)
  *                frame's packets had a checksum error.
  *
  * Short packets other than FS and FE (line start/end, generic) do not
- * reach the interface.
+ * reach the interface. A stage that holds what it passes on to times of
+ * its own (the ISP, its rows on a QEMU timer) has a sync hook as well,
+ * which passes on what is due by esp32_line_time(): a later stage's
+ * register access calls it, after esp32p4_csi_host_sync(), before taking
+ * its own events, so that it shows the stream as it is at the access
+ * however late those timers run.
  *
  * The ISP's hook
  * --------------
@@ -90,6 +95,7 @@ typedef struct ESP32P4CsiIdiOps {
     void (*line)(void *opaque, const ESP32P4CsiIdiLine *line);
     void (*frame_end)(void *opaque, uint8_t vc, uint16_t number,
                       bool crc_error, int64_t when_ns);
+    void (*sync)(void *opaque);
 } ESP32P4CsiIdiOps;
 
 /* The CSI_CM's input, which the machine gives the host as its sink. */
@@ -99,6 +105,18 @@ extern const ESP32P4CsiIdiOps esp32p4_csi_bridge_tail_ops;
 
 void esp32p4_csi_host_set_sink(ESP32P4CsiHostState *s,
                                const ESP32P4CsiIdiOps *ops, void *opaque);
+
+/*
+ * Bring the host up to esp32_line_time(): its PHY's start-up, and the
+ * camera's packets due by then, through to the host's sink.
+ */
+void esp32p4_csi_host_sync(ESP32P4CsiHostState *s);
+
+/*
+ * The CSI host that feeds the bridge (its "host" link), brought up to
+ * esp32_line_time(), for the ISP's register accesses.
+ */
+void esp32p4_csi_bridge_sync_host(ESP32P4CsiBridgeState *s);
 void esp32p4_csi_bridge_attach_isp(ESP32P4CsiBridgeState *s,
                                    const ESP32P4CsiIdiOps *ops,
                                    void *opaque);
@@ -174,6 +192,7 @@ struct ESP32P4CsiBridgeState {
     qemu_irq enableclk;
     Clock *clk_bus;
     QEMUTimer *req_timer;
+    ESP32P4CsiHostState *host;
     const ESP32P4CsiIdiOps *isp_ops;
     void *isp;
     ESP32P4CsiDmaWriteFn *isp_dma_write;
