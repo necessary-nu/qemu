@@ -175,6 +175,7 @@
 #define CB_INT_CLR          (CB + 0x20)
 #define CB_INT_ST           (CB + 0x24)
 #define CB_INT_ENA          (CB + 0x28)
+#define CB_DMA_REQ_INTERVAL (CB + 0x2c)
 #define CB_DMABLK_SIZE      (CB + 0x30)
 #define CB_HOST_CTRL        (CB + 0x40)
 #define CB_HOST_CM_CTRL     (CB + 0x48)
@@ -1270,6 +1271,83 @@ static void test_csi_capture(void)
     qtest_quit(qts);
 }
 
+/*
+ * VDMA channel 2 taking a frame's last words from the CSI bridge, the
+ * flow controller, one single request at a time, the bridge asking again
+ * at once as each is acknowledged (DMA_REQ_INTERVAL 0). The acknowledge
+ * comes inside VDMA's round, and the bridge's answer wakes the engine
+ * there, while its arbiters are busy with the round's transactions: the
+ * rounds keep their own timing, each the cycles of its transactions after
+ * the one before, on the bus clock, SYS_CLK (20 MHz from reset: XTAL,
+ * MEM_CLK divided by 2). The first round reads a word, a cycle; the next
+ * reads one and writes the two the FIFO then holds, two cycles; and so
+ * on, a word leaving the bridge's buffer 1, 2, 1, 2, ... cycles after the
+ * one before. The block is done as the last word moves.
+ */
+/* [spec:nuos:req:emu.esp32p4.dma/test] */
+static void test_csi_vdma_singles(void)
+{
+    QTestState *qts = machine(NULL);
+    uint8_t line[64];
+    int64_t drops[8];
+    uint32_t words, n = 0;
+
+    for (int i = 0; i < sizeof(line); i++) {
+        line[i] = i * 5 + 1;
+    }
+    csi_up(qts, 0x00, 2);
+    qtest_writel(qts, CB_DATA_TYPE_CFG, 0x2f12);
+    qtest_writel(qts, CB_DMA_REQ_CFG, 0x20000 | 512);
+    qtest_writel(qts, CB_DMA_REQ_INTERVAL, 0);
+    qtest_writel(qts, CB_FRAME_CFG, 1u << 24 | 64u << 12 | 1);
+
+    qtest_writel(qts, V_CFG0, 3);
+    qtest_writel(qts, V_CH(2) + V_CH_CFG0, 0);
+    qtest_writel(qts, V_CH(2) + V_CH_CFG1, 4 | 1u << 4 | 1u << 7 | 1u << 17);
+    qtest_writel(qts, V_CH(2) + V_INTST_ENA0, 0xffffffff);
+    qtest_writel(qts, V_CH(2) + V_INTCLEAR0, 0xffffffff);
+    qtest_writel(qts, V_CH(2) + V_SAR0, CSI_MEM);
+    qtest_writel(qts, V_CH(2) + V_DAR0, MEM);
+    qtest_writel(qts, V_CH(2) + V_BLOCK_TS0, sizeof(line) / 8 - 1);
+    qtest_writel(qts, V_CH(2) + V_CTL0, 1u << 2 | 1u << 4 | 3u << 8 |
+                 3u << 11 | 8u << 14 | 8u << 18);
+    qtest_writel(qts, V_CH(2) + V_CTL1, 0);
+    qtest_writel(qts, V_CHEN0, 2 | 2u << 8);
+    qtest_writel(qts, CB_CSI_EN, 1);
+
+    /* A frame of one line: its 8 words wait for the frame's end. */
+    csi_send(qts, 0, 0x00, 1, NULL, 0, 0, 0);
+    csi_send(qts, 0, 0x2a, sizeof(line), line, 0, 0, 0);
+    g_assert_cmpuint(qtest_readl(qts, CB_BUF_FLOW_CTL) >> 16, ==, 8);
+    csi_send(qts, 0, 0x01, 1, NULL, 0, 0, 0);
+
+    /* The words leave the buffer as the rounds read them. */
+    words = 8;
+    for (int i = 0; i < 1000 && n < 8; i++) {
+        uint32_t w = qtest_readl(qts, CB_BUF_FLOW_CTL) >> 16;
+
+        g_assert_cmpuint(w, >=, words - 1);
+        if (w < words) {
+            drops[n++] = vnow();
+            words = w;
+        }
+        step(qts, 1);
+    }
+    g_assert_cmpuint(n, ==, 8);
+    for (int k = 1; k < 8; k++) {
+        g_assert_cmpint(drops[k] - drops[k - 1], ==, k & 1 ? 50 : 100);
+    }
+    step(qts, 200);
+    g_assert_true(qtest_readl(qts, V_CH(2) + V_INTSTATUS) & DMA_TFR_DONE);
+    {
+        uint8_t got[sizeof(line)];
+
+        qtest_memread(qts, MEM, got, sizeof(got));
+        g_assert_cmpmem(got, sizeof(got), line, sizeof(line));
+    }
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1285,5 +1363,6 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/mipi/csi/packets", test_csi_packets);
     qtest_add_func("esp32p4/mipi/csi/bridge", test_csi_bridge);
     qtest_add_func("esp32p4/mipi/csi/capture", test_csi_capture);
+    qtest_add_func("esp32p4/mipi/csi/vdma-singles", test_csi_vdma_singles);
     return g_test_run();
 }

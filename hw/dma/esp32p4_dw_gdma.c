@@ -943,12 +943,19 @@ static void dw_arm(ESP32P4DwGdmaState *s, uint64_t cycle)
  * One round of the bus, on an edge of its clock, at the time it falls
  * due, esp32_line_time(): the read and the write arbiters each grant a
  * transaction, and the engine comes back when they are over, as many
- * cycles later.
+ * cycles later. A peripheral can answer the round's transactions within
+ * it, its handshake changing as an acknowledge or an access reaches it
+ * (the CSI and DSI bridges ask again at once): that wakes the engine
+ * (dw_kick()), for the next edge, while the arbiters are still busy with
+ * the round's transactions. They see the new request when those are
+ * over, the round's own cycle and cost deciding when, as if it had come
+ * a cycle later; a round that granted nothing leaves the wake-up set.
  */
 /* [spec:nuos:req:emu.esp32p4.dma] */
 static void dw_run(void *opaque)
 {
     ESP32P4DwGdmaState *s = opaque;
+    uint64_t cycle = s->due_cycle;
     uint32_t cost = 0;
     bool lli;
     int r, w;
@@ -975,7 +982,7 @@ static void dw_run(void *opaque)
         cost += ch_progress(s, n);
     }
     if (cost || r >= 0 || w >= 0) {
-        dw_arm(s, s->due_cycle + MAX(cost, 1));
+        dw_arm(s, cycle + MAX(cost, 1));
     }
 }
 
