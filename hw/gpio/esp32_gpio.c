@@ -1171,6 +1171,53 @@ void esp32_gpio_add_route_notifier(Esp32GpioState *s, Notifier *n)
 
 /*
  * [spec:nuos:req:emu.esp32.gpio]
+ * Whether anything but software sampling the pads sees pad n's level
+ * change: a line of it that something listens to (its level, RTCIO's
+ * input), its interrupt type or wakeup (GPIO_STATUS latches an edge
+ * whatever the enables say), an input signal a modelled block takes from
+ * it (esp32_gpio_sig_in_pad(), which needs its input enabled), or a direct
+ * IO_MUX input that one does.
+ */
+static bool esp32_gpio_pad_watched(Esp32GpioState *s, unsigned n)
+{
+    const IomuxFunc *fn;
+    unsigned f;
+
+    if (s->pad_out[n] || s->rtc_in_out[n] ||
+        FIELD_EX32(s->pin[n], GPIO_PIN0, INT_TYPE) != INT_TYPE_DISABLED ||
+        FIELD_EX32(s->pin[n], GPIO_PIN0, WAKEUP_ENABLE)) {
+        return true;
+    }
+    fn = pad_func(s, n, &f);
+    if (fn->kind == IOMUX_DIRECT &&
+        s->iomux_in_out[n * ESP32_IOMUX_FUNC_COUNT + f]) {
+        return true;
+    }
+    for (unsigned sig = 0; sig < ESP32_GPIO_SIG_COUNT; sig++) {
+        if (s->sig_in_out[sig] && esp32_gpio_sig_in_pad(s, sig) == (int)n) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * Whether output signal sig reaches a pad whose level anything but
+ * software sampling the pads sees (TYPE_ESP32_SIG_ROUTES).
+ */
+bool esp32_gpio_sig_out_watched(Esp32GpioState *s, unsigned sig)
+{
+    for (uint64_t m = esp32_gpio_sig_out_pads(s, sig); m; m &= m - 1) {
+        if (esp32_gpio_pad_watched(s, ctz64(m))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
  * Pad n's drive with the output enable of IO_MUX function func's line
  * forced to each level: whether the pad then carries that output, and
  * whether, and at what level, it is driven with the enable clear. A low
@@ -2274,10 +2321,24 @@ static const VMStateDescription vmstate_esp32_gpio = {
     }
 };
 
+static bool esp32_gpio_routes_out_watched(Object *obj, unsigned sig)
+{
+    return esp32_gpio_sig_out_watched(ESP32_GPIO(obj), sig);
+}
+
+static void esp32_gpio_routes_add_notifier(Object *obj, Notifier *n)
+{
+    esp32_gpio_add_route_notifier(ESP32_GPIO(obj), n);
+}
+
 static void esp32_gpio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
+    Esp32SigRoutesClass *src = ESP32_SIG_ROUTES_CLASS(klass);
+
+    src->sig_out_watched = esp32_gpio_routes_out_watched;
+    src->add_route_notifier = esp32_gpio_routes_add_notifier;
 
     rc->phases.hold = esp32_gpio_reset_hold;
     rc->phases.exit = esp32_gpio_reset_exit;
@@ -2305,6 +2366,10 @@ static const TypeInfo esp32_gpio_info = {
     .instance_finalize = esp32_gpio_finalize,
     .class_init = esp32_gpio_class_init,
     .class_size = sizeof(Esp32GpioClass),
+    .interfaces = (const InterfaceInfo[]) {
+        { TYPE_ESP32_SIG_ROUTES },
+        { }
+    },
 };
 
 static void esp32_gpio_register_types(void)

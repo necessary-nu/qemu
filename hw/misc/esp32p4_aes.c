@@ -68,6 +68,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_aes.h"
 #include "migration/vmstate.h"
 
@@ -477,9 +478,22 @@ static void aes_gdma_ready(void *opaque)
     aes_pump(opaque);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.crypto]
+ * GDMA's register access: the blocks whose cycles have run by then are
+ * done, their output in GDMA's channel and its EOF.
+ */
+static void aes_gdma_sync(void *opaque, int64_t when)
+{
+    ESP32P4AesState *s = opaque;
+
+    esp32p4_crypto_timer_sync(&s->op, when);
+}
+
 static const ESP32P4GdmaPeriphOps aes_gdma_ops = {
     .tx_ready = aes_gdma_ready,
     .rx_ready = aes_gdma_ready,
+    .sync = aes_gdma_sync,
 };
 
 /* [spec:nuos:req:emu.esp32p4.crypto] */
@@ -544,6 +558,7 @@ static uint64_t aes_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr reg = addr & ~3;
     uint32_t v = 0;
 
+    esp32p4_crypto_timer_sync(&s->op, esp32_line_time());
     if (s->occupied) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read at 0x%" HWADDR_PRIx
                       " while the RSA_DS peripheral occupies the "
@@ -639,6 +654,7 @@ static void aes_write(void *opaque, hwaddr addr, uint64_t value,
     int shift = (addr & 3) * 8;
     uint32_t v;
 
+    esp32p4_crypto_timer_sync(&s->op, esp32_line_time());
     if (s->occupied || aes_in_reset(s) || !clock_is_enabled(s->clk)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write at 0x%" HWADDR_PRIx
                       " dropped: the accelerator is %s\n", TYPE_ESP32P4_AES,

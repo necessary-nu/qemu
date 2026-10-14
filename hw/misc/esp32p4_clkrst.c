@@ -173,6 +173,7 @@
 #include "hw/core/qdev.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_clkrst.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
@@ -1985,9 +1986,10 @@ static void esp32p4_clkrst_arm_pulse(ESP32P4ClkRstState *s, int n)
         return;
     }
     s->core_pulse_waiting[n] = false;
-    esp32p4_clk_count_rebase(&count, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-    timer_mod(s->core_timer[n],
-              esp32p4_clk_count_time(&count, s->core_pulse_cycles[n]));
+    esp32p4_clk_count_rebase(&count, esp32_line_time());
+    s->core_pulse_due[n] = esp32p4_clk_count_time(&count,
+                                                  s->core_pulse_cycles[n]);
+    timer_mod(s->core_timer[n], s->core_pulse_due[n]);
 }
 
 /*
@@ -2013,7 +2015,7 @@ static void esp32p4_clkrst_core_pulse(ESP32P4ClkRstState *s, int n,
     esp32p4_clkrst_arm_pulse(s, n);
 }
 
-static void esp32p4_clkrst_core_timer(void *opaque)
+static void esp32p4_clkrst_core_phase_end(void *opaque)
 {
     ESP32P4ClkRstCoreTimer *t = opaque;
     ESP32P4ClkRstState *s = t->s;
@@ -2027,6 +2029,15 @@ static void esp32p4_clkrst_core_timer(void *opaque)
         s->core_pulse[n] = ESP32P4_CORE_PULSE_IDLE;
     }
     esp32p4_clkrst_update(s, false);
+}
+
+/* A reset phase ends at its time however late its timer runs. */
+static void esp32p4_clkrst_core_timer(void *opaque)
+{
+    ESP32P4ClkRstCoreTimer *t = opaque;
+
+    esp32_line_run_at(t->s->core_pulse_due[t->n],
+                      esp32p4_clkrst_core_phase_end, t);
 }
 
 /* LP_CLKRST's CPU reset of core @n, by software or the RTC watchdog. */
@@ -2093,8 +2104,16 @@ void esp32p4_clkrst_hp_core_reset(ESP32P4ClkRstState *s, unsigned source,
                                 ESP32P4_CLKRST_CORE_HP1, cause);
     esp32p4_clkrst_reset_hp_regs(s);
     s->hp_core_reset = true;
-    timer_mod(s->hp_core_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              MAX(length_ns, 1));
+    s->hp_core_due = esp32_line_time() + MAX(length_ns, 1);
+    timer_mod(s->hp_core_timer, s->hp_core_due);
+    esp32p4_clkrst_update(s, false);
+}
+
+static void esp32p4_clkrst_hp_core_release(void *opaque)
+{
+    ESP32P4ClkRstState *s = opaque;
+
+    s->hp_core_reset = false;
     esp32p4_clkrst_update(s, false);
 }
 
@@ -2102,8 +2121,49 @@ static void esp32p4_clkrst_hp_core_timer(void *opaque)
 {
     ESP32P4ClkRstState *s = opaque;
 
-    s->hp_core_reset = false;
-    esp32p4_clkrst_update(s, false);
+    esp32_line_run_at(s->hp_core_due, esp32p4_clkrst_hp_core_release, s);
+}
+
+/* [spec:nuos:req:emu.esp32p4.clocks] */
+void esp32p4_clkrst_sync(ESP32P4ClkRstState *s, int64_t now)
+{
+    if (s->syncing) {
+        return;
+    }
+    s->syncing = true;
+    for (int i = 0; i < ESP32P4_NUM_CLKIN; i++) {
+        esp32p4_clk_sync_source(s->clk_in[i], now);
+    }
+    for (;;) {
+        int64_t due = now;
+        int next = -1;
+
+        for (int n = 0; n < ESP32P4_CLKRST_HP_CORES; n++) {
+            if (timer_pending(s->core_timer[n]) &&
+                s->core_pulse_due[n] <= due &&
+                (next < 0 || s->core_pulse_due[n] < due)) {
+                next = n;
+                due = s->core_pulse_due[n];
+            }
+        }
+        if (timer_pending(s->hp_core_timer) && s->hp_core_due <= due &&
+            (next < 0 || s->hp_core_due < due)) {
+            next = ESP32P4_CLKRST_HP_CORES;
+            due = s->hp_core_due;
+        }
+        if (next < 0) {
+            break;
+        }
+        if (next == ESP32P4_CLKRST_HP_CORES) {
+            timer_del(s->hp_core_timer);
+            esp32_line_run_at(due, esp32p4_clkrst_hp_core_release, s);
+        } else {
+            timer_del(s->core_timer[next]);
+            esp32_line_run_at(due, esp32p4_clkrst_core_phase_end,
+                              &s->core_timer_ctx[next]);
+        }
+    }
+    s->syncing = false;
 }
 
 /* The value a read of register @idx returns. */
@@ -2171,6 +2231,7 @@ static uint64_t esp32p4_clkrst_read(ESP32P4ClkRstState *s, int block,
 {
     int idx = esp32p4_clkrst_index(block, addr & ~3);
 
+    esp32p4_clkrst_sync(s, esp32_line_time());
     if (idx < 0) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of reserved address "
                       "0x%" HWADDR_PRIx " in %s\n", TYPE_ESP32P4_CLKRST,
@@ -2234,6 +2295,7 @@ static void esp32p4_clkrst_write(ESP32P4ClkRstState *s, int block,
     uint32_t lanes, v, rw, wt, old, *r;
     int n;
 
+    esp32p4_clkrst_sync(s, esp32_line_time());
     if (idx < 0) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write to reserved address "
                       "0x%" HWADDR_PRIx " in %s\n", TYPE_ESP32P4_CLKRST,
@@ -2613,10 +2675,12 @@ static MemTxResult esp32p4_clkrst_gate_read(void *opaque, hwaddr addr,
                                             MemTxAttrs attrs)
 {
     ESP32P4ClkRstGate *g = opaque;
-    bool running = !g->held && clock_is_enabled(g->s->clk[g->clock]);
+    bool running;
     uint8_t buf[8];
     MemTxResult r;
 
+    esp32p4_clkrst_sync(g->s, esp32_line_time());
+    running = !g->held && clock_is_enabled(g->s->clk[g->clock]);
     if (!running && g->has_volatile &&
         addr < g->volatile_offset + g->volatile_size &&
         addr + size > g->volatile_offset) {
@@ -2636,6 +2700,7 @@ static MemTxResult esp32p4_clkrst_gate_write(void *opaque, hwaddr addr,
     ESP32P4ClkRstGate *g = opaque;
     uint8_t buf[8];
 
+    esp32p4_clkrst_sync(g->s, esp32_line_time());
     if (g->held || !clock_is_enabled(g->s->clk[g->clock])) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write to %s at 0x%" HWADDR_PRIx
                       " while its clock is gated or it is held in reset\n",
@@ -2887,8 +2952,8 @@ static int esp32p4_clkrst_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_esp32p4_clkrst = {
     .name = TYPE_ESP32P4_CLKRST,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .post_load = esp32p4_clkrst_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, ESP32P4ClkRstState, ESP32P4_CLKRST_NREGS),
@@ -2932,6 +2997,8 @@ static const VMStateDescription vmstate_esp32p4_clkrst = {
                              ESP32P4_CLKRST_HP_CORES),
         VMSTATE_BOOL_ARRAY(core_pulse_waiting, ESP32P4ClkRstState,
                            ESP32P4_CLKRST_HP_CORES),
+        VMSTATE_INT64_ARRAY(core_pulse_due, ESP32P4ClkRstState,
+                            ESP32P4_CLKRST_HP_CORES),
         VMSTATE_BOOL_ARRAY(core_reset_level, ESP32P4ClkRstState,
                            ESP32P4_CLKRST_HP_CORES),
         VMSTATE_BOOL_ARRAY(core_clock_level, ESP32P4ClkRstState,
@@ -2943,6 +3010,7 @@ static const VMStateDescription vmstate_esp32p4_clkrst = {
         VMSTATE_BOOL(hp_core_reset, ESP32P4ClkRstState),
         VMSTATE_BOOL(hp_core_reset_level, ESP32P4ClkRstState),
         VMSTATE_TIMER_PTR(hp_core_timer, ESP32P4ClkRstState),
+        VMSTATE_INT64(hp_core_due, ESP32P4ClkRstState),
         VMSTATE_BOOL(lp_core_reset_level, ESP32P4ClkRstState),
         VMSTATE_BOOL(lp_core_clock_level, ESP32P4ClkRstState),
         VMSTATE_UINT64_ARRAY(checked_soc, ESP32P4ClkRstState, 4),

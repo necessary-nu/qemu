@@ -92,3 +92,28 @@ bool esp32_line_lags(int64_t due_ns)
            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - due_ns >
            ESP32_LINE_MAX_LAG_NS;
 }
+
+/* [spec:nuos:req:emu.esp32.gpio] */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+bool esp32_sig_out_watched(Object *matrix, unsigned sig)
+{
+    return ESP32_SIG_ROUTES_GET_CLASS(matrix)->sig_out_watched(matrix, sig);
+}
+
+void esp32_sig_add_route_notifier(Object *matrix, Notifier *n)
+{
+    ESP32_SIG_ROUTES_GET_CLASS(matrix)->add_route_notifier(matrix, n);
+}
+
+static const TypeInfo esp32_sig_routes_info = {
+    .name = TYPE_ESP32_SIG_ROUTES,
+    .parent = TYPE_INTERFACE,
+    .class_size = sizeof(Esp32SigRoutesClass),
+};
+
+static void esp32_line_register_types(void)
+{
+    type_register_static(&esp32_sig_routes_info);
+}
+
+type_init(esp32_line_register_types)

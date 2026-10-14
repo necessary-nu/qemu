@@ -145,6 +145,24 @@ static void wd_tick_changed(void *opaque, ClockEvent event)
     wd_restart(s);
 }
 
+/*
+ * [spec:nuos:req:emu.watchdog]
+ * The count has reached zero by the access being made: the watchdog fires
+ * first, as its timer, which without icount can run well after, would
+ * have. A LOAD written after that moment comes too late to keep the
+ * reset off, as on the chip, and CTRL and REASON read as the expiry left
+ * them. Only a timer that has come fires.
+ */
+static void wd_catch_up(RP2350WatchdogState *s)
+{
+    if (timer_pending(s->expiry) &&
+        timer_expire_time_ns(s->expiry) <=
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_del(s->expiry);
+        wd_expired(s);
+    }
+}
+
 static uint32_t wd_ctrl(RP2350WatchdogState *s)
 {
     return s->ctrl | wd_time(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
@@ -156,6 +174,7 @@ static uint64_t rp2350_watchdog_read(void *opaque, hwaddr addr, unsigned size)
     RP2350WatchdogState *s = opaque;
     hwaddr reg = rp2350_atomic_reg(addr);
 
+    wd_catch_up(s);
     switch (reg) {
     case A_CTRL:
         return wd_ctrl(s);
@@ -179,6 +198,7 @@ static void rp2350_watchdog_write(void *opaque, hwaddr addr, uint64_t value,
     hwaddr reg = rp2350_atomic_reg(addr);
     uint32_t v;
 
+    wd_catch_up(s);
     switch (reg) {
     case A_CTRL:
         v = rp2350_atomic_apply(addr, wd_ctrl(s), value);

@@ -305,7 +305,8 @@ qtests_xtensa = \
      'esp32-board-reset-test',
      'esp32-ulp-test',
      'esp32-i2c-test',
-     'esp32-efuse-test'] : [])
+     'esp32-efuse-test',
+     'esp32-wdt-test'] : [])
 
 qtests_stm32l4x5 = \
   ['stm32l4x5_exti-test',

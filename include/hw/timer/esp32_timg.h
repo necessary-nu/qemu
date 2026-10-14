@@ -72,9 +72,14 @@ typedef struct Esp32TimgWdtState {
     bool edge_int_en;
     int prescale;
     Esp32TimgWdtStageMode mode[ESP32_TIMG_WDT_STAGE_COUNT];
-    int timeout[ESP32_TIMG_WDT_STAGE_COUNT];
-    uint32_t count_base;
+    uint32_t timeout[ESP32_TIMG_WDT_STAGE_COUNT];
+    /*
+     * The current stage's count at ns_base, and the count at which it
+     * ends: its expiry counter, 32 bits, has then come to its hold.
+     */
+    uint64_t count_base;
     uint64_t ns_base;
+    uint64_t due_count;
     int cur_stage;
     uint32_t protect_reg;
     QEMUTimer stage_timer;

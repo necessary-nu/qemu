@@ -31,9 +31,10 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/gpio/esp32_line.h"
+#include "hw/gpio/esp32_rtcio.h"
 #include "hw/misc/esp32_reg.h"
 #include "hw/misc/esp32_rtc_cntl.h"
-#include "hw/gpio/esp32_rtcio.h"
 #include "migration/vmstate.h"
 
 #define TIME_MASK MAKE_64BIT_MASK(0, 48)
@@ -291,7 +292,6 @@ static void esp32_rtc_wdt_update(Esp32RtcCntlState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint64_t count = esp32_rtc_wdt_count(s, now);
-    uint32_t hold;
 
     s->wdt_count_base = count;
     s->wdt_base_ns = now;
@@ -300,10 +300,25 @@ static void esp32_rtc_wdt_update(Esp32RtcCntlState *s)
     if (!s->wdt_running || !s->rtc_slowclk_freq) {
         return;
     }
-    hold = s->regs[A_RTC_CNTL_WDTCONFIG1 / 4 + s->wdt_stage];
     timer_mod(&s->wdt_timer,
-              hold > count ? esp32_rtc_ticks_to_ns(s, now, hold - count) :
-                             now);
+              s->wdt_due > count ?
+              esp32_rtc_ticks_to_ns(s, now, s->wdt_due - count) : now);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rtc]
+ * Where the current stage ends, from a count of @count: a stage ends when
+ * the 32-bit expiry counter, counting on, reaches the stage's hold (TRM
+ * 11.3.1). A hold the counter is at or past, 0 as a stage begins among
+ * them, is reached after the counter wraps, up to 2^32 cycles on; no
+ * stage ends at the instant it begins.
+ */
+static void esp32_rtc_wdt_set_due(Esp32RtcCntlState *s, uint64_t count)
+{
+    uint32_t hold = s->regs[A_RTC_CNTL_WDTCONFIG1 / 4 + s->wdt_stage];
+    uint32_t ahead = hold - (uint32_t)count;
+
+    s->wdt_due = count + (ahead ? ahead : 1ull << 32);
 }
 
 static void esp32_rtc_wdt_restart(Esp32RtcCntlState *s)
@@ -312,6 +327,7 @@ static void esp32_rtc_wdt_restart(Esp32RtcCntlState *s)
     s->wdt_count_base = 0;
     s->wdt_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->wdt_running = false;
+    esp32_rtc_wdt_set_due(s, 0);
     esp32_rtc_wdt_update(s);
 }
 
@@ -341,10 +357,9 @@ static void esp32_rtc_wdt_cb(void *opaque)
     Esp32RtcCntlState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t cfg = REG(s, RTC_CNTL_WDTCONFIG0);
-    uint32_t hold = s->regs[A_RTC_CNTL_WDTCONFIG1 / 4 + s->wdt_stage];
     unsigned action;
 
-    if (esp32_rtc_wdt_count(s, now) < hold) {
+    if (esp32_rtc_wdt_count(s, now) < s->wdt_due) {
         esp32_rtc_wdt_update(s);
         return;
     }
@@ -353,13 +368,15 @@ static void esp32_rtc_wdt_cb(void *opaque)
      * The next stage counts from when this one ended, not from when the
      * callback, which the host can run late without icount, got to it.
      */
-    if (s->wdt_running && s->rtc_slowclk_freq && hold > s->wdt_count_base) {
+    if (s->wdt_running && s->rtc_slowclk_freq &&
+        s->wdt_due > s->wdt_count_base) {
         now = MIN(now, esp32_rtc_ticks_to_ns(s, s->wdt_base_ns,
-                                             hold - s->wdt_count_base));
+                                             s->wdt_due - s->wdt_count_base));
     }
     s->wdt_stage = (s->wdt_stage + 1) % ESP32_RTC_WDT_STAGES;
     s->wdt_count_base = 0;
     s->wdt_base_ns = now;
+    esp32_rtc_wdt_set_due(s, 0);
     esp32_rtc_wdt_update(s);
 
     switch (action) {
@@ -566,7 +583,7 @@ static void esp32_rtc_update_clock_outputs(Esp32RtcCntlState *s)
  */
 static void esp32_rtc_clocks_changed(Esp32RtcCntlState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
     uint32_t old_freq = s->rtc_slowclk_freq;
     uint32_t bo;
 
@@ -607,24 +624,39 @@ static void esp32_rtc_clocks_changed(Esp32RtcCntlState *s)
  * stopped, as it is when it is 8MD256 from this very oscillator, the
  * wait is counted at RC_SLOW_CLK's nominal rate.
  */
-static void esp32_rtc_rc_fast_arm(Esp32RtcCntlState *s)
+static int64_t esp32_rtc_rc_fast_due(Esp32RtcCntlState *s)
 {
     uint32_t wait = FIELD_EX32(REG(s, RTC_CNTL_TIMER1), RTC_CNTL_TIMER1,
                                CK8M_WAIT);
     uint32_t hz = s->rtc_slowclk_freq ? s->rtc_slowclk_freq :
                                         ESP32_RC_SLOW_CLK_HZ;
 
-    timer_mod(&s->rc_fast_timer,
-              s->rc_fast_on_ns + muldiv64(wait, NANOSECONDS_PER_SECOND, hz));
+    return s->rc_fast_on_ns + muldiv64(wait, NANOSECONDS_PER_SECOND, hz);
 }
 
-static void esp32_rtc_rc_fast_cb(void *opaque)
+static void esp32_rtc_rc_fast_arm(Esp32RtcCntlState *s)
+{
+    timer_mod(&s->rc_fast_timer, esp32_rtc_rc_fast_due(s));
+}
+
+static void esp32_rtc_rc_fast_ready(void *opaque)
 {
     Esp32RtcCntlState *s = opaque;
 
     s->rc_fast_ready = true;
     esp32_rtc_clocks_changed(s);
     qemu_irq_pulse(s->clk_update);
+}
+
+/*
+ * The oscillator gives its clock from the end of its wait, however late
+ * the timer runs: the RTC timer counts at the new rate from then.
+ */
+static void esp32_rtc_rc_fast_cb(void *opaque)
+{
+    Esp32RtcCntlState *s = opaque;
+
+    esp32_line_run_at(esp32_rtc_rc_fast_due(s), esp32_rtc_rc_fast_ready, s);
 }
 
 /*
@@ -828,11 +860,14 @@ void esp32_rtc_cntl_sleep_reset_done(Esp32RtcCntlState *s)
     esp32_rtc_check_wakeup(s);
 }
 
+static void esp32_rtc_catch_up(Esp32RtcCntlState *s);
+
 void esp32_rtc_cntl_rtcio_changed(Esp32RtcCntlState *s)
 {
     bool xpd_32k = s->rtcio->regs[A_RTCIO_XTAL_32K_PAD / 4] &
                    R_RTCIO_XTAL_32K_PAD_XPD_XTAL_32K_MASK;
 
+    esp32_rtc_catch_up(s);
     if (s->xtal32k_fitted && xpd_32k != (s->xtal32k_freq != 0)) {
         esp32_rtc_clocks_changed(s);
     }
@@ -900,11 +935,21 @@ static void esp32_rtc_mem_crc(Esp32RtcCntlState *s, uint32_t old)
  * that resets is left to its timer: a reset is not made from within an
  * access.
  */
-static void esp32_rtc_catch_up(Esp32RtcCntlState *s)
+static void esp32_rtc_catch_up_to(Esp32RtcCntlState *s, int64_t now)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     unsigned action;
 
+    /*
+     * RC_FAST_CLK starting up first, if it has by then: the clocks it
+     * feeds time the rest.
+     */
+    if (timer_pending(&s->rc_fast_timer) &&
+        timer_expire_time_ns(&s->rc_fast_timer) <= now) {
+        int64_t due = timer_expire_time_ns(&s->rc_fast_timer);
+
+        timer_del(&s->rc_fast_timer);
+        esp32_line_run_at(due, esp32_rtc_rc_fast_ready, s);
+    }
     while (timer_pending(&s->wdt_timer) &&
            timer_expire_time_ns(&s->wdt_timer) <= now) {
         action = esp32_rtc_wdt_action(s);
@@ -927,12 +972,24 @@ static void esp32_rtc_catch_up(Esp32RtcCntlState *s)
     }
 }
 
+static void esp32_rtc_catch_up(Esp32RtcCntlState *s)
+{
+    esp32_rtc_catch_up_to(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+/* [spec:nuos:req:emu.esp32.ulp] */
+void esp32_rtc_cntl_add_access_notifier(Esp32RtcCntlState *s, Notifier *n)
+{
+    notifier_list_add(&s->access_notifiers, n);
+}
+
 static uint64_t esp32_rtc_cntl_read(void *opaque, hwaddr addr,
                                     unsigned int size)
 {
     Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
     uint32_t r;
 
+    notifier_list_notify(&s->access_notifiers, s);
     esp32_rtc_catch_up(s);
     switch (addr) {
     case A_RTC_CNTL_TIME0:
@@ -990,6 +1047,7 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
     uint32_t old;
     uint32_t writable = reg_info[addr / 4].writable;
 
+    notifier_list_notify(&s->access_notifiers, s);
     esp32_rtc_catch_up(s);
     old = *r;
     switch (addr) {
@@ -1141,6 +1199,10 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
         }
         *r = v;
         esp32_rtc_wdt_update(s);
+        if ((addr - A_RTC_CNTL_WDTCONFIG1) / 4 == s->wdt_stage) {
+            esp32_rtc_wdt_set_due(s, s->wdt_count_base);
+            esp32_rtc_wdt_update(s);
+        }
         break;
 
     case A_RTC_CNTL_WDTFEED:
@@ -1228,6 +1290,7 @@ static void esp32_rtc_wakeup_line(void *opaque, int n, int level)
 {
     Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
 
+    esp32_rtc_catch_up_to(s, esp32_line_time() - 1);
     s->wakeup_lines = deposit32(s->wakeup_lines, n, 1, level != 0);
     esp32_rtc_check_wakeup(s);
 }
@@ -1236,6 +1299,7 @@ static void esp32_rtc_gpio_wakeup_line(void *opaque, int n, int level)
 {
     Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
 
+    esp32_rtc_catch_up_to(s, esp32_line_time() - 1);
     s->gpio_wakeup_line = level;
     esp32_rtc_check_wakeup(s);
 }
@@ -1297,6 +1361,7 @@ static void esp32_rtc_cntl_reset_hold(Object *obj, ResetType type)
     s->wdt_count_base = 0;
     s->wdt_base_ns = now;
     s->wdt_running = false;
+    esp32_rtc_wdt_set_due(s, 0);
 }
 
 static void esp32_rtc_cntl_reset_exit(Object *obj, ResetType type)
@@ -1343,6 +1408,7 @@ static void esp32_rtc_cntl_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
     DeviceState *dev = DEVICE(obj);
 
+    notifier_list_init(&s->access_notifiers);
     memory_region_init_io(&s->iomem, obj, &esp32_rtc_cntl_ops, s,
                           TYPE_ESP32_RTC_CNTL, ESP32_RTC_CNTL_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
@@ -1408,8 +1474,8 @@ static int esp32_rtc_cntl_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_esp32_rtc_cntl = {
     .name = TYPE_ESP32_RTC_CNTL,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .post_load = esp32_rtc_cntl_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Esp32RtcCntlState,
@@ -1428,6 +1494,7 @@ static const VMStateDescription vmstate_esp32_rtc_cntl = {
         VMSTATE_UINT32(wdt_stage, Esp32RtcCntlState),
         VMSTATE_UINT64(wdt_count_base, Esp32RtcCntlState),
         VMSTATE_INT64(wdt_base_ns, Esp32RtcCntlState),
+        VMSTATE_UINT64(wdt_due, Esp32RtcCntlState),
         VMSTATE_BOOL(wdt_running, Esp32RtcCntlState),
         VMSTATE_UINT32(sleep, Esp32RtcCntlState),
         VMSTATE_BOOL(sleep_reset_pending, Esp32RtcCntlState),

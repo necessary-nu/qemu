@@ -1027,8 +1027,7 @@ static void i2s_hung_update(ESP32P4I2sState *s, ESP32P4I2sUnit *u,
         u->hung_fired = false;
     }
     if (!u->hung_fired && !timer_pending(&u->hung_timer)) {
-        timer_mod_ns(&u->hung_timer,
-                     i2s_hung_end(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)));
+        timer_mod_ns(&u->hung_timer, i2s_hung_end(s, esp32_line_time()));
     }
 }
 
@@ -3179,10 +3178,61 @@ static void i2s_lp_write(ESP32P4I2sState *s, hwaddr addr, uint32_t val)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.i2s]
+ * Take what fell due by @now as the timers that run it would, earliest
+ * first: a master unit's periods, each at its end (unit_run_until()), and
+ * the FIFO timeouts. Without icount those timers can run well after
+ * their time, while software reads INT_RAW, the FIFO and LP memory
+ * levels, or GDMA's channels for the data the periods moved: a register
+ * access, and GDMA's own, first take them.
+ */
+static void i2s_catch_up(ESP32P4I2sState *s, int64_t now)
+{
+    if (s->in_run) {
+        return;
+    }
+    for (;;) {
+        QEMUTimer *t[] = {
+            &s->tx.timer, &s->rx.timer, &s->tx.hung_timer, &s->rx.hung_timer,
+        };
+        int next = -1;
+        int64_t due = now;
+
+        for (int i = 0; i < ARRAY_SIZE(t); i++) {
+            int64_t at = timer_expire_time_ns(t[i]);
+
+            if (timer_pending(t[i]) && at <= due && (next < 0 || at < due)) {
+                next = i;
+                due = at;
+            }
+        }
+        if (next < 0) {
+            return;
+        }
+        timer_del(t[next]);
+        switch (next) {
+        case 0:
+            unit_run_until(s, &s->tx, now);
+            break;
+        case 1:
+            unit_run_until(s, &s->rx, now);
+            break;
+        case 2:
+            esp32_line_run_at(due, i2s_tx_hung_cb, s);
+            break;
+        default:
+            esp32_line_run_at(due, i2s_rx_hung_cb, s);
+            break;
+        }
+    }
+}
+
 static uint64_t esp32p4_i2s_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4I2sState *s = opaque;
 
+    i2s_catch_up(s, esp32_line_time());
     return i2s_is_lp(s) ? i2s_lp_read(s, addr) : i2s_hp_read(s, addr);
 }
 
@@ -3191,6 +3241,7 @@ static void esp32p4_i2s_write(void *opaque, hwaddr addr, uint64_t value,
 {
     ESP32P4I2sState *s = opaque;
 
+    i2s_catch_up(s, esp32_line_time());
     if (i2s_is_lp(s)) {
         i2s_lp_write(s, addr, value);
     } else {
@@ -3341,9 +3392,16 @@ static void esp32p4_i2s_reset_exit(Object *obj, ResetType type)
     i2s_update_irq(s);
 }
 
+/* [spec:nuos:req:emu.esp32p4.i2s] */
+static void i2s_gdma_sync(void *opaque, int64_t when)
+{
+    i2s_catch_up(opaque, when);
+}
+
 static const ESP32P4GdmaPeriphOps i2s_gdma_ops = {
     .tx_ready = i2s_gdma_tx_ready,
     .rx_ready = i2s_gdma_rx_ready,
+    .sync = i2s_gdma_sync,
 };
 
 static void esp32p4_i2s_realize(DeviceState *dev, Error **errp)

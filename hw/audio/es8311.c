@@ -1761,10 +1761,13 @@ static int es8311_event(I2CSlave *i2c, enum i2c_event event)
 }
 
 /* [spec:nuos:req:emu.esp32p4.i2c] */
+static void es8311_access_catch_up(ES8311State *s);
+
 static int es8311_send(I2CSlave *i2c, uint8_t data)
 {
     ES8311State *s = ES8311(i2c);
 
+    es8311_access_catch_up(s);
     if (s->ptr_next) {
         s->ptr = data;
         s->ptr_next = false;
@@ -1794,10 +1797,30 @@ static bool es8311_match(I2CSlave *candidate, uint8_t address,
 }
 
 /* [spec:nuos:req:emu.esp32p4.i2c] */
+/*
+ * [spec:nuos:req:emu.esp32p4.i2s]
+ * A register access on the I2C bus, at its bit's time: as the codec's
+ * master clocks, its LRCK periods due by then come first, which their
+ * timer, late without icount, has yet to take, so that FLAG's state
+ * machine and automute read as they are then. Only a timer that has come
+ * is run.
+ */
+static void es8311_access_catch_up(ES8311State *s)
+{
+    int64_t now = esp32_line_time();
+
+    if (timer_pending(&s->mst_timer) &&
+        timer_expire_time_ns(&s->mst_timer) <= now) {
+        timer_del(&s->mst_timer);
+        mst_catch_up(s, now);
+    }
+}
+
 static uint8_t es8311_recv(I2CSlave *i2c)
 {
     ES8311State *s = ES8311(i2c);
 
+    es8311_access_catch_up(s);
     return es8311_read_reg(s, s->ptr);
 }
 

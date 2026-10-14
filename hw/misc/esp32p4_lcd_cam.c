@@ -1797,7 +1797,11 @@ static void lcd_timer_cb(void *opaque)
     uint64_t pos;
     unsigned kind;
 
-    if (lcd_next_event(s, &t, &pos, &kind)) {
+    /*
+     * An access may have taken the event the timer was set for, and the
+     * next may not have come yet.
+     */
+    if (lcd_next_event(s, &t, &pos, &kind) && t <= now) {
         lcd_run(s, icount_enabled() ? t : MAX(t, now));
     }
     lcd_schedule(s);
@@ -2245,9 +2249,11 @@ static void cam_dma_rx_ready(void *opaque)
  * ====
  */
 
+static void lcd_cam_sync_at(ESP32P4LcdCamState *s, int64_t now);
+
 static void lcd_cam_dma_sync(void *opaque, int64_t when)
 {
-    lcd_run(opaque, when);
+    lcd_cam_sync_at(opaque, when);
 }
 
 static const ESP32P4GdmaPeriphOps lcd_cam_dma_ops = {
@@ -2292,9 +2298,30 @@ static void lcd_reset_module(ESP32P4LcdCamState *s)
     lcd_stop(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.lcd-cam]
+ * Take what has come by now: the LCD's events, and the camera's lines and
+ * its VSYNC filter's frame end, the camera first bringing its stream up
+ * to now. Without icount their timers can run well after, while software
+ * reads LC_DMA_INT_RAW's CAM_VSYNC or CAM_HS_INT, or GDMA's descriptors
+ * for a frame; a register access, and GDMA's, first take them. Only a
+ * timer that has come is run.
+ */
+static void lcd_cam_sync_at(ESP32P4LcdCamState *s, int64_t now)
+{
+    lcd_run(s, now);
+    if (s->camera) {
+        esp32p4_image_source_sync(s->camera);
+    }
+    if (timer_pending(&s->cam_timer) && s->cam_vsync_due <= now) {
+        timer_del(&s->cam_timer);
+        cam_timer_cb(s);
+    }
+}
+
 static void lcd_cam_sync(ESP32P4LcdCamState *s)
 {
-    lcd_run(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    lcd_cam_sync_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 /* [spec:nuos:req:emu.esp32p4.lcd-cam] */

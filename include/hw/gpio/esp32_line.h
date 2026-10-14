@@ -12,6 +12,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/line-time.h"
 #include "qemu/notify.h"
+#include "qom/object.h"
 
 /*
  * Line timing.
@@ -78,5 +79,29 @@ void esp32_line_sync(void);
 #define ESP32_LINE_MAX_LAG_NS   NANOSECONDS_PER_SECOND
 
 bool esp32_line_lags(int64_t due_ns);
+
+/*
+ * The routing of a GPIO matrix, for a block both chips have whose outputs
+ * cost it work edge by edge: whether output signal sig reaches a pad
+ * whose level anything but software sampling the pads sees (an input
+ * signal a modelled block takes from it, its interrupt type, a line of it
+ * the board listens to, ...), and a notifier the matrix calls whenever
+ * that may have changed. The ESP32's and the ESP32-P4's matrices
+ * implement it; a block holds a link to its machine's.
+ */
+#define TYPE_ESP32_SIG_ROUTES "esp32-sig-routes"
+
+typedef struct Esp32SigRoutesClass {
+    InterfaceClass parent_class;
+
+    bool (*sig_out_watched)(Object *matrix, unsigned sig);
+    void (*add_route_notifier)(Object *matrix, Notifier *n);
+} Esp32SigRoutesClass;
+
+DECLARE_CLASS_CHECKERS(Esp32SigRoutesClass, ESP32_SIG_ROUTES,
+                       TYPE_ESP32_SIG_ROUTES)
+
+bool esp32_sig_out_watched(Object *matrix, unsigned sig);
+void esp32_sig_add_route_notifier(Object *matrix, Notifier *n);
 
 #endif

@@ -1990,15 +1990,59 @@ static bool uart_reg_exists(ESP32P4UartState *s, hwaddr addr)
     return true;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.uart]
+ * The RX timeout, the UHCI idle timer and an AT_CMD sequence's post-idle
+ * wait whose time has come by an access, the frames received by then
+ * taken (a start bit since would have ended them), each at its time:
+ * without icount their timers can run well after, while software reads
+ * INT_RAW's RXFIFO_TOUT or AT_CMD_CHAR_DET, or UHCI's channel waits for
+ * the frame's end. Only a timer that has come is run.
+ */
+static void uart_idle_timers_catch_up(ESP32P4UartState *s)
+{
+    int64_t now = now_ns();
+
+    for (;;) {
+        QEMUTimer *t[] = { &s->tout_timer, &s->idle_timer, &s->at_timer };
+        QEMUTimerCB *cb[] = {
+            uart_tout_timer_cb, uart_idle_timer_cb, uart_at_timer_cb,
+        };
+        int next = -1;
+        int64_t due = now;
+
+        for (int i = 0; i < ARRAY_SIZE(t); i++) {
+            int64_t at = timer_expire_time_ns(t[i]);
+
+            if (timer_pending(t[i]) && at <= due && (next < 0 || at < due)) {
+                next = i;
+                due = at;
+            }
+        }
+        if (next < 0) {
+            return;
+        }
+        timer_del(t[next]);
+        esp32_line_run_at(due, cb[next], s);
+    }
+}
+
+/* [spec:nuos:req:emu.esp32p4.uart] */
+void esp32p4_uart_catch_up(ESP32P4UartState *s)
+{
+    uart_update_catch_up(s);
+    uart_tx_advance(s);
+    uart_filt_timer_cb(s);
+    esp32_uart_rx_flush(&s->rx);
+    uart_idle_timers_catch_up(s);
+}
+
 static uint64_t uart_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4UartState *s = ESP32P4_UART(opaque);
     uint32_t v = 0;
 
-    uart_update_catch_up(s);
-    uart_tx_advance(s);
-    uart_filt_timer_cb(s);
-    esp32_uart_rx_flush(&s->rx);
+    esp32p4_uart_catch_up(s);
     if (!uart_reg_exists(s, addr)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of reserved offset 0x%"
                       HWADDR_PRIx "\n", object_get_canonical_path(OBJECT(s)),
@@ -2092,10 +2136,7 @@ static void uart_write(void *opaque, hwaddr addr, uint64_t value,
     int64_t t = now_ns();
     unsigned r = R(addr);
 
-    uart_update_catch_up(s);
-    uart_tx_advance(s);
-    uart_filt_timer_cb(s);
-    esp32_uart_rx_flush(&s->rx);
+    esp32p4_uart_catch_up(s);
     if (!uart_reg_exists(s, addr)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write of reserved offset 0x%"
                       HWADDR_PRIx "\n", object_get_canonical_path(OBJECT(s)),

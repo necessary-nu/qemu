@@ -1359,6 +1359,16 @@ const ESP32P4ImageTiming *esp32p4_image_source_timing(ESP32P4ImageSource *s)
     return &s->timing;
 }
 
+/* [spec:nuos:req:emu.esp32p4.mipi] */
+void esp32p4_image_source_sync(ESP32P4ImageSource *s)
+{
+    if (!s->in_run && timer_pending(&s->timer) &&
+        timer_expire_time_ns(&s->timer) <= esp32_line_time()) {
+        run_until(s, esp32_line_time());
+        arm(s);
+    }
+}
+
 bool esp32p4_image_source_streaming(ESP32P4ImageSource *s)
 {
     if (!s->in_run) {

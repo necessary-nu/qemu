@@ -96,8 +96,9 @@
  * changes at every one of its edges' exact times, however close together,
  * stamped on the line (hw/gpio/esp32_line.h), so that a capture, a pulse
  * counter or an ETM event that an edge reaches sees each; the host's work
- * grows with the edges' rate. Whenever software samples the pads the
- * outputs are brought to their exact levels at that moment. Updates, fade
+ * grows with the edges' rate while something watches them (below).
+ * Whenever software samples the pads the outputs are brought to their
+ * exact levels at that moment. Updates, fade
  * ends, fade pauses and the timers' own updates are handled in time order at
  * their overflows; a QEMU timer fires for them, for the edges, and for
  * the overflows, matches and counts that an enabled interrupt or ETM
@@ -107,7 +108,13 @@
  * than 10 ms behind the present (the host running that far behind virtual
  * time, slower than the edges it is to drive) skips to its level shortly
  * before the present, stamped with the moment that level began: the edges
- * in between are lost, but no edge carries a time other than its own.
+ * in between are lost, but no edge carries a time other than its own. An
+ * output that reaches no pad something watches (an input a modelled block
+ * takes from it, an interrupt type, an ETM channel, a line the board
+ * listens to: esp32p4_gpio_sig_out_watched()) is not timed edge by edge:
+ * nothing sees its edges, and it takes its level of the moment whenever
+ * the controller is brought up to date, so that it costs the host nothing
+ * however fast.
  *
  * Not modelled: the light-sleep output (TRM 58.2), which needs the PMU;
  * LEDC_CLK_EN and GAMMA_RAM_CLK_EN, clock gating that software cannot
@@ -120,6 +127,7 @@
 #include "qemu/log.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_ledc.h"
 #include "migration/vmstate.h"
@@ -729,6 +737,19 @@ static void chan_drive(ESP32P4LedcState *s, int n, int64_t when)
     }
 }
 
+/* Bring a channel's output to its exact level at x. */
+static void chan_sample(ESP32P4LedcState *s, int n, int64_t x)
+{
+    ESP32P4LedcChannel *ch = &s->ch[n];
+
+    if (x <= ch->eval_ns || !ch->sig_out_en) {
+        return;
+    }
+    ch->eval_ns = x;
+    ch->gen_level = chan_level_at(s, n, x);
+    chan_drive(s, n, x);
+}
+
 /*
  * The time of the last edge of channel n at or before x, after `from`,
  * from which its level has not changed: INT64_MIN if none. Only the last
@@ -772,6 +793,14 @@ static void chan_eval(ESP32P4LedcState *s, int n, int64_t limit,
         ch->eval_ns = MAX(ch->eval_ns, inclusive ? limit : limit - 1);
         return;
     }
+    /*
+     * An output that reaches no pad something watches has no edge anyone
+     * sees: it takes its level of the moment, as a sample does.
+     */
+    if (!s->out_seen[n]) {
+        chan_sample(s, n, inclusive ? limit : limit - 1);
+        return;
+    }
     for (;;) {
         int64_t e = chan_next_edge(s, n, ch->eval_ns);
 
@@ -793,19 +822,6 @@ static void chan_eval(ESP32P4LedcState *s, int n, int64_t limit,
         ch->gen_level = chan_level_at(s, n, e);
         chan_drive(s, n, e);
     }
-}
-
-/* Bring a channel's output to its exact level at x. */
-static void chan_sample(ESP32P4LedcState *s, int n, int64_t x)
-{
-    ESP32P4LedcChannel *ch = &s->ch[n];
-
-    if (x <= ch->eval_ns || !ch->sig_out_en) {
-        return;
-    }
-    ch->eval_ns = x;
-    ch->gen_level = chan_level_at(s, n, x);
-    chan_drive(s, n, x);
 }
 
 /*
@@ -1332,7 +1348,8 @@ static int64_t ledc_next_wake(ESP32P4LedcState *s)
 
             next = MIN(next, due_time(t, timer_time(t, k, timer_top(t))));
         }
-        e = ch->sig_out_en ? chan_next_edge(s, n, ch->eval_ns) : INT64_MAX;
+        e = ch->sig_out_en && s->out_seen[n] ?
+            chan_next_edge(s, n, ch->eval_ns) : INT64_MAX;
         next = MIN(next, e);
     }
     return next;
@@ -1383,6 +1400,41 @@ static void ledc_line_sync(Notifier *notifier, void *data)
         chan_sample(s, n, now);
     }
     ledc_schedule(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * Which channels' outputs reach a pad, through the GPIO matrix or an IO
+ * MUX function, with the pad's output enabled, whose level something but
+ * software sampling the pads sees (esp32p4_gpio_sig_out_watched()): only
+ * theirs are timed edge by edge. The others are brought to their level of
+ * the moment whenever the controller is, as when software samples the
+ * pads, so that an output nobody watches costs the host nothing however
+ * fast it runs. A pad taking one up gets its level at that moment, the
+ * matrix bringing the line sources up to the present before a write.
+ */
+static void ledc_routes_changed(ESP32P4LedcState *s)
+{
+    int64_t now = ledc_now(s);
+
+    ledc_advance(s, now);
+    for (int n = 0; n < ESP32P4_LEDC_CHANNELS; n++) {
+        bool seen = !s->gpio ||
+                    esp32p4_gpio_sig_out_watched(s->gpio, s->sig_base + n);
+
+        if (seen && !s->out_seen[n]) {
+            chan_sample(s, n, now);
+        }
+        s->out_seen[n] = seen;
+    }
+    ledc_schedule(s);
+}
+
+static void ledc_route_notify(Notifier *notifier, void *data)
+{
+    ledc_routes_changed(container_of(notifier, ESP32P4LedcState,
+                                     route_notifier));
 }
 
 /*
@@ -1822,6 +1874,7 @@ static void esp32p4_ledc_reset_exit(Object *obj, ResetType type)
     }
     s->irq_level = false;
     qemu_set_irq(s->irq, 0);
+    ledc_routes_changed(s);
 }
 
 static void esp32p4_ledc_init(Object *obj)
@@ -1843,12 +1896,24 @@ static void esp32p4_ledc_init(Object *obj)
                                 ClockPreUpdate | ClockUpdate);
     timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, ledc_timer_cb, s);
     s->line_source.notify = ledc_line_sync;
+    s->route_notifier.notify = ledc_route_notify;
 }
 
 static void esp32p4_ledc_realize(DeviceState *dev, Error **errp)
 {
-    esp32_line_add_source(&ESP32P4_LEDC(dev)->line_source);
+    ESP32P4LedcState *s = ESP32P4_LEDC(dev);
+
+    esp32_line_add_source(&s->line_source);
+    if (s->gpio) {
+        esp32p4_gpio_add_route_notifier(s->gpio, &s->route_notifier);
+    }
 }
+
+static const Property esp32p4_ledc_properties[] = {
+    DEFINE_PROP_LINK("gpio", ESP32P4LedcState, gpio, TYPE_ESP32P4_GPIO,
+                     ESP32P4GpioState *),
+    DEFINE_PROP_UINT32("sig-base", ESP32P4LedcState, sig_base, 0),
+};
 
 static const VMStateDescription vmstate_esp32p4_ledc_timer = {
     .name = TYPE_ESP32P4_LEDC "-timer",
@@ -1919,8 +1984,8 @@ static const VMStateDescription vmstate_esp32p4_ledc_channel = {
 
 static const VMStateDescription vmstate_esp32p4_ledc = {
     .name = TYPE_ESP32P4_LEDC,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4LedcState),
         VMSTATE_TIMER(timer, ESP32P4LedcState),
@@ -1938,6 +2003,8 @@ static const VMStateDescription vmstate_esp32p4_ledc = {
         VMSTATE_UINT32(date, ESP32P4LedcState),
         VMSTATE_INT64(seen_ns, ESP32P4LedcState),
         VMSTATE_BOOL(irq_level, ESP32P4LedcState),
+        VMSTATE_BOOL_ARRAY(out_seen, ESP32P4LedcState,
+                           ESP32P4_LEDC_CHANNELS),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1948,6 +2015,7 @@ static void esp32p4_ledc_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->realize = esp32p4_ledc_realize;
+    device_class_set_props(dc, esp32p4_ledc_properties);
     dc->vmsd = &vmstate_esp32p4_ledc;
     rc->phases.hold = esp32p4_ledc_reset_hold;
     rc->phases.exit = esp32p4_ledc_reset_exit;

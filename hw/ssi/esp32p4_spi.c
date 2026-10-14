@@ -130,6 +130,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/registerfields.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/gpio/esp32p4_gpio_sig.h"
 #include "hw/ssi/esp32p4_spi.h"
 #include "migration/vmstate.h"
@@ -2525,9 +2526,49 @@ static void spi_rx_ready(void *opaque)
     }
 }
 
+static void spi_update_cb(void *opaque);
+
+/*
+ * [spec:nuos:req:emu.esp32p4.spi]
+ * Take what the controller has due by now, earliest first: SPI_UPDATE's
+ * copy, then the master's steps whose time has come (master_run()).
+ * Without icount their timers can run well after, while software polls
+ * CMD's USR and UPDATE, DMA_INT_RAW's TRANS_DONE, or reads W0-W15 and
+ * GDMA's channels for what the transfer received: a register access, and
+ * GDMA's, first take them. Only a timer that has come is run, so that the
+ * timers' order among others due at the same time stays as it was.
+ */
+static void spi_catch_up(ESP32P4SpiState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t upd = timer_expire_time_ns(s->update_timer);
+    int64_t step = timer_expire_time_ns(s->timer);
+    bool upd_due = timer_pending(s->update_timer) && upd <= now;
+    bool step_due = timer_pending(s->timer) && step <= now;
+
+    if (upd_due && (!step_due || upd <= step)) {
+        timer_del(s->update_timer);
+        esp32_line_run_at(upd, spi_update_cb, s);
+    }
+    if (step_due) {
+        timer_del(s->timer);
+        master_run(s);
+    }
+    if (upd_due && timer_pending(s->update_timer)) {
+        timer_del(s->update_timer);
+        esp32_line_run_at(upd, spi_update_cb, s);
+    }
+}
+
+static void spi_dma_sync(void *opaque, int64_t when)
+{
+    spi_catch_up(opaque);
+}
+
 static const ESP32P4GdmaPeriphOps spi_dma_ops = {
     .tx_ready = spi_tx_ready,
     .rx_ready = spi_rx_ready,
+    .sync = spi_dma_sync,
 };
 
 /* SPI_UPDATE */
@@ -2740,6 +2781,7 @@ static uint64_t esp32p4_spi_read(void *opaque, hwaddr addr, unsigned size)
     ESP32P4SpiState *s = opaque;
     uint32_t v;
 
+    spi_catch_up(s);
     if (!spi_read32(s, addr & ~3, &v)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "esp32p4_spi: SPI%u: read of 0x%" HWADDR_PRIx
@@ -2928,6 +2970,7 @@ static void esp32p4_spi_write(void *opaque, hwaddr addr, uint64_t value,
     hwaddr a = addr & ~3;
     uint32_t v = value;
 
+    spi_catch_up(s);
     if (size < 4) {
         uint32_t cur;
 

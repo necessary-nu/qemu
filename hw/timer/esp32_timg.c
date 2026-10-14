@@ -45,6 +45,8 @@ static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_update_config(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_feed(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now);
+static void esp32_timg_wdt_rehold(Esp32TimgWdtState *ws);
+static uint64_t esp32_timg_wdt_ahead(uint32_t hold, uint64_t count);
 static uint64_t esp32_timg_wdt_get_count(Esp32TimgWdtState *ws,
                                          uint64_t ns_now);
 
@@ -286,6 +288,9 @@ static void esp32_timg_write(void *opaque, hwaddr addr,
         if (!esp32_timg_wdt_protected(&s->wdt)) {
             int stage = (addr - A_TIMG_WDTCONFIG2) / 4;
             s->wdt.timeout[stage] = value;
+            if (stage == s->wdt.cur_stage) {
+                esp32_timg_wdt_rehold(&s->wdt);
+            }
         }
         break;
     }
@@ -348,6 +353,10 @@ static void esp32_timg_wdt_reset(Esp32TimgWdtState* ws)
     ws->timeout[2] = 0x000fffff;
     ws->timeout[3] = 0x000fffff;
     ws->protect_reg = ESP32_TIMG_WDT_PROTECT_WORD;
+    ws->cur_stage = 0;
+    ws->count_base = 0;
+    ws->ns_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    ws->due_count = esp32_timg_wdt_ahead(ws->timeout[0], 0);
 
     if (ws->parent->wdt_en_at_reset) {
         /* On reset, stage0 is configured as system reset, however this is done by
@@ -394,6 +403,14 @@ static void esp32_timg_apb_clk_update(void *opaque, ClockEvent event)
     Esp32TimgTimerState *timers[] = { &s->t0, &s->t1, &s->lact };
     uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    /*
+     * The alarms and watchdog stages due by the change, which a timer
+     * running late without icount has yet to take, at the old rate: re-
+     * armed at the new one they would otherwise be lost or come late.
+     */
+    if (event == ClockPreUpdate) {
+        esp32_timg_catch_up(s);
+    }
     for (int i = 0; i < ARRAY_SIZE(timers); i++) {
         Esp32TimgTimerState *ts = timers[i];
 
@@ -969,6 +986,21 @@ static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_n
     timer_mod_anticipate_ns(&ts->alarm_timer, ns_now + ns_to_alarm);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * The MWDT's ticks from @count until its 32-bit expiry counter, counting
+ * on, comes to @hold: a stage ends when the counter reaches the stage's
+ * timeout value (TRM 11.3.1). A hold the counter is at or past, 0 as a
+ * stage begins among them, is reached after the counter wraps, up to
+ * 2^32 ticks on; no stage ends at the instant it begins.
+ */
+static uint64_t esp32_timg_wdt_ahead(uint32_t hold, uint64_t count)
+{
+    uint32_t ahead = hold - (uint32_t)count;
+
+    return ahead ? ahead : 1ull << 32;
+}
+
 static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws)
 {
     return ws->protect_reg != ESP32_TIMG_WDT_PROTECT_WORD;
@@ -1009,6 +1041,7 @@ static void esp32_timg_wdt_update_config(Esp32TimgWdtState *ws)
     if (ws->en && !old_en) {
         ws->cur_stage = 0;
         ws->count_base = 0;
+        ws->due_count = esp32_timg_wdt_ahead(ws->timeout[0], 0);
     } else if (!ws->en && old_en) {
         qemu_irq_lower(get_level_irq(s, TIMG_WDT_INT));
     }
@@ -1025,11 +1058,14 @@ static void esp32_timg_wdt_feed(Esp32TimgWdtState *ws)
     ws->cur_stage = 0;
     ws->ns_base = ns_now;
     ws->count_base = 0;
+    ws->due_count = esp32_timg_wdt_ahead(ws->timeout[0], 0);
     esp32_timg_wdt_arm(ws, ns_now);
 }
 
 static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now)
 {
+    uint64_t count;
+
     timer_del(&ws->stage_timer);
 
     if (ws->parent->wdt_disable || !(ws->en || (ws->flashboot_en && ws->parent->flash_boot_mode))) {
@@ -1039,14 +1075,25 @@ static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now)
         return;
     }
 
-    uint32_t stage_timeout = ws->timeout[ws->cur_stage];
-    uint32_t cur_count = esp32_timg_wdt_get_count(ws, ns_now);
-    uint32_t count_to_timeout = stage_timeout - cur_count;
-    uint64_t ns_to_timeout = esp32_timg_apb_ns(ws->parent, count_to_timeout,
-                                               MAX(ws->prescale, 1));
-    TIMG_DEBUG_LOG("%s: TG%d ns=0x%08llx stage %d count=0x%08x count_to_timeout=0x%08x ns_to_timeout=0x%08llx\n",
-                   __func__, ws->parent->id, ns_now, ws->cur_stage, cur_count, count_to_timeout, ns_to_timeout);
-    timer_mod_anticipate_ns(&ws->stage_timer, ns_now + ns_to_timeout);
+    count = esp32_timg_wdt_get_count(ws, ns_now);
+    timer_mod_anticipate_ns(&ws->stage_timer, ns_now +
+        esp32_timg_apb_ns(ws->parent,
+                          ws->due_count > count ? ws->due_count - count : 0,
+                          MAX(ws->prescale, 1)));
+}
+
+/*
+ * The current stage's hold was written: the stage ends when the counter,
+ * counting on from where it is, comes to it.
+ */
+static void esp32_timg_wdt_rehold(Esp32TimgWdtState *ws)
+{
+    uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t count = esp32_timg_wdt_get_count(ws, ns_now);
+
+    ws->due_count = count + esp32_timg_wdt_ahead(ws->timeout[ws->cur_stage],
+                                                 count);
+    esp32_timg_wdt_arm(ws, ns_now);
 }
 
 /*
@@ -1057,14 +1104,14 @@ static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now)
 static uint64_t esp32_timg_wdt_stage_end_ns(Esp32TimgWdtState *ws,
                                             uint64_t ns_now)
 {
-    uint32_t left = ws->timeout[ws->cur_stage] - ws->count_base;
     uint64_t due;
 
     if (!clock_is_enabled(ws->parent->apb_clk) ||
-        ws->count_base > ws->timeout[ws->cur_stage]) {
+        ws->count_base >= ws->due_count) {
         return ns_now;
     }
-    due = ws->ns_base + esp32_timg_apb_ns(ws->parent, left,
+    due = ws->ns_base + esp32_timg_apb_ns(ws->parent,
+                                          ws->due_count - ws->count_base,
                                           MAX(ws->prescale, 1));
     if (due > ns_now || ns_now - due > TIMG_CATCHUP_NS) {
         return ns_now;
@@ -1103,6 +1150,7 @@ static void esp32_timg_wdt_cb(void *opaque)
     ws->count_base = 0;
     ws->cur_stage = next_stage;
     ws->ns_base = ns_now;
+    ws->due_count = esp32_timg_wdt_ahead(ws->timeout[next_stage], 0);
     esp32_timg_wdt_arm(ws, ns_now);
 }
 

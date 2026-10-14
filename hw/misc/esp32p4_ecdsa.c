@@ -74,6 +74,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_ecdsa.h"
 #include "migration/vmstate.h"
 #include "target/riscv/esp32p4_cpu.h"
@@ -486,12 +487,21 @@ static bool ecdsa_mem_ok(ESP32P4EcdsaState *s, hwaddr addr, bool write)
     return false;
 }
 
+/* [spec:nuos:req:emu.esp32p4.crypto] */
+static void ecdsa_sync(ESP32P4EcdsaState *s, int64_t now)
+{
+    ESP32P4CryptoTimer *ops[] = { &s->op, &s->sha_op };
+
+    esp32p4_crypto_timers_sync(ops, ARRAY_SIZE(ops), now);
+}
+
 static uint64_t ecdsa_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4EcdsaState *s = opaque;
     hwaddr reg = addr & ~3;
     uint32_t v = 0;
 
+    ecdsa_sync(s, esp32_line_time());
     if (reg >= A_MEM && reg < A_MEM_END) {
         unsigned off = reg - A_MEM;
 
@@ -597,6 +607,7 @@ static MemTxResult ecdsa_write(void *opaque, hwaddr addr, uint64_t value,
     int shift = (addr & 3) * 8;
     uint32_t v = deposit32(0, shift, size * 8, value);
 
+    ecdsa_sync(s, esp32_line_time());
     if (s->in_reset || !clock_is_enabled(s->clk)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write at 0x%" HWADDR_PRIx
                       " dropped: the peripheral is %s\n", TYPE_ESP32P4_ECDSA,

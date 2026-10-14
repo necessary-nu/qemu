@@ -9,6 +9,7 @@
 #ifndef HW_USB_DWC2_OTG_INTERNAL_H
 #define HW_USB_DWC2_OTG_INTERNAL_H
 
+#include "hw/core/line-time.h"
 #include "hw/usb/dwc2-otg.h"
 #include "hw/usb/dwc2-regs.h"
 
@@ -64,6 +65,17 @@ enum {
 /* Core */
 void dwc2_otg_update_irq(DWC2OTGState *s);
 /*
+ * The present, or the time of the timed event being taken (line_time()):
+ * each of the core's timers runs its event as of its due time, however
+ * late the timer runs, and what it starts counts from then. A register
+ * access first takes the events due by its time (dwc2_otg_catch_up()).
+ */
+static inline int64_t dwc2_otg_now(void)
+{
+    return line_time();
+}
+void dwc2_otg_catch_up(DWC2OTGState *s);
+/*
  * The PHY clock the core runs at: its period in Clock units, as its Clock
  * has it, 0 while it is stopped; the first ns by which @ticks of it have
  * elapsed from one of its edges, 0 while stopped; and its whole cycles in
@@ -118,6 +130,8 @@ void dwc2_otg_host_kick(DWC2OTGState *s);
 void dwc2_otg_host_frame_reset(DWC2OTGState *s);
 uint32_t dwc2_otg_haint(DWC2OTGState *s);
 void dwc2_otg_host_pre_save(DWC2OTGState *s);
+void dwc2_otg_host_frame(void *opaque);
+void dwc2_otg_host_bus(void *opaque);
 extern const VMStateDescription vmstate_dwc2_otg_hc;
 
 /* Device */
@@ -137,6 +151,8 @@ void dwc2_otg_dev_rx_popped(DWC2OTGState *s, uint32_t status);
 uint32_t dwc2_otg_daint(DWC2OTGState *s);
 uint32_t dwc2_otg_deachint(DWC2OTGState *s);
 void dwc2_otg_dev_kick(DWC2OTGState *s);
+void dwc2_otg_dev_idle(void *opaque);
+void dwc2_otg_dev_eopf(void *opaque);
 extern const VMStateDescription vmstate_dwc2_otg_ep;
 
 #endif

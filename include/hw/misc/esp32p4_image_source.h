@@ -384,6 +384,14 @@ const ESP32P4ImageTiming *esp32p4_image_source_timing(ESP32P4ImageSource *s);
 bool esp32p4_image_source_streaming(ESP32P4ImageSource *s);
 
 /*
+ * Run the stream's events due by now (lines, packets, sync edges handed
+ * to the receivers), which the sensor's timer, running late without
+ * icount, has yet to run: for a receiver to call before an access shows
+ * what the stream brought. Only a timer that has come is run.
+ */
+void esp32p4_image_source_sync(ESP32P4ImageSource *s);
+
+/*
  * CSI: whether the data lanes are out of LP-11 now (from a burst's SoT to
  * its EoT), for the D-PHY's stop state; a packet reaches the receivers
  * only as it ends.

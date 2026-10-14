@@ -58,6 +58,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/char/esp32p4_usb_serial_jtag.h"
+#include "hw/gpio/esp32_line.h"
 #include "migration/vmstate.h"
 
 #define A_EP1               0x00
@@ -190,9 +191,10 @@ static void usj_host_update(ESP32P4UsjState *s);
 static void usj_xfer_try(ESP32P4UsjState *s);
 static void usj_catch_up(ESP32P4UsjState *s);
 
+/* The present, or the time of the transaction or frame being taken. */
 static int64_t now_ns(void)
 {
-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return esp32_line_time();
 }
 
 /* A bulk transaction's bus time: token, data with PID and CRC, handshake. */
@@ -390,6 +392,7 @@ static void usj_host_schedule(ESP32P4UsjState *s)
         }
         break;
     }
+    s->host_next = next;
     timer_mod_ns(&s->host_timer, next);
 }
 
@@ -445,7 +448,7 @@ static void usj_host_update(ESP32P4UsjState *s)
     usj_update_irq(s);
 }
 
-static void usj_host_timer_cb(void *opaque)
+static void usj_host_step(void *opaque)
 {
     ESP32P4UsjState *s = opaque;
 
@@ -456,6 +459,17 @@ static void usj_host_timer_cb(void *opaque)
     usj_xfer_try(s);
     usj_host_schedule(s);
     usj_update_irq(s);
+}
+
+/*
+ * The host's next state change or frame, at its time however late its
+ * timer runs: the frames keep to their millisecond (esp32_line_run_at()).
+ */
+static void usj_host_timer_cb(void *opaque)
+{
+    ESP32P4UsjState *s = opaque;
+
+    esp32_line_run_at(s->host_next, usj_host_step, s);
 }
 
 /* ---- Bulk transactions ---- */
@@ -581,14 +595,19 @@ static void usj_catch_up(ESP32P4UsjState *s)
 {
     int64_t now = now_ns();
 
-    while (s->xfer_busy && s->xfer_end <= now) {
-        timer_del(&s->xfer_timer);
-        usj_xfer_end(s);
-    }
-    if (timer_pending(&s->host_timer) &&
-        timer_expire_time_ns(&s->host_timer) <= now) {
-        timer_del(&s->host_timer);
-        usj_host_timer_cb(s);
+    for (;;) {
+        bool host = timer_pending(&s->host_timer) && s->host_next <= now;
+
+        if (s->xfer_busy && s->xfer_end <= now &&
+            (!host || s->xfer_end <= s->host_next)) {
+            timer_del(&s->xfer_timer);
+            usj_xfer_end(s);
+        } else if (host) {
+            timer_del(&s->host_timer);
+            esp32_line_run_at(s->host_next, usj_host_step, s);
+        } else {
+            return;
+        }
     }
 }
 
@@ -894,8 +913,8 @@ static void usj_finalize(Object *obj)
 
 static const VMStateDescription vmstate_esp32p4_usj = {
     .name = TYPE_ESP32P4_USB_SERIAL_JTAG,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(usb48, ESP32P4UsjState),
         VMSTATE_UINT32_ARRAY(regs, ESP32P4UsjState, ESP32P4_USJ_NREGS),
@@ -910,6 +929,7 @@ static const VMStateDescription vmstate_esp32p4_usj = {
         VMSTATE_UINT8(host_state, ESP32P4UsjState),
         VMSTATE_UINT32(host_step, ESP32P4UsjState),
         VMSTATE_INT64(host_deadline, ESP32P4UsjState),
+        VMSTATE_INT64(host_next, ESP32P4UsjState),
         VMSTATE_UINT32(frame, ESP32P4UsjState),
         VMSTATE_BOOL(host_dtr, ESP32P4UsjState),
         VMSTATE_BOOL(host_rts, ESP32P4UsjState),

@@ -1086,6 +1086,23 @@ static void dw_i2c_timer(void *opaque)
     line_run_at(s->timer_due, dw_i2c_timer_at, s);
 }
 
+/*
+ * [spec:nuos:req:emu.i2c]
+ * The steps and polls whose time has come by a register access, in order,
+ * each at its time: without icount their timer can run well after, while
+ * software polls IC_STATUS, RAW_INTR_STAT, TXFLR and RXFLR, as the
+ * pico-sdk's blocking transfers do, or reads DATA_CMD. Only a timer that
+ * has come is run.
+ */
+static void dw_i2c_catch_up(DesignWareI2CState *s)
+{
+    while (timer_pending(s->timer) &&
+           s->timer_due <= qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_del(s->timer);
+        line_run_at(s->timer_due, dw_i2c_timer_at, s);
+    }
+}
+
 /* A wire changes at its time (line_time()), from which a step can begin. */
 static void dw_i2c_scl_in(void *opaque, int n, int level)
 {
@@ -1266,6 +1283,7 @@ static uint64_t dw_i2c_read(void *opaque, hwaddr addr, unsigned size)
     DesignWareI2CState *s = opaque;
     DesignWareI2CClass *dc = DESIGNWARE_I2C_GET_CLASS(s);
 
+    dw_i2c_catch_up(s);
     switch (addr) {
     case A_CON:
         return s->con;
@@ -1384,6 +1402,7 @@ static void dw_i2c_write(void *opaque, hwaddr addr, uint64_t value,
     DesignWareI2CClass *dc = DESIGNWARE_I2C_GET_CLASS(s);
     uint32_t speed;
 
+    dw_i2c_catch_up(s);
     switch (addr) {
     case A_CON:
         if (dw_check_disabled(s, "IC_CON")) {

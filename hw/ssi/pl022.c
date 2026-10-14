@@ -249,12 +249,14 @@ static void pl022_update(PL022State *s)
     pl022_drive_pins(s);
 }
 
-/* Restart the receive timeout after receive FIFO activity. */
+/*
+ * Restart the receive timeout after receive FIFO activity, at its time
+ * (line_time()): a frame's end the host got to late counts from the end.
+ */
 static void pl022_rt_restart(PL022State *s)
 {
     if (s->rx_fifo_len && pl022_timed(s) && pl022_clocked(s)) {
-        timer_mod(s->rt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  pl022_ns(s, PL022_RT_BITS));
+        timer_mod(s->rt_timer, line_time() + pl022_ns(s, PL022_RT_BITS));
     } else {
         timer_del(s->rt_timer);
     }

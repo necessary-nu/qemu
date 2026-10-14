@@ -50,6 +50,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -367,6 +368,16 @@ static bool overcurrent(RP2350USBCtrlState *s)
 
 /* Virtual time of `cycles` clk_usb cycles. */
 /* [spec:nuos:req:emu.clock-tree] */
+/*
+ * The present, or the time of the event being taken: each of the
+ * controller's timers runs its event as of its due time, however late it
+ * runs, and what the event starts counts from then.
+ */
+static int64_t usb_now(void)
+{
+    return line_time();
+}
+
 static int64_t usb_cycles_ns(RP2350USBCtrlState *s, uint64_t cycles)
 {
     return clock_ticks_to_ns(s->clk, cycles);
@@ -375,7 +386,7 @@ static int64_t usb_cycles_ns(RP2350USBCtrlState *s, uint64_t cycles)
 /* clk_usb cycles counted by the PHY: SOF_TIMESTAMP_RAW's counter. */
 static uint64_t phy_cycles(RP2350USBCtrlState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = usb_now();
 
     if (now <= s->phy_base_ns) {
         return s->phy_base;
@@ -619,9 +630,9 @@ static void dev_bus_activity(RP2350USBCtrlState *s, bool reset)
             s->intr_events |= INTR_DEV_RESUME_FROM_HOST;
         }
     }
-    timer_mod(s->dev_idle_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                                 usb_cycles_ns(s, SUSPEND_FRAMES *
-                                                  FRAME_CYCLES));
+    s->dev_idle_due = usb_now() +
+                      usb_cycles_ns(s, SUSPEND_FRAMES * FRAME_CYCLES);
+    timer_mod(s->dev_idle_timer, s->dev_idle_due);
 }
 
 /* [spec:nuos:req:emu.usb] */
@@ -653,9 +664,9 @@ void rp2350_usbctrl_update_dev_port(RP2350USBCtrlState *s)
     if (present != s->dev_present) {
         s->dev_present = present;
         if (present) {
-            timer_mod(s->dev_idle_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      usb_cycles_ns(s, SUSPEND_FRAMES * FRAME_CYCLES));
+            s->dev_idle_due = usb_now() +
+                              usb_cycles_ns(s, SUSPEND_FRAMES * FRAME_CYCLES);
+            timer_mod(s->dev_idle_timer, s->dev_idle_due);
         } else {
             timer_del(s->dev_idle_timer);
             s->dev_suspended = false;
@@ -949,10 +960,11 @@ static int64_t host_xact_ns(RP2350USBCtrlState *s, uint32_t len)
 
 static void host_kick(RP2350USBCtrlState *s, int64_t delay)
 {
-    int64_t when = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay;
+    int64_t when = usb_now() + delay;
 
     if (!timer_pending(s->host_timer) ||
         timer_expire_time_ns(s->host_timer) > when) {
+        s->host_due = when;
         timer_mod(s->host_timer, when);
     }
 }
@@ -977,8 +989,7 @@ static void host_update_port_dev(RP2350USBCtrlState *s, USBDevice *dev)
     if (host_active(s) &&
         (s->sie_ctrl & (SIE_CTRL_SOF_EN | SIE_CTRL_KEEP_ALIVE_EN))) {
         if (!timer_pending(s->host_frame_timer)) {
-            s->host_frame_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                               usb_cycles_ns(s, FRAME_CYCLES);
+            s->host_frame_ns = usb_now() + usb_cycles_ns(s, FRAME_CYCLES);
             timer_mod(s->host_frame_timer, s->host_frame_ns);
         }
     } else {
@@ -1065,8 +1076,9 @@ static void host_issue(RP2350USBCtrlState *s, int slot, int pid, uint8_t addr,
     s->xact_ep = ep;
     s->xact_sel = sel;
     s->xact_len = len;
-    timer_mod(s->host_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              host_xact_ns(s, pid == USB_TOKEN_IN ? 0 : len));
+    s->host_due = usb_now() +
+                  host_xact_ns(s, pid == USB_TOKEN_IN ? 0 : len);
+    timer_mod(s->host_timer, s->host_due);
 
     /*
      * A device answers at address 0 once powered; QEMU's devices wait for
@@ -1109,8 +1121,8 @@ static void host_issue(RP2350USBCtrlState *s, int slot, int pid, uint8_t addr,
     }
     host_xact_done(s, s->packet.status, s->packet.actual_length);
     if (pid == USB_TOKEN_IN) {
-        timer_mod(s->host_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  host_xact_ns(s, s->packet.actual_length));
+        s->host_due = usb_now() + host_xact_ns(s, s->packet.actual_length);
+        timer_mod(s->host_timer, s->host_due);
     }
 }
 
@@ -1133,8 +1145,7 @@ static void host_nak_retry(RP2350USBCtrlState *s)
         return;
     }
     s->nak_retry = MIN(s->nak_retry + 1, 0x3ffu);
-    s->epx_retry_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      (int64_t)delay * SCALE_US;
+    s->epx_retry_ns = usb_now() + (int64_t)delay * SCALE_US;
 }
 
 /*
@@ -1331,7 +1342,7 @@ static bool host_int_poll(RP2350USBCtrlState *s, int i)
 static void host_run(void *opaque)
 {
     RP2350USBCtrlState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = usb_now();
 
     if (s->xact_async || !host_active(s)) {
         return;
@@ -1804,11 +1815,79 @@ static void usb_reg_write(RP2350USBCtrlState *s, hwaddr addr, uint32_t value)
  * The registers are 32 bits wide: a narrow write is replicated across the
  * bus and writes the whole register; a narrow read returns its lanes.
  */
+/* A transaction, frame or suspend runs at its time however late. */
+static void host_run_cb(void *opaque)
+{
+    RP2350USBCtrlState *s = opaque;
+
+    line_run_at(s->host_due, host_run, s);
+}
+
+static void host_frame_cb(void *opaque)
+{
+    RP2350USBCtrlState *s = opaque;
+
+    line_run_at(s->host_frame_ns, host_frame, s);
+}
+
+static void dev_idle_cb(void *opaque)
+{
+    RP2350USBCtrlState *s = opaque;
+
+    line_run_at(s->dev_idle_due, dev_idle, s);
+}
+
+/*
+ * [spec:nuos:req:emu.usb]
+ * Take the controller's events due by an access, the bridge's among
+ * them, earliest first, each at its time: without icount their timers
+ * can run well after, while software polls BUFF_STATUS, SIE_STATUS's
+ * TRANS_COMPLETE or SUSPENDED, INTR or SOF_RD, or reads the buffer
+ * control words in the DPRAM. Only a timer that has come is run.
+ */
+static void usb_catch_up(RP2350USBCtrlState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (;;) {
+        struct {
+            QEMUTimer *timer;
+            int64_t due;
+            void (*run)(void *opaque);
+        } ev[] = {
+            { s->host_timer, s->host_due, host_run },
+            { s->host_frame_timer, s->host_frame_ns, host_frame },
+            { s->dev_idle_timer, s->dev_idle_due, dev_idle },
+        };
+        QEMUTimer *timer = NULL;
+        void (*run)(void *opaque) = NULL;
+        int64_t due = now;
+
+        for (int i = 0; i < ARRAY_SIZE(ev); i++) {
+            if (timer_pending(ev[i].timer) && ev[i].due <= due &&
+                (!timer || ev[i].due < due)) {
+                timer = ev[i].timer;
+                run = ev[i].run;
+                due = ev[i].due;
+            }
+        }
+        rp2350_usb_bridge_next(s, &due, &timer, &run);
+        if (!timer) {
+            return;
+        }
+        timer_del(timer);
+        line_run_at(due, run, s);
+    }
+}
+
 static uint64_t rp2350_usbctrl_regs_read(void *opaque, hwaddr addr,
                                          unsigned size)
 {
     RP2350USBCtrlState *s = opaque;
-    uint32_t v = usb_reg_read(s, rp2350_atomic_reg(addr & ~3));
+    uint32_t v;
+
+    usb_catch_up(s);
+    v = usb_reg_read(s, rp2350_atomic_reg(addr & ~3));
 
     return extract32(v, (addr & 3) * 8, size * 8);
 }
@@ -1819,6 +1898,7 @@ static void rp2350_usbctrl_regs_write(void *opaque, hwaddr addr,
     RP2350USBCtrlState *s = opaque;
     uint32_t v = value;
 
+    usb_catch_up(s);
     if (size == 1) {
         v = (v & 0xff) * 0x01010101u;
     } else if (size == 2) {
@@ -1848,6 +1928,7 @@ static uint64_t rp2350_usbctrl_dpram_read(void *opaque, hwaddr addr,
 {
     RP2350USBCtrlState *s = opaque;
 
+    usb_catch_up(s);
     return ldn_le_p(&s->dpram[addr], size);
 }
 
@@ -1857,6 +1938,7 @@ static void rp2350_usbctrl_dpram_write(void *opaque, hwaddr addr,
 {
     RP2350USBCtrlState *s = opaque;
 
+    usb_catch_up(s);
     stn_le_p(&s->dpram[addr], size, value);
     if (addr < DPRAM_BUF_CTRL_START || addr >= DPRAM_BUF_CTRL_END) {
         return;
@@ -2032,9 +2114,9 @@ static void rp2350_usbctrl_realize(DeviceState *dev, Error **errp)
     usb_register_port(&s->bus, &s->port, s, 0, &rp2350_usbctrl_port_ops,
                       USB_SPEED_MASK_LOW | USB_SPEED_MASK_FULL);
     usb_packet_init(&s->packet);
-    s->host_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, host_run, s);
-    s->host_frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, host_frame, s);
-    s->dev_idle_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dev_idle, s);
+    s->host_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, host_run_cb, s);
+    s->host_frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, host_frame_cb, s);
+    s->dev_idle_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dev_idle_cb, s);
     rp2350_usb_bridge_realize(s);
 }
 
@@ -2054,8 +2136,8 @@ static int rp2350_usbctrl_pre_save(void *opaque)
 
 static const VMStateDescription vmstate_rp2350_usbctrl = {
     .name = TYPE_RP2350_USBCTRL,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .pre_save = rp2350_usbctrl_pre_save,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(dpram, RP2350USBCtrlState,
@@ -2104,6 +2186,8 @@ static const VMStateDescription vmstate_rp2350_usbctrl = {
         VMSTATE_TIMER_PTR(dev_idle_timer, RP2350USBCtrlState),
         VMSTATE_TIMER_PTR(host_frame_timer, RP2350USBCtrlState),
         VMSTATE_INT64(host_frame_ns, RP2350USBCtrlState),
+        VMSTATE_INT64(host_due, RP2350USBCtrlState),
+        VMSTATE_INT64(dev_idle_due, RP2350USBCtrlState),
         VMSTATE_TIMER_PTR(host_timer, RP2350USBCtrlState),
         VMSTATE_UINT8(host_speed, RP2350USBCtrlState),
         VMSTATE_BOOL(epx_active, RP2350USBCtrlState),

@@ -1726,6 +1726,87 @@ static void etm_events(ESP32P4GpioState *s, uint64_t pf, int64_t t)
                     ESP32P4_GPIO_SIGS - SIG_LOOPBACK_FIRST)
 
 /*
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * Whether anything but software sampling the pads sees pad n's level
+ * change (esp32p4_gpio_sig_out_watched()), from the routing just built:
+ * a line of it that something listens to (its level, a watcher
+ * esp32p4_gpio_watch_pad() added, its drive for the analog blocks), a
+ * board wire to other pads, its interrupt type or wakeup (GPIO_STATUS
+ * latches an edge whatever INT_ENA says), an input signal a modelled
+ * block takes from it, a direct IO MUX input that one does, or, on an LP
+ * pad, the same on the LP side. The ETM event channels on pads are added
+ * by the caller.
+ */
+static bool pad_watched(ESP32P4GpioState *s, unsigned n)
+{
+    const ESP32P4GpioRoutes *r = &s->routes;
+    const IomuxFunc *fn;
+    unsigned f;
+
+    if (s->pad_out[n] || s->pad_watches[n] || s->drive_high_out[n] ||
+        s->drive_low_out[n] || r->wire_net[n] != BIT_ULL(n) ||
+        bit64(r->wakeup, n)) {
+        return true;
+    }
+    for (unsigned t = 1; t < ESP32P4_GPIO_INT_TYPES; t++) {
+        if (bit64(r->int_type[t], n)) {
+            return true;
+        }
+    }
+    for (unsigned w = 0; w < ESP32P4_GPIO_SIG_WORDS; w++) {
+        for (uint64_t m = r->chain_sigs[n][w] | r->direct_sigs[n][w]; m;
+             m &= m - 1) {
+            unsigned sig = w * 64 + ctz64(m);
+
+            if (s->sig_in_out[sig] || sig >= SIG_LOOPBACK_FIRST) {
+                return true;
+            }
+        }
+    }
+    fn = hp_func(s, n, &f);
+    if (fn->kind == IOMUX_DIRECT &&
+        s->iomux_in_out[ESP32P4_GPIO_IOMUX_LINE(n, f)]) {
+        return true;
+    }
+    if (n < ESP32P4_GPIO_LP_PADS) {
+        if (lp_owned(s, n) || (r->lp_wakeup & BIT(n))) {
+            return true;
+        }
+        for (unsigned t = 1; t < ESP32P4_GPIO_INT_TYPES; t++) {
+            if (bit64(r->lp_int_type[t], n)) {
+                return true;
+            }
+        }
+        for (uint32_t m = r->lp_chain_sigs[n]; m; m &= m - 1) {
+            if (s->lp_sig_in_out[ctz32(m)]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static uint64_t routes_watched(ESP32P4GpioState *s)
+{
+    uint64_t watched = 0;
+
+    for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
+        if (pad_watched(s, n)) {
+            watched |= BIT_ULL(n);
+        }
+    }
+    for (unsigned ch = 0; ch < ESP32P4_GPIO_ETM_CHANNELS; ch++) {
+        uint32_t cfg = s->etm_event_cfg[ch];
+        unsigned n = FIELD_EX32(cfg, ETM_EVENT, SEL);
+
+        if (FIELD_EX32(cfg, ETM_EVENT, EN) && n < ESP32P4_GPIO_PADS) {
+            watched |= BIT_ULL(n);
+        }
+    }
+    return watched;
+}
+
+/*
  * Take the routing from the registers: the pads each output signal
  * drives, the input signals each pad reaches, and the pads of each
  * interrupt type and enable.
@@ -1824,6 +1905,7 @@ static void routes_build(ESP32P4GpioState *s)
             r->lp_chain_sigs[sel] |= 1u << sig;
         }
     }
+    r->watched = routes_watched(s);
 }
 
 /*
@@ -2063,6 +2145,11 @@ static void esp32p4_gpio_settle_deferred(void *opaque)
     }
 }
 
+static void notify_route(ESP32P4GpioState *s)
+{
+    notifier_list_notify(&s->route_notifiers, s);
+}
+
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
  * Resolve the pads until the routing settles. Every line this drives
@@ -2098,6 +2185,10 @@ static void esp32p4_gpio_update_pads(ESP32P4GpioState *s, uint64_t pads)
     s->update_pending = false;
     s->updating = false;
     filters_schedule(s);
+    if (s->routes.watched != s->watched_told) {
+        s->watched_told = s->routes.watched;
+        notify_route(s);
+    }
 }
 
 /*
@@ -2132,11 +2223,6 @@ static bool esp32p4_gpio_held_back(ESP32P4GpioState *s, LineInput *fn,
                                    int n, int level)
 {
     return held_back(s, fn, s, n, level);
-}
-
-static void notify_route(ESP32P4GpioState *s)
-{
-    notifier_list_notify(&s->route_notifiers, s);
 }
 
 /* A filter output change, at the time it falls due, esp32_line_time(). */
@@ -2223,6 +2309,12 @@ uint64_t esp32p4_gpio_sig_out_pads(ESP32P4GpioState *s, unsigned sig)
         }
     }
     return pads;
+}
+
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+bool esp32p4_gpio_sig_out_watched(ESP32P4GpioState *s, unsigned sig)
+{
+    return (esp32p4_gpio_sig_out_pads(s, sig) & s->routes.watched) != 0;
 }
 
 /* [spec:nuos:req:emu.esp32p4.gpio] */
@@ -4496,10 +4588,24 @@ static const VMStateDescription vmstate_esp32p4_gpio = {
     },
 };
 
+static bool esp32p4_gpio_routes_out_watched(Object *obj, unsigned sig)
+{
+    return esp32p4_gpio_sig_out_watched(ESP32P4_GPIO(obj), sig);
+}
+
+static void esp32p4_gpio_routes_add_notifier(Object *obj, Notifier *n)
+{
+    esp32p4_gpio_add_route_notifier(ESP32P4_GPIO(obj), n);
+}
+
 static void esp32p4_gpio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
+    Esp32SigRoutesClass *src = ESP32_SIG_ROUTES_CLASS(klass);
+
+    src->sig_out_watched = esp32p4_gpio_routes_out_watched;
+    src->add_route_notifier = esp32p4_gpio_routes_add_notifier;
 
     rc->phases.hold = esp32p4_gpio_reset_hold;
     rc->phases.exit = esp32p4_gpio_reset_exit;
@@ -4543,6 +4649,10 @@ static const TypeInfo esp32p4_gpio_info = {
     .instance_init = esp32p4_gpio_init,
     .instance_finalize = esp32p4_gpio_finalize,
     .class_init = esp32p4_gpio_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { TYPE_ESP32_SIG_ROUTES },
+        { }
+    },
 };
 
 static void esp32p4_gpio_register_types(void)

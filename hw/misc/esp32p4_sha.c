@@ -73,6 +73,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_sha.h"
 #include "migration/vmstate.h"
 #include "target/riscv/esp32p4_cpu.h"
@@ -211,8 +212,21 @@ static void sha_gdma_ready(void *opaque)
     sha_pump(opaque);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.crypto]
+ * GDMA's register access: the blocks whose cycles have run by then are
+ * done, as their DMA descriptors and EOF show then.
+ */
+static void sha_gdma_sync(void *opaque, int64_t when)
+{
+    ESP32P4ShaDevState *s = opaque;
+
+    esp32p4_crypto_timer_sync(&s->op, when);
+}
+
 static const ESP32P4GdmaPeriphOps sha_gdma_ops = {
     .tx_ready = sha_gdma_ready,
+    .sync = sha_gdma_sync,
 };
 
 /* [spec:nuos:req:emu.esp32p4.crypto] */
@@ -251,6 +265,7 @@ static uint64_t sha_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr reg = addr & ~3;
     uint32_t v = 0;
 
+    esp32p4_crypto_timer_sync(&s->op, esp32_line_time());
     if (s->occupied) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read at 0x%" HWADDR_PRIx
                       " while another block occupies the accelerator\n",
@@ -309,6 +324,7 @@ static MemTxResult sha_write(void *opaque, hwaddr addr, uint64_t value,
     int shift = (addr & 3) * 8;
     uint32_t v = deposit32(0, shift, size * 8, value);
 
+    esp32p4_crypto_timer_sync(&s->op, esp32_line_time());
     if (s->occupied || sha_in_reset(s) || !clock_is_enabled(s->clk)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write at 0x%" HWADDR_PRIx
                       " dropped: the accelerator is %s\n", TYPE_ESP32P4_SHA,

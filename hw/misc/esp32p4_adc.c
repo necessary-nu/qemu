@@ -1066,6 +1066,30 @@ static void adc_lp_abort(ESP32P4AdcState *s, int64_t when)
     }
 }
 
+/* ---- Catching up ---- */
+
+/*
+ * [spec:nuos:req:emu.esp32p4.analog]
+ * Take, in time order and each at its own time, the sampling timer's
+ * ticks, the conversions' ends and the LP timers' ticks due by @now,
+ * which without icount their QEMU timers can run well after: a register
+ * access, and GDMA's, first find the controllers as they are then, a
+ * oneshot's MEAS_DONE and data in place, the HP controller's INT_RAW
+ * raised and the samples in GDMA's channel. An input (an ETM task, a
+ * reset, a clock change) takes those due before it.
+ */
+static void adc_catch_up(ESP32P4AdcState *s, int64_t now)
+{
+    ESP32P4ClkWait *waits[] = {
+        &s->hp_timer,
+        &s->unit[0].hp_conv, &s->unit[1].hp_conv,
+        &s->unit[0].lp_conv, &s->unit[1].lp_conv,
+        &s->unit[0].hw_timer, &s->unit[1].hw_timer,
+    };
+
+    esp32p4_clkwaits_catch_up(waits, ARRAY_SIZE(waits), now);
+}
+
 /* ---- Registers ---- */
 
 static uint64_t adc_hp_read(void *opaque, hwaddr addr, unsigned size)
@@ -1074,6 +1098,7 @@ static uint64_t adc_hp_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr reg = addr & ~3;
     uint32_t v;
 
+    adc_catch_up(s, esp32_line_time());
     if (reg >= ESP32P4_ADC_HP_NREGS * 4 || !hp_reg_info[reg / 4].valid) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of reserved HP offset 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_ADC, addr);
@@ -1106,6 +1131,7 @@ static void adc_hp_write(void *opaque, hwaddr addr, uint64_t value,
     const AdcReg *info;
     uint32_t *r, old;
 
+    adc_catch_up(s, now);
     if (reg >= ESP32P4_ADC_HP_NREGS * 4 || !hp_reg_info[reg / 4].valid) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write of reserved HP offset 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_ADC, addr);
@@ -1205,6 +1231,7 @@ static uint64_t adc_lp_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr reg = addr & ~3;
     uint32_t v;
 
+    adc_catch_up(s, esp32_line_time());
     if (reg >= ESP32P4_ADC_LP_NREGS * 4 || !lp_reg_info[reg / 4].valid) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of reserved LP offset 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_ADC, addr);
@@ -1239,6 +1266,7 @@ static void adc_lp_write(void *opaque, hwaddr addr, uint64_t value,
     const AdcReg *info;
     uint32_t *r, old;
 
+    adc_catch_up(s, now);
     if (reg >= ESP32P4_ADC_LP_NREGS * 4 || !lp_reg_info[reg / 4].valid) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write of reserved LP offset 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_ADC, addr);
@@ -1352,6 +1380,7 @@ static void adc_etm_task(void *opaque, int n, int level)
     if (!level) {
         return;
     }
+    adc_catch_up(s, when - 1);
     switch (n) {
     case ESP32P4_ADC_TASK_SAMPLE0:
     case ESP32P4_ADC_TASK_SAMPLE1: {
@@ -1407,6 +1436,7 @@ static void adc_set_hp_reset(void *opaque, int n, int level)
     if (s->hp_in_reset == !!level) {
         return;
     }
+    adc_catch_up(s, now - 1);
     adc_hp_abort(s, now);
     adc_hp_reset_regs(s);
     s->hp_in_reset = level;
@@ -1425,6 +1455,7 @@ static void adc_set_lp_reset(void *opaque, int n, int level)
     if (s->lp_in_reset == !!level) {
         return;
     }
+    adc_catch_up(s, now - 1);
     adc_lp_abort(s, now);
     adc_lp_reset_regs(s);
     s->lp_in_reset = level;
@@ -1437,6 +1468,7 @@ static void adc_clk_update(void *opaque, ClockEvent event)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (event == ClockPreUpdate) {
+        adc_catch_up(s, esp32_line_time() - 1);
         esp32p4_clkwait_fold(&s->hp_timer, now);
         for (unsigned u = 0; u < ESP32P4_ADC_UNITS; u++) {
             esp32p4_clkwait_fold(&s->unit[u].hp_conv, now);
@@ -1459,6 +1491,9 @@ static void adc_lp_clk_update(void *opaque, ClockEvent event)
     ESP32P4AdcState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    if (event == ClockPreUpdate) {
+        adc_catch_up(s, esp32_line_time() - 1);
+    }
     for (unsigned u = 0; u < ESP32P4_ADC_UNITS; u++) {
         if (event == ClockPreUpdate) {
             esp32p4_clkwait_fold(&s->unit[u].hw_timer, now);
@@ -1472,6 +1507,7 @@ static void adc_lp_sar_clk_update(ESP32P4AdcState *s, unsigned u,
                                   ClockEvent event)
 {
     if (event == ClockPreUpdate) {
+        adc_catch_up(s, esp32_line_time() - 1);
         esp32p4_clkwait_fold(&s->unit[u].lp_conv,
                              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     } else {
@@ -1494,9 +1530,15 @@ static void adc_dma_ready(void *opaque)
 {
 }
 
+static void adc_dma_sync(void *opaque, int64_t when)
+{
+    adc_catch_up(opaque, when);
+}
+
 static const ESP32P4GdmaPeriphOps adc_dma_ops = {
     .tx_ready = adc_dma_ready,
     .rx_ready = adc_dma_ready,
+    .sync = adc_dma_sync,
 };
 
 /* ---- Analog inputs ---- */

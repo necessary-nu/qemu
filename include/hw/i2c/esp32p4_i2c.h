@@ -122,6 +122,10 @@ struct ESP32P4I2CState {
     QEMUTimer slv_timer;
     QEMUTimer to_timer;
     QEMUTimer flt_timer[2];
+    /* Taking the timed events due by an access or an input edge. */
+    bool catching_up;
+    /* A line source: its SCL and SDA changes are timed events. */
+    Notifier line_source;
 
     /*
      * Registers as software sees them, and the copies in the I2C_SCLK

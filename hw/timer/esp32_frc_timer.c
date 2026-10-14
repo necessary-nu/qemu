@@ -95,10 +95,29 @@ static void esp32_frc_timer_update_config(Esp32FrcTimerState *s,
 }
 
 
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * Fire the alarm if the count has reached it by the access being made:
+ * without icount its timer can run well after, while software reads
+ * CTRL's STATUS, or changes the rate or the alarm, which would otherwise
+ * re-arm it past the count it was due at.
+ */
+static void esp32_frc_timer_catch_up(Esp32FrcTimerState *s)
+{
+    if (timer_pending(&s->alarm_timer) &&
+        timer_expire_time_ns(&s->alarm_timer) <=
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_del(&s->alarm_timer);
+        esp32_frc_timer_cb(s);
+    }
+}
+
 static uint64_t esp32_frc_timer_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp32FrcTimerState *s = ESP32_FRC_TIMER(opaque);
     uint64_t r = 0;
+
+    esp32_frc_timer_catch_up(s);
     switch (addr) {
     case A_FRC_TIMER_ALARM:
         r = s->alarm_reg;
@@ -130,6 +149,8 @@ static void esp32_frc_timer_write(void *opaque, hwaddr addr,
                        uint64_t value, unsigned int size)
 {
     Esp32FrcTimerState *s = ESP32_FRC_TIMER(opaque);
+
+    esp32_frc_timer_catch_up(s);
     trace_esp32_frc_timer_write(addr, value);
     switch (addr) {
     case A_FRC_TIMER_INT_CLR:
@@ -183,6 +204,7 @@ static void esp32_frc_timer_apb_clk_update(void *opaque, ClockEvent event)
     uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (event == ClockPreUpdate) {
+        esp32_frc_timer_catch_up(s);
         s->count_base = esp32_frc_timer_get_count(s, ns_now);
         s->ns_base = ns_now;
     } else if (s->enable) {

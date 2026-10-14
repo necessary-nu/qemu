@@ -1277,6 +1277,44 @@ static bool powman_nonsec_reg(hwaddr reg)
 }
 
 /* [spec:nuos:req:emu.powman] */
+/*
+ * [spec:nuos:req:emu.powman]
+ * Take what has come by the access being made, earliest first: the
+ * always-on timer reaching its alarm (TIMER.ALARM, INTR.TIMER), a tick
+ * source switch taking effect (TIMER.USING_*), the regulator settling
+ * (VREG_STS.VOUT_OK, VREG.UPDATE_IN_PROGRESS). Without icount their
+ * timers can run well after, while software reads READ_TIME past the
+ * alarm, polls USING_*, or waits on UPDATE_IN_PROGRESS, whose stale value
+ * would also drop a VREG write. The power sequencer's steps, which can
+ * reset the chip, are left to their timer. Only a timer that has come is
+ * run.
+ */
+static void powman_catch_up(RP2350PowmanState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (;;) {
+        QEMUTimer *t[] = { s->alarm_timer, s->switch_timer, s->vreg_timer };
+        QEMUTimerCB *cb[] = { aon_alarm_cb, aon_switch_cb, vreg_cb };
+        int64_t due = now;
+        int next = -1;
+
+        for (int i = 0; i < ARRAY_SIZE(t); i++) {
+            int64_t at = timer_expire_time_ns(t[i]);
+
+            if (timer_pending(t[i]) && at <= due && (next < 0 || at < due)) {
+                next = i;
+                due = at;
+            }
+        }
+        if (next < 0) {
+            return;
+        }
+        timer_del(t[next]);
+        cb[next](s);
+    }
+}
+
 static MemTxResult rp2350_powman_read(void *opaque, hwaddr addr,
                                       uint64_t *data, unsigned size,
                                       MemTxAttrs attrs)
@@ -1285,6 +1323,7 @@ static MemTxResult rp2350_powman_read(void *opaque, hwaddr addr,
     hwaddr reg = rp2350_atomic_reg(addr) & ~3;
     uint32_t v;
 
+    powman_catch_up(s);
     if (!attrs.secure && !attrs.unspecified && !powman_nonsec_reg(reg)) {
         qemu_log_mask(LOG_GUEST_ERROR, "rp2350-powman: Non-secure read of "
                       "offset 0x%" HWADDR_PRIx "\n", reg);
@@ -1488,6 +1527,7 @@ static MemTxResult rp2350_powman_write(void *opaque, hwaddr addr,
     bool secure = attrs.secure || attrs.unspecified;
     uint32_t v = value, old, eff;
 
+    powman_catch_up(s);
     /* A narrow write is replicated across the bus and writes the whole. */
     if (size == 1) {
         v = (v & 0xff) * 0x01010101u;

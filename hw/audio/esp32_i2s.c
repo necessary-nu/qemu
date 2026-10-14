@@ -929,8 +929,7 @@ static void i2s_hung_update(Esp32I2sState *s, QEMUTimer *t, bool *fired,
         *fired = false;
     }
     if (!*fired && !timer_pending(t)) {
-        timer_mod_ns(t, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                     i2s_hung_ns(s));
+        timer_mod_ns(t, esp32_line_time() + i2s_hung_ns(s));
     }
 }
 
@@ -2426,13 +2425,14 @@ static bool i2s_timer_due(QEMUTimer *t, int64_t now)
 /*
  * [spec:nuos:req:emu.esp32.i2s]
  * A register access first runs every event of the units due by its
- * moment, each at its own time, so that what software reads (the FIFOs,
- * INT_RAW, the outlink's progress) does not depend on how promptly the
- * host runs the units' timers.
+ * moment, each at its own time, then the FIFO timeouts due by then, at
+ * theirs, so that what software reads (the FIFOs, INT_RAW, the outlink's
+ * progress) does not depend on how promptly the host runs their timers.
+ * A clock change first runs those due before it, at the old rate.
  */
-static void i2s_catch_up(Esp32I2sState *s)
+static void i2s_catch_up_to(Esp32I2sState *s, int64_t now)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t t;
 
     if (i2s_timer_due(&s->tx_timer, now)) {
         i2s_tx_timer_cb(s);
@@ -2440,6 +2440,21 @@ static void i2s_catch_up(Esp32I2sState *s)
     if (i2s_timer_due(&s->rx_timer, now)) {
         i2s_rx_timer_cb(s);
     }
+    t = timer_expire_time_ns(&s->tx_hung_timer);
+    if (i2s_timer_due(&s->tx_hung_timer, now)) {
+        timer_del(&s->tx_hung_timer);
+        esp32_line_run_at(t, i2s_tx_hung_cb, s);
+    }
+    t = timer_expire_time_ns(&s->rx_hung_timer);
+    if (i2s_timer_due(&s->rx_hung_timer, now)) {
+        timer_del(&s->rx_hung_timer);
+        esp32_line_run_at(t, i2s_rx_hung_cb, s);
+    }
+}
+
+static void i2s_catch_up(Esp32I2sState *s)
+{
+    i2s_catch_up_to(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 /* [spec:nuos:req:emu.esp32.i2s] */
@@ -2789,6 +2804,10 @@ static void esp32_i2s_clock_update(void *opaque, ClockEvent event)
 {
     Esp32I2sState *s = opaque;
 
+    if (event == ClockPreUpdate) {
+        i2s_catch_up_to(s, esp32_line_time() - 1);
+        return;
+    }
     i2s_update_units(s, true);
     i2s_kick(s);
 }
@@ -2912,11 +2931,14 @@ static void esp32_i2s_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), i2s_sig_in, ESP32_I2S_SIG_IN,
                             ESP32_I2S_IN_COUNT);
     s->apb_clk = qdev_init_clock_in(DEVICE(obj), "apb",
-                                    esp32_i2s_clock_update, s, ClockUpdate);
+                                    esp32_i2s_clock_update, s,
+                                    ClockPreUpdate | ClockUpdate);
     s->f160m_clk = qdev_init_clock_in(DEVICE(obj), "pll-f160m",
-                                      esp32_i2s_clock_update, s, ClockUpdate);
+                                      esp32_i2s_clock_update, s,
+                                      ClockPreUpdate | ClockUpdate);
     s->apll_clk = qdev_init_clock_in(DEVICE(obj), "apll",
-                                     esp32_i2s_clock_update, s, ClockUpdate);
+                                     esp32_i2s_clock_update, s,
+                                     ClockPreUpdate | ClockUpdate);
     timer_init_ns(&s->tx_timer, QEMU_CLOCK_VIRTUAL, i2s_tx_timer_cb, s);
     timer_init_ns(&s->rx_timer, QEMU_CLOCK_VIRTUAL, i2s_rx_timer_cb, s);
     timer_init_ns(&s->tx_hung_timer, QEMU_CLOCK_VIRTUAL, i2s_tx_hung_cb, s);

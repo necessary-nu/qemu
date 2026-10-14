@@ -27,6 +27,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "chardev/char-fe.h"
+#include "hw/core/line-time.h"
 #include "hw/usb/rp2350_usbctrl.h"
 #include "migration/vmstate.h"
 
@@ -84,9 +85,16 @@ typedef enum {
     BR_FAIL,
 } BrResult;
 
+/* The present, or the time of the bridge's event being taken. */
 static int64_t br_now(void)
 {
-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return line_time();
+}
+
+static void br_timer_at(RP2350USBCtrlState *s, int64_t when)
+{
+    s->br_due = when;
+    timer_mod(s->br_timer, when);
 }
 
 static int64_t br_xact_ns(uint32_t len)
@@ -242,7 +250,7 @@ static void br_set_state(RP2350USBCtrlState *s, RP2350USBBridgeState state,
 {
     s->br_state = state;
     s->br_waiting = false;
-    timer_mod(s->br_timer, br_now() + delay);
+    br_timer_at(s, br_now() + delay);
 }
 
 /* Start enumeration step `step`. */
@@ -394,7 +402,7 @@ static void br_frame(void *opaque)
     rp2350_usbctrl_dev_sof(s, s->br_frame);
     if (s->br_waiting) {
         s->br_waiting = false;
-        timer_mod(s->br_timer, br_now() + br_xact_ns(0));
+        br_timer_at(s, br_now() + br_xact_ns(0));
     }
 }
 
@@ -486,7 +494,44 @@ static void br_run(void *opaque)
         s->br_waiting = true;
         return;
     }
-    timer_mod(s->br_timer, br_now() + ns);
+    br_timer_at(s, br_now() + ns);
+}
+
+/* A frame or step runs at its time however late its timer runs. */
+static void br_frame_cb(void *opaque)
+{
+    RP2350USBCtrlState *s = opaque;
+
+    line_run_at(s->br_frame_ns, br_frame, s);
+}
+
+static void br_run_cb(void *opaque)
+{
+    RP2350USBCtrlState *s = opaque;
+
+    line_run_at(s->br_due, br_run, s);
+}
+
+/* [spec:nuos:req:emu.usb] */
+bool rp2350_usb_bridge_next(RP2350USBCtrlState *s, int64_t *due,
+                            QEMUTimer **timer, void (**run)(void *opaque))
+{
+    bool found = false;
+
+    if (timer_pending(s->br_frame_timer) && s->br_frame_ns <= *due) {
+        *due = s->br_frame_ns;
+        *timer = s->br_frame_timer;
+        *run = br_frame;
+        found = true;
+    }
+    if (timer_pending(s->br_timer) && s->br_due <= *due &&
+        (!found || s->br_due < *due)) {
+        *due = s->br_due;
+        *timer = s->br_timer;
+        *run = br_run;
+        found = true;
+    }
+    return found;
 }
 
 void rp2350_usb_bridge_kick(RP2350USBCtrlState *s)
@@ -497,7 +542,7 @@ void rp2350_usb_bridge_kick(RP2350USBCtrlState *s)
         s->br_waiting = false;
         if (!timer_pending(s->br_timer) ||
             timer_expire_time_ns(s->br_timer) > when) {
-            timer_mod(s->br_timer, when);
+            br_timer_at(s, when);
         }
     }
 }
@@ -687,8 +732,8 @@ static void tok_event(void *opaque, QEMUChrEvent event)
 
 void rp2350_usb_bridge_realize(RP2350USBCtrlState *s)
 {
-    s->br_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, br_run, s);
-    s->br_frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, br_frame, s);
+    s->br_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, br_run_cb, s);
+    s->br_frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, br_frame_cb, s);
     if (qemu_chr_fe_backend_connected(&s->cdc_chr)) {
         qemu_chr_fe_set_handlers(&s->cdc_chr, br_can_receive, br_receive,
                                  br_event, NULL, s, NULL, true);
@@ -713,14 +758,15 @@ void rp2350_usb_bridge_reset(RP2350USBCtrlState *s)
 
 const VMStateDescription vmstate_rp2350_usb_bridge = {
     .name = TYPE_RP2350_USBCTRL "/bridge",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(br_state, RP2350USBCtrlState),
         VMSTATE_TIMER_PTR(br_timer, RP2350USBCtrlState),
         VMSTATE_TIMER_PTR(br_frame_timer, RP2350USBCtrlState),
         VMSTATE_UINT16(br_frame, RP2350USBCtrlState),
         VMSTATE_INT64(br_frame_ns, RP2350USBCtrlState),
+        VMSTATE_INT64(br_due, RP2350USBCtrlState),
         VMSTATE_UINT8(br_addr, RP2350USBCtrlState),
         VMSTATE_UINT8(br_mps0, RP2350USBCtrlState),
         VMSTATE_UINT8(br_step, RP2350USBCtrlState),

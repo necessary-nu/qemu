@@ -604,7 +604,7 @@ static void dwc2_set_mode(DWC2OTGState *s, bool host)
     dwc2_update_otg_outputs(s);
 }
 
-static void dwc2_mode_timer(void *opaque)
+static void dwc2_mode_switch(void *opaque)
 {
     DWC2OTGState *s = opaque;
 
@@ -612,6 +612,57 @@ static void dwc2_mode_timer(void *opaque)
     dwc2_otg_dev_update_present(s);
     dwc2_otg_host_update_port(s);
     dwc2_otg_update_irq(s);
+}
+
+static void dwc2_mode_timer(void *opaque)
+{
+    DWC2OTGState *s = opaque;
+
+    line_run_at(s->mode_due, dwc2_mode_switch, s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.usb]
+ * Take the core's events due by now, in time order, each at its time:
+ * the mode switch, the host's frames and bus steps, the device's
+ * suspend and end of frame. Without icount their timers can run well
+ * after, while software reads GINTSTS (CurMod after a forced mode, SOF,
+ * USBSusp, EOPF), HFNUM, a channel's HCINT or DSTS. A register access
+ * first takes them. Only a timer that has come is run.
+ */
+void dwc2_otg_catch_up(DWC2OTGState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (;;) {
+        struct {
+            QEMUTimer *timer;
+            int64_t due;
+            void (*run)(void *opaque);
+        } ev[] = {
+            { s->mode_timer, s->mode_due, dwc2_mode_switch },
+            { s->frame_timer, s->frame_start_ns + s->frame_ns,
+              dwc2_otg_host_frame },
+            { s->bus_timer, s->bus_due, dwc2_otg_host_bus },
+            { s->idle_timer, s->idle_due, dwc2_otg_dev_idle },
+            { s->eopf_timer, s->eopf_due, dwc2_otg_dev_eopf },
+        };
+        int64_t due = now;
+        int next = -1;
+
+        for (int i = 0; i < ARRAY_SIZE(ev); i++) {
+            if (timer_pending(ev[i].timer) && ev[i].due <= due &&
+                (next < 0 || ev[i].due < due)) {
+                next = i;
+                due = ev[i].due;
+            }
+        }
+        if (next < 0) {
+            return;
+        }
+        timer_del(ev[next].timer);
+        line_run_at(due, ev[next].run, s);
+    }
 }
 
 /*
@@ -882,8 +933,8 @@ static void dwc2_gusbcfg_write(DWC2OTGState *s, uint32_t val)
                       "device mode\n", s->name);
     }
     if ((val ^ s->gusbcfg) & mode) {
-        timer_mod(s->mode_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  DWC2_MODE_SWITCH_NS);
+        s->mode_due = dwc2_otg_now() + DWC2_MODE_SWITCH_NS;
+        timer_mod(s->mode_timer, s->mode_due);
     }
     s->gusbcfg = (s->gusbcfg & ~mask) | (val & mask);
     dwc2_try_soft_reset(s);
@@ -1389,6 +1440,7 @@ static uint64_t dwc2_csr_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr reg = addr & ~3;
     uint32_t v;
 
+    dwc2_otg_catch_up(s);
     if ((s->pcgcctl & PCGCTL_GATEHCLK) && reg != A_PCGCCTL) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read at 0x%" HWADDR_PRIx
                       " with the AHB clock gated (PCGCCTL.GateHclk)\n",
@@ -1412,6 +1464,7 @@ static void dwc2_csr_write(void *opaque, hwaddr addr, uint64_t data,
     hwaddr reg = addr & ~3;
     uint32_t val = data;
 
+    dwc2_otg_catch_up(s);
     if ((s->pcgcctl & PCGCTL_GATEHCLK) && reg != A_PCGCCTL) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write at 0x%" HWADDR_PRIx
                       " with the AHB clock gated (PCGCCTL.GateHclk)\n",
@@ -1666,8 +1719,8 @@ static const VMStateDescription vmstate_dwc2_otg_reqq = {
 
 static const VMStateDescription vmstate_dwc2_otg = {
     .name = TYPE_DWC2_OTG,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .pre_save = dwc2_otg_pre_save,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(gotgctl, DWC2OTGState),
@@ -1726,12 +1779,14 @@ static const VMStateDescription vmstate_dwc2_otg = {
         VMSTATE_BOOL(pull_dp, DWC2OTGState),
         VMSTATE_BOOL(host_mode, DWC2OTGState),
         VMSTATE_TIMER_PTR(mode_timer, DWC2OTGState),
+        VMSTATE_INT64(mode_due, DWC2OTGState),
         VMSTATE_BOOL(bsesvld, DWC2OTGState),
         VMSTATE_BOOL(asesvld, DWC2OTGState),
         VMSTATE_BOOL(port_connected, DWC2OTGState),
         VMSTATE_UINT8(port_speed, DWC2OTGState),
         VMSTATE_TIMER_PTR(frame_timer, DWC2OTGState),
         VMSTATE_TIMER_PTR(bus_timer, DWC2OTGState),
+        VMSTATE_INT64(bus_due, DWC2OTGState),
         VMSTATE_INT64(frame_start_ns, DWC2OTGState),
         VMSTATE_INT64(frame_ns, DWC2OTGState),
         VMSTATE_INT64(frame_origin_ns, DWC2OTGState),
@@ -1755,6 +1810,8 @@ static const VMStateDescription vmstate_dwc2_otg = {
         VMSTATE_BOOL(dev_host_attached, DWC2OTGState),
         VMSTATE_TIMER_PTR(idle_timer, DWC2OTGState),
         VMSTATE_TIMER_PTR(eopf_timer, DWC2OTGState),
+        VMSTATE_INT64(idle_due, DWC2OTGState),
+        VMSTATE_INT64(eopf_due, DWC2OTGState),
         VMSTATE_UINT16(dev_soffn, DWC2OTGState),
         VMSTATE_BOOL(setup_pending, DWC2OTGState),
         VMSTATE_BOOL(ctrl_in, DWC2OTGState),
