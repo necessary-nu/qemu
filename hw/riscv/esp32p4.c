@@ -3829,6 +3829,8 @@ static void esp32p4_init_rmt_pcnt(ESP32P4MachineState *s)
     dev = DEVICE(&s->rmt);
     object_property_set_link(OBJECT(dev), "gdma", OBJECT(&s->gdma[0]),
                              &error_abort);
+    object_property_set_link(OBJECT(dev), "gpio", OBJECT(gpio),
+                             &error_abort);
     qdev_connect_clock_in(dev, "sclk", qdev_get_clock_out(clkrst, "rmt"));
     sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
     g = esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,
