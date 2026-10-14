@@ -50,6 +50,8 @@
 #include "migration/register.h"
 #include "migration/vmstate.h"
 #include "migration/qemu-file-types.h"
+#include "exec/icount.h"
+#include "system/replay.h"
 
 static int get_str_sep(char *buf, int buf_size, const char **pp, int sep)
 {
@@ -89,6 +91,51 @@ struct GuestFwd {
     Slirp *slirp;
 };
 
+/*
+ * libslirp runs its TCP timers itself rather than on timers it asks of
+ * QEMU: slirp_pollfds_poll(), which the main loop calls after each poll,
+ * runs its fast timer (delayed ACKs) once its clock is SLIRP_FAST_MS past
+ * the poll before the fill that noted one, and its slow timer (each
+ * connection's retransmit, persist, keepalive and 2MSL counts, the IP
+ * reassembly queue's) once SLIRP_SLOW_MS past its last run, if the last
+ * fill found a connection, a fragment or a UDP or ICMP socket due to
+ * expire; its fill shortens the main loop's timeout to match. The clock is
+ * QEMU_CLOCK_VIRTUAL, but under icount the main loop polls at moments of
+ * the host's, so the timers ran at whatever virtual time those were: a
+ * guest's TCP retransmitted and acknowledged at different times in every
+ * run, and while every vCPU waited with no timer of the machine's to warp
+ * to, virtual time stood still and the timers never ran.
+ *
+ * So under icount, outside record/replay, libslirp steps at virtual times
+ * of the guest's: at each frame from the guest, and at the tick, a
+ * QEMU_CLOCK_VIRTUAL timer at the time the next of its timers falls due.
+ * A step polls every stack at the present virtual time, without the
+ * descriptors' events (the main loop's poll serves those), takes the frame,
+ * then fills and polls again until nothing is due at that time: a frame
+ * that notes a delayed ACK has it stamped with its own time, one that
+ * opens the first connection starts the slow timer at its own time. What
+ * libslirp keeps of its timers is out of sight, so SlirpTimers follows it
+ * by its rules, from what each fill reports and each poll's clock. The
+ * tick is external, as libslirp's own timers are, so the warp moves
+ * virtual time on to it while every vCPU waits. Virtual time does not pass
+ * a pending timer before it runs (but for sleep=on's warps, which follow
+ * the host's clock), so the main loop's polls find nothing due, unless at
+ * the tick's very time, where they run what the tick would. What comes in
+ * from the host's sockets still comes at moments of the host's.
+ */
+
+/* libslirp's TIMEOUT_FAST and TIMEOUT_SLOW, in ms of its clock */
+#define SLIRP_FAST_MS 2
+#define SLIRP_SLOW_MS 499
+
+/* libslirp's TCP timers, as its fills and polls leave them */
+typedef struct SlirpTimers {
+    bool fast;          /* a delayed ACK waits for the fast timer */
+    uint32_t fast_ms;   /* the clock the fill that noted it stamped */
+    bool slow;          /* the slow timer runs */
+    uint32_t slow_ms;   /* the clock as it last ran */
+} SlirpTimers;
+
 typedef struct SlirpState {
     NetClientState nc;
     QTAILQ_ENTRY(SlirpState) entry;
@@ -99,11 +146,69 @@ typedef struct SlirpState {
     gchar *smb_dir;
 #endif
     GSList *fwd;
+    SlirpTimers timers;
+    /*
+     * From the main loop's fill to its poll, the descriptors its fill gave
+     * libslirp (GPollFD), from index main_first of the main loop's poll on.
+     */
+    GArray *main_fds;
+    guint main_first;
 } SlirpState;
 
 static struct slirp_config_str *slirp_configs;
 static QTAILQ_HEAD(, SlirpState) slirp_stacks =
     QTAILQ_HEAD_INITIALIZER(slirp_stacks);
+
+/*
+ * libslirp's clock in ms as its last poll read it, the one clock of all its
+ * instances, which its fills stamp delayed ACKs with.
+ */
+static uint32_t net_slirp_curtime;
+/* The clock libslirp reads through a poll of ours, or -1: the live clock */
+static int64_t net_slirp_poll_ns = -1;
+/*
+ * In a call into libslirp. A frame the guest sends meanwhile (a NIC
+ * answering what libslirp sent it, at once) goes in without a step, which
+ * libslirp could not take inside the call, and is missed: a step follows
+ * the call.
+ */
+static bool net_slirp_busy;
+static bool net_slirp_missed;
+/* What libslirp keeps of its timers is unknown: step at once. */
+static bool net_slirp_unknown;
+static QEMUTimer *net_slirp_tick;
+
+static void net_slirp_step(SlirpState *in, const uint8_t *buf, size_t size);
+static void net_slirp_tick_arm(void);
+
+/* Whether libslirp steps at the guest's times and the tick. */
+static bool net_slirp_stepping(void)
+{
+    return icount_enabled() && replay_mode == REPLAY_MODE_NONE;
+}
+
+/* Call into libslirp; returns whether a call was already under way. */
+static bool net_slirp_enter(void)
+{
+    bool busy = net_slirp_busy;
+
+    net_slirp_busy = true;
+    return busy;
+}
+
+/* Return from the call net_slirp_enter() returned @busy for. */
+static void net_slirp_leave(bool busy)
+{
+    net_slirp_busy = busy;
+    if (busy || !net_slirp_stepping()) {
+        return;
+    }
+    if (net_slirp_missed) {
+        net_slirp_step(NULL, NULL, 0);
+    } else {
+        net_slirp_tick_arm();
+    }
+}
 
 static int slirp_hostfwd(SlirpState *s, const char *redir_str, Error **errp);
 static int slirp_guestfwd(SlirpState *s, const char *config_str, Error **errp);
@@ -137,7 +242,14 @@ static ssize_t net_slirp_receive(NetClientState *nc, const uint8_t *buf, size_t 
 {
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
 
-    slirp_input(s->slirp, buf, size);
+    if (!net_slirp_stepping()) {
+        slirp_input(s->slirp, buf, size);
+    } else if (net_slirp_busy) {
+        slirp_input(s->slirp, buf, size);
+        net_slirp_missed = true;
+    } else {
+        net_slirp_step(s, buf, size);
+    }
 
     return size;
 }
@@ -169,6 +281,10 @@ static void net_slirp_cleanup(NetClientState *nc)
     }
     slirp_smb_cleanup(s);
     QTAILQ_REMOVE(&slirp_stacks, s, entry);
+    g_array_free(s->main_fds, true);
+    if (net_slirp_stepping()) {
+        net_slirp_tick_arm();
+    }
 }
 
 static NetClientInfo net_slirp_info = {
@@ -185,6 +301,9 @@ static void net_slirp_guest_error(const char *msg, void *opaque)
 
 static int64_t net_slirp_clock_get_ns(void *opaque)
 {
+    if (net_slirp_poll_ns >= 0) {
+        return net_slirp_poll_ns;
+    }
     return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
@@ -208,7 +327,10 @@ static void net_slirp_init_completed(Slirp *slirp, void *opaque)
 static void net_slirp_timer_cb(void *opaque)
 {
     SlirpTimer *t = opaque;
+    bool busy = net_slirp_enter();
+
     slirp_handle_timer(t->slirp, t->id, t->cb_opaque);
+    net_slirp_leave(busy);
 }
 
 static void *net_slirp_timer_new_opaque(SlirpTimerId id,
@@ -371,10 +493,209 @@ static int net_slirp_get_revents(int idx, void *opaque)
     return slirp_gio_to_poll(g_array_index(pollfds, GPollFD, idx).revents);
 }
 
+/* What a fill that left @timeout at most the time to its next timer says */
+static void slirp_timers_filled(SlirpTimers *t, uint32_t timeout)
+{
+    if (timeout > SLIRP_FAST_MS) {
+        t->fast = false;
+    } else if (!t->fast) {
+        t->fast = true;
+        t->fast_ms = net_slirp_curtime;
+    }
+    /*
+     * With a delayed ACK waiting it says nothing of the slow timer, which
+     * the connection to send it keeps running, unless closed meanwhile:
+     * then this takes it for running, and the tick comes for nothing.
+     */
+    t->slow = timeout <= SLIRP_SLOW_MS;
+}
+
+/* What a poll whose clock read @now_ms ran */
+static void slirp_timers_polled(SlirpTimers *t, uint32_t now_ms)
+{
+    if (t->fast && now_ms - t->fast_ms >= SLIRP_FAST_MS) {
+        t->fast = false;
+    }
+    if (t->slow && now_ms - t->slow_ms >= SLIRP_SLOW_MS) {
+        t->slow_ms = now_ms;
+    }
+}
+
+/* ms from @now_ms to @period past @since, in libslirp's 32-bit ms */
+static uint32_t slirp_timers_left(uint32_t now_ms, uint32_t since,
+                                  uint32_t period)
+{
+    uint32_t passed = now_ms - since;
+
+    return passed < period ? period - passed : 0;
+}
+
+/* The virtual time in ms the next timer is due at, from @now_ms on */
+static int64_t slirp_timers_due(const SlirpTimers *t, int64_t now_ms)
+{
+    int64_t due = INT64_MAX;
+
+    if (t->fast) {
+        due = now_ms + slirp_timers_left((uint32_t)now_ms, t->fast_ms,
+                                         SLIRP_FAST_MS);
+    }
+    if (t->slow) {
+        due = MIN(due, now_ms + slirp_timers_left((uint32_t)now_ms,
+                                                  t->slow_ms,
+                                                  SLIRP_SLOW_MS));
+    }
+    return due;
+}
+
+static void net_slirp_tick_cb(void *opaque)
+{
+    net_slirp_step(NULL, NULL, 0);
+}
+
+/* Arm the tick at the next time a timer of any stack is due. */
+static void net_slirp_tick_arm(void)
+{
+    int64_t now_ms = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / SCALE_MS;
+    int64_t due = INT64_MAX;
+    SlirpState *s;
+
+    QTAILQ_FOREACH(s, &slirp_stacks, entry) {
+        due = MIN(due, slirp_timers_due(&s->timers, now_ms));
+    }
+    if (net_slirp_unknown) {
+        due = now_ms;
+    }
+    if (!net_slirp_tick) {
+        net_slirp_tick = timer_new_full(NULL, QEMU_CLOCK_VIRTUAL, SCALE_MS,
+                                        QEMU_TIMER_ATTR_EXTERNAL,
+                                        net_slirp_tick_cb, NULL);
+    }
+    if (due == INT64_MAX) {
+        timer_del(net_slirp_tick);
+    } else if (timer_expire_time_ns(net_slirp_tick) != due * SCALE_MS) {
+        timer_mod(net_slirp_tick, due);
+    }
+}
+
+/*
+ * Poll @s, its clock held at @now_ns throughout, so that the timers run as
+ * SlirpTimers takes them to.
+ */
+static void net_slirp_timers_poll(SlirpState *s, int64_t now_ns,
+                                  int select_error, GArray *pollfds)
+{
+    net_slirp_curtime = now_ns / SCALE_MS;
+    slirp_timers_polled(&s->timers, net_slirp_curtime);
+    net_slirp_poll_ns = now_ns;
+    slirp_pollfds_poll(s->slirp, select_error, net_slirp_get_revents,
+                       pollfds);
+    net_slirp_poll_ns = -1;
+}
+
+/*
+ * A step's fill registers no descriptor: it gives libslirp back the index
+ * the main loop's fill gave a descriptor, for the main loop's poll still
+ * to come, and -1 for any other.
+ */
+static int net_slirp_step_add_poll(slirp_os_socket fd, int events,
+                                   void *opaque)
+{
+    SlirpState *s = opaque;
+    guint i;
+
+    for (i = 0; i < s->main_fds->len; i++) {
+        if ((slirp_os_socket)g_array_index(s->main_fds, GPollFD, i).fd == fd) {
+            return s->main_first + i;
+        }
+    }
+    return -1;
+}
+
+static void net_slirp_step_fill(SlirpState *s)
+{
+    uint32_t timeout = UINT32_MAX;
+
+    slirp_pollfds_fill_socket(s->slirp, &timeout, net_slirp_step_add_poll, s);
+    slirp_timers_filled(&s->timers, timeout);
+}
+
+/*
+ * Step every stack at the present virtual time, giving @in the frame
+ * @buf, if any. A step's polls report no descriptor ready, as after a
+ * failed poll().
+ */
+static void net_slirp_step(SlirpState *in, const uint8_t *buf, size_t size)
+{
+    int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now_ms = now_ns / SCALE_MS;
+    SlirpState *s;
+
+    net_slirp_busy = true;
+    net_slirp_unknown = false;
+    QTAILQ_FOREACH(s, &slirp_stacks, entry) {
+        net_slirp_timers_poll(s, now_ns, true, NULL);
+    }
+    if (in) {
+        slirp_input(in->slirp, buf, size);
+    }
+    do {
+        net_slirp_missed = false;
+        QTAILQ_FOREACH(s, &slirp_stacks, entry) {
+            net_slirp_step_fill(s);
+            while (slirp_timers_due(&s->timers, now_ms) <= now_ms) {
+                net_slirp_timers_poll(s, now_ns, true, NULL);
+                net_slirp_step_fill(s);
+            }
+        }
+    } while (net_slirp_missed);
+    net_slirp_busy = false;
+    net_slirp_tick_arm();
+}
+
+/*
+ * The main loop's fill and poll while libslirp steps. The main loop need
+ * not wake for libslirp's timers, which the tick runs.
+ */
+static void net_slirp_main_poll(SlirpState *s, MainLoopPoll *poll)
+{
+    uint32_t timeout = UINT32_MAX;
+    bool busy = net_slirp_enter();
+    guint i;
+
+    switch (poll->state) {
+    case MAIN_LOOP_POLL_FILL:
+        s->main_first = poll->pollfds->len;
+        slirp_pollfds_fill_socket(s->slirp, &timeout, net_slirp_add_poll,
+                                  poll->pollfds);
+        slirp_timers_filled(&s->timers, timeout);
+        g_array_set_size(s->main_fds, 0);
+        for (i = s->main_first; i < poll->pollfds->len; i++) {
+            g_array_append_val(s->main_fds,
+                               g_array_index(poll->pollfds, GPollFD, i));
+        }
+        break;
+    case MAIN_LOOP_POLL_OK:
+    case MAIN_LOOP_POLL_ERR:
+        net_slirp_timers_poll(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                              poll->state == MAIN_LOOP_POLL_ERR,
+                              poll->pollfds);
+        g_array_set_size(s->main_fds, 0);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    net_slirp_leave(busy);
+}
+
 static void net_slirp_poll_notify(Notifier *notifier, void *data)
 {
     MainLoopPoll *poll = data;
     SlirpState *s = container_of(notifier, SlirpState, poll_notifier);
+
+    if (net_slirp_stepping()) {
+        net_slirp_main_poll(s, poll);
+        return;
+    }
 
     switch (poll->state) {
     case MAIN_LOOP_POLL_FILL:
@@ -415,8 +736,18 @@ net_slirp_stream_write(const void *buf, size_t size, void *opaque)
 static int net_slirp_state_load(QEMUFile *f, void *opaque, int version_id)
 {
     Slirp *slirp = opaque;
+    int ret;
 
-    return slirp_state_load(slirp, version_id, net_slirp_stream_read, f);
+    ret = slirp_state_load(slirp, version_id, net_slirp_stream_read, f);
+    if (net_slirp_stepping()) {
+        /*
+         * The connections loaded have timers of their own, and virtual time
+         * moved: step as the machine goes on, before it executes anything.
+         */
+        net_slirp_unknown = true;
+        net_slirp_tick_arm();
+    }
+    return ret;
 }
 
 static void net_slirp_state_save(QEMUFile *f, void *opaque)
@@ -643,6 +974,7 @@ static int net_slirp_init(NetClientState *peer, const char *model,
                       restricted ? "on" : "off");
 
     s = DO_UPCAST(SlirpState, nc, nc);
+    s->main_fds = g_array_new(false, false, sizeof(GPollFD));
 
     cfg.version =
          SLIRP_CHECK_VERSION(4, 9, 0) ? 6 :
@@ -1112,7 +1444,10 @@ static int guestfwd_can_read(void *opaque)
 static void guestfwd_read(void *opaque, const uint8_t *buf, int size)
 {
     struct GuestFwd *fwd = opaque;
+    bool busy = net_slirp_enter();
+
     slirp_socket_recv(fwd->slirp, fwd->server, fwd->port, buf, size);
+    net_slirp_leave(busy);
 }
 
 static ssize_t guestfwd_write(const void *buf, size_t len, void *chr)
