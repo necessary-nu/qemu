@@ -1729,12 +1729,13 @@ static void etm_events(ESP32P4GpioState *s, uint64_t pf, int64_t t)
  * [spec:nuos:req:emu.esp32p4.gpio]
  * Whether anything but software sampling the pads sees pad n's level
  * change (esp32p4_gpio_sig_out_watched()), from the routing just built:
- * a line of it that something listens to (its level, its drive for the
- * analog blocks), a board wire to other pads, its interrupt type or
- * wakeup (GPIO_STATUS latches an edge whatever INT_ENA says), an input
- * signal a modelled block takes from it, a direct IO MUX input that one
- * does, or, on an LP pad, the same on the LP side. The ETM event
- * channels on pads are added by the caller.
+ * a line of it that something listens to (its level, a watcher
+ * esp32p4_gpio_watch_pad() added, its drive for the analog blocks), a
+ * board wire to other pads, its interrupt type or wakeup (GPIO_STATUS
+ * latches an edge whatever INT_ENA says), an input signal a modelled
+ * block takes from it, a direct IO MUX input that one does, or, on an LP
+ * pad, the same on the LP side. The ETM event channels on pads are added
+ * by the caller.
  */
 static bool pad_watched(ESP32P4GpioState *s, unsigned n)
 {
@@ -1742,8 +1743,9 @@ static bool pad_watched(ESP32P4GpioState *s, unsigned n)
     const IomuxFunc *fn;
     unsigned f;
 
-    if (s->pad_out[n] || s->drive_high_out[n] || s->drive_low_out[n] ||
-        r->wire_net[n] != BIT_ULL(n) || bit64(r->wakeup, n)) {
+    if (s->pad_out[n] || s->pad_watches[n] || s->drive_high_out[n] ||
+        s->drive_low_out[n] || r->wire_net[n] != BIT_ULL(n) ||
+        bit64(r->wakeup, n)) {
         return true;
     }
     for (unsigned t = 1; t < ESP32P4_GPIO_INT_TYPES; t++) {

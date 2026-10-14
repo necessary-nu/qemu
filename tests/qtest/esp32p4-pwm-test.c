@@ -1061,9 +1061,10 @@ static void test_ledc_unrouted(void)
 
 /*
  * An LEDC output on a pad nothing watches: channel 0 as in ledc/unrouted
- * (a 50 ns period, high for its first 25 ns) on pad 22, whose line
+ * (a 50 ns period, high for its first 25 ns) on pad 30, whose line
  * nothing on the board listens to and from which no block takes an input
- * (pad 20, UART4's TXD, has the serial port's terminal listening). Its edges
+ * (the board watches GPIO0 to GPIO15 for the PMU's wakeup, and the serial
+ * ports' TXD pads for their terminals). Its edges
  * are not timed: a second of them costs the host next to nothing, and
  * GPIO_IN reads the exact level at the moment software samples it. Given
  * a rising-edge interrupt type, the pad is watched: GPIO_STATUS latches
@@ -1076,7 +1077,7 @@ static void test_ledc_unwatched_pad(void)
     QTestState *qts = start();
     int64_t c;
 
-    pad_out(qts, 22, SIG_LEDC(0));
+    pad_out(qts, 30, SIG_LEDC(0));
     ledc_timer(qts, 0, 1, 1);
     c = now + 50;
     lwr(qts, CH_HPOINT(0), 0);
@@ -1084,19 +1085,19 @@ static void test_ledc_unwatched_pad(void)
     lwr(qts, CH_CONF0(0), SIG_OUT_EN | PARA_UP);
     c += 1000 * 1000 * 1000;
     step_to(qts, c + 10);
-    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 22), ==, 1u << 22);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 30), ==, 1u << 30);
     step_to(qts, c + 30);
-    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 22), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 30), ==, 0);
     step_to(qts, c + 74);
-    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 22), ==, 1u << 22);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 30), ==, 1u << 30);
 
-    qtest_writel(qts, GPIO_PIN(22), PIN_INT_RISING);
-    qtest_writel(qts, GPIO_STATUS_W1TC, 1u << 22);
+    qtest_writel(qts, GPIO_PIN(30), PIN_INT_RISING);
+    qtest_writel(qts, GPIO_STATUS_W1TC, 1u << 30);
     step_to(qts, c + 99);
-    g_assert_cmphex(qtest_readl(qts, GPIO_STATUS) & (1u << 22), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, GPIO_STATUS) & (1u << 30), ==, 0);
     step_to(qts, c + 100);
-    g_assert_cmphex(qtest_readl(qts, GPIO_STATUS) & (1u << 22), ==,
-                    1u << 22);
+    g_assert_cmphex(qtest_readl(qts, GPIO_STATUS) & (1u << 30), ==,
+                    1u << 30);
     qtest_quit(qts);
 }
 
