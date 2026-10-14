@@ -1417,8 +1417,10 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
      * [spec:nuos:req:emu.esp32.rmt]
      * The RMT, behind its DPORT bit, on APB_CLK and REF_TICK. Its channels
      * reach the pads through the GPIO matrix as RMT_SIG_OUTn and
-     * RMT_SIG_INn.
+     * RMT_SIG_INn; the matrix tells it which outputs reach a watched pad.
      */
+    object_property_set_link(OBJECT(&s->rmt), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
     qdev_realize(DEVICE(&s->rmt), &s->periph_bus, &error_fatal);
     {
         Esp32PeriphGate *g = esp32_soc_add_gated_device(
