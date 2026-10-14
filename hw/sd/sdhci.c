@@ -1389,14 +1389,32 @@ static void sdhci_resume_pending_transfer(SDHCIState *s)
     sdhci_data_transfer(s);
 }
 
+/*
+ * Before a register access: a card insertion held back after a removal
+ * (SDHC_INSERTION_DELAY) that is due by now takes effect, at its time,
+ * however late its timer runs, as on QEMU's host clock it can: software
+ * waiting out the delay then finds the card present. A pending transfer
+ * resumes.
+ */
+static void sdhci_catch_up(SDHCIState *s)
+{
+    if (timer_pending(s->insert_timer) &&
+        timer_expire_time_ns(s->insert_timer) <=
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_del(s->insert_timer);
+        sdhci_raise_insertion_irq(s);
+    }
+    if (timer_pending(s->transfer_timer)) {
+        sdhci_resume_pending_transfer(s);
+    }
+}
+
 static uint64_t sdhci_read(void *opaque, hwaddr offset, unsigned size)
 {
     SDHCIState *s = (SDHCIState *)opaque;
     uint32_t ret = 0;
 
-    if (timer_pending(s->transfer_timer)) {
-        sdhci_resume_pending_transfer(s);
-    }
+    sdhci_catch_up(s);
 
     switch (offset & ~0x3) {
     case SDHC_SYSAD:
@@ -1540,9 +1558,7 @@ sdhci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
     uint32_t value = val;
     value <<= shift;
 
-    if (timer_pending(s->transfer_timer)) {
-        sdhci_resume_pending_transfer(s);
-    }
+    sdhci_catch_up(s);
 
     switch (offset & ~0x3) {
     case SDHC_SYSAD:
