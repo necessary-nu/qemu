@@ -29,6 +29,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(Esp32RmtState, ESP32_RMT)
  * Signal lines, connected by the SoC to the GPIO matrix:
  * - ESP32_RMT_SIG_OUT (gpio-out): RMT_SIG_OUTn, channel n's output.
  * - ESP32_RMT_SIG_IN (gpio-in): RMT_SIG_INn, channel n's input.
+ *
+ * Link "gpio": the GPIO matrix (TYPE_ESP32_SIG_ROUTES), for the block to
+ * see which of its outputs reach a watched pad. Without it every output
+ * is taken to reach one.
  */
 #define ESP32_RMT_SIG_OUT       "esp32-rmt-sig-out"
 #define ESP32_RMT_SIG_IN        "esp32-rmt-sig-in"
@@ -73,6 +77,14 @@ typedef struct Esp32RmtChannel {
     uint32_t tx_thr_count;
     uint8_t tx_end_level;
     bool mem_empty;
+    /*
+     * The start of the last pass of a continuous transmission run since
+     * the block last changed other than by running on: its cycle and read
+     * pointer (pass_valid). Not migrated: passes are compared afresh.
+     */
+    bool pass_valid;
+    uint64_t pass_c;
+    uint32_t pass_raddr;
 
     /* Output as driven onto RMT_SIG_OUTn */
     uint8_t out_level;
@@ -132,6 +144,20 @@ struct Esp32RmtState {
     bool running;
     /* The transmitters as a source of line changes (esp32_line.h) */
     Notifier line_source;
+
+    DeviceState *gpio;
+    Notifier route_notifier;
+    /* The channels whose output reaches a watched pad, bit n for channel n */
+    uint8_t out_watched;
+    /* The interrupt line's level as driven */
+    bool irq_level;
+    /* What the timer is set for, NEVER (INT64_MAX) when it is not */
+    int64_t due_ns;
+    /* The block has changed other than by running on since it was set */
+    bool sched_stale;
+    /* A look-ahead runs: interrupts are noted in ahead_raised only */
+    bool ahead;
+    uint32_t ahead_raised;
 };
 
 #endif

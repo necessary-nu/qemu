@@ -187,6 +187,25 @@
 #define BIAS_DREF_VBAT          8
 #define BIAS_DREF_VDDA          9
 
+#define HP_CLKRST_SOC_CLK_CTRL3 0x500e6020
+#define HP_CLKRST_PERI_CLK_CTRL22 0x500e609c
+#define LEDC_APB_CLK_EN         (1u << 0)
+#define LEDC_CLK_EN             (1u << 2)
+#define LEDC                    0x500d3000
+#define LEDC_CH_CONF0(n)        (LEDC + 0x00 + 0x14 * (n))
+#define LEDC_CH_HPOINT(n)       (LEDC + 0x04 + 0x14 * (n))
+#define LEDC_CH_DUTY(n)         (LEDC + 0x08 + 0x14 * (n))
+#define LEDC_TIMER_CONF(x)      (LEDC + 0xa0 + 8 * (x))
+#define LEDC_SIG_OUT_EN         (1u << 2)
+#define LEDC_PARA_UP            (1u << 4)
+#define LEDC_TCONF(res, div)    ((res) | ((uint32_t)(div) << 5))
+#define LEDC_T_RST              (1u << 24)
+#define GPIO_IN                 0x500e003c
+#define GPIO_FUNC_OUT(n)        (0x500e0558 + 4 * (n))
+#define IO_MUX_GPIO(n)          (0x500e1004 + 4 * (n))
+#define IO_MUX_PAD              ((1u << 12) | (1u << 9) | (2u << 10))
+#define SIG_LEDC(n)             (126 + (n))
+
 #define INTMTX_STATUS0          0x500d6200
 #define SRC_PMU_0               6
 #define SRC_PMU_1               7
@@ -588,6 +607,102 @@ static void test_ext_wakeup_terminal_pads(void)
 }
 
 /*
+ * LEDC timer @x on XTAL_CLK, running from now with resolution @res and a
+ * whole divider @div, and its channel @x at duty @duty from @hpoint,
+ * taken at the timer's first overflow.
+ */
+static void ledc_pwm(QTestState *qts, int x, int res, int div,
+                     uint32_t hpoint, uint32_t duty)
+{
+    qtest_writel(qts, LEDC_TIMER_CONF(x),
+                 LEDC_TCONF(res, div * 256) | LEDC_T_RST);
+    qtest_writel(qts, LEDC_TIMER_CONF(x), LEDC_TCONF(res, div * 256));
+    qtest_writel(qts, LEDC_CH_HPOINT(x), hpoint);
+    qtest_writel(qts, LEDC_CH_DUTY(x), duty << 4);
+    qtest_writel(qts, LEDC_CH_CONF0(x),
+                 x | LEDC_SIG_OUT_EN | LEDC_PARA_UP);
+}
+
+/* Step the clock from @t, the present, to @to; the new present. */
+static int64_t step_to(QTestState *qts, int64_t t, int64_t to)
+{
+    g_assert_cmpint(to, >, t);
+    return qtest_clock_step(qts, to - t);
+}
+
+static bool pad5(QTestState *qts)
+{
+    return (qtest_readl(qts, GPIO_IN) >> 5) & 1;
+}
+
+/*
+ * The EXT wakeup watches only the pads PMU_EXT_WAKEUP_SEL selects. With
+ * GPIO4 selected, a 40 MHz LEDC output on GPIO5 (40 million edges a
+ * second), which nothing else watches, is not timed edge by edge: a
+ * second of it costs the host next to nothing, GPIO_IN reading its exact
+ * level as software samples it. GPIO5 selected, on a 1.024 ms LEDC
+ * period, high for its first 512 us, the PMU sees its edges: asleep in
+ * the low half, the chip starts waking (PMU_SLEEP_SWITCH_ACTIVE_START) at
+ * the next rising edge's nanosecond, the EXT wakeup its cause.
+ */
+/* [spec:nuos:req:emu.esp32p4.low-power/test] */
+/* [spec:nuos:req:emu.esp32p4.pwm/test] */
+static void test_ext_wakeup_pwm(void)
+{
+    QTestState *qts = start(NULL);
+    int64_t t0, c, t;
+
+    /* On an edge of XTAL_CLK, which runs from time 0 */
+    t0 = qtest_clock_step(qts, 25);
+    qtest_writel(qts, HP_CLKRST_SOC_CLK_CTRL3,
+                 qtest_readl(qts, HP_CLKRST_SOC_CLK_CTRL3) | LEDC_APB_CLK_EN);
+    qtest_writel(qts, HP_CLKRST_PERI_CLK_CTRL22, LEDC_CLK_EN);
+    qtest_writel(qts, IO_MUX_GPIO(5), IO_MUX_PAD);
+    qtest_writel(qts, GPIO_FUNC_OUT(5), SIG_LEDC(0));
+    wr(qts, SLP_WAKEUP_CNTL2, 1u << WAKE_EXT);
+    wr(qts, EXT_WAKEUP_SEL, 1u << 4);
+    wr(qts, EXT_WAKEUP_LV, 1u << 4);
+    /* Channel 0: high for the first 25 ns of each 50 ns from t0 + 50 */
+    ledc_pwm(qts, 0, 1, 1, 0, 1);
+    /* Channel 1: high for the first 512 us of each 1024 from t0 + 1024 */
+    ledc_pwm(qts, 1, 10, 40, 0, 512);
+
+    c = t0 + 50 + 1000 * 1000 * 1000;
+    t = step_to(qts, t0, c + 10);
+    g_assert_true(pad5(qts));
+    t = step_to(qts, t, c + 30);
+    g_assert_false(pad5(qts));
+    t = step_to(qts, t, c + 74);
+    g_assert_true(pad5(qts));
+
+    /* Channel 1 on GPIO5, which the EXT wakeup now selects, low 600 us in */
+    t = step_to(qts, t, t0 + (977 * 1024 + 600) * US);
+    qtest_writel(qts, GPIO_FUNC_OUT(5), SIG_LEDC(1));
+    g_assert_false(pad5(qts));
+    wr(qts, EXT_WAKEUP_SEL, 1u << 5);
+    wr(qts, EXT_WAKEUP_LV, 1u << 5);
+    wr(qts, HP_SLEEP_HP_SYS_CNTL, CNTL_DIG_CPU_STALL);
+    wr(qts, LP_INT_CLR, 0xffffffff);
+    wr(qts, SLP_WAKEUP_CNTL0, SLEEP_REQ);
+    t = step_to(qts, t, t + 300 * US);
+    g_assert_cmphex(current_state(qts), ==, STATE_LP_SLEEP);
+
+    /* The next rising edge */
+    c = t0 + 978 * 1024 * US;
+    t = step_to(qts, t, c - 1);
+    g_assert_cmphex(rd(qts, LP_INT_RAW) & LP_INT_S2A_START, ==, 0);
+    g_assert_cmphex(current_state(qts), ==, STATE_LP_SLEEP);
+    t = step_to(qts, t, c);
+    g_assert_cmphex(rd(qts, LP_INT_RAW) & LP_INT_S2A_START, ==,
+                    LP_INT_S2A_START);
+    g_assert_cmphex(rd(qts, SLP_WAKEUP_STATUS0), ==, 1u << WAKE_EXT);
+    g_assert_cmphex(rd(qts, EXT_WAKEUP_ST), ==, 1u << 5);
+    step_to(qts, t, t + 200 * US);
+    g_assert_cmphex(current_state(qts), ==, STATE_ACTIVE);
+    qtest_quit(qts);
+}
+
+/*
  * The LP CPU's power: released by an enabled wakeup source (the HP CPU's
  * trigger), recording the cause and raising PMU_LP_CPU_WAKEUP_INT; its
  * sleep request rejected while a reject-enabled source is active, or
@@ -938,6 +1053,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/pmu/ext-wakeup", test_ext_wakeup);
     qtest_add_func("/esp32p4/pmu/ext-wakeup-terminal-pads",
                    test_ext_wakeup_terminal_pads);
+    qtest_add_func("/esp32p4/pmu/ext-wakeup-pwm", test_ext_wakeup_pwm);
     qtest_add_func("/esp32p4/pmu/lp-cpu", test_lp_cpu);
     qtest_add_func("/esp32p4/pmu/immediate", test_immediate);
     qtest_add_func("/esp32p4/pmu/ldo-counter", test_ldo_counter);
