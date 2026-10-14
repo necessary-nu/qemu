@@ -436,12 +436,29 @@ uint32_t esp32p4_lp_sys_reg(ESP32P4LPSysState *s, hwaddr offset)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.pms] */
+void esp32p4_lp_sys_set_records(ESP32P4LPSysState *s,
+                                void (*due)(void *opaque), void *opaque)
+{
+    s->records_due = due;
+    s->records_opaque = opaque;
+}
+
+/* Before a register access: the records held back after their refusals. */
+static void esp32p4_lp_sys_take_records(ESP32P4LPSysState *s)
+{
+    if (s->records_due) {
+        s->records_due(s->records_opaque);
+    }
+}
+
 static uint64_t esp32p4_lp_sys_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4LPSysState *s = opaque;
     hwaddr reg = addr & ~3;
     uint32_t v;
 
+    esp32p4_lp_sys_take_records(s);
     if (reg >= ESP32P4_LP_SYS_NREGS * 4 ||
         !esp32p4_lp_sys_regs[R(reg)].valid) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of %u bytes at reserved "
@@ -471,6 +488,7 @@ static void esp32p4_lp_sys_write(void *opaque, hwaddr addr, uint64_t value,
     const ESP32P4LPSysReg *info;
     uint32_t *r;
 
+    esp32p4_lp_sys_take_records(s);
     if (reg >= ESP32P4_LP_SYS_NREGS * 4 ||
         !esp32p4_lp_sys_regs[R(reg)].valid) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write of %u bytes at reserved "

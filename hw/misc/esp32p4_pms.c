@@ -923,11 +923,30 @@ static void esp32p4_pms_record_timer(void *opaque)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32p4.pms]
+ * A register access of the ICM or LP_SYS first takes the records waiting
+ * for the end of a core's block of code. Under icount, where records
+ * wait, a block can end with such an access made after the refusal (a
+ * load that is the block's last instruction, before a page boundary):
+ * it must find the refusal recorded, not leave it to the timer that
+ * takes the records only as the core leaves its block.
+ */
+static void esp32p4_pms_records_due(void *opaque)
+{
+    ESP32P4PmsState *s = opaque;
+
+    if (timer_pending(s->record_timer)) {
+        timer_del(s->record_timer);
+        esp32p4_pms_flush_records(s);
+    }
+}
+
+/*
  * Record a refusal in record @rec. From the middle of a core's block (a
  * trace encoder writing as the core reports an instruction) the record,
- * and the interrupt it raises, wait for the block's end; a record keeps
- * only the first refusal until software clears it, so only the first
- * waits.
+ * and the interrupt it raises, wait for the block's end, or for an access
+ * to the record (esp32p4_pms_records_due()); a record keeps only the
+ * first refusal until software clears it, so only the first waits.
  */
 /* [spec:nuos:req:emu.esp32p4.pms] */
 static void esp32p4_pms_record(ESP32P4PmsState *s, int rec, uint32_t addr,
@@ -1336,6 +1355,8 @@ static void esp32p4_pms_realize(DeviceState *dev, Error **errp)
                           "esp32p4.apm-check", 4 * GiB);
     s->record_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                    esp32p4_pms_record_timer, s);
+    esp32p4_icm_set_records(s->icm, esp32p4_pms_records_due, s);
+    esp32p4_lp_sys_set_records(s->lp_sys, esp32p4_pms_records_due, s);
     address_space_init(&s->check_as, &s->check, "esp32p4.apm-check");
     address_space_init(&s->bus_as, &s->bus, "esp32p4.bus");
 }

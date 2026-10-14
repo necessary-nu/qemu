@@ -152,11 +152,30 @@ static uint32_t esp32p4_icm_reg(ESP32P4IcmState *s, hwaddr addr, bool *ok)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.pms] */
+void esp32p4_icm_set_records(ESP32P4IcmState *s, void (*due)(void *opaque),
+                             void *opaque)
+{
+    s->records_due = due;
+    s->records_opaque = opaque;
+}
+
+/* Before a register access: the records held back after their refusals. */
+static void esp32p4_icm_take_records(ESP32P4IcmState *s)
+{
+    if (s->records_due) {
+        s->records_due(s->records_opaque);
+    }
+}
+
 static uint64_t esp32p4_icm_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4IcmState *s = opaque;
     bool ok;
-    uint32_t v = esp32p4_icm_reg(s, addr & ~3, &ok);
+    uint32_t v;
+
+    esp32p4_icm_take_records(s);
+    v = esp32p4_icm_reg(s, addr & ~3, &ok);
 
     if (!ok) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of reserved offset 0x%"
@@ -172,9 +191,12 @@ static void esp32p4_icm_write(void *opaque, hwaddr addr, uint64_t value,
     ESP32P4IcmState *s = opaque;
     hwaddr reg = addr & ~3;
     bool ok;
-    uint32_t old = esp32p4_icm_reg(s, reg, &ok);
-    uint32_t v = deposit32(reg == A_INT_RAW || reg == A_INT_CLR ? 0 : old,
-                           (addr & 3) * 8, size * 8, value);
+    uint32_t old, v;
+
+    esp32p4_icm_take_records(s);
+    old = esp32p4_icm_reg(s, reg, &ok);
+    v = deposit32(reg == A_INT_RAW || reg == A_INT_CLR ? 0 : old,
+                  (addr & 3) * 8, size * 8, value);
 
     switch (reg) {
     case A_VER_DATE:

@@ -114,6 +114,10 @@ struct ESP32P4LPSysState {
     qemu_irq pad_comp[ESP32P4_LP_SYS_PAD_COMPS];
     qemu_irq etm_wakeup_flag;
     qemu_irq force_download;
+
+    /* The block whose records can wait (esp32p4_lp_sys_set_records()). */
+    void (*records_due)(void *opaque);
+    void *records_opaque;
 };
 
 /*
@@ -123,6 +127,13 @@ struct ESP32P4LPSysState {
  */
 void esp32p4_lp_sys_addrhole(ESP32P4LPSysState *s, uint32_t addr,
                              uint8_t id, bool write, bool illegal);
+
+/*
+ * The block that records refusals here and can hold a record back after
+ * the refusal, as esp32p4_icm_set_records() has it.
+ */
+void esp32p4_lp_sys_set_records(ESP32P4LPSysState *s,
+                                void (*due)(void *opaque), void *opaque);
 
 /*
  * The PMU's ext1 wakeup by the RTC pads in @pads (bit n for GPIO n of
