@@ -492,8 +492,9 @@ static void test_slot1(void)
 /*
  * The SD lines' pads as GPIO_IN reads them: slot 0's CMD and DAT pulled
  * up to VO4, low with VO4 off; CLK with no pull; GPIO45, the supply
- * switch's gate, pulled down by R27 against its own pull-up; a card in
- * slot 1 brings the C6's pull-ups on its pads, an empty slot 1 none.
+ * switch's gate, pulled down by R27 against its own pull-up; slot 1's
+ * pads, the ESP32-C6's, pulled up by the board, with a card there or
+ * none.
  */
 /* [spec:nuos:req:emu.esp32p4.gpio/test] */
 static void test_board_pulls(void)
@@ -529,7 +530,7 @@ static void test_board_pulls(void)
         unsigned pad = sd_pin_pad[1][i];
 
         qtest_writel(qts, SDP_IO_MUX(pad), SDP_MCU_SEL(1) | SDP_FUN_IE);
-        g_assert_false(gpio_in(qts, pad));
+        g_assert_true(gpio_in(qts, pad));
     }
     qtest_quit(qts);
     unlink(img);
