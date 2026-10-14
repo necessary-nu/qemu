@@ -1464,6 +1464,16 @@ static void esp32p4_init_timers(ESP32P4MachineState *s)
                                         ESP32P4_CLKRST_RWDT_CORE_RESET, n));
     }
 
+    /*
+     * [spec:nuos:req:emu.esp32p4.timers]
+     * An RTC watchdog's or MWDT's reset resets the timer groups: their
+     * events take one order across the blocks at a register access.
+     */
+    line_due_order_init(&s->wdt_order);
+    esp32p4_timg_join_due_order(&s->timg[0], &s->wdt_order);
+    esp32p4_timg_join_due_order(&s->timg[1], &s->wdt_order);
+    esp32p4_lp_wdt_join_due_order(&s->lp_wdt, &s->wdt_order);
+
     object_initialize_child(OBJECT(s), "lp-timer", &s->lp_timer,
                             TYPE_ESP32P4_LP_TIMER);
     dev = DEVICE(&s->lp_timer);

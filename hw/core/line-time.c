@@ -12,6 +12,7 @@
 #include "qemu/timer.h"
 #include "hw/core/line-time.h"
 #include "migration/vmstate.h"
+#include "system/runstate.h"
 
 /*
  * The time of the change being propagated, while line_set_at() or
@@ -80,6 +81,48 @@ int64_t line_sync(void)
     line_run_at(now, line_notify_sources, NULL);
     line_syncing = false;
     return now;
+}
+
+void line_due_order_init(LineDueOrder *o)
+{
+    QLIST_INIT(&o->sources);
+    o->running = false;
+}
+
+void line_due_order_add(LineDueOrder *o, LineDueSource *src)
+{
+    QLIST_INSERT_HEAD(&o->sources, src, next);
+}
+
+/*
+ * Run the sources' events due by @now, the earliest first: each event can
+ * change when the others fall due (a reset that deletes a block's timers),
+ * so the next is chosen afresh after each.
+ */
+void line_due_order_run(LineDueOrder *o, int64_t now)
+{
+    if (o->running) {
+        return;
+    }
+    o->running = true;
+    while (qemu_reset_requested_get() == SHUTDOWN_CAUSE_NONE) {
+        LineDueSource *src, *first = NULL;
+        int64_t due = now;
+
+        QLIST_FOREACH(src, &o->sources, next) {
+            int64_t at = src->next_due(src);
+
+            if (at <= due && (!first || at < due)) {
+                first = src;
+                due = at;
+            }
+        }
+        if (!first) {
+            break;
+        }
+        first->run(first);
+    }
+    o->running = false;
 }
 
 /* A change held back, to be replayed at its time: fn(opaque, n, level). */

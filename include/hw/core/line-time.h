@@ -12,6 +12,7 @@
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
 #include "qemu/notify.h"
+#include "qemu/queue.h"
 
 /*
  * Levels move between devices as qemu_irq level changes, which carry no
@@ -58,6 +59,40 @@ void line_run_at(int64_t when_ns, void (*fn)(void *opaque), void *opaque);
 void line_add_source(Notifier *n);
 void line_remove_source(Notifier *n);
 int64_t line_sync(void);
+
+/*
+ * Events of several devices in one order.
+ *
+ * A device catching up at a register access runs its own events due by
+ * then, each at its time and in order. Where another device's events act
+ * on it, as one watchdog's reset resets a block whose own watchdog would
+ * fire a little after, two such events due close together must run in
+ * the order of their times across the devices, as their QEMU timers would
+ * have run them: each device's stream of events is a LineDueSource, which
+ * says when its next event falls due (INT64_MAX for none) and runs it, at
+ * its own time, and the devices' sources join one LineDueOrder.
+ * line_due_order_run() runs every source's events due by a moment, the
+ * earliest first; a device calls it before its own catch-up. It runs
+ * nothing while a system reset is pending, which undoes what would come
+ * after its request, and called again from inside an event it leaves the
+ * order to the run under way.
+ */
+typedef struct LineDueSource LineDueSource;
+
+struct LineDueSource {
+    int64_t (*next_due)(LineDueSource *src);
+    void (*run)(LineDueSource *src);
+    QLIST_ENTRY(LineDueSource) next;
+};
+
+typedef struct LineDueOrder {
+    QLIST_HEAD(, LineDueSource) sources;
+    bool running;
+} LineDueOrder;
+
+void line_due_order_init(LineDueOrder *o);
+void line_due_order_add(LineDueOrder *o, LineDueSource *src);
+void line_due_order_run(LineDueOrder *o, int64_t now);
 
 /*
  * Changes that reach a device while it resolves another.
