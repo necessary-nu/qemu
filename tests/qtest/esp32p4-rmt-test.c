@@ -109,6 +109,10 @@
 #define FUN_IE              (1u << 9)
 #define FUN_DRV2            (2u << 10)
 #define SIG_RMT(n)          (246 + (n))
+#define GPIO_STATUS         (GPIO + 0x044)
+#define GPIO_STATUS_W1TC    (GPIO + 0x04c)
+#define GPIO_PIN(n)         (GPIO + 0x074 + 4 * (n))
+#define PIN_INT_RISING      (1u << 7)
 #define GPIO_PATH           "/machine/gpio"
 
 #define INTMTX_STATUS1      0x500d6204u
@@ -779,6 +783,181 @@ static void test_mem_size_and_power(void)
     stop();
 }
 
+/* The level of a carrier of 3 + 5 cycles, started high at t0, at t */
+static int carrier_level(int64_t t0, int64_t t)
+{
+    return (t - t0) / CYC % 8 < 3;
+}
+
+static int pad30_rose(void)
+{
+    return (rd(GPIO_STATUS) >> 30) & 1;
+}
+
+/*
+ * TX channel 0 idling low on pad 30, which nothing watches, its low level
+ * carried at 5 MHz with CARRIER_EFF_EN clear: ten million carrier edges a
+ * second, which the block takes in closed form. GPIO_IN reads the exact
+ * level a nanosecond either side of edges a second on; a transmission
+ * then starts on its tick, its high entry plain, and the carrier starts
+ * afresh, high, after it; with pad 30's rising-edge interrupt set, the
+ * pad watched, GPIO_STATUS latches the next carrier rise at its
+ * nanosecond.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_unwatched_carrier(void)
+{
+    uint32_t conf = TX_DIV(1) | TX_MEM_SIZE(1) | TX_IDLE_EN | TX_CARRIER_EN;
+    int64_t t0, s0, e;
+
+    start();
+    clocks_on();
+    pad_gpio(30);
+    wr(GPIO_FUNC_OUT(30), SIG_RMT(0));
+    wr(RAM(TX_BLOCK(0)), word(entry(1, 100), entry(0, 0)));
+    wr(TX_CARRIER(0), (3 << 16) | 5);
+    step(1000);
+    t0 = now;
+    tx_setup(0, conf);
+
+    for (e = t0 + 1000 * 1000 * 1000 + 3 * CYC;
+         e <= t0 + 1000 * 1000 * 1000 + 8 * CYC; e += 5 * CYC) {
+        clock_to(e - 1);
+        g_assert_cmpint(pad_level(30), ==, carrier_level(t0, e - 1));
+        clock_to(e);
+        g_assert_cmpint(pad_level(30), ==, carrier_level(t0, e));
+        g_assert_cmpint(carrier_level(t0, e), !=, carrier_level(t0, e - 1));
+    }
+
+    /* Mid-way through a carrier low phase, the transmission starts */
+    s0 = now + 4 * CYC;
+    clock_to(s0);
+    g_assert_cmpint(pad_level(30), ==, 0);
+    tx_go(0, conf);
+    clock_to(s0 + CYC - 1);
+    g_assert_cmpint(pad_level(30), ==, 0);
+    clock_to(s0 + CYC);
+    g_assert_cmpint(pad_level(30), ==, 1);
+    clock_to(s0 + 101 * CYC + 3 * CYC - 1);
+    g_assert_cmpint(pad_level(30), ==, 1);
+    clock_to(s0 + 101 * CYC + 3 * CYC);
+    g_assert_cmpint(pad_level(30), ==, 0);
+    g_assert_cmphex(rd(INT_RAW), ==, INT_TX_END(0));
+
+    /* Watched: the carrier's second rise after the entry, at its moment */
+    wr(GPIO_PIN(30), PIN_INT_RISING);
+    e = s0 + 101 * CYC + 16 * CYC;
+    clock_to(e - 1);
+    wr(GPIO_STATUS_W1TC, 1u << 30);
+    g_assert_cmpint(pad30_rose(), ==, 0);
+    clock_to(e);
+    g_assert_cmpint(pad30_rose(), ==, 1);
+    stop();
+}
+
+/*
+ * A continuous transmission on pad 30, which nothing watches, of passes of
+ * three 25 ns entries, high, low, high: some 13 million passes a second,
+ * which the block takes whole. GPIO_IN reads each entry's level at its
+ * nanosecond a second on, and TX_STATUS the read pointer.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_unwatched_passes(void)
+{
+    uint32_t conf = TX_DIV(1) | TX_MEM_SIZE(1) | TX_IDLE_EN | TX_CONTI;
+    int64_t s0, p;
+
+    start();
+    clocks_on();
+    pad_gpio(30);
+    wr(GPIO_FUNC_OUT(30), SIG_RMT(0));
+    wr(RAM(TX_BLOCK(0) + 0), word(entry(1, 1), entry(0, 1)));
+    wr(RAM(TX_BLOCK(0) + 1), word(entry(1, 1), entry(0, 0)));
+    tx_setup(0, conf);
+    step(1000);
+    s0 = now;
+    tx_go(0, conf);
+    /* Pass k starts at s0 + CYC + 3 * k * CYC */
+    p = s0 + CYC + 3 * CYC * (1000 * 1000 * 1000 / (3 * CYC));
+    clock_to(p - 1);
+    g_assert_cmpint(pad_level(30), ==, 1);
+    clock_to(p);
+    g_assert_cmpint(pad_level(30), ==, 1);
+    g_assert_cmphex(rd(TX_STATUS(0)) & 0x3ff, ==, TX_BLOCK(0) + 1);
+    clock_to(p + CYC - 1);
+    g_assert_cmpint(pad_level(30), ==, 1);
+    clock_to(p + CYC);
+    g_assert_cmpint(pad_level(30), ==, 0);
+    clock_to(p + 2 * CYC - 1);
+    g_assert_cmpint(pad_level(30), ==, 0);
+    clock_to(p + 2 * CYC);
+    g_assert_cmpint(pad_level(30), ==, 1);
+    g_assert_cmphex(rd(TX_STATUS(0)) & 0x3ff, ==, TX_BLOCK(0) + 2);
+    g_assert_cmpuint(ST_STATE(rd(TX_STATUS(0))), ==, 1);
+    g_assert_cmphex(rd(INT_RAW), ==, INT_TX_END(0));
+    stop();
+}
+
+/*
+ * A loop transmission of 1000 passes on pad 30, which nothing watches,
+ * TX_LOOP enabled: with nothing read meanwhile, TX_LOOP reaches the
+ * interrupt line at the 1000th end marker to the nanosecond, and the
+ * transmitter stops there. Without LOOP_STOP_EN it runs on, the count
+ * starting again: TX_LOOP comes again 1000 passes later.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_loop_moment(void)
+{
+    uint32_t conf = TX_DIV(4) | TX_MEM_SIZE(1) | TX_IDLE_EN | TX_CONTI;
+    int64_t s0, e;
+
+    start();
+    clocks_on();
+    qtest_irq_intercept_out_named(qts, "/machine/rmt", "sysbus-irq");
+    pad_gpio(30);
+    wr(GPIO_FUNC_OUT(30), SIG_RMT(0));
+    wr(RAM(TX_BLOCK(0) + 0), word(entry(1, 30), entry(0, 20)));
+    wr(RAM(TX_BLOCK(0) + 1), word(entry(1, 10), entry(0, 0)));
+    wr(TX_LIM(0), 0x80 | LOOP_NUM(1000) | LOOP_CNT_EN | LOOP_STOP_EN |
+       LOOP_CNT_RESET);
+    wr(TX_LIM(0), 0x80 | LOOP_NUM(1000) | LOOP_CNT_EN | LOOP_STOP_EN);
+    tx_setup(0, conf);
+    wr(INT_ENA, INT_TX_LOOP(0));
+    step(1000);
+    s0 = now;
+    tx_go(0, conf);
+    /* Passes of 60 ticks of 100 ns from s0 + 100 */
+    e = s0 + 100 + 1000 * 6000;
+    clock_to(e - 1);
+    g_assert_false(qtest_get_irq(qts, 0));
+    clock_to(e);
+    g_assert_true(qtest_get_irq(qts, 0));
+    g_assert_cmphex(rd(INT_RAW), ==, INT_TX_LOOP(0) | INT_TX_END(0));
+    g_assert_cmpuint(ST_STATE(rd(TX_STATUS(0))), ==, 0);
+    g_assert_cmpint(pad_level(30), ==, 0);
+
+    /* Looping on */
+    wr(INT_CLR, 0xffffffff);
+    wr(TX_LIM(0), 0x80 | LOOP_NUM(1000) | LOOP_CNT_EN);
+    tx_setup(0, conf);
+    s0 = now;
+    tx_go(0, conf);
+    e = s0 + 100 + 1000 * 6000;
+    clock_to(e - 1);
+    g_assert_false(qtest_get_irq(qts, 0));
+    clock_to(e);
+    g_assert_true(qtest_get_irq(qts, 0));
+    wr(INT_CLR, INT_TX_LOOP(0));
+    g_assert_false(qtest_get_irq(qts, 0));
+    g_assert_cmpuint(ST_STATE(rd(TX_STATUS(0))), ==, 1);
+    clock_to(e + 1000 * 6000 - 1);
+    g_assert_false(qtest_get_irq(qts, 0));
+    g_assert_cmpint(pad_level(30), ==, 1);
+    clock_to(e + 1000 * 6000);
+    g_assert_true(qtest_get_irq(qts, 0));
+    stop();
+}
+
 /* Held in reset, the block is back at its reset values. */
 /* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
 static void test_block_reset(void)
@@ -812,5 +991,8 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/rmt/mem_size_and_power",
                    test_mem_size_and_power);
     qtest_add_func("esp32p4/rmt/block_reset", test_block_reset);
+    qtest_add_func("esp32p4/rmt/unwatched_carrier", test_unwatched_carrier);
+    qtest_add_func("esp32p4/rmt/unwatched_passes", test_unwatched_passes);
+    qtest_add_func("esp32p4/rmt/loop_moment", test_loop_moment);
     return g_test_run();
 }
