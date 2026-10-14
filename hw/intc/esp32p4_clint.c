@@ -47,7 +47,8 @@
  * unimplemented (esp32p4_clkrst.c). The WFI autoclock gating of the CPU
  * subsystem does not reach it (esp32p4_clkrst.c). Each core's registers
  * are behind its CLIC bus clock: while that is stopped they drop writes.
- * Each core's time CSR reads the count.
+ * Each core's time and timeh CSRs read the count, its low and high halves
+ * (esp32p4_csr.c has who may read them).
  *
  * Under icount the counter is exact: a timer interrupt is raised at the
  * virtual time the count reaches mtimecmp.
@@ -215,7 +216,8 @@ static void clint_mtime_clk_update(void *opaque, ClockEvent event)
     clint_restart(s);
 }
 
-/* The time CSR. */
+/* The time and timeh CSRs: the count, as mtimelo and mtimehi read it. */
+/* [spec:nuos:req:emu.esp32p4.cpu] */
 static uint64_t clint_rdtime(void *opaque)
 {
     return clint_count(opaque);

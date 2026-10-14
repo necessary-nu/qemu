@@ -41,7 +41,8 @@
  * the entry point of an image it booted):
  *
  *   - Core 0: mstatus 0x9 (MIE set: the ROM's _init enables interrupts,
- *     none of which its CLIC configuration lets through), mie 0, mtvec
+ *     none of which its CLIC configuration lets through), mcounteren 0x7
+ *     (its value from reset, which the ROM does not write), mie 0, mtvec
  *     0x4FC00B03 (the ROM's vector table in CLIC mode), mhcr 0x1030 (the
  *     return stack, branch prediction and branch target buffer on), PMA
  *     entry 15 cfg 0xC000001D addr 0x11FFFFFF (CPU_ATTR_Cacheable: L2MEM,
@@ -79,17 +80,20 @@
  *     KiB of L2MEM. No line is dirty, so their contents, the ROM's on the
  *     chip, are not presented.
  *   - The flash MSPI controller: reset (HP_RST_EN0), then configured for
- *     the image header's DIO reads at 80 MHz (SPI0 CTRL 0x00AC200C, CTRL2
- *     0x01002C41, CLOCK 0x80000000, USER 0x200000C0, USER1 0x6C000041,
- *     USER2 0x700000BB, CACHE_FCTRL 0x40000005 with the AXI port open;
- *     SPI1 CTRL 0x00AC200C, CTRL1 0x001FF7FC, CLOCK 0x80000000), its
- *     buffer W0 the flash's JEDEC ID from the ROM's RDID; the flash MMU
- *     all invalid (Cache_FLASH_MMU_Init(), ITEM_INDEX 0x3FF), so nothing
- *     maps the flash window. The ROM's commands to the flash itself
- *     (release from power-down, status reads, write disable) leave it as
- *     it is from power-on, and are not repeated; the raw interrupt bits
- *     its transactions set (SPI0 and SPI1 INT_RAW 0x18) are not
- *     presented.
+ *     the image header's DIO reads at 80 MHz, both ports in DIO mode and
+ *     SPI0 reading with DIO's command 0xBB, 28 address bits (the address
+ *     and the mode bits' upper half) and 2 dummy cycles (SPI0 CTRL
+ *     0x00AC200C, CTRL2 0x01002C41, CLOCK 0x80000000, USER 0x200000C0,
+ *     USER1 0x6C000041, USER2 0x700000BB, MOSI_DLEN and MISO_DLEN 0xFF
+ *     (SPI_init()'s 256 bits), CACHE_FCTRL 0x40000005 with the AXI port
+ *     open; SPI1 CTRL 0x00AC200C, CTRL1 0x001FF7FC, CLOCK 0x80000000),
+ *     SPI1's buffer W0 the flash's JEDEC ID from the ROM's RDID, and both
+ *     ports' SLV_ST_END and MST_ST_END raised by the ROM's transactions
+ *     (INT_RAW 0x18); the flash MMU all invalid (Cache_FLASH_MMU_Init(),
+ *     ITEM_INDEX 0x3FF), so nothing maps the flash window. The ROM's
+ *     commands to the flash itself (release from power-down, status
+ *     reads, write disable) leave it as it is from power-on, and are not
+ *     repeated.
  *   - HP_SYS_CLKRST: PERI_CLK_CTRL00 0xC00C; the SHA accelerator's clock
  *     and reset as ets_sha_enable() leaves them, and SHA_MODE SHA-256. The
  *     SHA's digest of the image and the last block it hashed (SHA_H_n,
@@ -186,6 +190,7 @@
 #define SPI_MEM_USER1               0x01c
 #define SPI_MEM_USER2               0x020
 #define SPI_MEM_RD_STATUS           0x02c
+#define SPI_MEM_MOSI_DLEN           0x024
 #define SPI_MEM_MISO_DLEN           0x028
 #define SPI_MEM_MISC                0x034
 #define SPI_MEM_CACHE_FCTRL         0x03c
@@ -486,6 +491,8 @@ static void rom_flash_boot(ESP32P4MachineState *s)
     rom_wr(SPI1_BASE + SPI_MEM_RD_STATUS, 0);
     rom_wr(SPI0_BASE + SPI_MEM_CLOCK, 0x80000000);
     rom_wr(SPI1_BASE + SPI_MEM_CLOCK, 0x80000000);
+    rom_wr(SPI0_BASE + SPI_MEM_MISO_DLEN, 0xff);
+    rom_wr(SPI0_BASE + SPI_MEM_MOSI_DLEN, 0xff);
     rom_wr(SPI0_BASE + SPI_MEM_USER, 0x200000c0);
     rom_wr(SPI0_BASE + SPI_MEM_USER1, 0x6c000041);
     rom_wr(SPI0_BASE + SPI_MEM_USER2, 0x700000bb);
@@ -498,6 +505,7 @@ static void rom_flash_boot(ESP32P4MachineState *s)
      * byte first.
      */
     rom_wr(SPI1_BASE + SPI_MEM_W0, bswap32(rom_flash_jedec_id(s)) >> 8);
+    esp32p4_mspi_raise_state_ends(&s->flash_mspi);
 }
 
 /*
