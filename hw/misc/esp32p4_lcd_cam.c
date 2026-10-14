@@ -1697,10 +1697,45 @@ static void lcd_tx_arrived(void *opaque)
 }
 
 /*
- * Take the engine's events due by @until, each at its own time, with a
- * GDMA delivery that came during them taken at its time.
+ * [spec:nuos:req:emu.esp32p4.lcd-cam]
+ * The host has fallen ESP32_LINE_MAX_LAG_NS behind the LCD's events
+ * (include/hw/gpio/esp32_line.h), at esp32_line_time(), the present. RGB
+ * frames restart at the present, the ones between dropped; an i80
+ * transaction goes on from the present, PCLK pausing as when GDMA holds it
+ * up, so that a panel takes every word of it.
  */
-/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
+static void lcd_slip(void *opaque)
+{
+    ESP32P4LcdCamState *s = opaque;
+    uint64_t next = lcd_lc_at(s, esp32_line_time()) + 1;
+
+    if (log_once(s, LOG_LAG)) {
+        qemu_log_mask(LOG_UNIMP, "esp32p4.lcd-cam: the host is too slow for "
+                      "the LCD: %s\n", s->lcd_state == LCD_RGB ?
+                      "RGB frames restart at the present, frames dropped" :
+                      "the i80 transaction goes on from the present");
+    }
+    if (s->lcd_state == LCD_RGB) {
+        s->lcd_pos0 = next;
+        s->lcd_pos = 0;
+        s->rgb_in_line = false;
+        s->rgb_starved = false;
+        rgb_take_frame(s);
+        return;
+    }
+    i80_deliver_run(s);
+    if (next > s->lcd_pos0 + s->lcd_pos * s->lcd_mo) {
+        s->lcd_pos0 = next - s->lcd_pos * s->lcd_mo;
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.lcd-cam]
+ * Take the engine's events due by @until, each at its own time, with a
+ * GDMA delivery that came during them taken at its time. On the host's
+ * clock an event ESP32_LINE_MAX_LAG_NS behind the present, which the host
+ * cannot follow, makes the LCD slip to the present first (lcd_slip()).
+ */
 static void lcd_run(ESP32P4LcdCamState *s, int64_t until)
 {
     int64_t t;
@@ -1723,6 +1758,11 @@ static void lcd_run(ESP32P4LcdCamState *s, int64_t until)
         if (!have || t > until) {
             break;
         }
+        if (kind != EV_EDGE && esp32_line_lags(t)) {
+            esp32_line_run_at(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                              lcd_slip, s);
+            continue;
+        }
         esp32_line_run_at(t, lcd_event, s);
     }
     s->in_lcd_run = false;
@@ -1742,39 +1782,13 @@ static void lcd_schedule(ESP32P4LcdCamState *s)
 }
 
 /*
- * How far the host may fall behind RGB frames before they slip: a
- * second, far longer than the host's own pauses (a busy host holds QEMU's
- * main loop up for tens of milliseconds), as the image source has it.
- */
-#define LCD_MAX_LAG_NS          NANOSECONDS_PER_SECOND
-
-/* RGB frames restart at the present, the ones between dropped. */
-static void rgb_slip(void *opaque)
-{
-    ESP32P4LcdCamState *s = opaque;
-
-    if (log_once(s, LOG_LAG)) {
-        qemu_log_mask(LOG_UNIMP, "esp32p4.lcd-cam: the host is too slow for "
-                      "the RGB frames: they restart at the present, frames "
-                      "dropped\n");
-    }
-    s->lcd_pos0 = lcd_lc_at(s, esp32_line_time()) + 1;
-    s->lcd_pos = 0;
-    s->rgb_in_line = false;
-    s->rgb_starved = false;
-    rgb_take_frame(s);
-}
-
-/*
+ * [spec:nuos:req:emu.esp32p4.lcd-cam]
  * Under icount the timer takes the event at its deadline and no later
  * ones, so that the LCD's events and every other device's run in order
  * of time. On the host's clock the timer comes late, by the main loop's
  * latency: it takes every event due by the present, each at its own
  * time, as software sampling the pads does (lcd_cam_line_sync()), since
- * one event a callback falls ever further behind a stream of lines. RGB
- * frames faster than the host can follow still fall behind: once they
- * are LCD_MAX_LAG_NS behind they slip to the present rather than hold
- * the system back for ever.
+ * one event a callback falls ever further behind a stream of lines.
  */
 static void lcd_timer_cb(void *opaque)
 {
@@ -1788,11 +1802,7 @@ static void lcd_timer_cb(void *opaque)
      * next may not have come yet.
      */
     if (lcd_next_event(s, &t, &pos, &kind) && t <= now) {
-        if (s->lcd_state == LCD_RGB && now - t > LCD_MAX_LAG_NS) {
-            esp32_line_run_at(now, rgb_slip, s);
-        } else {
-            lcd_run(s, icount_enabled() ? t : MAX(t, now));
-        }
+        lcd_run(s, icount_enabled() ? t : MAX(t, now));
     }
     lcd_schedule(s);
 }

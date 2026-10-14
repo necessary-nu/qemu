@@ -54,6 +54,33 @@ void esp32_line_add_source(Notifier *n);
 void esp32_line_sync(void);
 
 /*
+ * Streams on the host's clock.
+ *
+ * A stream (a unit's clock edges, a sensor's or a panel's lines, an audio
+ * port's frames) takes each of its events at the event's own time, however
+ * late the QEMU timer that runs it: under icount virtual time waits for
+ * the stream, which never falls behind. On the host's clock QEMU's main
+ * loop runs late, by however long the host holds it up, and a stream
+ * catches up: it takes the events that fell due at their due times, in
+ * order, with what feeds or takes its data (DMA, a peer on the pads)
+ * brought up to each event's time first, so that a frame or transfer in
+ * progress completes as it would have.
+ *
+ * Only a stream more than ESP32_LINE_MAX_LAG_NS behind the present, as it
+ * comes to take an event (esp32_line_lags()), slips: it goes on from the
+ * present, as the stream says (logged). The bound is far beyond the host's
+ * pauses: a scheduler holds a thread up for a quantum of about 10 ms, a
+ * host loaded several times over its cores for tens of milliseconds at a
+ * time. A stream a second behind is one whose events cost the host more
+ * than their own time, which it can never catch up with; slipping then
+ * keeps the catch-up from holding QEMU's main loop, and the cores waiting
+ * for it, ever longer.
+ */
+#define ESP32_LINE_MAX_LAG_NS   NANOSECONDS_PER_SECOND
+
+bool esp32_line_lags(int64_t due_ns);
+
+/*
  * The routing of a GPIO matrix, for a block both chips have whose outputs
  * cost it work edge by edge: whether output signal sig reaches a pad
  * whose level anything but software sampling the pads sees (an input

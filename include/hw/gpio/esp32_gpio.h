@@ -74,10 +74,20 @@ REG32(GPIO_STRAP, 0x0038)
  * Pads, for boards and tests:
  *
  * - ESP32_GPIO_PAD_IN (gpio-in, ESP32_GPIO_PIN_COUNT lines): drive pad n
- *   from outside the chip at the given level. An outside driver overrides
- *   the chip's own driver and pulls.
- * - ESP32_GPIO_PAD_RELEASE (gpio-in): a high level stops driving pad n
- *   from outside.
+ *   from outside the chip at the given level, as outside driver 0,
+ *   "outside" (a test, or a board's fixed wiring).
+ * - ESP32_GPIO_PAD_RELEASE (gpio-in): a high level stops driver 0 driving
+ *   pad n.
+ * - esp32_gpio_ext_driver() (below): another driver outside the chip, a
+ *   board's chip or connector (a serial port's terminal), with lines of
+ *   its own to drive pads and release them.
+ * - A driver, outside the chip or the pad's own output driver (output
+ *   enabled, push-pull, or open drain driving low), wins over every pull.
+ *   Pad n takes the level of its drivers while they agree; drivers at
+ *   different levels make a divider of like strengths, each a strong
+ *   pull to its rail: the pad is mid-rail, between VIL and VIH, its level
+ *   undefined, and it reads low, logged as a guest error naming the
+ *   drivers.
  * - ESP32_GPIO_PAD_OUT (gpio-out): the level on pad n.
  * - ESP32_GPIO_BOARD_PULL_UP, ESP32_GPIO_BOARD_PULL_DOWN (gpio-in): a
  *   resistor the board has from pad n to the pad's supply, or to ground,
@@ -199,7 +209,20 @@ typedef enum Esp32GpioIrq {
     ESP32_GPIO_IRQ_COUNT,
 } Esp32GpioIrq;
 
-typedef struct Esp32GpioState {
+/* Drivers outside the chip, the "outside" lines' among them */
+#define ESP32_GPIO_EXT_DRIVERS  8
+
+typedef struct Esp32GpioState Esp32GpioState;
+
+/* An outside driver's lines, ESP32_GPIO_PIN_COUNT each */
+typedef struct Esp32GpioExtDriver {
+    Esp32GpioState *s;
+    unsigned id;
+    qemu_irq *in;
+    qemu_irq *release;
+} Esp32GpioExtDriver;
+
+struct Esp32GpioState {
     SysBusDevice parent_obj;
 
     /* GPIO matrix registers, with the sigma-delta block at 0xf00 */
@@ -251,9 +274,17 @@ typedef struct Esp32GpioState {
     uint32_t sdm_acc[ESP32_GPIO_SDM_COUNT];
     uint8_t sdm_out[ESP32_GPIO_SDM_COUNT];
 
-    /* Levels driven into the block from outside */
-    uint64_t ext_driven;
-    uint64_t ext_level;
+    /*
+     * The pads each driver outside the chip drives, and at what levels;
+     * of them all, the pads one drives high and those one drives low
+     */
+    uint64_t ext_driven[ESP32_GPIO_EXT_DRIVERS];
+    uint64_t ext_level[ESP32_GPIO_EXT_DRIVERS];
+    uint64_t ext_high;
+    uint64_t ext_low;
+    unsigned ext_drivers;
+    char *ext_name[ESP32_GPIO_EXT_DRIVERS];
+    Esp32GpioExtDriver ext[ESP32_GPIO_EXT_DRIVERS];
     /* The board's pull resistors on each pad, ohms (0: none) */
     uint32_t board_pull_up[ESP32_GPIO_PIN_COUNT];
     uint32_t board_pull_down[ESP32_GPIO_PIN_COUNT];
@@ -277,8 +308,12 @@ typedef struct Esp32GpioState {
     uint8_t iomux_in[ESP32_GPIO_PIN_COUNT * ESP32_IOMUX_FUNC_COUNT];
     uint8_t irq_level[ESP32_GPIO_IRQ_COUNT];
     bool wakeup_level;
-    /* The pads whose pulls hold them between VIL and VIH, as resolved */
+    /*
+     * The pads whose pulls hold them between VIL and VIH, and those whose
+     * drivers are at odds, as resolved
+     */
     uint64_t undefined;
+    uint64_t contended;
     /* Drive every output line on the next update, not only changed ones */
     bool resync;
     bool updating;
@@ -296,7 +331,7 @@ typedef struct Esp32GpioState {
      */
     NotifierList route_notifiers;
     bool setup_changed;
-} Esp32GpioState;
+};
 
 typedef struct Esp32GpioClass {
     SysBusDeviceClass parent_class;
@@ -381,9 +416,20 @@ bool esp32_gpio_pad_level(Esp32GpioState *s, unsigned n);
 /*
  * Whether pad n is driven digitally, from outside the chip or by its own
  * output driver, and if so, at what *level: for the analog blocks, which
- * see such a pad at the supply or ground.
+ * see such a pad at the supply or ground (low, as it reads, for drivers
+ * at odds).
  */
 bool esp32_gpio_pad_driven(Esp32GpioState *s, unsigned n, bool *level);
+
+/*
+ * Another driver outside the chip, named @name in guest errors: returns
+ * its number, d, whose lines esp32_gpio_ext_in(s, d, n) drives pad n at
+ * the line's level and esp32_gpio_ext_release(s, d, n) stops driving it
+ * at a high level. Driver 0 is ESP32_GPIO_PAD_IN's and _RELEASE's.
+ */
+unsigned esp32_gpio_ext_driver(Esp32GpioState *s, const char *name);
+qemu_irq esp32_gpio_ext_in(Esp32GpioState *s, unsigned d, unsigned n);
+qemu_irq esp32_gpio_ext_release(Esp32GpioState *s, unsigned d, unsigned n);
 
 /*
  * The output signal that reaches input signal sig through a pad: the pad

@@ -19,9 +19,17 @@
  * Absent on the HP core, and so illegal: mstatush, menvcfg, menvcfgh and
  * mconfigptr (the core follows privileged architecture 1.10), every
  * event selector but mhpmevent8, 9 and 13, and pmpcfg8-15 and
- * pmpaddr32-63 beyond its 32 PMP entries; timeh, uie, uip and utval,
- * which the TRM's CSR list leaves out. The counters other than those
- * three are left out by the CPU's PMU mask.
+ * pmpaddr32-63 beyond its 32 PMP entries; uie, uip and utval, which the
+ * TRM's CSR list leaves out. The counters other than those three are left
+ * out by the CPU's PMU mask.
+ *
+ * time and timeh read the count of the CLINT's mtime (esp32p4_clint.c),
+ * the same count software reads from mtimelo and mtimehi, at CPU_CLK's
+ * rate: in machine mode, and in user mode while mcounteren.TM is set. The
+ * TRM's CSR list leaves timeh out, but describes it (register 2.58), and
+ * the chip reads it. Writing either is illegal, as their numbers make
+ * them read-only. The LP core, which TRM 5.3.1 gives neither, and which
+ * has no CLINT, lacks both.
  *
  * An access the core does not permit raises an illegal instruction
  * exception: QEMU's CSR access check covers the privilege the CSR number
@@ -1387,7 +1395,6 @@ const RISCVCSR esp32p4_csr_list[] = {
            write_xintthresh),
     HP_CSR(CSR_ESP_UCLICBASE, "uclicbase", clic, read_xclicbase,
            write_xclicbase),
-    HP_CSR(CSR_TIMEH, "timeh", hp_absent, read_absent, write_absent),
 
     CTR_CSR(CSR_MCOUNTINHIBIT, "mcountinhibit"),
     MHPMEVENT(3), MHPMEVENT(4), MHPMEVENT(5), MHPMEVENT(6), MHPMEVENT(7),
@@ -1493,6 +1500,7 @@ const RISCVCSR esp32p4_csr_list[] = {
     CTR_CSR(CSR_MINSTRETH, "minstreth"),
     CTR_CSR(CSR_CYCLE, "cycle"),
     LP_CSR(CSR_TIME, "time"),
+    LP_CSR(CSR_TIMEH, "timeh"),
     CTR_CSR(CSR_INSTRET, "instret"),
     CTR_CSR(CSR_CYCLEH, "cycleh"),
     CTR_CSR(CSR_INSTRETH, "instreth"),

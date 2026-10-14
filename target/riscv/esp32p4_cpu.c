@@ -839,8 +839,16 @@ static TCGTBCPUState esp32p4_hp_get_tb_cpu_state(CPUState *cs)
 }
 
 /* [spec:nuos:req:emu.esp32p4.cpu] */
+/* [spec:nuos:req:emu.esp32p4.boot] */
 static void esp32p4_hp_reset_hold(ESP32P4CPU *cpu)
 {
+    /*
+     * mcounteren reads 0x7 from reset on the chip, CY, TM and IR set,
+     * where the TRM gives 0 (register 2.32): the boot ROM never writes it,
+     * and hands an application that value.
+     */
+    cpu->parent_obj.env.mcounteren = COUNTEREN_CY | COUNTEREN_TM |
+                                     COUNTEREN_IR;
     memset(cpu->hwlp_start, 0, sizeof(cpu->hwlp_start));
     memset(cpu->hwlp_end, 0, sizeof(cpu->hwlp_end));
     memset(cpu->hwlp_count, 0, sizeof(cpu->hwlp_count));

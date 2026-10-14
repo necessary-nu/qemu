@@ -364,6 +364,7 @@ struct ESP32P4I2sState {
     int64_t etm_deferred_ns[ESP32P4_I2S_ETM_TASKS];
 
     bool logged_conv;
+    bool logged_lag;
     bool logged_slave_clk;
     bool logged_peer_pdm;
 };

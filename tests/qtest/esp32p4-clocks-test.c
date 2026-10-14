@@ -162,7 +162,8 @@ static const Reg clkrst_regs[] = {
     { HP_BASE + 0x0d8, 0x00001011, 0x0001ffff, 0, 0 },
     /* XTAL_CLK's 40 MHz, in 0.25 MHz steps. */
     { HP_BASE + 0x0dc, 160, 0, 0, 0xffffffff },
-    { HP_BASE + 0x0e0, 0x00000000, 0, 0, 0x07ffffff },
+    /* DIV_EFFECT set, as the chip reads it (the v3 header gives 0). */
+    { HP_BASE + 0x0e0, 0x00000002, 0, 0, 0x07ffffff },
     { HP_BASE + 0x0e4, 0x03ffffff, 0xffffffff, 0, 0 },
     { HP_BASE + 0x0e8, 0x00000303, 0x0007ffff, 0, 0 },
     { HP_BASE + 0x0ec, 0x00000002, 0x00000003, 0, 0 },
@@ -526,10 +527,15 @@ static void test_soc_clocks(void)
 {
     QTestState *qts = qtest_init("-M esp32p4");
 
-    /* The dividers change only when SOC_CLK_DIV_UPDATE takes them. */
+    /*
+     * The dividers change only when SOC_CLK_DIV_UPDATE takes them. The
+     * divider takes effect (DIV_EFFECT) from reset, undivided, as on the
+     * chip, and stays so.
+     */
+    g_assert_cmphex(qtest_readl(qts, CPU_CLK_STATUS0), ==, 2);
     qtest_writel(qts, ROOT_CLK_CTRL0, 3 << 5);
     assert_hz(qts, "cpu", 40 * MHZ);
-    g_assert_cmphex(qtest_readl(qts, CPU_CLK_STATUS0), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, CPU_CLK_STATUS0), ==, 2);
     qtest_writel(qts, ROOT_CLK_CTRL0, (3 << 5) | (1 << 4));
     g_assert_cmphex(qtest_readl(qts, ROOT_CLK_CTRL0), ==, 3 << 5);
     assert_hz(qts, "cpu", 10 * MHZ);
@@ -723,7 +729,7 @@ static void test_cpll(void)
     assert_hz(qts, "apb", 100 * MHZ);
     assert_cpu_hz(qts, HP_CPU0, 400 * MHZ);
     g_assert_cmpuint(qtest_readl(qts, CPU_SRC_FREQ0), ==, 1600);
-    g_assert_cmphex(qtest_readl(qts, CPU_CLK_STATUS0), ==, 4);
+    g_assert_cmphex(qtest_readl(qts, CPU_CLK_STATUS0), ==, 4 | 2);
 
     /* Releasing core 1's clock, it executes at CPU_CLK too. */
     set_bits(qts, SOC_CLK_CTRL0, 1 << 4);
