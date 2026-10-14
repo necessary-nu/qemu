@@ -127,6 +127,17 @@ static void release(QTestState *qts, unsigned n)
     qtest_set_irq_in(qts, GPIO_PATH, PAD_RELEASE, n, 1);
 }
 
+/* The times @what appears in @text */
+static int count(const char *text, const char *what)
+{
+    int n = 0;
+
+    for (const char *p = text; (p = strstr(p, what)); p++) {
+        n++;
+    }
+    return n;
+}
+
 /* GPIO18 as a GPIO-matrix pad with its input enabled */
 static void gpio18_matrix(QTestState *qts)
 {
@@ -242,7 +253,7 @@ static void test_pads(void)
 {
     QTestState *qts = start();
 
-    /* An outside driver wins over pulls and the chip's own driver */
+    /* An outside driver wins over pulls */
     qtest_writel(qts, IO_MUX_GPIO19, MCU_SEL(PIN_FUNC_GPIO) | FUN_IE |
                  FUN_WPU);
     g_assert_true(in_bit(qts, 19));
@@ -283,6 +294,68 @@ static void test_pads(void)
     g_assert_false(in_bit(qts, 20));
 
     qtest_quit(qts);
+}
+
+/*
+ * A pad's drivers against each other, the guest errors in a log: serial
+ * port 0's terminal holds U0RXD (GPIO3) high, and an outside driver high
+ * agrees with it; driving low, the two fight, and the pad reads low, a
+ * guest error naming both; released, the terminal's level is back. The
+ * chip's own output against an outside driver: agreeing, the level;
+ * fighting, low and named; an open-drain output's low a driver too, its
+ * high none.
+ */
+/* [spec:nuos:req:emu.esp32.gpio/test] */
+static void test_pad_drivers(void)
+{
+    g_autofree char *log = NULL;
+    g_autofree char *text = NULL;
+    QTestState *qts;
+    int fd = g_file_open_tmp("esp32-gpio-XXXXXX.log", &log, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    qts = qtest_initf("-M esp32 -nic none -serial null -d guest_errors "
+                      "-D %s", log);
+
+    g_assert_true(in_bit(qts, 3));
+    drive(qts, 3, 1);
+    g_assert_true(in_bit(qts, 3));
+    drive(qts, 3, 0);
+    g_assert_false(in_bit(qts, 3));
+    release(qts, 3);
+    g_assert_true(in_bit(qts, 3));
+
+    gpio18_matrix(qts);
+    qtest_writel(qts, GPIO_ENABLE_W1TS, 1u << 18);
+    qtest_writel(qts, GPIO_OUT_W1TS, 1u << 18);
+    drive(qts, 18, 1);
+    g_assert_true(in_bit(qts, 18));
+    drive(qts, 18, 0);
+    g_assert_false(in_bit(qts, 18));
+    release(qts, 18);
+    g_assert_true(in_bit(qts, 18));
+
+    qtest_writel(qts, GPIO_PIN(18), PIN_PAD_DRIVER);
+    qtest_writel(qts, GPIO_OUT_W1TC, 1u << 18);
+    drive(qts, 18, 1);
+    g_assert_false(in_bit(qts, 18));
+    qtest_writel(qts, GPIO_OUT_W1TS, 1u << 18);
+    g_assert_true(in_bit(qts, 18));
+    drive(qts, 18, 0);
+    g_assert_false(in_bit(qts, 18));
+    qtest_quit(qts);
+
+    g_assert_true(g_file_get_contents(log, &text, NULL, NULL));
+    unlink(log);
+    g_assert_nonnull(strstr(text, "GPIO3 is driven high and low at once "
+                                  "(outside low, serial port 0 high)"));
+    g_assert_nonnull(strstr(text, "GPIO18 is driven high and low at once "
+                                  "(outside low, its own output high)"));
+    g_assert_nonnull(strstr(text, "GPIO18 is driven high and low at once "
+                                  "(outside high, its own output low)"));
+    /* Those three fights, and no more: agreeing drivers make none. */
+    g_assert_cmpint(count(text, "driven high and low"), ==, 3);
 }
 
 /* [spec:nuos:req:emu.esp32.gpio/test] */
@@ -629,6 +702,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32-gpio/strap", test_strap);
     qtest_add_func("esp32-gpio/output-readback", test_output_readback);
     qtest_add_func("esp32-gpio/pads", test_pads);
+    qtest_add_func("esp32-gpio/pad-drivers", test_pad_drivers);
     qtest_add_func("esp32-gpio/pulls", test_pulls);
     qtest_add_func("esp32-gpio/iomux-inputs", test_iomux_inputs);
     qtest_add_func("esp32-gpio/input-routing", test_input_routing);
