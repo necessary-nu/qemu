@@ -26,9 +26,12 @@
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "qemu/lockable.h"
+#include "qemu/cutils.h"
+#include "qemu/error-report.h"
 #include "system/cpu-timers.h"
 #include "exec/icount.h"
 #include "system/replay.h"
+#include "system/qtest.h"
 #include "system/cpus.h"
 #include "hw/core/cpu.h"
 
@@ -64,6 +67,22 @@ typedef struct QEMUClock {
 QEMUTimerListGroup main_loop_tlg;
 static QEMUClock qemu_clocks[QEMU_CLOCK_MAX];
 
+/*
+ * Late timers, a test mode for the host's clock. Without icount, virtual
+ * time is the host's time and QEMU_CLOCK_VIRTUAL timers run when the main
+ * loop gets to them, which on a loaded host can be well after they fall
+ * due, while the vCPUs run on and read clocks past those deadlines. A
+ * device must then show the guest, at a register access, what is due by
+ * the access's time whether or not its timer has run. With
+ * QEMU_LATE_TIMERS_NS set in the environment to a number of nanoseconds,
+ * every QEMU_CLOCK_VIRTUAL timer runs that much after its deadline, in
+ * deadline order as ever, so that a device relying on its timer having
+ * run shows itself in any guest that looks within that time. Under
+ * icount, record/replay and qtest, where virtual time moves only as the
+ * vCPUs or the test move it, the setting has no effect.
+ */
+static int64_t late_timers_ns;
+
 /* A QEMUTimerList is a list of timers attached to a clock. More
  * than one QEMUTimerList can be attached to each clock, for instance
  * used by different AioContexts / threads. Each clock also has
@@ -94,6 +113,25 @@ struct QEMUTimerList {
 static inline QEMUClock *qemu_clock_ptr(QEMUClockType type)
 {
     return &qemu_clocks[type];
+}
+
+static int64_t timerlist_lateness_ns(QEMUTimerList *timer_list)
+{
+    if (!late_timers_ns || timer_list->clock->type != QEMU_CLOCK_VIRTUAL ||
+        icount_enabled() || replay_mode != REPLAY_MODE_NONE ||
+        qtest_enabled()) {
+        return 0;
+    }
+    return late_timers_ns;
+}
+
+/* When a timer expiring at @expire_time runs. */
+static int64_t timerlist_run_time(QEMUTimerList *timer_list,
+                                  int64_t expire_time)
+{
+    int64_t late = timerlist_lateness_ns(timer_list);
+
+    return expire_time > INT64_MAX - late ? INT64_MAX : expire_time + late;
 }
 
 static bool timer_expired_ns(const QEMUTimer *timer_head, int64_t current_time)
@@ -203,7 +241,8 @@ bool timerlist_expired(QEMUTimerList *timer_list)
         expire_time = timer_list->active_timers->expire_time;
     }
 
-    return expire_time <= qemu_clock_get_ns(timer_list->clock->type);
+    return timerlist_run_time(timer_list, expire_time) <=
+           qemu_clock_get_ns(timer_list->clock->type);
 }
 
 bool qemu_clock_expired(QEMUClockType type)
@@ -241,7 +280,8 @@ int64_t timerlist_deadline_ns(QEMUTimerList *timer_list)
         expire_time = timer_list->active_timers->expire_time;
     }
 
-    delta = expire_time - qemu_clock_get_ns(timer_list->clock->type);
+    delta = timerlist_run_time(timer_list, expire_time) -
+            qemu_clock_get_ns(timer_list->clock->type);
 
     if (delta <= 0) {
         return 0;
@@ -673,7 +713,8 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
      * the checkpoint can be issued at a time until no timers are left and we are
      * done".
      */
-    current_time = qemu_clock_get_ns(timer_list->clock->type);
+    current_time = qemu_clock_get_ns(timer_list->clock->type) -
+                   timerlist_lateness_ns(timer_list);
     qemu_mutex_lock(&timer_list->active_timers_lock);
     while ((ts = timer_list->active_timers)) {
         if (!timer_expired_ns(ts, current_time)) {
@@ -783,8 +824,17 @@ static void qemu_virtual_clock_set_ns(int64_t time)
 void qemu_init_clocks(QEMUTimerListNotifyCB *notify_cb)
 {
     QEMUClockType type;
+    const char *late = getenv("QEMU_LATE_TIMERS_NS");
+
     for (type = 0; type < QEMU_CLOCK_MAX; type++) {
         qemu_clock_init(type, notify_cb);
+    }
+    if (late && *late &&
+        (qemu_strtoi64(late, NULL, 10, &late_timers_ns) < 0 ||
+         late_timers_ns < 0)) {
+        error_report("QEMU_LATE_TIMERS_NS=%s is not a number of "
+                     "nanoseconds", late);
+        exit(1);
     }
 
 #ifdef CONFIG_PRCTL_PR_SET_TIMERSLACK

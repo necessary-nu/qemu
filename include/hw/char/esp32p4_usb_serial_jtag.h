@@ -85,6 +85,8 @@ struct ESP32P4UsjState {
 
     /* The host: its state, the frame it is in, and the requests to make. */
     QEMUTimer host_timer;
+    /* When host_timer is due: the next state change or frame. */
+    int64_t host_next;
     uint8_t host_state;
     uint32_t host_step;
     int64_t host_deadline;

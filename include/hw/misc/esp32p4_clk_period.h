@@ -835,6 +835,14 @@ struct ESP32P4ClkSourceClass {
      * as @out last took them: false if @obj does not drive @out.
      */
     bool (*exact_edges)(Object *obj, Clock *out, ESP32P4ClkEdges *e);
+    /*
+     * Optional: make the changes of @obj's outputs that fell due by @now
+     * (a PLL locking), each at its own time, which a QEMU timer running
+     * late has not made yet. The reset and clock control calls it on the
+     * sources of its inputs before an access to it or to a block behind
+     * its gates, so that the access finds the clocks as they are then.
+     */
+    void (*sync)(Object *obj, int64_t now);
 };
 
 /*
@@ -882,6 +890,28 @@ static inline bool esp32p4_clk_exact_edges(Clock *clk, ESP32P4ClkEdges *e)
         }
     }
     return false;
+}
+
+/*
+ * Have the device driving the clock on @clk at its source make the
+ * changes it has due by @now (ESP32P4ClkSourceClass's sync), if it can.
+ */
+static inline void esp32p4_clk_sync_source(Clock *clk, int64_t now)
+{
+    Clock *root = clk;
+    Object *owner;
+
+    while (root->source) {
+        root = root->source;
+    }
+    owner = OBJECT(root)->parent;
+    if (owner && object_dynamic_cast(owner, TYPE_ESP32P4_CLK_SOURCE)) {
+        ESP32P4ClkSourceClass *k = ESP32P4_CLK_SOURCE_GET_CLASS(owner);
+
+        if (k->sync) {
+            k->sync(owner, now);
+        }
+    }
 }
 
 /* The exact period of the clock on @clk (esp32p4_clk_exact_edges()). */

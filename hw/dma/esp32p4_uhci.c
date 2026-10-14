@@ -41,6 +41,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/dma/esp32p4_uhci.h"
+#include "hw/gpio/esp32_line.h"
 #include "migration/vmstate.h"
 
 #define A_CONF0             0x00
@@ -524,8 +525,7 @@ static void uhci_hung_update(ESP32P4UhciState *s, QEMUTimer *t, bool *fired,
         *fired = false;
     }
     if (!*fired && !timer_pending(t)) {
-        timer_mod_ns(t, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                     uhci_hung_ns(s, shift));
+        timer_mod_ns(t, esp32_line_time() + uhci_hung_ns(s, shift));
     }
 }
 
@@ -638,9 +638,56 @@ static void uhci_gdma_ready(void *opaque)
     uhci_kick(opaque);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.uart]
+ * Bring the UART the UHCI serves up to now (esp32p4_uart_catch_up()),
+ * which moves what its frames brought, then end the timeouts whose time
+ * has come, each at its time: without icount the UART's timers and the
+ * timeouts' can run well after, while software reads INT_RAW or GDMA's
+ * channels for a frame's data and end. A register access, and GDMA's,
+ * first do so. Only a timer that has come is run.
+ */
+static void uhci_catch_up(ESP32P4UhciState *s)
+{
+    ESP32P4UartState *uart = uhci_uart(s);
+    int64_t now = esp32_line_time();
+
+    if (uart) {
+        esp32p4_uart_catch_up(uart);
+    }
+    for (;;) {
+        int64_t out = timer_expire_time_ns(&s->out_hung_timer);
+        int64_t in = timer_expire_time_ns(&s->in_hung_timer);
+        bool out_due = timer_pending(&s->out_hung_timer) && out <= now;
+        bool in_due = timer_pending(&s->in_hung_timer) && in <= now;
+
+        if (out_due && (!in_due || out <= in)) {
+            timer_del(&s->out_hung_timer);
+            esp32_line_run_at(out, uhci_out_hung_cb, s);
+        } else if (in_due) {
+            timer_del(&s->in_hung_timer);
+            esp32_line_run_at(in, uhci_in_hung_cb, s);
+        } else {
+            return;
+        }
+    }
+}
+
+/* GDMA's register access, while a channel of the UHCI's runs. */
+static void uhci_gdma_sync(void *opaque, int64_t when)
+{
+    ESP32P4UhciState *s = opaque;
+
+    if (esp32p4_gdma_tx_flowing(s->gdma, ESP32P4_GDMA_AHB_UHCI0) ||
+        esp32p4_gdma_rx_flowing(s->gdma, ESP32P4_GDMA_AHB_UHCI0)) {
+        uhci_catch_up(s);
+    }
+}
+
 static const ESP32P4GdmaPeriphOps uhci_gdma_ops = {
     .tx_ready = uhci_gdma_ready,
     .rx_ready = uhci_gdma_ready,
+    .sync = uhci_gdma_sync,
 };
 
 /* ---- Registers ---- */
@@ -674,6 +721,7 @@ static uint64_t uhci_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4UhciState *s = opaque;
 
+    uhci_catch_up(s);
     switch (addr) {
     case A_CONF0:
         return s->conf0;
@@ -725,6 +773,7 @@ static void uhci_write(void *opaque, hwaddr addr, uint64_t value,
     ESP32P4UhciState *s = opaque;
     uint32_t v = value;
 
+    uhci_catch_up(s);
     switch (addr) {
     case A_CONF0: {
         uint32_t old = s->conf0;

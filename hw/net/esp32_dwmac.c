@@ -72,6 +72,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/net/esp32_dwmac.h"
 #include "migration/vmstate.h"
 #include "net/checksum.h"
@@ -1547,6 +1548,126 @@ static bool dwmac_tx_vlan(Esp32DwmacState *s, uint8_t *frame, size_t *len)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32.emac]
+ * [spec:nuos:req:emu.esp32p4.emac]
+ * The MAC's timed events: a management frame's end, a frame's or pause
+ * frame's end on the wire, a received pause's end, the pause refresh and
+ * the receive watchdog. Each runs as of its due time however late its
+ * QEMU timer runs (esp32_line_run_at()), so that what it starts counts
+ * from then, and a register access first takes those due by its time,
+ * in time order (dwmac_catch_up()).
+ */
+enum {
+    DT_MDIO,
+    DT_TX,
+    DT_PAUSE,
+    DT_PAUSE_REFRESH,
+    DT_RX_WDT,
+    DT_COUNT,
+};
+
+static void dwmac_mdio_end(void *opaque);
+static void dwmac_tx_end(void *opaque);
+static void dwmac_pause_end(void *opaque);
+static void dwmac_pause_refresh_end(void *opaque);
+static void dwmac_rx_wdt_end(void *opaque);
+
+static QEMUTimer *dwmac_timer(Esp32DwmacState *s, int n)
+{
+    switch (n) {
+    case DT_MDIO:
+        return &s->mdio_timer;
+    case DT_TX:
+        return &s->tx_timer;
+    case DT_PAUSE:
+        return &s->pause_timer;
+    case DT_PAUSE_REFRESH:
+        return &s->pause_refresh_timer;
+    default:
+        return &s->rx_wdt_timer;
+    }
+}
+
+static void (*const dwmac_timer_end[DT_COUNT])(void *opaque) = {
+    [DT_MDIO] = dwmac_mdio_end,
+    [DT_TX] = dwmac_tx_end,
+    [DT_PAUSE] = dwmac_pause_end,
+    [DT_PAUSE_REFRESH] = dwmac_pause_refresh_end,
+    [DT_RX_WDT] = dwmac_rx_wdt_end,
+};
+
+static void dwmac_timer_at(Esp32DwmacState *s, int n, int64_t due)
+{
+    s->due[n] = due;
+    timer_mod(dwmac_timer(s, n), due);
+}
+
+static void dwmac_mdio_cb(void *opaque)
+{
+    Esp32DwmacState *s = opaque;
+
+    esp32_line_run_at(s->due[DT_MDIO], dwmac_mdio_end, s);
+}
+
+static void dwmac_tx_timer_cb(void *opaque)
+{
+    Esp32DwmacState *s = opaque;
+
+    esp32_line_run_at(s->due[DT_TX], dwmac_tx_end, s);
+}
+
+static void dwmac_pause_timer_cb(void *opaque)
+{
+    Esp32DwmacState *s = opaque;
+
+    esp32_line_run_at(s->due[DT_PAUSE], dwmac_pause_end, s);
+}
+
+static void dwmac_pause_refresh_cb(void *opaque)
+{
+    Esp32DwmacState *s = opaque;
+
+    esp32_line_run_at(s->due[DT_PAUSE_REFRESH], dwmac_pause_refresh_end, s);
+}
+
+static void dwmac_rx_wdt_cb(void *opaque)
+{
+    Esp32DwmacState *s = opaque;
+
+    esp32_line_run_at(s->due[DT_RX_WDT], dwmac_rx_wdt_end, s);
+}
+
+/*
+ * Take the events due by now, earliest first: without icount their
+ * timers can run well after, while software polls GMIIADDR's GB, as
+ * ESP-IDF's MDIO functions do, reads GMIIDATA, the DMA's STATUS (TI, RI,
+ * TPS, the transmit and receive states) or the descriptors it closes.
+ * Only a timer that has come is run.
+ */
+static void dwmac_catch_up(Esp32DwmacState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (;;) {
+        int64_t due = now;
+        int next = -1;
+
+        for (int n = 0; n < DT_COUNT; n++) {
+            if (timer_pending(dwmac_timer(s, n)) && s->due[n] <= due &&
+                (next < 0 || s->due[n] < due)) {
+                next = n;
+                due = s->due[n];
+            }
+        }
+        if (next < 0) {
+            return;
+        }
+        timer_del(dwmac_timer(s, next));
+        esp32_line_run_at(due, dwmac_timer_end[next], s);
+    }
+}
+
+/*
  * Turn the gathered frame into the bytes the wire carries and start
  * sending them; the frame has left, and reached a receiver, when the wire
  * time is over. A frame with TDES0.TTSE has its timestamp taken as its
@@ -1560,7 +1681,7 @@ static void dwmac_tx_frame_out(Esp32DwmacState *s)
     uint32_t status = 0;
     unsigned cic = (tdes0 >> TDES0_CIC_SHIFT) & 3;
     size_t jabber_max = (s->config & CFG_JE) ? 10240 : 2048;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
     bool add_crc, changed;
     size_t wire_len;
 
@@ -1625,7 +1746,7 @@ static void dwmac_tx_frame_out(Esp32DwmacState *s)
     s->tx_on_wire = true;
     s->tx_state = TS_WAITING;
     dwmac_tx_drive(s, true);
-    timer_mod(&s->tx_timer, now + dwmac_wire_ns(s, wire_len));
+    dwmac_timer_at(s, DT_TX, now + dwmac_wire_ns(s, wire_len));
 }
 
 /*
@@ -1639,8 +1760,8 @@ static void dwmac_tx_pause_out(Esp32DwmacState *s)
     s->pause_on_wire = true;
     s->tx_on_wire = true;
     dwmac_tx_drive(s, true);
-    timer_mod(&s->tx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              dwmac_wire_ns(s, ETH_MIN_LEN + ETH_FCS_LEN));
+    dwmac_timer_at(s, DT_TX, esp32_line_time() +
+                   dwmac_wire_ns(s, ETH_MIN_LEN + ETH_FCS_LEN));
 }
 
 static void dwmac_tx_pause_done(Esp32DwmacState *s)
@@ -1679,11 +1800,11 @@ static void dwmac_pause_refresh_arm(Esp32DwmacState *s)
     unsigned plt = plt_slots[(s->flow_ctrl >> FC_PLT_SHIFT) & 3];
     unsigned slots = pt > plt ? pt - plt : 1;
 
-    timer_mod(&s->pause_refresh_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              (int64_t)slots * SLOT_BITS * dwmac_bit_ns(s));
+    dwmac_timer_at(s, DT_PAUSE_REFRESH, esp32_line_time() +
+                   (int64_t)slots * SLOT_BITS * dwmac_bit_ns(s));
 }
 
-static void dwmac_pause_refresh_cb(void *opaque)
+static void dwmac_pause_refresh_end(void *opaque)
 {
     Esp32DwmacState *s = opaque;
 
@@ -1780,7 +1901,7 @@ static bool dwmac_tx_maybe_stop(Esp32DwmacState *s)
     return true;
 }
 
-static void dwmac_tx_timer_cb(void *opaque)
+static void dwmac_tx_end(void *opaque)
 {
     Esp32DwmacState *s = opaque;
 
@@ -2037,11 +2158,11 @@ static void dwmac_rx_pause(Esp32DwmacState *s, const uint8_t *f)
         return;
     }
     s->paused = true;
-    timer_mod(&s->pause_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              (int64_t)quanta * SLOT_BITS * dwmac_bit_ns(s));
+    dwmac_timer_at(s, DT_PAUSE, esp32_line_time() +
+                   (int64_t)quanta * SLOT_BITS * dwmac_bit_ns(s));
 }
 
-static void dwmac_pause_timer_cb(void *opaque)
+static void dwmac_pause_end(void *opaque)
 {
     Esp32DwmacState *s = opaque;
 
@@ -2155,10 +2276,9 @@ static bool dwmac_rx_dma_frame(Esp32DwmacState *s, const uint8_t *frame,
             uint32_t riwt = s->rx_wdt & 0xff;
 
             if (riwt && clock_get_hz(s->bus_clk)) {
-                timer_mod(&s->rx_wdt_timer,
-                          dwmac_bus_after(s,
-                                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                                          riwt * 256));
+                dwmac_timer_at(s, DT_RX_WDT,
+                               dwmac_bus_after(s, esp32_line_time(),
+                                               riwt * 256));
             }
         } else {
             timer_del(&s->rx_wdt_timer);
@@ -2176,7 +2296,7 @@ static bool dwmac_rx_dma_frame(Esp32DwmacState *s, const uint8_t *frame,
     return true;
 }
 
-static void dwmac_rx_wdt_cb(void *opaque)
+static void dwmac_rx_wdt_end(void *opaque)
 {
     Esp32DwmacState *s = opaque;
 
@@ -2511,7 +2631,7 @@ static void dwmac_mdio_start(Esp32DwmacState *s)
     Esp32DwmacClass *k = dwmac_class(s);
     unsigned cr = (s->mii_addr >> MII_CR_SHIFT) & 0xf;
     uint32_t d = div[cr];
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), end;
+    int64_t now = esp32_line_time(), end;
 
     if (!d) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -2526,7 +2646,7 @@ static void dwmac_mdio_start(Esp32DwmacState *s)
     if (k->mdio_drive) {
         k->mdio_drive(s, true);
     }
-    timer_mod(&s->mdio_timer, end);
+    dwmac_timer_at(s, DT_MDIO, end);
 }
 
 /*
@@ -2537,7 +2657,7 @@ static void dwmac_mdio_start(Esp32DwmacState *s)
  * PHY answers returns the idle level of the MAC's MDIO input in every
  * bit, the pulled-up 0xffff on a board's MDIO line.
  */
-static void dwmac_mdio_cb(void *opaque)
+static void dwmac_mdio_end(void *opaque)
 {
     Esp32DwmacState *s = opaque;
     Esp32DwmacClass *k = dwmac_class(s);
@@ -2808,9 +2928,11 @@ static void dwmac_ptp_write(Esp32DwmacState *s, hwaddr off, uint32_t v)
 uint32_t esp32_dwmac_read(Esp32DwmacState *s, hwaddr off, hwaddr addr)
 {
     Esp32DwmacClass *k = dwmac_class(s);
-    bool live = dwmac_live(s);
+    bool live;
     uint32_t v;
 
+    dwmac_catch_up(s);
+    live = dwmac_live(s);
     if (dwmac_is_addr(s, off)) {
         if (off & 4) {
             return s->addr_low[(off - A_ADDR0_HIGH) / 8];
@@ -2966,6 +3088,7 @@ void esp32_dwmac_write(Esp32DwmacState *s, hwaddr off, uint32_t v,
     Esp32DwmacClass *k = dwmac_class(s);
     uint32_t old;
 
+    dwmac_catch_up(s);
     if (dwmac_is_addr(s, off)) {
         unsigned n = (off - A_ADDR0_HIGH) / 8;
 
@@ -3308,8 +3431,8 @@ static const Property esp32_dwmac_properties[] = {
 
 const VMStateDescription vmstate_esp32_dwmac = {
     .name = TYPE_ESP32_DWMAC,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(held, Esp32DwmacState),
         VMSTATE_UINT32(bus_mode, Esp32DwmacState),
@@ -3405,6 +3528,7 @@ const VMStateDescription vmstate_esp32_dwmac = {
         VMSTATE_TIMER(ptp_timer, Esp32DwmacState),
         VMSTATE_BOOL(pps_level, Esp32DwmacState),
         VMSTATE_CLOCK(bus_clk, Esp32DwmacState),
+        VMSTATE_INT64_ARRAY(due, Esp32DwmacState, 5),
         VMSTATE_END_OF_LIST()
     }
 };

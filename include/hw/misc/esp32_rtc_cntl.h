@@ -446,6 +446,8 @@ typedef struct Esp32RtcCntlState {
     uint32_t xtal32k_freq;
     uint32_t reset_cause[ESP32_CPU_COUNT];
     bool stat_vector_sel[ESP32_CPU_COUNT];
+    /* Blocks whose timed state RTC_CNTL's registers show: the ULP */
+    NotifierList access_notifiers;
 } Esp32RtcCntlState;
 
 /*
@@ -456,6 +458,12 @@ void esp32_rtc_cntl_sleep_reset_done(Esp32RtcCntlState *s);
 
 /* An RTCIO input or wakeup setting changed: re-evaluate the wakeup sources */
 void esp32_rtc_cntl_rtcio_changed(Esp32RtcCntlState *s);
+
+/*
+ * @n is told of every register access before it is made, to take its own
+ * events due by then: a block whose timed state the registers show.
+ */
+void esp32_rtc_cntl_add_access_notifier(Esp32RtcCntlState *s, Notifier *n);
 
 /* RTC_CNTL_HOLD_FORCE and RTC_CNTL_DG_PAD_FORCE_HOLD, for RTCIO */
 uint32_t esp32_rtc_cntl_hold_force(Esp32RtcCntlState *s);

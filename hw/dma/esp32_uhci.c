@@ -34,6 +34,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/dma/esp32_uhci.h"
 #include "hw/dma/esp32_lldesc.h"
+#include "hw/gpio/esp32_line.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 
@@ -967,8 +968,7 @@ static void uhci_hung_update(Esp32UhciState *s, QEMUTimer *t, bool *fired,
         *fired = false;
     }
     if (!*fired && !timer_pending(t)) {
-        timer_mod_ns(t, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                     uhci_hung_ns(s, shift));
+        timer_mod_ns(t, esp32_line_time() + uhci_hung_ns(s, shift));
     }
 }
 
@@ -1108,11 +1108,48 @@ static void uhci_link_write(Esp32UhciState *s, bool out, uint32_t value)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.uhci]
+ * Bring the UARTs up to now (esp32_uart_catch_up()), which moves what
+ * their frames brought through the UHCI, then end the timeouts whose
+ * time has come, each at its time: without icount the UARTs' timers and
+ * the timeouts' can run well after, while software reads INT_RAW, the
+ * DMA status registers or the descriptors the UHCI writes back. Only a
+ * timer that has come is run.
+ */
+static void uhci_catch_up(Esp32UhciState *s)
+{
+    int64_t now = esp32_line_time();
+
+    for (int i = 0; i < ESP32_UHCI_UART_COUNT; i++) {
+        if (s->uart[i]) {
+            esp32_uart_catch_up(s->uart[i]);
+        }
+    }
+    for (;;) {
+        int64_t out = timer_expire_time_ns(&s->out_hung_timer);
+        int64_t in = timer_expire_time_ns(&s->in_hung_timer);
+        bool out_due = timer_pending(&s->out_hung_timer) && out <= now;
+        bool in_due = timer_pending(&s->in_hung_timer) && in <= now;
+
+        if (out_due && (!in_due || out <= in)) {
+            timer_del(&s->out_hung_timer);
+            esp32_line_run_at(out, uhci_out_hung_cb, s);
+        } else if (in_due) {
+            timer_del(&s->in_hung_timer);
+            esp32_line_run_at(in, uhci_in_hung_cb, s);
+        } else {
+            return;
+        }
+    }
+}
+
 /* [spec:nuos:req:emu.esp32.uhci] */
 static uint64_t esp32_uhci_read(void *opaque, hwaddr addr, unsigned size)
 {
     Esp32UhciState *s = opaque;
 
+    uhci_catch_up(s);
     switch (addr) {
     case A_CONF0:
         return s->conf0;
@@ -1194,6 +1231,7 @@ static void esp32_uhci_write(void *opaque, hwaddr addr, uint64_t value,
     Esp32UhciState *s = opaque;
     uint32_t v = value;
 
+    uhci_catch_up(s);
     switch (addr) {
     case A_CONF0:
         s->conf0 = v & CONF0_MASK;

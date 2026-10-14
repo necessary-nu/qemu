@@ -139,8 +139,10 @@
  * (esp32_line_run_at()), so that the lines it changes, the PMU's wakeup
  * among them, carry it, and what it times from there it times from that.
  * Register accesses (RTC_TOUCH's, LP_ANALOG_PERI's TOUCH_* and the touch
- * timer's PMU_TOUCH_PWR_CNTL), clock changes, the PMU's sleep and the
- * reset first take the events that fell due before them, in time order.
+ * timer's PMU_TOUCH_PWR_CNTL), samples of the pads (the sawtooth is on a
+ * pad only while its measurement runs), clock changes, the PMU's sleep and
+ * the reset first take the events that fell due before them, in time
+ * order.
  *
  * Not modelled, and without effect here: the shield's drive
  * (TOUCH_BUF_DRV), the guard ring (TOUCH_OUT_RING), whose water rejection
@@ -1039,6 +1041,20 @@ void esp32p4_touch_sync(ESP32P4TouchState *s)
     touch_catch_up(s, esp32_line_time());
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.analog]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * The pads are sampled (GPIO_IN, a filter, a receiver): the measurement
+ * ends due by then have taken the sawtooth off their pads, as the pad
+ * reads at that moment on the chip, however late their timers run.
+ */
+static void touch_line_sync(Notifier *n, void *data)
+{
+    ESP32P4TouchState *s = container_of(n, ESP32P4TouchState, line_source);
+
+    touch_catch_up(s, esp32_line_time());
+}
+
 /* An event falls due: take it at its time, which a late timer has passed. */
 static void touch_meas_cb(void *opaque)
 {
@@ -1495,6 +1511,7 @@ static void esp32p4_touch_init(Object *obj)
     qdev_init_gpio_out_named(dev, s->pad_analog, ESP32P4_TOUCH_PAD_ANALOG,
                              ESP32P4_TOUCH_SLOTS);
     s->load_notifier.notify = touch_load_changed;
+    s->line_source.notify = touch_line_sync;
     s->analog_ch = -1;
     s->fast = qdev_init_clock_in(dev, "fast", touch_fast_update, s,
                                  ClockPreUpdate | ClockUpdate);
@@ -1528,6 +1545,7 @@ static void esp32p4_touch_realize(DeviceState *dev, Error **errp)
     if (s->gpio) {
         esp32p4_gpio_add_load_notifier(s->gpio, &s->load_notifier);
     }
+    esp32_line_add_source(&s->line_source);
 }
 
 static const VMStateDescription vmstate_esp32p4_touch_chan = {

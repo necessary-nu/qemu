@@ -123,12 +123,29 @@ static void rp2350_eppb_write_sleepctrl(RP2350EPPBState *s, uint32_t value)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.eppb]
+ * SLEEPCTRL.WICENACK follows WICENREQ after its delay as a timer runs:
+ * without icount that can be well after, while software polls WICENACK.
+ * An access takes the acknowledgement once its time has come.
+ */
+static void rp2350_eppb_catch_up(RP2350EPPBState *s)
+{
+    if (timer_pending(s->wicen_timer) &&
+        timer_expire_time_ns(s->wicen_timer) <=
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_del(s->wicen_timer);
+        rp2350_eppb_wicen_ack(s);
+    }
+}
+
 static MemTxResult rp2350_eppb_read(void *opaque, hwaddr addr,
                                     uint64_t *data, unsigned size,
                                     MemTxAttrs attrs)
 {
     RP2350EPPBState *s = opaque;
 
+    rp2350_eppb_catch_up(s);
     if (attrs.user) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "rp2350-eppb: unprivileged read of offset 0x%"
@@ -163,6 +180,7 @@ static MemTxResult rp2350_eppb_write(void *opaque, hwaddr addr,
     RP2350EPPBState *s = opaque;
     uint32_t old;
 
+    rp2350_eppb_catch_up(s);
     if (attrs.user) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "rp2350-eppb: unprivileged write to offset 0x%"

@@ -233,6 +233,8 @@ struct Esp32SensState {
     uint32_t touch_ff[ESP32_TOUCH_PADS];
     /* The die temperature at the temperature sensor, in millidegrees C */
     int32_t tsens_mc;
+    /* Blocks whose timed state SENS's registers show: the ULP */
+    NotifierList access_notifiers;
 };
 
 /*
@@ -242,6 +244,12 @@ struct Esp32SensState {
  * or, in double mode, two, and returns how many.
  */
 unsigned esp32_sens_dig_sample(Esp32SensState *s, uint16_t out[2]);
+
+/*
+ * @n is told of every register access before it is made, to take its own
+ * events due by then: a block whose timed state the registers show.
+ */
+void esp32_sens_add_access_notifier(Esp32SensState *s, Notifier *n);
 
 /* SENS_SAR_DAC_DIG_FORCE: the DACs take their codes from I2S0 */
 bool esp32_sens_dac_dma_enabled(Esp32SensState *s);

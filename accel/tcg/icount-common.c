@@ -242,6 +242,17 @@ static int64_t icount_window_elapsed(void)
            (int64_t)timers_state.window_frac;
 }
 
+/* Set virtual time @x past the window's start. */
+static void icount_window_set(int64_t x)
+{
+    int64_t ns = timers_state.window_ns;
+    uint32_t frac = timers_state.window_frac;
+
+    icount_time_add(&ns, &frac, x, 0);
+    qatomic_set(&timers_state.qemu_icount_time, ns);
+    timers_state.qemu_icount_time_frac = frac;
+}
+
 /* Bring virtual time up to the window's CPUs' (icount_window_x()). */
 static void icount_window_sync(void)
 {
@@ -253,12 +264,7 @@ static void icount_window_sync(void)
     x = icount_window_x();
 
     if (x > icount_window_elapsed()) {
-        int64_t ns = timers_state.window_ns;
-        uint32_t frac = timers_state.window_frac;
-
-        icount_time_add(&ns, &frac, x, 0);
-        qatomic_set(&timers_state.qemu_icount_time, ns);
-        timers_state.qemu_icount_time_frac = frac;
+        icount_window_set(x);
     }
 }
 
@@ -290,8 +296,21 @@ static void icount_account_time(CPUState *cpu, int64_t executed)
     }
     if (insn_time && cpu->icount_in_window && !cpu->icount_window_idle &&
         timers_state.window_cpus) {
+        int64_t x = icount_window_x();
+
         cpu->icount_own += executed * insn_time + carry;
-        icount_window_sync();
+        if (executed < 0 && icount_window_elapsed() == x) {
+            /*
+             * Instructions given back (cpu_restore_state()) after virtual
+             * time counted them, as a device's clock read during an access
+             * that faults or is held does: they have not run, and the time
+             * they moved virtual time on goes back with them, as it does
+             * outside the window.
+             */
+            icount_window_set(icount_window_x());
+        } else {
+            icount_window_sync();
+        }
         return;
     }
     if (!insn_time) {

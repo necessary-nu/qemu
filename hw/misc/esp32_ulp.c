@@ -605,10 +605,23 @@ static void ulp_run(Esp32UlpState *s)
     }
 }
 
-static void ulp_timer_cb(void *opaque)
+/* When the phase under way ends, or the next instruction starts. */
+static int64_t ulp_due(Esp32UlpState *s)
 {
-    Esp32UlpState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (s->phase == ESP32_ULP_RUNNING) {
+        return run_next_ns(s);
+    }
+    return s->slow_base_ns + clock_ticks_to_ns(s->slow_clk, s->slow_left);
+}
+
+/*
+ * The phase ends, or the next instructions come: a phase's successor
+ * counts from its end however late the timer runs, so that the ULP's
+ * timer keeps to its period; the program runs up to the present.
+ */
+static void ulp_event(Esp32UlpState *s)
+{
+    int64_t now = ulp_due(s);
     uint32_t force = s->sens->regs[A_SENS_SAR_START_FORCE / 4];
 
     switch (s->phase) {
@@ -643,6 +656,49 @@ static void ulp_timer_cb(void *opaque)
     default:
         break;
     }
+}
+
+static void ulp_timer_cb(void *opaque)
+{
+    Esp32UlpState *s = opaque;
+
+    s->in_event = true;
+    ulp_event(s);
+    s->in_event = false;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.ulp]
+ * RTC_CNTL or SENS is accessed: the ULP's phases and instructions due by
+ * then first, as its timer, which without icount can run well after,
+ * would take them, so that the access finds what they left, ULP_CP's
+ * interrupt, the wakeup and the registers its REG_WRs write among it.
+ * Only a timer that has come is run; an access the ULP makes itself, by
+ * REG_RD or REG_WR, takes nothing.
+ */
+static void ulp_catch_up(Esp32UlpState *s)
+{
+    if (s->in_event) {
+        return;
+    }
+    s->in_event = true;
+    while (timer_pending(&s->timer) &&
+           timer_expire_time_ns(&s->timer) <=
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_del(&s->timer);
+        ulp_event(s);
+    }
+    s->in_event = false;
+}
+
+static void ulp_rtc_access(Notifier *n, void *data)
+{
+    ulp_catch_up(container_of(n, Esp32UlpState, rtc_access));
+}
+
+static void ulp_sens_access(Notifier *n, void *data)
+{
+    ulp_catch_up(container_of(n, Esp32UlpState, sens_access));
 }
 
 /*
@@ -696,6 +752,9 @@ static void esp32_ulp_clk_event(Esp32UlpState *s, Clock *clk,
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    if (event == ClockPreUpdate) {
+        ulp_catch_up(s);
+    }
     if (clk == s->fast_clk && phase_fast(s)) {
         if (event == ClockPreUpdate) {
             clk_fold(clk, now, &s->run_base_ns, &s->run_cycles);
@@ -755,6 +814,10 @@ static void esp32_ulp_realize(DeviceState *dev, Error **errp)
         return;
     }
     address_space_init(&s->rtc_as, s->rtc_regs, "esp32-ulp");
+    s->rtc_access.notify = ulp_rtc_access;
+    s->sens_access.notify = ulp_sens_access;
+    esp32_rtc_cntl_add_access_notifier(s->rtc_cntl, &s->rtc_access);
+    esp32_sens_add_access_notifier(s->sens, &s->sens_access);
 }
 
 static void esp32_ulp_init(Object *obj)

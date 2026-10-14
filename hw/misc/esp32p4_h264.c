@@ -1536,11 +1536,27 @@ static int seq_of(hwaddr a, int *idx)
     return -1;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.h264]
+ * Take the encoder's row ends, its temporary lines and its motion vector
+ * moves due by @now, in time order, each at its own time: without icount
+ * their timers can run well after, while software polls INT_RAW's
+ * FRAME_DONE, DB_TMP_READY and MOVE_DONE, SYS_STATUS, or its DMA
+ * channels' INT_RAW and descriptors for the stream.
+ */
+static void h264_catch_up(ESP32P4H264State *s, int64_t now)
+{
+    ESP32P4ClkWait *waits[] = { &s->row_wait, &s->tmp_wait, &s->move_wait };
+
+    esp32p4_clkwaits_catch_up(waits, ARRAY_SIZE(waits), now);
+}
+
 static uint64_t h264_enc_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4H264State *s = opaque;
     int idx, seq = seq_of(addr, &idx);
 
+    h264_catch_up(s, h264_now());
     if (seq >= 0) {
         return s->seq[seq][idx];
     }
@@ -1605,6 +1621,7 @@ static void h264_enc_write(void *opaque, hwaddr addr, uint64_t value,
     int64_t now = h264_now();
     int idx, seq = seq_of(addr, &idx);
 
+    h264_catch_up(s, now);
     if (seq >= 0) {
         s->seq[seq][idx] = v & seq_mask[idx];
         return;
@@ -1921,6 +1938,7 @@ static uint64_t h264_dma_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr o;
     uint32_t v = 0;
 
+    h264_catch_up(s, h264_now());
     if (dma_decode(addr, &rx, &n, &o)) {
         if (dma_chan_read(s, rx, n, o, &v)) {
             return v;
@@ -2097,6 +2115,7 @@ static void h264_dma_write(void *opaque, hwaddr addr, uint64_t value,
     int n;
     hwaddr o;
 
+    h264_catch_up(s, now);
     if (dma_decode(addr, &rx, &n, &o)) {
         dma_chan_write(s, rx, n, o, v, now);
         return;
@@ -2171,6 +2190,7 @@ static void h264_clk_update(void *opaque, ClockEvent event)
     int64_t now = h264_now();
 
     if (event == ClockPreUpdate) {
+        h264_catch_up(s, now - 1);
         esp32p4_clkwait_fold(&s->row_wait, now);
         esp32p4_clkwait_fold(&s->tmp_wait, now);
         esp32p4_clkwait_fold(&s->move_wait, now);

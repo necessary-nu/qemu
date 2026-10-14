@@ -167,6 +167,7 @@ struct RP2350USBCtrlState {
     /* The host is driving a bus reset. */
     bool dev_bus_reset;
     QEMUTimer *dev_idle_timer;
+    int64_t dev_idle_due;
 
     /* clk_usb, and its cycle phy_base, reached at virtual time phy_base_ns. */
     Clock *clk;
@@ -181,6 +182,7 @@ struct RP2350USBCtrlState {
     QEMUTimer *host_frame_timer;
     int64_t host_frame_ns;
     QEMUTimer *host_timer;
+    int64_t host_due;
     uint8_t host_speed;
     /* EPX transfer state */
     bool epx_active;
@@ -214,6 +216,7 @@ struct RP2350USBCtrlState {
 
     uint32_t br_state;
     QEMUTimer *br_timer;
+    int64_t br_due;
     QEMUTimer *br_frame_timer;
     uint16_t br_frame;
     int64_t br_frame_ns;
@@ -278,6 +281,12 @@ void rp2350_usb_bridge_reset(RP2350USBCtrlState *s);
 void rp2350_usb_bridge_port_changed(RP2350USBCtrlState *s);
 /* Software armed a device buffer: a NAKed transaction may now succeed. */
 void rp2350_usb_bridge_kick(RP2350USBCtrlState *s);
+/*
+ * The bridge's earliest event due by *@due, if any: its time in *@due,
+ * its timer, and what takes it; for the controller's catch-up.
+ */
+bool rp2350_usb_bridge_next(RP2350USBCtrlState *s, int64_t *due,
+                            QEMUTimer **timer, void (**run)(void *opaque));
 extern const VMStateDescription vmstate_rp2350_usb_bridge;
 
 #endif

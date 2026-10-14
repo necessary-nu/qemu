@@ -21,10 +21,13 @@
  * the cycles ended (esp32_line_run_at(), include/hw/gpio/esp32_line.h).
  * An operation starts at esp32_line_time(), or with _start_at() at a
  * given time, such as that of the register write that began a
- * calculation the model made first. esp32p4_crypto_timer_sync() ends an
- * operation whose cycles have run by then, for a block to call before a
- * register access shows what the operation leaves. The block calls
- * esp32p4_crypto_timer_clock_update() from its clock's callback.
+ * calculation the model made first. esp32p4_crypto_timer_sync() ends the
+ * operations whose cycles have run by then, and those they started that
+ * have too, each at its time, for a block to call before every register
+ * access: what the access shows or changes is what the operations leave
+ * by its time, however late their QEMU timers run
+ * (esp32p4_crypto_timers_sync() for a block with several). The block
+ * calls esp32p4_crypto_timer_clock_update() from its clock's callback.
  */
 typedef void ESP32P4CryptoDoneFn(void *opaque);
 
@@ -51,6 +54,8 @@ void esp32p4_crypto_timer_start(ESP32P4CryptoTimer *t, uint64_t cycles);
 void esp32p4_crypto_timer_start_at(ESP32P4CryptoTimer *t, uint64_t cycles,
                                    int64_t when);
 void esp32p4_crypto_timer_sync(ESP32P4CryptoTimer *t, int64_t now);
+void esp32p4_crypto_timers_sync(ESP32P4CryptoTimer *const *t, unsigned n,
+                                int64_t now);
 void esp32p4_crypto_timer_cancel(ESP32P4CryptoTimer *t);
 void esp32p4_crypto_timer_clock_update(ESP32P4CryptoTimer *t);
 

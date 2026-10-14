@@ -73,6 +73,7 @@
 #include "qemu/log.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_axi_perf_mon.h"
 #include "migration/vmstate.h"
 
@@ -571,6 +572,42 @@ static void esp32p4_apm_select_changed(ESP32P4AxiPerfMonState *s, int n,
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.debug]
+ * End the bandwidth windows whose time has come by now, in time order,
+ * each at its own time: without icount their timers can run well after,
+ * while software reads INS_DATA, the RANGE counts or INT_RAW. A register
+ * access first does so. Only a timer that has come is run.
+ */
+static void esp32p4_apm_catch_up(ESP32P4AxiPerfMonState *s)
+{
+    static QEMUTimerCB *const cb[UNITS][2] = {
+        { esp32p4_apm_timer_u0_rd, esp32p4_apm_timer_u0_wr },
+        { esp32p4_apm_timer_u1_rd, esp32p4_apm_timer_u1_wr },
+    };
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (;;) {
+        int64_t due = now;
+        int next = -1;
+
+        for (int i = 0; i < UNITS * 2; i++) {
+            QEMUTimer *t = s->measure[i / 2][i % 2].ins_timer;
+            int64_t at = timer_expire_time_ns(t);
+
+            if (timer_pending(t) && at <= due && (next < 0 || at < due)) {
+                next = i;
+                due = at;
+            }
+        }
+        if (next < 0) {
+            return;
+        }
+        timer_del(s->measure[next / 2][next % 2].ins_timer);
+        esp32_line_run_at(due, cb[next / 2][next % 2], s);
+    }
+}
+
 static uint64_t esp32p4_axi_perf_mon_read(void *opaque, hwaddr addr,
                                           unsigned size)
 {
@@ -578,6 +615,7 @@ static uint64_t esp32p4_axi_perf_mon_read(void *opaque, hwaddr addr,
     hwaddr reg = addr & ~3;
     uint32_t v;
 
+    esp32p4_apm_catch_up(s);
     if (reg >= ESP32P4_AXI_PERF_MON_NREGS * 4 ||
         !esp32p4_axi_perf_mon_regs[R(reg)].valid) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of reserved offset 0x%"
@@ -613,6 +651,7 @@ static void esp32p4_axi_perf_mon_write(void *opaque, hwaddr addr,
     uint32_t *r, old;
     int n;
 
+    esp32p4_apm_catch_up(s);
     if (reg >= ESP32P4_AXI_PERF_MON_NREGS * 4 ||
         !esp32p4_axi_perf_mon_regs[R(reg)].valid) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write to reserved offset 0x%"

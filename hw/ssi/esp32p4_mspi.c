@@ -1523,6 +1523,14 @@ MemTxResult esp32p4_mspi_axi_write(ESP32P4MSPIState *s, uint32_t addr,
     return mspi_axi(s, addr, (uint8_t *)buf, len, true);
 }
 
+/* [spec:nuos:req:emu.esp32p4.boot] */
+void esp32p4_mspi_raise_state_ends(ESP32P4MSPIState *s)
+{
+    spi0_raise(s, INT0_SLV_ST_END | INT0_MST_ST_END);
+    spi1_raise(s, INT1_SLV_ST_END | INT1_MST_ST_END);
+    mspi_update_irq(s);
+}
+
 /* The window: direct accesses, and the accesses of masters without cache. */
 
 /* [spec:nuos:req:emu.esp32p4.memory] */
@@ -1894,9 +1902,9 @@ static uint64_t spi1_clock_div(ESP32P4MSPIState *s)
     return clock & CLOCK_CLK_EQU_SYSCLK ? 1 : CLOCK_CLKCNT_N(clock) + 1;
 }
 
-static void spi1_schedule(ESP32P4MSPIState *s)
+/* Time SPI1's cycles from @from: the present, or a phase's end. */
+static void spi1_schedule_from(ESP32P4MSPIState *s, int64_t from)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     ESP32P4ClkEdges e;
 
     if (!clock_is_enabled(s->core_clk)) {
@@ -1904,11 +1912,16 @@ static void spi1_schedule(ESP32P4MSPIState *s)
         return;
     }
     s->spi1_waiting = false;
-    e = esp32p4_clk_edges_or_at(s->core_clk, now);
-    s->spi1_end_at = esp32p4_clk_edges_after(&e, now,
+    e = esp32p4_clk_edges_or_at(s->core_clk, from);
+    s->spi1_end_at = esp32p4_clk_edges_after(&e, from,
                                              s->spi1_cycles *
                                              spi1_clock_div(s));
     timer_mod(&s->spi1_timer, s->spi1_end_at);
+}
+
+static void spi1_schedule(ESP32P4MSPIState *s)
+{
+    spi1_schedule_from(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 /* The cycles of the status read FLASH_WAITI_CTRL makes after an operation. */
@@ -2190,7 +2203,7 @@ static void spi1_end(void *opaque)
         s->spi1_waiti = false;
         s->spi1_cycles = spi1_waiti_reads(s, s->spi1_end_at, ready) *
                          spi1_waiti_cycles(s);
-        spi1_schedule(s);
+        spi1_schedule_from(s, s->spi1_end_at);
         return;
     }
     s->spi1[R1_CMD] &= ~s->spi1_busy_cmd;
@@ -2208,14 +2221,17 @@ static void spi1_end(void *opaque)
 }
 
 /*
- * End SPI1's transaction if its time has come: the timer that ends it may
- * run late on the host's clock, after an access that must find it ended.
+ * [spec:nuos:req:emu.esp32p4.memory]
+ * End SPI1's transaction if its time has come, and the automatic status
+ * reads (FLASH_WAITI_CTRL) that follow it, timed from its end: the timer
+ * that ends each may run late on the host's clock, after an access that
+ * must find them ended.
  */
 static void spi1_catch_up(ESP32P4MSPIState *s)
 {
-    if (timer_pending(&s->spi1_timer) &&
-        timer_expire_time_ns(&s->spi1_timer) <=
-        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+    while (timer_pending(&s->spi1_timer) &&
+           timer_expire_time_ns(&s->spi1_timer) <=
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
         timer_del(&s->spi1_timer);
         spi1_end(s);
     }

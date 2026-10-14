@@ -33,8 +33,9 @@
  *    channel reads or writes a device, the timer wakes the engine every
  *    cycle, so that the device sees each transfer in its own cycle.
  *
- * A register access never issues a transfer itself: it only brings the
- * idle engine (and the pacing timers) up to date.
+ * A register access issues no transfer of its own accord: it brings the
+ * idle engine (and the pacing timers) up to date, and issues the transfers
+ * only the engine's timer, late, has yet to issue (engine_catch_up()).
  *
  * Each transfer completes before the next is issued, so the bus pipeline
  * is never observable: FIFO_LEVELS reads zero, BUSY falls as the last
@@ -1176,6 +1177,31 @@ static void dreq_set(void *opaque, int dreq, int level)
     engine_kick(s);
 }
 
+/*
+ * [spec:nuos:req:emu.dma]
+ * Before a register access: the work the engine's timer has come for,
+ * which without icount it can be well after, while software polls
+ * CH_CTRL's BUSY, TRANS_COUNT or INTR, as the pico-sdk's
+ * dma_channel_wait_for_finish_blocking() does. The transfers due are
+ * issued as that timer would issue them, but for one that would reach a
+ * device in the middle of an access, this one's register block included,
+ * which is left to the end of the access; then the idle engine and the
+ * pacing timers come up to now. Only a timer that has come brings the
+ * transfers forward.
+ */
+static void engine_catch_up(RP2350DMAState *s)
+{
+    if (timer_pending(s->timer) &&
+        timer_expire_time_ns(s->timer) <=
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        if (!engine_run(s, ENGINE_SERVICE)) {
+            engine_defer(s);
+        }
+        engine_kick(s);
+    }
+    engine_run(s, ENGINE_SYNC);
+}
+
 /* Registers. */
 
 static void bad_offset(const char *what, hwaddr addr)
@@ -1573,7 +1599,7 @@ static MemTxResult rp2350_dma_read(void *opaque, hwaddr addr, uint64_t *data,
     uint32_t v;
     MemTxResult r;
 
-    engine_run(s, ENGINE_SYNC);
+    engine_catch_up(s);
     r = reg_read(s, rp2350_atomic_reg(addr & ~3), access_level(attrs), &v,
                  "read");
     *data = extract32(v, (addr & 3) * 8, size * 8);
@@ -1593,7 +1619,7 @@ static MemTxResult rp2350_dma_write(void *opaque, hwaddr addr, uint64_t value,
     } else if (size == 2) {
         v = (v & 0xffff) * 0x00010001u;
     }
-    engine_run(s, ENGINE_SYNC);
+    engine_catch_up(s);
     r = reg_write(s, addr & ~3, v, access_level(attrs));
     update_outputs(s);
     /* A trigger, say, may leave a DREQ-paced channel requesting. */
