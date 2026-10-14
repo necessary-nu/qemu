@@ -399,10 +399,15 @@ typedef struct Esp32RtcCntlState {
     int64_t rc_fast_on_ns;
     bool rc_fast_ready;
 
-    /* RTC watchdog: its stage, and its count since wdt_base_ns */
+    /*
+     * RTC watchdog: its stage, its count at wdt_base_ns, and the count at
+     * which the stage ends, its 32-bit expiry counter having come to the
+     * stage's hold.
+     */
     uint32_t wdt_stage;
     uint64_t wdt_count_base;
     int64_t wdt_base_ns;
+    uint64_t wdt_due;
     bool wdt_running;
 
     /* An Esp32RtcSleep */

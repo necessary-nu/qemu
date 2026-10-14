@@ -1473,6 +1473,9 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         DeviceState *pwm = DEVICE(&s->mcpwm[i]);
         Esp32PeriphGate *g;
 
+        object_property_set_link(OBJECT(pwm), "gpio", OBJECT(&s->gpio),
+                                 &error_abort);
+        qdev_prop_set_uint32(pwm, "sig-base", out_sig[i]);
         qdev_realize(pwm, &s->periph_bus, &error_fatal);
         g = esp32_soc_add_gated_device(s, &s->mcpwm[i], base[i],
                                        ESP32_GATE_PERIP, bit[i], bit[i]);
