@@ -774,6 +774,30 @@ static uint32_t pmu_ext_pads_active(ESP32P4PMUState *s)
 
 /*
  * [spec:nuos:req:emu.esp32p4.low-power]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * The EXT wakeup looks only at the pads PMU_EXT_WAKEUP_SEL selects (sel):
+ * the PMU watches those (esp32p4_gpio_watch_pads_set()) and merely
+ * follows the others, so that a PWM output or a bus on a pad the wakeup
+ * does not look at need not be timed edge by edge for it. The GPIO
+ * wakeup and the LP GPIO wakeup are the matrix's, whose pads it counts as
+ * watched while their WAKEUP_ENABLE is set. Called before a new selection
+ * takes effect: a pad taken on has its level of the moment as this
+ * returns, while its changes, under the old selection, wake nothing.
+ */
+static void pmu_ext_watch(ESP32P4PMUState *s, uint32_t sel)
+{
+    uint32_t want = sel & MAKE_64BIT_MASK(0, ESP32P4_PMU_EXT_PADS);
+    uint32_t changed = want ^ s->ext_watched;
+
+    if (!s->gpio || !changed) {
+        return;
+    }
+    s->ext_watched = want;
+    esp32p4_gpio_watch_pads_set(s->gpio, s->ext_pad_in, changed, want);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
  * Take HP state @mode's settings as the controls, as a switch to it does.
  */
 static void pmu_apply_hp(ESP32P4PMUState *s, int mode)
@@ -1802,6 +1826,10 @@ static void esp32p4_pmu_write(void *opaque, hwaddr addr, uint64_t value,
                       HWADDR_PRIx "\n", TYPE_ESP32P4_PMU, addr);
         return;
     }
+    if (reg == A_EXT_WAKEUP_SEL) {
+        pmu_ext_watch(s, ((*r & ~(info->rw & lanes)) | (v & info->rw)) &
+                         ~(v & info->wtc));
+    }
     *r = (*r & ~(info->rw & lanes)) | (v & info->rw);
     *r &= ~(v & info->wtc);
     pmu_log_unmodelled(s, reg, *r & ~old);
@@ -1934,7 +1962,8 @@ static void esp32p4_pmu_set_wakeup(void *opaque, int n, int level)
  * A pad of GPIO0 to GPIO15: only those PMU_EXT_WAKEUP_SEL selects take
  * part, and a write to it or PMU_EXT_WAKEUP_LV looks at every pad again,
  * so a change elsewhere changes nothing (those pads may carry a fast bus,
- * an LCD's data, edge by edge).
+ * an LCD's data, which their blocks need not time edge by edge for the
+ * PMU: see pmu_ext_watch()).
  */
 static void esp32p4_pmu_set_ext_pad(void *opaque, int n, int level)
 {
@@ -2036,6 +2065,7 @@ static void esp32p4_pmu_reset_exit(Object *obj, ResetType type)
     pmu_drive_outputs(s, true);
     pmu_vo_drive(s, true);
     qemu_irq_pulse(s->touch_pwr);
+    pmu_ext_watch(s, s->regs[R(A_EXT_WAKEUP_SEL)]);
 }
 
 static void esp32p4_pmu_init(Object *obj)
@@ -2066,6 +2096,9 @@ static void esp32p4_pmu_init(Object *obj)
                             ESP32P4_PMU_WAKE_SOURCES);
     qdev_init_gpio_in_named(dev, esp32p4_pmu_set_ext_pad, ESP32P4_PMU_EXT_PAD,
                             ESP32P4_PMU_EXT_PADS);
+    for (i = 0; i < ESP32P4_PMU_EXT_PADS; i++) {
+        s->ext_pad_in[i] = qdev_get_gpio_in_named(dev, ESP32P4_PMU_EXT_PAD, i);
+    }
     qdev_init_gpio_in_named(dev, esp32p4_pmu_etm_task, ESP32P4_PMU_ETM_TASK,
                             1);
     qdev_init_gpio_out_named(dev, &s->lp_int, ESP32P4_PMU_LP_INT, 1);
@@ -2116,10 +2149,32 @@ static void esp32p4_pmu_init(Object *obj)
 
 static void esp32p4_pmu_realize(DeviceState *dev, Error **errp)
 {
-    if (!ESP32P4_PMU(dev)->clkrst) {
+    ESP32P4PMUState *s = ESP32P4_PMU(dev);
+
+    if (!s->clkrst) {
         error_setg(errp, "%s: the \"clkrst\" link is not set",
                    TYPE_ESP32P4_PMU);
+        return;
     }
+    /* Watching from here; the reset's end leaves the selected ones. */
+    if (s->gpio) {
+        for (int i = 0; i < ESP32P4_PMU_EXT_PADS; i++) {
+            esp32p4_gpio_watch_pad(s->gpio, i, s->ext_pad_in[i]);
+        }
+        s->ext_watched = MAKE_64BIT_MASK(0, ESP32P4_PMU_EXT_PADS);
+    }
+}
+
+/* The matrix keeps its watchers' settings: the PMU's follow the selection. */
+static int esp32p4_pmu_post_load(void *opaque, int version_id)
+{
+    ESP32P4PMUState *s = opaque;
+
+    if (s->gpio) {
+        s->ext_watched = s->regs[R(A_EXT_WAKEUP_SEL)] &
+                         MAKE_64BIT_MASK(0, ESP32P4_PMU_EXT_PADS);
+    }
+    return 0;
 }
 
 static void esp32p4_pmu_finalize(Object *obj)
@@ -2216,6 +2271,7 @@ static const VMStateDescription vmstate_esp32p4_pmu = {
     .name = TYPE_ESP32P4_PMU,
     .version_id = 4,
     .minimum_version_id = 4,
+    .post_load = esp32p4_pmu_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(fast, ESP32P4PMUState),
         VMSTATE_CLOCK(slow, ESP32P4PMUState),
@@ -2260,6 +2316,8 @@ static const Property esp32p4_pmu_properties[] = {
                      CPUState *),
     DEFINE_PROP_LINK("lp-sys", ESP32P4PMUState, lp_sys, TYPE_ESP32P4_LP_SYS,
                      ESP32P4LPSysState *),
+    DEFINE_PROP_LINK("gpio", ESP32P4PMUState, gpio, TYPE_ESP32P4_GPIO,
+                     ESP32P4GpioState *),
     DEFINE_PROP_UINT32("vdd-ldo-mv", ESP32P4PMUState, vdd_ldo_mv, 3300),
 };
 

@@ -132,6 +132,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/registerfields.h"
+#include "hw/core/resettable.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "migration/vmstate.h"
 
@@ -1725,12 +1726,20 @@ static void etm_events(ESP32P4GpioState *s, uint64_t pf, int64_t t)
     MAKE_64BIT_MASK(SIG_LOOPBACK_FIRST % 64, \
                     ESP32P4_GPIO_SIGS - SIG_LOOPBACK_FIRST)
 
+/* Whether a watcher of pad n watches it (esp32p4_gpio_watch_pads_set()) */
+static bool pad_watching(ESP32P4GpioState *s, unsigned n)
+{
+    return (MAKE_64BIT_MASK(0, s->pad_watches[n]) &
+            ~s->pad_watch_idle[n]) != 0;
+}
+
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
  * Whether anything but software sampling the pads sees pad n's level
  * change (esp32p4_gpio_sig_out_watched()), from the routing just built:
  * a line of it that something listens to (its level, a watcher
- * esp32p4_gpio_watch_pad() added, its drive for the analog blocks), a
+ * esp32p4_gpio_watch_pad() added that watches it, its drive for the
+ * analog blocks), a
  * board wire to other pads, its interrupt type or wakeup (GPIO_STATUS
  * latches an edge whatever INT_ENA says), an input signal a modelled
  * block takes from it, a direct IO MUX input that one does, or, on an LP
@@ -1743,7 +1752,7 @@ static bool pad_watched(ESP32P4GpioState *s, unsigned n)
     const IomuxFunc *fn;
     unsigned f;
 
-    if (s->pad_out[n] || s->pad_watches[n] || s->drive_high_out[n] ||
+    if (s->pad_out[n] || pad_watching(s, n) || s->drive_high_out[n] ||
         s->drive_low_out[n] || r->wire_net[n] != BIT_ULL(n) ||
         bit64(r->wakeup, n)) {
         return true;
@@ -3651,6 +3660,40 @@ void esp32p4_gpio_watch_pad(ESP32P4GpioState *s, unsigned n, qemu_irq irq)
     s->pad_watch[n][s->pad_watches[n]++] = irq;
 }
 
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+void esp32p4_gpio_watch_pads_set(ESP32P4GpioState *s, const qemu_irq *irqs,
+                                 uint64_t pads, uint64_t on)
+{
+    bool changed = false, taken_on = false;
+
+    for (uint64_t m = pads; m; m &= m - 1) {
+        unsigned n = ctz64(m);
+        unsigned w = 0;
+
+        g_assert(n < ESP32P4_GPIO_PADS);
+        while (w < s->pad_watches[n] && s->pad_watch[n][w] != irqs[n]) {
+            w++;
+        }
+        g_assert(w < s->pad_watches[n]);
+        if (bit64(on, n) != !(s->pad_watch_idle[n] & BIT(w))) {
+            s->pad_watch_idle[n] ^= BIT(w);
+            changed = true;
+            taken_on |= bit64(on, n);
+        }
+    }
+    if (!changed) {
+        return;
+    }
+    if (!DEVICE(s)->realized || resettable_is_in_reset(OBJECT(s))) {
+        s->dirty_all = true;
+        return;
+    }
+    if (taken_on) {
+        esp32_line_sync();
+    }
+    esp32p4_gpio_update(s);
+}
+
 static void esp32p4_gpio_set_sig_out(void *opaque, int n, int level)
 {
     ESP32P4GpioState *s = opaque;
@@ -4458,6 +4501,18 @@ static int esp32p4_gpio_post_load(void *opaque, int version_id)
     return 0;
 }
 
+/* The watchers' settings, which are theirs and so outlast a reset */
+static const VMStateDescription vmstate_esp32p4_gpio_pad_watch = {
+    .name = TYPE_ESP32P4_GPIO "/pad-watch",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(pad_watch_idle, ESP32P4GpioState,
+                            ESP32P4_GPIO_PADS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_esp32p4_gpio = {
     .name = TYPE_ESP32P4_GPIO,
     .version_id = 7,
@@ -4585,6 +4640,10 @@ static const VMStateDescription vmstate_esp32p4_gpio = {
         VMSTATE_BOOL(wakeup_level, ESP32P4GpioState),
         VMSTATE_BOOL(lp_wakeup_level, ESP32P4GpioState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_esp32p4_gpio_pad_watch,
+        NULL
     },
 };
 

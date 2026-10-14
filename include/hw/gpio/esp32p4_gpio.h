@@ -537,9 +537,13 @@ struct ESP32P4GpioState {
     unsigned ext_drivers;
     char *ext_name[ESP32P4_GPIO_EXT_DRIVERS];
     ESP32P4GpioExtDriver ext[ESP32P4_GPIO_EXT_DRIVERS];
-    /* The irqs that follow each pad's level */
+    /*
+     * The irqs that follow each pad's level, and those of them that do
+     * not watch it (bit w for pad_watch[n][w]: esp32p4_gpio_watch_pads_set())
+     */
     qemu_irq pad_watch[ESP32P4_GPIO_PADS][ESP32P4_GPIO_PAD_WATCHES];
     uint8_t pad_watches[ESP32P4_GPIO_PADS];
+    uint8_t pad_watch_idle[ESP32P4_GPIO_PADS];
     uint64_t ext_pull_up;
     /* The pads a USB PHY has, and those an analog block holds mid-rail */
     uint64_t ext_phy;
@@ -771,6 +775,23 @@ qemu_irq esp32p4_gpio_ext_release(ESP32P4GpioState *s, unsigned d,
  * terminal, a chip on the board, has its own.
  */
 void esp32p4_gpio_watch_pad(ESP32P4GpioState *s, unsigned n, qemu_irq irq);
+
+/*
+ * Whether pad n's watcher irqs[n] (esp32p4_gpio_watch_pad()) watches it,
+ * for each pad n in @pads: bit n of @on. A watcher that does not still
+ * follows the pad's level as the matrix resolves it, but does not make
+ * the pad watched (esp32p4_gpio_sig_out_watched()): a block driving the
+ * pad need not time its edges for it, and may bring the pad to its level
+ * only as software samples it. A watcher taken on has the pad's level of
+ * the moment (esp32_line_time()) as this returns: the line sources are
+ * brought up to then and the pads resolved again, the blocks whose
+ * outputs a pad newly watched takes up driving their levels of the
+ * moment. While the matrix is held in reset, its reset's end does that.
+ * Watchers watch from their esp32p4_gpio_watch_pad(); the setting is the
+ * watcher's, which a reset of the matrix leaves as it is.
+ */
+void esp32p4_gpio_watch_pads_set(ESP32P4GpioState *s, const qemu_irq *irqs,
+                                 uint64_t pads, uint64_t on);
 
 /*
  * Notifier n is told of each change to the load on any pad, in the

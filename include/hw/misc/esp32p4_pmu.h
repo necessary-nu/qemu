@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/gpio/esp32p4_gpio.h"
 #include "hw/misc/esp32p4_ana.h"
 #include "hw/misc/esp32p4_clkrst.h"
 #include "hw/misc/esp32p4_lp_sys.h"
@@ -93,7 +94,9 @@ enum {
  *     "lp-cpu", whose wait for an interrupt (its "in-wfi" property)
  *     LP_CPU_WAITI_RDY shows; and
  *     "lp-sys", where LP_SYSTEM's EXT_WAKEUP1_STATUS records the pads of
- *     an EXT wakeup.
+ *     an EXT wakeup; and "gpio", the GPIO matrix, whose pads GPIO0 to
+ *     GPIO15 the PMU follows for the EXT wakeup ("ext-pad"), watching
+ *     those PMU_EXT_WAKEUP_SEL selects.
  *   - Sysbus IRQs 0 and 1: PMU_INTR (the HP_INT_* registers) and the
  *     LP_INT_* registers' interrupt, interrupt matrix sources 6 and 7; the
  *     latter is also the named GPIO output "lp-int", for the LP core.
@@ -270,6 +273,10 @@ struct ESP32P4PMUState {
     ESP32P4ClkRstState *clkrst;
     CPUState *lp_cpu;
     ESP32P4LPSysState *lp_sys;
+    ESP32P4GpioState *gpio;
+    /* The "ext-pad" inputs, and those that watch their pads */
+    qemu_irq ext_pad_in[ESP32P4_PMU_EXT_PADS];
+    uint32_t ext_watched;
 
     uint32_t regs[ESP32P4_PMU_NREGS];
 
