@@ -10,6 +10,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
+#include "exec/icount.h"
 #include "hw/gpio/esp32_line.h"
 
 /*
@@ -76,4 +77,18 @@ void esp32_line_sync(void)
     line_syncing = true;
     notifier_list_notify(&line_sources, NULL);
     line_syncing = false;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * Whether a stream's event due at @due_ns is more than
+ * ESP32_LINE_MAX_LAG_NS behind the present: never under icount, where
+ * virtual time waits for every event.
+ */
+bool esp32_line_lags(int64_t due_ns)
+{
+    return !icount_enabled() &&
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - due_ns >
+           ESP32_LINE_MAX_LAG_NS;
 }

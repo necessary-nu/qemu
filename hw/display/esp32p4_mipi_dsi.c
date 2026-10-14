@@ -2924,11 +2924,61 @@ static void brg_event(void *opaque)
     brg_schedule(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.mipi]
+ * The host has fallen ESP32_LINE_MAX_LAG_NS behind the generator
+ * (include/hw/gpio/esp32_line.h), at esp32_line_time(), the present: its
+ * timing restarts there with a new frame, the frames between dropped.
+ */
+static void brg_slip(void *opaque)
+{
+    ESP32P4DsiBridgeState *s = opaque;
+    int64_t now = esp32_line_time();
+
+    if (!s->lag_logged) {
+        s->lag_logged = true;
+        qemu_log_mask(LOG_UNIMP, "%s: the host is too slow for the DPI "
+                      "frames: they restart at the present, frames dropped\n",
+                      TYPE_ESP32P4_DSI_BRIDGE);
+    }
+    if (s->host) {
+        esp32p4_dsi_host_dpi_stop(s->host, now);
+    }
+    esp32p4_clk_count_start(&s->dpi_count, s->clk_dpi, now);
+    s->cyc_base = 0;
+    s->frame_cyc = 0;
+    s->line = 0;
+    s->step = 0;
+    brg_latch_timing(s);
+    brg_schedule(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.mipi]
+ * The generator's event at @t, its time: on the host's clock, an event
+ * ESP32_LINE_MAX_LAG_NS behind the present, which the host cannot follow,
+ * makes the generator slip to the present instead.
+ */
+static void brg_take_event(ESP32P4DsiBridgeState *s, int64_t t)
+{
+    if (esp32_line_lags(t)) {
+        esp32_line_run_at(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), brg_slip, s);
+    } else {
+        esp32_line_run_at(t, brg_event, s);
+    }
+}
+
+/*
+ * The timer takes the event it was set for and no later one, however late
+ * it runs: re-armed in the past, it runs again among every other device's
+ * timers in order of time, so a generator the host held up catches up
+ * event by event.
+ */
 static void brg_timer_cb(void *opaque)
 {
     ESP32P4DsiBridgeState *s = opaque;
 
-    esp32_line_run_at(brg_cyc_ns(s, s->next_cyc), brg_event, s);
+    brg_take_event(s, brg_cyc_ns(s, s->next_cyc));
 }
 
 /*
@@ -2945,7 +2995,7 @@ static void brg_catch_up(ESP32P4DsiBridgeState *s, int64_t now)
 
         if (gen <= now && gen <= req) {
             timer_del(s->timer);
-            esp32_line_run_at(gen, brg_event, s);
+            brg_take_event(s, gen);
         } else if (req <= now) {
             timer_del(s->req_timer);
             esp32_line_run_at(req, (void (*)(void *))brg_update_req, s);

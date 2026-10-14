@@ -987,7 +987,35 @@ static void run_event(void *opaque)
     }
 }
 
-/* Run every event due by @now, each at its own time. */
+static void update_stream(ESP32P4ImageSource *s);
+
+/*
+ * [spec:nuos:req:emu.esp32p4.lcd-cam]
+ * [spec:nuos:req:emu.esp32p4.mipi]
+ * The host has fallen ESP32_LINE_MAX_LAG_NS behind the stream
+ * (include/hw/gpio/esp32_line.h): it restarts at the present, the frames
+ * between dropped.
+ */
+static void image_source_restart(void *opaque)
+{
+    ESP32P4ImageSource *s = opaque;
+
+    if (!s->lag_logged) {
+        s->lag_logged = true;
+        qemu_log_mask(LOG_UNIMP, "esp32p4-image-source: the host is too "
+                      "slow for the stream: it restarts at the present, "
+                      "frames dropped\n");
+    }
+    stop_stream(s, esp32_line_time());
+    update_stream(s);
+}
+
+/*
+ * Run every event due by @now, each at its own time. On the host's clock
+ * a stream the host held up catches up event by event, the frame in
+ * progress going on; only a stream ESP32_LINE_MAX_LAG_NS behind, which
+ * the host cannot follow at all, restarts at the present.
+ */
 static void run_until(ESP32P4ImageSource *s, int64_t now)
 {
     if (s->in_run) {
@@ -1000,56 +1028,30 @@ static void run_until(ESP32P4ImageSource *s, int64_t now)
         if (when > now) {
             break;
         }
+        if (esp32_line_lags(when)) {
+            esp32_line_run_at(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                              image_source_restart, s);
+            continue;
+        }
         esp32_line_run_at(when, run_event, s);
     }
     s->in_run = false;
 }
 
-/*
- * How far the host may fall behind the stream before the stream slips: a
- * second, far longer than the host's own pauses (a busy host can hold
- * QEMU's main loop up for tens of milliseconds), which a sensor never
- * drops frames for; only a stream the host cannot keep up with at all
- * falls that far behind.
- */
-#define IMAGE_MAX_LAG_NS    NANOSECONDS_PER_SECOND
-
-static void update_stream(ESP32P4ImageSource *s);
-
-static void image_source_restart(void *opaque)
-{
-    ESP32P4ImageSource *s = opaque;
-
-    stop_stream(s, esp32_line_time());
-    update_stream(s);
-}
-
+/* [spec:nuos:req:emu.esp32p4.lcd-cam] */
+/* [spec:nuos:req:emu.esp32p4.mipi] */
 /*
  * The timer runs the events at its deadline, the next event's time, and
  * no later ones even if it runs late: with the timers running in deadline
  * order, the sensor's events reach the receivers in order of time with
- * every other device's. On the host's clock a stream faster than the
- * host can follow falls ever further behind; once it is IMAGE_MAX_LAG_NS
- * behind it restarts at the present, the frames between dropped (logged),
- * rather than hold the system back for ever. (Under icount virtual time
- * waits for it.)
+ * every other device's, and a late stream catches up event by event
+ * within the same run of the timers. (Under icount virtual time waits for
+ * it.)
  */
 static void image_source_timer(void *opaque)
 {
     ESP32P4ImageSource *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    if (s->running && s->next_ev < s->events->len &&
-        now - g_array_index(s->events, ImageEvent, s->next_ev).ns >
-        IMAGE_MAX_LAG_NS) {
-        if (!s->lag_logged) {
-            s->lag_logged = true;
-            qemu_log_mask(LOG_UNIMP, "esp32p4-image-source: the host is too "
-                          "slow for the stream: it restarts at the present, "
-                          "frames dropped\n");
-        }
-        esp32_line_run_at(now, image_source_restart, s);
-    }
     if (s->running && s->next_ev < s->events->len) {
         run_until(s, g_array_index(s->events, ImageEvent, s->next_ev).ns);
     }

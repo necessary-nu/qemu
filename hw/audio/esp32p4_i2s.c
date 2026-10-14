@@ -388,9 +388,6 @@ enum {
 /* A frame's data: 16-bit PCM from the PDM-to-PCM converter */
 #define PCM_BITS                16
 
-/* Bound on the events one timer callback runs to catch up */
-#define MAX_CATCH_UP            65536
-
 /* GDMA-AHB's peripheral numbers of I2S0 to I2S2 */
 static const unsigned i2s_gdma_periph[ESP32P4_I2S_HP_COUNT] = {
     ESP32P4_GDMA_AHB_I2S0, ESP32P4_GDMA_AHB_I2S1, ESP32P4_GDMA_AHB_I2S2,
@@ -2254,20 +2251,20 @@ static void i2s_etm_deferred_apply(ESP32P4I2sState *c)
     }
 }
 
-/* Whether the transmit FIFO holds a whole frame's data. */
-static bool tx_frame_ready(ESP32P4I2sState *s)
+/*
+ * [spec:nuos:req:emu.esp32p4.i2s]
+ * Run @u's periods that have ended by @upto, each at its end, with GDMA's
+ * rounds due before it run first, so that the FIFOs hold what they would
+ * have. On the host's clock a unit the host held up catches up period by
+ * period; only a unit ESP32_LINE_MAX_LAG_NS behind (include/hw/gpio/
+ * esp32_line.h), which the host cannot follow, slips: its clock's timing
+ * restarts at the present, the periods between not run (logged).
+ */
+static void unit_run_until(ESP32P4I2sState *s, ESP32P4I2sUnit *u,
+                           int64_t upto)
 {
-    I2sCfg c;
-
-    unit_cfg(s, &s->tx, &c);
-    return tx_has(s, tx_need(&c) * c.bytes);
-}
-
-static void unit_timer_cb(ESP32P4I2sState *s, ESP32P4I2sUnit *u)
-{
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    unsigned runs = 0;
     bool tx = u == &s->tx;
+    int64_t t;
 
     for (unsigned k = 0; k < ESP32P4_I2S_COUNT; k++) {
         if (s->bus[k]) {
@@ -2276,27 +2273,24 @@ static void unit_timer_cb(ESP32P4I2sState *s, ESP32P4I2sUnit *u)
     }
     s->in_run = true;
     while (unit_own_clock(s, u) && u->frame_ticks &&
-           unit_event_time(s, u, u->events + 1) <= now) {
-        if (tx && unit_event_time(s, u, u->events + 2) <= now &&
-            !tx_frame_ready(s)) {
-            /*
-             * Behind time, with the FIFO short of a frame: GDMA, whose
-             * transfers wait for this to return, cannot have kept up. The
-             * clock slips rather than running out of data it would have.
-             */
-            u->anchor = now;
+           (t = unit_event_time(s, u, u->events + 1)) <= upto) {
+        if (esp32_line_lags(t)) {
+            if (!s->logged_lag) {
+                qemu_log_mask(LOG_UNIMP, "esp32p4_i2s: %s: the host is too "
+                              "slow for %s's clock: its timing restarts at "
+                              "the present\n", i2s_name(s),
+                              tx ? "TX" : "RX");
+                s->logged_lag = true;
+            }
+            u->anchor = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
             u->events = 0;
-            break;
+            continue;
+        }
+        if (s->gdma) {
+            esp32p4_gdma_sync(s->gdma, t - 1);
         }
         u->events++;
-        esp32_line_run_at(unit_event_time(s, u, u->events), i2s_bus_run_at,
-                          &(I2sAt) { .s = s, .n = tx });
-        if (++runs == MAX_CATCH_UP) {
-            /* Too far behind to catch up: drop the backlog */
-            u->anchor = now;
-            u->events = 0;
-            break;
-        }
+        esp32_line_run_at(t, i2s_bus_run_at, &(I2sAt) { .s = s, .n = tx });
     }
     unit_arm(s, u);
     s->in_run = false;
@@ -2310,6 +2304,21 @@ static void unit_timer_cb(ESP32P4I2sState *s, ESP32P4I2sUnit *u)
         i2s_etm_deferred_apply(c);
     }
     i2s_update_irq(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.i2s]
+ * The timer takes the period it was set for, however late it runs, and
+ * no later one: re-armed for the next in the past, it runs again among
+ * every other device's timers in order of time, so that on the host's
+ * clock a unit catching up does so in step with what it exchanges data
+ * with, an audio backend's stream on its own timer too (a codec's
+ * buffers then neither run dry nor overflow). Under icount virtual time
+ * waits for every period.
+ */
+static void unit_timer_cb(ESP32P4I2sState *s, ESP32P4I2sUnit *u)
+{
+    unit_run_until(s, u, unit_event_time(s, u, u->events + 1));
 }
 
 static void i2s_tx_timer_cb(void *opaque)
@@ -2339,7 +2348,7 @@ static void i2s_tx_resume(ESP32P4I2sState *s)
         return;
     }
     s->tx.stalled = false;
-    s->tx.anchor = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->tx.anchor = esp32_line_time();
     s->tx.events = 0;
     unit_arm(s, &s->tx);
     i2s_hung_update(s, &s->tx, false);

@@ -326,6 +326,7 @@ enum {
     LOG_LINSEL = 1 << 8,
     LOG_MASTER = 1 << 9,
     LOG_MASTER_LRCK = 1 << 10,
+    LOG_LAG = 1 << 11,
 };
 
 /* Register reset values (datasheet chapter 8) */
@@ -1503,8 +1504,12 @@ static void mst_edge_at(void *opaque)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32p4.i2s]
  * Run the master's edges due by @now, each at its own time, and arm the
- * timer for the end of the frame after.
+ * timer for the end of the frame after. On the host's clock an edge
+ * ESP32_LINE_MAX_LAG_NS behind the present (include/hw/gpio/
+ * esp32_line.h), which the host cannot follow, restarts the clocks'
+ * timing at the present, the frames between not run.
  */
 static void mst_catch_up(ES8311State *s, int64_t now)
 {
@@ -1515,6 +1520,13 @@ static void mst_catch_up(ES8311State *s, int64_t now)
 
         if (t > now) {
             break;
+        }
+        if (esp32_line_lags(t)) {
+            log_once(s, LOG_LAG, LOG_UNIMP, "the host is too slow for the "
+                     "master clocks: their timing restarts at the present");
+            s->mst_anchor_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            s->mst_edge = 0;
+            continue;
         }
         esp32_line_run_at(t, mst_edge_at,
                           &(MstEdge) { .s = s, .n = s->mst_edge });
@@ -1530,11 +1542,23 @@ static void mst_catch_up(ES8311State *s, int64_t now)
                                   per_frame));
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.i2s]
+ * The timer takes the frame it was set for, up to the next frame's start,
+ * however late it runs, and no later one: re-armed for the next in the
+ * past, it runs again among every other device's timers in order of
+ * time, so that on the host's clock a master the host held up catches up
+ * frame by frame in step with the audio backend's timer, and the buffers
+ * between them neither run dry nor overflow. Under icount it runs at that
+ * time.
+ */
 static void es8311_mst_timer(void *opaque)
 {
     ES8311State *s = opaque;
+    uint64_t per_frame = 2 * (uint64_t)s->mst_frame;
 
-    mst_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    mst_catch_up(s, mst_edge_time(s, (s->mst_edge / per_frame + 1) *
+                                     per_frame));
 }
 
 /* Software samples the pads: the master's edges up to the present. */
