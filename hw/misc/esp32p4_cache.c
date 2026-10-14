@@ -37,7 +37,9 @@
  *     from them (so a write of the value already there leaves it clean);
  *     and whether it is valid and locked;
  *   - for the external memory, the L2 contents, and whether the line is
- *     valid, dirty and locked there.
+ *     valid, dirty and locked there. With the L2's 128-byte lines, the
+ *     two 64-byte lines of each share that state: the L2 holds, dirties,
+ *     cleans, writes back and drops the 128 bytes as one.
  *
  * A core's access to a line the L1 does not hold fills the L1, from the L2
  * where it holds the line and otherwise from the memory through the L2,
@@ -62,13 +64,26 @@
  * done interrupt. SYNC_MAP picks the caches: L1-ICache0 and 1 (bits 0 and
  * 1; 2 and 3 are reserved), the L1-DCache (bit 4), the L2 (bit 5). A
  * SYNC_SIZE of zero operates on the whole cache, as the ROM's
- * Cache_*_All() use it; otherwise on the lines SYNC_ADDR to SYNC_ADDR +
- * SYNC_SIZE touch, in the L2's line size (64 or 128 bytes,
- * L2_CACHE_BLOCKSIZE_CONF) for the L2. Invalidate drops the lines (and
- * their dirty data); clean leaves the lines and makes them clean;
- * write-back writes the dirty lines to the next level, the L1's to the L2
- * (or to the memory for L2MEM, or with the L2 bypassed) and the L2's to
- * the memory, L1 before L2; write-back-invalidate does both. Operating on
+ * Cache_*_All() use it; otherwise on every line SYNC_ADDR to SYNC_ADDR +
+ * SYNC_SIZE touches, in each cache's own line size: the L1's 64 bytes,
+ * the L2's 64 or 128 (L2_CACHE_BLOCKSIZE_CONF). An operation acts on whole
+ * lines, as the chip's do: a line the range touches is dropped, cleaned or
+ * written back entirely, so that invalidating a range not aligned to
+ * lines drops the dirty data of the touched lines' bytes outside it too,
+ * which is why ESP-IDF's esp_cache_msync() refuses such an invalidation.
+ * The TRM gives no rule for a range not aligned to lines. The ROM's
+ * Cache_Op_Addr(), through which ESP-IDF's cache_hal operations go
+ * (Cache_Invalidate_Addr() and the rest), rounds the range out to whole
+ * lines of the largest line size the map names before it writes SYNC_ADDR
+ * and SYNC_SIZE, so that the controller gets whole lines from ESP-IDF; a
+ * range written to the registers unaligned is taken to name the lines it
+ * touches likewise. Invalidate drops the lines (and their dirty data);
+ * clean leaves the lines and makes them clean; write-back writes the
+ * dirty lines to the next level, the L1's to the L2 (or to the memory for
+ * L2MEM, or with the L2 bypassed) and the L2's to the memory, L1 before
+ * L2; write-back-invalidate does both. An L1 write-back into a line the
+ * L2 does not hold allocates the line there, reading the rest of a
+ * 128-byte line from the memory as a miss would. Operating on
  * an address range leaves locked lines; on the whole cache, it does not.
  * A SYNC_MAP of zero, or more than one operation at once, completes with
  * SYNC_ERR and SYNC_ERR_CODE 0 or 1. Lock and unlock (LOCK_CTRL, with
@@ -863,6 +878,26 @@ static bool cache_l2_bypassed(ESP32P4CacheState *c)
     return reg(c, A_L2_BYPASS_CACHE_CONF) & BYPASS_L2_CACHE;
 }
 
+/* The L2's line size: 64 or 128 bytes (L2_CACHE_BLOCKSIZE_CONF). */
+static unsigned cache_l2_line(ESP32P4CacheState *c)
+{
+    return reg(c, A_L2_BLOCKSIZE_CONF) & BLOCKSIZE_128 ? 128 : 64;
+}
+
+/*
+ * The 64-byte units [*first, *end) of the L2 line that holds unit `unit`:
+ * the model keeps the L2's state per 64 bytes, and a 128-byte line's two
+ * units share theirs.
+ */
+static void cache_l2_units(ESP32P4CacheState *c, uint32_t unit,
+                           uint32_t *first, uint32_t *end)
+{
+    uint32_t n = cache_l2_line(c) / ESP32P4_CACHE_LINE;
+
+    *first = QEMU_ALIGN_DOWN(unit, n);
+    *end = *first + n;
+}
+
 static bool view_ext(ESP32P4CacheView *v)
 {
     return v->kind != ESP32P4_CACHE_VIEW_L2MEM;
@@ -1126,6 +1161,19 @@ static MemTxResult cache_access_fail(ESP32P4CacheState *c, uint32_t vaddr,
 }
 
 /*
+ * Whether an L2 prelock section takes the L2 line holding unit `line` as
+ * it fills, by the line's start: a 128-byte line is locked whole or not.
+ */
+static bool l2_prelocked(ESP32P4CacheView *v, uint32_t line)
+{
+    uint32_t first, end;
+
+    cache_l2_units(v->cache, line, &first, &end);
+    return cache_prelocked(v->cache, A_L2_PRELOCK_CONF, true,
+                           view_vaddr(v, first * ESP32P4_CACHE_LINE));
+}
+
+/*
  * Fill the L2 lines of the fill block at `off` that it does not hold and
  * that `need` marks, from the memory, into `buf` (the block's contents);
  * with the L2 bypassed, only read them. Returns the memory's answer.
@@ -1133,7 +1181,6 @@ static MemTxResult cache_access_fail(ESP32P4CacheState *c, uint32_t vaddr,
 static MemTxResult l2_fill_block(ESP32P4CacheView *v, uint32_t off,
                                  uint8_t *buf, bool l2_alloc)
 {
-    ESP32P4CacheState *c = v->cache;
     uint32_t first = off / ESP32P4_CACHE_LINE;
     MemTxResult r;
     uint32_t i;
@@ -1155,8 +1202,7 @@ static MemTxResult l2_fill_block(ESP32P4CacheView *v, uint32_t off,
                    ESP32P4_CACHE_LINE);
             set_bit(line, v->l2_valid);
             clear_bit(line, v->l2_dirty);
-            if (cache_prelocked(c, A_L2_PRELOCK_CONF, true,
-                                view_vaddr(v, line * ESP32P4_CACHE_LINE))) {
+            if (l2_prelocked(v, line)) {
                 set_bit(line, v->l2_lock);
             }
         }
@@ -1231,6 +1277,56 @@ static void l2mem_store(ESP32P4CacheState *c, uint32_t off,
     }
 }
 
+/* Mark the L2 line holding unit `line` dirty: the whole line. */
+/* [spec:nuos:req:emu.esp32p4.memory] */
+static void l2_mark_dirty(ESP32P4CacheView *v, uint32_t line)
+{
+    uint32_t first, end;
+
+    cache_l2_units(v->cache, line, &first, &end);
+    bitmap_set(v->l2_dirty, first, end - first);
+}
+
+/*
+ * Allocate the L2 line holding unit `line` for an L1 write-back into it,
+ * which brings the line's other units from the memory where the L2 does
+ * not hold them (only a 128-byte line has another), filled as a miss
+ * fills them. Returns the memory's answer; on an error nothing is
+ * allocated.
+ */
+/* [spec:nuos:req:emu.esp32p4.memory] */
+static MemTxResult l2_allocate_line(ESP32P4CacheView *v, uint32_t line)
+{
+    ESP32P4CacheState *c = v->cache;
+    uint32_t first, end, u;
+
+    cache_l2_units(c, line, &first, &end);
+    for (u = first; u < end; u++) {
+        if (u != line && !test_bit(u, v->l2_valid)) {
+            MemTxResult r = esp32p4_mspi_axi_read(view_mspi(v),
+                                                  u * ESP32P4_CACHE_LINE,
+                                                  view_l2(v) +
+                                                  u * ESP32P4_CACHE_LINE,
+                                                  ESP32P4_CACHE_LINE);
+
+            if (r != MEMTX_OK) {
+                return r;
+            }
+        }
+    }
+    for (u = first; u < end; u++) {
+        if (test_bit(u, v->l2_valid)) {
+            continue;
+        }
+        set_bit(u, v->l2_valid);
+        clear_bit(u, v->l2_dirty);
+        if (l2_prelocked(v, u)) {
+            set_bit(u, v->l2_lock);
+        }
+    }
+    return MEMTX_OK;
+}
+
 /* Write L2 line `line` back to the memory if it is dirty. */
 static MemTxResult l2_writeback_line(ESP32P4CacheView *v, uint32_t line)
 {
@@ -1269,9 +1365,11 @@ static void l1_writeback_line(ESP32P4CacheView *v, uint32_t line)
             return;
         }
     } else {
+        if (l2_allocate_line(v, line) != MEMTX_OK) {
+            return;
+        }
         memcpy(view_l2(v) + off, data, ESP32P4_CACHE_LINE);
-        set_bit(line, v->l2_valid);
-        set_bit(line, v->l2_dirty);
+        l2_mark_dirty(v, line);
     }
     memcpy(view_clean(v) + off, data, ESP32P4_CACHE_LINE);
 }
@@ -1324,7 +1422,7 @@ static MemTxResult cache_past_l1(ESP32P4CacheView *v, uint32_t off,
     }
     if (write) {
         memcpy(view_l2(v) + off, buf, size);
-        set_bit(line, v->l2_dirty);
+        l2_mark_dirty(v, line);
     } else {
         memcpy(buf, view_l2(v) + off, size);
     }
@@ -1448,11 +1546,6 @@ static bool view_lines(ESP32P4CacheView *v, uint32_t vaddr, uint32_t size,
     *first = lo / ESP32P4_CACHE_LINE;
     *end = hi / ESP32P4_CACHE_LINE;
     return true;
-}
-
-static unsigned cache_l2_line(ESP32P4CacheState *c)
-{
-    return reg(c, A_L2_BLOCKSIZE_CONF) & BLOCKSIZE_128 ? 128 : 64;
 }
 
 /* [spec:nuos:req:emu.esp32p4.memory] */
