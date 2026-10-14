@@ -1523,6 +1523,14 @@ MemTxResult esp32p4_mspi_axi_write(ESP32P4MSPIState *s, uint32_t addr,
     return mspi_axi(s, addr, (uint8_t *)buf, len, true);
 }
 
+/* [spec:nuos:req:emu.esp32p4.boot] */
+void esp32p4_mspi_raise_state_ends(ESP32P4MSPIState *s)
+{
+    spi0_raise(s, INT0_SLV_ST_END | INT0_MST_ST_END);
+    spi1_raise(s, INT1_SLV_ST_END | INT1_MST_ST_END);
+    mspi_update_irq(s);
+}
+
 /* The window: direct accesses, and the accesses of masters without cache. */
 
 /* [spec:nuos:req:emu.esp32p4.memory] */

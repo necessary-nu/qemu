@@ -145,4 +145,12 @@ MemTxResult esp32p4_mspi_axi_read(ESP32P4MSPIState *s, uint32_t addr,
 MemTxResult esp32p4_mspi_axi_write(ESP32P4MSPIState *s, uint32_t addr,
                                    const uint8_t *buf, uint32_t len);
 
+/*
+ * Raise SPI0's and SPI1's SLV_ST_END and MST_ST_END, as transactions
+ * ending on both ports do: for the machine's presentation of the state the
+ * boot ROM leaves (esp32p4_boot.c), which does not repeat the ROM's
+ * transactions.
+ */
+void esp32p4_mspi_raise_state_ends(ESP32P4MSPIState *s);
+
 #endif
