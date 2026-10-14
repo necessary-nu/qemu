@@ -298,6 +298,12 @@ struct Esp32DwmacState {
     /* The next system time event: target time, overflow or PPS edge */
     QEMUTimer ptp_timer;
     bool pps_level;
+    /*
+     * When the MDIO, transmit, pause, pause refresh and receive watchdog
+     * timers are due, in that order: a callback runs as of that time
+     * however late its timer runs.
+     */
+    int64_t due[5];
 };
 
 /*

@@ -554,11 +554,34 @@ static uint32_t lp_ana_value(ESP32P4LPAnaState *s, hwaddr reg)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
+ * Bring the brown-out detector's counters and the battery's filters up to
+ * the time of an access, if one of their timers has come: without icount
+ * those can run well after, while software reads INT_RAW's BOD_MODE0 or
+ * the filters' FLAG. Only a timer that has come brings it up to date.
+ */
+static void lp_ana_catch_up(ESP32P4LPAnaState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    bool due = timer_pending(&s->bod_timer) &&
+               timer_expire_time_ns(&s->bod_timer) <= now;
+
+    for (int f = 0; f < ESP32P4_LP_ANA_FILTERS; f++) {
+        due |= timer_pending(&s->filter[f].timer) &&
+               timer_expire_time_ns(&s->filter[f].timer) <= now;
+    }
+    if (due) {
+        lp_ana_update(s);
+    }
+}
+
 static uint64_t lp_ana_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4LPAnaState *s = opaque;
     hwaddr reg = addr & ~3;
 
+    lp_ana_catch_up(s);
     if (!esp32p4_lp_ana_reg_info(reg)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of %u bytes at reserved "
                       "offset 0x%" HWADDR_PRIx "\n", TYPE_ESP32P4_LP_ANA,
@@ -581,6 +604,7 @@ static void lp_ana_write(void *opaque, hwaddr addr, uint64_t value,
     uint32_t *r;
     uint32_t wt, old;
 
+    lp_ana_catch_up(s);
     if (!info) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write of %u bytes at reserved "
                       "offset 0x%" HWADDR_PRIx " (value 0x%" PRIx64 ")\n",

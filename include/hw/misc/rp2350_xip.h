@@ -96,6 +96,8 @@ struct RP2350XIPState {
     qemu_irq dreq[RP2350_XIP_NUM_DREQ];
     QEMUTimer *busy_timer;
     QEMUTimer *stream_timer;
+    /* When the streamed word under way has been read. */
+    int64_t stream_due;
 
     /* Properties: the size of the device on each chip select (0: none). */
     uint32_t cs_size[RP2350_QMI_CS];

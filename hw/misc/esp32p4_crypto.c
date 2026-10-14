@@ -73,12 +73,36 @@ void esp32p4_crypto_timer_start(ESP32P4CryptoTimer *t, uint64_t cycles)
     esp32p4_crypto_timer_start_at(t, cycles, esp32_line_time());
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.crypto]
+ * End, in time order, each operation of @t whose cycles have run by
+ * @now, at the time they ran: an operation that ends can start another,
+ * its cycles counted from that end, which may itself have run by then.
+ */
+void esp32p4_crypto_timers_sync(ESP32P4CryptoTimer *const *t, unsigned n,
+                                int64_t now)
+{
+    for (;;) {
+        ESP32P4CryptoTimer *next = NULL;
+
+        for (unsigned i = 0; i < n; i++) {
+            if (t[i]->active && timer_pending(&t[i]->timer) &&
+                t[i]->due_ns <= now &&
+                (!next || t[i]->due_ns < next->due_ns)) {
+                next = t[i];
+            }
+        }
+        if (!next) {
+            return;
+        }
+        timer_del(&next->timer);
+        esp32_line_run_at(next->due_ns, crypto_timer_done, next);
+    }
+}
+
 void esp32p4_crypto_timer_sync(ESP32P4CryptoTimer *t, int64_t now)
 {
-    if (t->active && timer_pending(&t->timer) && t->due_ns <= now) {
-        timer_del(&t->timer);
-        esp32_line_run_at(t->due_ns, crypto_timer_done, t);
-    }
+    esp32p4_crypto_timers_sync(&t, 1, now);
 }
 
 void esp32p4_crypto_timer_cancel(ESP32P4CryptoTimer *t)

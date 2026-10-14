@@ -285,13 +285,18 @@ static void phy_timer_cb(void *opaque)
 
 /*
  * A register access at esp32_line_time(): first the PHY's start-up, if it
- * fell due before, at its own time.
+ * fell due before, at its own time, then the camera's packets due by then
+ * (esp32p4_image_source_sync()), which its timer, late without icount, has
+ * yet to bring: INT_ST_MAIN and the groups' errors as they are then.
  */
 static void phy_catch_up(ESP32P4CsiHostState *s)
 {
     if (timer_pending(s->phy_timer) && s->phy_due_ns <= esp32_line_time()) {
         timer_del(s->phy_timer);
         esp32_line_run_at(s->phy_due_ns, phy_update, s);
+    }
+    if (s->attached) {
+        esp32p4_image_source_sync(s->attached);
     }
 }
 

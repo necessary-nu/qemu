@@ -140,6 +140,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "migration/vmstate.h"
 #include "system/block-backend.h"
@@ -977,6 +978,24 @@ static void esp32p4_efuse_op_done(void *opaque)
     esp32p4_efuse_update_irq(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.efuse]
+ * End the running read or programming if its cycles have run by the
+ * time of the access being made, at the time they ran: without icount
+ * its timer can run well after that, while software polls EFUSE_CMD's
+ * READ_CMD or PGM_CMD, INT_RAW and the RD_ registers the read loads, as
+ * the ROM and ESP-IDF do.
+ */
+static void esp32p4_efuse_catch_up(ESP32P4EfuseState *s)
+{
+    int64_t due = timer_expire_time_ns(&s->op_timer);
+
+    if (timer_pending(&s->op_timer) && due <= esp32_line_time()) {
+        timer_del(&s->op_timer);
+        esp32_line_run_at(due, esp32p4_efuse_op_done, s);
+    }
+}
+
 /* EFUSE_STATE, from how far the running operation has got. */
 static uint32_t esp32p4_efuse_state(ESP32P4EfuseState *s)
 {
@@ -1122,7 +1141,10 @@ static uint32_t esp32p4_efuse_read_reg(ESP32P4EfuseState *s, hwaddr addr)
 static uint64_t esp32p4_efuse_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4EfuseState *s = opaque;
-    uint32_t value = esp32p4_efuse_read_reg(s, addr & ~3);
+    uint32_t value;
+
+    esp32p4_efuse_catch_up(s);
+    value = esp32p4_efuse_read_reg(s, addr & ~3);
 
     return extract32(value, (addr & 3) * 8, size * 8);
 }
@@ -1272,6 +1294,7 @@ static void esp32p4_efuse_write(void *opaque, hwaddr addr, uint64_t value,
     unsigned shift = (addr & 3) * 8;
     uint32_t mask = MAKE_64BIT_MASK(shift, size * 8);
 
+    esp32p4_efuse_catch_up(s);
     if (s->in_reset) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write at 0x%" HWADDR_PRIx
                       " while the controller is held in reset\n",
@@ -1355,6 +1378,9 @@ static void esp32p4_efuse_clk_update(void *opaque, ClockEvent event)
 {
     ESP32P4EfuseState *s = opaque;
 
+    if (event == ClockPreUpdate) {
+        esp32p4_efuse_catch_up(s);
+    }
     if (s->op == OP_NONE) {
         return;
     }
@@ -1455,6 +1481,7 @@ uint32_t esp32p4_efuse_word(ESP32P4EfuseState *s, unsigned block,
                             unsigned word)
 {
     assert(block < ESP32P4_EFUSE_BLOCKS && word < block_words(block));
+    esp32p4_efuse_catch_up(s);
     return s->rd[rd_word_base[block] + word];
 }
 
@@ -1471,6 +1498,7 @@ uint32_t esp32p4_efuse_key_purpose(ESP32P4EfuseState *s, unsigned block)
     unsigned k = block - ESP32P4_EFUSE_KEY_BLOCK0;
 
     assert(k < ESP32P4_EFUSE_KEY_BLOCKS);
+    esp32p4_efuse_catch_up(s);
     return extract32(s->rd[field[k].word], field[k].bit, 4) |
            extract32(s->rd[field[k].hi_word], field[k].hi_bit, 1) << 4;
 }
@@ -1483,6 +1511,7 @@ void esp32p4_efuse_key(ESP32P4EfuseState *s, unsigned block,
 
     assert(block >= ESP32P4_EFUSE_KEY_BLOCK0 &&
            block < ESP32P4_EFUSE_KEY_BLOCK0 + ESP32P4_EFUSE_KEY_BLOCKS);
+    esp32p4_efuse_catch_up(s);
     for (w = 0; w < ESP32P4_EFUSE_RS_WORDS; w++) {
         stl_le_p(key + 4 * w, s->rd[rd_word_base[block] + w]);
     }

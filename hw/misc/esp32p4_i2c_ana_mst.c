@@ -44,6 +44,7 @@
 #include "qapi/error.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_i2c_ana_mst.h"
 #include "migration/vmstate.h"
 
@@ -132,7 +133,7 @@ static ESP32P4ClkEdges esp32p4_i2c_ana_mst_edges(ESP32P4I2CAnaMstState *s,
  */
 static void esp32p4_i2c_ana_mst_schedule(ESP32P4I2CAnaMstState *s, int n)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
     uint64_t done;
 
     if (!s->busy[n]) {
@@ -187,11 +188,61 @@ static void esp32p4_i2c_ana_mst_done(ESP32P4I2CAnaMstState *s, int n)
     }
 }
 
-static void esp32p4_i2c_ana_mst_timer(void *opaque)
+static void esp32p4_i2c_ana_mst_done_at(void *opaque)
 {
     ESP32P4I2CAnaMstTimer *t = opaque;
 
     esp32p4_i2c_ana_mst_done(t->s, t->n);
+}
+
+/* When master @n's transaction ends, while it runs. */
+static int64_t esp32p4_i2c_ana_mst_due(ESP32P4I2CAnaMstState *s, int n)
+{
+    return esp32p4_clk_count_time(&s->xfer[n], s->xfer_left[n]);
+}
+
+/*
+ * A transaction ends at its time however late its timer runs: the slave
+ * takes a write then, a PLL relocking from it (esp32_line_run_at()).
+ */
+static void esp32p4_i2c_ana_mst_timer(void *opaque)
+{
+    ESP32P4I2CAnaMstTimer *t = opaque;
+
+    esp32_line_run_at(esp32p4_i2c_ana_mst_due(t->s, t->n),
+                      esp32p4_i2c_ana_mst_done_at, t);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.clocks]
+ * End the transactions whose bits have run by the time of the access or
+ * clock change being made, each at its own time: without icount their
+ * timers can run well after that, while software polls BUSY, as
+ * ESP-IDF's regi2c functions do, or reads the data a read brought.
+ */
+static void esp32p4_i2c_ana_mst_catch_up(ESP32P4I2CAnaMstState *s)
+{
+    int64_t now = esp32_line_time();
+
+    for (;;) {
+        int64_t due = now;
+        int next = -1;
+
+        for (int n = 0; n < ESP32P4_I2C_ANA_MST_MASTERS; n++) {
+            if (timer_pending(s->timer[n]) &&
+                esp32p4_i2c_ana_mst_due(s, n) <= due &&
+                (next < 0 || esp32p4_i2c_ana_mst_due(s, n) < due)) {
+                next = n;
+                due = esp32p4_i2c_ana_mst_due(s, n);
+            }
+        }
+        if (next < 0) {
+            return;
+        }
+        timer_del(s->timer[next]);
+        esp32_line_run_at(due, esp32p4_i2c_ana_mst_done_at,
+                          &s->timer_ctx[next]);
+    }
 }
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */
@@ -205,8 +256,7 @@ static void esp32p4_i2c_ana_mst_start(ESP32P4I2CAnaMstState *s, int n)
     s->busy[n] = true;
     s->xfer_left[n] = (uint64_t)MAX(bit, 1) * (write ? WRITE_BITS : READ_BITS);
     s->xfer[n].edges = esp32p4_clk_edges_stopped();
-    esp32p4_clk_count_rebase(&s->xfer[n],
-                             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    esp32p4_clk_count_rebase(&s->xfer[n], esp32_line_time());
     esp32p4_i2c_ana_mst_schedule(s, n);
 }
 
@@ -222,6 +272,7 @@ static uint64_t esp32p4_i2c_ana_mst_read(void *opaque, hwaddr addr,
                       "0x%" HWADDR_PRIx "\n", TYPE_ESP32P4_I2C_ANA_MST, addr);
         return 0;
     }
+    esp32p4_i2c_ana_mst_catch_up(s);
     v = s->regs[idx];
     if ((idx == R_I2C0_CTRL || idx == R_I2C1_CTRL) &&
         s->busy[idx - R_I2C0_CTRL]) {
@@ -244,6 +295,7 @@ static void esp32p4_i2c_ana_mst_write(void *opaque, hwaddr addr,
                       "0x%" HWADDR_PRIx "\n", TYPE_ESP32P4_I2C_ANA_MST, addr);
         return;
     }
+    esp32p4_i2c_ana_mst_catch_up(s);
     mask = deposit32(0, (addr & 3) * 8, size * 8, UINT32_MAX) &
            esp32p4_i2c_ana_mst_regs[idx].rw;
     v = deposit32(0, (addr & 3) * 8, size * 8, value);
@@ -293,6 +345,7 @@ static void esp32p4_i2c_ana_mst_clock_update(void *opaque, ClockEvent event)
     ESP32P4I2CAnaMstState *s = opaque;
     int n;
 
+    esp32p4_i2c_ana_mst_catch_up(s);
     for (n = 0; n < ESP32P4_I2C_ANA_MST_MASTERS; n++) {
         esp32p4_i2c_ana_mst_schedule(s, n);
     }

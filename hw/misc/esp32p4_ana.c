@@ -72,6 +72,7 @@
 #include "qemu/log.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_ana.h"
 #include "migration/vmstate.h"
 
@@ -262,14 +263,13 @@ static void esp32p4_ana_update_out(ESP32P4AnaState *s, int pll)
     ESP32P4ClkEdges old = s->out_edges[pll], xtal;
     ESP32P4ClkPeriod p = esp32p4_ana_out_period(s, pll);
 
-    xtal = esp32p4_clk_edges_or_at(s->xtal,
-                                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    xtal = esp32p4_clk_edges_or_at(s->xtal, esp32_line_time());
     if (!esp32p4_clk_period_running(p)) {
         s->out_edges[pll] = esp32p4_clk_edges_stopped();
     } else if (!esp32p4_clk_period_eq(p, old.period) ||
                !esp32p4_clk_edges_eq(&xtal, &s->ref_edges[pll])) {
-        s->out_edges[pll] = esp32p4_clk_edges_from(
-            p, &xtal, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        s->out_edges[pll] = esp32p4_clk_edges_from(p, &xtal,
+                                                   esp32_line_time());
     }
     s->ref_edges[pll] = xtal;
     s->out_period[pll] = s->out_edges[pll].period;
@@ -322,8 +322,8 @@ static void esp32p4_ana_start_cal(ESP32P4AnaState *s, int pll)
         esp32p4_ana_check_apll(s);
     }
     esp32p4_ana_set_cal_end(s, pll, false);
-    timer_mod(s->cal_timer[pll],
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + PLL_CAL_NS);
+    s->cal_due[pll] = esp32_line_time() + PLL_CAL_NS;
+    timer_mod(s->cal_timer[pll], s->cal_due[pll]);
 }
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */
@@ -332,13 +332,13 @@ static void esp32p4_ana_relock(ESP32P4AnaState *s, int pll)
     s->locked[pll] = false;
     timer_del(s->lock_timer[pll]);
     if (s->xpd[pll]) {
-        timer_mod(s->lock_timer[pll],
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + PLL_LOCK_NS);
+        s->lock_due[pll] = esp32_line_time() + PLL_LOCK_NS;
+        timer_mod(s->lock_timer[pll], s->lock_due[pll]);
     }
     esp32p4_ana_update_out(s, pll);
 }
 
-static void esp32p4_ana_lock_done(void *opaque)
+static void esp32p4_ana_lock_at(void *opaque)
 {
     ESP32P4AnaPllTimer *t = opaque;
 
@@ -346,11 +346,74 @@ static void esp32p4_ana_lock_done(void *opaque)
     esp32p4_ana_update_out(t->s, t->pll);
 }
 
-static void esp32p4_ana_cal_done(void *opaque)
+static void esp32p4_ana_cal_at(void *opaque)
 {
     ESP32P4AnaPllTimer *t = opaque;
 
     esp32p4_ana_set_cal_end(t->s, t->pll, true);
+}
+
+/*
+ * A PLL locks, or its calibration ends, at its time however late the
+ * timer runs: the output's edges start from the lock, and the blocks
+ * clocked from it take it then (esp32_line_run_at()).
+ */
+static void esp32p4_ana_lock_done(void *opaque)
+{
+    ESP32P4AnaPllTimer *t = opaque;
+
+    esp32_line_run_at(t->s->lock_due[t->pll], esp32p4_ana_lock_at, t);
+}
+
+static void esp32p4_ana_cal_done(void *opaque)
+{
+    ESP32P4AnaPllTimer *t = opaque;
+
+    esp32_line_run_at(t->s->cal_due[t->pll], esp32p4_ana_cal_at, t);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.clocks]
+ * The locks and calibration ends due by @now, in time order, each at its
+ * own time: an access through the reset and clock control finds the PLLs
+ * locked that are locked then, whenever the host gets to their timers.
+ */
+static void esp32p4_ana_sync(Object *obj, int64_t now)
+{
+    ESP32P4AnaState *s = ESP32P4_ANA(obj);
+
+    for (;;) {
+        int64_t due = now;
+        int next = -1;
+        bool lock = false;
+
+        for (int pll = 0; pll < ESP32P4_ANA_NUM_PLLS; pll++) {
+            if (timer_pending(s->lock_timer[pll]) &&
+                s->lock_due[pll] <= due &&
+                (next < 0 || s->lock_due[pll] < due)) {
+                next = pll;
+                due = s->lock_due[pll];
+                lock = true;
+            }
+            if (timer_pending(s->cal_timer[pll]) &&
+                s->cal_due[pll] <= due &&
+                (next < 0 || s->cal_due[pll] < due)) {
+                next = pll;
+                due = s->cal_due[pll];
+                lock = false;
+            }
+        }
+        if (next < 0) {
+            return;
+        }
+        if (lock) {
+            timer_del(s->lock_timer[next]);
+            esp32_line_run_at(due, esp32p4_ana_lock_at, &s->timer_ctx[next]);
+        } else {
+            timer_del(s->cal_timer[next]);
+            esp32_line_run_at(due, esp32p4_ana_cal_at, &s->timer_ctx[next]);
+        }
+    }
 }
 
 /*
@@ -599,8 +662,8 @@ static int esp32p4_ana_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_esp32p4_ana = {
     .name = TYPE_ESP32P4_ANA,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .post_load = esp32p4_ana_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(xtal, ESP32P4AnaState),
@@ -620,6 +683,8 @@ static const VMStateDescription vmstate_esp32p4_ana = {
                                 ESP32P4_ANA_NUM_PLLS),
         VMSTATE_TIMER_PTR_ARRAY(cal_timer, ESP32P4AnaState,
                                 ESP32P4_ANA_NUM_PLLS),
+        VMSTATE_INT64_ARRAY(lock_due, ESP32P4AnaState, ESP32P4_ANA_NUM_PLLS),
+        VMSTATE_INT64_ARRAY(cal_due, ESP32P4AnaState, ESP32P4_ANA_NUM_PLLS),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -633,6 +698,7 @@ static void esp32p4_ana_class_init(ObjectClass *klass, const void *data)
     rc->phases.hold = esp32p4_ana_reset_hold;
     dc->vmsd = &vmstate_esp32p4_ana;
     csc->exact_edges = esp32p4_ana_exact_edges;
+    csc->sync = esp32p4_ana_sync;
 }
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */

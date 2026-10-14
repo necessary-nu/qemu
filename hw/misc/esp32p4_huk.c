@@ -48,6 +48,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_huk.h"
 #include "migration/vmstate.h"
 
@@ -286,6 +287,7 @@ static uint64_t huk_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr reg = addr & ~3;
     uint32_t v = 0;
 
+    esp32p4_crypto_timer_sync(&s->op, esp32_line_time());
     if (reg >= A_INFO && reg < A_INFO_END) {
         if (huk_info_ok(s, addr, false)) {
             v = ldl_le_p(s->info + reg - A_INFO);
@@ -337,6 +339,7 @@ static void huk_write(void *opaque, hwaddr addr, uint64_t value,
     int shift = (addr & 3) * 8;
     uint32_t v = deposit32(0, shift, size * 8, value);
 
+    esp32p4_crypto_timer_sync(&s->op, esp32_line_time());
     if (reg >= A_INFO && reg < A_INFO_END) {
         uint8_t *p = s->info + reg - A_INFO;
 

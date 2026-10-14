@@ -514,12 +514,19 @@ static void ev_timer_cb(void *opaque)
 
 static void upd_run(void *opaque);
 
-/* What fell due before an access at esp32_line_time(), in order. */
+/*
+ * What fell due before an access at esp32_line_time(), in order: the DVP
+ * camera's lines first, which its timer, late without icount, has yet to
+ * bring (esp32p4_image_source_sync()).
+ */
 static void isp_sync(ESP32P4IspState *s)
 {
     int64_t now = esp32_line_time();
     IspEvent *ev;
 
+    if (s->camera) {
+        esp32p4_image_source_sync(s->camera);
+    }
     upd_run(s);
     s->deliver_upto = now;
     while ((ev = g_queue_peek_head(s->events)) && ev->due <= now) {

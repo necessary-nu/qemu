@@ -283,6 +283,7 @@ struct DWC2OTGState {
     bool pull_dp;
     bool host_mode;
     QEMUTimer *mode_timer;
+    int64_t mode_due;
     bool bsesvld;
     bool asesvld;
 
@@ -295,6 +296,7 @@ struct DWC2OTGState {
     uint8_t port_speed;
     QEMUTimer *frame_timer;
     QEMUTimer *bus_timer;
+    int64_t bus_due;
     int64_t frame_start_ns;
     int64_t frame_ns;
     /*
@@ -331,6 +333,8 @@ struct DWC2OTGState {
     bool dev_host_attached;
     QEMUTimer *idle_timer;
     QEMUTimer *eopf_timer;
+    int64_t idle_due;
+    int64_t eopf_due;
     uint16_t dev_soffn;
     /* A SETUP's phase has not yet ended with a data or status token. */
     bool setup_pending;

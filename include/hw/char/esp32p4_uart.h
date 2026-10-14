@@ -95,6 +95,12 @@ unsigned esp32p4_uart_dma_tx_free(ESP32P4UartState *s);
 bool esp32p4_uart_dma_tx_push(ESP32P4UartState *s, uint8_t byte);
 unsigned esp32p4_uart_dma_rx_count(ESP32P4UartState *s);
 bool esp32p4_uart_dma_rx_pop(ESP32P4UartState *s, uint8_t *byte);
+/*
+ * Take what the UART has due by now, as a register access does first:
+ * the frames sent and received, the idle timers. The UHCI calls it before
+ * an access of its own shows what the UART's data leads to.
+ */
+void esp32p4_uart_catch_up(ESP32P4UartState *s);
 
 typedef struct ESP32P4UartFifo {
     uint8_t data[ESP32P4_UART_FIFO_LEN];

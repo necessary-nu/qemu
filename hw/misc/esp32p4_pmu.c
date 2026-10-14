@@ -1719,11 +1719,68 @@ uint32_t esp32p4_pmu_touch_pwr_cntl(ESP32P4PMUState *s)
     return s->regs[R(A_TOUCH_PWR_CNTL)];
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
+ * Take what the PMU has due by the time of the access being made, in time
+ * order, each at its own time: the sleep and wake sequence's steps, the
+ * LP CPU's sleep process and the regulators' counters reaching their
+ * targets. Without icount their timers can run well after, while
+ * software polls HP_INT_RAW for the wakeup or the sleep's reject, as
+ * ESP-IDF does, MAIN_STATE, LP_CPU_PWR0's STALL_RDY or the LDO_INT bits.
+ * Only a timer that has come is run.
+ */
+static void pmu_catch_up(ESP32P4PMUState *s)
+{
+    int64_t now = esp32_line_time();
+
+    for (;;) {
+        int64_t due = now;
+        int next = -1;
+
+        if (timer_pending(&s->seq_timer) && s->seq_due_ns <= due) {
+            next = 0;
+            due = s->seq_due_ns;
+        }
+        if (timer_pending(&s->lp_sleep_timer) &&
+            s->lp_sleep_due_ns <= due &&
+            (next < 0 || s->lp_sleep_due_ns < due)) {
+            next = 1;
+            due = s->lp_sleep_due_ns;
+        }
+        for (int i = 0; i < ESP32P4_PMU_EXT_LDOS; i++) {
+            int64_t t = timer_expire_time_ns(&s->ldo[i].timer);
+
+            if (timer_pending(&s->ldo[i].timer) && t <= due &&
+                (next < 0 || t < due)) {
+                next = 2 + i;
+                due = t;
+            }
+        }
+        switch (next) {
+        case -1:
+            return;
+        case 0:
+            timer_del(&s->seq_timer);
+            esp32_line_run_at(due, pmu_seq_step, s);
+            break;
+        case 1:
+            timer_del(&s->lp_sleep_timer);
+            esp32_line_run_at(due, pmu_lp_sleep_step, s);
+            break;
+        default:
+            timer_del(&s->ldo[next - 2].timer);
+            esp32_line_run_at(due, pmu_ldo_cb, &s->ldo[next - 2]);
+            break;
+        }
+    }
+}
+
 static uint64_t esp32p4_pmu_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4PMUState *s = opaque;
     hwaddr reg = addr & ~3;
 
+    pmu_catch_up(s);
     if (!esp32p4_pmu_regs[R(reg)].valid) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of %u bytes at reserved "
                       "offset 0x%" HWADDR_PRIx "\n", TYPE_ESP32P4_PMU, size,
@@ -1788,9 +1845,11 @@ static void esp32p4_pmu_write(void *opaque, hwaddr addr, uint64_t value,
     const PMUReg *info = &esp32p4_pmu_regs[R(reg)];
     uint32_t *r = pmu_reg(s, reg);
     uint32_t wt = v & info->wt;
-    uint32_t old = *r;
+    uint32_t old;
     int n;
 
+    pmu_catch_up(s);
+    old = *r;
     if (!info->valid) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write of %u bytes at reserved "
                       "offset 0x%" HWADDR_PRIx " (value 0x%" PRIx64 ")\n",

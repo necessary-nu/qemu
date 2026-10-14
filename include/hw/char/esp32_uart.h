@@ -212,4 +212,10 @@ unsigned esp32_uart_dma_tx_free(ESP32UARTState *s);
 void esp32_uart_dma_tx_push(ESP32UARTState *s, uint8_t byte);
 unsigned esp32_uart_dma_rx_count(ESP32UARTState *s);
 uint8_t esp32_uart_dma_rx_pop(ESP32UARTState *s);
+/*
+ * Bring the UART up to now, as a register access does first: the frames
+ * sent and received by then, the receive timeout. The UHCI calls it before
+ * an access of its own shows what the UART's data leads to.
+ */
+void esp32_uart_catch_up(ESP32UARTState *s);
 

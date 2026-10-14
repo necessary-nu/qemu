@@ -79,6 +79,11 @@ struct Esp32UlpState {
     uint32_t phase;
     bool timer_en;
     bool start_level;
+    /* Taking a timed event, from the timer or an access's catch-up */
+    bool in_event;
+    /* Told of RTC_CNTL's and SENS's register accesses */
+    Notifier rtc_access;
+    Notifier sens_access;
 
     /* The programmer's model */
     uint16_t r[ESP32_ULP_REGS];

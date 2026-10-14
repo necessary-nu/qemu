@@ -332,6 +332,16 @@ static bool etm_read_reg(ESP32P4EtmState *s, hwaddr addr, uint32_t *v)
         }
         return true;
     case A_TASK_ST0 ... A_TASK_ST_LAST:
+        /*
+         * The tasks RTC_EVT_TICK's edges due by now have set, though
+         * their timer has yet to run, as it can be without icount.
+         */
+        if (timer_pending(&s->tick_timer) &&
+            timer_expire_time_ns(&s->tick_timer) <=
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+            etm_tick_fold(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+            etm_tick_schedule(s);
+        }
         *v = (addr & 4) ? 0 : s->task_st[(addr - A_TASK_ST0) / 8];
         return true;
     case A_CLK_EN:

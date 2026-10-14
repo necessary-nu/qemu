@@ -130,6 +130,8 @@ struct ESP32P4TouchState {
     ESP32P4PMUState *pmu;
     ESP32P4GpioState *gpio;
     Notifier load_notifier;
+    /* A line source: the pads sampled see the sawtooth as it is then. */
+    Notifier line_source;
 
     /* RTC_TOUCH's own state. */
     uint32_t int_raw;
