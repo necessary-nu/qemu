@@ -189,6 +189,13 @@ enum {
  */
 #define ESP32P4_BOARD_C6_SDIO_PAD0  14
 #define ESP32P4_BOARD_C6_SDIO_PADS  6
+/*
+ * The ESP32-C6's other lines: GPIO54 its CHIP_PU (EN, through R54, 0 Ohm),
+ * pulled up to ESP_3V3 by R13 (ohms); GPIO6 its IO2 (through R52, 0 Ohm)
+ */
+#define ESP32P4_BOARD_C6_CHIP_PU_PAD 54
+#define ESP32P4_BOARD_C6_CHIP_PU_PULL_UP 10000
+#define ESP32P4_BOARD_C6_IO2_PAD    6
 
 /*
  * The board's audio (hw/riscv/esp32p4_audio.c): the ESP_I2C wires and

@@ -2448,6 +2448,31 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
                                             ESP32P4_BOARD_C6_SDIO_PAD0 + i),
                      ESP32P4_BOARD_SD_PULL_UP);
     }
+    /*
+     * [spec:nuos:req:emu.esp32p4.gpio]
+     * The ESP32-C6's two other lines to the P4, as the board wires them;
+     * the C6 itself is not modelled. GPIO54 is its CHIP_PU (EN), which
+     * R13 pulls up to ESP_3V3 with 10 kOhm, so that the C6 runs unless
+     * the P4 drives the pad low (ESP-Hosted's slave reset). GPIO6 is its
+     * IO2, not one of its strapping pins: an input with neither pull nor
+     * driver at reset and after it (the C6's datasheet, table 2-1, "IE"),
+     * while CHIP_PU holds it in reset and while it runs until its
+     * firmware sets the pin up, drawing no more than an input's leakage;
+     * the board puts nothing else there, and the pad's own pulls decide
+     * its level. The C6 is on ESP_3V3 with the rest of the board, so
+     * never unpowered while the board is.
+     *
+     * Not modelled: C6, the 1 uF from CHIP_PU to ground, which with R13
+     * delays the C6's power-on reset. GPIO54 takes the level of its
+     * drivers and pulls at once; on the board, released from low it reads
+     * high only some 14 ms later (10 ms to the time constant, VIH being
+     * 0.75 of the supply), and the pad's driver takes tens of
+     * microseconds to swing it. What the C6's firmware drives on IO2 is
+     * not modelled either.
+     */
+    qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_BOARD_PULL_UP,
+                                        ESP32P4_BOARD_C6_CHIP_PU_PAD),
+                 ESP32P4_BOARD_C6_CHIP_PU_PULL_UP);
     qdev_connect_gpio_out_named(dev, DWC_SDMMC_CCMD_OD_PULLUP_EN_N, 0,
         qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,
                                ESP32P4_SIG_SD_CCMD_OD_PULLUP_EN_N_PAD_OUT));
