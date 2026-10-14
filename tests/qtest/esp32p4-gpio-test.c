@@ -1097,12 +1097,19 @@ static void test_lp_io(void)
     qtest_set_irq_in(qts, GPIO_PATH, "lp-sig-oe", LP_SIG_SPI_CK, 0);
     g_assert_false(qtest_get_irq(qts, 5));
 
-    /* The LP UART's TXD, high out of reset, on GPIO14 in function 0 */
+    /*
+     * The LP UART's TXD, high out of reset, on GPIO14 in function 0: the
+     * pad is high already, the board's pull-up on the ESP32-C6's SDIO
+     * DAT0 holding it there, and TXD drives it low and high again.
+     */
     qtest_writel(qts, LP_IOMUX_PAD(14), LP_PAD_MUX_SEL | LP_PAD_FUN_IE);
-    g_assert_true(qtest_get_irq(qts, 14));
+    g_assert_true(lp_in(qts, 14));
     qtest_set_irq_in(qts, GPIO_PATH, "lp-sig-out", LP_SIG_UART_TXD, 0);
     g_assert_false(qtest_get_irq(qts, 14));
     g_assert_false(lp_in(qts, 14));
+    qtest_set_irq_in(qts, GPIO_PATH, "lp-sig-out", LP_SIG_UART_TXD, 1);
+    g_assert_true(qtest_get_irq(qts, 14));
+    g_assert_true(lp_in(qts, 14));
 
     /* Handed back to the HP IO MUX, GPIO5 is GPIO_OUT's again. */
     qtest_writel(qts, LP_IOMUX_PAD(5), 0);

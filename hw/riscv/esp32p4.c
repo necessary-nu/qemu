@@ -128,7 +128,8 @@
  *     board's microSD socket is slot 0, on the IO MUX pads GPIO39 to
  *     GPIO44 (SD1_*, function 0); slot 1 is where the board's ESP32-C6
  *     sits, as an SDIO slave, on GPIO14 to GPIO19 through the GPIO
- *     matrix, and has no card unless given one. A card answers only
+ *     matrix, and has no card unless given one; the board's 51 kOhm
+ *     pull-ups on those pads are there either way. A card answers only
  *     through pads set up as the hardware needs them: their function, the
  *     matrix's routing both ways, input enables, output enables, the
  *     pulls, the board's 51 kOhm pull-ups (hw/sd/esp32p4_sdmmc.c):
@@ -2321,7 +2322,8 @@ static void esp32p4_sd_supply(void *opaque, int n, int level)
  * the IO MUX functions SD1_* of GPIO39 to GPIO48, slot 1's the matrix
  * signals 0 to 9, SD_CARD_CCLK_2 to SD_CARD_CDATA7_2, the host's idle
  * levels driven onto them; the microSD socket on slot 0's pads, slot 1's
- * card where the ESP32-C6 is, on GPIO14 to GPIO19, with its pull-ups.
+ * card where the ESP32-C6 is, on GPIO14 to GPIO19, with the board's
+ * pull-ups there.
  */
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */
 static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
@@ -2417,9 +2419,10 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
         }
         /*
          * [spec:nuos:req:emu.esp32p4.gpio]
-         * A card in slot 1 stands where the ESP32-C6 is, and with it the
-         * board's pull-ups on its lines (R15 to R21, to ESP_3V3); with
-         * the C6 not modelled and no card, those pads have neither.
+         * A card in slot 1 stands where the ESP32-C6 is, its lines pulled
+         * up as the board pulls the C6's: on GPIO14 to GPIO19 those very
+         * pull-ups, and on pads the slot1-pad-* properties give elsewhere,
+         * ones like them.
          */
         if (slot == 1 && dinfo) {
             ESP32P4SdmmcState *sd = &s->sdmmc;
@@ -2433,6 +2436,17 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
                 }
             }
         }
+    }
+    /*
+     * [spec:nuos:req:emu.esp32p4.gpio]
+     * The board's 51 kOhm pull-ups on the ESP32-C6's SDIO lines, GPIO14
+     * to GPIO19, to ESP_3V3 (R15, R16 and R18 to R21), there whether or
+     * not anything stands for the C6, which is not modelled.
+     */
+    for (unsigned i = 0; i < ESP32P4_BOARD_C6_SDIO_PADS; i++) {
+        qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_BOARD_PULL_UP,
+                                            ESP32P4_BOARD_C6_SDIO_PAD0 + i),
+                     ESP32P4_BOARD_SD_PULL_UP);
     }
     qdev_connect_gpio_out_named(dev, DWC_SDMMC_CCMD_OD_PULLUP_EN_N, 0,
         qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_SIG_OUT,

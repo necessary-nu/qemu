@@ -82,11 +82,13 @@
  * fell due before them, in order. GDMA-AXI keeps in step: before an edge
  * the unit takes late, the channels' bus rounds due by then run
  * (esp32p4_gdma_sync()), and GDMA-AXI's own register accesses first let
- * the unit take its edges due by then (ops->sync). An edge costs the host
- * far more than a MHz clock's period, so on the host's clock a unit
- * clocked that fast for long falls behind; once it is PARLIO_MAX_LAG_NS
- * behind, its clocks slip to the present (logged) rather than hold the
- * system back for ever.
+ * the unit take its edges due by then (ops->sync). On the host's clock a
+ * unit held up by the host catches up edge by edge, its frames going on
+ * as they would have. An edge costs the host far more than a MHz clock's
+ * period, so a unit clocked that fast for long falls ever further behind:
+ * once an edge is ESP32_LINE_MAX_LAG_NS behind (include/hw/gpio/
+ * esp32_line.h), the clocks slip to the present (logged), the frames
+ * going on from there, rather than hold the system back for ever.
  *
  * Not modelled: the FIFOs' depth, which the TRM does not give, is taken
  * as 16 bytes; a fractional divider on a pad clock divides by its
@@ -197,9 +199,6 @@
 #define VERSION_MASK            0x0fffffffu
 
 #define BITCNT_MASK             0x7ffffu
-
-/* How far the host may fall behind the units' edges before they slip. */
-#define PARLIO_MAX_LAG_NS       (10 * SCALE_MS)
 
 /* The FIFO entries' marks. */
 #define F_EOF                   BIT(0)
@@ -1013,9 +1012,10 @@ static int parlio_next_event(ESP32P4ParlioState *s, int64_t *due)
 }
 
 /*
- * The host has fallen more than PARLIO_MAX_LAG_NS behind the units' edges
- * at @now: the clocks' next edges move to the present, and the receive
- * timeout counts from it.
+ * [spec:nuos:req:emu.esp32p4.parlio]
+ * The host has fallen ESP32_LINE_MAX_LAG_NS behind the units' edges at
+ * @now: the clocks' next edges move to the present, and the receive
+ * timeout counts from it. A frame in progress goes on from there.
  */
 static void parlio_slip(ESP32P4ParlioState *s, int64_t now)
 {
@@ -1044,19 +1044,20 @@ static void parlio_slip(ESP32P4ParlioState *s, int64_t now)
  * order, each at its own time, with GDMA-AXI's rounds due by each run
  * before it. Each edge costs the host far longer than a MHz clock's
  * period (every pad change settles the GPIO matrix), so on the host's
- * clock a unit clocked that fast for long cannot keep up: when the
- * earliest is more than PARLIO_MAX_LAG_NS behind @now, the clocks slip
- * to the present rather than hold the system back for ever.
+ * clock a unit clocked that fast for long cannot keep up: once an edge
+ * is ESP32_LINE_MAX_LAG_NS behind the present, the clocks slip to the
+ * present rather than hold the system back for ever.
  */
-static void parlio_catch_up(ESP32P4ParlioState *s, int64_t upto, int64_t now)
+static void parlio_catch_up(ESP32P4ParlioState *s, int64_t upto)
 {
     int64_t due;
-    int next = parlio_next_event(s, &due);
+    int next;
 
-    if (next >= 0 && now - due > PARLIO_MAX_LAG_NS) {
-        parlio_slip(s, now);
-    }
     while ((next = parlio_next_event(s, &due)) >= 0 && due <= upto) {
+        if (esp32_line_lags(due)) {
+            parlio_slip(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+            continue;
+        }
         if (s->gdma) {
             esp32p4_gdma_sync(s->gdma, due);
         }
@@ -1076,7 +1077,7 @@ static void parlio_catch_up(ESP32P4ParlioState *s, int64_t upto, int64_t now)
  */
 static void parlio_sync(ESP32P4ParlioState *s, int64_t now)
 {
-    parlio_catch_up(s, now, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    parlio_catch_up(s, now);
     if (s->gdma) {
         esp32p4_gdma_sync(s->gdma, now);
     }
@@ -1099,7 +1100,7 @@ static void uclk_timer_cb(void *opaque)
     int64_t due = uclk_due(u);
 
     timer_mod(u->timer, due);
-    parlio_catch_up(u->s, due, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    parlio_catch_up(u->s, due);
 }
 
 static void rx_timeout_cb(void *opaque)
@@ -1108,7 +1109,7 @@ static void rx_timeout_cb(void *opaque)
     int64_t due = rx_timeout_at(s);
 
     timer_mod(s->rx_timeout_timer, due);
-    parlio_catch_up(s, due, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    parlio_catch_up(s, due);
 }
 
 /*

@@ -214,6 +214,7 @@ struct ESP32P4DsiBridgeState {
     uint32_t line;
     uint32_t step;
     uint64_t next_cyc;
+    bool lag_logged;
     uint32_t vtotal, vsync, vbank, vdisp;
     uint32_t htotal, hsync, hbank, hdisp;
 

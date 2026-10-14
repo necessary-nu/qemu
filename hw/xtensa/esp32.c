@@ -1055,8 +1055,9 @@ static void esp32_soc_connect_sdio(Esp32SocState *s)
  *
  * The board's serial terminals sit on the pads the machine gives them
  * (terminal_tx_pad, terminal_rx_pad): the terminal takes what the TX pad
- * carries and drives the RX pad, which the UART reaches only as software
- * routes it.
+ * carries and drives the RX pad, an outside driver of its own
+ * (esp32_gpio_ext_driver()), which the UART reaches only as software
+ * routes it, and which fights any other driver there at another level.
  */
 static void esp32_soc_connect_lines(Esp32SocState *s)
 {
@@ -1083,6 +1084,8 @@ static void esp32_soc_connect_lines(Esp32SocState *s)
     for (int i = 0; i < ESP32_UART_COUNT; i++) {
         DeviceState *uart = DEVICE(&s->uart[i]);
         DeviceState *term = DEVICE(&s->terminal[i]);
+        g_autofree char *name = g_strdup_printf("serial port %d", i);
+        unsigned d = esp32_gpio_ext_driver(&s->gpio, name);
 
         qdev_connect_gpio_out_named(uart, ESP32_UART_TXD, 0,
                                     SIG_OUT(uart_lines[i].txd));
@@ -1109,8 +1112,7 @@ static void esp32_soc_connect_lines(Esp32SocState *s)
                                     qdev_get_gpio_in_named(term,
                                         ESP32_UART_TERMINAL_RX, 0));
         qdev_connect_gpio_out_named(term, ESP32_UART_TERMINAL_TX, 0,
-                                    qdev_get_gpio_in_named(gpio,
-                                        ESP32_GPIO_PAD_IN,
+                                    esp32_gpio_ext_in(&s->gpio, d,
                                         s->terminal_rx_pad[i]));
     }
 

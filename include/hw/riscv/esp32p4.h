@@ -179,10 +179,16 @@ enum {
 #define ESP32P4_BOARD_SD_POWER_PULL_DOWN 10000
 /*
  * The board's pull-ups on the SD lines (ohms): R5 to R9 on the microSD
- * socket's CMD and DAT0 to DAT3, to VO4; R15 to R21 on the ESP32-C6's
- * SDIO lines, slot 1's, to ESP_3V3.
+ * socket's CMD and DAT0 to DAT3, to VO4; R15, R16 and R18 to R21 on the
+ * ESP32-C6's SDIO lines, slot 1's, to ESP_3V3.
  */
 #define ESP32P4_BOARD_SD_PULL_UP    51000
+/*
+ * The ESP32-C6's SDIO lines, GPIO14 to GPIO19 (DAT0 to DAT3, CLK, CMD;
+ * R19, R18, R16, R15, R20 and R21 their pull-ups)
+ */
+#define ESP32P4_BOARD_C6_SDIO_PAD0  14
+#define ESP32P4_BOARD_C6_SDIO_PADS  6
 
 /*
  * The board's audio (hw/riscv/esp32p4_audio.c): the ESP_I2C wires and
