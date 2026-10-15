@@ -850,6 +850,9 @@ struct ESP32P4ClkRstState {
 /* The @reset of esp32p4_clkrst_map_gated() for a block that has none. */
 #define ESP32P4_CLKRST_GATE_NO_RESET ESP32P4_NUM_RESETS
 
+/* How many registers esp32p4_clkrst_gate_volatile() can name per block */
+#define ESP32P4_CLKRST_GATE_VOLATILE_MAX 4
+
 /*
  * Map region @n of @dev at @addr in system memory behind the bus clock
  * ESP32P4_CLK_@bus_clock and the reset line ESP32P4_RST_@reset, or
@@ -867,7 +870,9 @@ struct ESP32P4ClkRstState {
  *
  * A register whose read has a side effect, such as popping a FIFO, must
  * not act while the block is gated: esp32p4_clkrst_gate_volatile() names
- * it, and while gated it reads as 0 and has no effect.
+ * it, once for each such register (up to
+ * ESP32P4_CLKRST_GATE_VOLATILE_MAX), and while gated it reads as 0 and
+ * has no effect.
  */
 ESP32P4ClkRstGate *esp32p4_clkrst_map_gated(ESP32P4ClkRstState *s,
                                             SysBusDevice *dev, int n,

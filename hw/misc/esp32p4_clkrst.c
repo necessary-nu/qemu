@@ -1322,9 +1322,12 @@ struct ESP32P4ClkRstGate {
     unsigned reset;
     Esp32GatedRegion region;
     bool held;
-    bool has_volatile;
-    hwaddr volatile_offset;
-    unsigned volatile_size;
+    /* The registers esp32p4_clkrst_gate_volatile() names */
+    unsigned n_volatile;
+    struct {
+        hwaddr offset;
+        unsigned size;
+    } volatile_reg[ESP32P4_CLKRST_GATE_VOLATILE_MAX];
     QTAILQ_ENTRY(ESP32P4ClkRstGate) next;
 };
 
@@ -2711,9 +2714,13 @@ static bool esp32p4_clkrst_gate_pass(void *opaque, hwaddr addr,
                       memory_region_name(&g->region.through), addr);
         return false;
     }
-    return !(g->has_volatile &&
-             addr < g->volatile_offset + g->volatile_size &&
-             addr + size > g->volatile_offset);
+    for (unsigned i = 0; i < g->n_volatile; i++) {
+        if (addr < g->volatile_reg[i].offset + g->volatile_reg[i].size &&
+            addr + size > g->volatile_reg[i].offset) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */
@@ -2743,9 +2750,10 @@ ESP32P4ClkRstGate *esp32p4_clkrst_map_gated(ESP32P4ClkRstState *s,
 void esp32p4_clkrst_gate_volatile(ESP32P4ClkRstGate *g, hwaddr offset,
                                   unsigned size)
 {
-    g->has_volatile = true;
-    g->volatile_offset = offset;
-    g->volatile_size = size;
+    assert(g->n_volatile < ESP32P4_CLKRST_GATE_VOLATILE_MAX);
+    g->volatile_reg[g->n_volatile].offset = offset;
+    g->volatile_reg[g->n_volatile].size = size;
+    g->n_volatile++;
 }
 
 /*
