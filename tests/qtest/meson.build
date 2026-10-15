@@ -282,6 +282,7 @@ qtests_rp2350 = \
 qtests_xtensa = \
   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ?
     ['esp32-clock-test',
+     'esp32-machine-test',
      'esp32-spi-dma-test',
      'esp32-flash-pins-test',
      'esp32-flash-protocol-test',

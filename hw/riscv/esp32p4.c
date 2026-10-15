@@ -514,6 +514,7 @@
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
 #include "system/blockdev.h"
+#include "system/qtest.h"
 #include "system/reset.h"
 #include "system/system.h"
 #include "system/tcg.h"
@@ -735,9 +736,11 @@ static void esp32p4_lp_core_boot(void *opaque, uint32_t *pc, uint32_t *mtvec)
     *pc = base + ESP32P4_LP_BOOT_OFFSET;
     if (!s->lp_rom_loaded && *pc == ESP32P4_LP_RESET_VECTOR) {
         *pc = esp32p4_lp_sys_lp_core_app_addr(&s->lp_sys);
-        qemu_log_mask(LOG_UNIMP, "esp32p4: the LP ROM is unavailable: the LP "
-                      "core starts at the application's boot address 0x%08"
-                      PRIx32 "\n", *pc);
+        qemu_log_mask(LOG_UNIMP, "esp32p4: the LP ROM is unavailable, its "
+                      "contents not published (-M esp32p4,lp-rom=FILE takes "
+                      "an image dumped from the chip): the LP core starts "
+                      "at the application's boot address 0x%08" PRIx32 "\n",
+                      *pc);
     }
 }
 
@@ -845,8 +848,15 @@ static void esp32p4_init_flash(ESP32P4MachineState *s)
     s->flash_bus = (SSIBus *)qdev_get_child_bus(DEVICE(&s->flash_mspi),
                                                 "ssi");
     if (!s->flash_size) {
-        qemu_log("esp32p4: no flash is configured (-M esp32p4,flash-size="
-                 "SIZE); the flash bus has no chip on it\n");
+        /*
+         * Only the boot ROM needs the flash a user may have meant to give:
+         * a -kernel image stands for what it would boot from it.
+         */
+        if (!MACHINE(s)->kernel_filename && !qtest_enabled()) {
+            warn_report("esp32p4: no flash is configured (-M esp32p4,"
+                        "flash-size=SIZE): the flash bus has no chip on it, "
+                        "and the boot ROM nothing to boot from");
+        }
         return;
     }
     flash = qdev_new(esp32p4_flash_part(s->flash_size));
@@ -5176,12 +5186,6 @@ static void esp32p4_init(MachineState *machine)
                         esp32p4_unimplemented[i].size),
                     esp32p4_unimplemented[i].base);
     }
-    if (!s->lp_rom_loaded) {
-        qemu_log_mask(LOG_UNIMP, "esp32p4: the LP ROM's contents are not "
-                      "published, so it is absent (-M esp32p4,lp-rom=FILE "
-                      "takes an image dumped from the chip)\n");
-    }
-
     esp32p4_load(s);
 }
 

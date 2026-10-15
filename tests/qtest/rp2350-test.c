@@ -420,6 +420,47 @@ static void test_rom_with_direct_load(void)
     unlink(rom);
 }
 
+/*
+ * Building the machine logs nothing as a guest error or an unimplemented
+ * access, so that -d's log starts with the guest's own; nor does an empty
+ * guest, a branch to itself, run on TCG and reset.
+ */
+/* [spec:nuos:req:emu.machine+1/test] */
+static void test_quiet(void)
+{
+    g_autofree char *path = write_image(XIP_BASE);
+
+    for (int tcg = 0; tcg < 2; tcg++) {
+        g_autofree char *log = NULL;
+        g_autofree char *text = NULL;
+        QTestState *qts;
+        int fd;
+
+        fd = g_file_open_tmp("rp2350-test-XXXXXX.log", &log, NULL);
+        g_assert_cmpint(fd, >=, 0);
+        close(fd);
+        qts = qtest_initf("-M rp2350,flash-size=4M -kernel %s %s "
+                          "-d guest_errors,unimp -D %s", path,
+                          tcg ? "-accel tcg" : "", log);
+        if (tcg) {
+            g_usleep(100 * 1000);
+        }
+        qtest_system_reset(qts);
+        if (tcg) {
+            g_usleep(100 * 1000);
+        }
+        qtest_quit(qts);
+
+        g_assert(g_file_get_contents(log, &text, NULL, NULL));
+        if (*text) {
+            g_test_message("%s logged: %s", tcg ? "TCG" : "qtest", text);
+            g_test_fail();
+        }
+        unlink(log);
+    }
+    unlink(path);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -433,6 +474,7 @@ int main(int argc, char **argv)
     qtest_add_func("/rp2350/flash-drive", test_flash_drive);
     qtest_add_func("/rp2350/irq-routing", test_irq_routing);
     qtest_add_func("/rp2350/rom-with-direct-load", test_rom_with_direct_load);
+    qtest_add_func("/rp2350/quiet", test_quiet);
 
     return g_test_run();
 }
