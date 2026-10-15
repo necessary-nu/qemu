@@ -75,6 +75,11 @@ void esp32_line_sync(void);
  * than their own time, which it can never catch up with; slipping then
  * keeps the catch-up from holding QEMU's main loop, and the cores waiting
  * for it, ever longer.
+ *
+ * A PWM output (LEDC's channels, MCPWM's generators), whose edges follow
+ * a counter software reads, keeps its timing: it goes on from the present
+ * by skipping to its level at the moment it is being brought to, stamped
+ * with the moment that level began, the edges in between lost.
  */
 #define ESP32_LINE_MAX_LAG_NS   NANOSECONDS_PER_SECOND
 

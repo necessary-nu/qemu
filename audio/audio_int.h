@@ -229,6 +229,8 @@ struct AudioMixengBackend {
 
     bool timer_running;
     uint64_t timer_last;
+    /* The time the timer is set for, while it is set */
+    int64_t timer_due;
     VMChangeStateEntry *vmse;
 };
 

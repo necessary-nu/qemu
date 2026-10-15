@@ -223,9 +223,15 @@ struct Esp32McpwmState {
     /* Output lines as last driven */
     uint8_t out_level[ESP32_MCPWM_OUTS];
     uint8_t irq_level;
-    /* When the timer is due, and whether it is firing */
+    /*
+     * When the timer is due, whether it is set for then, whether it is
+     * firing, and whether the block is catching up (the QEMU timer set as
+     * it ends)
+     */
     int64_t due_ns;
+    bool armed;
     bool in_timer_cb;
+    bool catching_up;
     /*
      * The block has changed other than by running on since the timer was
      * last set, which may now be due at another moment.
@@ -233,6 +239,8 @@ struct Esp32McpwmState {
     bool schedule_stale;
     /* The latest moment the block has acted at */
     int64_t seen_ns;
+    /* Edges have been lost to a host too slow for them (logged once) */
+    bool lag_logged;
     DeviceState *gpio;
     uint32_t sig_base;
     Notifier route_notifier;
