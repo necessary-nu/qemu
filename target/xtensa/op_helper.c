@@ -36,6 +36,13 @@
 
 #ifndef CONFIG_USER_ONLY
 
+/*
+ * CCOUNT counts the CPU clock's edges since time_base, at whole multiples
+ * of its period from virtual time 0 (clock_edge_ns()): under icount the
+ * edges the CPU executes its instructions between, so that from a read at
+ * one edge to a read at another it counts exactly the edges between, and
+ * a CCOMPARE match comes at exactly its edge, at any period.
+ */
 void HELPER(update_ccount)(CPUXtensaState *env)
 {
     XtensaCPU *cpu = env_archcpu(env);
@@ -43,7 +50,18 @@ void HELPER(update_ccount)(CPUXtensaState *env)
 
     env->ccount_time = now;
     env->sregs[CCOUNT] = env->ccount_base +
-        (uint32_t)clock_ns_to_ticks(cpu->clock, now - env->time_base);
+        (uint32_t)(clock_ns_to_ticks(cpu->clock, now) -
+                   clock_ns_to_ticks(cpu->clock, env->time_base));
+}
+
+/* When CCOUNT, as last updated, has counted @dcc more. */
+static uint64_t ccount_time_after(CPUXtensaState *env, uint64_t dcc)
+{
+    XtensaCPU *cpu = env_archcpu(env);
+
+    return clock_edge_ns(cpu->clock,
+                         clock_ns_to_ticks(cpu->clock, env->ccount_time) +
+                         dcc);
 }
 
 void HELPER(wsr_ccount)(CPUXtensaState *env, uint32_t v)
@@ -59,15 +77,13 @@ void HELPER(wsr_ccount)(CPUXtensaState *env, uint32_t v)
 
 void HELPER(update_ccompare)(CPUXtensaState *env, uint32_t i)
 {
-    XtensaCPU *cpu = env_archcpu(env);
     uint64_t dcc;
 
     qatomic_and(&env->sregs[INTSET],
                ~(1u << env->config->timerint[i]));
     HELPER(update_ccount)(env);
     dcc = (uint64_t)(env->sregs[CCOMPARE + i] - env->sregs[CCOUNT] - 1) + 1;
-    timer_mod(env->ccompare[i].timer,
-              env->ccount_time + clock_ticks_to_ns(cpu->clock, dcc));
+    timer_mod(env->ccompare[i].timer, ccount_time_after(env, dcc));
     env->yield_needed = 1;
 }
 
@@ -92,7 +108,6 @@ void xtensa_cpu_clock_rebase(CPUXtensaState *env)
  */
 void xtensa_cpu_clock_rearm(CPUXtensaState *env)
 {
-    XtensaCPU *cpu = env_archcpu(env);
     uint32_t i;
 
     if (!xtensa_option_enabled(env->config, XTENSA_OPTION_TIMER_INTERRUPT)) {
@@ -106,8 +121,7 @@ void xtensa_cpu_clock_rearm(CPUXtensaState *env)
             continue;
         }
         dcc = (uint64_t)(env->sregs[CCOMPARE + i] - env->sregs[CCOUNT] - 1) + 1;
-        timer_mod(env->ccompare[i].timer,
-                  env->ccount_time + clock_ticks_to_ns(cpu->clock, dcc));
+        timer_mod(env->ccompare[i].timer, ccount_time_after(env, dcc));
     }
 }
 

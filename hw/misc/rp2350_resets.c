@@ -12,6 +12,13 @@
  * subsystem RP2350_RESETS_RELEASE_NS later, when its RESET_DONE bit sets.
  * What a subsystem does while it is in reset is up to the owner of the
  * hold callback, which is told when subsystems enter and leave reset.
+ *
+ * A clock glitch leaves the logic it reaches undefined (datasheet,
+ * "Multiplexers": "they can corrupt the logic running from the clock").
+ * A subsystem it leaves so is held through the hold callback as one in
+ * reset, inert and not answering, though RESET_DONE goes on reading it out
+ * of reset, until its reset is next asserted: by RESET, a watchdog pulse
+ * or a reset of RESETS itself.
  */
 
 #include "qemu/osdep.h"
@@ -25,13 +32,17 @@
 #define A_WDSEL      0x4
 #define A_RESET_DONE 0x8
 
-/* Bring the subsystems' hold state in line with `held`. */
+/*
+ * Bring the subsystems' hold state in line with `held` and `corrupt`: a
+ * subsystem a glitch left undefined is held as one in reset is.
+ */
 static void resets_sync(RP2350ResetsState *s)
 {
-    uint32_t enter = s->held & ~s->asserted;
-    uint32_t leave = s->asserted & ~s->held;
+    uint32_t want = s->held | s->corrupt;
+    uint32_t enter = want & ~s->asserted;
+    uint32_t leave = s->asserted & ~want;
 
-    s->asserted = s->held;
+    s->asserted = want;
     if (!s->hold_fn) {
         return;
     }
@@ -71,6 +82,8 @@ static void resets_update(RP2350ResetsState *s)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int i;
 
+    /* Asserting the reset of a subsystem a glitch left undefined resets it. */
+    s->corrupt &= ~s->reset;
     for (i = 0; i < RP2350_NUM_RESETS; i++) {
         if (s->reset & BIT(i)) {
             s->held |= BIT(i);
@@ -120,12 +133,27 @@ void rp2350_resets_pulse(RP2350ResetsState *s, uint32_t blocks)
             s->release_ns[i] = now + RP2350_RESETS_RELEASE_NS;
         }
     }
-    /* A subsystem already in reset is restarted by leaving and entering. */
+    /*
+     * A subsystem already in reset, or left undefined by a glitch, is
+     * restarted by leaving and entering.
+     */
+    s->corrupt &= ~blocks;
     s->held &= ~blocks;
     resets_sync(s);
     s->held |= blocks;
     resets_sync(s);
     resets_schedule(s);
+}
+
+/* [spec:nuos:req:emu.resets] */
+/* [spec:nuos:req:emu.clock-tree] */
+uint32_t rp2350_resets_corrupt(RP2350ResetsState *s, uint32_t blocks)
+{
+    rp2350_resets_catch_up(s);
+    blocks &= RP2350_RESETS_ALL & ~s->held & ~s->corrupt;
+    s->corrupt |= blocks;
+    resets_sync(s);
+    return blocks;
 }
 
 /* The boot ROM waits for RESET_DONE, so these leave reset at once. */
@@ -134,6 +162,7 @@ void rp2350_resets_boot_rom_handoff(RP2350ResetsState *s)
     uint32_t blocks = s->rom_unreset;
     int i;
 
+    s->corrupt &= ~blocks;
     s->held |= blocks;
     resets_sync(s);
     s->reset &= ~blocks;
@@ -227,6 +256,7 @@ static void rp2350_resets_hold_reset(Object *obj, ResetType type)
     }
     s->reset = RP2350_RESETS_ALL & ~s->rom_unreset;
     s->held = s->reset;
+    s->corrupt = 0;
     s->wdsel = 0;
 }
 
@@ -253,13 +283,14 @@ static int rp2350_resets_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_rp2350_resets = {
     .name = TYPE_RP2350_RESETS,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .post_load = rp2350_resets_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(reset, RP2350ResetsState),
         VMSTATE_UINT32(wdsel, RP2350ResetsState),
         VMSTATE_UINT32(held, RP2350ResetsState),
+        VMSTATE_UINT32(corrupt, RP2350ResetsState),
         VMSTATE_INT64_ARRAY(release_ns, RP2350ResetsState, RP2350_NUM_RESETS),
         VMSTATE_TIMER_PTR(release_timer, RP2350ResetsState),
         VMSTATE_END_OF_LIST()

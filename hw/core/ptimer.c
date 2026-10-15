@@ -28,6 +28,8 @@ struct ptimer_state
     int64_t last_event;
     int64_t next_event;
     uint8_t policy_mask;
+    /* It counts its clock's edges (ptimer_set_period_from_clock_edges()). */
+    bool edges;
     QEMUTimer *timer;
     ptimer_cb callback;
     void *callback_opaque;
@@ -41,6 +43,45 @@ struct ptimer_state
     bool need_reload;
 };
 
+/*
+ * Whether @s counts its clock's edges: asked to, with a period of at least
+ * a nanosecond, so that each edge's time rounded up to the nanosecond
+ * comes before the next edge, and below 2^32 ns, for its 2^-32 ns units to
+ * fit 64 bits.
+ */
+static bool ptimer_on_edges(ptimer_state *s)
+{
+    return s->edges && s->period >= 1 && s->period <= UINT32_MAX;
+}
+
+/* The period of @s, on its edges, in 2^-32 ns units. */
+static uint64_t ptimer_edge_period(ptimer_state *s)
+{
+    return ((uint64_t)s->period << 32) | s->period_frac;
+}
+
+/* The edges of @s's clock at or before @ns, from time 0. */
+static uint64_t ptimer_edges_at(ptimer_state *s, int64_t ns)
+{
+    uint64_t lo = (uint64_t)ns << 32;
+    uint64_t hi = (uint64_t)ns >> 32;
+
+    divu128(&lo, &hi, ptimer_edge_period(s));
+    return lo;
+}
+
+/* The first nanosecond at or after the time of @s's clock's edge @edge. */
+static int64_t ptimer_edge_ns(ptimer_state *s, uint64_t edge)
+{
+    uint64_t lo, hi;
+
+    mulu64(&lo, &hi, edge, ptimer_edge_period(s));
+    if (hi >> 31) {
+        return INT64_MAX;
+    }
+    return (int64_t)((hi << 32) | (lo >> 32)) + ((uint32_t)lo != 0);
+}
+
 /* Use a bottom-half routine to avoid reentrancy issues.  */
 static void ptimer_trigger(ptimer_state *s)
 {
@@ -53,6 +94,7 @@ static void ptimer_reload(ptimer_state *s, int delta_adjust)
     uint64_t period;
     uint64_t delta;
     bool suppress_trigger = false;
+    bool limited = false;
 
     /*
      * Note that if delta_adjust is 0 then we must be here because of
@@ -141,12 +183,22 @@ static void ptimer_reload(ptimer_state *s, int delta_adjust)
         !icount_enabled() && !qtest_enabled()) {
         period = 10000 / delta;
         period_frac = 0;
+        limited = true;
     }
 
     s->last_event = s->next_event;
-    s->next_event = s->last_event + delta * period;
-    if (period_frac) {
-        s->next_event += ((int64_t)period_frac * delta) >> 32;
+    if (ptimer_on_edges(s) && !limited) {
+        /*
+         * From the clock's last edge at or before the start, which for an
+         * expiry's reload is the expiry's own edge.
+         */
+        s->next_event = ptimer_edge_ns(s, ptimer_edges_at(s, s->last_event) +
+                                          delta);
+    } else {
+        s->next_event = s->last_event + delta * period;
+        if (period_frac) {
+            s->next_event += ((int64_t)period_frac * delta) >> 32;
+        }
     }
     timer_mod(s->timer, s->next_event);
 }
@@ -227,6 +279,24 @@ uint64_t ptimer_get_count(ptimer_state *s)
             /* Prevent timer underflowing if it should already have
                triggered.  */
             counter = 0;
+        } else if (ptimer_on_edges(s) &&
+                   (oneshot || s->delta * s->period >= 10000 ||
+                    icount_enabled() || qtest_enabled())) {
+            /*
+             * The whole periods left, as below with every time on an
+             * edge: the edges still to come up to the expiry's, less the
+             * period under way once the clock has gone past the start.
+             */
+            counter = ptimer_edges_at(s, next) - ptimer_edges_at(s, now);
+            if (now != last) {
+                counter--;
+            }
+            if ((s->policy_mask & PTIMER_POLICY_WRAP_AFTER_ONE_PERIOD) &&
+                !oneshot && s->delta == s->limit &&
+                counter == (now == last ? s->limit + DELTA_ADJUST
+                                        : s->limit)) {
+                return 0;
+            }
         } else {
             uint64_t rem;
             uint64_t div;
@@ -356,14 +426,14 @@ void ptimer_set_period(ptimer_state *s, int64_t period)
     s->delta = ptimer_get_count(s);
     s->period = period;
     s->period_frac = 0;
+    s->edges = false;
     if (s->enabled) {
         s->need_reload = true;
     }
 }
 
-/* Set counter increment interval from a Clock */
-void ptimer_set_period_from_clock(ptimer_state *s, const Clock *clk,
-                                  unsigned int divisor)
+static void ptimer_set_clock_period(ptimer_state *s, const Clock *clk,
+                                    unsigned int divisor, bool edges)
 {
     /*
      * The raw clock period is a 64-bit value in units of 2^-32 ns;
@@ -388,10 +458,23 @@ void ptimer_set_period_from_clock(ptimer_state *s, const Clock *clk,
     period_frac *= divisor;
     s->period += extract64(period_frac, 32, 32);
     s->period_frac = (uint32_t)period_frac;
+    s->edges = edges;
 
     if (s->enabled) {
         s->need_reload = true;
     }
+}
+
+/* Set counter increment interval from a Clock */
+void ptimer_set_period_from_clock(ptimer_state *s, const Clock *clk,
+                                  unsigned int divisor)
+{
+    ptimer_set_clock_period(s, clk, divisor, false);
+}
+
+void ptimer_set_period_from_clock_edges(ptimer_state *s, const Clock *clk)
+{
+    ptimer_set_clock_period(s, clk, 1, true);
 }
 
 /* Set counter frequency in Hz.  */
@@ -401,6 +484,7 @@ void ptimer_set_freq(ptimer_state *s, uint32_t freq)
     s->delta = ptimer_get_count(s);
     s->period = 1000000000ll / freq;
     s->period_frac = (1000000000ll << 32) / freq;
+    s->edges = false;
     if (s->enabled) {
         s->need_reload = true;
     }
@@ -450,6 +534,24 @@ void ptimer_transaction_commit(ptimer_state *s)
     s->in_transaction = false;
 }
 
+static bool ptimer_edges_needed(void *opaque)
+{
+    ptimer_state *s = opaque;
+
+    return s->edges;
+}
+
+static const VMStateDescription vmstate_ptimer_edges = {
+    .name = "ptimer/edges",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ptimer_edges_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(edges, ptimer_state),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmstate_ptimer = {
     .name = "ptimer",
     .version_id = 1,
@@ -464,6 +566,10 @@ const VMStateDescription vmstate_ptimer = {
         VMSTATE_INT64(next_event, ptimer_state),
         VMSTATE_TIMER_PTR(timer, ptimer_state),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_ptimer_edges,
+        NULL
     }
 };
 

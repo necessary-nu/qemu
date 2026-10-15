@@ -64,6 +64,15 @@ int64_t icount_get(void);
  */
 int64_t icount_get_precise(uint32_t *frac);
 /*
+ * icount_get_cpu_edge: as icount_get_precise(), but for a CPU executing
+ * at a clock's rate (icount_set_cpu_clock()), the time of its clock's
+ * first edge at or after it, rounded down to 2^-32 ns as the CPU's
+ * instructions' time is: the edge from which the CPU, idle and woken now,
+ * goes on, as it does after virtual time has moved on to a timer's
+ * deadline with every CPU idle.
+ */
+int64_t icount_get_cpu_edge(CPUState *cpu, uint32_t *frac);
+/*
  * convert an instruction counter value to ns, based on the icount shift.
  * This shift is set as a fixed value with the icount "shift" option
  * (precise mode), or it is constantly approximated and corrected at

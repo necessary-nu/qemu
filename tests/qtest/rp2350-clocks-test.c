@@ -282,7 +282,7 @@ static void test_pll(void)
     g_assert_cmphex(qtest_readl(qts, PLL_SYS + PLL_PWR), ==, 0x4);
 
     /* clk_ref from the XOSC times the frequency counter. */
-    qtest_writel(qts, CLK_CTRL(CLK_REF), 2);
+    rp2350_clk_switch(qts, 0, CLK_REF, 0, 2, 4);
     g_assert_cmpuint(fc0_khz(qts, FC_PLL_SYS), ==, 150000);
     /* POSTDIV2 3: 100 MHz. */
     qtest_writel(qts, PLL_SYS + PLL_PRIM, (5 << 16) | (3 << 12));
@@ -335,9 +335,23 @@ static void test_clock_muxes(void)
     g_assert_cmphex(qtest_readl(qts, CLK_SELECTED(CLK_SYS)), ==, 0x2);
     g_assert_cmphex(qtest_readl(qts, CLK_SELECTED(CLK_REF)), ==, 0x1);
 
-    /* runtime_init_clocks(): move clk_sys and clk_ref off aux sources. */
+    /*
+     * runtime_init_clocks(): move clk_sys and clk_ref off aux sources.
+     * clk_sys's glitchless mux passes the ROSC, its aux source, for two
+     * of its cycles (161 ns at 12.4 MHz), SELECTED showing it; then reads
+     * 0 for two cycles of clk_ref, the same ROSC, and then shows clk_ref.
+     */
     qtest_writel(qts, CLK_CTRL(CLK_SYS) + CLR, 0x1);
+    g_assert_cmphex(qtest_readl(qts, CLK_SELECTED(CLK_SYS)), ==, 0x2);
+    qtest_clock_step(qts, 150);
+    g_assert_cmphex(qtest_readl(qts, CLK_SELECTED(CLK_SYS)), ==, 0x2);
+    qtest_clock_step(qts, 20);
+    g_assert_cmphex(qtest_readl(qts, CLK_SELECTED(CLK_SYS)), ==, 0);
+    qtest_clock_step(qts, 140);
+    g_assert_cmphex(qtest_readl(qts, CLK_SELECTED(CLK_SYS)), ==, 0);
+    qtest_clock_step(qts, 20);
     g_assert_cmphex(qtest_readl(qts, CLK_SELECTED(CLK_SYS)), ==, 0x1);
+    /* clk_ref is already on rosc_clksrc_ph: no switch. */
     qtest_writel(qts, CLK_CTRL(CLK_REF) + CLR, 0x3);
     g_assert_cmphex(qtest_readl(qts, CLK_SELECTED(CLK_REF)), ==, 0x1);
 
@@ -351,6 +365,7 @@ static void test_clock_muxes(void)
     g_assert_cmphex(qtest_readl(qts, TICK_CTRL(TICK_TIMER0)), ==,
                     1 | TICK_RUNNING);
     qtest_writel(qts, CLK_CTRL(CLK_REF), 0x2);
+    qtest_clock_step(qts, 170);
     g_assert_cmphex(qtest_readl(qts, CLK_SELECTED(CLK_REF)), ==, 0);
     g_assert_cmphex(qtest_readl(qts, CLK_SELECTED(CLK_SYS)), ==, 0);
     g_assert_cmphex(qtest_readl(qts, TICK_CTRL(TICK_TIMER0)), ==, 1);
@@ -439,8 +454,10 @@ static void test_frequencies(void)
     g_assert_cmphex(qtest_readl(qts, CLK_DIV(CLK_PERI)), ==, 0x30000);
     qtest_writel(qts, CLK_DIV(CLK_PERI), 0);
     g_assert_cmpuint(fc0_khz(qts, FC_CLK_PERI), ==, 37500);
-    /* clk_peri from PLL_USB through its aux mux. */
+    /* clk_peri from PLL_USB through its aux mux, stopped to switch it. */
     qtest_writel(qts, CLK_DIV(CLK_PERI), 0x10000);
+    rp2350_clk_stop(qts, 0, CLK_PERI);
+    qtest_writel(qts, CLK_CTRL(CLK_PERI), 2 << 5);
     qtest_writel(qts, CLK_CTRL(CLK_PERI), CTRL_ENABLE | (2 << 5));
     g_assert_cmpuint(fc0_khz(qts, FC_CLK_PERI), ==, 48000);
     /* clk_adc divided by 3. */
@@ -534,11 +551,13 @@ static void test_resus(void)
     rp2350_clocks_init(qts);
     qtest_writel(qts, INTE, 1);
     qtest_writel(qts, RESUS_CTRL, RESUS_ENABLE | 100);
-    qtest_writel(qts, CLK_CTRL(CLK_SYS), 0);
+    rp2350_clk_switch(qts, 0, CLK_SYS, 0, 0, 0x1);
     qtest_writel(qts, CLK_CTRL(CLK_SYS), 4 << 5);
     qtest_writel(qts, CLK_CTRL(CLK_SYS), (4 << 5) | 1);
+    g_assert_cmphex(qtest_readl(qts, CLK_SELECTED(CLK_SYS)), ==, 0x1);
+    qtest_clock_step(qts, 1 * US);
     g_assert_cmphex(qtest_readl(qts, CLK_SELECTED(CLK_SYS)), ==, 0);
-    qtest_clock_step(qts, 8 * US);
+    qtest_clock_step(qts, 7 * US);
     g_assert_cmphex(qtest_readl(qts, RESUS_STATUS), ==, 0);
     g_assert_false(qtest_get_irq(qts, CLOCKS_IRQ));
     qtest_clock_step(qts, 1 * US);
@@ -599,7 +618,8 @@ static void test_ticks(void)
     qtest_clock_step(qts, 100 * US);
     g_assert_cmpuint(qtest_readl(qts, TIMER0_TIMERAWL), ==, 150);
     qtest_writel(qts, CLK_CTRL(CLK_SYS), 1);
-    qtest_writel(qts, CLK_CTRL(CLK_REF), (1 << 5) | 1);
+    /* The mux lets go of the XOSC two of its cycles later, and stops. */
+    rp2350_clk_switch(qts, 0, CLK_REF, 0, (1 << 5) | 1, 0);
     g_assert_cmphex(qtest_readl(qts, TICK_CTRL(TICK_TIMER0)), ==, 1);
     qtest_clock_step(qts, 100 * US);
     g_assert_cmpuint(qtest_readl(qts, TIMER0_TIMERAWL), ==, 150);
