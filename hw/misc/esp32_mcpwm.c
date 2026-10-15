@@ -37,7 +37,15 @@
  * that cannot keep up skips ahead (below). An output that reaches no such
  * pad has no edge anyone sees: it is driven at its level of the moment
  * whenever the block is brought up to date (mcpwm_routes_run()), and
- * costs nothing.
+ * costs nothing. Nor is one only a pulse counter takes in bulk, through
+ * the output's wave (hw/gpio/esp32_line.h): the outputs' edges repeat
+ * once the core's state does, and a copy of the core, run from its last
+ * change from outside edge by edge until its state at an edge is one it
+ * had at an earlier one, gives each output's edges in closed form, which
+ * the counter takes when it looks; every change from outside is announced
+ * at its moment to the counters taking the outputs. An output whose
+ * pattern is longer than ESP32_MCPWM_PATTERN_EDGES edges, or slower to
+ * show than the look-ahead goes, has its edges driven one by one.
  *
  * The capture timer counts APB_CLK and is computed in closed form; capture
  * inputs, fault inputs and GPIO sync inputs act at the moment their level
@@ -2169,24 +2177,26 @@ static void mcpwm_line_sync_run(void *opaque)
  * fast it switches. An output a pad takes up is first driven at its level
  * of that moment.
  */
+static void mcpwm_update_seen(Esp32McpwmState *s);
+
 static void mcpwm_routes_run(void *opaque)
 {
     Esp32McpwmState *s = opaque;
-    uint8_t seen = 0;
+    uint8_t watched = 0, taken = 0;
 
     mcpwm_sync(s);
     mcpwm_update(s);
     for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
         if (!s->gpio ||
             esp32_sig_out_watched(OBJECT(s->gpio), s->sig_base + n)) {
-            seen |= BIT(n);
+            watched |= BIT(n);
+        } else if (esp32_sig_out_taken(OBJECT(s->gpio), s->sig_base + n)) {
+            taken |= BIT(n);
         }
     }
-    if (seen != s->out_seen) {
-        s->out_seen = seen;
-        mcpwm_changed(s);
-        mcpwm_schedule(s);
-    }
+    s->out_watched = watched;
+    s->out_taken = taken;
+    mcpwm_update_seen(s);
 }
 
 static void mcpwm_route_notify(Notifier *n, void *data)
@@ -2229,6 +2239,303 @@ static void mcpwm_access_begin(Esp32McpwmState *s)
 {
     mcpwm_sync_others(s);
     mcpwm_sync(s);
+}
+
+/* Waves */
+
+/*
+ * The PWM_clk cycles of `cycles` cycles at least: in whole ns, rounded
+ * down, a ns short for the rounding of the edges' own times.
+ */
+static int64_t mcpwm_cycles_ns_floor(Esp32McpwmState *s, uint64_t cycles)
+{
+    uint64_t src = cycles * clk_div(s);
+    int64_t ns;
+
+    if (s->p4) {
+        ns = esp32p4_clk_cycles_ns_floor(s->p4_edges.period, src);
+    } else {
+        ns = clock_is_enabled(s->core_clk) ?
+             clock_ticks_to_ns(s->core_clk, src) : INT64_MAX;
+    }
+    return ns == INT64_MAX ? 0 : MAX(ns - 1, 0);
+}
+
+/*
+ * The group of timers operator k's belongs to (core_groups()), so that a
+ * run of it alone follows the operator's outputs.
+ */
+static unsigned op_group(const Esp32McpwmCore *c, int k)
+{
+    unsigned groups[ESP32_MCPWM_TIMERS];
+    int n = core_groups(c, groups);
+
+    for (int g = 0; g < n; g++) {
+        if (op_in(c, k, groups[g])) {
+            return groups[g];
+        }
+    }
+    return ALL_TIMERS;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.mcpwm]
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * Find output n's pattern: a copy of the core as it last changed run to
+ * each of the output's edges in turn, until the state of the operator's
+ * group at an edge, as compared for repetition (core_normalise(), its
+ * interrupts left out, which change no output), is one it had at an
+ * earlier edge: the edges between repeat from there for ever. A group
+ * that goes still has no edges after its last; one whose pattern is
+ * longer than ESP32_MCPWM_PATTERN_EDGES edges, or whose next edge the
+ * look-ahead does not reach, has none found.
+ */
+static void mcpwm_find_pattern(Esp32McpwmState *s, int n)
+{
+    Esp32McpwmPattern *p = &s->pattern[n];
+    g_autofree Esp32McpwmCore *c = g_new(Esp32McpwmCore, 1);
+    g_autofree Esp32McpwmCore *norm = g_new(Esp32McpwmCore, 1);
+    g_autofree Esp32McpwmCore *snaps =
+        g_new(Esp32McpwmCore, ESP32_MCPWM_PATTERN_EDGES + 1);
+    uint64_t at[ESP32_MCPWM_PATTERN_EDGES + 1];
+    uint8_t driven[ESP32_MCPWM_OUTS];
+    McpwmWatch w = { .driven = driven, .outs = BIT(n) };
+    unsigned group;
+    uint32_t edges = 0;
+
+    p->found = true;
+    p->ok = false;
+    memcpy(c, &s->wave_core, sizeof(*c));
+    group = op_group(c, n / 2);
+    p->from = c->now;
+    p->level0 = op_out(c, n / 2, n % 2);
+    for (int i = 0; i < ESP32_MCPWM_OUTS; i++) {
+        driven[i] = op_out(c, i / 2, i % 2);
+    }
+    for (;;) {
+        Esp32McpwmCore ahead;
+        McpwmSeen seen;
+
+        memcpy(&ahead, c, sizeof(ahead));
+        ahead.etm_fired = 0;
+        seen = core_run_group(&ahead, NO_EVENT - 1, &w, group);
+        if (seen == SEEN_NOTHING) {
+            /* Still from its last edge on */
+            p->npre = edges;
+            memcpy(p->pre, at, edges * sizeof(at[0]));
+            p->nrep = 0;
+            p->period = 0;
+            p->rep = edges ? at[edges - 1] : p->from;
+            break;
+        }
+        if (seen != SEEN_OUTPUT || edges == ESP32_MCPWM_PATTERN_EDGES) {
+            return;
+        }
+        core_run_group(c, ahead.now, NULL, group);
+        driven[n] = op_out(c, n / 2, n % 2);
+        at[edges] = c->now;
+        core_normalise(norm, c, group);
+        norm->int_raw = 0;
+        for (uint32_t j = 0; j < edges; j++) {
+            if (memcmp(&snaps[j], norm, sizeof(*norm)) == 0) {
+                /* Edge j's state again: edges j.. repeat */
+                p->npre = j;
+                memcpy(p->pre, at, j * sizeof(at[0]));
+                p->rep = at[j];
+                p->period = at[edges] - at[j];
+                p->nrep = edges - j;
+                for (uint32_t i = 0; i < p->nrep; i++) {
+                    p->off[i] = at[j + i] - at[j];
+                }
+                goto found;
+            }
+        }
+        memcpy(&snaps[edges], norm, sizeof(*norm));
+        edges++;
+    }
+found:
+    p->min_gap = UINT64_MAX;
+    for (uint32_t i = 1; i < p->npre; i++) {
+        p->min_gap = MIN(p->min_gap, p->pre[i] - p->pre[i - 1]);
+    }
+    if (p->npre && p->nrep) {
+        p->min_gap = MIN(p->min_gap, p->rep - p->pre[p->npre - 1]);
+    }
+    for (uint32_t i = 0; i < p->nrep; i++) {
+        uint64_t next = i + 1 < p->nrep ? p->off[i + 1] : p->period;
+
+        p->min_gap = MIN(p->min_gap, next - p->off[i]);
+    }
+    p->ok = true;
+}
+
+static Esp32McpwmPattern *mcpwm_pattern(Esp32McpwmState *s, int n)
+{
+    if (!s->pattern[n].found) {
+        mcpwm_find_pattern(s, n);
+    }
+    return &s->pattern[n];
+}
+
+/* Output n's edges at cycles up to x, from the pattern's start. */
+static uint64_t pattern_edges_to(const Esp32McpwmPattern *p, uint64_t x)
+{
+    uint64_t total = 0, q, r;
+
+    for (uint32_t i = 0; i < p->npre && p->pre[i] <= x; i++) {
+        total++;
+    }
+    if (!p->nrep || x < p->rep) {
+        return total;
+    }
+    q = (x - p->rep) / p->period;
+    r = (x - p->rep) % p->period;
+    total += q * p->nrep;
+    for (uint32_t i = 0; i < p->nrep && p->off[i] <= r; i++) {
+        total++;
+    }
+    return total;
+}
+
+/* The cycle of the pattern's m-th edge (m >= 1); NO_EVENT if none. */
+static uint64_t pattern_edge(const Esp32McpwmPattern *p, uint64_t m)
+{
+    uint64_t q;
+
+    if (m <= p->npre) {
+        return p->pre[m - 1];
+    }
+    m -= p->npre;
+    if (!p->nrep) {
+        return NO_EVENT;
+    }
+    q = (m - 1) / p->nrep;
+    if (q > (NO_EVENT - p->rep) / (p->period + 1)) {
+        return NO_EVENT;
+    }
+    return p->rep + q * p->period + p->off[(m - 1) % p->nrep];
+}
+
+static Esp32McpwmState *wave_mcpwm(Esp32LineWave *w)
+{
+    return w->opaque;
+}
+
+static bool mcpwm_wave_describes(Esp32LineWave *w)
+{
+    return mcpwm_pattern(wave_mcpwm(w), w->index)->ok;
+}
+
+static uint64_t mcpwm_wave_edges_by(Esp32McpwmState *s, int n, int64_t t)
+{
+    return pattern_edges_to(mcpwm_pattern(s, n), mcpwm_cycle_at(s, t));
+}
+
+static bool mcpwm_wave_level(Esp32LineWave *w, int64_t t)
+{
+    Esp32McpwmState *s = wave_mcpwm(w);
+
+    return mcpwm_pattern(s, w->index)->level0 ^
+           (mcpwm_wave_edges_by(s, w->index, t) & 1);
+}
+
+static uint64_t mcpwm_wave_edges(Esp32LineWave *w, int64_t a, int64_t b)
+{
+    Esp32McpwmState *s = wave_mcpwm(w);
+
+    if (b <= a) {
+        return 0;
+    }
+    return mcpwm_wave_edges_by(s, w->index, b) -
+           mcpwm_wave_edges_by(s, w->index, a);
+}
+
+static int64_t mcpwm_wave_edge(Esp32LineWave *w, int64_t a, uint64_t j)
+{
+    Esp32McpwmState *s = wave_mcpwm(w);
+    uint64_t x = pattern_edge(mcpwm_pattern(s, w->index),
+                              mcpwm_wave_edges_by(s, w->index, a) + j);
+
+    return x == NO_EVENT ? INT64_MAX : mcpwm_ns_at(s, x);
+}
+
+static int64_t mcpwm_wave_min_hold(Esp32LineWave *w)
+{
+    Esp32McpwmState *s = wave_mcpwm(w);
+    Esp32McpwmPattern *p = mcpwm_pattern(s, w->index);
+
+    return p->min_gap == UINT64_MAX ? INT64_MAX :
+           mcpwm_cycles_ns_floor(s, p->min_gap);
+}
+
+/* Only a change from outside, which is announced, ends a pattern. */
+static int64_t mcpwm_wave_until(Esp32LineWave *w)
+{
+    return INT64_MAX;
+}
+
+static const Esp32LineWaveOps mcpwm_wave_ops = {
+    .describes = mcpwm_wave_describes,
+    .level = mcpwm_wave_level,
+    .edges = mcpwm_wave_edges,
+    .edge = mcpwm_wave_edge,
+    .min_hold = mcpwm_wave_min_hold,
+    .until = mcpwm_wave_until,
+};
+
+/*
+ * [spec:nuos:req:emu.esp32.mcpwm]
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * The outputs whose edges are timed one by one: those something but a
+ * counter taking their waves watches, and those a counter takes that no
+ * pattern describes. An output that comes to be is driven at its level of
+ * the moment by the update that schedules it.
+ */
+static void mcpwm_update_seen(Esp32McpwmState *s)
+{
+    uint8_t seen = s->out_watched;
+
+    for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+        if ((s->out_taken & BIT(n)) &&
+            !mcpwm_wave_describes(&s->wave[n])) {
+            seen |= BIT(n);
+        }
+    }
+    if (seen != s->out_seen) {
+        s->out_seen = seen;
+        mcpwm_changed(s);
+        mcpwm_schedule(s);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.mcpwm]
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * The core may change from outside at `when`: the counters taking the
+ * outputs' waves take their edges before it as they were.
+ */
+static void mcpwm_waves_changing(Esp32McpwmState *s, int64_t when)
+{
+    for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+        if (esp32_line_wave_taken(&s->wave[n])) {
+            esp32_line_wave_changing(&s->wave[n], when);
+        }
+    }
+}
+
+/* It has: the patterns start again from the core as it now is. */
+static void mcpwm_waves_changed(Esp32McpwmState *s, int64_t when)
+{
+    memcpy(&s->wave_core, &s->core, sizeof(s->wave_core));
+    for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+        s->pattern[n].found = false;
+    }
+    mcpwm_update_seen(s);
+    for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+        if (esp32_line_wave_taken(&s->wave[n])) {
+            esp32_line_wave_changed(&s->wave[n], when);
+        }
+    }
 }
 
 /* Capture */
@@ -2706,6 +3013,7 @@ static void mcpwm_do_write(void *opaque)
     uint32_t v = a->value;
 
     mcpwm_access_begin(s);
+    mcpwm_waves_changing(s, mcpwm_now(s));
     mcpwm_changed(s);
     if (s->p4 && addr >= A_P4_EVT_EN) {
         if (!p4_write(s, addr, v)) {
@@ -2806,6 +3114,7 @@ static void mcpwm_do_write(void *opaque)
     }
     core_settle(c);
     mcpwm_update(s);
+    mcpwm_waves_changed(s, mcpwm_now(s));
 }
 
 /* [spec:nuos:req:emu.esp32.mcpwm] */
@@ -2865,6 +3174,7 @@ static void mcpwm_do_etm_task(void *opaque)
     int n = in->n;
 
     mcpwm_sync(s);
+    mcpwm_waves_changing(s, mcpwm_now(s));
     mcpwm_changed(s);
     if (n <= TASK_CMPR_B_UP(ESP32_MCPWM_OPS - 1)) {
         op_transfer(&c->op[n % ESP32_MCPWM_OPS],
@@ -2897,6 +3207,7 @@ static void mcpwm_do_etm_task(void *opaque)
     mcpwm_cap_sync_hit(s);
     core_settle(c);
     mcpwm_update(s);
+    mcpwm_waves_changed(s, mcpwm_now(s));
 }
 
 /* [spec:nuos:req:emu.esp32p4.pwm] */
@@ -2919,6 +3230,7 @@ static void mcpwm_do_sync_in(void *opaque)
     bool before;
 
     mcpwm_sync(s);
+    mcpwm_waves_changing(s, mcpwm_now(s));
     mcpwm_changed(s);
     before = sync_level(s, in->n);
     s->sync_in[in->n] = in->level != 0;
@@ -2926,6 +3238,7 @@ static void mcpwm_do_sync_in(void *opaque)
         gpio_sync(s, in->n);
     }
     mcpwm_update(s);
+    mcpwm_waves_changed(s, mcpwm_now(s));
 }
 
 static void esp32_mcpwm_sync_in(void *opaque, int n, int level)
@@ -2941,10 +3254,12 @@ static void mcpwm_do_fault_in(void *opaque)
     Esp32McpwmState *s = in->s;
 
     mcpwm_sync(s);
+    mcpwm_waves_changing(s, mcpwm_now(s));
     mcpwm_changed(s);
     s->core.fault_in[in->n] = in->level != 0;
     core_faults(&s->core);
     mcpwm_update(s);
+    mcpwm_waves_changed(s, mcpwm_now(s));
 }
 
 static void esp32_mcpwm_fault_in(void *opaque, int n, int level)
@@ -2983,6 +3298,7 @@ static void mcpwm_clk_pre_update(Esp32McpwmState *s)
 {
     mcpwm_sync_others(s);
     mcpwm_sync(s);
+    mcpwm_waves_changing(s, mcpwm_now(s));
     mcpwm_changed(s);
 }
 
@@ -3008,6 +3324,7 @@ static void mcpwm_core_clk_post(void *opaque)
 
     mcpwm_changed(s);
     mcpwm_update(s);
+    mcpwm_waves_changed(s, mcpwm_now(s));
 }
 
 static void esp32_mcpwm_core_clk_update(void *opaque, ClockEvent event)
@@ -3030,10 +3347,19 @@ static void mcpwm_cap_clk_pre(void *opaque)
     cap_reanchor(s);
 }
 
+static void mcpwm_cap_clk_post(void *opaque)
+{
+    Esp32McpwmState *s = opaque;
+
+    mcpwm_waves_changed(s, mcpwm_now(s));
+}
+
 static void esp32_mcpwm_cap_clk_update(void *opaque, ClockEvent event)
 {
     if (event == ClockPreUpdate) {
         mcpwm_at(mcpwm_cap_clk_pre, opaque);
+    } else {
+        mcpwm_at(mcpwm_cap_clk_post, opaque);
     }
 }
 
@@ -3066,6 +3392,7 @@ static void esp32_mcpwm_reset_hold(Object *obj, ResetType type)
     Esp32McpwmCore *c = &s->core;
     bool fault_in[ESP32_MCPWM_FAULTS];
 
+    mcpwm_waves_changing(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     s->catching_up = false;
     mcpwm_arm(s, false);
     mcpwm_changed(s);
@@ -3116,6 +3443,7 @@ static void esp32_mcpwm_reset_hold(Object *obj, ResetType type)
     /* Drive every line afresh. */
     memset(s->out_level, 0xff, sizeof(s->out_level));
     s->irq_level = 0xff;
+    mcpwm_waves_changed(s, s->div_ns);
 }
 
 static void esp32_mcpwm_reset_exit(Object *obj, ResetType type)
@@ -3156,11 +3484,15 @@ static void esp32_mcpwm_init(Object *obj)
                                          esp32_mcpwm_core_clk_update, s,
                                          ClockPreUpdate | ClockUpdate);
         s->cap_clk = qdev_init_clock_in(dev, "apb", esp32_mcpwm_cap_clk_update,
-                                        s, ClockPreUpdate);
+                                        s, ClockPreUpdate | ClockUpdate);
     }
     s->line_source.notify = mcpwm_line_sync;
     s->route_notifier.notify = mcpwm_route_notify;
     s->out_seen = MAKE_64BIT_MASK(0, ESP32_MCPWM_OUTS);
+    s->out_watched = s->out_seen;
+    for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+        esp32_line_wave_init(&s->wave[n], &mcpwm_wave_ops, s, n);
+    }
 }
 
 static void esp32_mcpwm_realize(DeviceState *dev, Error **errp)
@@ -3177,6 +3509,10 @@ static void esp32_mcpwm_realize(DeviceState *dev, Error **errp)
     esp32_line_add_source(&s->line_source);
     if (s->gpio) {
         esp32_sig_add_route_notifier(OBJECT(s->gpio), &s->route_notifier);
+        for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+            esp32_sig_set_wave(OBJECT(s->gpio), s->sig_base + n,
+                               &s->wave[n]);
+        }
     }
 }
 
@@ -3303,20 +3639,27 @@ static const VMStateDescription vmstate_esp32p4_mcpwm_period = {
     },
 };
 
-/* Whether the timer is set is the QEMU timer's, which migration carries */
+/*
+ * Whether the timer is set is the QEMU timer's, which migration carries.
+ * The outputs' patterns start again from the core as it was migrated.
+ */
 static int esp32_mcpwm_post_load(void *opaque, int version_id)
 {
     Esp32McpwmState *s = opaque;
 
     s->armed = timer_pending(s->timer);
     s->catching_up = false;
+    memcpy(&s->wave_core, &s->core, sizeof(s->wave_core));
+    for (int n = 0; n < ESP32_MCPWM_OUTS; n++) {
+        s->pattern[n].found = false;
+    }
     return 0;
 }
 
 static const VMStateDescription vmstate_esp32_mcpwm = {
     .name = TYPE_ESP32_MCPWM,
-    .version_id = 5,
-    .minimum_version_id = 5,
+    .version_id = 6,
+    .minimum_version_id = 6,
     .post_load = esp32_mcpwm_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(core_clk, Esp32McpwmState),
@@ -3348,6 +3691,8 @@ static const VMStateDescription vmstate_esp32_mcpwm = {
         VMSTATE_INT64(due_ns, Esp32McpwmState),
         VMSTATE_INT64(seen_ns, Esp32McpwmState),
         VMSTATE_UINT8(out_seen, Esp32McpwmState),
+        VMSTATE_UINT8(out_watched, Esp32McpwmState),
+        VMSTATE_UINT8(out_taken, Esp32McpwmState),
         VMSTATE_END_OF_LIST()
     },
     .subsections = (const VMStateDescription * const []) {

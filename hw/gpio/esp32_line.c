@@ -165,6 +165,56 @@ bool esp32_line_pwm_skips(const Esp32LineLag *lag, int64_t due_ns)
 
 /* [spec:nuos:req:emu.esp32.gpio] */
 /* [spec:nuos:req:emu.esp32p4.gpio] */
+void esp32_line_wave_init(Esp32LineWave *w, const Esp32LineWaveOps *ops,
+                          void *opaque, unsigned index)
+{
+    w->ops = ops;
+    w->opaque = opaque;
+    w->index = index;
+    notifier_list_init(&w->takers);
+}
+
+bool esp32_line_wave_taken(Esp32LineWave *w)
+{
+    return !QLIST_EMPTY(&w->takers.notifiers);
+}
+
+void esp32_line_wave_take(Esp32LineWave *w, Notifier *n)
+{
+    notifier_list_add(&w->takers, n);
+}
+
+void esp32_line_wave_drop(Notifier *n)
+{
+    notifier_remove(n);
+}
+
+static void wave_announce(Esp32LineWave *w, int64_t when, bool done)
+{
+    Esp32LineWaveChange c = { .wave = w, .when = when, .done = done };
+
+    notifier_list_notify(&w->takers, &c);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * The output is about to change at @when: its takers take its edges
+ * before then as its description has them.
+ */
+void esp32_line_wave_changing(Esp32LineWave *w, int64_t when)
+{
+    wave_announce(w, when, false);
+}
+
+/* The output has changed at @when: its takers go on from its new one. */
+void esp32_line_wave_changed(Esp32LineWave *w, int64_t when)
+{
+    wave_announce(w, when, true);
+}
+
+/* [spec:nuos:req:emu.esp32.gpio] */
+/* [spec:nuos:req:emu.esp32p4.gpio] */
 bool esp32_sig_out_watched(Object *matrix, unsigned sig)
 {
     return ESP32_SIG_ROUTES_GET_CLASS(matrix)->sig_out_watched(matrix, sig);
@@ -173,6 +223,28 @@ bool esp32_sig_out_watched(Object *matrix, unsigned sig)
 void esp32_sig_add_route_notifier(Object *matrix, Notifier *n)
 {
     ESP32_SIG_ROUTES_GET_CLASS(matrix)->add_route_notifier(matrix, n);
+}
+
+void esp32_sig_set_wave(Object *matrix, unsigned sig, Esp32LineWave *w)
+{
+    ESP32_SIG_ROUTES_GET_CLASS(matrix)->set_wave(matrix, sig, w);
+}
+
+void esp32_sig_set_bulk_in(Object *matrix, unsigned sig, bool on)
+{
+    ESP32_SIG_ROUTES_GET_CLASS(matrix)->set_bulk_in(matrix, sig, on);
+}
+
+Esp32LineWave *esp32_sig_in_wave(Object *matrix, unsigned sig,
+                                 bool *inverted)
+{
+    return ESP32_SIG_ROUTES_GET_CLASS(matrix)->sig_in_wave(matrix, sig,
+                                                           inverted);
+}
+
+bool esp32_sig_out_taken(Object *matrix, unsigned sig)
+{
+    return ESP32_SIG_ROUTES_GET_CLASS(matrix)->sig_out_taken(matrix, sig);
 }
 
 static const TypeInfo esp32_sig_routes_info = {

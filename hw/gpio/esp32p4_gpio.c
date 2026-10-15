@@ -1739,6 +1739,44 @@ static bool pad_watching(ESP32P4GpioState *s, unsigned n)
 
 /*
  * [spec:nuos:req:emu.esp32p4.gpio]
+ * The wave (esp32_line.h) of the output signal that alone drives pad n,
+ * push-pull, its level reaching the pad's HP chain as it is: no outside
+ * driver or pull, board wire, hold, USB PHY or LP IO MUX on the pad, and
+ * neither its pin filter nor a glitch filter on it. NULL if there is no
+ * such output or it has no wave; *inverted says whether OUT_INV_SEL
+ * inverts it on its way.
+ */
+static Esp32LineWave *pad_wave(ESP32P4GpioState *s, unsigned n,
+                               bool *inverted)
+{
+    const IomuxFunc *fn;
+    unsigned f;
+    bool val, oe;
+    PadCtl c;
+    int sig;
+
+    if (n >= ESP32P4_GPIO_PADS || lp_owned(s, n) ||
+        bit64(s->ext_high | s->ext_low | s->ext_pull_up | s->held |
+              s->ext_phy, n) ||
+        s->pad_wire[n] || hp_filter_on(s, n) || pad_glitch(s, n) >= 0) {
+        return NULL;
+    }
+    pad_ctl(s, n, &c);
+    if (!c.ie || c.od || !c.oe) {
+        return NULL;
+    }
+    sig = pad_drive(s, n, &val, &oe);
+    if (sig < 0 || !oe || !s->wave[sig]) {
+        return NULL;
+    }
+    fn = hp_func(s, n, &f);
+    *inverted = fn->kind == IOMUX_GPIO &&
+                FIELD_EX32(s->func_out_sel[n], FUNC_OUT, OUT_INV_SEL);
+    return s->wave[sig];
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
  * Whether anything but software sampling the pads sees pad n's level
  * change (esp32p4_gpio_sig_out_watched()), from the routing just built:
  * a line of it that something listens to (its level, a watcher
@@ -1748,13 +1786,18 @@ static bool pad_watching(ESP32P4GpioState *s, unsigned n)
  * latches an edge whatever INT_ENA says), an input signal a modelled
  * block takes from it, a direct IO MUX input that one does, or, on an LP
  * pad, the same on the LP side. The ETM event channels on pads are added
- * by the caller.
+ * by the caller. An input signal taking waves in bulk through the matrix
+ * (esp32p4_gpio_set_bulk_in()) does not watch a pad whose output has a
+ * wave (pad_wave()): it takes the output's edges from the wave, and
+ * *taken says so.
  */
-static bool pad_watched(ESP32P4GpioState *s, unsigned n)
+static bool pad_watched(ESP32P4GpioState *s, unsigned n, bool *taken)
 {
     const ESP32P4GpioRoutes *r = &s->routes;
     const IomuxFunc *fn;
     unsigned f;
+    bool inv;
+    Esp32LineWave *wave = pad_wave(s, n, &inv);
 
     if (s->pad_out[n] || pad_watching(s, n) || s->drive_high_out[n] ||
         s->drive_low_out[n] || r->wire_net[n] != BIT_ULL(n) ||
@@ -1771,6 +1814,11 @@ static bool pad_watched(ESP32P4GpioState *s, unsigned n)
              m &= m - 1) {
             unsigned sig = w * 64 + ctz64(m);
 
+            if (wave && (s->bulk_in[w] & BIT_ULL(sig % 64)) &&
+                (r->chain_sigs[n][w] & BIT_ULL(sig % 64))) {
+                *taken = true;
+                continue;
+            }
             if (s->sig_in_out[sig] || sig >= SIG_LOOPBACK_FIRST) {
                 return true;
             }
@@ -1799,13 +1847,18 @@ static bool pad_watched(ESP32P4GpioState *s, unsigned n)
     return false;
 }
 
-static uint64_t routes_watched(ESP32P4GpioState *s)
+static uint64_t routes_watched(ESP32P4GpioState *s, uint64_t *taken)
 {
     uint64_t watched = 0;
 
+    *taken = 0;
     for (unsigned n = 0; n < ESP32P4_GPIO_PADS; n++) {
-        if (pad_watched(s, n)) {
+        bool t = false;
+
+        if (pad_watched(s, n, &t)) {
             watched |= BIT_ULL(n);
+        } else if (t) {
+            *taken |= BIT_ULL(n);
         }
     }
     for (unsigned ch = 0; ch < ESP32P4_GPIO_ETM_CHANNELS; ch++) {
@@ -1918,7 +1971,8 @@ static void routes_build(ESP32P4GpioState *s)
             r->lp_chain_sigs[sel] |= 1u << sig;
         }
     }
-    r->watched = routes_watched(s);
+    r->watched = routes_watched(s, &r->taken);
+    r->taken &= ~r->watched;
 }
 
 /*
@@ -2198,8 +2252,10 @@ static void esp32p4_gpio_update_pads(ESP32P4GpioState *s, uint64_t pads)
     s->update_pending = false;
     s->updating = false;
     filters_schedule(s);
-    if (s->routes.watched != s->watched_told) {
+    if (s->routes.watched != s->watched_told ||
+        s->routes.taken != s->taken_told) {
         s->watched_told = s->routes.watched;
+        s->taken_told = s->routes.taken;
         notify_route(s);
     }
 }
@@ -2328,6 +2384,67 @@ uint64_t esp32p4_gpio_sig_out_pads(ESP32P4GpioState *s, unsigned sig)
 bool esp32p4_gpio_sig_out_watched(ESP32P4GpioState *s, unsigned sig)
 {
     return (esp32p4_gpio_sig_out_pads(s, sig) & s->routes.watched) != 0;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * Whether output signal sig reaches an input signal that takes its wave
+ * in bulk (pad_watched()), on a pad nothing else watches.
+ */
+bool esp32p4_gpio_sig_out_taken(ESP32P4GpioState *s, unsigned sig)
+{
+    return (esp32p4_gpio_sig_out_pads(s, sig) & s->routes.taken) != 0;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * Wiring, set as the blocks realize: the next round, at the latest the
+ * reset's, takes it in.
+ */
+void esp32p4_gpio_set_wave(ESP32P4GpioState *s, unsigned sig,
+                           Esp32LineWave *w)
+{
+    assert(sig < ESP32P4_GPIO_SIGS);
+    s->wave[sig] = w;
+    s->dirty_all = true;
+}
+
+/* [spec:nuos:req:emu.esp32p4.gpio] */
+void esp32p4_gpio_set_bulk_in(ESP32P4GpioState *s, unsigned sig, bool on)
+{
+    assert(sig < ESP32P4_GPIO_SIGS);
+    s->bulk_in[sig / 64] = deposit64(s->bulk_in[sig / 64], sig % 64, 1, on);
+    s->dirty_all = true;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * The wave input signal sig takes in bulk: through the matrix from a pad
+ * whose output has one (pad_wave()), sig having been set to take waves;
+ * NULL otherwise. *inverted says whether the path inverts it.
+ */
+Esp32LineWave *esp32p4_gpio_sig_in_wave(ESP32P4GpioState *s, unsigned sig,
+                                        bool *inverted)
+{
+    uint32_t cfg;
+    unsigned sel;
+    Esp32LineWave *w;
+    bool inv;
+
+    if (sig >= ESP32P4_GPIO_SIGS ||
+        !(s->bulk_in[sig / 64] & BIT_ULL(sig % 64))) {
+        return NULL;
+    }
+    cfg = s->func_in_sel[sig];
+    sel = FIELD_EX32(cfg, FUNC_IN, IN_SEL);
+    if (!FIELD_EX32(cfg, FUNC_IN, SIG_IN_SEL) || sel >= ESP32P4_GPIO_PADS) {
+        return NULL;
+    }
+    w = pad_wave(s, sel, &inv);
+    if (w) {
+        *inverted = inv ^ FIELD_EX32(cfg, FUNC_IN, IN_INV_SEL);
+    }
+    return w;
 }
 
 /* [spec:nuos:req:emu.esp32p4.gpio] */
@@ -3574,6 +3691,10 @@ static void ext_drive(ESP32P4GpioState *s, unsigned d, unsigned n,
         return;
     }
     filters_catch_up(s, esp32_line_time());
+    if (driven != s->ext_driven[d]) {
+        /* A pad driven from outside takes no wave (pad_wave()). */
+        s->dirty_all = true;
+    }
     s->ext_driven[d] = driven;
     s->ext_level[d] = lvl;
     ext_update(s);
@@ -3784,6 +3905,9 @@ static void esp32p4_gpio_set_pull_up(void *opaque, int n, int level)
         return;
     }
     filters_catch_up(s, esp32_line_time());
+    if (bit64(s->ext_pull_up, n) != (level != 0)) {
+        s->dirty_all = true;
+    }
     s->ext_pull_up = deposit64(s->ext_pull_up, n, 1, level != 0);
     esp32p4_gpio_update_pads(s, 1ULL << n);
 }
@@ -4656,6 +4780,29 @@ static bool esp32p4_gpio_routes_out_watched(Object *obj, unsigned sig)
     return esp32p4_gpio_sig_out_watched(ESP32P4_GPIO(obj), sig);
 }
 
+static void esp32p4_gpio_routes_set_wave(Object *obj, unsigned sig,
+                                         Esp32LineWave *w)
+{
+    esp32p4_gpio_set_wave(ESP32P4_GPIO(obj), sig, w);
+}
+
+static void esp32p4_gpio_routes_set_bulk_in(Object *obj, unsigned sig,
+                                            bool on)
+{
+    esp32p4_gpio_set_bulk_in(ESP32P4_GPIO(obj), sig, on);
+}
+
+static Esp32LineWave *esp32p4_gpio_routes_in_wave(Object *obj, unsigned sig,
+                                                  bool *inverted)
+{
+    return esp32p4_gpio_sig_in_wave(ESP32P4_GPIO(obj), sig, inverted);
+}
+
+static bool esp32p4_gpio_routes_out_taken(Object *obj, unsigned sig)
+{
+    return esp32p4_gpio_sig_out_taken(ESP32P4_GPIO(obj), sig);
+}
+
 static void esp32p4_gpio_routes_add_notifier(Object *obj, Notifier *n)
 {
     esp32p4_gpio_add_route_notifier(ESP32P4_GPIO(obj), n);
@@ -4669,6 +4816,10 @@ static void esp32p4_gpio_class_init(ObjectClass *klass, const void *data)
 
     src->sig_out_watched = esp32p4_gpio_routes_out_watched;
     src->add_route_notifier = esp32p4_gpio_routes_add_notifier;
+    src->set_wave = esp32p4_gpio_routes_set_wave;
+    src->set_bulk_in = esp32p4_gpio_routes_set_bulk_in;
+    src->sig_in_wave = esp32p4_gpio_routes_in_wave;
+    src->sig_out_taken = esp32p4_gpio_routes_out_taken;
 
     rc->phases.hold = esp32p4_gpio_reset_hold;
     rc->phases.exit = esp32p4_gpio_reset_exit;

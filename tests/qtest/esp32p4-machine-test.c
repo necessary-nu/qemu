@@ -138,6 +138,41 @@ static int run_qemu(const char *args, char **err)
     return status;
 }
 
+/*
+ * What QEMU, started stopped (-S) with @args, writes to stderr as it
+ * builds the machine: the monitor, on stdin, quits it once it has.
+ */
+static char *startup_stderr(const char *args)
+{
+    g_autofree char *cmd = g_strdup_printf("%s -S -display none -serial none "
+                                           "-monitor stdio %s",
+                                           qtest_qemu_binary(NULL), args);
+    g_auto(GStrv) argv = NULL;
+    GString *err = g_string_new(NULL);
+    GError *gerr = NULL;
+    int in_fd, err_fd, status;
+    char buf[256];
+    ssize_t n;
+    GPid pid;
+
+    g_assert(g_shell_parse_argv(cmd, NULL, &argv, &gerr));
+    g_assert(g_spawn_async_with_pipes(NULL, argv, NULL,
+                                      G_SPAWN_DO_NOT_REAP_CHILD |
+                                      G_SPAWN_STDOUT_TO_DEV_NULL,
+                                      NULL, NULL, &pid, &in_fd, NULL,
+                                      &err_fd, &gerr));
+    g_assert_no_error(gerr);
+    g_assert_cmpint(write(in_fd, "quit\n", 5), ==, 5);
+    close(in_fd);
+    while ((n = read(err_fd, buf, sizeof(buf))) > 0) {
+        g_string_append_len(err, buf, n);
+    }
+    close(err_fd);
+    g_assert_cmpint(waitpid(pid, &status, 0), ==, pid);
+    g_spawn_close_pid(pid);
+    return g_string_free(err, false);
+}
+
 static void assert_refused(const char *args, const char *message)
 {
     g_autofree char *err = NULL;
@@ -317,7 +352,8 @@ static void test_unimplemented(void)
     g_assert(strstr(text, "esp32p4.pvt: unimplemented device read"));
     g_assert(strstr(text, "esp32p4.audio-addc: unimplemented device write"));
     g_assert(strstr(text, "esp32p4.rtc-cali: unimplemented device read"));
-    g_assert(strstr(text, "LP ROM's contents are not published"));
+    /* The absent LP ROM is logged as the LP core reaches it, not before. */
+    g_assert(!strstr(text, "LP ROM"));
     unlink(log);
 }
 
@@ -398,8 +434,24 @@ static void test_no_flash(void)
     qtest_quit(qts);
 
     g_assert(g_file_get_contents(log, &text, NULL, NULL));
-    g_assert(strstr(text, "no flash is configured"));
+    g_assert(!strstr(text, "no flash is configured"));
     unlink(log);
+
+    /*
+     * A user booting the ROM is warned that it has no flash to boot from;
+     * not one whose -kernel image stands for what it would boot.
+     */
+    {
+        g_autofree char *elf = write_elf(0x4ff80000);
+        g_autofree char *with_kernel = g_strdup_printf("-M esp32p4 -kernel %s",
+                                                       elf);
+        g_autofree char *err = startup_stderr("-M esp32p4");
+        g_autofree char *err_kernel = startup_stderr(with_kernel);
+
+        g_assert(strstr(err, "warning: esp32p4: no flash is configured"));
+        g_assert(!strstr(err_kernel, "no flash"));
+        unlink(elf);
+    }
 
     /* So is a flash-size of zero. */
     qts = qtest_init("-M esp32p4,flash-size=0");
@@ -536,33 +588,58 @@ static void test_kernel(void)
  * presenting it, from the start and again at a system reset, logs no
  * guest error, so that a guest's error log starts with the guest's own.
  * The ROM's change of the flash core clock's divider with the clock's gate
- * on is not the guest's breach of the TRM's procedure.
+ * on is not the guest's breach of the TRM's procedure. Nor does building
+ * the machine log anything, with flash or without, as a guest error or
+ * an unimplemented access; nor does an empty guest, a branch to itself,
+ * run on TCG and reset.
  */
 /* [spec:nuos:req:emu.esp32p4.boot/test] */
+/* [spec:nuos:req:emu.esp32p4.machine/test] */
 static void test_kernel_quiet(void)
 {
+    static const char *const boards[] = {
+        "esp32p4,flash-size=16M", "esp32p4",
+    };
     g_autofree char *elf = write_elf(0x4ff80000);
-    g_autofree char *log = NULL;
-    g_autofree char *text = NULL;
-    g_autofree char *regs = NULL;
-    QTestState *qts;
-    int fd;
 
-    fd = g_file_open_tmp("esp32p4-test-XXXXXX.log", &log, NULL);
-    g_assert_cmpint(fd, >=, 0);
-    close(fd);
-    qts = qtest_initf("-M esp32p4,flash-size=16M -kernel %s "
-                      "-d guest_errors -D %s", elf, log);
-    qtest_system_reset(qts);
-    regs = qtest_hmp(qts, "info registers -a");
-    g_assert_cmphex(dump_reg(regs, 0, "pc"), ==, 0x4ff80000);
-    g_assert_cmphex(qtest_readl(qts, HP_SYS_CLKRST_PERI_CLK_CTRL00) &
-                    FLASH_CORE_CLK_DIV_NUM, ==, 0);
-    qtest_quit(qts);
+    for (size_t b = 0; b < ARRAY_SIZE(boards); b++) {
+        for (int tcg = 0; tcg < 2; tcg++) {
+            g_autofree char *log = NULL;
+            g_autofree char *text = NULL;
+            QTestState *qts;
+            int fd;
 
-    g_assert(g_file_get_contents(log, &text, NULL, NULL));
-    g_assert_cmpstr(text, ==, "");
-    unlink(log);
+            fd = g_file_open_tmp("esp32p4-test-XXXXXX.log", &log, NULL);
+            g_assert_cmpint(fd, >=, 0);
+            close(fd);
+            qts = qtest_initf("-M %s -kernel %s %s -d guest_errors,unimp "
+                              "-D %s", boards[b], elf,
+                              tcg ? "-accel tcg" : "", log);
+            if (tcg) {
+                g_usleep(100 * 1000);
+            }
+            qtest_system_reset(qts);
+            if (tcg) {
+                g_usleep(100 * 1000);
+            } else if (b == 0) {
+                g_autofree char *regs = qtest_hmp(qts, "info registers -a");
+
+                g_assert_cmphex(dump_reg(regs, 0, "pc"), ==, 0x4ff80000);
+                g_assert_cmphex(qtest_readl(qts,
+                                            HP_SYS_CLKRST_PERI_CLK_CTRL00) &
+                                FLASH_CORE_CLK_DIV_NUM, ==, 0);
+            }
+            qtest_quit(qts);
+
+            g_assert(g_file_get_contents(log, &text, NULL, NULL));
+            if (*text) {
+                g_test_message("-M %s%s logged: %s", boards[b],
+                               tcg ? " on TCG" : "", text);
+                g_test_fail();
+            }
+            unlink(log);
+        }
+    }
     unlink(elf);
 }
 
