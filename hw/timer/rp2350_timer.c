@@ -216,7 +216,13 @@ static void timer_sys_changed(void *opaque, ClockEvent event)
     timer_clock_changed(s, s->clk_sys, event);
 }
 
-/* Fire every armed alarm whose target the counter has reached by now. */
+/*
+ * Fire every armed alarm whose target the counter has reached by now,
+ * its interrupt at the time the alarm fell due (line_set_at()), however
+ * late its timer runs or an access takes it: a core that the interrupt
+ * wakes from a sleep wakes then.
+ */
+/* [spec:nuos:req:emu.timer] */
 static void timer_fire_due(RP2350TimerState *s, int64_t now)
 {
     int i;
@@ -224,9 +230,14 @@ static void timer_fire_due(RP2350TimerState *s, int64_t now)
     for (i = 0; i < RP2350_TIMER_ALARMS; i++) {
         if ((s->armed & (1u << i)) && s->alarm_due_ns[i] >= 0 &&
             s->alarm_due_ns[i] <= now) {
+            int64_t due = s->alarm_due_ns[i];
+
             s->alarm_due_ns[i] = -1;
             timer_del(s->alarm_timer[i]);
-            timer_fire(s, i);
+            s->armed &= ~(1u << i);
+            s->intr |= 1u << i;
+            line_set_at(s->irq[i], ((s->intr | s->intf) & s->inte) >> i & 1,
+                        due);
         }
     }
 }

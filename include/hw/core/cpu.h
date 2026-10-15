@@ -440,6 +440,8 @@ struct qemu_work_item;
  * @interrupt_request: Indicates a pending interrupt request.
  *   Only used by system emulation.
  * @halted: Nonzero if the CPU is in suspended state.
+ * @sleep_log: When the CPU slept (cpu_sleep_enter()). Only used by system
+ *   emulation.
  * @stop: Indicates a pending stop request.
  * @stopped: Indicates the CPU has been artificially stopped.
  * @unplug: Indicates a pending CPU unplug request.
@@ -513,6 +515,33 @@ struct qemu_work_item;
  * some common TCG CPU variables which are accessed with a negative offset
  * from cpu_env.
  */
+/*
+ * CPUSleepLog: when a CPU slept, over virtual time.
+ *
+ * A power controller that decides at times of its own whether its CPUs
+ * sleep, as the RP2350's POWMAN does at each of its ticks, runs on a QEMU
+ * timer, which without icount can run well after such a time; by then a
+ * CPU may have gone to sleep, or woken and slept again. The CPU keeps its
+ * recent sleeps, each from the time it halted in WFI, WFE or the like
+ * (cpu_sleep_enter()) to the time the event that woke it fell due, which
+ * the event gives as it reaches the halted CPU (cpu_sleep_wake_event()):
+ * a device's interrupt at its own time, however late the device raises
+ * it. A wake that gives no time ends the sleep when the CPU's halt ends
+ * (cpu_sleep_exit()), which is later.
+ */
+#define CPU_SLEEP_CHANGES 16
+
+typedef struct CPUSleepLog {
+    /* The changes kept, oldest first: their times, and asleep or awake. */
+    int64_t when[CPU_SLEEP_CHANGES];
+    bool asleep[CPU_SLEEP_CHANGES];
+    uint32_t n;
+    /* Whether older changes were dropped: before when[0] is not known. */
+    bool lost;
+    /* While asleep, the earliest waking event's time; INT64_MAX if none. */
+    int64_t wake_ns;
+} CPUSleepLog;
+
 struct CPUState {
     /*< private >*/
     DeviceState parent_obj;
@@ -610,6 +639,7 @@ struct CPUState {
     int cluster_index;
     uint32_t tcg_cflags;
     uint32_t halted;
+    CPUSleepLog sleep_log;
     int32_t exception_index;
 
     bool vcpu_dirty;
@@ -1134,6 +1164,50 @@ void cpu_hold_access(CPUState *cpu);
  * before that CPU's next instruction. The device makes the access then.
  */
 void cpu_hold_access_exclusive(CPUState *cpu);
+
+/**
+ * cpu_sleep_enter:
+ * @cpu: The CPU, halting on its thread to sleep (WFI, WFE or the like).
+ * @when: The virtual time it goes to sleep.
+ *
+ * Start a sleep in @cpu's log (CPUSleepLog). System emulation only.
+ */
+void cpu_sleep_enter(CPUState *cpu, int64_t when);
+
+/**
+ * cpu_sleep_wake_event:
+ * @cpu: A CPU an event that wakes it from a sleep reaches, as it reaches
+ *   it, with the BQL held.
+ * @when: The event's own time (line_event_time()).
+ *
+ * The earliest such event ends the sleep, at its time but never before
+ * the sleep began, once the CPU's halt ends (cpu_sleep_exit()). Nothing
+ * while @cpu does not sleep. System emulation only.
+ */
+void cpu_sleep_wake_event(CPUState *cpu, int64_t when);
+
+/**
+ * cpu_sleep_exit:
+ * @cpu: The CPU, whose halt ends on its thread.
+ *
+ * End @cpu's sleep, if it is in one: at the time of the earliest event
+ * that woke it (cpu_sleep_wake_event()), or now if none gave one. System
+ * emulation only.
+ */
+void cpu_sleep_exit(CPUState *cpu);
+
+/**
+ * cpu_slept_at:
+ * @cpu: The CPU.
+ * @when: A virtual time, no later than the present.
+ *
+ * With the BQL held. System emulation only.
+ *
+ * Returns: 1 if @cpu slept at @when, 0 if it was awake (or held in a halt
+ * that is no sleep, which its log does not show), and -1 if @when lies
+ * before the changes its log keeps.
+ */
+int cpu_slept_at(CPUState *cpu, int64_t when);
 
 /**
  * cpu_pause:

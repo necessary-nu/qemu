@@ -981,8 +981,16 @@ static int rp2350_sram_domain(int domain)
     return domain == RP2350_POWMAN_SRAM0 ? 0 : 1;
 }
 
+/*
+ * Whether both cores were asleep at @when, a POWMAN tick's time, which
+ * without icount can lie well before the moment the host gets to the
+ * tick: each core asleep in WFI or WFE then, as its log of its sleeps
+ * shows (cpu_slept_at()), from its halt to the time of the event that
+ * woke it, or powered off or locked up. A core whose clock stopped is
+ * not asleep.
+ */
 /* [spec:nuos:req:emu.powman] */
-static bool rp2350_soc_procs_asleep(void *opaque)
+static bool rp2350_soc_procs_asleep(void *opaque, int64_t when)
 {
     RP2350State *s = opaque;
     int i;
@@ -992,8 +1000,17 @@ static bool rp2350_soc_procs_asleep(void *opaque)
         return true;
     }
     for (i = 0; i < RP2350_NUM_CORES; i++) {
-        /* A core whose clock stopped is not asleep. */
-        if (!CPU(s->armv7m[i].cpu)->halted || s->core_clock_halted[i]) {
+        ARMCPU *cpu = s->armv7m[i].cpu;
+        CPUState *cs = CPU(cpu);
+
+        if (s->core_clock_halted[i]) {
+            return false;
+        }
+        if (cs->halted && (cpu->m_locked_up ||
+                           qatomic_read(&cpu->power_state) == PSCI_OFF)) {
+            continue;
+        }
+        if (cpu_slept_at(cs, when) != 1) {
             return false;
         }
     }

@@ -881,8 +881,16 @@ static void powman_seq_start(RP2350PowmanState *s, uint32_t target,
 {
     s->seq = SEQ_CHANGING;
     s->seq_target = target;
-    timer_mod(s->seq_timer,
-              now + powman_seq_ns(s, powman_current(s), target));
+    s->seq_ns = now + powman_seq_ns(s, powman_current(s), target);
+    timer_mod(s->seq_timer, s->seq_ns);
+}
+
+/* The processors' sleep is sampled on the POWMAN tick after @now. */
+static void powman_seq_wait(RP2350PowmanState *s, int64_t now)
+{
+    s->seq = SEQ_WAITING;
+    s->seq_ns = now + powman_tick_ns(s);
+    timer_mod(s->seq_timer, s->seq_ns);
 }
 
 /* Ask for a system reset that this device carries out as `kind`. */
@@ -997,17 +1005,28 @@ static void powman_seq_complete(RP2350PowmanState *s, int64_t now)
 }
 
 /*
- * The sequencer's step at @now: a power-down's wait for the processors to
- * sleep, sampled each POWMAN tick, or the end of a change of power state.
+ * The sequencer's step at its time, seq_ns (line_time()), however late
+ * its timer runs: a power-down's wait for the processors to sleep,
+ * sampled each POWMAN tick, or the end of a change of power state, which
+ * may start the next. A tick decides from the processors' sleep at its
+ * own time, not at the moment the host gets to it: one that went to
+ * sleep after the tick is awake for it, and one that an interrupt due
+ * before it woke is awake however late the interrupt came. The next tick
+ * waits for the sequencer's timer, which runs after those of the
+ * interrupts due before it.
  */
-static void powman_seq_step(RP2350PowmanState *s, int64_t now)
+/* [spec:nuos:req:emu.powman] */
+static void powman_seq_at(void *opaque)
 {
+    RP2350PowmanState *s = opaque;
+    int64_t now = line_time();
+
     switch (s->seq) {
     case SEQ_WAITING:
-        if (!s->ops || s->ops->procs_asleep(s->ops_opaque)) {
+        if (!s->ops || s->ops->procs_asleep(s->ops_opaque, now)) {
             powman_swcore_down(s, now);
         } else {
-            timer_mod(s->seq_timer, now + powman_tick_ns(s));
+            powman_seq_wait(s, now);
         }
         break;
     case SEQ_CHANGING:
@@ -1018,28 +1037,9 @@ static void powman_seq_step(RP2350PowmanState *s, int64_t now)
 
 static void powman_seq_cb(void *opaque)
 {
-    powman_seq_step(opaque, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-}
+    RP2350PowmanState *s = opaque;
 
-/*
- * The sequencer's step due at @due, taken by an access at @now: the end
- * of a change of power state at its time, which may start the next. A
- * power-down waiting for the processors to sleep samples them each POWMAN
- * tick, and an access is made by one that is awake: the ticks up to the
- * access find it so and go by, the next one after it waiting for the
- * sequencer's timer.
- */
-/* [spec:nuos:req:emu.powman] */
-static void powman_seq_due(RP2350PowmanState *s, int64_t due, int64_t now)
-{
-    if (s->seq == SEQ_WAITING && s->ops &&
-        !s->ops->procs_asleep(s->ops_opaque)) {
-        int64_t tick = MAX(powman_tick_ns(s), 1);
-
-        timer_mod(s->seq_timer, due + ((now - due) / tick + 1) * tick);
-        return;
-    }
-    powman_seq_step(s, due);
+    line_run_at(s->seq_ns, powman_seq_at, s);
 }
 
 /*
@@ -1065,8 +1065,7 @@ static void powman_pwrup_changed(RP2350PowmanState *s)
     case SEQ_IDLE:
         if (powman_current(s) & DOM(SWCORE)) {
             s->wake_reqs = reqs;
-            powman_seq_start(s, powman_wake_target(s),
-                             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+            powman_seq_start(s, powman_wake_target(s), line_time());
         }
         break;
     }
@@ -1135,11 +1134,9 @@ static void powman_state_write(RP2350PowmanState *s, uint32_t eff,
     s->state &= ~STATE_BAD_SW_REQ;
     if (req & DOM(SWCORE)) {
         /* The processors' sleep is sampled on each POWMAN tick. */
-        s->seq = SEQ_WAITING;
-        timer_mod(s->seq_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                                powman_tick_ns(s));
+        powman_seq_wait(s, line_time());
     } else {
-        powman_seq_start(s, req, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        powman_seq_start(s, req, line_time());
     }
 out:
     powman_update_irq(s);
@@ -1367,8 +1364,8 @@ static bool powman_nonsec_reg(hwaddr reg)
  * timers can run well after, while software reads READ_TIME past the
  * alarm, polls USING_*, or waits on UPDATE_IN_PROGRESS, whose stale value
  * would also drop a VREG write; and the power sequencer's steps
- * (powman_seq_due()), while software polls STATE.CHANGING, each at its
- * time. Only a timer that has come is run.
+ * (powman_seq_at()), while software polls STATE.CHANGING or WAITING,
+ * each at its time. Only a timer that has come is run.
  */
 static void powman_catch_up(RP2350PowmanState *s)
 {
@@ -1383,7 +1380,9 @@ static void powman_catch_up(RP2350PowmanState *s)
         QEMUTimer *t[] = {
             s->alarm_timer, s->switch_timer, s->vreg_timer, s->seq_timer,
         };
-        QEMUTimerCB *at_fn[] = { aon_alarm_at, aon_switch_at, vreg_cb, NULL };
+        QEMUTimerCB *at_fn[] = {
+            aon_alarm_at, aon_switch_at, vreg_cb, powman_seq_at,
+        };
         int64_t due = now;
         int next = -1;
 
@@ -1399,11 +1398,7 @@ static void powman_catch_up(RP2350PowmanState *s)
             return;
         }
         timer_del(t[next]);
-        if (at_fn[next]) {
-            line_run_at(due, at_fn[next], s);
-        } else {
-            powman_seq_due(s, due, now);
-        }
+        line_run_at(due, at_fn[next], s);
     }
 }
 
@@ -1785,6 +1780,7 @@ static void powman_reset_regs(RP2350PowmanState *s)
     int i;
 
     timer_del(s->seq_timer);
+    s->seq_ns = 0;
     s->badpasswd = 0;
     s->vreg_ctrl = VREG_CTRL_RESET;
     vreg_reset(s);
@@ -1943,6 +1939,7 @@ static const VMStateDescription vmstate_rp2350_powman = {
     .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(seq_timer, RP2350PowmanState),
+        VMSTATE_INT64(seq_ns, RP2350PowmanState),
         VMSTATE_TIMER_PTR(alarm_timer, RP2350PowmanState),
         VMSTATE_INT64(alarm_ns, RP2350PowmanState),
         VMSTATE_TIMER_PTR(switch_timer, RP2350PowmanState),

@@ -78,8 +78,11 @@ enum {
  * SoC's; the power manager only sequences them.
  */
 typedef struct RP2350PowmanOps {
-    /* Whether both processors are asleep (in WFI or WFE) or powered off. */
-    bool (*procs_asleep)(void *opaque);
+    /*
+     * Whether both processors were asleep (in WFI or WFE) or powered off
+     * at virtual time @when, no later than the present.
+     */
+    bool (*procs_asleep)(void *opaque, int64_t when);
     /* The switched core starts to power down: stop both processors. */
     void (*swcore_stop)(void *opaque);
     /*
@@ -98,8 +101,12 @@ struct RP2350PowmanState {
     qemu_irq psm_reset;
     qemu_irq watchdog_reset;
     qemu_irq alarm_wake;
-    /* Sequencer steps, and polling the processors while WAITING. */
+    /*
+     * Sequencer steps, and polling the processors while WAITING: the next
+     * at seq_ns.
+     */
     QEMUTimer *seq_timer;
+    int64_t seq_ns;
     /*
      * The tick on which the AON timer reaches its alarm, at alarm_ns; a
      * DORMANT wake event, in the clock tree's due order.
