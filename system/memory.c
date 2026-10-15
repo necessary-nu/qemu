@@ -1339,11 +1339,11 @@ const MemoryRegionOps unassigned_mem_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
-bool memory_region_access_valid(MemoryRegion *mr,
-                                hwaddr addr,
-                                unsigned size,
-                                bool is_write,
-                                MemTxAttrs attrs)
+static bool memory_region_access_valid_own(MemoryRegion *mr,
+                                           hwaddr addr,
+                                           unsigned size,
+                                           bool is_write,
+                                           MemTxAttrs attrs)
 {
     if (mr->ops->valid.accepts
         && !mr->ops->valid.accepts(mr->opaque, addr, size, is_write, attrs)) {
@@ -1379,6 +1379,16 @@ bool memory_region_access_valid(MemoryRegion *mr,
         return false;
     }
     return true;
+}
+
+bool memory_region_access_valid(MemoryRegion *mr,
+                                hwaddr addr,
+                                unsigned size,
+                                bool is_write,
+                                MemTxAttrs attrs)
+{
+    return memory_region_access_valid_own(mr->gate_front ?: mr, addr, size,
+                                          is_write, attrs);
 }
 
 static MemTxResult memory_region_dispatch_read1(MemoryRegion *mr,
@@ -1421,6 +1431,16 @@ MemTxResult memory_region_dispatch_read(MemoryRegion *mr,
     if (!memory_region_access_valid(mr, addr, size, false, attrs)) {
         *pval = unassigned_mem_read(mr, addr, size);
         return MEMTX_DECODE_ERROR;
+    }
+    if (unlikely(mr->gate)) {
+        if (!mr->gate(mr->gate_opaque, addr, size, false, attrs)) {
+            *pval = 0;
+            return MEMTX_OK;
+        }
+        if (!memory_region_access_valid_own(mr, addr, size, false, attrs)) {
+            *pval = unassigned_mem_read(mr, addr, size);
+            return MEMTX_DECODE_ERROR;
+        }
     }
 
     r = memory_region_dispatch_read1(mr, addr, pval, size, attrs);
@@ -1470,6 +1490,15 @@ MemTxResult memory_region_dispatch_write(MemoryRegion *mr,
     if (!memory_region_access_valid(mr, addr, size, true, attrs)) {
         unassigned_mem_write(mr, addr, data, size);
         return MEMTX_DECODE_ERROR;
+    }
+    if (unlikely(mr->gate)) {
+        if (!mr->gate(mr->gate_opaque, addr, size, true, attrs)) {
+            return MEMTX_OK;
+        }
+        if (!memory_region_access_valid_own(mr, addr, size, true, attrs)) {
+            unassigned_mem_write(mr, addr, data, size);
+            return MEMTX_DECODE_ERROR;
+        }
     }
 
     adjust_endianness(mr, &data, op);
@@ -2565,6 +2594,20 @@ void memory_region_del_subregion(MemoryRegion *mr,
 
     memory_region_update_pending |= mr->enabled && subregion->enabled;
     memory_region_transaction_commit();
+}
+
+bool memory_region_set_gate(MemoryRegion *mr, MemoryRegion *front,
+                            MemoryRegionGateFn *gate, void *opaque)
+{
+    if (!mr->terminates || mr->alias || mr->ram || mr->ram_device ||
+        mr->rom_device || mr->is_iommu || !QTAILQ_EMPTY(&mr->subregions) ||
+        (gate && mr->gate)) {
+        return false;
+    }
+    mr->gate = gate;
+    mr->gate_front = gate ? front : NULL;
+    mr->gate_opaque = gate ? opaque : NULL;
+    return true;
 }
 
 void memory_region_set_enabled(MemoryRegion *mr, bool enabled)
