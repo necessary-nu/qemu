@@ -11,6 +11,7 @@
 #define HW_TIMER_ESP32P4_TIMG_H
 
 #include "hw/core/clock.h"
+#include "hw/core/line-time.h"
 #include "hw/core/sysbus.h"
 #include "hw/misc/esp32p4_clkrst.h"
 #include "qemu/timer.h"
@@ -87,6 +88,8 @@ typedef struct ESP32P4TimgTimer {
     bool running;
     /* When the scheduled alarm falls due. */
     int64_t due_ns;
+    /* The alarms, in the machine's watchdog due order. */
+    LineDueSource due_src;
 } ESP32P4TimgTimer;
 
 typedef struct ESP32P4TimgWdt {
@@ -119,6 +122,8 @@ typedef struct ESP32P4TimgWdt {
     bool running;
     /* When the next stage end anything sees comes, its QEMU timer's. */
     int64_t due_ns;
+    /* Those stage ends, in the machine's watchdog due order. */
+    LineDueSource due_src;
 } ESP32P4TimgWdt;
 
 typedef struct ESP32P4TimgCal {
@@ -188,6 +193,18 @@ struct ESP32P4TimgState {
     bool spi_boot;
     /* Counts the block's resets, for actions that reset it. */
     uint32_t reset_count;
+    /* The due order the timers and the MWDT take part in, if any. */
+    LineDueOrder *due_order;
 };
+
+/*
+ * Make the timers' alarms and the MWDT's stage ends sources of @o
+ * (hw/core/line-time.h), in which the machine puts every block whose
+ * resets act on another's (the timer groups, the RTC watchdog): a
+ * register access first runs every source's events due by then, in the
+ * order of their times, so that of two watchdogs due close together the
+ * first's reset comes first, however late their QEMU timers run.
+ */
+void esp32p4_timg_join_due_order(ESP32P4TimgState *s, LineDueOrder *o);
 
 #endif

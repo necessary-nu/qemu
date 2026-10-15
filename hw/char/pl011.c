@@ -488,7 +488,7 @@ static void pl011_line_write_txdata(PL011State *s, uint8_t data)
     pl011_update(s);
 }
 
-static void pl011_line_rx_sample(void *opaque);
+static void pl011_line_run_due(PL011State *s, int64_t now);
 
 /* The receiver's input: UARTRXD, or UARTTXD in loopback. */
 static void pl011_line_rx_changed(PL011State *s, int64_t when)
@@ -499,13 +499,16 @@ static void pl011_line_rx_changed(PL011State *s, int64_t when)
         return;
     }
     /*
-     * Samples that fell due by the edge's time see the level before it,
-     * however late their timer runs: the sender may be catching up on
-     * bits whose time has passed (pl011_line_catch_up()).
+     * What fell due by the edge's time comes first, however late its
+     * timer runs: the samples, which see the level before it, and the
+     * receive timeout, which a character the edge starts would otherwise
+     * put off. The sender may be catching up on bits whose time has
+     * passed (line_sync(), pl011_line_catch_up()).
      */
-    while (timer_pending(s->rx_timer) && s->rx_next <= when) {
-        timer_del(s->rx_timer);
-        pl011_line_rx_sample(s);
+    pl011_line_run_due(s, when);
+    level = pl011_loopback_enabled(s) ? s->txd : s->rxd_pin;
+    if (level == s->rx_level) {
+        return;
     }
     s->rx_level = level;
     if (level) {
@@ -842,21 +845,11 @@ static QEMUTimer *pl011_line_due(PL011State *s, int64_t now)
     return due;
 }
 
-/*
- * [spec:nuos:req:emu.uart]
- * A register access first takes every line event due by its moment, each
- * at its own time: without icount the line timers' callbacks run late,
- * and until they do software would read BUSY, the FIFOs and the
- * interrupts as of when the host got to them, not of the access.
- */
-static void pl011_line_catch_up(PL011State *s)
+/* The line events due by @now, the earliest first, each at its own time. */
+static void pl011_line_run_due(PL011State *s, int64_t now)
 {
-    int64_t now = line_time();
     QEMUTimer *t;
 
-    if (!s->line_level) {
-        return;
-    }
     while ((t = pl011_line_due(s, now))) {
         timer_del(t);
         if (t == s->tx_timer) {
@@ -866,6 +859,42 @@ static void pl011_line_catch_up(PL011State *s)
         } else {
             pl011_line_rt_tick(s);
         }
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.uart]
+ * A register access first takes every line event due by its moment, each
+ * at its own time: without icount the line timers' callbacks run late,
+ * and until they do software would read BUSY, the FIFOs and the
+ * interrupts as of when the host got to them, not of the access. The
+ * line sources come first (line_sync()): a transmitter in another device
+ * (a serial adapter, another UART through the pins) puts out the bits
+ * due by then, which reach this receiver at their times; then this
+ * UART's own events up to that same moment.
+ */
+static void pl011_line_catch_up(PL011State *s)
+{
+    if (!s->line_level) {
+        return;
+    }
+    pl011_line_run_due(s, line_sync());
+}
+
+/*
+ * [spec:nuos:req:emu.uart]
+ * UARTTXD's changes due by line_time(), for another device's receiver
+ * that syncs its sources before an access: the transmitter's events only.
+ */
+static void pl011_line_tx_sync(Notifier *n, void *data)
+{
+    PL011State *s = container_of(n, PL011State, line_source);
+    int64_t now = line_time();
+
+    while (timer_pending(s->tx_timer) &&
+           timer_expire_time_ns(s->tx_timer) <= now) {
+        timer_del(s->tx_timer);
+        pl011_line_tx_tick(s);
     }
 }
 
@@ -1402,6 +1431,7 @@ static void pl011_init(Object *obj)
     s->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pl011_line_tx_tick, s);
     s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pl011_line_rx_sample, s);
     s->rt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pl011_line_rt_tick, s);
+    s->line_source.notify = pl011_line_tx_sync;
     /* Undriven inputs idle high: marking, and CTS deasserted. */
     s->rxd_pin = 1;
     s->ncts_pin = 1;
@@ -1451,10 +1481,21 @@ static void pl011_realize(DeviceState *dev, Error **errp)
         if (qemu_chr_fe_backend_connected(&s->chr)) {
             error_setg(errp, "a line-level PL011 has no chardev; attach "
                        "one to its pins");
+            return;
         }
+        line_add_source(&s->line_source);
         return;
     }
     pl011_set_handlers(s);
+}
+
+static void pl011_unrealize(DeviceState *dev)
+{
+    PL011State *s = PL011(dev);
+
+    if (s->line_level) {
+        line_remove_source(&s->line_source);
+    }
 }
 
 static void pl011_reset(DeviceState *dev)
@@ -1487,6 +1528,7 @@ static void pl011_class_init(ObjectClass *oc, const void *data)
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     dc->realize = pl011_realize;
+    dc->unrealize = pl011_unrealize;
     device_class_set_legacy_reset(dc, pl011_reset);
     dc->vmsd = &vmstate_pl011;
     device_class_set_props(dc, pl011_properties);

@@ -366,17 +366,77 @@ static void swd_cb(void *opaque)
     swd_event(s, s->swd.due_ns);
 }
 
-/* Run the watchdogs' events that fell due by @now, as of when they did. */
+static int64_t lp_wdt_rwdt_next_due(LineDueSource *src)
+{
+    ESP32P4LPWdtState *s = container_of(src, ESP32P4LPWdtState, rwdt_src);
+
+    return timer_pending(&s->rwdt.timer) ? s->rwdt.due_ns : INT64_MAX;
+}
+
+static void lp_wdt_rwdt_run_due(LineDueSource *src)
+{
+    ESP32P4LPWdtState *s = container_of(src, ESP32P4LPWdtState, rwdt_src);
+
+    timer_del(&s->rwdt.timer);
+    rwdt_timeout(s, s->rwdt.due_ns);
+}
+
+static int64_t lp_wdt_swd_next_due(LineDueSource *src)
+{
+    ESP32P4LPWdtState *s = container_of(src, ESP32P4LPWdtState, swd_src);
+
+    return timer_pending(&s->swd.timer) ? s->swd.due_ns : INT64_MAX;
+}
+
+static void lp_wdt_swd_run_due(LineDueSource *src)
+{
+    ESP32P4LPWdtState *s = container_of(src, ESP32P4LPWdtState, swd_src);
+
+    timer_del(&s->swd.timer);
+    swd_event(s, s->swd.due_ns);
+}
+
+/*
+ * Run the watchdogs' events that fell due by @now, as of when they did,
+ * the earlier first: none after one that asks for a system reset.
+ */
 static void lp_wdt_catch_up(ESP32P4LPWdtState *s, int64_t now)
 {
-    if (timer_pending(&s->swd.timer) && s->swd.due_ns <= now) {
-        timer_del(&s->swd.timer);
-        swd_event(s, s->swd.due_ns);
+    while (qemu_reset_requested_get() == SHUTDOWN_CAUSE_NONE) {
+        int64_t rwdt = lp_wdt_rwdt_next_due(&s->rwdt_src);
+        int64_t swd = lp_wdt_swd_next_due(&s->swd_src);
+
+        if (MIN(rwdt, swd) > now) {
+            return;
+        }
+        if (swd < rwdt) {
+            lp_wdt_swd_run_due(&s->swd_src);
+        } else {
+            lp_wdt_rwdt_run_due(&s->rwdt_src);
+        }
     }
-    if (timer_pending(&s->rwdt.timer) && s->rwdt.due_ns <= now) {
-        timer_del(&s->rwdt.timer);
-        rwdt_timeout(s, s->rwdt.due_ns);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * A register access at @now: first every event due by then in the due
+ * order the block takes part in, the timer groups' with its own, in the
+ * order of their times; then the rest of its own.
+ */
+static void lp_wdt_access_catch_up(ESP32P4LPWdtState *s, int64_t now)
+{
+    if (s->due_order) {
+        line_due_order_run(s->due_order, now);
     }
+    lp_wdt_catch_up(s, now);
+}
+
+/* [spec:nuos:req:emu.esp32p4.timers] */
+void esp32p4_lp_wdt_join_due_order(ESP32P4LPWdtState *s, LineDueOrder *o)
+{
+    s->due_order = o;
+    line_due_order_add(o, &s->rwdt_src);
+    line_due_order_add(o, &s->swd_src);
 }
 
 /* Inputs -------------------------------------------------------------- */
@@ -492,7 +552,7 @@ static uint64_t lp_wdt_read(void *opaque, hwaddr addr, unsigned size)
     ESP32P4LPWdtState *s = opaque;
     uint32_t v;
 
-    lp_wdt_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    lp_wdt_access_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     if (!lp_wdt_read_reg(s, addr & ~3, &v)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of reserved offset 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_LP_WDT, addr);
@@ -614,7 +674,7 @@ static void lp_wdt_write(void *opaque, hwaddr addr, uint64_t data,
     uint32_t ones = (data << shift) & lanes;
     uint32_t old;
 
-    lp_wdt_catch_up(s, now);
+    lp_wdt_access_catch_up(s, now);
     lp_wdt_read_reg(s, addr & ~3, &old);
     if ((addr & ~3) == A_SWD_CONFIG) {
         old &= ~SWD_RESET_FLAG;
@@ -704,6 +764,10 @@ static void esp32p4_lp_wdt_init(Object *obj)
                                     ClockPreUpdate | ClockUpdate);
     timer_init_ns(&s->rwdt.timer, QEMU_CLOCK_VIRTUAL, rwdt_cb, s);
     timer_init_ns(&s->swd.timer, QEMU_CLOCK_VIRTUAL, swd_cb, s);
+    s->rwdt_src.next_due = lp_wdt_rwdt_next_due;
+    s->rwdt_src.run = lp_wdt_rwdt_run_due;
+    s->swd_src.next_due = lp_wdt_swd_next_due;
+    s->swd_src.run = lp_wdt_swd_run_due;
     qdev_init_gpio_in_named(dev, lp_wdt_set_spi_boot, ESP32P4_LP_WDT_SPI_BOOT,
                             1);
     qdev_init_gpio_in_named(dev, lp_wdt_set_sleep, ESP32P4_LP_WDT_SLEEP, 1);
