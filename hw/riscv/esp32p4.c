@@ -3495,6 +3495,7 @@ static void esp32p4_init_mipi(ESP32P4MachineState *s)
     qdev_connect_clock_in(cbrg, "bus",
                           qdev_get_clock_out(clkrst, "csi-brg-sys"));
     object_property_set_link(OBJECT(cbrg), "host", OBJECT(csi), &error_abort);
+    object_property_set_link(OBJECT(cbrg), "vdma", OBJECT(vdma), &error_abort);
     if (s->csi_camera) {
         object_property_set_link(OBJECT(csi), "camera",
                                  OBJECT(s->csi_camera), &error_abort);
