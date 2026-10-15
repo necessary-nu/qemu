@@ -14,6 +14,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "libqtest.h"
+#include "esp32p4-psram.h"
 
 #define FLASH_SIZE          (16 * 1024 * 1024)
 #define FLASH_CACHED        0x40000000
@@ -256,7 +257,10 @@ static void test_psram_pages(void)
     char *image;
     QTestState *qts = start(&image);
 
-    axi_open(qts, SPI0_PSRAM);
+    /* SPI0 set up for the die as it powers up. */
+    esp32p4_psram_dqs_on(qts);
+    esp32p4_psram_spi0_opi(qts, false, ESP32P4_PSRAM_PUP_DUMMY,
+                           ESP32P4_PSRAM_PUP_DUMMY);
     mmu_set(qts, SPI0_PSRAM, 0, PSRAM_VALID | PSRAM_ACCESS | 9);
     mmu_set(qts, SPI0_PSRAM, 4, PSRAM_VALID | PSRAM_ACCESS | 9);
     qtest_writel(qts, PSRAM_DIRECT + 0x80, 0x12345678);

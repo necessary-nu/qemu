@@ -13,6 +13,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "esp32p4-psram.h"
 
 #define SPI1_FLASH          0x5008d000
 #define SPI1_PSRAM          0x5008f000
@@ -265,28 +266,35 @@ static void test_psram(void)
 {
     QTestState *qts = start();
 
-    /* The die is on chip select 1. */
-    qtest_writel(qts, SPI1_PSRAM + MISC, 1);
+    /*
+     * The die on chip select 1, in OPI DTR mode, the strobes' inputs on,
+     * at its power-up latencies.
+     */
+    esp32p4_psram_spi1_opi(qts);
+    esp32p4_psram_dqs_on(qts);
 
     /* Mode registers 0 to 3 as ESP-IDF reads them: 16 bits at 0 and 2. */
-    spi1_user(qts, SPI1_PSRAM, 0x4040, 16, 0, 32, 18, 0, 2);
+    spi1_user(qts, SPI1_PSRAM, 0x4040, 16, 0, 32, ESP32P4_PSRAM_PUP_DUMMY, 0,
+              2);
     g_assert_cmphex(qtest_readl(qts, SPI1_PSRAM + W(0)) & 0xffff, ==,
-                    0x0d00);
-    spi1_user(qts, SPI1_PSRAM, 0x4040, 16, 2, 32, 18, 0, 2);
+                    0x0d08);
+    spi1_user(qts, SPI1_PSRAM, 0x4040, 16, 2, 32, ESP32P4_PSRAM_PUP_DUMMY, 0,
+              2);
     g_assert_cmphex(qtest_readl(qts, SPI1_PSRAM + W(0)) & 0xffff, ==,
                     0x20df);
 
     /* Synchronous write and read, and the same memory through SPI0. */
     qtest_writel(qts, SPI1_PSRAM + W(0), 0xa5a55a5a);
     qtest_writel(qts, SPI1_PSRAM + W(1), 0x0f0ff0f0);
-    spi1_user(qts, SPI1_PSRAM, 0x8080, 16, 0x70008, 32, 8, 8, 0);
+    spi1_user(qts, SPI1_PSRAM, 0x8080, 16, 0x70008, 32,
+              ESP32P4_PSRAM_PUP_DUMMY, 8, 0);
     qtest_writel(qts, SPI1_PSRAM + W(0), 0);
-    spi1_user(qts, SPI1_PSRAM, 0x0000, 16, 0x7000c, 32, 18, 0, 4);
+    spi1_user(qts, SPI1_PSRAM, 0x0000, 16, 0x7000c, 32,
+              ESP32P4_PSRAM_PUP_DUMMY, 0, 4);
     g_assert_cmphex(qtest_readl(qts, SPI1_PSRAM + W(0)), ==, 0x0f0ff0f0);
 
-    qtest_writel(qts, SPI0_PSRAM + CACHE_FCTRL,
-                 qtest_readl(qts, SPI0_PSRAM + CACHE_FCTRL) &
-                 ~CLOSE_AXI_INF_EN);
+    esp32p4_psram_spi0_opi(qts, false, ESP32P4_PSRAM_PUP_DUMMY,
+                           ESP32P4_PSRAM_PUP_DUMMY);
     qtest_writel(qts, SPI0_PSRAM + MMU_ITEM_INDEX, 1);
     qtest_writel(qts, SPI0_PSRAM + MMU_ITEM_CONTENT,
                  PSRAM_VALID | PSRAM_ACCESS | 7);

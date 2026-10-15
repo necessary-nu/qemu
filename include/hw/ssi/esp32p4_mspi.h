@@ -118,10 +118,15 @@ struct ESP32P4MSPIState {
     /* The status reads FLASH_WAITI_CTRL makes follow the transaction. */
     bool spi1_waiti;
     /*
-     * SPI0's address phase, as USER1 last set it, logged as longer than
-     * the address.
+     * The hazards logged for SPI0's set-up as its registers last set it
+     * (MSPI_LOGGED_*): logged once until software writes SPI0's registers.
      */
-    bool spi0_addr_logged;
+    uint32_t spi0_logged;
+    /*
+     * The cores (bit n for CPU index n) whose access the AXI port holds
+     * until it takes accesses again (esp32p4_mspi_axi_ready()).
+     */
+    uint32_t axi_waiting;
 
     /* The manual encryption block: its state and the ciphertext. */
     uint32_t xts_state;
@@ -136,6 +141,21 @@ struct ESP32P4MSPIState {
     uint32_t crypto_ctrl;
     bool download_boot;
 };
+
+/*
+ * Whether the AXI port takes an access by `attrs`'s master now. While the
+ * controller's bus clock is stopped or it is held in reset, its AXI slave
+ * answers nothing; while its core clock is stopped, or CACHE_FCTRL's
+ * AXI_REQ_EN is clear, it takes the access but never runs it on the SPI
+ * bus: on the chip the access never completes, and the bus hangs. A
+ * core's access waits on the bus (esp32p4_cpu_bus_hold()) until the
+ * controller takes accesses again, then is made: returns false with *res
+ * the handler's result that holds it. Another master's, which cannot wait
+ * here, is refused with an error response (logged): returns false with
+ * *res MEMTX_ERROR. Returns true when the access may go on.
+ */
+bool esp32p4_mspi_axi_ready(ESP32P4MSPIState *s, MemTxAttrs attrs,
+                            MemTxResult *res);
 
 /*
  * The AXI port through which the cache, the direct windows and the DMA
