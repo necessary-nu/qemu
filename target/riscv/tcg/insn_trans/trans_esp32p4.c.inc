@@ -335,7 +335,8 @@ static uint32_t esp32p4_trace_kind(DisasContext *ctx, CPURISCVState *env)
  * While the trace encoder traces the core, each instruction reports its
  * start, and with it the retirement of the one before; the encoder learns
  * from the address each starts at whether a branch was taken and where a
- * jump went.
+ * jump went. An instruction the core unwound and executes again reports
+ * its start once (helper_esp32p4_trace_insn()).
  */
 /* [spec:nuos:req:emu.esp32p4.debug] */
 static void gen_esp32p4_trace_insn(DisasContext *ctx, CPURISCVState *env)

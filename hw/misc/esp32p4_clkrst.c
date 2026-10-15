@@ -52,10 +52,27 @@
  *     sets bypasses the divider, and an update has taken effect by the
  *     time software sees SOC_CLK_DIV_UPDATE clear, so it never reads 0.
  *     The source mux changes at once.
- *     The TRM limits CPU_CLK to 400 MHz on v3.x, MEM_CLK and SYS_CLK to
- *     200 MHz and APB_CLK to 100 MHz; a configuration above them is logged
- *     as a guest error and runs as configured, as what the hardware then
- *     does is not documented.
+ *     MEM_CLK and SYS_CLK are limited to 200 MHz and APB_CLK to 100 MHz
+ *     (TRM 11.2.4.1), and CPU_CLK to 400 MHz on v3.x: the TRM's text gives
+ *     360 MHz, earlier silicon's limit, where its figure 11.2-1, its
+ *     chapter 9 ("up to 400 MHz") and the v3.x datasheet (v0.7: "up to 400
+ *     MHz", CPLL_CLK 400 MHz) give 400, and ESP-IDF runs v3.x at 400 MHz
+ *     (rtc_clk.c's 100, 200 and 400 MHz from a 400 MHz CPLL, and
+ *     Kconfig.cpu's ESP_DEFAULT_CPU_FREQ_MHZ_400, the default unless
+ *     ESP32P4_SELECTS_REV_LESS_V3, which offers 360 MHz instead). A
+ *     configuration above a limit is logged as a guest error and runs as
+ *     configured, as what the hardware then does is not documented.
+ *     The TRM (11.3.1) has the four dividers applied one at a time, in an
+ *     order, APB_CLK's to CPU_CLK's as they fall and CPU_CLK's to
+ *     APB_CLK's as they rise, which "helps to prevent high-frequency clock
+ *     glitches", and calls applying them at once "not recommended": an
+ *     update that changes more than one is logged as a guest error, and
+ *     takes effect as written. A sequence of single updates is not judged:
+ *     the order depends on the direction of the switch the updates make
+ *     up, which the hardware does not know (ESP-IDF's switch from 100 to
+ *     200 MHz, then on to 400 MHz, raises MEM_CLK's divider after lowering
+ *     CPU_CLK's, as an upward switch out of order would), and the states
+ *     an update passes through are checked against the limits above.
  *   - The PLLs' fixed dividers: PLL_F240M, F160M, F120M, F80M and F20M
  *     from SPLL_CLK, F50M and F25M from MPLL_CLK (REF_CLK_CTRL*), and the
  *     USB 48 MHz, 12 MHz and 25 MHz from SPLL_CLK and MPLL_CLK
@@ -84,6 +101,15 @@
  *     16 to 26, as v3's headers and figure 43.4-11 have it; the TRM's
  *     register description gives it MIPI_DSI_DPHY_CLK_SRC_SEL's sources,
  *     as earlier silicon had.
+ *     The TRM (11.3.3) has a clock's gate turned off while its source,
+ *     divider or other configuration changes, and on again after, giving
+ *     no consequence otherwise: a change of a source or divider while the
+ *     clock runs with its gate on (a mux or divider with no gate of its
+ *     own: while a gated clock it feeds runs, or, feeding none, while it
+ *     runs itself) is logged as a guest error, and takes effect as
+ *     written. ESP-IDF's UART driver changes SCLK_DIV_NUM so, as it sets a
+ *     baud rate. The HP root and SoC clocks (11.3.1) and the LP system's
+ *     (11.3.2) have their own procedures.
  *   - The PVT monitor's clocks from PLL_F160M_CLK, which ESP-IDF enables
  *     for them (pmu_pvt.c), and the LP ADC's function clock from its bus
  *     clock, LP_PERI_CLK, as TRM table 11.2-7 has it, and its SAR clocks
@@ -2310,6 +2336,179 @@ static void esp32p4_clkrst_check_kept(unsigned idx, uint32_t old,
     }
 }
 
+/* Whether field @f is in register @idx and differs from @old in @new. */
+static bool esp32p4_clkrst_field_changes(ClkField f, unsigned idx,
+                                         uint32_t old, uint32_t new)
+{
+    return f.width && f.reg == idx &&
+           extract32(old, f.shift, f.width) != extract32(new, f.shift,
+                                                         f.width);
+}
+
+/*
+ * Whether clock @id ran before a write of @new to register @idx and its
+ * gates stay on: it has at least one.
+ */
+static bool esp32p4_clkrst_runs_gated(ESP32P4ClkRstState *s, int id,
+                                      const ClkField *gate, int ngates,
+                                      unsigned idx, uint32_t new)
+{
+    bool gated = false;
+
+    for (int i = 0; i < ngates; i++) {
+        uint32_t v;
+
+        if (!gate[i].width) {
+            continue;
+        }
+        v = gate[i].reg == idx ? new : s->regs[gate[i].reg];
+        if (!extract32(v, gate[i].shift, gate[i].width)) {
+            return false;
+        }
+        gated = true;
+    }
+    return gated && s->period[id];
+}
+
+/*
+ * Whether a change of clock @id's source or divider by a write of @new to
+ * register @idx changes a clock that runs with its gate on: @id's own, or,
+ * with none of its own, a gated clock it feeds, or, feeding none, @id
+ * itself as it runs.
+ */
+static bool esp32p4_clkrst_change_in_use(ESP32P4ClkRstState *s, int id,
+                                         unsigned idx, uint32_t new)
+{
+    const ClkDesc *d = &esp32p4_clk_desc[id];
+    bool feeds = false;
+
+    if (d->gate[0].width) {
+        return esp32p4_clkrst_runs_gated(s, id, d->gate,
+                                         ARRAY_SIZE(d->gate), idx, new);
+    }
+    for (int c = 0; c < ESP32P4_NUM_CLOCKS; c++) {
+        const ClkDesc *cd = &esp32p4_clk_desc[c];
+        uint32_t sel = fld(s, cd->sel);
+
+        if (cd->kind == SPECIAL || !cd->gate[0].width ||
+            sel >= cd->nparents || cd->parent[sel] != id) {
+            continue;
+        }
+        feeds = true;
+        if (esp32p4_clkrst_runs_gated(s, c, cd->gate, ARRAY_SIZE(cd->gate),
+                                      idx, new)) {
+            return true;
+        }
+    }
+    return !feeds && s->period[id];
+}
+
+/*
+ * The SDIO host's special clocks: SDIO_LS_CLK's source, divider and gate,
+ * and the source (low-speed or the SDIO PLL, SDIO_HS_MODE) and gate of
+ * the clocks it takes from it. SDIO_LS_CLK's edge counts, which divide
+ * it too, are checked as SDIO_LS_CLK_EDGE_CFG_UPDATE takes them.
+ */
+static const struct {
+    uint16_t clk;
+    ClkField sel;
+    ClkField div;
+    ClkField gate;
+} esp32p4_sdio_procedure[] = {
+    { C(SDIO_LS), B(PERI_CLK_CTRL01, 23), F(PERI_CLK_CTRL02, 0, 8),
+      B(PERI_CLK_CTRL01, 24) },
+    { C(SDIO_SLF), B(PERI_CLK_CTRL01, 22), { 0 }, B(PERI_CLK_CTRL02, 27) },
+    { C(SDIO_DRV), B(PERI_CLK_CTRL01, 22), { 0 }, B(PERI_CLK_CTRL02, 28) },
+    { C(SDIO_SAM), B(PERI_CLK_CTRL01, 22), { 0 }, B(PERI_CLK_CTRL02, 29) },
+};
+
+static void esp32p4_clkrst_log_in_use(unsigned idx, int id, bool src,
+                                      bool div)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "%s: %s changes %s's %s while it runs "
+                  "with its gate on\n", TYPE_ESP32P4_CLKRST,
+                  esp32p4_clkrst_regs[idx].name, esp32p4_clock_names[id],
+                  src && div ? "source and divider" :
+                  src ? "source" : "divider");
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.clocks]
+ * Log a write of @new over @old to register @idx that changes a clock's
+ * source or divider while the clock runs with its gate on, against the
+ * TRM's procedure (11.3.3).
+ */
+static void esp32p4_clkrst_check_in_use(ESP32P4ClkRstState *s, unsigned idx,
+                                        uint32_t old, uint32_t new)
+{
+    for (int id = 0; id < ESP32P4_NUM_CLOCKS; id++) {
+        const ClkDesc *d = &esp32p4_clk_desc[id];
+        bool src, div = false;
+
+        if (d->kind == SPECIAL || id == C(ROOT) || id == C(LP_SLOW) ||
+            id == C(LP_FAST) || id == C(LP_PERI)) {
+            continue;
+        }
+        src = esp32p4_clkrst_field_changes(d->sel, idx, old, new);
+        for (int i = 0; i < ARRAY_SIZE(d->div); i++) {
+            div |= esp32p4_clkrst_field_changes(d->div[i], idx, old, new);
+        }
+        if ((src || div) && esp32p4_clkrst_change_in_use(s, id, idx, new)) {
+            esp32p4_clkrst_log_in_use(idx, id, src, div);
+        }
+    }
+    for (int i = 0; i < ARRAY_SIZE(esp32p4_sdio_procedure); i++) {
+        int id = esp32p4_sdio_procedure[i].clk;
+        bool src = esp32p4_clkrst_field_changes(
+            esp32p4_sdio_procedure[i].sel, idx, old, new);
+        bool div = esp32p4_clkrst_field_changes(
+            esp32p4_sdio_procedure[i].div, idx, old, new);
+
+        if ((src || div) &&
+            esp32p4_clkrst_runs_gated(s, id, &esp32p4_sdio_procedure[i].gate,
+                                      1, idx, new)) {
+            esp32p4_clkrst_log_in_use(idx, id, src, div);
+        }
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.clocks]
+ * Take the SoC clocks' dividers from ROOT_CLK_CTRL0..3, as
+ * SOC_CLK_DIV_UPDATE does, logging an update that changes more than one
+ * of them against the TRM's procedure (11.3.1).
+ */
+static void esp32p4_clkrst_update_soc_div(ESP32P4ClkRstState *s)
+{
+    uint32_t c0 = s->regs[R_ROOT_CLK_CTRL0];
+    uint32_t c1 = s->regs[R_ROOT_CLK_CTRL1];
+    uint32_t c2 = s->regs[R_ROOT_CLK_CTRL2];
+    uint32_t c3 = s->regs[R_ROOT_CLK_CTRL3];
+    const uint8_t div[4][3] = {
+        { extract32(c0, 5, 8), extract32(c0, 13, 8), extract32(c0, 21, 8) },
+        { extract32(c1, 0, 8), extract32(c1, 8, 8), extract32(c1, 16, 8) },
+        { extract32(c1, 24, 8), extract32(c2, 0, 8), extract32(c2, 8, 8) },
+        { extract32(c2, 16, 8), extract32(c2, 24, 8), extract32(c3, 0, 8) },
+    };
+    g_autoptr(GString) changed = g_string_new(NULL);
+    int n = 0;
+
+    for (int i = 0; i < 4; i++) {
+        if (memcmp(div[i], s->soc_div[i], sizeof(div[i]))) {
+            g_string_append_printf(changed, "%s%s", n ? ", " : "",
+                                   esp32p4_soc_names[i]);
+            n++;
+        }
+    }
+    if (n > 1) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: SOC_CLK_DIV_UPDATE applies the "
+                      "dividers of %s at once, where they go one at a time "
+                      "in their order\n", TYPE_ESP32P4_CLKRST,
+                      changed->str);
+    }
+    memcpy(s->soc_div, div, sizeof(s->soc_div));
+}
+
 /* [spec:nuos:req:emu.esp32p4.clocks] */
 static void esp32p4_clkrst_write(ESP32P4ClkRstState *s, int block,
                                  hwaddr addr, uint64_t value, unsigned size)
@@ -2331,33 +2530,24 @@ static void esp32p4_clkrst_write(ESP32P4ClkRstState *s, int block,
     wt = esp32p4_clkrst_regs[idx].wt & lanes & v;
     r = &s->regs[idx];
     old = *r;
+    esp32p4_clkrst_check_in_use(s, idx, old, (old & ~rw) | (v & rw));
     *r = (old & ~rw) | (v & rw);
     esp32p4_clkrst_check_kept(idx, old, *r);
 
     switch (idx) {
     case R_ROOT_CLK_CTRL0:
         if (wt & SOC_CLK_DIV_UPDATE) {
-            uint32_t c0 = s->regs[R_ROOT_CLK_CTRL0];
-            uint32_t c1 = s->regs[R_ROOT_CLK_CTRL1];
-            uint32_t c2 = s->regs[R_ROOT_CLK_CTRL2];
-            uint32_t c3 = s->regs[R_ROOT_CLK_CTRL3];
-
-            s->soc_div[0][0] = extract32(c0, 5, 8);
-            s->soc_div[0][1] = extract32(c0, 13, 8);
-            s->soc_div[0][2] = extract32(c0, 21, 8);
-            s->soc_div[1][0] = extract32(c1, 0, 8);
-            s->soc_div[1][1] = extract32(c1, 8, 8);
-            s->soc_div[1][2] = extract32(c1, 16, 8);
-            s->soc_div[2][0] = extract32(c1, 24, 8);
-            s->soc_div[2][1] = extract32(c2, 0, 8);
-            s->soc_div[2][2] = extract32(c2, 8, 8);
-            s->soc_div[3][0] = extract32(c2, 16, 8);
-            s->soc_div[3][1] = extract32(c2, 24, 8);
-            s->soc_div[3][2] = extract32(c3, 0, 8);
+            esp32p4_clkrst_update_soc_div(s);
         }
         break;
     case R_PERI_CLK_CTRL02:
         if (wt & SDIO_LS_CLK_EDGE_CFG_UPDATE) {
+            if (extract32(*r, 17, 4) != s->sdio_edge[2] &&
+                esp32p4_clkrst_runs_gated(s, C(SDIO_LS),
+                                          &esp32p4_sdio_procedure[0].gate, 1,
+                                          idx, *r)) {
+                esp32p4_clkrst_log_in_use(idx, C(SDIO_LS), false, true);
+            }
             s->sdio_edge[0] = extract32(*r, 9, 4);
             s->sdio_edge[1] = extract32(*r, 13, 4);
             s->sdio_edge[2] = extract32(*r, 17, 4);

@@ -48,9 +48,17 @@ typedef struct Esp32TimgTimerState {
     bool alarm;
     uint64_t alarm_val;
     uint64_t load_val;
+    /* The count, and the prescaler's APB_CLK cycles towards its next tick */
     uint64_t count_base;
+    uint32_t pre;
     uint64_t last_val;
+    /*
+     * APB_CLK's edges are counted from ns_base, the timer's reset or the
+     * clock's last change of rate; synced of them are in count_base and
+     * pre.
+     */
     uint64_t ns_base;
+    uint64_t synced;
     Esp32TimgInterruptType int_type;
     QEMUTimer alarm_timer;
 } Esp32TimgTimerState;
