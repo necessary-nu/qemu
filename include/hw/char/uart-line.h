@@ -28,16 +28,27 @@
  * "tx" is the line the adapter drives (the chip's RX pin), high while
  * idle. A line held low for a whole frame is a break, passed to the
  * character device as one; a break from the character device holds "tx"
- * low for two frames. The adapter has no flow control. Its transmitter is
- * a line source (hw/core/line-time.h): a receiver's register access
- * brings the "tx" line up to its time first.
+ * low for two frames, once the bytes before it have gone. The adapter has
+ * no flow control. Its transmitter is a line source
+ * (hw/core/line-time.h): a receiver's register access brings the "tx"
+ * line up to its time first.
+ *
+ * The host's bytes wait for the line in a queue of UART_LINE_TX_QUEUE
+ * (355 ms of the line at 115200 baud), as a host's serial driver buffers
+ * what is written to its port, and the character device is read as the
+ * queue has room. Without icount the transmitter's timer runs late, and
+ * the queue gains room only as it runs: a receiver's access bringing the
+ * line up to its time sends what the queue holds, and the host's next
+ * bytes come once the main loop reads them. A queue holding less than
+ * the line carries over the timer's lateness would leave the line idle
+ * until then, which with the timer on time it never is.
  */
 #define TYPE_UART_LINE "uart-line"
 OBJECT_DECLARE_SIMPLE_TYPE(UARTLineState, UART_LINE)
 
 #define UART_LINE_RX "rx"
 #define UART_LINE_TX "tx"
-#define UART_LINE_TX_QUEUE 16
+#define UART_LINE_TX_QUEUE 4096
 
 struct UARTLineState {
     SysBusDevice parent_obj;
@@ -65,7 +76,9 @@ struct UARTLineState {
     int32_t tx_len;
     int32_t tx_bit;
     uint8_t txd;
+    /* A break from the host, after tx_break_after more bytes */
     bool tx_break;
+    uint32_t tx_break_after;
     /* The chip's RX line as a source its receiver syncs (line_sync()). */
     Notifier line_source;
 };
