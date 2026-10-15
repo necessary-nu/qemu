@@ -1201,8 +1201,8 @@ static const VMStateDescription vmstate_esp32p4_counters = {
 /* The inputs from the system registers and the debug assistant's state. */
 static const VMStateDescription vmstate_esp32p4_debug = {
     .name = "esp32p4-cpu/debug",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(err_resp_dis, ESP32P4CPU),
         VMSTATE_BOOL(wakeup, ESP32P4CPU),
@@ -1215,6 +1215,9 @@ static const VMStateDescription vmstate_esp32p4_debug = {
         VMSTATE_UINT32(spmon_min, ESP32P4CPU),
         VMSTATE_UINT32(spmon_max, ESP32P4CPU),
         VMSTATE_UINT32(spmon_out, ESP32P4CPU),
+        VMSTATE_UINT32(trace_start_pc, ESP32P4CPU),
+        VMSTATE_BOOL(trace_started, ESP32P4CPU),
+        VMSTATE_BOOL(trace_unwound, ESP32P4CPU),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1259,16 +1262,19 @@ static void (*esp32p4_riscv_restore_state_to_opc)(CPUState *cs,
 /*
  * The core unwinds from the middle of an instruction's code to its start,
  * as the instruction raises an exception or is to execute again: it has
- * not retired, though it counted itself as it started.
+ * not retired, though it counted itself as it started and reported its
+ * start to the trace.
  */
 /* [spec:nuos:req:emu.esp32p4.cpu] */
 /* [spec:nuos:req:emu.esp32p4.lp-core] */
+/* [spec:nuos:req:emu.esp32p4.debug] */
 static void esp32p4_restore_state_to_opc(CPUState *cs,
                                          const TranslationBlock *tb,
                                          const uint64_t *data)
 {
     esp32p4_riscv_restore_state_to_opc(cs, tb, data);
     esp32p4_cpu_of(cs)->insns--;
+    esp32p4_trace_unwound(esp32p4_cpu_of(cs), true);
 }
 #endif
 

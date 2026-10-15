@@ -11,6 +11,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/registerfields.h"
 #include "hw/core/clock.h"
+#include "hw/gpio/esp32_line.h"
 #include "qemu/timer.h"
 #include "qemu/notify.h"
 
@@ -115,6 +116,8 @@ typedef struct Esp32LEDCState {
     uint32_t date;
     /* Edges have been lost to a host too slow for them (logged once) */
     bool lag_logged;
+    /* How far behind the timers' catch-ups end (esp32_line_caught_up()) */
+    Esp32LineLag lag;
 
     Notifier line_source;
 } Esp32LEDCState;

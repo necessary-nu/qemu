@@ -20,6 +20,13 @@
  * with them: a UART whose software stops reading overflows its RX FIFO
  * and loses bytes, as on silicon.
  *
+ * Without a chardev there is no bridge on the pads: the terminal drives
+ * nothing, and the board does not have it watch the pad carrying the
+ * chip's TXD either (esp32_uart_terminal_attached()). Nothing would see
+ * the frames it took from there, and a pad something watches makes the
+ * block driving it time each edge for it: a PWM output, RMT or PARLIO
+ * on such a pad would cost the host every edge for no one.
+ *
  * Only on the host's clock (neither icount nor qtest's clock) does it
  * pace them: it starts a frame only while the UART's RX FIFO has room for
  * it and the frame before, which the UART may still be decoding
@@ -325,6 +332,13 @@ static void term_format_changed(Notifier *n, void *data)
 static void term_line_sync(Notifier *n, void *data)
 {
     term_tx_advance(container_of(n, Esp32UartTerminalState, line_source));
+}
+
+/* [spec:nuos:req:emu.esp32.gpio] */
+/* [spec:nuos:req:emu.esp32p4.uart] */
+bool esp32_uart_terminal_attached(Esp32UartTerminalState *s)
+{
+    return qemu_chr_fe_backend_connected(&s->chr);
 }
 
 static void esp32_uart_terminal_realize(DeviceState *dev, Error **errp)

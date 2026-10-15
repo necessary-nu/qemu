@@ -159,7 +159,9 @@
  * integrations time their lines), and what it times from there it times
  * from that. Register accesses, clock changes and the card-side inputs
  * first take the events that fell due before them, in time order, so
- * that software sees the controller as it is at the access.
+ * that software sees the controller as it is at the access; each is
+ * taken at one moment, the present as it begins, as an event is at its
+ * time, though without icount the virtual clock moves on meanwhile.
  *
  * Not modelled: boot mode, CE-ATA (CCS, CCSD) and MMC CMD40's interrupt
  * response, which are logged as unimplemented; CLKENA's low-power clock
@@ -501,6 +503,21 @@ static void dwc_run_event(DWCSDMMCState *s, int64_t when,
     s->in_event = true;
     line_run_at(when, dwc_event_at, &e);
     s->in_event = was;
+}
+
+/*
+ * Take an access or a change of an input, @fn, at the present, fixed for
+ * all of it, as an event is at its time: without icount the virtual clock
+ * moves on as the model works, and what an access finds (a card busy, a
+ * command waiting for it) and what it schedules from that (a wake at the
+ * busy's end) must be of one moment, or an end falling between them is
+ * neither seen nor waited for, and the command is never taken.
+ */
+static void dwc_at_present(void (*fn)(void *opaque), void *opaque)
+{
+    DWCEvent e = { .when = dwc_now(), .fn = fn, .opaque = opaque };
+
+    line_run_at(e.when, dwc_event_at, &e);
 }
 
 static uint64_t dwc_default_cclk_period(DWCSDMMCState *s)
@@ -2372,10 +2389,18 @@ static bool dwc_reg_read(DWCSDMMCState *s, hwaddr offset, uint32_t *v)
     return true;
 }
 
+/* A register access, taken at the present (dwc_at_present()) */
+typedef struct DWCAccess {
+    DWCSDMMCState *s;
+    hwaddr offset;
+    unsigned size;
+    uint64_t value;
+} DWCAccess;
+
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */
-static uint64_t dwc_sdmmc_read(void *opaque, hwaddr offset, unsigned size)
+static uint64_t dwc_sdmmc_do_read(DWCSDMMCState *s, hwaddr offset,
+                                  unsigned size)
 {
-    DWCSDMMCState *s = DWC_SDMMC(opaque);
     DWCSDMMCClass *dc = DWC_SDMMC_GET_CLASS(s);
     hwaddr reg = offset & ~3;
     uint32_t v;
@@ -2397,6 +2422,21 @@ static uint64_t dwc_sdmmc_read(void *opaque, hwaddr offset, unsigned size)
         return 0;
     }
     return extract32(v, (offset & 3) * 8, size * 8);
+}
+
+static void dwc_sdmmc_read_now(void *opaque)
+{
+    DWCAccess *a = opaque;
+
+    a->value = dwc_sdmmc_do_read(a->s, a->offset, a->size);
+}
+
+static uint64_t dwc_sdmmc_read(void *opaque, hwaddr offset, unsigned size)
+{
+    DWCAccess a = { .s = DWC_SDMMC(opaque), .offset = offset, .size = size };
+
+    dwc_at_present(dwc_sdmmc_read_now, &a);
+    return a.value;
 }
 
 /* Write @value's bits under @mask to register @offset. */
@@ -2576,10 +2616,9 @@ static bool dwc_reg_write(DWCSDMMCState *s, hwaddr offset, uint32_t value,
 }
 
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */
-static void dwc_sdmmc_write(void *opaque, hwaddr offset, uint64_t value,
-                            unsigned size)
+static void dwc_sdmmc_do_write(DWCSDMMCState *s, hwaddr offset,
+                               uint64_t value, unsigned size)
 {
-    DWCSDMMCState *s = DWC_SDMMC(opaque);
     DWCSDMMCClass *dc = DWC_SDMMC_GET_CLASS(s);
     hwaddr reg = offset & ~3;
     unsigned shift = (offset & 3) * 8;
@@ -2601,6 +2640,24 @@ static void dwc_sdmmc_write(void *opaque, hwaddr offset, uint64_t value,
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write at 0x%03" HWADDR_PRIx
                       ", which has no register\n", TYPE_DWC_SDMMC, offset);
     }
+}
+
+static void dwc_sdmmc_write_now(void *opaque)
+{
+    DWCAccess *a = opaque;
+
+    dwc_sdmmc_do_write(a->s, a->offset, a->value, a->size);
+}
+
+static void dwc_sdmmc_write(void *opaque, hwaddr offset, uint64_t value,
+                            unsigned size)
+{
+    DWCAccess a = {
+        .s = DWC_SDMMC(opaque), .offset = offset, .size = size,
+        .value = value,
+    };
+
+    dwc_at_present(dwc_sdmmc_write_now, &a);
 }
 
 static const MemoryRegionOps dwc_sdmmc_ops = {
@@ -2714,13 +2771,28 @@ void dwc_sdmmc_catch_up(DWCSDMMCState *s)
     dwc_catch_up(s, dwc_now());
 }
 
-static void dwc_card_detect_n(void *opaque, int slot, int level)
+/* A change of an input, taken at the present (dwc_at_present()) */
+typedef struct DWCInput {
+    DWCSDMMCState *s;
+    int slot;
+    int level;
+} DWCInput;
+
+static void dwc_card_detect_n_now(void *opaque)
 {
-    DWCSDMMCState *s = opaque;
+    DWCInput *in = opaque;
+    DWCSDMMCState *s = in->s;
 
     dwc_catch_up(s, dwc_now());
-    s->cd_n_in = deposit32(s->cd_n_in, slot, 1, level != 0);
-    dwc_debounce_arm(s, slot);
+    s->cd_n_in = deposit32(s->cd_n_in, in->slot, 1, in->level != 0);
+    dwc_debounce_arm(s, in->slot);
+}
+
+static void dwc_card_detect_n(void *opaque, int slot, int level)
+{
+    DWCInput in = { .s = opaque, .slot = slot, .level = level };
+
+    dwc_at_present(dwc_card_detect_n_now, &in);
 }
 
 static void dwc_card_write_prt(void *opaque, int slot, int level)
@@ -2750,20 +2822,37 @@ static void dwc_card_irq(DeviceState *dev, unsigned slot, bool level)
     dwc_sdmmc_update_irq(s);
 }
 
+static void dwc_card_power_now(void *opaque)
+{
+    DWCInput *in = opaque;
+    DWCSDMMCState *s = in->s;
+
+    dwc_catch_up(s, dwc_now());
+    sdbus_set_power(&s->sdbus[in->slot], in->level);
+    dwc_sdmmc_update(s);
+}
+
 /* [spec:nuos:req:emu.sd-card-power-cut] */
 void dwc_sdmmc_set_card_power(DWCSDMMCState *s, unsigned slot, bool on)
 {
+    DWCInput in = { .s = s, .slot = slot, .level = on };
+
+    dwc_at_present(dwc_card_power_now, &in);
+}
+
+static void dwc_lines_changed_now(void *opaque)
+{
+    DWCSDMMCState *s = opaque;
+
     dwc_catch_up(s, dwc_now());
-    sdbus_set_power(&s->sdbus[slot], on);
+    dwc_sdclk_sync(s);
     dwc_sdmmc_update(s);
 }
 
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */
 void dwc_sdmmc_lines_changed(DWCSDMMCState *s)
 {
-    dwc_catch_up(s, dwc_now());
-    dwc_sdclk_sync(s);
-    dwc_sdmmc_update(s);
+    dwc_at_present(dwc_lines_changed_now, s);
 }
 
 /* [spec:nuos:req:emu.sd-card-timing] */
@@ -2825,6 +2914,17 @@ static void dwc_card_lines(DeviceState *dev)
     dwc_run_event(s, when, dwc_lines_run, s);
 }
 
+static void dwc_pad_mv_now(void *opaque)
+{
+    DWCInput *in = opaque;
+    DWCSDMMCState *s = in->s;
+
+    dwc_catch_up(s, dwc_now());
+    s->pad_mv[in->slot] = MAX(in->level, 0);
+    dwc_sdclk_sync(s);
+    dwc_sdmmc_update(s);
+}
+
 /*
  * [spec:nuos:req:emu.esp32p4.sd-uhs]
  * A slot's pad supply, in mV, changes: what the card sees and what the
@@ -2832,12 +2932,9 @@ static void dwc_card_lines(DeviceState *dev)
  */
 static void dwc_pad_mv(void *opaque, int slot, int mv)
 {
-    DWCSDMMCState *s = opaque;
+    DWCInput in = { .s = opaque, .slot = slot, .level = mv };
 
-    dwc_catch_up(s, dwc_now());
-    s->pad_mv[slot] = MAX(mv, 0);
-    dwc_sdclk_sync(s);
-    dwc_sdmmc_update(s);
+    dwc_at_present(dwc_pad_mv_now, &in);
 }
 
 uint64_t dwc_sdmmc_card_div(DWCSDMMCState *s, unsigned slot)
@@ -2845,14 +2942,10 @@ uint64_t dwc_sdmmc_card_div(DWCSDMMCState *s, unsigned slot)
     return dwc_card_div(s, slot);
 }
 
-static void dwc_clock_update(void *opaque, ClockEvent event)
+static void dwc_clock_changed_now(void *opaque)
 {
     DWCSDMMCState *s = opaque;
 
-    if (event == ClockPreUpdate) {
-        dwc_catch_up(s, dwc_now());
-        return;
-    }
     for (unsigned slot = 0; slot < s->num_slots; slot++) {
         if (!timer_pending(&s->debounce_timer[slot])) {
             dwc_debounce_arm(s, slot);
@@ -2863,6 +2956,17 @@ static void dwc_clock_update(void *opaque, ClockEvent event)
     }
     dwc_sdclk_sync(s);
     dwc_sdmmc_update(s);
+}
+
+static void dwc_clock_update(void *opaque, ClockEvent event)
+{
+    DWCSDMMCState *s = opaque;
+
+    if (event == ClockPreUpdate) {
+        dwc_catch_up(s, dwc_now());
+        return;
+    }
+    dwc_at_present(dwc_clock_changed_now, s);
 }
 
 void dwc_sdmmc_clock_changed(DWCSDMMCState *s)

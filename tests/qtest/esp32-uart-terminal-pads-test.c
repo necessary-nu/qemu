@@ -164,6 +164,103 @@ static void test_serial1(void)
     g_free(path);
 }
 
+#define DPORT_PERIP_RST_EN      0x3ff000c4
+#define PERIP_UART2             (1u << 23)
+#define PERIP_PWM0              (1u << 17)
+#define PWM0                    0x3ff5e000
+#define PWM_CLK_CFG             (PWM0 + 0x000)
+#define PWM_TIMER0_CFG0         (PWM0 + 0x004)
+#define PWM_TIMER0_CFG1         (PWM0 + 0x008)
+#define PWM_GEN0_TSTMP_A        (PWM0 + 0x040)
+#define PWM_GEN0_A              (PWM0 + 0x050)
+/* GEN0_A: high at TEZ, low at TEA; timer 0 running on, counting up */
+#define GEN_UTEZ_HIGH_UTEA_LOW  ((2u << 0) | (1u << 4))
+#define TIMER_RUN_UP            (2 | (1u << 3))
+#define SIG_PWM0_OUT0A          32
+#define SIG_U2TXD               198
+#define UART2                   0x3ff6e000
+#define GPIO_ENABLE_W1TS        (FP_GPIO + 0x24)
+#define IO_MUX_GPIO17           (FP_IO_MUX + 0x50)
+
+#define TIMG0_WDTCONFIG0        0x3ff5f048
+#define RTC_WDTCONFIG0          0x3ff4808c
+#define RTC_WDTWPROTECT         0x3ff480a4
+#define RTC_WDT_WKEY            0x50d83aa1
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio/test]
+ * [spec:nuos:req:emu.esp32.mcpwm/test]
+ * A terminal without a chardev listens to nothing. With serial2 left out,
+ * MCPWM0's PWM0A on its TX pad, GPIO17, PWM_clk at 40 MHz (PLL_F160M_CLK
+ * by 4), high for the first 25 ns of each 50 ns (40 million edges a
+ * second), reaches a pad nothing watches: its edges are not timed, and a
+ * second of them costs the host next to nothing (timed one by one they
+ * cost it tens of seconds), GPIO_IN reading the exact level as software
+ * samples it. Given a chardev, serial2 receives exactly the frames UART2
+ * sends on GPIO17. (serial1's TX pad, GPIO33, is an RTC pad, whose input
+ * RTCIO takes whatever the terminal does.)
+ */
+static void test_idle_serial2(void)
+{
+    static const char msg[] = "idle\r\n";
+    g_autofree char *dir = g_dir_make_tmp("esp32-terminal-XXXXXX", NULL);
+    g_autofree char *port2 = g_build_filename(dir, "port2", NULL);
+    g_autofree char *got = NULL;
+    QTestState *qts = qtest_init("-M esp32 -nic none -serial null");
+    uint32_t en = qtest_readl(qts, DPORT_PERIP_CLK_EN);
+    int64_t t0, c, host;
+    size_t len;
+
+    /* The flash boot watchdogs would reset the chip within the second. */
+    qtest_writel(qts, TIMG0_WDTCONFIG0, 0);
+    qtest_writel(qts, RTC_WDTWPROTECT, RTC_WDT_WKEY);
+    qtest_writel(qts, RTC_WDTCONFIG0, 0);
+    qtest_writel(qts, IO_MUX_GPIO17, MCU_SEL(PIN_FUNC_GPIO) | FUN_IE);
+    qtest_writel(qts, FP_FUNC_OUT(17), SIG_PWM0_OUT0A);
+    qtest_writel(qts, DPORT_PERIP_RST_EN,
+                 qtest_readl(qts, DPORT_PERIP_RST_EN) & ~PERIP_PWM0);
+    /* The block's clock enabled at t0: PWM_clk's edges from there */
+    t0 = qtest_clock_step(qts, 1000);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, en & ~PERIP_PWM0);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, en | PERIP_PWM0);
+    qtest_writel(qts, PWM_CLK_CFG, 3);
+    qtest_writel(qts, PWM_GEN0_TSTMP_A, 1);
+    qtest_writel(qts, PWM_GEN0_A, GEN_UTEZ_HIGH_UTEA_LOW);
+    qtest_writel(qts, PWM_TIMER0_CFG0, 1u << 8);
+    qtest_writel(qts, PWM_TIMER0_CFG1, TIMER_RUN_UP);
+
+    c = t0 + 1000 * 1000 * 1000;
+    host = g_get_monotonic_time();
+    qtest_clock_step(qts, c + 10 - t0);
+    host = g_get_monotonic_time() - host;
+    g_assert_cmpint(host, <, G_USEC_PER_SEC / 2);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 17), ==, 1u << 17);
+    qtest_clock_step(qts, 20);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 17), ==, 0);
+    qtest_clock_step(qts, 44);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 17), ==, 1u << 17);
+    qtest_quit(qts);
+
+    qts = qtest_initf("-M esp32 -nic none -serial null -serial null "
+                      "-serial file:%s", port2);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN,
+                 qtest_readl(qts, DPORT_PERIP_CLK_EN) | PERIP_UART2 |
+                 PERIP_UART_MEM);
+    qtest_writel(qts, UART2 + UART_CLKDIV, CLKDIV_115200);
+    qtest_writel(qts, IO_MUX_GPIO17, MCU_SEL(PIN_FUNC_GPIO) | FUN_IE);
+    qtest_writel(qts, FP_FUNC_OUT(17), SIG_U2TXD);
+    qtest_writel(qts, GPIO_ENABLE_W1TS, 1u << 17);
+    for (int i = 0; msg[i]; i++) {
+        qtest_writel(qts, UART2 + UART_FIFO, msg[i]);
+    }
+    qtest_clock_step(qts, MS);
+    g_assert(g_file_get_contents(port2, &got, &len, NULL));
+    g_assert_cmpmem(got, len, msg, strlen(msg));
+    qtest_quit(qts);
+    unlink(port2);
+    rmdir(dir);
+}
+
 /* QEMU's exit status for a command line the machine must refuse */
 static int run_qemu(const char *args)
 {
@@ -214,6 +311,8 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32/uart-terminal-pads/flash-untouched",
                    test_flash_untouched);
     qtest_add_func("/esp32/uart-terminal-pads/serial1", test_serial1);
+    qtest_add_func("/esp32/uart-terminal-pads/idle-serial2",
+                   test_idle_serial2);
     qtest_add_func("/esp32/uart-terminal-pads/refused", test_refused);
     ret = g_test_run();
     unlink(flash_path);

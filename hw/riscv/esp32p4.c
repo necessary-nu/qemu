@@ -178,10 +178,14 @@
  *
  *       -M esp32p4,serial1-pads=10:11
  *
- *     A port drives its RXD pad, idle high, only while its chardev is
- *     connected:
+ *     A port drives its RXD pad, idle high, and watches its TXD pad only
+ *     while its chardev is connected:
  *
  *       -serial stdio -serial null -serial file:uart2.log
+ *
+ *     A port with none (-serial none, or past the last -serial) is
+ *     nothing on its pads: a PWM output, RMT or PARLIO driving its TXD pad
+ *     is not timed edge by edge for it.
  *
  *     Port 0 thus holds the strapping pin GPIO38 high through a reset,
  *     unless its terminal holds a break there (its "break" property), as
@@ -4716,9 +4720,11 @@ static void esp32p4_init_uart(ESP32P4MachineState *s)
         object_property_set_link(OBJECT(term), "uart",
                                  OBJECT(lp ? &s->lp_uart : &s->uart[i]),
                                  &error_abort);
-        esp32p4_gpio_watch_pad(&s->gpio, tx_pad,
-                               qdev_get_gpio_in_named(term,
-                                   ESP32_UART_TERMINAL_RX, 0));
+        if (esp32_uart_terminal_attached(&s->terminal[i])) {
+            esp32p4_gpio_watch_pad(&s->gpio, tx_pad,
+                                   qdev_get_gpio_in_named(term,
+                                       ESP32_UART_TERMINAL_RX, 0));
+        }
         qdev_connect_gpio_out_named(term, ESP32_UART_TERMINAL_TX, 0,
                                     esp32p4_gpio_ext_in(&s->gpio, d, rx_pad));
         qdev_realize(term, NULL, &error_fatal);
