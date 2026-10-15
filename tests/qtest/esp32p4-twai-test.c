@@ -385,6 +385,41 @@ static void test_reset_values(void)
     stop();
 }
 
+/*
+ * With TWAIn_APB_CLK gated a register read that would clear something
+ * (INT, ALC, ECC) reads 0 and clears nothing; the rest read what they
+ * hold.
+ */
+/* [spec:nuos:req:emu.esp32p4.twai/test] */
+static void test_gated_reads(void)
+{
+    uint8_t f[13];
+    int bits;
+
+    start("");
+    clocks_on();
+    route(2, 30, 30);
+    setup(2, BTR0_1M, BTR1_1M, MODE_STM);
+    step(20 * BIT_NS);
+    wr(2, INT_ENA, INT_TI | INT_RI);
+    sff(f, 0x123, false, 0, NULL);
+    bits = frame_bits(f);
+    load(2, f);
+    wr(2, CMD, CMD_SRR);
+    step((bits + 4) * BIT_NS);
+    qtest_writel(qts, SOC_CLK_CTRL2,
+                 qtest_readl(qts, SOC_CLK_CTRL2) & ~TWAI_APB_CLK_EN(2));
+    g_assert_cmphex(rd(2, INT), ==, 0);
+    g_assert_cmphex(rd(2, ALC), ==, 0);
+    g_assert_cmphex(rd(2, ECC), ==, 0);
+    g_assert_cmphex(rd(2, INT_ENA), ==, INT_TI | INT_RI);
+    g_assert_cmphex(rd(2, RMC), ==, 1);
+    clocks_on();
+    g_assert_cmphex(rd(2, INT), ==, INT_TI | INT_RI);
+    g_assert_cmphex(rd(2, INT), ==, INT_RI);
+    stop();
+}
+
 /* Which registers take writes in reset mode, operation mode, or never */
 /* [spec:nuos:req:emu.esp32p4.twai/test] */
 static void test_register_access(void)
@@ -1438,6 +1473,7 @@ int main(int argc, char **argv)
 
     qtest_add_func("esp32p4/twai/reset_values", test_reset_values);
     qtest_add_func("esp32p4/twai/register_access", test_register_access);
+    qtest_add_func("esp32p4/twai/gated_reads", test_gated_reads);
     qtest_add_func("esp32p4/twai/frames", test_frames);
     qtest_add_func("esp32p4/twai/interrupts", test_interrupts);
     qtest_add_func("esp32p4/twai/filters", test_filters);

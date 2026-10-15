@@ -12,6 +12,7 @@
 #include "hw/core/clock.h"
 #include "hw/core/qdev.h"
 #include "hw/core/sysbus.h"
+#include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "hw/misc/esp32p4_mipi.h"
 #include "qemu/timer.h"
@@ -191,6 +192,8 @@ struct ESP32P4DsiBridgeState {
     QEMUTimer *timer;
     QEMUTimer *req_timer;
     ESP32P4DsiHostState *host;
+    /* VDMA, which feeds the FIFO: brought up to each pixel event */
+    ESP32P4DwGdmaState *vdma;
 
     uint32_t regs[0x104 / 4];
     /* The DPI registers in effect, from DPI_CONFIG_UPDATE. */

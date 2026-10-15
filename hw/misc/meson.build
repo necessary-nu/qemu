@@ -221,6 +221,8 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
 ))
 
 system_ss.add(when: 'CONFIG_ESP32_MCPWM', if_true: files('esp32_mcpwm.c'))
+system_ss.add(when: 'CONFIG_ESP32_GATED_REGION',
+              if_true: files('esp32_gated_region.c'))
 
 system_ss.add(when: 'CONFIG_ESP32P4', if_true: files(
   'esp32p4_adc.c',

@@ -71,6 +71,12 @@
  *     runs it (esp32_line_run_at()); register accesses, VDMA's writes and
  *     acknowledges, and DPI clock changes first run the DPI's events and
  *     the request interval's end that fell due before them, in order.
+ *     Each piece of a line first brings in VDMA's rounds due by its time
+ *     (the "vdma" link, esp32p4_dw_gdma_sync()), whose QEMU timer can run
+ *     late as well: else an access catching the DPI up would take the
+ *     FIFO short of what VDMA had written by then, an underrun the chip
+ *     never has. VDMA's writes then reach the FIFO's port during the
+ *     bridge's own register access, which its port allows.
  *
  * The DSI host (0x500A0000), DesignWare-derived, with its D-PHY:
  *
@@ -2888,6 +2894,9 @@ static void brg_event(void *opaque)
         uint32_t want = DIV_ROUND_UP(MIN(k * px, s->hdisp) * MAX(bits, 8), 8);
         uint32_t row = s->line - s->vsync - s->vbank;
 
+        if (s->vdma) {
+            esp32p4_dw_gdma_sync(s->vdma, t);
+        }
         if (!s->underrun && want > s->raw_len) {
             uint32_t got = brg_fifo_out(s, s->raw + s->raw_len,
                                         want - s->raw_len);
@@ -3267,6 +3276,8 @@ static void brg_init(Object *obj)
                           ESP32P4_DSI_REGS_SIZE);
     memory_region_init_io(&s->mem, obj, &brg_mem_ops, s,
                           "esp32p4.mipi-dsi-mem", ESP32P4_DSI_MEM_SIZE);
+    /* VDMA's writes, which a pixel event brings in, during any access. */
+    s->mem.disable_reentrancy_guard = true;
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
@@ -3295,6 +3306,8 @@ static void brg_finalize(Object *obj)
 static const Property brg_properties[] = {
     DEFINE_PROP_LINK("dsi-host", ESP32P4DsiBridgeState, host,
                      TYPE_ESP32P4_DSI_HOST, ESP32P4DsiHostState *),
+    DEFINE_PROP_LINK("vdma", ESP32P4DsiBridgeState, vdma,
+                     TYPE_ESP32P4_DW_GDMA, ESP32P4DwGdmaState *),
 };
 
 static const VMStateDescription vmstate_brg = {
