@@ -17,6 +17,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "esp32p4-psram.h"
 #include "qobject/qdict.h"
 
 #define PINS                0x500e1200u
@@ -278,7 +279,8 @@ static void psram_write(uint32_t addr, const uint32_t *data, int words)
     for (int i = 0; i < words; i++) {
         wr(SPI1_PSRAM + W(i), data[i]);
     }
-    spi1_user(SPI1_PSRAM, PSRAM_SYNC_WRITE, 16, addr, 32, 8, 4 * words, 0);
+    spi1_user(SPI1_PSRAM, PSRAM_SYNC_WRITE, 16, addr, 32,
+              ESP32P4_PSRAM_PUP_DUMMY, 4 * words, 0);
 }
 
 static void psram_read(uint32_t addr, uint32_t *data, int words)
@@ -286,7 +288,8 @@ static void psram_read(uint32_t addr, uint32_t *data, int words)
     for (int i = 0; i < words; i++) {
         wr(SPI1_PSRAM + W(i), 0);
     }
-    spi1_user(SPI1_PSRAM, PSRAM_SYNC_READ, 16, addr, 32, 18, 0, 4 * words);
+    spi1_user(SPI1_PSRAM, PSRAM_SYNC_READ, 16, addr, 32,
+              ESP32P4_PSRAM_PUP_DUMMY, 0, 4 * words);
     for (int i = 0; i < words; i++) {
         data[i] = rd(SPI1_PSRAM + W(i));
     }
@@ -307,7 +310,8 @@ static void data_delay(unsigned dlc)
  * the data; the data lines delayed 1.5 ns, at 240 MHz, sampled before
  * their beats, each byte reads the one before; the strobe delayed 1.5 ns,
  * after them, each reads the one after; the rising edges' delay alone,
- * the even beats only. DQS_LOOP, or an SDR read, takes no strobe.
+ * the even beats only. DQS_LOOP takes no strobe; in SDR the die takes no
+ * command at all.
  */
 /* [spec:nuos:req:emu.esp32p4.memory/test] */
 static void test_psram_strobe(void)
@@ -318,12 +322,11 @@ static void test_psram_strobe(void)
     int64_t at;
 
     qts = qtest_init("-M esp32p4,strap-mode=0");
-    wr(SPI1_PSRAM + MISC, 1);
+    esp32p4_psram_spi1_opi(qts);
     psram_write(0x100, ref, 2);
     t = psram_fast();
     g_assert_cmpuint(t, >=, 4100);
     g_assert_cmpuint(t, <=, 4200);
-    wr(SPI1_PSRAM + DDR, rd(SPI1_PSRAM + DDR) | DDR_EN);
 
     psram_read(0x100, got, 2);
     g_assert_cmphex(got[0], ==, 0);
@@ -357,22 +360,26 @@ static void test_psram_strobe(void)
     g_assert_cmphex(got[0], ==, 0x44442222);
     g_assert_cmphex(got[1], ==, 0x88886666);
 
-    /* DQS_LOOP: the controller's own strobe; and an SDR read. */
+    /*
+     * DQS_LOOP: the controller's own strobe. In SDR the die takes no
+     * command: nothing drives the lines.
+     */
     wr(SPI1_PSRAM + DDR, rd(SPI1_PSRAM + DDR) | DDR_DQS_LOOP);
     psram_read(0x100, got, 2);
     g_assert_cmphex(got[0], ==, ref[0]);
     wr(SPI1_PSRAM + DDR, rd(SPI1_PSRAM + DDR) & ~(DDR_DQS_LOOP | DDR_EN));
     wr(PSRAM_DQS(0), 0);
     psram_read(0x100, got, 2);
-    g_assert_cmphex(got[0], ==, ref[0]);
+    g_assert_cmphex(got[0], ==, 0);
     qtest_quit(qts);
 }
 
 /*
- * The die in x16 mode (MR8 bit 6): two bytes a beat, the even on DQ0 to
- * DQ7 with DQS0, the odd on DQ8 to DQ15 with DQS1. DQS1 off: the odd
- * bytes read 0. DQ8 to DQ15 delayed: the odd bytes take the beat
- * before's. Through SPI0 and the MMU, with SMEM_DDR, alike.
+ * The die in x16 mode (MR8 bit 6), the ports' data on 16 lines (SPI0's
+ * SRAM_CMD SDIN_HEX): two bytes a beat, the even on DQ0 to DQ7 with DQS0,
+ * the odd on DQ8 to DQ15 with DQS1. DQS1 off: the odd bytes read 0. DQ8
+ * to DQ15 delayed: the odd bytes take the beat before's. Through SPI0 and
+ * the MMU, with SMEM_DDR, alike; in SDR the die takes no command.
  */
 /* [spec:nuos:req:emu.esp32p4.memory/test] */
 static void test_psram_x16(void)
@@ -381,12 +388,14 @@ static void test_psram_x16(void)
     uint32_t got[2], mr8 = 1u << 6;
 
     qts = qtest_init("-M esp32p4,strap-mode=0");
-    wr(SPI1_PSRAM + MISC, 1);
+    esp32p4_psram_spi1_opi(qts);
     psram_write(0x200, ref, 2);
     wr(SPI1_PSRAM + W(0), mr8);
     spi1_user(SPI1_PSRAM, PSRAM_REG_WRITE, 16, 8, 32, 0, 1, 0);
     psram_fast();
-    wr(SPI1_PSRAM + DDR, rd(SPI1_PSRAM + DDR) | DDR_EN);
+    /* Both ports' data on 16 lines, which SPI0's SRAM_CMD sets. */
+    esp32p4_psram_spi0_opi(qts, true, ESP32P4_PSRAM_PUP_DUMMY,
+                           ESP32P4_PSRAM_PUP_DUMMY);
     wr(PSRAM_DQS(0), DQS_XPD);
     psram_read(0x200, got, 2);
     g_assert_cmphex(got[0], ==, 0x00330011);
@@ -402,13 +411,12 @@ static void test_psram_x16(void)
     g_assert_cmphex(got[0], ==, 0x22330011);
     g_assert_cmphex(got[1], ==, 0x66774455);
 
-    wr(SPI0_PSRAM + CACHE_FCTRL, rd(SPI0_PSRAM + CACHE_FCTRL) &
-       ~CLOSE_AXI_INF_EN);
+    /* SPI0's DDR read through the same pads; in SDR, nothing. */
     wr(SPI0_PSRAM + MMU_ITEM_INDEX, 0);
     wr(SPI0_PSRAM + MMU_ITEM_CONTENT, PSRAM_VALID | PSRAM_ACCESS | 0);
-    g_assert_cmphex(rd(PSRAM_DIRECT + 0x200), ==, ref[0]);
-    wr(SPI0_PSRAM + SMEM_DDR, rd(SPI0_PSRAM + SMEM_DDR) | DDR_EN);
     g_assert_cmphex(rd(PSRAM_DIRECT + 0x200), ==, 0x22330011);
+    wr(SPI0_PSRAM + SMEM_DDR, rd(SPI0_PSRAM + SMEM_DDR) & ~DDR_EN);
+    g_assert_cmphex(rd(PSRAM_DIRECT + 0x200), ==, 0);
     qtest_quit(qts);
 }
 

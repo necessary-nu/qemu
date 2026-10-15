@@ -14,6 +14,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "libqtest.h"
+#include "esp32p4-psram.h"
 
 #define FLASH_SIZE          (16 * 1024 * 1024)
 #define FLASH_CACHED        0x40000000
@@ -110,8 +111,29 @@ static uint32_t mmu_get(QTestState *qts, uint32_t spi0, uint32_t entry)
     return qtest_readl(qts, spi0 + MMU_ITEM_CONTENT);
 }
 
+/*
+ * SPI0's flash reads set up as the boot ROM leaves them (esp32p4_boot.c):
+ * DIO, command BBh from USER2, 28 address bits (the address and the mode
+ * bits' upper half, WB_MODE's 0) and 2 dummy cycles, the first driven
+ * high. Out of reset SPI0 sends FAST_READ (0Bh) with no dummy phase, which
+ * reads the flash a byte late, as the chip would.
+ */
+static void spi0_rom_read_setup(QTestState *qts)
+{
+    qtest_writel(qts, SPI0_FLASH + 0x008, 0x00ac200c);
+    qtest_writel(qts, SPI0_FLASH + 0x018, 0x200000c0);
+    qtest_writel(qts, SPI0_FLASH + 0x01c, 0x6c000041);
+    qtest_writel(qts, SPI0_FLASH + 0x020, 0x700000bb);
+    qtest_writel(qts, SPI0_FLASH + 0x02c, 0);
+    qtest_writel(qts, SPI0_FLASH + CACHE_FCTRL,
+                 qtest_readl(qts, SPI0_FLASH + CACHE_FCTRL) | 0x5);
+}
+
 static void axi_open(QTestState *qts, uint32_t spi0)
 {
+    if (spi0 == SPI0_FLASH) {
+        spi0_rom_read_setup(qts);
+    }
     qtest_writel(qts, spi0 + CACHE_FCTRL,
                  qtest_readl(qts, spi0 + CACHE_FCTRL) & ~CLOSE_AXI_INF_EN);
 }
@@ -235,7 +257,10 @@ static void test_psram_pages(void)
     char *image;
     QTestState *qts = start(&image);
 
-    axi_open(qts, SPI0_PSRAM);
+    /* SPI0 set up for the die as it powers up. */
+    esp32p4_psram_dqs_on(qts);
+    esp32p4_psram_spi0_opi(qts, false, ESP32P4_PSRAM_PUP_DUMMY,
+                           ESP32P4_PSRAM_PUP_DUMMY);
     mmu_set(qts, SPI0_PSRAM, 0, PSRAM_VALID | PSRAM_ACCESS | 9);
     mmu_set(qts, SPI0_PSRAM, 4, PSRAM_VALID | PSRAM_ACCESS | 9);
     qtest_writel(qts, PSRAM_DIRECT + 0x80, 0x12345678);

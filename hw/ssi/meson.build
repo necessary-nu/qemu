@@ -14,5 +14,6 @@ system_ss.add(when: 'CONFIG_IBEX', if_true: files('ibex_spi_host.c'))
 system_ss.add(when: 'CONFIG_BCM2835_SPI', if_true: files('bcm2835_spi.c'))
 system_ss.add(when: 'CONFIG_PNV_SPI', if_true: files('pnv_spi.c'))
 system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files('esp32_spi.c', 'esp32_spi_dma.c'))
-system_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_mspi.c',
-                                                   'esp32p4_spi.c'))
+system_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_spi.c'))
+# Holds the cores' accesses on the bus.
+specific_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_mspi.c'))

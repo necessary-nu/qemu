@@ -1822,6 +1822,30 @@ static MemTxResult cache_debug_access(ESP32P4CacheView *v, uint32_t off,
 }
 
 /*
+ * Whether a core's access at `off` through L1 cache `l1`, or past it,
+ * reaches the external memory: through the controller's AXI port, which
+ * may hold it (esp32p4_mspi_axi_ready()). A fill takes the fill block's
+ * lines from the L2 where it holds all of them.
+ */
+static bool cache_needs_memory(ESP32P4CacheView *v, int l1, uint32_t off,
+                               bool past_l1)
+{
+    uint32_t first = QEMU_ALIGN_DOWN(off, FILL) / ESP32P4_CACHE_LINE;
+
+    if (!view_ext(v)) {
+        return false;
+    }
+    if (past_l1) {
+        return !test_bit(off / ESP32P4_CACHE_LINE, v->l2_valid);
+    }
+    if (l1_holds_page(v, l1, first)) {
+        return false;
+    }
+    return find_next_zero_bit(v->l2_valid, first + LINES_PER_FILL, first) <
+           first + LINES_PER_FILL;
+}
+
+/*
  * An access through a core's translations, by that core: through its
  * instruction cache for a fetch, the data cache for a load or store. The
  * memory system makes each access within a naturally aligned unit of its
@@ -1865,6 +1889,13 @@ static MemTxResult cache_view_access(ESP32P4CacheView *v, uint32_t off,
     l1 = cache_access_l1(attrs, write, &core);
     dbus = l1 == L1_D;
     if (cache_l1_bypassed(c, l1)) {
+        if (cache_needs_memory(v, l1, off, true) &&
+            !esp32p4_mspi_axi_ready(view_mspi(v), attrs, &r)) {
+            if (!write) {
+                *data = 0;
+            }
+            return r;
+        }
         r = cache_past_l1(v, off, buf, size, write, false);
         if (r != MEMTX_OK) {
             memset(buf, 0, sizeof(buf));
@@ -1880,6 +1911,13 @@ static MemTxResult cache_view_access(ESP32P4CacheView *v, uint32_t off,
             *data = 0;
         }
         return cache_access_fail(c, view_vaddr(v, off), false, core, dbus);
+    }
+    if (cache_needs_memory(v, l1, off, false) &&
+        !esp32p4_mspi_axi_ready(view_mspi(v), attrs, &r)) {
+        if (!write) {
+            *data = 0;
+        }
+        return r;
     }
     r = l1_fill_block(v, l1, off);
     if (r != MEMTX_OK) {

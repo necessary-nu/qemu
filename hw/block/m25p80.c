@@ -2158,6 +2158,67 @@ uint8_t m25p80_continuous_cmd(DeviceState *dev)
     return s && s->pi->chip ? m25chip_continuous_cmd(&s->chip) : 0;
 }
 
+/*
+ * [spec:nuos:req:emu.flash-chip]
+ * A part this file decodes itself takes the address and dummy bytes of
+ * the dual and quad I/O reads on their two or four lines, sends the data
+ * of the dual and quad reads on theirs, takes a quad or dual page
+ * program's data on its four or two, and in a Numonyx part's dual or quad
+ * I/O mode moves every byte on those lines.
+ */
+unsigned m25p80_io_lines(DeviceState *dev)
+{
+    Flash *s = (Flash *)object_dynamic_cast(OBJECT(dev), TYPE_M25P80);
+
+    if (!s) {
+        return 1;
+    }
+    if (s->pi->chip) {
+        return m25chip_io_lines(&s->chip);
+    }
+    if (get_man(s) == MAN_NUMONYX && numonyx_mode(s) != MODE_STD) {
+        return numonyx_mode(s) == MODE_QIO ? 4 : 2;
+    }
+    switch (s->state) {
+    case STATE_COLLECTING_DATA:
+    case STATE_COLLECTING_VAR_LEN_DATA:
+        switch (s->cmd_in_progress) {
+        case DIOR:
+        case DIOR4:
+            return 2;
+        case QIOR:
+        case QIOR4:
+            return 4;
+        }
+        return 1;
+    case STATE_PAGE_PROGRAM:
+        switch (s->cmd_in_progress) {
+        case DPP:
+            return 2;
+        case QPP:
+        case QPP_4:
+            return 4;
+        }
+        return 1;
+    case STATE_READ:
+    case STATE_READING_DATA:
+        switch (s->cmd_in_progress) {
+        case DOR:
+        case DOR4:
+        case DIOR:
+        case DIOR4:
+            return 2;
+        case QOR:
+        case QOR4:
+        case QIOR:
+        case QIOR4:
+            return 4;
+        }
+        return 1;
+    }
+    return 1;
+}
+
 /* [spec:nuos:req:emu.flash-power-cut] */
 void m25p80_power_off(DeviceState *dev)
 {
