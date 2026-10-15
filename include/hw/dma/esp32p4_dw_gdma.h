@@ -12,6 +12,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "hw/core/clock.h"
+#include "qemu/notify.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "system/memory.h"
@@ -155,6 +156,12 @@ struct ESP32P4DwGdmaState {
     bool hs_last[ESP32P4_DW_GDMA_HS];
     /* The arbiters' last grants, reads and writes. */
     uint32_t rr_last[2];
+
+    /* The streams feeding VDMA's handshakes (esp32p4_dw_gdma_add_source()) */
+    NotifierList sources;
+    bool syncing_sources;
+    /* A round is under way (dw_run()) */
+    bool in_round;
 };
 
 /*
@@ -166,5 +173,18 @@ struct ESP32P4DwGdmaState {
  * must allow that (disable_reentrancy_guard).
  */
 void esp32p4_dw_gdma_sync(ESP32P4DwGdmaState *s, int64_t now);
+
+/*
+ * A peripheral that VDMA reads through a handshake interface, its data
+ * coming from a stream of QEMU timers of its own that run late without
+ * icount (the CSI bridge, a camera's frames through the CSI host and the
+ * ISP), adds a notifier: VDMA's register accesses first call it, at their
+ * time (esp32_line_time()), and it brings the stream up to then, each of
+ * the stream's events at its own time, with VDMA's rounds due before each
+ * brought in first (esp32p4_dw_gdma_sync()). The requests the stream
+ * raises then come at their times, and VDMA's rounds take what it had
+ * brought by theirs, however late its timers.
+ */
+void esp32p4_dw_gdma_add_source(ESP32P4DwGdmaState *s, Notifier *n);
 
 #endif

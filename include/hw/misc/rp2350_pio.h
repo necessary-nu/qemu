@@ -235,6 +235,9 @@ struct RP2350PIOState {
     QEMUTimer *in_timer;
     int64_t in_due_ns;
 
+    /* Software sampling the pads brings the blocks up to time first. */
+    Notifier line_source;
+
     /* Levels last driven on the outputs, GPIO-numbered for the pins. */
     uint64_t drv_out[RP2350_PIO_BLOCKS];
     uint64_t drv_oe[RP2350_PIO_BLOCKS];

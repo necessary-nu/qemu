@@ -130,6 +130,7 @@
 #include "hw/gpio/esp32_line.h"
 #include "hw/timer/esp32p4_timg.h"
 #include "migration/vmstate.h"
+#include "target/riscv/esp32p4_cpu.h"
 
 #define A_TCONFIG(x)        (0x00 + 0x24 * (x))
 #define TIMER_REGS_END      0x48
@@ -1354,19 +1355,31 @@ static bool timg_read_reg(ESP32P4TimgState *s, hwaddr addr, uint32_t *v)
     }
 }
 
-static uint64_t timg_read(void *opaque, hwaddr addr, unsigned size)
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * An access first takes what fell due by then; a reset or stall of the
+ * core making it among that (a stage's CPU or HP core reset, a system
+ * reset) comes before the access, which the core does not make
+ * (esp32p4_cpu_access_stopped()).
+ */
+static MemTxResult timg_read(void *opaque, hwaddr addr, uint64_t *data,
+                             unsigned size, MemTxAttrs attrs)
 {
     ESP32P4TimgState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t v;
 
     timg_access_catch_up(s, now);
+    if (esp32p4_cpu_access_stopped(attrs)) {
+        return MEMTX_ERROR;
+    }
     timg_cal_access(s, addr & ~3, now);
     if (!timg_read_reg(s, addr & ~3, &v)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s%u: read of reserved offset 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_TIMG, s->group, addr);
     }
-    return extract32(v, (addr & 3) * 8, size * 8);
+    *data = extract32(v, (addr & 3) * 8, size * 8);
+    return MEMTX_OK;
 }
 
 /* [spec:nuos:req:emu.esp32p4.timers] */
@@ -1514,8 +1527,8 @@ static void timg_write_reg(ESP32P4TimgState *s, hwaddr addr, uint32_t value,
     }
 }
 
-static void timg_write(void *opaque, hwaddr addr, uint64_t data,
-                       unsigned size)
+static MemTxResult timg_write(void *opaque, hwaddr addr, uint64_t data,
+                              unsigned size, MemTxAttrs attrs)
 {
     ESP32P4TimgState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -1523,18 +1536,23 @@ static void timg_write(void *opaque, hwaddr addr, uint64_t data,
     uint32_t lanes = MAKE_64BIT_MASK(shift, size * 8);
     uint32_t ones = (data << shift) & lanes;
     uint32_t old;
+    bool kept = timg_access_catch_up(s, now);
 
-    if (!timg_access_catch_up(s, now)) {
-        return;
+    if (esp32p4_cpu_access_stopped(attrs)) {
+        return MEMTX_ERROR;
+    }
+    if (!kept) {
+        return MEMTX_OK;
     }
     timg_cal_access(s, addr & ~3, now);
     timg_read_reg(s, addr & ~3, &old);
     timg_write_reg(s, addr & ~3, (old & ~lanes) | ones, ones, now);
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps timg_ops = {
-    .read = timg_read,
-    .write = timg_write,
+    .read_with_attrs = timg_read,
+    .write_with_attrs = timg_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,

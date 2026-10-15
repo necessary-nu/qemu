@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "hw/misc/esp32p4_image_source.h"
 #include "hw/misc/esp32p4_mipi.h"
@@ -115,6 +116,14 @@ void esp32p4_csi_host_sync(ESP32P4CsiHostState *s);
 /*
  * The CSI host that feeds the bridge (its "host" link), brought up to
  * esp32_line_time(), for the ISP's register accesses.
+ *
+ * VDMA (the bridge's "vdma" link) reads the buffer at its port as its
+ * rounds take it: the bridge brings in VDMA's rounds due by each of the
+ * stream's events before taking the event, and the stream up to each of
+ * VDMA's reads of the port and accesses to VDMA's registers
+ * (esp32p4_dw_gdma_add_source()), so that, however late the QEMU timers
+ * of either, the stream and VDMA's rounds reach the buffer in the order of
+ * their times.
  */
 void esp32p4_csi_bridge_sync_host(ESP32P4CsiBridgeState *s);
 void esp32p4_csi_bridge_attach_isp(ESP32P4CsiBridgeState *s,
@@ -193,6 +202,14 @@ struct ESP32P4CsiBridgeState {
     Clock *clk_bus;
     QEMUTimer *req_timer;
     ESP32P4CsiHostState *host;
+    /*
+     * VDMA, which reads the buffer (its "vdma" link): the stream is
+     * brought up to its accesses and its rounds to the stream's events.
+     */
+    ESP32P4DwGdmaState *vdma;
+    Notifier vdma_source;
+    /* Bringing the stream up to time, its events coming in meanwhile */
+    bool in_stream;
     const ESP32P4CsiIdiOps *isp_ops;
     void *isp;
     ESP32P4CsiDmaWriteFn *isp_dma_write;

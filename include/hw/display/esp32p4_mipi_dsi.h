@@ -105,6 +105,8 @@ struct ESP32P4DsiHostState {
 
     MemoryRegion iomem;
     qemu_irq irq;
+    /* The bridge whose DPI the host follows (its "dsi-host" link) */
+    ESP32P4DsiBridgeState *bridge;
     Clock *clk_cfg;
     Clock *clk_ref;
     Clock *lanebyteclk;

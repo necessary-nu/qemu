@@ -619,6 +619,22 @@ ESP32P4CPU *esp32p4_cpu_bus_waiter(MemTxAttrs attrs);
 MemTxResult esp32p4_cpu_bus_hold(ESP32P4CPU *cpu);
 void esp32p4_cpu_bus_release(ESP32P4CPU *cpu);
 
+/*
+ * An access a reset comes before. A device that first takes, at a core's
+ * access, the events due by then (a watchdog's stage, a step of the
+ * PMU's sleep) can take one that resets the core making the access,
+ * stops its clock, or resets the system: on the chip the core never makes
+ * the access, the reset or stall coming first. From the access's handler,
+ * after that catch-up, esp32p4_cpu_access_stopped() of its attributes
+ * says whether the core making it (esp32p4_cpu_bus_waiter()) is now held
+ * so, its reset input or clock enable holding it or a system reset
+ * pending; if so it holds the access (cpu_hold_access()), and the handler
+ * returns MEMTX_ERROR, not having taken it: the core stops at the
+ * instruction, which has not executed, for the reset or stall to take it
+ * there, and makes it again only if it goes on from there, after a stall.
+ */
+bool esp32p4_cpu_access_stopped(MemTxAttrs attrs);
+
 /* The LP core's start, which the machine gives it. */
 void esp32p4_lp_cpu_set_boot(ESP32P4CPU *cpu, ESP32P4LPBootFn fn,
                              void *opaque);
