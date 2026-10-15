@@ -133,7 +133,11 @@
  * bus, so that each block takes them as it takes the ROM's (UART0's
  * REG_UPDATE among them, which carries the configuration into its core a
  * few cycles after core 0 starts). Blocks the machine does not model take
- * the writes as unimplemented devices do.
+ * the writes as unimplemented devices do. The writes are the ROM's, made
+ * in its place, not the guest's: HP_SYS_CLKRST takes them without judging
+ * them against the TRM's procedures for changing clocks, which the ROM
+ * does not keep to (it changes the flash core clock's divider with the
+ * clock's gate on), so that a guest's error log starts with the guest's.
  */
 
 #include "qemu/osdep.h"
@@ -690,6 +694,7 @@ void esp32p4_present_rom_handoff(ESP32P4MachineState *s)
     uint32_t saved_pc[2];
 
     current_cpu = CPU(&s->hp_cpu[0]);
+    esp32p4_clkrst_set_rom_handoff(&s->clkrst, true);
     /* _init: the CLIC's 3 level bits (MNLBITS). */
     rom_set(CLIC_MCLICCFG, 6);
     rom_main(s, saved_pc);
@@ -699,6 +704,7 @@ void esp32p4_present_rom_handoff(ESP32P4MachineState *s)
     rom_load_image(s);
     rom_boot_cache_finish();
     rom_core0(s);
+    esp32p4_clkrst_set_rom_handoff(&s->clkrst, false);
     current_cpu = self;
 }
 
