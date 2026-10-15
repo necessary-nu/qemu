@@ -127,7 +127,6 @@ void esp32_gated_region_init(Esp32GatedRegion *r, DeviceState *dev,
     r->block = block;
     r->pass = pass;
     r->opaque = opaque;
-    address_space_init(&r->block_as, block, as_name);
     memory_region_init(&r->mr, NULL, name, size);
     /*
      * No owner: an owner's re-entrancy guard would block the forwarded
@@ -136,12 +135,13 @@ void esp32_gated_region_init(Esp32GatedRegion *r, DeviceState *dev,
      */
     memory_region_init_io(&r->through, NULL, &esp32_gated_region_ops, r,
                           name, size);
-    memory_region_add_subregion_overlap(&r->mr, 0, &r->through, 0);
     r->in_place = esp32_gated_region_fits(block) &&
                   memory_region_set_gate(block, &r->through, pass, opaque);
     if (r->in_place) {
-        memory_region_init_alias(&r->direct, NULL, name, block, 0, size);
-        memory_region_add_subregion_overlap(&r->mr, 0, &r->direct, 1);
+        memory_region_add_subregion(&r->mr, 0, block);
+    } else {
+        address_space_init(&r->block_as, block, as_name);
+        memory_region_add_subregion(&r->mr, 0, &r->through);
     }
 }
 

@@ -20,21 +20,20 @@
  * split and checked as the block's region splits and checks them.
  *
  * Where the block's region allows it (a single I/O region whose accesses
- * are split as @mr's are: at most 4 bytes, aligned), @mr maps the block's
- * region itself, and the gate decides each access to it in place
- * (memory_region_set_gate()): an access is one dispatch. Otherwise the
- * gate's own region, @through, takes the accesses and passes those the
- * gate lets through on: to the I/O region that holds the access, where
- * the block's region is a container of them, as the block's (the RMT's
- * registers and its RAM, which share a page: mapped side by side in
- * place they would make TCG find the region of each access through the
- * page's own small address space, costing more than the gate's); to the
- * block's region through an address space of its own for the rest.
+ * are split as @mr's are: at most 4 bytes, aligned), @mr holds the
+ * block's region itself, and the gate decides each access to it in place
+ * (memory_region_set_gate(), the gate's own region @through, unmapped,
+ * the front whose checks come first): an access is one dispatch.
+ * Otherwise @mr holds @through, which takes the accesses and passes
+ * those the gate lets through on: to the I/O region that holds the
+ * access, where the block's region is a container of them, as the RMT's
+ * is (its registers and its RAM, which share a page: mapped side by side
+ * in place they would make TCG find the region of each access through
+ * the page's own small address space, costing more than the gate's); to
+ * the block's region through an address space of its own for the rest.
  */
 typedef struct Esp32GatedRegion {
     MemoryRegion mr;
-    /* An alias of the block's region, in front of @through, if in place */
-    MemoryRegion direct;
     MemoryRegion through;
     MemoryRegion *block;
     AddressSpace block_as;
