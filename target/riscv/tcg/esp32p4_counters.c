@@ -466,15 +466,27 @@ void HELPER(esp32p4_branch)(CPURISCVState *env, uint32_t taken)
 
 /*
  * The core begins to wait on the bus, or ends its wait: the cycles of
- * its clock between are the LP core's memory access wait cycles.
+ * its clock between are the LP core's memory access wait cycles. The wait
+ * begins at an edge of the core's clock, where its held instruction
+ * would have begun, and ends at the edge the core goes on from, under
+ * icount the first at or after the release (icount_get_cpu_edge()): the
+ * release comes when the device's timer fires, whose time may fall
+ * within the core's cycle.
  */
 /* [spec:nuos:req:emu.esp32p4.lp-core] */
 void esp32p4_counters_bus_wait(ESP32P4CPU *cpu, bool wait)
 {
+    CtrTime t;
     uint64_t now;
 
     BQL_LOCK_GUARD();
-    now = ctr_raw(cpu, CTR_CYCLE);
+    if (!wait && icount_enabled()) {
+        t.ns = icount_get_cpu_edge(CPU(cpu), &t.frac);
+    } else {
+        t = ctr_now();
+    }
+    ctr_cycles_sync(cpu, t);
+    now = cpu->cycles;
 
     if (wait) {
         cpu->bus_wait_from = now;
