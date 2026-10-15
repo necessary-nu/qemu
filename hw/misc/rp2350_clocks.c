@@ -27,11 +27,47 @@
  *    the generators with a FRAC field; an integer part of 0 divides by
  *    its maximum plus one), and gated by ENABLE and KILL where it has
  *    them. A generator whose source is stopped is stopped. A glitchless
- *    mux completes a switch (SELECTED shows the source) only once the new
- *    source is running; until then its output is stopped. Enabling and
- *    switching take effect at once rather than after two source cycles.
+ *    mux switching from one input keeps showing it in SELECTED for two
+ *    cycles of it, as it lets go of it; SELECTED then reads 0 for two
+ *    cycles of the new input, as it takes that up, and then shows the new
+ *    input once that runs. The output follows the new input at once,
+ *    though: those cycles of the old input, and the stop while the new
+ *    one is taken up, are not modelled. Clearing ENABLE stops the output
+ *    at once, but ENABLED, and the generator's exposure to a glitch,
+ *    stay for two cycles of its source, as the stop takes on hardware;
+ *    setting it starts the output at once.
  *  - Each TICKS generator ticks every CYCLES clk_ref cycles while it is
  *    enabled.
+ *
+ * Glitches. An auxiliary mux switches with a glitch (datasheet,
+ * "Multiplexers"), so changing AUXSRC glitches the clock while the
+ * generator's output follows the aux mux:
+ *
+ *  - for clk_ref and clk_sys, while the glitchless mux passes the aux
+ *    mux, or is switching from it or taking it up (SELECTED not yet
+ *    showing the new input). A write that changes SRC away from the aux
+ *    mux and AUXSRC together glitches; one that changes SRC to the aux
+ *    mux and AUXSRC together does not, the mux taking the aux mux up only
+ *    two cycles of its old input later. While the resuscitation circuit
+ *    has clk_sys on clk_ref, clk_sys's aux mux is not passed;
+ *  - for the others, while the generator runs (ENABLED set, which it
+ *    stays for two source cycles after ENABLE clears) and a destination
+ *    is out of reset. Setting KILL then glitches it too ("Divider").
+ *
+ * A glitch reaches every generator running from the glitched one, and is
+ * logged as a guest error naming the generator and the rule broken. Its
+ * effect:
+ *
+ *  - on clk_sys (directly, or from clk_ref while clk_sys runs from it),
+ *    the processors and everything else clk_sys clocks stop: clk_sys's
+ *    output stops until CLOCKS is reset, as by a watchdog reset through
+ *    the PSM. The generator itself runs on, so the resuscitation circuit
+ *    sees no stop and does not restart it;
+ *  - on clk_ref, nothing beyond the generators running from it: the tick
+ *    generators it clocks count on, so the watchdog still fires;
+ *  - on a peripheral clock, its destinations out of reset are left
+ *    undefined until they are reset (rp2350_clocks_set_glitch_fn());
+ *  - on a GPOUT, nothing on the chip: its destination is off-chip.
  *
  * The frequency counter (FC0) waits FC0_DELAY clk_ref cycles, then for
  * the clock under test to run (WAITING), then counts its edges for the
@@ -219,6 +255,10 @@ static void rp2350_clkregs_class_init(ObjectClass *klass, const void *data)
 #define CTRL_KILL          (1u << 10)
 #define CTRL_AUXSRC_SHIFT  5
 
+/* A glitchless mux's input from its generator's auxiliary mux. */
+#define GL_AUX             1
+#define GL_NONE            (-1)
+
 #define RESUS_CTRL_CLEAR   (1u << 16)
 #define RESUS_CTRL_FRCE    (1u << 12)
 #define RESUS_CTRL_ENABLE  (1u << 8)
@@ -371,12 +411,100 @@ static bool clk_has_enable(int n)
     return n != RP2350_CLK_REF && n != RP2350_CLK_SYS;
 }
 
+/* The index of generator n's glitchless mux, or -1 if it has none. */
+static int clk_glitchless(int n)
+{
+    switch (n) {
+    case RP2350_CLK_REF:
+        return 0;
+    case RP2350_CLK_SYS:
+        return 1;
+    }
+    return -1;
+}
+
+/* CTRL's SRC field of a generator with a glitchless mux. */
+static uint32_t clk_src_mask(int n)
+{
+    return n == RP2350_CLK_REF ? 3 : 1;
+}
+
+/* CTRL's AUXSRC field. */
+static uint32_t clk_aux_mask(int n)
+{
+    switch (n) {
+    case RP2350_CLK_GPOUT0 ... RP2350_CLK_GPOUT3:
+        return 0xfu << CTRL_AUXSRC_SHIFT;
+    case RP2350_CLK_REF:
+        return 0x3u << CTRL_AUXSRC_SHIFT;
+    }
+    return 0x7u << CTRL_AUXSRC_SHIFT;
+}
+
 static uint32_t clocks_reset[CLOCKS_NREGS];
 static uint32_t clocks_wmask[CLOCKS_NREGS];
 
-static uint32_t clk_aux(RP2350ClocksState *s, int n)
+/* The input generator n's auxiliary mux selects with CTRL `ctrl`. */
+static int clk_aux_source(int n, uint32_t ctrl)
 {
-    return s->parent_obj.regs[R_CLK_CTRL(n)] >> CTRL_AUXSRC_SHIFT;
+    uint32_t aux = (ctrl & clk_aux_mask(n)) >> CTRL_AUXSRC_SHIFT;
+
+    switch (n) {
+    case RP2350_CLK_REF:
+        return ref_aux[aux];
+    case RP2350_CLK_SYS:
+        return sys_aux[aux];
+    case RP2350_CLK_PERI:
+        return peri_aux[aux];
+    case RP2350_CLK_HSTX:
+        return hstx_aux[aux];
+    case RP2350_CLK_USB:
+    case RP2350_CLK_ADC:
+        return usb_aux[aux];
+    default:
+        return gpout_aux[n >= RP2350_CLK_GPOUT2][aux];
+    }
+}
+
+/* Input `in` of clk_ref's or clk_sys's glitchless mux with CTRL `ctrl`. */
+static int gl_input_source(int n, uint32_t ctrl, int in)
+{
+    if (in == GL_AUX) {
+        return clk_aux_source(n, ctrl);
+    }
+    if (n == RP2350_CLK_REF) {
+        return ref_glitchless[in];
+    }
+    return SRC_GEN(RP2350_CLK_REF);
+}
+
+/* Whether glitchless mux g is in a switch, which has yet to complete. */
+static bool gl_switching(RP2350ClocksState *s, int g)
+{
+    return s->gl_from[g] != GL_NONE &&
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->gl_done_ns[g];
+}
+
+/*
+ * Whether generator n's glitchless mux is exposed to its input `in`, so
+ * that a glitch on the input reaches its output: while it passes the
+ * input, and while it lets go of it or takes it up in a switch, until the
+ * switch completes ("SELECTED = 0x0 implies a switch is in progress ...
+ * the glitchless mux is vulnerable to glitches on the auxiliary mux").
+ * During a switch's first two cycles the mux has not yet started taking
+ * up the new input.
+ */
+static bool gl_exposed(RP2350ClocksState *s, int n, int in)
+{
+    int g = clk_glitchless(n);
+    int src = s->parent_obj.regs[R_CLK_CTRL(n)] & clk_src_mask(n);
+
+    if (!gl_switching(s, g)) {
+        return src == in;
+    }
+    return s->gl_from[g] == in ||
+           (src == in &&
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->gl_leave_ns[g]);
 }
 
 /* The input generator n's muxes select. */
@@ -384,27 +512,10 @@ static int clk_source(RP2350ClocksState *s, int n)
 {
     uint32_t ctrl = s->parent_obj.regs[R_CLK_CTRL(n)];
 
-    switch (n) {
-    case RP2350_CLK_REF:
-        if ((ctrl & 3) == 1) {
-            return ref_aux[clk_aux(s, n) & 3];
-        }
-        return ref_glitchless[ctrl & 3];
-    case RP2350_CLK_SYS:
-        if (ctrl & 1) {
-            return sys_aux[clk_aux(s, n) & 7];
-        }
-        return SRC_GEN(RP2350_CLK_REF);
-    case RP2350_CLK_PERI:
-        return peri_aux[clk_aux(s, n) & 7];
-    case RP2350_CLK_HSTX:
-        return hstx_aux[clk_aux(s, n) & 7];
-    case RP2350_CLK_USB:
-    case RP2350_CLK_ADC:
-        return usb_aux[clk_aux(s, n) & 7];
-    default:
-        return gpout_aux[n >= RP2350_CLK_GPOUT2][clk_aux(s, n) & 0xf];
+    if (clk_glitchless(n) >= 0) {
+        return gl_input_source(n, ctrl, ctrl & clk_src_mask(n));
     }
+    return clk_aux_source(n, ctrl);
 }
 
 static uint64_t source_period(RP2350ClocksState *s, int src)
@@ -416,6 +527,18 @@ static uint64_t source_period(RP2350ClocksState *s, int src)
         return clock_get(s->clk[src - SRC_CLK]);
     }
     return clock_get(s->src[src]);
+}
+
+/*
+ * The time `cycles` cycles of a clock of `period` take, in ns rounded up;
+ * 0 for a stopped clock.
+ */
+static int64_t cycles_ns(uint64_t period, unsigned cycles)
+{
+    uint64_t lo, hi;
+
+    mulu64(&lo, &hi, period, cycles);
+    return (hi << 32 | lo >> 32) + !!(uint32_t)lo;
 }
 
 /* The divisor of generator n in 16.16 fixed point. */
@@ -446,8 +569,10 @@ static uint64_t clk_period(RP2350ClocksState *s, int n, uint64_t src)
 }
 
 /*
- * ENABLED follows ENABLE while the generator's source runs, since the
- * enable is synchronised to the source clock; KILL stops it at once.
+ * The generator's output follows ENABLE while its source runs, since the
+ * enable is synchronised to the source clock; KILL stops it at once. A
+ * clear of ENABLE leaves ENABLED set for two cycles of the source ("Clock
+ * generators require two cycles of the source clock to stop the output").
  */
 static void clk_update_enabled(RP2350ClocksState *s, int n, uint64_t src)
 {
@@ -455,9 +580,27 @@ static void clk_update_enabled(RP2350ClocksState *s, int n, uint64_t src)
 
     if (ctrl & CTRL_KILL) {
         s->enabled &= ~BIT(n);
-    } else if (src) {
-        s->enabled = deposit32(s->enabled, n, 1, !!(ctrl & CTRL_ENABLE));
+        s->stop_ns[n] = 0;
+    } else if (!src) {
+        return;
+    } else if (ctrl & CTRL_ENABLE) {
+        s->enabled |= BIT(n);
+        s->stop_ns[n] = 0;
+    } else if (s->enabled & BIT(n)) {
+        s->enabled &= ~BIT(n);
+        s->stop_ns[n] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                        cycles_ns(src, 2);
     }
+}
+
+/*
+ * Whether a generator with an enable runs, as ENABLED shows: its output
+ * enabled, or stopping, within two source cycles of ENABLE clearing.
+ */
+static bool clk_running(RP2350ClocksState *s, int n)
+{
+    return (s->enabled & BIT(n)) ||
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->stop_ns[n];
 }
 
 static void clocks_update_irq(RP2350ClocksState *s)
@@ -497,31 +640,38 @@ static void clocks_resus_arm(RP2350ClocksState *s, uint64_t sys)
 }
 
 /*
- * Recompute every generator, in dependency order: clk_ref, then clk_sys
- * (which may run from clk_ref), then the clocks that may run from
- * clk_sys, then the GPOUTs, which may run from any of them.
+ * The generators in dependency order: clk_ref, then clk_sys (which may
+ * run from clk_ref), then the clocks that may run from clk_sys, then the
+ * GPOUTs, which may run from any of them.
  */
+static const int clk_order[RP2350_NUM_CLOCKS] = {
+    RP2350_CLK_REF, RP2350_CLK_SYS, RP2350_CLK_PERI, RP2350_CLK_HSTX,
+    RP2350_CLK_USB, RP2350_CLK_ADC, RP2350_CLK_GPOUT0,
+    RP2350_CLK_GPOUT1, RP2350_CLK_GPOUT2, RP2350_CLK_GPOUT3,
+};
+
+/* Recompute every generator, in dependency order. */
 /* [spec:nuos:req:emu.clock-tree] */
 static void clocks_update(RP2350ClocksState *s)
 {
-    static const int order[RP2350_NUM_CLOCKS] = {
-        RP2350_CLK_REF, RP2350_CLK_SYS, RP2350_CLK_PERI, RP2350_CLK_HSTX,
-        RP2350_CLK_USB, RP2350_CLK_ADC, RP2350_CLK_GPOUT0,
-        RP2350_CLK_GPOUT1, RP2350_CLK_GPOUT2, RP2350_CLK_GPOUT3,
-    };
     int i;
 
     for (i = 0; i < RP2350_NUM_CLOCKS; i++) {
-        int n = order[i];
+        int n = clk_order[i];
         uint64_t src = source_period(s, clk_source(s, n));
         uint64_t period;
 
-        clk_update_enabled(s, n, src);
+        if (clk_has_enable(n)) {
+            clk_update_enabled(s, n, src);
+        }
         period = clk_period(s, n, src);
         if (n == RP2350_CLK_SYS) {
             clocks_resus_arm(s, period);
             if (s->resussed) {
                 period = clock_get(s->clk[RP2350_CLK_REF]);
+            }
+            if (s->sys_glitched) {
+                period = 0;
             }
         }
         clock_update(s->clk[n], period);
@@ -541,6 +691,181 @@ static void clocks_resus_cb(void *opaque)
     s->resussed = true;
     clocks_update(s);
     clocks_update_irq(s);
+}
+
+/*
+ * A write of CTRL changes generator n's glitchless mux's SRC from that of
+ * `old` to that of `ctrl`. The mux lets go of the input it is leaving
+ * over two cycles of it, then takes up the new one over two cycles of
+ * that. A change before it lets go keeps the input being left and when
+ * it is let go of; a change while it takes up an input leaves that one.
+ * A stopped input is let go of, or taken up, at once.
+ */
+/* [spec:nuos:req:emu.clocks] */
+/* [spec:nuos:req:emu.clock-tree] */
+static void gl_switch(RP2350ClocksState *s, int n, uint32_t old, uint32_t ctrl)
+{
+    int g = clk_glitchless(n);
+    int to = ctrl & clk_src_mask(n);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t period;
+
+    if (!gl_switching(s, g) || now >= s->gl_leave_ns[g]) {
+        int from = old & clk_src_mask(n);
+
+        period = source_period(s, gl_input_source(n, old, from));
+        s->gl_from[g] = from;
+        s->gl_leave_ns[g] = now + cycles_ns(period, 2);
+    }
+    period = source_period(s, gl_input_source(n, ctrl, to));
+    s->gl_done_ns[g] = MAX(s->gl_leave_ns[g], now) + cycles_ns(period, 2);
+}
+
+/*
+ * Whether a glitch on generator n reaches generator m, which runs from it:
+ * clk_sys while its glitchless mux is exposed to clk_ref, or the
+ * resuscitation circuit has switched it there; the others while they run
+ * from it.
+ */
+static bool clk_follows(RP2350ClocksState *s, int m, int n)
+{
+    uint32_t ctrl = s->parent_obj.regs[R_CLK_CTRL(m)];
+
+    switch (m) {
+    case RP2350_CLK_REF:
+        return false;
+    case RP2350_CLK_SYS:
+        return n == RP2350_CLK_REF && (s->resussed || gl_exposed(s, m, 0));
+    }
+    return clk_running(s, m) && clk_aux_source(m, ctrl) == SRC_GEN(n);
+}
+
+/*
+ * The rule a write of generator n's CTRL from `old` to `ctrl` breaks, if
+ * it glitches the clock; NULL if it does not. For a generator with an
+ * enable, whether a destination is out of reset is left to the caller.
+ */
+static const char *clk_glitch_rule(RP2350ClocksState *s, int n, uint32_t old,
+                                   uint32_t ctrl)
+{
+    bool aux = (old ^ ctrl) & clk_aux_mask(n);
+    int g = clk_glitchless(n);
+
+    if (g >= 0) {
+        /*
+         * The resuscitation circuit has clk_sys on clk_ref. A write that
+         * changes SRC and AUXSRC together finds the mux where it was.
+         */
+        if (!aux || (n == RP2350_CLK_SYS && s->resussed) ||
+            !gl_exposed(s, n, GL_AUX)) {
+            return NULL;
+        }
+        return "AUXSRC changed while the glitchless mux passed the auxiliary "
+               "mux, or had not completed a switch from or to it (SELECTED "
+               "not yet showing the new source)";
+    }
+    if (!clk_running(s, n)) {
+        return NULL;
+    }
+    if (aux) {
+        return "AUXSRC changed while the generator ran (ENABLED set: ENABLE "
+               "not cleared, or cleared less than two source cycles before) "
+               "with a destination out of reset";
+    }
+    if (ctrl & ~old & CTRL_KILL) {
+        return "KILL set while the generator ran with a destination out of "
+               "reset";
+    }
+    return NULL;
+}
+
+/*
+ * Whether a glitch on generator n reaches the logic it clocks, and with
+ * `apply`, leave a peripheral clock's destinations undefined.
+ */
+static bool clk_glitch_dests(RP2350ClocksState *s, int n, bool apply)
+{
+    switch (n) {
+    case RP2350_CLK_PERI:
+    case RP2350_CLK_HSTX:
+    case RP2350_CLK_USB:
+    case RP2350_CLK_ADC:
+        return !s->glitch_fn || s->glitch_fn(s->glitch_opaque, n, apply);
+    }
+    /* clk_ref's and clk_sys's are always clocked; a GPOUT's are off-chip. */
+    return true;
+}
+
+/*
+ * A glitch on generator n, breaking `rule`: it reaches every generator
+ * running from n, and from those, and the logic each clocks out of reset.
+ * If it reaches no logic, its destinations all held in reset, the rule
+ * was kept.
+ */
+/* [spec:nuos:req:emu.clock-tree] */
+static void clocks_glitch(RP2350ClocksState *s, int n, const char *rule)
+{
+    uint32_t glitched = BIT(n), took = 0;
+    g_autoptr(GString) reach = g_string_new(NULL);
+    int i, j, m;
+
+    for (i = 0; i < RP2350_NUM_CLOCKS; i++) {
+        m = clk_order[i];
+        for (j = 0; j < RP2350_NUM_CLOCKS && !(glitched & BIT(m)); j++) {
+            if ((glitched & BIT(j)) && clk_follows(s, m, j)) {
+                glitched |= BIT(m);
+            }
+        }
+    }
+    for (m = 0; m < RP2350_NUM_CLOCKS; m++) {
+        if ((glitched & BIT(m)) && clk_glitch_dests(s, m, false)) {
+            took |= BIT(m);
+            if (m != n) {
+                g_string_append_printf(reach, ", %s", rp2350_clock_names[m]);
+            }
+        }
+    }
+    if (!took) {
+        return;
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "rp2350-clocks: %s glitched: %s%s%s\n",
+                  rp2350_clock_names[n], rule,
+                  reach->len ? "; it reached " : "",
+                  reach->len ? reach->str + 2 : "");
+    for (m = 0; m < RP2350_NUM_CLOCKS; m++) {
+        if (took & BIT(m)) {
+            clk_glitch_dests(s, m, true);
+        }
+    }
+    if ((took & BIT(RP2350_CLK_SYS)) && !s->sys_glitched) {
+        qemu_log_mask(LOG_GUEST_ERROR, "rp2350-clocks: the processors and "
+                      "everything else on clk-sys stop until CLOCKS is "
+                      "reset\n");
+        s->sys_glitched = true;
+        clocks_update(s);
+    }
+}
+
+/*
+ * A write of generator n's CTRL, from `old` to `ctrl`: a change of a
+ * glitchless mux's SRC starts a switch, and a change of AUXSRC or KILL
+ * may glitch the clock.
+ */
+/* [spec:nuos:req:emu.clocks] */
+/* [spec:nuos:req:emu.clock-tree] */
+static void clk_write_ctrl(RP2350ClocksState *s, int n, uint32_t old,
+                           uint32_t ctrl)
+{
+    const char *rule = clk_glitch_rule(s, n, old, ctrl);
+
+    if (clk_glitchless(n) >= 0 && ((old ^ ctrl) & clk_src_mask(n))) {
+        gl_switch(s, n, old, ctrl);
+    }
+    s->parent_obj.regs[R_CLK_CTRL(n)] = ctrl;
+    if (rule) {
+        clocks_glitch(s, n, rule);
+    }
+    clocks_update(s);
 }
 
 /* [spec:nuos:req:emu.clock-tree] */
@@ -762,21 +1087,28 @@ static uint32_t clocks_read(RP2350ClkRegsState *rs, unsigned reg)
 
         switch (reg % CLK_STRIDE) {
         case 0:
-            if (clk_has_enable(n) && (s->enabled & BIT(n))) {
+            if (clk_has_enable(n) && clk_running(s, n)) {
                 ctrl |= CTRL_ENABLED;
             }
             return ctrl;
         case 2:
             /*
              * clk_ref and clk_sys have glitchless muxes, whose SELECTED is
-             * a one-hot of the source once the switch to it completes,
-             * which takes the new source running. The others' read 1.
+             * a one-hot of the input they pass: during a switch, the one
+             * being left until it is let go of, then none; once the switch
+             * completes, the new one while it runs. The others' read 1.
              */
-            if (n == RP2350_CLK_REF || n == RP2350_CLK_SYS) {
+            if (clk_glitchless(n) >= 0) {
+                int g = clk_glitchless(n);
+
+                if (gl_switching(s, g)) {
+                    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) <
+                           s->gl_leave_ns[g] ? 1u << s->gl_from[g] : 0;
+                }
                 if (!source_period(s, clk_source(s, n))) {
                     return 0;
                 }
-                return 1u << (ctrl & (n == RP2350_CLK_REF ? 3 : 1));
+                return 1u << (ctrl & clk_src_mask(n));
             }
             return 1;
         }
@@ -794,6 +1126,22 @@ static uint32_t clocks_read(RP2350ClkRegsState *rs, unsigned reg)
         return regs[R_WAKE_EN1];
     }
     return regs[reg];
+}
+
+/* A write of a generator's CTRL, through any alias. */
+static bool clocks_write(RP2350ClkRegsState *rs, unsigned reg, hwaddr addr,
+                         uint32_t value)
+{
+    uint32_t old = rs->regs[reg];
+    uint32_t mask = clocks_wmask[reg];
+
+    if (reg >= RP2350_NUM_CLOCKS * CLK_STRIDE || reg % CLK_STRIDE) {
+        return false;
+    }
+    value = rp2350_atomic_apply(addr, old, value);
+    clk_write_ctrl(RP2350_CLOCKS(rs), reg / CLK_STRIDE, old,
+                   (old & ~mask) | (value & mask));
+    return true;
 }
 
 static void clocks_written(RP2350ClkRegsState *rs, unsigned reg)
@@ -837,6 +1185,13 @@ static void clocks_written(RP2350ClkRegsState *rs, unsigned reg)
     }
 }
 
+void rp2350_clocks_set_glitch_fn(RP2350ClocksState *s, RP2350ClocksGlitchFn *fn,
+                                 void *opaque)
+{
+    s->glitch_fn = fn;
+    s->glitch_opaque = opaque;
+}
+
 /* [spec:nuos:req:emu.clock-tree] */
 void rp2350_clocks_boot_rom_handoff(RP2350ClocksState *s)
 {
@@ -849,10 +1204,20 @@ void rp2350_clocks_boot_rom_handoff(RP2350ClocksState *s)
 static void clocks_reset_hold(RP2350ClkRegsState *rs)
 {
     RP2350ClocksState *s = RP2350_CLOCKS(rs);
+    int i;
 
     timer_del(s->resus_timer);
     timer_del(s->fc0_timer);
     s->enabled = 0;
+    for (i = 0; i < RP2350_NUM_CLOCKS; i++) {
+        s->stop_ns[i] = 0;
+    }
+    for (i = 0; i < RP2350_NUM_GLITCHLESS; i++) {
+        s->gl_from[i] = GL_NONE;
+        s->gl_leave_ns[i] = 0;
+        s->gl_done_ns[i] = 0;
+    }
+    s->sys_glitched = false;
     s->resussed = false;
     s->fc0_phase = FC0_IDLE;
     s->fc0_stalled = false;
@@ -863,7 +1228,10 @@ static void clocks_reset_hold(RP2350ClkRegsState *rs)
     s->fc0_edges = 0;
 }
 
-/* A reset switches clk_ref and clk_sys back to the ROSC. */
+/*
+ * A reset switches clk_ref and clk_sys back to the ROSC, and ends a
+ * glitch's stop of clk_sys.
+ */
 static void rp2350_clocks_exit_reset(Object *obj, ResetType type)
 {
     RP2350ClocksState *s = RP2350_CLOCKS(obj);
@@ -893,14 +1261,22 @@ static void rp2350_clocks_init(Object *obj)
 
 static const VMStateDescription vmstate_rp2350_clocks = {
     .name = TYPE_RP2350_CLOCKS,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(parent_obj.regs, RP2350ClocksState,
                              RP2350_CLKREGS_MAX),
         VMSTATE_ARRAY_CLOCK(src, RP2350ClocksState, RP2350_NUM_CLKSRC),
         VMSTATE_ARRAY_CLOCK(clk, RP2350ClocksState, RP2350_NUM_CLOCKS),
         VMSTATE_UINT32(enabled, RP2350ClocksState),
+        VMSTATE_INT64_ARRAY(stop_ns, RP2350ClocksState, RP2350_NUM_CLOCKS),
+        VMSTATE_INT32_ARRAY(gl_from, RP2350ClocksState,
+                            RP2350_NUM_GLITCHLESS),
+        VMSTATE_INT64_ARRAY(gl_leave_ns, RP2350ClocksState,
+                            RP2350_NUM_GLITCHLESS),
+        VMSTATE_INT64_ARRAY(gl_done_ns, RP2350ClocksState,
+                            RP2350_NUM_GLITCHLESS),
+        VMSTATE_BOOL(sys_glitched, RP2350ClocksState),
         VMSTATE_BOOL(resussed, RP2350ClocksState),
         VMSTATE_TIMER_PTR(resus_timer, RP2350ClocksState),
         VMSTATE_TIMER_PTR(fc0_timer, RP2350ClocksState),
@@ -955,6 +1331,7 @@ static void rp2350_clocks_class_init(ObjectClass *klass, const void *data)
     c->reset = clocks_reset;
     c->wmask = clocks_wmask;
     c->read = clocks_read;
+    c->write = clocks_write;
     c->written = clocks_written;
     c->catch_up = clocks_catch_up;
     c->reset_hold = clocks_reset_hold;

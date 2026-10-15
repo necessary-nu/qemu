@@ -79,10 +79,18 @@ struct RP2350ResetsState {
     uint32_t wdsel;
     /* Subsystems in reset: RESET_DONE is its complement. */
     uint32_t held;
+    /*
+     * Subsystems a clock glitch left undefined, out of reset but held as
+     * though in reset until their reset is next asserted.
+     */
+    uint32_t corrupt;
     /* When each released subsystem leaves reset; -1 when none is due. */
     int64_t release_ns[RP2350_NUM_RESETS];
 
-    /* The subsystems currently held through hold_fn; not migrated. */
+    /*
+     * The subsystems currently held through hold_fn, those in reset and
+     * those left undefined; not migrated.
+     */
     uint32_t asserted;
     RP2350ResetsHoldFn *hold_fn;
     void *hold_opaque;
@@ -105,6 +113,15 @@ void rp2350_resets_catch_up(RP2350ResetsState *s);
  * RESETS.RESET keeps its value.
  */
 void rp2350_resets_pulse(RP2350ResetsState *s, uint32_t blocks);
+
+/*
+ * A clock glitch reaches the subsystems in `blocks`: those not held in
+ * reset are left undefined, held through the hold callback as though in
+ * reset (inert, not answering on the bus) while RESET_DONE reads them out
+ * of reset, until their reset is next asserted by RESET, a watchdog pulse
+ * or a reset of RESETS. Returns the subsystems it left undefined.
+ */
+uint32_t rp2350_resets_corrupt(RP2350ResetsState *s, uint32_t blocks);
 
 /*
  * Reset the subsystems the boot ROM uses on its way to a flash image, and

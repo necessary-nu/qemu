@@ -23,7 +23,9 @@
 
 #define CLOCKS          0x40010000
 #define CLK_REF_CTRL    (CLOCKS + 0x30)
+#define CLK_REF_SELECTED (CLOCKS + 0x38)
 #define CLK_SYS_CTRL    (CLOCKS + 0x3c)
+#define CLK_SYS_SELECTED (CLOCKS + 0x44)
 #define CLK_REF_XOSC    2
 
 #define XOSC            0x40048000
@@ -93,7 +95,12 @@ static QTestState *start(void)
     return qts;
 }
 
-/* xosc_init(), then clk_sys from clk_ref from the XOSC. */
+/*
+ * xosc_init(), then clk_sys from clk_ref from the XOSC: clk_sys's
+ * glitchless mux switched off its auxiliary mux alone (SRC cleared, its
+ * AUXSRC left), and each switch waited for, as runtime_init_clocks()
+ * does.
+ */
 static void run_from_xosc(QTestState *qts)
 {
     qtest_writel(qts, XOSC_CTRL, 0xaa0);
@@ -102,8 +109,12 @@ static void run_from_xosc(QTestState *qts)
     qtest_clock_step(qts, XOSC_STARTUP_NS + 1);
     g_assert_cmphex(qtest_readl(qts, XOSC_STATUS) & XOSC_STABLE, ==,
                     XOSC_STABLE);
-    qtest_writel(qts, CLK_SYS_CTRL, 0);
+    qtest_writel(qts, CLK_SYS_CTRL + CLR, 1);
+    qtest_clock_step(qts, 1000);
+    g_assert_cmphex(qtest_readl(qts, CLK_SYS_SELECTED), ==, 1);
     qtest_writel(qts, CLK_REF_CTRL, CLK_REF_XOSC);
+    qtest_clock_step(qts, 1000);
+    g_assert_cmphex(qtest_readl(qts, CLK_REF_SELECTED), ==, 1 << CLK_REF_XOSC);
 }
 
 static void aon_start(QTestState *qts, uint32_t use)
