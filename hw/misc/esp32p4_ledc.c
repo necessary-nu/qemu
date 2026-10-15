@@ -106,9 +106,11 @@
  * event is pulsed stamped with its time, in time order with the edges,
  * and a task acts at the time its pulse is stamped with. On the host's
  * clock an output the host held up catches up edge by edge, each at its
- * own time; only an edge more than ESP32_LINE_MAX_LAG_NS (1 s) behind the
- * present as it comes to it (the host slower than the edges it is to
- * drive, include/hw/gpio/esp32_line.h) makes it skip to its level at the
+ * own time; only a host slower than the edges it is to drive, losing
+ * ground on the controller as its timer's catch-ups each end further
+ * behind than the last, or an edge more than ESP32_LINE_MAX_LAG_NS (1 s)
+ * behind the present as the output comes to it (esp32_line_pwm_skips(),
+ * include/hw/gpio/esp32_line.h), makes it skip to its level at the
  * moment it is being brought to, stamped with the moment that level
  * began, the edges in between lost, so that no edge carries a time other
  * than its own; under icount none is. An output that reaches no pad
@@ -773,13 +775,12 @@ static int64_t chan_last_edge(ESP32P4LedcState *s, int n, int64_t from,
 /*
  * [spec:nuos:req:emu.esp32p4.pwm]
  * Run a channel's output up to limit (and including it with inclusive),
- * each edge at its own time. On the host's clock an edge more than
- * ESP32_LINE_MAX_LAG_NS behind the present as the output comes to it
- * (esp32_line_lags()) makes the output skip to its level at limit,
- * stamped with the edge that began that level, the edges in between
- * lost: a host that slow cannot follow them, and a skip to any earlier
- * moment would leave the output behind still, skipping again at every
- * edge.
+ * each edge at its own time. On the host's clock an edge the host is too
+ * slow for (esp32_line_pwm_skips()) makes the output skip to its level at
+ * limit, stamped with the edge that began that level, the edges in
+ * between lost: a host that slow cannot follow them, and a skip to any
+ * earlier moment would leave the output behind still, skipping again at
+ * every edge.
  */
 static void chan_eval(ESP32P4LedcState *s, int n, int64_t limit,
                       bool inclusive)
@@ -809,7 +810,7 @@ static void chan_eval(ESP32P4LedcState *s, int n, int64_t limit,
         if (e == INT64_MAX || e > last) {
             break;
         }
-        if (esp32_line_lags(e)) {
+        if (esp32_line_pwm_skips(&s->lag, e)) {
             int64_t x = last;
             bool level = chan_level_at(s, n, x);
             int64_t began = level == ch->out_level ? x :
@@ -1387,12 +1388,20 @@ static int64_t ledc_now(ESP32P4LedcState *s)
     return MAX(s->seen_ns, esp32_line_time());
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * The timer's catch-up: everything due up to the present as it runs, and
+ * how far behind the present that leaves the controller, which tells
+ * whether the host is losing ground on it (esp32_line_caught_up()).
+ */
 static void ledc_timer_cb(void *opaque)
 {
     ESP32P4LedcState *s = opaque;
+    int64_t now = ledc_now(s);
 
-
-    ledc_advance(s, ledc_now(s));
+    esp32_line_catching_up(&s->lag);
+    ledc_advance(s, now);
+    esp32_line_caught_up(&s->lag, now);
     ledc_schedule(s);
 }
 
