@@ -168,8 +168,9 @@
  *     DesignWare core's meaning, as the CSI host's masks have it (TRM
  *     42.6); TRM 43.4.2.4 says the reverse.
  *   - Register accesses first run what fell due before them, in order: the
- *     PHY's start-up, the link's phases, the pattern generator's lines,
- *     each at its time.
+ *     PHY's start-up, the link's phases, the pattern generator's lines and
+ *     the bridge's DPI events (the bridge the host follows, which its
+ *     "dsi-host" link names), each at its time.
  *   - Not modelled (logged when used): the DBI and eDPI interfaces, 3D,
  *     display stream compression, the TE hardware, HS skew calibration,
  *     VID_SHADOW_PIN_REQ, HS transmit timeouts (TO_HS_TX: the model's link
@@ -1817,6 +1818,9 @@ static void host_triggers(ESP32P4DsiHostState *s, uint32_t v)
 
 /* ---- The host's registers ---- */
 
+static int64_t brg_next_due(ESP32P4DsiBridgeState *s);
+static void brg_catch_up(ESP32P4DsiBridgeState *s, int64_t now);
+
 static void link_run_cb(void *opaque)
 {
     link_run(opaque);
@@ -1824,8 +1828,13 @@ static void link_run_cb(void *opaque)
 
 /*
  * A register access at esp32_line_time(): first what fell due before it,
- * the PHY's start-up, the link's phases and the pattern generator's lines,
- * in order, each at its own time, however late their QEMU timers run.
+ * the PHY's start-up, the link's phases, the pattern generator's lines
+ * and the bridge's DPI events (its lines' syncs and pixels, the "bridge"
+ * the bridge's "dsi-host" link sets), in order, each at its own time,
+ * however late their QEMU timers run. Else a change of mode (MODE_CFG,
+ * PWR_UP) would take the host out of video before the lines the DPI had
+ * sent by then, which would then find it out, and the panel never get
+ * them.
  */
 static void host_sync(ESP32P4DsiHostState *s)
 {
@@ -1836,7 +1845,7 @@ static void host_sync(ESP32P4DsiHostState *s)
     };
 
     for (;;) {
-        int64_t due = INT64_MAX;
+        int64_t due = INT64_MAX, dpi;
         int first = -1;
 
         for (int i = 0; i < 3; i++) {
@@ -1846,6 +1855,11 @@ static void host_sync(ESP32P4DsiHostState *s)
                 due = t;
                 first = i;
             }
+        }
+        dpi = s->bridge ? brg_next_due(s->bridge) : INT64_MAX;
+        if (dpi <= now && dpi < due) {
+            brg_catch_up(s->bridge, dpi);
+            continue;
         }
         if (first < 0) {
             break;
@@ -2990,6 +3004,16 @@ static void brg_timer_cb(void *opaque)
     brg_take_event(s, brg_cyc_ns(s, s->next_cyc));
 }
 
+/* When the bridge's next event, or request interval's end, falls due. */
+static int64_t brg_next_due(ESP32P4DsiBridgeState *s)
+{
+    int64_t gen = s->running && timer_pending(s->timer) ?
+                  brg_cyc_ns(s, s->next_cyc) : INT64_MAX;
+    int64_t req = timer_pending(s->req_timer) ? s->req_hold_ns : INT64_MAX;
+
+    return MIN(gen, req);
+}
+
 /*
  * Run the generator's events and the request interval's ends due by @now,
  * in order, each at its own time.
@@ -3295,6 +3319,15 @@ static void brg_init(Object *obj)
     s->req_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, brg_req_timer_cb, s);
 }
 
+static void brg_realize(DeviceState *dev, Error **errp)
+{
+    ESP32P4DsiBridgeState *s = ESP32P4_DSI_BRIDGE(dev);
+
+    if (s->host) {
+        s->host->bridge = s;
+    }
+}
+
 static void brg_finalize(Object *obj)
 {
     ESP32P4DsiBridgeState *s = ESP32P4_DSI_BRIDGE(obj);
@@ -3361,6 +3394,7 @@ static void brg_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->vmsd = &vmstate_brg;
+    dc->realize = brg_realize;
     rc->phases.hold = brg_reset_hold;
     rc->phases.exit = brg_reset_exit;
     device_class_set_props(dc, brg_properties);
