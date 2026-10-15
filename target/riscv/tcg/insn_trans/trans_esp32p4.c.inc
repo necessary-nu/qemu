@@ -335,13 +335,21 @@ static uint32_t esp32p4_trace_kind(DisasContext *ctx, CPURISCVState *env)
  * While the trace encoder traces the core, each instruction reports its
  * start, and with it the retirement of the one before; the encoder learns
  * from the address each starts at whether a branch was taken and where a
- * jump went.
+ * jump went. Under icount an MMIO access that is not the last instruction
+ * of its block starts, is unwound and runs again alone, in a block of its
+ * own (CF_MEMI_ONLY, see cpu_io_recompile()): it has reported its start
+ * already, and does not again, or the encoder would see it retire and the
+ * core go back to it.
  */
 /* [spec:nuos:req:emu.esp32p4.debug] */
 static void gen_esp32p4_trace_insn(DisasContext *ctx, CPURISCVState *env)
 {
-    TCGv pc = tcg_temp_new();
+    TCGv pc;
 
+    if (tb_cflags(ctx->base.tb) & CF_MEMI_ONLY) {
+        return;
+    }
+    pc = tcg_temp_new();
     gen_pc_plus_diff(pc, ctx, 0);
     gen_helper_esp32p4_trace_insn(tcg_env, pc,
                                   tcg_constant_i32(esp32p4_trace_kind(ctx,

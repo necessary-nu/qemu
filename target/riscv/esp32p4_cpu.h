@@ -273,7 +273,10 @@ typedef struct ESP32P4AssistOps {
  *
  * insn: an instruction at @pc in privilege mode @priv starts, so the one
  *   before it has retired; @kind is the instruction's ESP32P4_TRACE_KIND_*
- *   and its length (ESP32P4_TRACE_LEN_4 for 4 bytes, else 2).
+ *   and its length (ESP32P4_TRACE_LEN_4 for 4 bytes, else 2). Each start
+ *   is reported once, however often QEMU executes the instruction: an
+ *   MMIO access unwound to run again alone (cpu_io_recompile()) does not
+ *   report its start again.
  * trap: a trap is taken to @handler: an interrupt (@interrupt) or an
  *   exception, its cause @cause and trap value @tval, at @epc, from
  *   privilege mode @priv; @retired says whether the instruction last
