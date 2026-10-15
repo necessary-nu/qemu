@@ -113,6 +113,8 @@ typedef struct Esp32LEDCState {
     uint32_t int_ena;
     uint32_t conf;
     uint32_t date;
+    /* Edges have been lost to a host too slow for them (logged once) */
+    bool lag_logged;
 
     Notifier line_source;
 } Esp32LEDCState;

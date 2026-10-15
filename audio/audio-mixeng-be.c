@@ -567,7 +567,43 @@ static size_t audio_pcm_sw_write(SWVoiceOut *sw, void *buf, size_t buf_len)
 
 /*
  * Timer
+ *
+ * The timer runs the voices once a period of virtual time (the audiodev's
+ * timer-period), and the backends that pace themselves by the virtual
+ * clock (RateCtl: wav, none, dbus) take or give, each run, the frames due
+ * by the time the run is for. A device streaming on QEMU_CLOCK_VIRTUAL
+ * takes or gives its frames at their own times, however late the main
+ * loop runs: on the host's clock a host that holds QEMU up makes the
+ * device's timers late, and a device such as a codec catches up frame by
+ * frame, its timer re-armed in the past running again among the other
+ * timers in order of time. The audio timer catches up in the same way:
+ * it takes the periods it missed one a callback, each run at its
+ * period's end (audio_virtual_now()), re-armed for the next in the past,
+ * so that the frames the backend gives a capture voice arrive in step
+ * with the device taking them, and the frames a playback voice is given
+ * leave in step with the device making them; a voice's buffer then
+ * neither runs dry nor overflows, as under icount, where the timer runs
+ * at each period's end. Only a timer AUDIO_TIMER_MAX_LAG_NS behind the
+ * present (a host that cannot keep up at all) goes on from the present,
+ * the periods between run at once (RateCtl then restarts its count, as
+ * it does more than 65536 frames behind). A timer-period of 0, a run at
+ * every main loop iteration, has no periods to catch up.
  */
+#define AUDIO_TIMER_MAX_LAG_NS  NANOSECONDS_PER_SECOND
+
+/* The virtual time of the timer's run in progress; INT64_MIN outside one */
+static int64_t audio_run_ns = INT64_MIN;
+
+/*
+ * The present for the voices: the end of the period the timer's run is
+ * for while it runs, else the virtual clock.
+ */
+static int64_t audio_virtual_now(void)
+{
+    return audio_run_ns != INT64_MIN ? audio_run_ns
+                                     : qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
 static int audio_is_timer_needed(AudioMixengBackend *s)
 {
     HWVoiceIn *hwi = NULL;
@@ -586,11 +622,19 @@ static int audio_is_timer_needed(AudioMixengBackend *s)
     return 0;
 }
 
+/* Set the timer for @due, unless it is set for an earlier time. */
+static void audio_arm_timer(AudioMixengBackend *s, int64_t due)
+{
+    if (!timer_pending(s->ts) || due < s->timer_due) {
+        s->timer_due = due;
+        timer_mod_ns(s->ts, due);
+    }
+}
+
 static void audio_reset_timer(AudioMixengBackend *s)
 {
     if (audio_is_timer_needed(s)) {
-        timer_mod_anticipate_ns(s->ts,
-            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->period_ticks);
+        audio_arm_timer(s, audio_virtual_now() + s->period_ticks);
         if (!s->timer_running) {
             s->timer_running = true;
             s->timer_last = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -605,9 +649,13 @@ static void audio_reset_timer(AudioMixengBackend *s)
     }
 }
 
+/*
+ * The timer's run: the period it was set for, at that period's end,
+ * however late it runs, and no later one (see "Timer" above).
+ */
 static void audio_timer (void *opaque)
 {
-    int64_t now, diff;
+    int64_t now, diff, due;
     AudioMixengBackend *s = opaque;
 
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -617,8 +665,14 @@ static void audio_timer (void *opaque)
     }
     s->timer_last = now;
 
+    due = s->timer_due;
+    if (s->dev->timer_period <= 0 || now - due > AUDIO_TIMER_MAX_LAG_NS) {
+        due = now;
+    }
+    audio_run_ns = due;
     audio_run(s, "timer");
     audio_reset_timer(s);
+    audio_run_ns = INT64_MIN;
 }
 
 /*
@@ -1723,10 +1777,16 @@ int audio_buffer_bytes(AudiodevPerDirectionOptions *pdo,
     return audio_buffer_samples(pdo, as, def_usecs) * audio_format_bits(as->fmt) / 8;
 }
 
+/*
+ * The rate control counts the frames due since its start, in virtual
+ * time, up to the time the voices run at (audio_virtual_now()): the end
+ * of the period the audio timer's run is for, so that a timer catching
+ * up takes each period's frames in turn.
+ */
 void audio_rate_start(RateCtl *rate)
 {
     memset(rate, 0, sizeof(RateCtl));
-    rate->start_ticks = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    rate->start_ticks = audio_virtual_now();
 }
 
 size_t audio_rate_peek_bytes(RateCtl *rate, struct audio_pcm_info *info)
@@ -1736,7 +1796,7 @@ size_t audio_rate_peek_bytes(RateCtl *rate, struct audio_pcm_info *info)
     int64_t bytes;
     int64_t frames;
 
-    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    now = audio_virtual_now();
     ticks = now - rate->start_ticks;
     bytes = muldiv64(ticks, info->bytes_per_second, NANOSECONDS_PER_SECOND);
     frames = (bytes - rate->bytes_sent) / info->bytes_per_frame;

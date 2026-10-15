@@ -47,8 +47,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4ParlioState, ESP32P4_PARLIO)
  * internal sources; "sys", PARLIO_SYS_CLK, the GDMA interface's. Links:
  * "gdma", GDMA-AXI, which serves PARLIO (peripheral 3), and "clkrst",
  * asked whether a unit's clock comes from its pad
- * (esp32p4_clkrst_pad_source()). Sysbus IRQs: 0, HP_PARLIO_RX_INTR; 1,
- * HP_PARLIO_TX_INTR.
+ * (esp32p4_clkrst_pad_source()); "gpio", the GPIO matrix
+ * (TYPE_ESP32_SIG_ROUTES), asked which of the units' outputs reach a pad
+ * something watches, whose edges are then timed one by one (without it,
+ * all are). Sysbus IRQs: 0, HP_PARLIO_RX_INTR; 1, HP_PARLIO_TX_INTR.
  */
 #define ESP32P4_PARLIO_TXD          "txd"
 #define ESP32P4_PARLIO_TX_CLK_OUT   "tx-clk-out"
@@ -85,11 +87,14 @@ typedef struct ESP32P4ParlioClk {
     ESP32P4ClkEdges half_e; /* its half periods, on its edges */
     int64_t k0;             /* the half period internal edge 0 ends */
     uint64_t next;          /* the next internal edge's number */
+    uint64_t wake;          /* the first edge the timer must take at its time */
     bool running;           /* edges being taken, one after the other */
     bool in_level;          /* the divided input clock */
     bool pad_level;         /* the pad clock as last seen */
     uint32_t pad_count;     /* the pad clock's rising edges, divided */
     bool out_level;         /* the level put out */
+    bool line_level;        /* ... as driven on its line */
+    bool watched;           /* its line reaches a pad something watches */
     bool pad_frac_logged;
 } ESP32P4ParlioClk;
 
@@ -137,8 +142,12 @@ struct ESP32P4ParlioState {
     uint8_t tx_byte;            /* the byte being shifted out */
     uint8_t tx_byte_flags;
     uint8_t tx_byte_bits;       /* ... its bits still to go */
-    uint16_t tx_out;            /* TXD as driven */
+    uint16_t tx_out;            /* TXD as put out */
+    uint16_t txd_line;          /* ... as driven on the lines */
+    uint16_t txd_watched;       /* the lines that reach a watched pad */
     bool tx_cs_active;
+    bool cs_line;               /* CS's line level */
+    bool cs_watched;
     ESP32P4ParlioFifo tx_fifo;
 
     /* The RX unit. */
@@ -154,11 +163,17 @@ struct ESP32P4ParlioState {
     uint8_t rx_byte_bits;
     int64_t rx_last_data_ns;
     int64_t rx_timeout_from;
+    bool rx_timeout_on;         /* the receive timeout counting */
     bool lag_logged;
     ESP32P4ParlioFifo rx_fifo;
 
     ESP32P4GdmaState *gdma;
     ESP32P4ClkRstState *clkrst;
+    DeviceState *gpio;
+    Notifier line_source;
+    Notifier route_notifier;
+    bool in_catch_up;
+    bool routes_stale;
 };
 
 #endif
