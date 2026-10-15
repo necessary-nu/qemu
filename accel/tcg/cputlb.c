@@ -1286,6 +1286,7 @@ io_prepare(hwaddr *out_offset, CPUState *cpu, CPUTLBEntryFull *full,
     mr_offset = full->xlat_offset + addr;
     cpu->mem_io_pc = retaddr;
     cpu->access_held = false;
+    cpu->access_held_exclusive = false;
     if (!cpu->neg.can_do_io) {
         cpu_io_recompile(cpu, retaddr);
     }
@@ -1300,10 +1301,17 @@ static void io_failed(CPUState *cpu, CPUTLBEntryFull *full, vaddr addr,
 {
     /*
      * A device holds the access (cpu_hold_access()): no fault, the
-     * instruction is made again when the CPU next runs.
+     * instruction is made again when the CPU next runs, or at once with
+     * every other CPU stopped (cpu_hold_access_exclusive()).
      */
     if (cpu->access_held) {
+        bool exclusive = cpu->access_held_exclusive;
+
         cpu->access_held = false;
+        cpu->access_held_exclusive = false;
+        if (exclusive) {
+            cpu_loop_exit_atomic(cpu, retaddr);
+        }
         cpu_loop_exit_restore(cpu, retaddr);
     }
     if (!cpu->ignore_memory_transaction_failures
