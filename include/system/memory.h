@@ -569,6 +569,38 @@ typedef struct MemoryRegionIoeventfd MemoryRegionIoeventfd;
 typedef bool MemoryRegionGateFn(void *opaque, hwaddr addr, unsigned size,
                                 bool is_write, MemTxAttrs attrs);
 
+/**
+ * struct MemoryRegionStoreWatchOps: what a RAM region's store watch is
+ * asked (memory_region_set_store_watch())
+ *
+ * Under TCG a CPU's loads and stores reach a RAM region's memory through
+ * its TLB, without a call into the region's owner. A store watch has each
+ * store a CPU makes to a page it watches pass through @store first, on the
+ * TLB's slow path rather than as an access to I/O, for an owner that keeps
+ * its own record of what has been stored where, finer than the pages of
+ * the dirty memory log.
+ *
+ * @page_watched: whether a CPU's stores to the page at @offset, aligned to
+ *   the target's pages, pass through @store; asked as the CPU's TLB maps
+ *   the page writable. The answer stands for that CPU until its TLB entry
+ *   for the page is flushed: an owner that watches a page again flushes
+ *   the page from every CPU's TLB, each CPU's on its own thread
+ *   (async_run_on_cpu()) or with it stopped.
+ *
+ * @store: a CPU's store of @size bytes at @offset, which the CPU makes
+ *   once this returns true. A store never spans a target page. @last is
+ *   true when the store is the last instruction of its translation block,
+ *   as an access to I/O always is, so that work the call queues for the
+ *   CPU runs before the CPU's next instruction; when it is false,
+ *   returning false, having done nothing, has the CPU make the store
+ *   again as the last instruction of a block, passing it through @store
+ *   again. Returns true when @last is.
+ */
+typedef struct MemoryRegionStoreWatchOps {
+    bool (*page_watched)(void *opaque, hwaddr offset);
+    bool (*store)(void *opaque, hwaddr offset, unsigned size, bool last);
+} MemoryRegionStoreWatchOps;
+
 /** MemoryRegion:
  *
  * A struct representing a memory region.
@@ -627,6 +659,10 @@ struct MemoryRegion {
     MemoryRegionGateFn *gate;
     MemoryRegion *gate_front;
     void *gate_opaque;
+
+    /* What a CPU's stores to RAM pass (memory_region_set_store_watch()) */
+    const MemoryRegionStoreWatchOps *store_watch;
+    void *store_watch_opaque;
 };
 
 struct IOMMUMemoryRegion {
@@ -2188,6 +2224,38 @@ void memory_region_del_subregion(MemoryRegion *mr,
  */
 bool memory_region_set_gate(MemoryRegion *mr, MemoryRegion *front,
                             MemoryRegionGateFn *gate, void *opaque);
+
+/**
+ * memory_region_set_store_watch: watch the stores CPUs make to a RAM region
+ *
+ * Under TCG, each store a CPU makes to a page of @mr that @ops'
+ * page_watched callback says is watched passes through @ops' store
+ * callback before it is made (MemoryRegionStoreWatchOps). Accesses other
+ * than the CPUs' (DMA, a debugger's, the owner's own to the memory) do
+ * not. The pages the CPUs' TLBs map already are watched from their next
+ * mapping: the caller sets the watch before any CPU maps @mr.
+ *
+ * @mr: a RAM region
+ * @ops: the watch, or NULL to remove it
+ * @opaque: passed to @ops' callbacks
+ */
+void memory_region_set_store_watch(MemoryRegion *mr,
+                                   const MemoryRegionStoreWatchOps *ops,
+                                   void *opaque);
+
+/**
+ * memory_region_store_watched: whether a CPU's stores to a page of a RAM
+ * region pass its store watch, asked as a CPU's TLB maps the page
+ *
+ * @mr: a RAM region
+ * @offset: the page's offset in @mr, aligned to the target's pages
+ */
+static inline bool memory_region_store_watched(MemoryRegion *mr,
+                                               hwaddr offset)
+{
+    return unlikely(mr->store_watch) &&
+           mr->store_watch->page_watched(mr->store_watch_opaque, offset);
+}
 
 /*
  * memory_region_set_enabled: dynamically enable or disable a region

@@ -86,6 +86,12 @@ void cpu_hold_access(CPUState *cpu)
     cpu->access_held = true;
 }
 
+void cpu_hold_access_exclusive(CPUState *cpu)
+{
+    cpu->access_held = true;
+    cpu->access_held_exclusive = true;
+}
+
 static int cpu_common_gdb_read_register(CPUState *cpu, GByteArray *buf, int reg)
 {
     return 0;
