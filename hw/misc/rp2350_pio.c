@@ -1747,6 +1747,23 @@ static void pio_disturb(RP2350PIOState *s)
     core_settle_loops(&s->core);
 }
 
+/*
+ * [spec:nuos:req:emu.pio]
+ * Software samples the pads (line_sync()): the blocks run to the cycle of
+ * line_time(), each pin change on the way reaching the pads at its own
+ * time, which their timer, late without icount, has yet to bring.
+ */
+static void pio_line_sync(Notifier *n, void *data)
+{
+    RP2350PIOState *s = container_of(n, RP2350PIOState, line_source);
+
+    if (s->busy || !clock_is_enabled(s->clk)) {
+        return;
+    }
+    pio_sync(s, pio_now(s));
+    pio_schedule(s);
+}
+
 /* The blocks were changed from outside: drive and re-time the outputs. */
 static void pio_settle(RP2350PIOState *s)
 {
@@ -2446,6 +2463,8 @@ static void rp2350_pio_realize(DeviceState *dev, Error **errp)
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pio_timer_cb, s);
     s->in_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pio_in_timer_cb, s);
+    s->line_source.notify = pio_line_sync;
+    line_add_source(&s->line_source);
 }
 
 static const Property rp2350_pio_properties[] = {
