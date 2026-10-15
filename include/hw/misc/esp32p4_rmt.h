@@ -13,6 +13,7 @@
 #include "hw/misc/esp32p4_clk_period.h"
 #include "hw/core/clock.h"
 #include "hw/dma/esp32p4_gdma.h"
+#include "hw/gpio/esp32p4_gpio.h"
 #include "qemu/notify.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -50,11 +51,34 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4RmtState, ESP32P4_RMT)
  *   - Sysbus IRQ 0: RMT_INTR (interrupt matrix source 43).
  *   - Link "gdma": GDMA-AHB, which serves TX channel 3 and RX channel 7
  *     (PERI_SEL 10) when their DMA_ACCESS_EN is set.
+ *   - Link "gpio": the GPIO matrix, for the block to see which TX outputs
+ *     reach a watched pad. Without it every output is taken to reach one.
  *
  * The RMT has no ETM events or tasks on the P4.
  */
 #define ESP32P4_RMT_SIG_OUT     "sig-out"
 #define ESP32P4_RMT_SIG_IN      "sig-in"
+
+/*
+ * A pass of a continuous transmission just after it started, relative to
+ * its start: what decides how it runs on, but the loop count. Cycles are
+ * counted from the start; the struct is compared whole, padding zeroed.
+ */
+typedef struct ESP32P4RmtPass {
+    uint64_t entry_end;
+    uint64_t event;
+    uint64_t carrier_end;
+    uint32_t raddr;
+    uint32_t word;
+    uint32_t thr_count;
+    uint8_t state;
+    uint8_t half;
+    uint8_t level;
+    uint8_t end_level;
+    bool pass_sent;
+    bool carrier;
+    bool carrier_high;
+} ESP32P4RmtPass;
 
 typedef struct ESP32P4RmtTx {
     /* Registers as written. */
@@ -93,6 +117,17 @@ typedef struct ESP32P4RmtTx {
     uint8_t end_level;
     bool mem_empty;
     uint8_t out_level;
+    /*
+     * The pass started last, its cycle and count (pass_start_c,
+     * pass_seq), and the start of the one before as it was found
+     * (pass_c, pass) while the block has changed only by running on
+     * since (pass_valid). Not migrated: passes are compared afresh.
+     */
+    uint64_t pass_start_c;
+    uint32_t pass_seq;
+    bool pass_valid;
+    uint64_t pass_c;
+    ESP32P4RmtPass pass;
 
     /* The APB FIFO's (and DMA's) write pointer, absolute. */
     uint32_t apb_waddr;
@@ -186,6 +221,20 @@ struct ESP32P4RmtState {
 
     /* Bringing the channels up to date; inputs arriving meanwhile wait. */
     bool syncing;
+
+    ESP32P4GpioState *gpio;
+    Notifier route_notifier;
+    /* The TX channels whose output reaches a watched pad, bit n */
+    uint8_t out_watched;
+    /* The interrupt line's level as driven */
+    bool irq_level;
+    /* What the timer is set for, NEVER (INT64_MAX) when it is not */
+    int64_t due_ns;
+    /* The block has changed other than by running on since it was set */
+    bool sched_stale;
+    /* A look-ahead runs: interrupts are noted in ahead_raised only */
+    bool ahead;
+    uint32_t ahead_raised;
 };
 
 #endif

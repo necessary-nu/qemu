@@ -25,6 +25,8 @@ struct RP2350ROSCState {
     /* The divider's outputs, rosc_clksrc and rosc_clksrc_ph. */
     Clock *out;
     Clock *out_ph;
+    /* Takes a start-up due by now, for CLOCKS (rp2350_clocks_add_feed()). */
+    Notifier feed;
 
     /* Registers as last written (raw, including invalid codes). */
     uint32_t ctrl;

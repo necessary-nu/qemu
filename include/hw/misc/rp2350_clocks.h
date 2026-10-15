@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "qemu/notify.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -38,6 +39,8 @@ struct RP2350ClkRegsState {
 
     MemoryRegion iomem;
     uint32_t regs[RP2350_CLKREGS_MAX];
+    /* Takes the block's events due by now, for CLOCKS if it feeds it. */
+    Notifier feed;
 };
 
 struct RP2350ClkRegsClass {
@@ -143,7 +146,20 @@ struct RP2350ClocksState {
     uint64_t fc0_edges;
     uint64_t fc0_last_period;
     int64_t fc0_last_ns;
+
+    /* The blocks feeding the clock sources (rp2350_clocks_add_feed()). */
+    NotifierList feeds;
 };
+
+/*
+ * A block whose outputs feed CLOCKS's clock sources (an oscillator, a
+ * PLL) and change at times of their own, on QEMU timers that run late
+ * without icount: @n takes its events due by now, which CLOCKS has each
+ * feed do before a register access, so that what an access sees and sets
+ * going (a frequency count, a glitchless switch) starts from the sources
+ * as they are then.
+ */
+void rp2350_clocks_add_feed(RP2350ClocksState *s, Notifier *n);
 
 /*
  * Configure CLOCKS as the boot ROM's early boot path leaves it: clk_ref

@@ -121,8 +121,12 @@
  *   - HOST_CTRL's CSI_ENABLECLK and CSI_CFG_CLK_EN gate the host's clock
  *     lane and PHY clock; LOOPBK_TEST_EN (the DSI PHY looped to this one)
  *     is not modelled (logged).
- *   - Register accesses, VDMA's reads and its acknowledges first end a
- *     request interval that fell due before them, at its time.
+ *   - Register accesses, VDMA's reads and its acknowledges, and the
+ *     stream's arrivals, first end a request interval that fell due
+ *     before them, at its time. A register access first brings in what
+ *     the stream has brought by then, the camera's packets through the
+ *     host (the "host" link) and the ISP's rows, whose QEMU timers run
+ *     late without icount.
  */
 
 #include "qemu/osdep.h"
@@ -298,6 +302,12 @@ static void phy_catch_up(ESP32P4CsiHostState *s)
     if (s->attached) {
         esp32p4_image_source_sync(s->attached);
     }
+}
+
+/* [spec:nuos:req:emu.esp32p4.mipi] */
+void esp32p4_csi_host_sync(ESP32P4CsiHostState *s)
+{
+    phy_catch_up(s);
 }
 
 static uint32_t host_lanes(ESP32P4CsiHostState *s)
@@ -1077,7 +1087,7 @@ static void brg_req_timer_cb(void *opaque)
 }
 
 /*
- * An access or acknowledge at esp32_line_time(): first the request
+ * An access, acknowledge or input at esp32_line_time(): first the request
  * interval's end, if it fell due before, at its own time.
  */
 static void brg_catch_up(ESP32P4CsiBridgeState *s)
@@ -1087,6 +1097,32 @@ static void brg_catch_up(ESP32P4CsiBridgeState *s)
         esp32_line_run_at(s->req_hold_ns,
                           (void (*)(void *))brg_update_req, s);
     }
+}
+
+/* [spec:nuos:req:emu.esp32p4.mipi] */
+void esp32p4_csi_bridge_sync_host(ESP32P4CsiBridgeState *s)
+{
+    if (s->host) {
+        esp32p4_csi_host_sync(s->host);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.mipi]
+ * A register access at esp32_line_time(): first the stream the bridge
+ * takes in, up to then, whose stages' QEMU timers, late without icount,
+ * have yet to bring it: the camera's packets through the host, then the
+ * ISP's rows due by then (its sync hook); each reaches the bridge at its
+ * own time. Then the bridge's own request interval. The buffer's fill,
+ * the interrupts and the requests to VDMA are then as at the access.
+ */
+static void brg_access_catch_up(ESP32P4CsiBridgeState *s)
+{
+    esp32p4_csi_bridge_sync_host(s);
+    if (s->isp_ops && s->isp_ops->sync) {
+        s->isp_ops->sync(s->isp);
+    }
+    brg_catch_up(s);
 }
 
 static void brg_hs_ack(void *opaque, int n, int level)
@@ -1219,6 +1255,7 @@ static void tail_frame_start(void *opaque, uint8_t vc, uint16_t number,
 {
     ESP32P4CsiBridgeState *s = opaque;
 
+    brg_catch_up(s);
     if (s->capturing) {
         brg_frame_close(s, true);
     }
@@ -1241,6 +1278,7 @@ static void tail_line(void *opaque, const ESP32P4CsiIdiLine *l)
     g_autofree uint8_t *b = NULL;
     uint64_t f;
 
+    brg_catch_up(s);
     if (!s->capturing || l->dt < (dtc & 0x3f) || l->dt > extract32(dtc, 8, 6)) {
         return;
     }
@@ -1282,6 +1320,7 @@ static void tail_frame_end(void *opaque, uint8_t vc, uint16_t number,
 {
     ESP32P4CsiBridgeState *s = opaque;
 
+    brg_catch_up(s);
     if (s->capturing) {
         brg_frame_close(s, false);
     }
@@ -1527,7 +1566,7 @@ static uint64_t brg_read(void *opaque, hwaddr addr, unsigned size)
     ESP32P4CsiBridgeState *s = opaque;
     const CsiReg *r = brg_reg(addr);
 
-    brg_catch_up(s);
+    brg_access_catch_up(s);
     if (!r) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of unknown register 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_CSI_BRIDGE, addr);
@@ -1552,7 +1591,7 @@ static void brg_write(void *opaque, hwaddr addr, uint64_t value,
     const CsiReg *r = brg_reg(addr);
     uint32_t v = value, old;
 
-    brg_catch_up(s);
+    brg_access_catch_up(s);
     if (!r) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write of unknown register 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_CSI_BRIDGE, addr);
@@ -1709,12 +1748,18 @@ static const VMStateDescription vmstate_brg = {
     },
 };
 
+static const Property brg_properties[] = {
+    DEFINE_PROP_LINK("host", ESP32P4CsiBridgeState, host,
+                     TYPE_ESP32P4_CSI_HOST, ESP32P4CsiHostState *),
+};
+
 static void brg_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->vmsd = &vmstate_brg;
+    device_class_set_props(dc, brg_properties);
     rc->phases.hold = brg_reset_hold;
     rc->phases.exit = brg_reset_exit;
 }

@@ -28,7 +28,9 @@
  * "tx" is the line the adapter drives (the chip's RX pin), high while
  * idle. A line held low for a whole frame is a break, passed to the
  * character device as one; a break from the character device holds "tx"
- * low for two frames. The adapter has no flow control.
+ * low for two frames. The adapter has no flow control. Its transmitter is
+ * a line source (hw/core/line-time.h): a receiver's register access
+ * brings the "tx" line up to its time first.
  */
 #define TYPE_UART_LINE "uart-line"
 OBJECT_DECLARE_SIMPLE_TYPE(UARTLineState, UART_LINE)
@@ -64,6 +66,8 @@ struct UARTLineState {
     int32_t tx_bit;
     uint8_t txd;
     bool tx_break;
+    /* The chip's RX line as a source its receiver syncs (line_sync()). */
+    Notifier line_source;
 };
 
 #endif

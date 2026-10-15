@@ -12,6 +12,7 @@
 #include "qemu/timer.h"
 #include "hw/core/line-time.h"
 #include "migration/vmstate.h"
+#include "system/runstate.h"
 
 /*
  * The time of the change being propagated, while line_set_at() or
@@ -19,6 +20,8 @@
  * receiver can answer a stamped change with a change of its own.
  */
 static int64_t line_stamp = INT64_MIN;
+static NotifierList line_sources = NOTIFIER_LIST_INITIALIZER(line_sources);
+static bool line_syncing;
 
 int64_t line_time(void)
 {
@@ -44,6 +47,82 @@ void line_run_at(int64_t when_ns, void (*fn)(void *opaque), void *opaque)
     line_stamp = when_ns;
     fn(opaque);
     line_stamp = outer;
+}
+
+void line_add_source(Notifier *n)
+{
+    notifier_list_add(&line_sources, n);
+}
+
+void line_remove_source(Notifier *n)
+{
+    notifier_remove(n);
+}
+
+static void line_notify_sources(void *opaque)
+{
+    notifier_list_notify(&line_sources, NULL);
+}
+
+/*
+ * Bring every source's outputs up to line_time(), the moment it returns,
+ * which each source sees as its line_time(). A change a source puts out
+ * can reach a receiver that syncs again: that inner sync sees the
+ * sources as they are.
+ */
+int64_t line_sync(void)
+{
+    int64_t now = line_time();
+
+    if (line_syncing) {
+        return now;
+    }
+    line_syncing = true;
+    line_run_at(now, line_notify_sources, NULL);
+    line_syncing = false;
+    return now;
+}
+
+void line_due_order_init(LineDueOrder *o)
+{
+    QLIST_INIT(&o->sources);
+    o->running = false;
+}
+
+void line_due_order_add(LineDueOrder *o, LineDueSource *src)
+{
+    QLIST_INSERT_HEAD(&o->sources, src, next);
+}
+
+/*
+ * Run the sources' events due by @now, the earliest first: each event can
+ * change when the others fall due (a reset that deletes a block's timers),
+ * so the next is chosen afresh after each.
+ */
+void line_due_order_run(LineDueOrder *o, int64_t now)
+{
+    if (o->running) {
+        return;
+    }
+    o->running = true;
+    while (qemu_reset_requested_get() == SHUTDOWN_CAUSE_NONE) {
+        LineDueSource *src, *first = NULL;
+        int64_t due = now;
+
+        QLIST_FOREACH(src, &o->sources, next) {
+            int64_t at = src->next_due(src);
+
+            if (at <= due && (!first || at < due)) {
+                first = src;
+                due = at;
+            }
+        }
+        if (!first) {
+            break;
+        }
+        first->run(first);
+    }
+    o->running = false;
 }
 
 /* A change held back, to be replayed at its time: fn(opaque, n, level). */

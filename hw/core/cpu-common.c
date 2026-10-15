@@ -81,6 +81,11 @@ void cpu_exit(CPUState *cpu)
     qemu_cpu_kick(cpu);
 }
 
+void cpu_hold_access(CPUState *cpu)
+{
+    cpu->access_held = true;
+}
+
 static int cpu_common_gdb_read_register(CPUState *cpu, GByteArray *buf, int reg)
 {
     return 0;

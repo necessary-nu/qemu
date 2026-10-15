@@ -28,11 +28,13 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
+#include "hw/core/cpu.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/watchdog/rp2350_watchdog.h"
 #include "migration/vmstate.h"
+#include "system/cpus.h"
 
 #define A_CTRL       0x00
 #define A_LOAD       0x04
@@ -152,15 +154,31 @@ static void wd_tick_changed(void *opaque, ClockEvent event)
  * have. A LOAD written after that moment comes too late to keep the
  * reset off, as on the chip, and CTRL and REASON read as the expiry left
  * them. Only a timer that has come fires.
+ *
+ * A reset the expiry asks of the processor making the access comes before
+ * the access, which the chip never makes: the PSM's reset of the
+ * processor, queued as work for it, or a chip-level reset, which stops
+ * it. The access is then held (cpu_hold_access()): the processor stops
+ * at the instruction, which has not executed, for the reset. True if it
+ * is.
  */
-static void wd_catch_up(RP2350WatchdogState *s)
+static bool wd_catch_up(RP2350WatchdogState *s, MemTxAttrs attrs)
 {
-    if (timer_pending(s->expiry) &&
-        timer_expire_time_ns(s->expiry) <=
+    CPUState *cs = current_cpu;
+
+    if (!timer_pending(s->expiry) ||
+        timer_expire_time_ns(s->expiry) >
         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
-        timer_del(s->expiry);
-        wd_expired(s);
+        return false;
     }
+    timer_del(s->expiry);
+    wd_expired(s);
+    if (!cs || !qemu_cpu_is_self(cs) || attrs.debug || attrs.unspecified ||
+        (cpu_work_list_empty(cs) && !cs->stop)) {
+        return false;
+    }
+    cpu_hold_access(cs);
+    return true;
 }
 
 static uint32_t wd_ctrl(RP2350WatchdogState *s)
@@ -169,36 +187,48 @@ static uint32_t wd_ctrl(RP2350WatchdogState *s)
 }
 
 /* [spec:nuos:req:emu.watchdog] */
-static uint64_t rp2350_watchdog_read(void *opaque, hwaddr addr, unsigned size)
+static MemTxResult rp2350_watchdog_read(void *opaque, hwaddr addr,
+                                        uint64_t *data, unsigned size,
+                                        MemTxAttrs attrs)
 {
     RP2350WatchdogState *s = opaque;
     hwaddr reg = rp2350_atomic_reg(addr);
 
-    wd_catch_up(s);
+    if (wd_catch_up(s, attrs)) {
+        return MEMTX_ERROR;
+    }
     switch (reg) {
     case A_CTRL:
-        return wd_ctrl(s);
+        *data = wd_ctrl(s);
+        return MEMTX_OK;
     case A_LOAD:
         /* Write-only: the loaded value is visible in CTRL.TIME. */
-        return 0;
+        *data = 0;
+        return MEMTX_OK;
     case A_REASON:
-        return s->reason;
+        *data = s->reason;
+        return MEMTX_OK;
     case A_SCRATCH0 ... A_SCRATCH7:
-        return s->scratch[(reg - A_SCRATCH0) / 4];
+        *data = s->scratch[(reg - A_SCRATCH0) / 4];
+        return MEMTX_OK;
     }
     qemu_log_mask(LOG_GUEST_ERROR, "rp2350-watchdog: read of bad offset 0x%"
                   HWADDR_PRIx "\n", addr);
-    return 0;
+    *data = 0;
+    return MEMTX_OK;
 }
 
-static void rp2350_watchdog_write(void *opaque, hwaddr addr, uint64_t value,
-                                  unsigned size)
+static MemTxResult rp2350_watchdog_write(void *opaque, hwaddr addr,
+                                         uint64_t value, unsigned size,
+                                         MemTxAttrs attrs)
 {
     RP2350WatchdogState *s = opaque;
     hwaddr reg = rp2350_atomic_reg(addr);
     uint32_t v;
 
-    wd_catch_up(s);
+    if (wd_catch_up(s, attrs)) {
+        return MEMTX_ERROR;
+    }
     switch (reg) {
     case A_CTRL:
         v = rp2350_atomic_apply(addr, wd_ctrl(s), value);
@@ -226,11 +256,12 @@ static void rp2350_watchdog_write(void *opaque, hwaddr addr, uint64_t value,
                       "0x%" HWADDR_PRIx "\n", addr);
         break;
     }
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps rp2350_watchdog_ops = {
-    .read = rp2350_watchdog_read,
-    .write = rp2350_watchdog_write,
+    .read_with_attrs = rp2350_watchdog_read,
+    .write_with_attrs = rp2350_watchdog_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 4,
     .valid.max_access_size = 4,
