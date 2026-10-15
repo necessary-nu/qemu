@@ -70,12 +70,17 @@ static int64_t now;
 
 /*
  * A board strapped for Joint Download Boot (GPIO36 high, GPIO35 low), so
- * that the watchdogs' flash boot protection does not run.
+ * that the watchdogs' flash boot protection does not run, with no network
+ * on its Ethernet. QEMU's default one, user-mode networking, sends an
+ * IPv6 router advertisement every 200 to 600 s of virtual time, which
+ * nothing here watches: some 4.7 million over the counter's overflow, and
+ * on a macOS host with no IPv6 DNS server each looks up the host's
+ * resolver configuration anew, minutes in all.
  */
 static QTestState *start(void)
 {
     now = 0;
-    return qtest_init("-M esp32p4,strap-mode=0x04");
+    return qtest_init("-M esp32p4,strap-mode=0x04 -nic none");
 }
 
 static void step(QTestState *qts, int64_t ns)
@@ -222,7 +227,8 @@ static void test_targets(void)
  * The 48-bit counter's overflow sets OVERFLOW_RAW and
  * MAIN_TIMER_OVERFLOW_LP_INT_RAW, after 2^48 cycles, some 59 years; the
  * blocks that run periodically, the calibration units and the super
- * watchdog, are stopped so that virtual time can get there.
+ * watchdog, are stopped, and the board has no network (start()), so that
+ * virtual time can get there.
  */
 /* [spec:nuos:req:emu.esp32p4.timers/test] */
 static void test_overflow(void)
