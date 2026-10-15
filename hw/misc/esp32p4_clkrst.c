@@ -2144,7 +2144,13 @@ void esp32p4_clkrst_sync(ESP32P4ClkRstState *s, int64_t now)
     }
     s->syncing = true;
     for (int i = 0; i < ESP32P4_NUM_CLKIN; i++) {
-        esp32p4_clk_sync_source(s->clk_in[i], now);
+        ESP32P4ClkSourceSync *src = &s->in_source[i];
+
+        esp32p4_clk_find_source(s->clk_in[i], src);
+        /* A device driving several inputs (the PLLs) syncs them all */
+        if (src->sync && (i == 0 || src->owner != src[-1].owner)) {
+            src->sync(src->owner, now);
+        }
     }
     for (;;) {
         int64_t due = now;

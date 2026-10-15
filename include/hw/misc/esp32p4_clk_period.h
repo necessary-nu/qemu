@@ -893,10 +893,25 @@ static inline bool esp32p4_clk_exact_edges(Clock *clk, ESP32P4ClkEdges *e)
 }
 
 /*
- * Have the device driving the clock on @clk at its source make the
- * changes it has due by @now (ESP32P4ClkSourceClass's sync), if it can.
+ * The device driving the clock at a Clock's source, @owner, and its
+ * ESP32P4ClkSourceClass sync, NULL if it has none, as
+ * esp32p4_clk_find_source() last found them for the source at @root.
  */
-static inline void esp32p4_clk_sync_source(Clock *clk, int64_t now)
+typedef struct ESP32P4ClkSourceSync {
+    Clock *root;
+    Object *owner;
+    void (*sync)(Object *obj, int64_t now);
+} ESP32P4ClkSourceSync;
+
+/*
+ * Find the device driving the clock on @clk at its source, and its sync,
+ * which makes the changes the device has due by a time, into @found. What
+ * @found holds stands while @clk's source stays the same: a caller
+ * syncing before every access to a block would otherwise spend more on
+ * finding them, a QOM interface cast each, than on the access.
+ */
+static inline void esp32p4_clk_find_source(Clock *clk,
+                                           ESP32P4ClkSourceSync *found)
 {
     Clock *root = clk;
     Object *owner;
@@ -904,13 +919,15 @@ static inline void esp32p4_clk_sync_source(Clock *clk, int64_t now)
     while (root->source) {
         root = root->source;
     }
+    if (root == found->root) {
+        return;
+    }
     owner = OBJECT(root)->parent;
+    found->root = root;
+    found->owner = owner;
+    found->sync = NULL;
     if (owner && object_dynamic_cast(owner, TYPE_ESP32P4_CLK_SOURCE)) {
-        ESP32P4ClkSourceClass *k = ESP32P4_CLK_SOURCE_GET_CLASS(owner);
-
-        if (k->sync) {
-            k->sync(owner, now);
-        }
+        found->sync = ESP32P4_CLK_SOURCE_GET_CLASS(owner)->sync;
     }
 }
 

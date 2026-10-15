@@ -760,6 +760,8 @@ struct ESP32P4ClkRstState {
     uint8_t sdio_edge[3];
 
     Clock *clk_in[ESP32P4_NUM_CLKIN];
+    /* The device at each input's source, as esp32p4_clkrst_sync() syncs */
+    ESP32P4ClkSourceSync in_source[ESP32P4_NUM_CLKIN];
     Clock *clk[ESP32P4_NUM_CLOCKS];
     /* The index + 1 of each output Clock, for its exact period. */
     GHashTable *clk_ids;
