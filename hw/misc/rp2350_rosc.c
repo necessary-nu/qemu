@@ -301,6 +301,29 @@ static void rosc_startup_cb(void *opaque)
     rosc_update_clocks(s);
 }
 
+/*
+ * [spec:nuos:req:emu.rosc-trng]
+ * The start-up that has ended by now, which its timer, running late
+ * without icount, has yet to take: the outputs run from then. A register
+ * access takes it first, and so does one of CLOCKS, which the outputs
+ * feed (the "feed" notifier): software that waited out the start-up then
+ * counts, or switches to, a running oscillator.
+ */
+static void rosc_catch_up(RP2350ROSCState *s)
+{
+    if (timer_pending(s->startup_timer) &&
+        timer_expire_time_ns(s->startup_timer) <=
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        timer_del(s->startup_timer);
+        rosc_startup_cb(s);
+    }
+}
+
+static void rosc_feed(Notifier *n, void *data)
+{
+    rosc_catch_up(container_of(n, RP2350ROSCState, feed));
+}
+
 /* [spec:nuos:req:emu.rosc-trng] */
 static void rosc_enter_dormant(RP2350ROSCState *s)
 {
@@ -333,6 +356,7 @@ static uint64_t rp2350_rosc_read(void *opaque, hwaddr addr, unsigned size)
 {
     RP2350ROSCState *s = opaque;
 
+    rosc_catch_up(s);
     switch (rp2350_atomic_reg(addr)) {
     case A_CTRL:
         return s->ctrl;
@@ -405,6 +429,7 @@ static void rp2350_rosc_write(void *opaque, hwaddr addr, uint64_t value64,
     hwaddr reg = rp2350_atomic_reg(addr);
     uint32_t value = value64;
 
+    rosc_catch_up(s);
     switch (reg) {
     case A_CTRL:
         rosc_write_ctrl(s, rp2350_atomic_apply(addr, s->ctrl, value));
@@ -527,6 +552,7 @@ static void rp2350_rosc_init(Object *obj)
                           TYPE_RP2350_ROSC, RP2350_ATOMIC_REGION_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     s->startup_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rosc_startup_cb, s);
+    s->feed.notify = rosc_feed;
     qdev_init_gpio_in_named(DEVICE(obj), rosc_set_wake,
                             RP2350_OSC_DORMANT_WAKE, 1);
     s->out = qdev_init_clock_out(DEVICE(obj), RP2350_ROSC_CLK);

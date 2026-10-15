@@ -1280,6 +1280,7 @@ io_prepare(hwaddr *out_offset, CPUState *cpu, CPUTLBEntryFull *full,
     section = full->section;
     mr_offset = full->xlat_offset + addr;
     cpu->mem_io_pc = retaddr;
+    cpu->access_held = false;
     if (!cpu->neg.can_do_io) {
         cpu_io_recompile(cpu, retaddr);
     }
@@ -1292,6 +1293,14 @@ static void io_failed(CPUState *cpu, CPUTLBEntryFull *full, vaddr addr,
                       unsigned size, MMUAccessType access_type, int mmu_idx,
                       MemTxResult response, uintptr_t retaddr)
 {
+    /*
+     * A device holds the access (cpu_hold_access()): no fault, the
+     * instruction is made again when the CPU next runs.
+     */
+    if (cpu->access_held) {
+        cpu->access_held = false;
+        cpu_loop_exit_restore(cpu, retaddr);
+    }
     if (!cpu->ignore_memory_transaction_failures
         && cpu->cc->tcg_ops->do_transaction_failed) {
         hwaddr physaddr = full->phys_addr | (addr & ~TARGET_PAGE_MASK);

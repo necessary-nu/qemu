@@ -72,6 +72,10 @@ struct ESP32P4IcmState {
     uint32_t rdn_eco_cs;
     uint32_t rdn_eco_low;
     uint32_t rdn_eco_high;
+
+    /* The block whose records can wait (esp32p4_icm_set_records()). */
+    void (*records_due)(void *opaque);
+    void *records_opaque;
 };
 
 /*
@@ -83,5 +87,14 @@ struct ESP32P4IcmState {
  */
 void esp32p4_icm_addrhole(ESP32P4IcmState *s, bool sys, uint32_t addr,
                           uint8_t id, bool write, bool illegal);
+
+/*
+ * The block that records refusals here and can hold a record back after
+ * the refusal (the APMs, from the middle of a core's block of code, until
+ * it ends): @due takes what it holds, which a register access runs first,
+ * so that the record is there for a read made after the refusal.
+ */
+void esp32p4_icm_set_records(ESP32P4IcmState *s, void (*due)(void *opaque),
+                             void *opaque);
 
 #endif

@@ -162,10 +162,16 @@ static void rp2350_clkregs_hold_reset(Object *obj, ResetType type)
     }
 }
 
+static void rp2350_clkregs_feed(Notifier *n, void *data)
+{
+    rp2350_clkregs_catch_up(container_of(n, RP2350ClkRegsState, feed));
+}
+
 static void rp2350_clkregs_init(Object *obj)
 {
     RP2350ClkRegsState *s = RP2350_CLKREGS(obj);
 
+    s->feed.notify = rp2350_clkregs_feed;
     memory_region_init_io(&s->iomem, obj, &rp2350_clkregs_ops, s,
                           object_get_typename(obj), RP2350_ATOMIC_REGION_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
@@ -537,16 +543,24 @@ static void clocks_resus_cb(void *opaque)
     clocks_update_irq(s);
 }
 
+/* [spec:nuos:req:emu.clock-tree] */
+void rp2350_clocks_add_feed(RP2350ClocksState *s, Notifier *n)
+{
+    notifier_list_add(&s->feeds, n);
+}
+
 /*
  * The frequency counter's delay and interval end, and the resuscitation,
  * when due; a count that ends starts the next phase, which may be due
- * too.
+ * too. First the blocks feeding the sources take theirs (an oscillator's
+ * start-up, a PLL's lock), so that the sources are as they are by now.
  */
 /* [spec:nuos:req:emu.clock-tree] */
 static void clocks_catch_up(RP2350ClkRegsState *rs)
 {
     RP2350ClocksState *s = RP2350_CLOCKS(rs);
 
+    notifier_list_notify(&s->feeds, NULL);
     if (clkregs_due(s->resus_timer)) {
         timer_del(s->resus_timer);
         clocks_resus_cb(s);
@@ -872,6 +886,7 @@ static void rp2350_clocks_init(Object *obj)
         s->clk[i] = qdev_init_clock_out(dev, rp2350_clock_names[i]);
     }
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    notifier_list_init(&s->feeds);
     s->resus_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, clocks_resus_cb, s);
     s->fc0_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, fc0_cb, s);
 }

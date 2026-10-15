@@ -174,6 +174,23 @@ static void uart_line_tx_tick(void *opaque)
     uart_line_tx_schedule(s);
 }
 
+/*
+ * [spec:nuos:req:emu.uart]
+ * The bits due by line_time(), each at its own time: a receiver's register
+ * access (line_sync()) brings the chip's RX line up to its time first,
+ * however late the bit timer runs.
+ */
+static void uart_line_tx_sync(Notifier *n, void *data)
+{
+    UARTLineState *s = container_of(n, UARTLineState, line_source);
+    int64_t now = line_time();
+
+    while (timer_pending(s->tx_timer) && s->tx_next <= now) {
+        timer_del(s->tx_timer);
+        uart_line_tx_tick(s);
+    }
+}
+
 static int uart_line_can_receive(void *opaque)
 {
     UARTLineState *s = opaque;
@@ -234,6 +251,7 @@ static void uart_line_init(Object *obj)
     fifo8_create(&s->tx_queue, UART_LINE_TX_QUEUE);
     s->rx_level = 1;
     s->txd = 1;
+    s->line_source.notify = uart_line_tx_sync;
 }
 
 static void uart_line_finalize(Object *obj)
@@ -256,6 +274,12 @@ static void uart_line_realize(DeviceState *dev, Error **errp)
     qemu_chr_fe_set_handlers(&s->chr, uart_line_can_receive,
                              uart_line_receive, uart_line_event, NULL, s,
                              NULL, true);
+    line_add_source(&s->line_source);
+}
+
+static void uart_line_unrealize(DeviceState *dev)
+{
+    line_remove_source(&UART_LINE(dev)->line_source);
 }
 
 static const VMStateDescription vmstate_uart_line = {
@@ -295,6 +319,7 @@ static void uart_line_class_init(ObjectClass *oc, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(oc);
 
     dc->realize = uart_line_realize;
+    dc->unrealize = uart_line_unrealize;
     dc->vmsd = &vmstate_uart_line;
     device_class_set_props(dc, uart_line_properties);
     rc->phases.hold = uart_line_reset_hold;

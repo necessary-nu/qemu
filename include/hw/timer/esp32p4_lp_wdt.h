@@ -10,6 +10,7 @@
 #define HW_TIMER_ESP32P4_LP_WDT_H
 
 #include "hw/core/clock.h"
+#include "hw/core/line-time.h"
 #include "hw/core/sysbus.h"
 #include "hw/misc/esp32p4_clkrst.h"
 #include "hw/nvram/esp32p4_efuse.h"
@@ -97,7 +98,18 @@ struct ESP32P4LPWdtState {
     bool spi_boot;
     bool sleep;
     bool swd_reset_en;
+
+    /* The due order the watchdogs take part in, if any, as its sources. */
+    LineDueOrder *due_order;
+    LineDueSource rwdt_src;
+    LineDueSource swd_src;
 };
+
+/*
+ * Make the RTC and super watchdogs' events sources of @o, as
+ * esp32p4_timg_join_due_order() does the timer groups'.
+ */
+void esp32p4_lp_wdt_join_due_order(ESP32P4LPWdtState *s, LineDueOrder *o);
 
 /*
  * A write of SWD_RST_FLAG_CLR, which needs no key: the boot ROM's main()
