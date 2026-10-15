@@ -760,6 +760,8 @@ struct ESP32P4ClkRstState {
     uint8_t sdio_edge[3];
 
     Clock *clk_in[ESP32P4_NUM_CLKIN];
+    /* The device at each input's source, as esp32p4_clkrst_sync() syncs */
+    ESP32P4ClkSourceSync in_source[ESP32P4_NUM_CLKIN];
     Clock *clk[ESP32P4_NUM_CLOCKS];
     /* The index + 1 of each output Clock, for its exact period. */
     GHashTable *clk_ids;
@@ -848,6 +850,9 @@ struct ESP32P4ClkRstState {
 /* The @reset of esp32p4_clkrst_map_gated() for a block that has none. */
 #define ESP32P4_CLKRST_GATE_NO_RESET ESP32P4_NUM_RESETS
 
+/* How many registers esp32p4_clkrst_gate_volatile() can name per block */
+#define ESP32P4_CLKRST_GATE_VOLATILE_MAX 4
+
 /*
  * Map region @n of @dev at @addr in system memory behind the bus clock
  * ESP32P4_CLK_@bus_clock and the reset line ESP32P4_RST_@reset, or
@@ -865,7 +870,9 @@ struct ESP32P4ClkRstState {
  *
  * A register whose read has a side effect, such as popping a FIFO, must
  * not act while the block is gated: esp32p4_clkrst_gate_volatile() names
- * it, and while gated it reads as 0 and has no effect.
+ * it, once for each such register (up to
+ * ESP32P4_CLKRST_GATE_VOLATILE_MAX), and while gated it reads as 0 and
+ * has no effect.
  */
 ESP32P4ClkRstGate *esp32p4_clkrst_map_gated(ESP32P4ClkRstState *s,
                                             SysBusDevice *dev, int n,
@@ -873,13 +880,6 @@ ESP32P4ClkRstGate *esp32p4_clkrst_map_gated(ESP32P4ClkRstState *s,
                                             unsigned reset, int priority);
 void esp32p4_clkrst_gate_volatile(ESP32P4ClkRstGate *g, hwaddr offset,
                                   unsigned size);
-
-/*
- * The block a gated mapping's region @mr leads to, or NULL for a region
- * that is not one: for a DMA master that must see whether the block is in
- * the middle of an access, which the gate has no owner to show.
- */
-DeviceState *esp32p4_clkrst_gated_device(MemoryRegion *mr);
 
 /*
  * Bring the clock tree up to @now: the changes its sources (the PLLs) and

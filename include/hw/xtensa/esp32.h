@@ -40,6 +40,7 @@
 #include "hw/display/esp_rgb.h"
 #include "hw/net/esp32_emac.h"
 #include "hw/net/ip101_phy.h"
+#include "hw/misc/esp32_gated_region.h"
 
 /* The DPORT register pairs that gate a peripheral's clock and reset it. */
 typedef enum Esp32GateRegs {
@@ -60,8 +61,7 @@ typedef struct Esp32PeriphGate Esp32PeriphGate;
 /* One of a gated peripheral's register blocks, seen through the gate. */
 typedef struct Esp32GateWindow {
     Esp32PeriphGate *gate;
-    MemoryRegion iomem;
-    AddressSpace dev_as;
+    Esp32GatedRegion region;
 } Esp32GateWindow;
 
 /*
