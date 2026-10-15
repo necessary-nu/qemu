@@ -487,6 +487,8 @@ struct qemu_work_item;
  * @mem_io_pc: Host Program Counter at which the memory was accessed.
  * @access_held: The device the CPU's current load or store reached holds
  *   it (cpu_hold_access()).
+ * @access_held_exclusive: And has the CPU make it again with every other
+ *   CPU stopped (cpu_hold_access_exclusive()).
  * @accel: Pointer to accelerator specific state.
  * @vcpu_dirty: Hardware accelerator is not synchronized with QEMU state
  * @kvm_fd: vCPU file descriptor for KVM.
@@ -585,6 +587,7 @@ struct CPUState {
      */
     uintptr_t mem_io_pc;
     bool access_held;
+    bool access_held_exclusive;
 
     /* Only used in KVM */
     int kvm_fd;
@@ -1113,6 +1116,24 @@ void cpu_exit(CPUState *cpu);
  * hold lapses with the CPU's next access to a device.
  */
 void cpu_hold_access(CPUState *cpu);
+
+/**
+ * cpu_hold_access_exclusive:
+ * @cpu: The CPU whose own load or store a device is handling, on its
+ *   thread, in parallel with other CPUs: under TCG with each CPU on a
+ *   thread of its own (CF_PARALLEL), outside an exclusive section
+ *   (cpu_in_exclusive_context()).
+ *
+ * For a device whose answer to the access must take effect for every CPU
+ * at the access's instant, as one changing what other CPUs' translations
+ * reach would: the device answers the access with a failure, MEMTX_ERROR,
+ * and the CPU, rather than taking a fault, gives back the instruction,
+ * which has not executed, and makes it again at once, alone, with every
+ * other CPU stopped between translation blocks (start_exclusive()), as it
+ * makes an atomic operation on I/O; work queued meanwhile for any CPU runs
+ * before that CPU's next instruction. The device makes the access then.
+ */
+void cpu_hold_access_exclusive(CPUState *cpu);
 
 /**
  * cpu_pause:

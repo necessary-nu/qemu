@@ -2610,6 +2610,15 @@ bool memory_region_set_gate(MemoryRegion *mr, MemoryRegion *front,
     return true;
 }
 
+void memory_region_set_store_watch(MemoryRegion *mr,
+                                   const MemoryRegionStoreWatchOps *ops,
+                                   void *opaque)
+{
+    assert(memory_region_is_ram(mr));
+    mr->store_watch = ops;
+    mr->store_watch_opaque = ops ? opaque : NULL;
+}
+
 void memory_region_set_enabled(MemoryRegion *mr, bool enabled)
 {
     if (enabled == mr->enabled) {
