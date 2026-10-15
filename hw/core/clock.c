@@ -50,6 +50,12 @@ void clock_set_callback(Clock *clk, ClockCallback *cb, void *opaque,
     clk->callback_events = events;
 }
 
+void clock_set_sync(Clock *clk, ClockSyncFn *fn, void *opaque)
+{
+    clk->sync = fn;
+    clk->sync_opaque = opaque;
+}
+
 bool clock_set(Clock *clk, uint64_t period)
 {
     if (clk->period == period) {

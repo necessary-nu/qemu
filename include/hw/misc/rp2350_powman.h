@@ -114,6 +114,7 @@ struct RP2350PowmanState {
     QEMUTimer *alarm_timer;
     int64_t alarm_ns;
     LineDueSource alarm_due;
+    LineDueOrder *clock_order;
     /*
      * A tick source switch, which waits for the current source's tick, at
      * switch_ns.

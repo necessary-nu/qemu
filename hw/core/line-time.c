@@ -96,46 +96,86 @@ int64_t line_sync(void)
     return now;
 }
 
+/*
+ * A loaded snapshot or an incoming migration brings the sources' timers
+ * with it, untold: the order asks its sources afresh.
+ */
+static void line_due_order_vm_change(void *opaque, bool running,
+                                     RunState state)
+{
+    LineDueOrder *o = opaque;
+
+    o->next = INT64_MIN;
+}
+
 void line_due_order_init(LineDueOrder *o)
 {
     QLIST_INIT(&o->sources);
     o->running = false;
+    o->untold = 0;
+    o->next = INT64_MIN;
+    qemu_add_vm_change_state_handler(line_due_order_vm_change, o);
 }
 
 void line_due_order_add(LineDueOrder *o, LineDueSource *src)
 {
     QLIST_INSERT_HEAD(&o->sources, src, next);
+    if (!src->tells) {
+        o->untold++;
+    }
+    o->next = INT64_MIN;
+}
+
+/* Arm @t for an event of a source of @o (if any) at @when. */
+void line_due_order_mod(LineDueOrder *o, QEMUTimer *t, int64_t when)
+{
+    timer_mod(t, when);
+    if (o) {
+        o->next = MIN(o->next, when);
+    }
 }
 
 /*
  * Run the sources' events due by @now, the earliest first: each event can
  * change when the others fall due (a reset that deletes a block's timers),
- * so the next is chosen afresh after each.
+ * so the next is chosen afresh after each. Once none is due, the earliest
+ * to come is when the order next has to look.
  */
 void line_due_order_run(LineDueOrder *o, int64_t now)
 {
-    if (o->running) {
+    if (o->running || (!o->untold && now < o->next)) {
         return;
     }
     o->running = true;
+    o->next = INT64_MIN;
     while (qemu_reset_requested_get() == SHUTDOWN_CAUSE_NONE) {
         LineDueSource *src, *first = NULL;
-        int64_t due = now;
+        int64_t due = now, soonest = INT64_MAX;
 
         QLIST_FOREACH(src, &o->sources, next) {
             int64_t at = src->next_due(src);
 
+            soonest = MIN(soonest, at);
             if (at <= due && (!first || at < due)) {
                 first = src;
                 due = at;
             }
         }
         if (!first) {
+            o->next = soonest;
             break;
         }
         first->run(first);
     }
     o->running = false;
+}
+
+/* Run the events due by line_time(), reading it only if one is pending. */
+void line_due_order_catch_up(LineDueOrder *o)
+{
+    if (o->untold || o->next != INT64_MAX) {
+        line_due_order_run(o, line_time());
+    }
 }
 
 /* A change held back, to be replayed at its time: fn(opaque, n, level). */

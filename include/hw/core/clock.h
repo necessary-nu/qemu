@@ -34,6 +34,7 @@ typedef enum ClockEvent {
 } ClockEvent;
 
 typedef void ClockCallback(void *opaque, ClockEvent event);
+typedef void ClockSyncFn(void *opaque);
 
 /*
  * clock store a value representing the clock's period in 2^-32ns unit.
@@ -65,6 +66,8 @@ typedef void ClockCallback(void *opaque, ClockEvent event);
  * @source: source (or parent in clock tree) of the clock
  * @children: list of clocks connected to this one (it is their source)
  * @sibling: structure used to form a clock list
+ * @sync: brings the clock up to time (clock_set_sync())
+ * @sync_opaque: argument for @sync
  */
 
 
@@ -89,6 +92,9 @@ struct Clock {
     Clock *source;
     QLIST_HEAD(, Clock) children;
     QLIST_ENTRY(Clock) sibling;
+
+    ClockSyncFn *sync;
+    void *sync_opaque;
 };
 
 /*
@@ -152,6 +158,42 @@ void clock_set_callback(Clock *clk, ClockCallback *cb,
  * Further @src update will be propagated to @clk and its subtree.
  */
 void clock_set_source(Clock *clk, Clock *src);
+
+/**
+ * clock_set_sync:
+ * @clk: the clock
+ * @fn: the function that brings @clk up to time
+ * @opaque: argument for @fn
+ *
+ * A clock whose device changes it at times of its own, on QEMU timers
+ * that can run well after them (without icount, on a loaded host),
+ * takes a change only once its timer runs: until then a device timing
+ * from the clock would count at a rate the clock no longer has, or not
+ * at all. The clock's device sets @fn, which makes every change of @clk,
+ * and of the clocks feeding it, due by the time of the access or change
+ * at hand, each at its own time.
+ */
+void clock_set_sync(Clock *clk, ClockSyncFn *fn, void *opaque);
+
+/**
+ * clock_sync:
+ * @clk: the clock
+ *
+ * Bring @clk up to time, before a device reads or acts on what it counts
+ * or times by it, as at a register access: run the function set with
+ * clock_set_sync() on the first clock from @clk towards its root that
+ * has one. A clock with none on its way to the root is always up to
+ * time.
+ */
+static inline void clock_sync(Clock *clk)
+{
+    for (; clk; clk = clk->source) {
+        if (clk->sync) {
+            clk->sync(clk->sync_opaque);
+            return;
+        }
+    }
+}
 
 /**
  * clock_has_source:

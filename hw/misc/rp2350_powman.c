@@ -530,7 +530,7 @@ static void aon_update(RP2350PowmanState *s)
 
         if (ns < INT64_MAX - s->aon_start_ns) {
             s->alarm_ns = s->aon_start_ns + ns;
-            timer_mod(s->alarm_timer, s->alarm_ns);
+            line_due_order_mod(s->clock_order, s->alarm_timer, s->alarm_ns);
         }
     }
     powman_update_irq(s);
@@ -576,6 +576,8 @@ void rp2350_powman_join_clock_order(RP2350PowmanState *s, LineDueOrder *o)
 {
     s->alarm_due.next_due = aon_alarm_next_due;
     s->alarm_due.run = aon_alarm_run_due;
+    s->alarm_due.tells = true;
+    s->clock_order = o;
     line_due_order_add(o, &s->alarm_due);
 }
 
@@ -1375,7 +1377,7 @@ static void powman_catch_up(RP2350PowmanState *s)
      * clk_ref, the fast POWMAN clock and the XOSC tick, as of now, and
      * with it the alarm if it came before.
      */
-    rp2350_clocks_sync(s->clk_ref);
+    clock_sync(s->clk_ref);
     for (;;) {
         QEMUTimer *t[] = {
             s->alarm_timer, s->switch_timer, s->vreg_timer, s->seq_timer,
