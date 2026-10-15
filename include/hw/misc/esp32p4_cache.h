@@ -108,15 +108,14 @@ typedef struct ESP32P4CacheView {
 
     /*
      * What the translations reach, `size` apart: the data cache's
-     * contents as a ROM device, which a load reads directly and a store
-     * writes through the controller; the same contents as RAM; each
-     * instruction cache's contents; and the region through which the
-     * accesses no cache's contents serve go.
+     * contents, RAM whose stores the model watches (a store to a page
+     * with a clean line marks its line dirty); each instruction cache's
+     * contents; and the region through which the accesses no cache's
+     * contents serve go.
      */
     MemoryRegion target;
     AddressSpace target_as;
     MemoryRegion l1[ESP32P4_CACHE_NL1];
-    MemoryRegion l1d_ram;
     MemoryRegion miss;
     MemoryRegion l2;
     /* The host memory of each cache's contents. */
@@ -132,7 +131,7 @@ typedef struct ESP32P4CacheView {
     int32_t nlines;
     /*
      * Per 4 KiB page: whether a core may have been given a translation
-     * that stores to the data cache's contents directly.
+     * that stores to the data cache's contents directly, past the watch.
      */
     unsigned long *l1d_direct;
     int32_t npages;
