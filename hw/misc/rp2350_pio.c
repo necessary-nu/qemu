@@ -2326,11 +2326,15 @@ static void rp2350_pio_clk_update(void *opaque, ClockEvent event)
     RP2350PIOState *s = opaque;
 
     if (event == ClockPreUpdate) {
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        uint64_t cycle = pio_cycle_at(s, now);
+        /*
+         * At the change's time (line_time()), however late the event
+         * making it ran, never before the last.
+         */
+        int64_t when = MAX(line_time(), s->base_ns);
+        uint64_t cycle = pio_cycle_at(s, when);
 
         pio_disturb(s);
-        s->base_ns = now;
+        s->base_ns = when;
         s->base_cycle = cycle;
     } else {
         pio_schedule(s);

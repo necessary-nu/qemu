@@ -401,6 +401,11 @@ void HELPER(wfi)(CPUARMState *env, uint32_t insn_len)
     qatomic_set(&env->halt_reason, HALT_WFI);
     cs->exception_index = EXCP_HLT;
     cs->halted = 1;
+    /*
+     * The core sleeps from here (cpu_sleep_enter()). WFI ends its block,
+     * so the clock can be read here, at its end, even under icount.
+     */
+    cpu_sleep_enter(cs, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     cpu_loop_exit(cs);
 #endif
 }
@@ -464,6 +469,7 @@ void HELPER(wfit)(CPUARMState *env, uint32_t rd)
     qatomic_set(&env->halt_reason, HALT_WFI);
     cs->exception_index = EXCP_HLT;
     cs->halted = 1;
+    cpu_sleep_enter(cs, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     cpu_loop_exit(cs);
 #endif
 }
@@ -480,6 +486,18 @@ void HELPER(sev)(CPUARMState *env)
         if (cs == self) {
             continue;
         }
+#ifndef CONFIG_USER_ONLY
+        /*
+         * A core asleep in WFE wakes at the SEV's time, which ends this
+         * CPU's block and so can be read, even under icount.
+         */
+        if (qatomic_read(&cs->halted) &&
+            qatomic_read(&target_cpu->env.halt_reason) == HALT_WFE) {
+            BQL_LOCK_GUARD();
+
+            cpu_sleep_wake_event(cs, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        }
+#endif
         if (!qemu_cpu_is_self(cs)) {
             qemu_cpu_kick(cs);
         } else if (qatomic_read(&cs->halted)) {
@@ -648,6 +666,7 @@ void HELPER(wfe)(CPUARMState *env, uint32_t insn_len)
     qatomic_set(&env->halt_reason, HALT_WFE);
     cs->exception_index = EXCP_HLT;
     cs->halted = 1;
+    cpu_sleep_enter(cs, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     cpu_loop_exit(cs);
 #endif
 }
@@ -743,6 +762,7 @@ void HELPER(wfet)(CPUARMState *env, uint32_t rd)
     qatomic_set(&env->halt_reason, HALT_WFE);
     cs->exception_index = EXCP_HLT;
     cs->halted = 1;
+    cpu_sleep_enter(cs, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     cpu_loop_exit(cs);
 #endif
 }

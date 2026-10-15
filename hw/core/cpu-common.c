@@ -123,6 +123,8 @@ static void cpu_common_reset_hold(Object *obj, ResetType type)
 
     cpu->interrupt_request = 0;
     cpu->halted = cpu->start_powered_off;
+    memset(&cpu->sleep_log, 0, sizeof(cpu->sleep_log));
+    cpu->sleep_log.wake_ns = INT64_MAX;
     cpu->mem_io_pc = 0;
     cpu->icount_extra = 0;
     qatomic_set(&cpu->neg.icount_decr.u32, 0);

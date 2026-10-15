@@ -223,6 +223,8 @@ struct RP2350State {
     RP2350PLLState pll_sys;
     RP2350PLLState pll_usb;
     RP2350TicksState ticks;
+    /* The clock tree's events, in the order of their times. */
+    LineDueOrder clock_order;
     RP2350SysInfoState sysinfo;
     RP2350SysCfgState syscfg;
     RP2350TBManState tbman;

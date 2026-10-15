@@ -1201,7 +1201,8 @@ static void pl011_event(void *opaque, QEMUChrEvent event)
  */
 static void pl011_line_clock_update(PL011State *s, ClockEvent event)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /* The change's time, however late the event making it ran. */
+    int64_t now = line_time();
 
     if (event == ClockPreUpdate) {
         if (!clock_get(s->clk)) {

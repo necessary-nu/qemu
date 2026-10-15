@@ -17,6 +17,7 @@
 #include "qemu/timer.h"
 #include "hw/intc/armv7m_nvic.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-properties.h"
 #include "system/tcg.h"
 #include "system/runstate.h"
@@ -223,6 +224,22 @@ static int exc_group_prio(NVICState *s, int rawprio, bool targets_secure)
 }
 
 /*
+ * An event that wakes the CPU from a sleep reaches it: from WFI or WFE
+ * for an exception (@any), from WFE only for an event (SEVONPEND). Its
+ * time is the interrupt's own (line_event_time()), however late the
+ * device raises it, which ends the sleep in the CPU's log.
+ */
+static void nvic_wake_event(NVICState *s, bool any)
+{
+    CPUState *cs = CPU(s->cpu);
+
+    if (qatomic_read(&cs->halted) &&
+        (any || qatomic_read(&s->cpu->env.halt_reason) == HALT_WFE)) {
+        cpu_sleep_wake_event(cs, line_event_time());
+    }
+}
+
+/*
  * Update the pending state of an exception vector.
  * This is the central function for all updates to vec->pending.
  * Handles SEVONPEND: if this is a 0->1 transition on an external interrupt
@@ -240,6 +257,7 @@ static void nvic_update_pending_state(NVICState *s, VecInfo *vec,
         /* SEVONPEND: interrupt going to pending is a WFE wakeup event */
         if (s->cpu->env.v7m.scr[scr_bank] & R_V7M_SCR_SEVONPEND_MASK) {
             s->cpu->env.event_register = true;
+            nvic_wake_event(s, false);
             qemu_cpu_kick(CPU(s->cpu));
         }
     }
@@ -511,6 +529,9 @@ static void nvic_irq_update(NVICState *s)
      */
     lvl = (pend_prio < s->exception_prio);
     trace_nvic_irq_update(s->vectpending, pend_prio, s->exception_prio, lvl);
+    if (lvl) {
+        nvic_wake_event(s, true);
+    }
     qemu_set_irq(s->excpout, lvl);
 }
 

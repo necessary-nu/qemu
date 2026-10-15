@@ -54,6 +54,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/misc/rp2350_m33_debug.h"
 #include "migration/vmstate.h"
@@ -442,11 +443,22 @@ static uint32_t dwt_cyccnt(RP2350M33DebugState *s)
                       clock_ns_to_ticks(s->cpuclk, s->dwt_cyccnt_ns));
 }
 
-/* Fold the count so far into dwt_cyccnt before its rate changes. */
+/*
+ * Fold the count so far into dwt_cyccnt before its rate changes: at the
+ * access, or at the time of a change of the core clock (line_time()),
+ * however late the event making it ran, never before the last.
+ */
 static void dwt_cyccnt_latch(RP2350M33DebugState *s)
 {
-    s->dwt_cyccnt = dwt_cyccnt(s);
-    s->dwt_cyccnt_ns = now_ns();
+    int64_t when = MAX(line_time(), s->dwt_cyccnt_ns);
+    uint32_t ctrl = *s_reg(s, RP2350_M33_DEBUG_DWT, A_DWT_CTRL);
+
+    if (ctrl & DWT_CTRL_CYCCNTENA) {
+        s->dwt_cyccnt += (uint32_t)(clock_ns_to_ticks(s->cpuclk, when) -
+                                    clock_ns_to_ticks(s->cpuclk,
+                                                      s->dwt_cyccnt_ns));
+    }
+    s->dwt_cyccnt_ns = when;
 }
 
 static void rp2350_m33_debug_cpuclk_update(void *opaque, ClockEvent event)

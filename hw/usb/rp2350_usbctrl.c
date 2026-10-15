@@ -2054,8 +2054,10 @@ static void rp2350_usbctrl_reset_exit(Object *obj, ResetType type)
 }
 
 /*
- * clk_usb changes rate, starts or stops: the PHY's cycle count continues
- * at the new rate, and the PHY comes alive or dies with the clock.
+ * clk_usb changes rate, starts or stops, at the change's time
+ * (usb_now()) however late the event making it ran, never before the
+ * last: the PHY's cycle count continues at the new rate, and the PHY
+ * comes alive or dies with the clock.
  */
 static void rp2350_usbctrl_clk_changed(void *opaque, ClockEvent event)
 {
@@ -2064,7 +2066,7 @@ static void rp2350_usbctrl_clk_changed(void *opaque, ClockEvent event)
 
     if (event == ClockPreUpdate) {
         s->phy_base = phy_cycles(s);
-        s->phy_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->phy_base_ns = MAX(usb_now(), s->phy_base_ns);
         return;
     }
     hz = clock_get_hz(s->clk);

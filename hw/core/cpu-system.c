@@ -30,6 +30,8 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysemu-cpu-ops.h"
 #include "migration/vmstate.h"
+#include "qemu/main-loop.h"
+#include "qemu/timer.h"
 #include "system/hw_accel.h"
 #include "system/tcg.h"
 #include "cpu-internal.h"
@@ -37,6 +39,91 @@
 bool cpu_has_work(CPUState *cpu)
 {
     return cpu->cc->sysemu_ops->has_work(cpu);
+}
+
+/*
+ * Whether the log's last change put the CPU to sleep. Only the CPU's own
+ * thread starts and ends a sleep (and a reset, with every CPU stopped),
+ * so that thread can ask without the BQL.
+ */
+static bool sleep_log_asleep(const CPUSleepLog *log)
+{
+    return log->n && log->asleep[log->n - 1];
+}
+
+/* A change, never before the last: the oldest goes once enough are kept. */
+static void sleep_log_add(CPUSleepLog *log, bool asleep, int64_t when)
+{
+    if (log->n && when < log->when[log->n - 1]) {
+        when = log->when[log->n - 1];
+    }
+    if (log->n == CPU_SLEEP_CHANGES) {
+        memmove(&log->when[0], &log->when[1],
+                (CPU_SLEEP_CHANGES - 1) * sizeof(log->when[0]));
+        memmove(&log->asleep[0], &log->asleep[1],
+                (CPU_SLEEP_CHANGES - 1) * sizeof(log->asleep[0]));
+        log->n--;
+        log->lost = true;
+    }
+    log->when[log->n] = when;
+    log->asleep[log->n] = asleep;
+    log->n++;
+}
+
+void cpu_sleep_enter(CPUState *cpu, int64_t when)
+{
+    CPUSleepLog *log = &cpu->sleep_log;
+    BQL_LOCK_GUARD();
+
+    if (sleep_log_asleep(log)) {
+        return;
+    }
+    log->wake_ns = INT64_MAX;
+    sleep_log_add(log, true, when);
+}
+
+void cpu_sleep_wake_event(CPUState *cpu, int64_t when)
+{
+    CPUSleepLog *log = &cpu->sleep_log;
+
+    if (!sleep_log_asleep(log)) {
+        return;
+    }
+    log->wake_ns = MIN(log->wake_ns, MAX(when, log->when[log->n - 1]));
+}
+
+void cpu_sleep_exit(CPUState *cpu)
+{
+    CPUSleepLog *log = &cpu->sleep_log;
+    int64_t when;
+
+    if (!sleep_log_asleep(log)) {
+        return;
+    }
+    BQL_LOCK_GUARD();
+    when = log->wake_ns;
+    if (when == INT64_MAX) {
+        when = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    }
+    log->wake_ns = INT64_MAX;
+    sleep_log_add(log, false, when);
+}
+
+int cpu_slept_at(CPUState *cpu, int64_t when)
+{
+    const CPUSleepLog *log = &cpu->sleep_log;
+    int i;
+
+    for (i = log->n - 1; i >= 0; i--) {
+        if (log->when[i] <= when) {
+            /* A sleep under way ends at the waking event's time. */
+            if (i == log->n - 1 && log->asleep[i] && log->wake_ns <= when) {
+                return 0;
+            }
+            return log->asleep[i];
+        }
+    }
+    return log->lost ? -1 : 0;
 }
 
 bool cpu_paging_enabled(const CPUState *cpu)

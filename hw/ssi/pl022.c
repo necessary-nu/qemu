@@ -762,7 +762,8 @@ static const VMStateDescription vmstate_pl022 = {
 static void pl022_clk_update(void *opaque, ClockEvent event)
 {
     PL022State *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /* The change's time, however late the event making it ran. */
+    int64_t now = line_time();
 
     if (event == ClockPreUpdate) {
         if (s->busy && timer_pending(s->frame_timer)) {
