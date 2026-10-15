@@ -113,6 +113,17 @@ enum {
 extern const char *const rp2350_clock_names[RP2350_NUM_CLOCKS];
 extern const char *const rp2350_clock_source_names[RP2350_NUM_CLKSRC];
 
+/*
+ * For a glitch reaching generator `clk`, a peripheral clock (clk_peri,
+ * clk_hstx, clk_usb or clk_adc): returns whether any of its destinations
+ * is out of reset, so that the glitch reaches logic, and with `apply`
+ * leaves those undefined.
+ */
+typedef bool RP2350ClocksGlitchFn(void *opaque, int clk, bool apply);
+
+/* clk_ref's and clk_sys's glitchless muxes, by their index in state. */
+#define RP2350_NUM_GLITCHLESS 2
+
 struct RP2350ClocksState {
     RP2350ClkRegsState parent_obj;
 
@@ -122,6 +133,30 @@ struct RP2350ClocksState {
 
     /* ENABLED of the generators that have an enable, by generator bit. */
     uint32_t enabled;
+    /*
+     * For each generator with an enable that a clear of ENABLE stopped:
+     * until when it still reads ENABLED, and is exposed to a glitch, two
+     * cycles of its source after the clear. Its output stops at once.
+     */
+    int64_t stop_ns[RP2350_NUM_CLOCKS];
+
+    /*
+     * Each glitchless mux's last switch: the input it left (-1 if none),
+     * shown in SELECTED until gl_leave_ns, two cycles of that input after
+     * SRC changed; then SELECTED reads 0 until gl_done_ns, two cycles of
+     * the new input later, when the switch completes.
+     */
+    int32_t gl_from[RP2350_NUM_GLITCHLESS];
+    int64_t gl_leave_ns[RP2350_NUM_GLITCHLESS];
+    int64_t gl_done_ns[RP2350_NUM_GLITCHLESS];
+
+    /*
+     * A glitch reached clk_sys: the processors and everything else
+     * clk_sys clocks stop until CLOCKS is reset.
+     */
+    bool sys_glitched;
+    RP2350ClocksGlitchFn *glitch_fn;
+    void *glitch_opaque;
 
     /*
      * The clk_sys resuscitation circuit: whether it has switched clk_sys
@@ -160,6 +195,10 @@ struct RP2350ClocksState {
  * as they are then.
  */
 void rp2350_clocks_add_feed(RP2350ClocksState *s, Notifier *n);
+
+/* Have @fn handle glitches that reach the peripheral clocks. */
+void rp2350_clocks_set_glitch_fn(RP2350ClocksState *s, RP2350ClocksGlitchFn *fn,
+                                 void *opaque);
 
 /*
  * Configure CLOCKS as the boot ROM's early boot path leaves it: clk_ref

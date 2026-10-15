@@ -183,22 +183,56 @@ static void icount_edge_time(uint64_t k, uint64_t period, uint64_t frac,
 }
 
 /*
+ * The first edge of @cpu's icount clock at or after @thi:@tlo 2^-32 ns from
+ * time 0, in the same units as *@ehi:*@elo, and in *@rem the fraction of a
+ * unit beyond it, in 1/den of a unit as icount_edge_time() gives it; false
+ * for none. The clock's edges fall at whole multiples of its exact period
+ * from time 0 (on the virtual clock, its bias included), the edges devices
+ * timed on the clock count.
+ */
+static bool icount_cpu_edge(CPUState *cpu, uint64_t thi, uint64_t tlo,
+                            uint64_t *ehi, uint64_t *elo, uint64_t *rem)
+{
+    uint64_t period = qatomic_read(&cpu->icount_period);
+    uint64_t frac = qatomic_read(&cpu->icount_period_frac);
+    uint64_t den = qatomic_read(&cpu->icount_period_den);
+    uint64_t qlo = tlo, qhi = thi, k;
+
+    if (!period) {
+        return false;
+    }
+    /* The first edge of the whole period: edges of the exact one are later. */
+    if (divu128(&qlo, &qhi, period)) {
+        qlo++;
+        qhi += !qlo;
+    }
+    if (qhi) {
+        return false;
+    }
+    k = qlo;
+    while (k > 0) {
+        icount_edge_time(k - 1, period, frac, den, elo, ehi, rem);
+        if (*ehi < thi || (*ehi == thi && *elo < tlo)) {
+            break;
+        }
+        k--;
+    }
+    icount_edge_time(k, period, frac, den, elo, ehi, rem);
+    return true;
+}
+
+/*
  * The first edge of @cpu's icount clock at or after @units 2^-32 ns past
- * the window's start, in the same units. The clock's edges fall at whole
- * multiples of its exact period from time 0 (on the virtual clock, its
- * bias included), the edges devices timed on the clock count. @cpu's
+ * the window's start, in the same units (icount_cpu_edge()). @cpu's
  * remainder is set for that edge, so that its instructions, each taking
  * an exact period, go on from edge to edge.
  */
 static int64_t icount_window_edge(CPUState *cpu, int64_t units)
 {
-    uint64_t period = qatomic_read(&cpu->icount_period);
-    uint64_t frac = qatomic_read(&cpu->icount_period_frac);
-    uint64_t den = qatomic_read(&cpu->icount_period_den);
     int64_t start_ns = timers_state.qemu_icount_bias + timers_state.window_ns;
-    uint64_t tlo, thi, qlo, qhi, elo, ehi, rem, k;
+    uint64_t tlo, thi, elo, ehi, rem;
 
-    if (!period || start_ns < 0 || units < 0 || units > INT64_MAX / 2) {
+    if (start_ns < 0 || units < 0 || units > INT64_MAX / 2) {
         return units;
     }
     /* The time, in 2^-32 ns from time 0. */
@@ -206,25 +240,9 @@ static int64_t icount_window_edge(CPUState *cpu, int64_t units)
     thi = (uint64_t)start_ns >> 32;
     tlo += (uint64_t)units;
     thi += tlo < (uint64_t)units;
-    /* The first edge of the whole period: edges of the exact one are later. */
-    qlo = tlo;
-    qhi = thi;
-    if (divu128(&qlo, &qhi, period)) {
-        qlo++;
-        qhi += !qlo;
-    }
-    if (qhi) {
+    if (!icount_cpu_edge(cpu, thi, tlo, &ehi, &elo, &rem)) {
         return units;
     }
-    k = qlo;
-    while (k > 0) {
-        icount_edge_time(k - 1, period, frac, den, &elo, &ehi, &rem);
-        if (ehi < thi || (ehi == thi && elo < tlo)) {
-            break;
-        }
-        k--;
-    }
-    icount_edge_time(k, period, frac, den, &elo, &ehi, &rem);
     cpu->icount_time_rem = rem;
     return units + (int64_t)(elo - tlo);
 }
@@ -501,6 +519,24 @@ int64_t icount_get_precise(uint32_t *frac)
     return icount;
 }
 
+int64_t icount_get_cpu_edge(CPUState *cpu, uint32_t *frac)
+{
+    int64_t ns = icount_get_precise(frac);
+    uint64_t tlo, thi, elo, ehi, rem;
+
+    if (icount_enabled() != ICOUNT_PRECISE ||
+        replay_mode != REPLAY_MODE_NONE || ns < 0) {
+        return ns;
+    }
+    tlo = ((uint64_t)ns << 32) | *frac;
+    thi = (uint64_t)ns >> 32;
+    if (!icount_cpu_edge(cpu, thi, tlo, &ehi, &elo, &rem) || ehi >> 31) {
+        return ns;
+    }
+    *frac = (uint32_t)elo;
+    return (int64_t)((ehi << 32) | (elo >> 32));
+}
+
 int64_t icount_to_ns(int64_t icount)
 {
     return icount << qatomic_read(&timers_state.icount_time_shift);
@@ -634,6 +670,54 @@ static void icount_timer_cb(void *opaque)
     icount_warp_rt();
 }
 
+/* Whether CPUs execute at their clocks' rate (icount_set_cpu_clock()). */
+static bool icount_cpus_clocked(void)
+{
+    CPUState *cpu;
+
+    if (icount_enabled() != ICOUNT_PRECISE ||
+        replay_mode != REPLAY_MODE_NONE) {
+        return false;
+    }
+    CPU_FOREACH(cpu) {
+        if (qatomic_read(&cpu->icount_period)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Move virtual time on @deadline ns, to the next timer's deadline, while
+ * every vCPU is idle. With CPUs executing at their clocks' rate, virtual
+ * time keeps the fraction of a nanosecond their instructions ran to, and
+ * reads it rounded up (icount_get()): it moves to the first moment that
+ * reads as the deadline, a unit of 2^-32 ns past the nanosecond before.
+ * A CPU the timer wakes goes on from its clock's first edge at or after
+ * that moment (icount_window_update()), which is the first edge whose time
+ * rounds up to the deadline or later: the one a running CPU's instruction
+ * ends on as it finds the timer has fired, and so the one at which a
+ * timer timed on the CPU's clock, due at that edge, comes. Keeping the
+ * fraction the CPUs went idle at would put the moment anywhere within the
+ * nanosecond before the deadline, and the wake an edge late whenever the
+ * edge falls before it.
+ */
+static void icount_warp_to_deadline(int64_t deadline)
+{
+    int64_t ns;
+
+    if (!icount_cpus_clocked()) {
+        qatomic_set(&timers_state.qemu_icount_bias,
+                    timers_state.qemu_icount_bias + deadline);
+        return;
+    }
+    ns = timers_state.qemu_icount_bias + timers_state.qemu_icount_time +
+         (timers_state.qemu_icount_time_frac != 0) + deadline - 1;
+    qatomic_set(&timers_state.qemu_icount_bias,
+                ns - timers_state.qemu_icount_time);
+    timers_state.qemu_icount_time_frac = 1;
+}
+
 void icount_start_warp_timer(void)
 {
     int64_t clock;
@@ -743,8 +827,7 @@ void icount_start_warp_timer(void)
              */
             seqlock_write_lock(&timers_state.vm_clock_seqlock,
                                &timers_state.vm_clock_lock);
-            qatomic_set(&timers_state.qemu_icount_bias,
-                        timers_state.qemu_icount_bias + deadline);
+            icount_warp_to_deadline(deadline);
             seqlock_write_unlock(&timers_state.vm_clock_seqlock,
                                  &timers_state.vm_clock_lock);
             qemu_clock_notify(QEMU_CLOCK_VIRTUAL);

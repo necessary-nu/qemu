@@ -15,6 +15,7 @@
 
 #include "ptimer-test.h"
 
+const VMStateInfo vmstate_info_bool;
 const VMStateInfo vmstate_info_uint8;
 const VMStateInfo vmstate_info_uint32;
 const VMStateInfo vmstate_info_uint64;
