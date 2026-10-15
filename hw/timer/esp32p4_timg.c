@@ -397,6 +397,20 @@ static void timg_timer_cb(void *opaque)
     timg_timer_due(t->s, t - t->s->t);
 }
 
+static int64_t timg_timer_next_due(LineDueSource *src)
+{
+    ESP32P4TimgTimer *t = container_of(src, ESP32P4TimgTimer, due_src);
+
+    return timer_pending(&t->timer) ? t->due_ns : INT64_MAX;
+}
+
+static void timg_timer_run_due(LineDueSource *src)
+{
+    ESP32P4TimgTimer *t = container_of(src, ESP32P4TimgTimer, due_src);
+
+    timg_timer_due(t->s, t - t->s->t);
+}
+
 /* [spec:nuos:req:emu.esp32p4.timers] */
 static void timg_timer_write_config(ESP32P4TimgState *s, int x,
                                     uint32_t value, int64_t now)
@@ -713,6 +727,21 @@ static void timg_wdt_cb(void *opaque)
 {
     ESP32P4TimgState *s = opaque;
 
+    timg_wdt_timeout(s, s->wdt.due_ns);
+}
+
+static int64_t timg_wdt_next_due(LineDueSource *src)
+{
+    ESP32P4TimgWdt *w = container_of(src, ESP32P4TimgWdt, due_src);
+
+    return timer_pending(&w->timer) ? w->due_ns : INT64_MAX;
+}
+
+static void timg_wdt_run_due(LineDueSource *src)
+{
+    ESP32P4TimgState *s = container_of(src, ESP32P4TimgState, wdt.due_src);
+
+    timer_del(&s->wdt.timer);
     timg_wdt_timeout(s, s->wdt.due_ns);
 }
 
@@ -1203,6 +1232,37 @@ static bool timg_catch_up(ESP32P4TimgState *s, int64_t now)
     return s->reset_count == resets;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * A register access at @now: first every event due by then in the due
+ * order the block takes part in, the other blocks' (the RTC watchdog, the
+ * other timer group) with its own, in the order of their times, so that
+ * an earlier reset that resets this block comes before this block's own
+ * events, which it then never takes; then the rest of the block's. False
+ * if an event reset the block.
+ */
+static bool timg_access_catch_up(ESP32P4TimgState *s, int64_t now)
+{
+    uint32_t resets = s->reset_count;
+
+    if (s->due_order) {
+        line_due_order_run(s->due_order, now);
+    }
+    return timg_catch_up(s, now) && s->reset_count == resets;
+}
+
+/* [spec:nuos:req:emu.esp32p4.timers] */
+void esp32p4_timg_join_due_order(ESP32P4TimgState *s, LineDueOrder *o)
+{
+    int x;
+
+    s->due_order = o;
+    for (x = 0; x < ESP32P4_TIMG_TIMERS; x++) {
+        line_due_order_add(o, &s->t[x].due_src);
+    }
+    line_due_order_add(o, &s->wdt.due_src);
+}
+
 /* Bring the calibration unit up to @now for an access to its registers. */
 static void timg_cal_access(ESP32P4TimgState *s, hwaddr addr, int64_t now)
 {
@@ -1300,7 +1360,7 @@ static uint64_t timg_read(void *opaque, hwaddr addr, unsigned size)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t v;
 
-    timg_catch_up(s, now);
+    timg_access_catch_up(s, now);
     timg_cal_access(s, addr & ~3, now);
     if (!timg_read_reg(s, addr & ~3, &v)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s%u: read of reserved offset 0x%"
@@ -1464,7 +1524,7 @@ static void timg_write(void *opaque, hwaddr addr, uint64_t data,
     uint32_t ones = (data << shift) & lanes;
     uint32_t old;
 
-    if (!timg_catch_up(s, now)) {
+    if (!timg_access_catch_up(s, now)) {
         return;
     }
     timg_cal_access(s, addr & ~3, now);
@@ -1616,8 +1676,12 @@ static void esp32p4_timg_init(Object *obj)
         s->t[i].s = s;
         timer_init_ns(&s->t[i].timer, QEMU_CLOCK_VIRTUAL, timg_timer_cb,
                       &s->t[i]);
+        s->t[i].due_src.next_due = timg_timer_next_due;
+        s->t[i].due_src.run = timg_timer_run_due;
     }
     timer_init_ns(&s->wdt.timer, QEMU_CLOCK_VIRTUAL, timg_wdt_cb, s);
+    s->wdt.due_src.next_due = timg_wdt_next_due;
+    s->wdt.due_src.run = timg_wdt_run_due;
     for (i = 0; i <= ESP32P4_TIMG_TIMERS; i++) {
         sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[i]);
     }

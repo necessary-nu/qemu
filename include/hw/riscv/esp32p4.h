@@ -351,6 +351,11 @@ struct ESP32P4MachineState {
     ESP32P4SysTimerState systimer;
     ESP32P4TimgState timg[2];
     ESP32P4LPWdtState lp_wdt;
+    /*
+     * The timer groups' and the RTC watchdog's events, whose resets act
+     * on one another's blocks, in one order (esp32p4_timg.h).
+     */
+    LineDueOrder wdt_order;
     ESP32P4LPTimerState lp_timer;
     /* Each HP core's stall, to the system timer and the RTC timer. */
     SplitIRQ core_stall_split[ESP32P4_HP_CORES];

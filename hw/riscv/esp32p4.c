@@ -1465,6 +1465,16 @@ static void esp32p4_init_timers(ESP32P4MachineState *s)
                                         ESP32P4_CLKRST_RWDT_CORE_RESET, n));
     }
 
+    /*
+     * [spec:nuos:req:emu.esp32p4.timers]
+     * An RTC watchdog's or MWDT's reset resets the timer groups: their
+     * events take one order across the blocks at a register access.
+     */
+    line_due_order_init(&s->wdt_order);
+    esp32p4_timg_join_due_order(&s->timg[0], &s->wdt_order);
+    esp32p4_timg_join_due_order(&s->timg[1], &s->wdt_order);
+    esp32p4_lp_wdt_join_due_order(&s->lp_wdt, &s->wdt_order);
+
     object_initialize_child(OBJECT(s), "lp-timer", &s->lp_timer,
                             TYPE_ESP32P4_LP_TIMER);
     dev = DEVICE(&s->lp_timer);
@@ -2756,6 +2766,8 @@ static void esp32p4_init_low_power(ESP32P4MachineState *s)
                              &error_abort);
     object_property_set_link(OBJECT(pmu), "lp-sys", OBJECT(&s->lp_sys),
                              &error_abort);
+    object_property_set_link(OBJECT(pmu), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
     qdev_connect_clock_in(pmu, "fast", qdev_get_clock_out(clkrst,
                                                           "lp-dyn-fast"));
     qdev_connect_clock_in(pmu, "slow", qdev_get_clock_out(clkrst,
@@ -2870,11 +2882,6 @@ static void esp32p4_init_low_power(ESP32P4MachineState *s)
                                 qdev_get_gpio_in_named(pmu,
                                     ESP32P4_PMU_WAKEUP,
                                     ESP32P4_PMU_WAKE_RTC_TIMER1));
-    for (i = 0; i < ESP32P4_PMU_EXT_PADS; i++) {
-        esp32p4_gpio_watch_pad(&s->gpio, i,
-                               qdev_get_gpio_in_named(pmu,
-                                                      ESP32P4_PMU_EXT_PAD, i));
-    }
 
     object_initialize_child(OBJECT(s), "lp-ana", &s->lp_ana,
                             TYPE_ESP32P4_LP_ANA);
@@ -3485,6 +3492,7 @@ static void esp32p4_init_mipi(ESP32P4MachineState *s)
                           qdev_get_clock_out(clkrst, "mipi-csi-dphy-cfg"));
     qdev_connect_clock_in(cbrg, "bus",
                           qdev_get_clock_out(clkrst, "csi-brg-sys"));
+    object_property_set_link(OBJECT(cbrg), "host", OBJECT(csi), &error_abort);
     if (s->csi_camera) {
         object_property_set_link(OBJECT(csi), "camera",
                                  OBJECT(s->csi_camera), &error_abort);
@@ -3868,6 +3876,8 @@ static void esp32p4_init_rmt_pcnt(ESP32P4MachineState *s)
     object_initialize_child(OBJECT(s), "rmt", &s->rmt, TYPE_ESP32P4_RMT);
     dev = DEVICE(&s->rmt);
     object_property_set_link(OBJECT(dev), "gdma", OBJECT(&s->gdma[0]),
+                             &error_abort);
+    object_property_set_link(OBJECT(dev), "gpio", OBJECT(gpio),
                              &error_abort);
     qdev_connect_clock_in(dev, "sclk", qdev_get_clock_out(clkrst, "rmt"));
     sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);

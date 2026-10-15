@@ -517,7 +517,8 @@ static void upd_run(void *opaque);
 /*
  * What fell due before an access at esp32_line_time(), in order: the DVP
  * camera's lines first, which its timer, late without icount, has yet to
- * bring (esp32p4_image_source_sync()).
+ * bring (esp32p4_image_source_sync()), and the CSI camera's packets
+ * through the CSI host (esp32p4_csi_bridge_sync_host()).
  */
 static void isp_sync(ESP32P4IspState *s)
 {
@@ -526,6 +527,9 @@ static void isp_sync(ESP32P4IspState *s)
 
     if (s->camera) {
         esp32p4_image_source_sync(s->camera);
+    }
+    if (s->bridge) {
+        esp32p4_csi_bridge_sync_host(s->bridge);
     }
     upd_run(s);
     s->deliver_upto = now;
@@ -1034,10 +1038,16 @@ static void isp_csi_frame_end(void *opaque, uint8_t vc, uint16_t number,
     }
 }
 
+static void isp_csi_sync(void *opaque)
+{
+    isp_sync(opaque);
+}
+
 static const ESP32P4CsiIdiOps esp32p4_isp_idi_ops = {
     .frame_start = isp_csi_frame_start,
     .line = isp_csi_line,
     .frame_end = isp_csi_frame_end,
+    .sync = isp_csi_sync,
 };
 
 /* ---- DVP ---- */

@@ -18,24 +18,36 @@
  * REF_TICK (REF_ALWAYS_ON), divided by DIV_CNT (0 meaning 256) into the
  * channel clock.
  *
- * Timing runs on QEMU_CLOCK_VIRTUAL with one timer for the block, set for
- * the next output edge, filter decision, sampled input edge or idle end;
- * there are no per-tick events. When the timer runs late, or a register
- * access finds events due, every due event is processed in order, each at
- * its own virtual time, so signal edges at rates far above the timer's
- * resolution are delivered as a batch with their exact times. Times are
- * those of the signal lines (hw/gpio/esp32_line.h): an output edge is
- * stamped with its time on the GPIO matrix signal, and an input changes
- * at the time its change is stamped with, so a channel receiving another
- * block's output through the matrix, or another channel's, measures the
- * transmitted durations exactly. The block is a line source: a block that
- * samples the pads brings the transmitters up to the moment it samples
- * at, and a register access or the block's timer, while a receiver is
- * enabled, first brings every other source up to the moment it acts at,
- * so that an edge sent late (the host running behind virtual time without
- * icount) still reaches the receiver before it records the time after it.
- * Every edge is still delivered: the cost of a transmission is
- * proportional to its number of edges, carrier edges included.
+ * Timing runs on QEMU_CLOCK_VIRTUAL; there are no per-tick events. The
+ * channels run on whenever the block is brought up to a moment (a register
+ * or RAM access, an input change, software sampling the pads, a clock
+ * change, the block's timer): each runs through every event due since,
+ * each at its own virtual time, so that what software reads is exact at
+ * the moment it reads it. The block's one timer is set only for the
+ * moments something outside the block sees, and only when they change
+ * (rmt_schedule()): an edge of an output that reaches a watched pad (one
+ * whose level something but software sampling the pads sees:
+ * esp32_sig_out_watched()), and the raising of an interrupt INT_ENA lets
+ * out while INT_RAW does not already hold it, found by running a copy of
+ * the channel ahead. An output nothing watches has no edge anyone sees:
+ * it is driven with its level of the moment whenever the block is brought
+ * up to date, its carrier worked out in closed form and the passes of a
+ * continuous transmission taken whole once they repeat, so that it costs
+ * the host nothing however fast it switches. A register access that finds
+ * the timer's moment unchanged leaves the timer alone: setting it again
+ * would stop the CPU's run under icount for nothing.
+ *
+ * Times are those of the signal lines (hw/gpio/esp32_line.h): an output
+ * edge is stamped with its time on the GPIO matrix signal, and an input
+ * changes at the time its change is stamped with, so a channel receiving
+ * another block's output through the matrix, or another channel's,
+ * measures the transmitted durations exactly. The block is a line source:
+ * a block that samples the pads brings the transmitters up to the moment
+ * it samples at, and a register access or the block's timer, while a
+ * receiver is enabled, first brings every other source up to the moment
+ * it acts at, so that an edge sent late (the host running behind virtual
+ * time without icount) still reaches the receiver before it records the
+ * time after it.
  *
  * Behaviour the TRM leaves open, as modelled:
  * - TX_START starts the transmitter when written as 1 while it is idle,
@@ -100,8 +112,10 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/host-utils.h"
+#include "qapi/error.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32_rmt.h"
 #include "migration/vmstate.h"
@@ -187,6 +201,19 @@
 
 #define NEVER                   INT64_MAX
 
+/* The interrupts channel n's transmitter and its receiver raise */
+#define INT_TX_BITS(n)          (INT_TX_END(n) | INT_ERR(n) | \
+                                 INT_TX_THR_EVENT(n))
+#define INT_RX_BITS(n)          (INT_RX_END(n) | INT_ERR(n))
+
+/*
+ * A receiver's look-ahead with no further input goes through its pending
+ * filter and sampler decisions, at most two full entries (an idle
+ * threshold of up to 65535 ticks against entries of 32767) and the idle
+ * end.
+ */
+#define RX_AHEAD_STEPS          8
+
 static inline bool ch_conf1(Esp32RmtChannel *c, uint32_t bit)
 {
     return (c->conf1 & bit) != 0;
@@ -226,20 +253,19 @@ static unsigned ram_index(unsigned n, uint32_t off)
     return (n * ESP32_RMT_BLOCK_WORDS + off) % ESP32_RMT_RAM_WORDS;
 }
 
-/* Period of channel n's base clock, in 2^-32 ns; 0 while it is stopped */
-static uint64_t base_period(Esp32RmtState *s, unsigned n)
+/* Period of channel c's base clock, in 2^-32 ns; 0 while it is stopped */
+static uint64_t base_period(Esp32RmtState *s, Esp32RmtChannel *c)
 {
-    if (ch_conf1(&s->ch[n], CONF1_REF_ALWAYS_ON)) {
+    if (ch_conf1(c, CONF1_REF_ALWAYS_ON)) {
         return clock_get(s->apb_clk);
     }
     return clock_get(s->ref_tick_clk);
 }
 
-/* The base clock cycle channel n is in at time t */
-static uint64_t cycle_at(Esp32RmtState *s, unsigned n, int64_t t)
+/* The base clock cycle channel c is in at time t */
+static uint64_t cycle_at(Esp32RmtState *s, Esp32RmtChannel *c, int64_t t)
 {
-    Esp32RmtChannel *c = &s->ch[n];
-    uint64_t period = base_period(s, n);
+    uint64_t period = base_period(s, c);
     uint64_t lo, hi, d;
 
     if (!period || t <= c->anchor_ns) {
@@ -252,11 +278,10 @@ static uint64_t cycle_at(Esp32RmtState *s, unsigned n, int64_t t)
     return c->anchor_c + lo;
 }
 
-/* The first time at which channel n has reached cycle cyc */
-static int64_t cycle_time(Esp32RmtState *s, unsigned n, uint64_t cyc)
+/* The first time at which channel c has reached cycle cyc */
+static int64_t cycle_time(Esp32RmtState *s, Esp32RmtChannel *c, uint64_t cyc)
 {
-    Esp32RmtChannel *c = &s->ch[n];
-    uint64_t period = base_period(s, n);
+    uint64_t period = base_period(s, c);
     uint64_t lo, hi, ns;
 
     if (cyc <= c->anchor_c) {
@@ -279,31 +304,43 @@ static int64_t cycle_time(Esp32RmtState *s, unsigned n, uint64_t cyc)
     return c->anchor_ns + ns;
 }
 
-/* Restart channel n's cycle count from time now, at the cycle it is in. */
-static void reanchor(Esp32RmtState *s, unsigned n, int64_t now)
+/* Restart channel c's cycle count from time now, at the cycle it is in. */
+static void reanchor(Esp32RmtState *s, Esp32RmtChannel *c, int64_t now)
 {
-    Esp32RmtChannel *c = &s->ch[n];
-
-    c->anchor_c = cycle_at(s, n, now);
+    c->anchor_c = cycle_at(s, c, now);
     c->anchor_ns = now;
 }
 
-/* The first channel clock tick of channel n at or after cycle cyc */
-static uint64_t tick_ceil(Esp32RmtState *s, unsigned n, uint64_t cyc)
+/* The first channel clock tick of channel c at or after cycle cyc */
+static uint64_t tick_ceil(Esp32RmtChannel *c, uint64_t cyc)
 {
-    uint32_t div = ch_div(&s->ch[n]);
+    uint32_t div = ch_div(c);
 
     return DIV_ROUND_UP(cyc, div) * div;
 }
 
+/*
+ * Raise interrupts. A look-ahead (s->ahead), running a copy of a channel
+ * to find when it first raises one that is seen, only notes them.
+ */
 static void raise_int(Esp32RmtState *s, uint32_t bits)
 {
-    s->int_raw |= bits;
+    if (s->ahead) {
+        s->ahead_raised |= bits;
+    } else {
+        s->int_raw |= bits;
+    }
 }
 
+/* The interrupt line, driven only as its level changes */
 static void update_irq(Esp32RmtState *s)
 {
-    qemu_set_irq(s->irq, (s->int_raw & s->int_ena) != 0);
+    bool level = (s->int_raw & s->int_ena) != 0;
+
+    if (level != s->irq_level) {
+        s->irq_level = level;
+        qemu_set_irq(s->irq, level);
+    }
 }
 
 /*
@@ -324,29 +361,29 @@ static void set_out(Esp32RmtState *s, unsigned n, uint8_t level, int64_t t)
     s->running = was_running;
 }
 
-/* [spec:nuos:req:emu.esp32.rmt] */
+/* [spec:nuos:req:emu.esp32.rmt] The level channel c's output is to have */
+static uint8_t tx_out_level(Esp32RmtChannel *c)
+{
+    if (c->tx_state == ESP32_RMT_TX_ENTRY) {
+        return c->tx_carrier ? c->tx_carrier_high : c->tx_level;
+    }
+    if (ch_conf1(c, CONF1_IDLE_OUT_EN)) {
+        return ch_conf1(c, CONF1_IDLE_OUT_LV);
+    }
+    return c->tx_end_level;
+}
+
 static void tx_update_out(Esp32RmtState *s, unsigned n, int64_t t)
 {
-    Esp32RmtChannel *c = &s->ch[n];
-    uint8_t level;
-
-    if (c->tx_state == ESP32_RMT_TX_ENTRY) {
-        level = c->tx_carrier ? c->tx_carrier_high : c->tx_level;
-    } else if (ch_conf1(c, CONF1_IDLE_OUT_EN)) {
-        level = ch_conf1(c, CONF1_IDLE_OUT_LV);
-    } else {
-        level = c->tx_end_level;
-    }
-    set_out(s, n, level, t);
+    set_out(s, n, tx_out_level(&s->ch[n]), t);
 }
 
 /*
  * Fetch the word at the read pointer. Past the end of the channel's
  * memory the transmitter stops with MEM_EMPTY and ERR.
  */
-static bool tx_fetch(Esp32RmtState *s, unsigned n)
+static bool tx_fetch(Esp32RmtState *s, Esp32RmtChannel *c, unsigned n)
 {
-    Esp32RmtChannel *c = &s->ch[n];
     uint32_t lim = c->tx_lim & TX_LIM_MASK;
 
     if (c->tx_raddr >= ch_mem_words(c)) {
@@ -380,11 +417,34 @@ static void tx_set_event(Esp32RmtChannel *c)
     }
 }
 
-/* An end marker with the given level, reached at cycle cyc. */
-static void tx_end(Esp32RmtState *s, unsigned n, uint64_t cyc, uint8_t level)
+/*
+ * The carrier's toggles before cycle lim, taken at once: high for
+ * CARRIER_HIGH and low for CARRIER_LOW cycles from where it started, it
+ * keeps its phase however many periods pass. Returns the cycle of the
+ * last toggle taken; the carrier is to have one due before lim.
+ */
+static uint64_t tx_carrier_skip(Esp32RmtChannel *c, uint64_t lim)
 {
-    Esp32RmtChannel *c = &s->ch[n];
+    uint64_t e0 = c->tx_carrier_end_c;
+    uint64_t d1 = carrier_cycles(c, !c->tx_carrier_high);
+    uint64_t p = d1 + carrier_cycles(c, c->tx_carrier_high);
+    uint64_t span = lim - 1 - e0;
+    uint64_t j = span / p;
 
+    /* Toggles fall at e0 + j * p (to the other level) and + d1 (back). */
+    if (span % p < d1) {
+        c->tx_carrier_high = !c->tx_carrier_high;
+        c->tx_carrier_end_c = e0 + j * p + d1;
+        return e0 + j * p;
+    }
+    c->tx_carrier_end_c = e0 + (j + 1) * p;
+    return e0 + j * p + d1;
+}
+
+/* An end marker with the given level, reached at cycle cyc. */
+static void tx_end(Esp32RmtState *s, Esp32RmtChannel *c, unsigned n,
+                   uint64_t cyc, uint8_t level)
+{
     c->tx_end_level = level;
     c->tx_carrier = false;
     c->tx_raddr = 0;
@@ -401,16 +461,16 @@ static void tx_end(Esp32RmtState *s, unsigned n, uint64_t cyc, uint8_t level)
 }
 
 /* Start sending the current entry at cycle cyc. */
-static void tx_begin_entry(Esp32RmtState *s, unsigned n, uint64_t cyc)
+static void tx_begin_entry(Esp32RmtState *s, Esp32RmtChannel *c, unsigned n,
+                           uint64_t cyc)
 {
-    Esp32RmtChannel *c = &s->ch[n];
     uint32_t e = c->tx_half ? c->tx_word >> 16 : c->tx_word & 0xffff;
     uint32_t period = e & ENTRY_PERIOD_MASK;
     uint8_t level = (e & ENTRY_LEVEL) != 0;
     bool carried;
 
     if (!period) {
-        tx_end(s, n, cyc, level);
+        tx_end(s, c, n, cyc, level);
         return;
     }
     c->tx_state = ESP32_RMT_TX_ENTRY;
@@ -429,13 +489,12 @@ static void tx_begin_entry(Esp32RmtState *s, unsigned n, uint64_t cyc)
 }
 
 /* Process the transmitter's event at cycle cyc. */
-static void tx_step(Esp32RmtState *s, unsigned n, uint64_t cyc)
+static void tx_step(Esp32RmtState *s, Esp32RmtChannel *c, unsigned n,
+                    uint64_t cyc)
 {
-    Esp32RmtChannel *c = &s->ch[n];
-
     if (c->tx_state == ESP32_RMT_TX_STARTING) {
-        if (tx_fetch(s, n)) {
-            tx_begin_entry(s, n, cyc);
+        if (tx_fetch(s, c, n)) {
+            tx_begin_entry(s, c, n, cyc);
         }
         return;
     }
@@ -457,27 +516,97 @@ static void tx_step(Esp32RmtState *s, unsigned n, uint64_t cyc)
                    (s->apb_conf & APB_CONF_MEM_TX_WRAP_EN)) {
             c->tx_raddr = 0;
         }
-        if (!tx_fetch(s, n)) {
+        if (!tx_fetch(s, c, n)) {
             return;
         }
     }
-    tx_begin_entry(s, n, cyc);
+    tx_begin_entry(s, c, n, cyc);
 }
 
-/* Run channel n's transmitter up to time t. */
+/*
+ * A continuous transmission about to start a pass at cycle cyc. Each pass
+ * starts afresh, the carrier off and the threshold count at 0, from the
+ * read pointer: with the memory, the settings and the read pointer where
+ * the last pass started, the pass is the last one again, as long and
+ * raising the same interrupts. The passes up to cycle now_c are then
+ * passed whole (the channel's pass tracking is dropped whenever the block
+ * changes other than by running on). Returns the cycle at which the pass
+ * to run starts, which the caller runs with, as the event's.
+ */
+static uint64_t tx_pass_skip(Esp32RmtChannel *c, uint64_t cyc, uint64_t now_c)
+{
+    if (c->pass_valid && c->pass_raddr == c->tx_raddr && cyc > c->pass_c) {
+        uint64_t len = cyc - c->pass_c;
+
+        if (now_c - cyc >= len) {
+            cyc += (now_c - cyc) / len * len;
+            c->tx_event_c = cyc;
+        }
+    }
+    c->pass_valid = true;
+    c->pass_c = cyc;
+    c->pass_raddr = c->tx_raddr;
+    return cyc;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rmt]
+ * Run channel n's transmitter up to time t. The edges of an output that
+ * reaches a watched pad are driven one by one, each stamped with its time.
+ * One that reaches none is driven once, with the level it has at t,
+ * stamped with the moment that level began; meanwhile its carrier's
+ * toggles are taken entry by entry in closed form, and a continuous
+ * transmission whose passes repeat skips whole passes.
+ */
 static void tx_advance(Esp32RmtState *s, unsigned n, int64_t t)
 {
     Esp32RmtChannel *c = &s->ch[n];
+    bool watched = s->out_watched & BIT(n);
+    uint8_t level = c->out_level;
+    uint64_t level_c = 0, now_c = 0;
+    bool have_now = false;
 
     while (c->tx_state != ESP32_RMT_TX_IDLE) {
         uint64_t cyc = c->tx_event_c;
-        int64_t at = cycle_time(s, n, cyc);
+        int64_t at = cycle_time(s, c, cyc);
 
         if (at > t) {
             break;
         }
-        tx_step(s, n, cyc);
-        tx_update_out(s, n, at);
+        if (watched) {
+            tx_step(s, c, n, cyc);
+            tx_update_out(s, n, at);
+            continue;
+        }
+        if (!have_now) {
+            now_c = cycle_at(s, c, t);
+            have_now = true;
+        }
+        if (c->tx_state == ESP32_RMT_TX_ENTRY && c->tx_carrier &&
+            c->tx_carrier_end_c < c->tx_entry_end_c) {
+            cyc = tx_carrier_skip(c, MIN(c->tx_entry_end_c, now_c + 1));
+            tx_set_event(c);
+        } else {
+            if (c->tx_state == ESP32_RMT_TX_STARTING &&
+                ch_conf1(c, CONF1_TX_CONTI_MODE)) {
+                uint64_t from = c->pass_c;
+                uint64_t start = tx_pass_skip(c, cyc, now_c);
+
+                /* The idle level, begun in the last pass, moves with it */
+                if (level_c >= from) {
+                    level_c += start - cyc;
+                }
+                cyc = start;
+            }
+            tx_step(s, c, n, cyc);
+        }
+        if (tx_out_level(c) != level) {
+            level = tx_out_level(c);
+            level_c = cyc;
+        }
+    }
+    if (!watched && level != c->out_level) {
+        set_out(s, n, level, cycle_time(s, c, level_c));
     }
 }
 
@@ -502,7 +631,8 @@ static void tx_start(Esp32RmtState *s, unsigned n, int64_t now)
     c->tx_half = 0;
     c->tx_carrier = false;
     c->tx_state = ESP32_RMT_TX_STARTING;
-    c->tx_event_c = tick_ceil(s, n, cycle_at(s, n, now) + 1);
+    c->tx_event_c = tick_ceil(c, cycle_at(s, c, now) + 1);
+    c->pass_valid = false;
 }
 
 /*
@@ -510,9 +640,9 @@ static void tx_start(Esp32RmtState *s, unsigned n, int64_t now)
  * low half of a word moves the pointer past the word, so that the pointer
  * counts the words holding the frame.
  */
-static void rx_write(Esp32RmtState *s, unsigned n, uint32_t entry)
+static void rx_write(Esp32RmtState *s, Esp32RmtChannel *c, unsigned n,
+                     uint32_t entry)
 {
-    Esp32RmtChannel *c = &s->ch[n];
     uint32_t *w;
 
     if (!ch_conf1(c, CONF1_MEM_OWNER)) {
@@ -526,7 +656,7 @@ static void rx_write(Esp32RmtState *s, unsigned n, uint32_t entry)
         return;
     }
     w = &s->ram[ram_index(n, c->rx_waddr)];
-    if (!rmt_mem_pd(s)) {
+    if (!rmt_mem_pd(s) && !s->ahead) {
         if (c->rx_half) {
             *w = (*w & 0xffff) | (entry << 16);
         } else {
@@ -563,26 +693,27 @@ static uint64_t rx_record_event(Esp32RmtChannel *c, bool *idle)
 }
 
 /* [spec:nuos:req:emu.esp32.rmt] */
-static void rx_record(Esp32RmtState *s, unsigned n, uint64_t cyc)
+static void rx_record(Esp32RmtState *s, Esp32RmtChannel *c, unsigned n,
+                      uint64_t cyc)
 {
-    Esp32RmtChannel *c = &s->ch[n];
     bool idle;
 
     rx_record_event(c, &idle);
     if (idle) {
-        rx_write(s, n, c->rx_level ? ENTRY_LEVEL : 0);
+        rx_write(s, c, n, c->rx_level ? ENTRY_LEVEL : 0);
         c->rx_frame = false;
         raise_int(s, INT_RX_END(n));
     } else {
-        rx_write(s, n, (c->rx_level ? ENTRY_LEVEL : 0) | ENTRY_PERIOD_MASK);
+        rx_write(s, c, n,
+                 (c->rx_level ? ENTRY_LEVEL : 0) | ENTRY_PERIOD_MASK);
         c->rx_edge_c = cyc;
     }
 }
 
 /* A sampled input edge to level at channel clock tick cyc */
-static void rx_edge(Esp32RmtState *s, unsigned n, uint64_t cyc, uint8_t level)
+static void rx_edge(Esp32RmtState *s, Esp32RmtChannel *c, unsigned n,
+                    uint64_t cyc, uint8_t level)
 {
-    Esp32RmtChannel *c = &s->ch[n];
     uint64_t ticks;
 
     c->in_samp = level;
@@ -594,25 +725,24 @@ static void rx_edge(Esp32RmtState *s, unsigned n, uint64_t cyc, uint8_t level)
     }
     ticks = (cyc - c->rx_edge_c) / ch_div(c);
     if (ticks) {
-        rx_write(s, n, (c->rx_level ? ENTRY_LEVEL : 0) |
-                       MIN(ticks, ENTRY_PERIOD_MASK));
+        rx_write(s, c, n, (c->rx_level ? ENTRY_LEVEL : 0) |
+                          MIN(ticks, ENTRY_PERIOD_MASK));
         c->rx_edge_c = cyc;
     }
     c->rx_level = level;
 }
 
 /* The filter's output changed to level at time t: sample it. */
-static void rx_filtered(Esp32RmtState *s, unsigned n, int64_t t,
+static void rx_filtered(Esp32RmtState *s, Esp32RmtChannel *c, int64_t t,
                         uint8_t level)
 {
-    Esp32RmtChannel *c = &s->ch[n];
-    uint64_t cyc = cycle_at(s, n, t);
+    uint64_t cyc = cycle_at(s, c, t);
 
     c->in_filt = level;
-    if (cycle_time(s, n, cyc) < t) {
+    if (cycle_time(s, c, cyc) < t) {
         cyc++;
     }
-    cyc = tick_ceil(s, n, cyc);
+    cyc = tick_ceil(c, cyc);
     if (c->samp_pending) {
         /* Back to the sampled level before the tick: the pulse is lost */
         c->samp_pending = false;
@@ -631,7 +761,7 @@ static void rx_raw(Esp32RmtState *s, unsigned n, int64_t t, uint8_t level)
     c->in_raw = level;
     if (!ch_conf1(c, CONF1_RX_FILTER_EN) || !thres) {
         if (level != c->in_filt) {
-            rx_filtered(s, n, t, level);
+            rx_filtered(s, c, t, level);
         }
         return;
     }
@@ -647,6 +777,42 @@ static void rx_raw(Esp32RmtState *s, unsigned n, int64_t t, uint8_t level)
     }
 }
 
+/*
+ * Process the receiver's first event due by time t, a filter decision, a
+ * sampled edge or a recorded entry, and return its time; NEVER if none is
+ * due.
+ */
+static int64_t rx_step(Esp32RmtState *s, Esp32RmtChannel *c, unsigned n,
+                       int64_t t)
+{
+    int64_t filt_t = c->filt_pending ? c->filt_ns : NEVER;
+    int64_t samp_t = c->samp_pending ? cycle_time(s, c, c->samp_c) : NEVER;
+    int64_t rec_t = NEVER;
+    uint64_t rec_c = 0;
+    bool idle;
+
+    if (c->rx_frame) {
+        rec_c = rx_record_event(c, &idle);
+        rec_t = cycle_time(s, c, rec_c);
+    }
+    if (filt_t <= samp_t && filt_t <= rec_t && filt_t <= t &&
+        filt_t != NEVER) {
+        c->filt_pending = false;
+        rx_filtered(s, c, filt_t, !c->in_filt);
+        return filt_t;
+    }
+    if (samp_t <= rec_t && samp_t <= t && samp_t != NEVER) {
+        c->samp_pending = false;
+        rx_edge(s, c, n, c->samp_c, !c->in_samp);
+        return samp_t;
+    }
+    if (rec_t <= t && rec_t != NEVER) {
+        rx_record(s, c, n, rec_c);
+        return rec_t;
+    }
+    return NEVER;
+}
+
 /* Run channel n's receiver up to time t. */
 static void rx_advance(Esp32RmtState *s, unsigned n, int64_t t)
 {
@@ -655,52 +821,74 @@ static void rx_advance(Esp32RmtState *s, unsigned n, int64_t t)
     if (!ch_conf1(c, CONF1_RX_EN)) {
         return;
     }
-    for (;;) {
-        int64_t filt_t = c->filt_pending ? c->filt_ns : NEVER;
-        int64_t samp_t = c->samp_pending ? cycle_time(s, n, c->samp_c)
-                                         : NEVER;
-        int64_t rec_t = NEVER;
-        uint64_t rec_c = 0;
-        bool idle;
-
-        if (c->rx_frame) {
-            rec_c = rx_record_event(c, &idle);
-            rec_t = cycle_time(s, n, rec_c);
-        }
-        if (filt_t <= samp_t && filt_t <= rec_t && filt_t <= t &&
-            filt_t != NEVER) {
-            c->filt_pending = false;
-            rx_filtered(s, n, filt_t, !c->in_filt);
-        } else if (samp_t <= rec_t && samp_t <= t && samp_t != NEVER) {
-            c->samp_pending = false;
-            rx_edge(s, n, c->samp_c, !c->in_samp);
-        } else if (rec_t <= t && rec_t != NEVER) {
-            rx_record(s, n, rec_c);
-        } else {
-            break;
-        }
+    while (rx_step(s, c, n, t) != NEVER) {
+        continue;
     }
 }
 
-static int64_t rx_next_event(Esp32RmtState *s, unsigned n)
+/*
+ * [spec:nuos:req:emu.esp32.rmt]
+ * The time at which channel n's transmitter, running on as it is with the
+ * memory as it is, first raises one of the interrupts seen; NEVER if it
+ * does not. The carrier, which raises nothing, is left out. If it ever
+ * reaches an end marker, the end of its memory or its threshold, it does
+ * within MAX(its memory, TX_LIM) + 1 fetches, so the run looks no further.
+ */
+static int64_t tx_seen_at(Esp32RmtState *s, unsigned n, uint32_t seen)
 {
-    Esp32RmtChannel *c = &s->ch[n];
-    int64_t t = NEVER;
-    bool idle;
+    Esp32RmtChannel c = s->ch[n];
+    uint32_t steps = 3 * (MAX(ch_mem_words(&c), c.tx_lim & TX_LIM_MASK) + 2);
+    int64_t found = NEVER;
 
-    if (!ch_conf1(c, CONF1_RX_EN)) {
-        return NEVER;
+    c.conf0 &= ~CONF0_CARRIER_EN;
+    c.tx_carrier = false;
+    if (c.tx_state == ESP32_RMT_TX_ENTRY) {
+        tx_set_event(&c);
     }
-    if (c->filt_pending) {
-        t = MIN(t, c->filt_ns);
+    s->ahead = true;
+    s->ahead_raised = 0;
+    while (c.tx_state != ESP32_RMT_TX_IDLE && steps--) {
+        uint64_t cyc = c.tx_event_c;
+        int64_t at = cycle_time(s, &c, cyc);
+
+        if (at == NEVER) {
+            break;
+        }
+        tx_step(s, &c, n, cyc);
+        if (s->ahead_raised & seen) {
+            found = at;
+            break;
+        }
     }
-    if (c->samp_pending) {
-        t = MIN(t, cycle_time(s, n, c->samp_c));
+    s->ahead = false;
+    return found;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rmt]
+ * The time at which channel n's receiver, with its input as it is, first
+ * raises one of the interrupts seen; NEVER if it does not.
+ */
+static int64_t rx_seen_at(Esp32RmtState *s, unsigned n, uint32_t seen)
+{
+    Esp32RmtChannel c = s->ch[n];
+    int64_t found = NEVER;
+
+    s->ahead = true;
+    s->ahead_raised = 0;
+    for (unsigned i = 0; i < RX_AHEAD_STEPS; i++) {
+        int64_t at = rx_step(s, &c, n, NEVER);
+
+        if (at == NEVER) {
+            break;
+        }
+        if (s->ahead_raised & seen) {
+            found = at;
+            break;
+        }
     }
-    if (c->rx_frame) {
-        t = MIN(t, cycle_time(s, n, rx_record_event(c, &idle)));
-    }
-    return t;
+    s->ahead = false;
+    return found;
 }
 
 /*
@@ -722,24 +910,62 @@ static void rmt_sync(Esp32RmtState *s, int64_t now)
     s->running = false;
 }
 
+/*
+ * The block has changed other than by running on: the moments it is seen
+ * at are to be found again, and continuous passes compared afresh.
+ */
+static void rmt_changed(Esp32RmtState *s)
+{
+    s->sched_stale = true;
+    for (unsigned n = 0; n < ESP32_RMT_CHANNELS; n++) {
+        s->ch[n].pass_valid = false;
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rmt]
+ * Drive the interrupt line, and set the timer for the first moment
+ * something outside the block sees: the next event of a transmitter whose
+ * output reaches a watched pad, and the first raising of an interrupt that
+ * INT_ENA lets out and INT_RAW does not hold. Running on alone does not
+ * change that moment, as the channels evolve alone: it is found again only
+ * when the block has changed otherwise (sched_stale), and the timer is set
+ * only when it moves.
+ */
 static void rmt_schedule(Esp32RmtState *s)
 {
     int64_t next = NEVER;
+    uint32_t seen;
 
+    update_irq(s);
+    if (!s->sched_stale) {
+        return;
+    }
+    s->sched_stale = false;
+    seen = s->int_ena & ~s->int_raw;
     for (unsigned n = 0; n < ESP32_RMT_CHANNELS; n++) {
         Esp32RmtChannel *c = &s->ch[n];
 
         if (c->tx_state != ESP32_RMT_TX_IDLE) {
-            next = MIN(next, cycle_time(s, n, c->tx_event_c));
+            if (s->out_watched & BIT(n)) {
+                next = MIN(next, cycle_time(s, c, c->tx_event_c));
+            } else if (seen & INT_TX_BITS(n)) {
+                next = MIN(next, tx_seen_at(s, n, seen & INT_TX_BITS(n)));
+            }
         }
-        next = MIN(next, rx_next_event(s, n));
+        if (ch_conf1(c, CONF1_RX_EN) && (seen & INT_RX_BITS(n))) {
+            next = MIN(next, rx_seen_at(s, n, seen & INT_RX_BITS(n)));
+        }
     }
     if (next == NEVER) {
-        timer_del(&s->timer);
-    } else {
+        if (s->due_ns != NEVER) {
+            timer_del(&s->timer);
+            s->due_ns = NEVER;
+        }
+    } else if (next != s->due_ns) {
         timer_mod_ns(&s->timer, next);
+        s->due_ns = next;
     }
-    update_irq(s);
 }
 
 static bool rmt_receiving(Esp32RmtState *s)
@@ -778,6 +1004,8 @@ static void rmt_timer_cb(void *opaque)
 {
     Esp32RmtState *s = opaque;
 
+    s->due_ns = NEVER;
+    s->sched_stale = true;
     rmt_catch_up(s);
     rmt_schedule(s);
 }
@@ -820,6 +1048,7 @@ static void esp32_rmt_sig_in(void *opaque, int n, int level)
         c->in_raw = c->in_filt = c->in_samp = level;
         return;
     }
+    s->sched_stale = true;
     t = esp32_line_time();
     if (outer) {
         s->running = true;
@@ -957,7 +1186,7 @@ static void conf0_write(Esp32RmtState *s, unsigned n, uint32_t v, int64_t now)
         v &= ~(CONF0_MEM_PD | CONF0_CLK_EN);
     }
     if ((v ^ c->conf0) & CONF0_DIV_CNT_MASK) {
-        reanchor(s, n, now);
+        reanchor(s, c, now);
     }
     if (n == 0 && (v & CONF0_MEM_PD) && !(c->conf0 & CONF0_MEM_PD)) {
         memset(s->ram, 0, sizeof(s->ram));
@@ -973,14 +1202,14 @@ static void conf1_write(Esp32RmtState *s, unsigned n, uint32_t v, int64_t now)
 
     v &= CONF1_MASK;
     if ((v ^ old) & CONF1_REF_ALWAYS_ON) {
-        reanchor(s, n, now);
+        reanchor(s, c, now);
     }
     c->conf1 = v & ~(CONF1_TX_START | CONF1_REF_CNT_RST);
 
     if (v & CONF1_REF_CNT_RST) {
         /* The divider restarts: a channel clock tick now */
-        reanchor(s, n, now);
-        c->anchor_c = tick_ceil(s, n, c->anchor_c);
+        reanchor(s, c, now);
+        c->anchor_c = tick_ceil(c, c->anchor_c);
     }
     if (v & CONF1_MEM_RD_RST) {
         c->tx_raddr = 0;
@@ -1009,7 +1238,7 @@ static void conf1_write(Esp32RmtState *s, unsigned n, uint32_t v, int64_t now)
     } else if ((old & CONF1_RX_FILTER_EN) && !(v & CONF1_RX_FILTER_EN) &&
                c->filt_pending) {
         c->filt_pending = false;
-        rx_filtered(s, n, now, c->in_raw);
+        rx_filtered(s, c, now, c->in_raw);
     }
     if (v & CONF1_TX_START) {
         tx_start(s, n, now);
@@ -1068,6 +1297,7 @@ static void rmt_reg_write(Esp32RmtState *s, hwaddr addr, uint64_t value)
                       "0x%" HWADDR_PRIx "\n", addr);
         break;
     }
+    rmt_changed(s);
     rmt_schedule(s);
 }
 
@@ -1160,12 +1390,13 @@ static void rmt_ram_access_write(void *opaque)
     Esp32RmtState *s = a->s;
 
     rmt_catch_up(s);
-    rmt_schedule(s);
-    if (!ram_accessible(s, a->addr, true)) {
-        return;
+    if (ram_accessible(s, a->addr, true)) {
+        s->ram[a->addr / 4] = deposit32(s->ram[a->addr / 4],
+                                        (a->addr & 3) * 8, a->size * 8,
+                                        a->value);
+        rmt_changed(s);
     }
-    s->ram[a->addr / 4] = deposit32(s->ram[a->addr / 4], (a->addr & 3) * 8,
-                                    a->size * 8, a->value);
+    rmt_schedule(s);
 }
 
 static uint64_t esp32_rmt_ram_read(void *opaque, hwaddr addr, unsigned size)
@@ -1207,11 +1438,56 @@ static void esp32_rmt_clk_update(void *opaque, ClockEvent event)
     if (event == ClockPreUpdate) {
         rmt_sync(s, now);
         for (unsigned n = 0; n < ESP32_RMT_CHANNELS; n++) {
-            reanchor(s, n, now);
+            reanchor(s, &s->ch[n], now);
         }
     } else {
+        rmt_changed(s);
         rmt_schedule(s);
     }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rmt]
+ * Which channels' outputs reach a pad whose level something but software
+ * sampling the pads sees (esp32_sig_out_watched()): only their edges are
+ * timed one by one. The others are driven with their level of the moment
+ * whenever the block is brought up to date. The transmitters are first
+ * brought up to now as they were, so that an output a watcher takes up
+ * has its level of the moment and its next edge timed from there.
+ */
+static void rmt_routes_run(void *opaque)
+{
+    Esp32RmtState *s = opaque;
+    int64_t t = esp32_line_time();
+    uint8_t watched = 0;
+
+    for (unsigned n = 0; n < ESP32_RMT_CHANNELS; n++) {
+        if (!s->gpio ||
+            esp32_sig_out_watched(OBJECT(s->gpio), ESP32_SIG_RMT_OUT0 + n)) {
+            watched |= BIT(n);
+        }
+    }
+    if (watched == s->out_watched) {
+        return;
+    }
+    if (!s->running) {
+        s->running = true;
+        for (unsigned n = 0; n < ESP32_RMT_CHANNELS; n++) {
+            tx_advance(s, n, t);
+        }
+        s->running = false;
+    }
+    s->out_watched = watched;
+    rmt_changed(s);
+    if (!s->running) {
+        rmt_schedule(s);
+    }
+}
+
+static void rmt_route_notify(Notifier *notifier, void *data)
+{
+    esp32_line_run_at(esp32_line_time(), rmt_routes_run,
+                      container_of(notifier, Esp32RmtState, route_notifier));
 }
 
 static void esp32_rmt_reset_hold(Object *obj, ResetType type)
@@ -1220,6 +1496,9 @@ static void esp32_rmt_reset_hold(Object *obj, ResetType type)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     timer_del(&s->timer);
+    s->due_ns = NEVER;
+    s->sched_stale = true;
+    s->irq_level = false;
     s->int_raw = 0;
     s->int_ena = 0;
     s->apb_conf = 0;
@@ -1247,7 +1526,9 @@ static void esp32_rmt_reset_exit(Object *obj, ResetType type)
     for (unsigned n = 0; n < ESP32_RMT_CHANNELS; n++) {
         qemu_set_irq(s->sig_out[n], 0);
     }
-    update_irq(s);
+    qemu_set_irq(s->irq, 0);
+    esp32_line_run_at(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), rmt_routes_run,
+                      s);
 }
 
 static void esp32_rmt_init(Object *obj)
@@ -1276,11 +1557,44 @@ static void esp32_rmt_init(Object *obj)
                                          ClockPreUpdate | ClockUpdate);
     timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, rmt_timer_cb, s);
     s->line_source.notify = rmt_line_sync;
+    s->route_notifier.notify = rmt_route_notify;
+    s->out_watched = MAKE_64BIT_MASK(0, ESP32_RMT_CHANNELS);
+    s->due_ns = NEVER;
 }
 
 static void esp32_rmt_realize(DeviceState *dev, Error **errp)
 {
-    esp32_line_add_source(&ESP32_RMT(dev)->line_source);
+    Esp32RmtState *s = ESP32_RMT(dev);
+
+    if (s->gpio && !object_dynamic_cast(OBJECT(s->gpio),
+                                        TYPE_ESP32_SIG_ROUTES)) {
+        error_setg(errp, "%s: \"gpio\" is not a GPIO matrix",
+                   object_get_typename(OBJECT(dev)));
+        return;
+    }
+    esp32_line_add_source(&s->line_source);
+    if (s->gpio) {
+        esp32_sig_add_route_notifier(OBJECT(s->gpio), &s->route_notifier);
+    }
+}
+
+static const Property esp32_rmt_properties[] = {
+    DEFINE_PROP_LINK("gpio", Esp32RmtState, gpio, TYPE_DEVICE,
+                     DeviceState *),
+};
+
+/*
+ * The timer's moment is the one it is set for; the schedule is found
+ * again, and continuous passes compared afresh, as the block next runs.
+ */
+static int esp32_rmt_post_load(void *opaque, int version_id)
+{
+    Esp32RmtState *s = opaque;
+
+    s->due_ns = timer_pending(&s->timer) ? timer_expire_time_ns(&s->timer)
+                                         : NEVER;
+    rmt_changed(s);
+    return 0;
 }
 
 static const VMStateDescription vmstate_esp32_rmt_channel = {
@@ -1331,8 +1645,9 @@ static const VMStateDescription vmstate_esp32_rmt_channel = {
 
 static const VMStateDescription vmstate_esp32_rmt = {
     .name = TYPE_ESP32_RMT,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .post_load = esp32_rmt_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(ram, Esp32RmtState, ESP32_RMT_RAM_WORDS),
         VMSTATE_UINT32(int_raw, Esp32RmtState),
@@ -1344,6 +1659,8 @@ static const VMStateDescription vmstate_esp32_rmt = {
         VMSTATE_TIMER(timer, Esp32RmtState),
         VMSTATE_CLOCK(apb_clk, Esp32RmtState),
         VMSTATE_CLOCK(ref_tick_clk, Esp32RmtState),
+        VMSTATE_UINT8(out_watched, Esp32RmtState),
+        VMSTATE_BOOL(irq_level, Esp32RmtState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1357,6 +1674,7 @@ static void esp32_rmt_class_init(ObjectClass *klass, const void *data)
     rc->phases.exit = esp32_rmt_reset_exit;
     dc->realize = esp32_rmt_realize;
     dc->vmsd = &vmstate_esp32_rmt;
+    device_class_set_props(dc, esp32_rmt_properties);
 }
 
 /* [spec:nuos:req:emu.esp32.rmt] */

@@ -79,6 +79,16 @@
 #define SIG_RMT_IN(n)       (83 + (n))
 #define SIG_RMT_OUT(n)      (87 + (n))
 
+#define GPIO_STATUS         (GPIO + 0x44)
+#define GPIO_STATUS_W1TC    (GPIO + 0x4c)
+#define GPIO_PIN(n)         (GPIO + 0x88 + 4 * (n))
+#define PIN_INT_RISING      (1u << 7)
+
+#define TIMG0_WDTCONFIG0    0x3ff5f048
+#define RTC_WDTCONFIG0      0x3ff4808c
+#define RTC_WDTWPROTECT     0x3ff480a4
+#define RTC_WDT_WKEY        0x50d83aa1
+
 #define GPIO_PATH           "/machine/soc/gpio"
 #define PAD_IN              "esp32-gpio-pad-in"
 #define PAD_OUT             "esp32-gpio-pad"
@@ -134,6 +144,20 @@ static void loopback(QTestState *qts)
 static bool pad18(QTestState *qts)
 {
     return (qtest_readl(qts, GPIO_IN) >> 18) & 1;
+}
+
+static int64_t step_to(QTestState *qts, int64_t now, int64_t t)
+{
+    g_assert_cmpint(t, >=, now);
+    return qtest_clock_step(qts, t - now);
+}
+
+/* The flash boot watchdogs would reset the chip within a second. */
+static void stop_watchdogs(QTestState *qts)
+{
+    qtest_writel(qts, TIMG0_WDTCONFIG0, 0);
+    qtest_writel(qts, RTC_WDTWPROTECT, RTC_WDT_WKEY);
+    qtest_writel(qts, RTC_WDTCONFIG0, 0);
 }
 
 /* [spec:nuos:req:emu.esp32.rmt/test] */
@@ -675,6 +699,135 @@ static void test_ref_tick(void)
     qtest_quit(qts);
 }
 
+/*
+ * The unwatched transmission: a pass of PASS_HIGH ticks high on a carrier
+ * of 3 + 5 APB cycles, PASS_LOW low, the end marker and the idle tick of
+ * continuous mode, on 25 ns ticks.
+ */
+#define PASS_HIGH           30001
+#define PASS_LOW            1000
+#define PASS                (PASS_HIGH + PASS_LOW + 1)
+
+/* GPIO18's level at time t, the first pass starting at t0 */
+static bool unwatched_level(int64_t t0, int64_t t)
+{
+    int64_t o;
+
+    if (t < t0) {
+        return false;
+    }
+    o = (t - t0) / APB_NS % PASS;
+    return o < PASS_HIGH && o % 8 < 3;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rmt/test]
+ * A continuous transmission carried at 5 MHz on GPIO18, which nothing
+ * watches, for a second: some ten million carrier edges, which the block
+ * takes in closed form. GPIO_IN reads the exact level, carrier phase
+ * included, a nanosecond either side of its edges; TX_END, enabled with
+ * the pad still unwatched, reaches the interrupt line at the pass's end
+ * marker to the nanosecond; and with GPIO18's rising-edge interrupt set,
+ * the pad watched, GPIO_STATUS latches the next carrier rise at its
+ * nanosecond.
+ */
+static void test_unwatched(void)
+{
+    QTestState *qts = start();
+    int64_t now, t0, pass_at, e;
+
+    stop_watchdogs(qts);
+    qtest_irq_intercept_out_named(qts, "/machine/soc/rmt", "sysbus-irq");
+    qtest_writel(qts, IO_MUX_GPIO18, MCU_SEL_GPIO | FUN_IE);
+    qtest_writel(qts, GPIO_FUNC_OUT(18), SIG_RMT_OUT(0));
+    wr(qts, APB_CONF, FIFO_MASK);
+    qtest_writel(qts, RAM(0, 0), W(E(1, PASS_HIGH), E(0, PASS_LOW)));
+    qtest_writel(qts, RAM(0, 1), W(E(0, 0), 0));
+    wr(qts, CARRIER_DUTY(0), (3 << 16) | 5);
+    now = qtest_clock_step(qts, US);
+    chan_clock(qts, 0, DIV(1) | MEM_SIZE(1) | CARRIER_EN | CARRIER_OUT_LV,
+               TX_CONTI_MODE);
+    wr(qts, CONF1(0), REF_ALWAYS_ON | TX_CONTI_MODE | TX_START);
+    t0 = now + APB_NS;
+
+    /* A carrier fall and rise about a second on */
+    pass_at = t0 + (1000 * 1000 * 1000 / (PASS * APB_NS)) * PASS * APB_NS;
+    for (e = pass_at + (8 * 1000 + 3) * APB_NS;
+         e <= pass_at + (8 * 1000 + 8) * APB_NS; e += 5 * APB_NS) {
+        now = step_to(qts, now, e - 1);
+        g_assert_cmpint(pad18(qts), ==, unwatched_level(t0, e - 1));
+        now = step_to(qts, now, e);
+        g_assert_cmpint(pad18(qts), ==, unwatched_level(t0, e));
+        g_assert_cmpint(unwatched_level(t0, e), !=,
+                        unwatched_level(t0, e - 1));
+    }
+    /* The carried stretch's end */
+    e = pass_at + PASS_HIGH * APB_NS;
+    now = step_to(qts, now, e - 1);
+    g_assert_true(pad18(qts));
+    now = step_to(qts, now, e);
+    g_assert_false(pad18(qts));
+    g_assert_cmphex(rd(qts, INT_RAW), ==, INT_TX_END(0));
+    g_assert_cmpuint(ST_STATE(rd(qts, STATUS(0))), ==, 1);
+    g_assert_cmpuint(ST_RADDR(rd(qts, STATUS(0))), ==, 0);
+
+    /* TX_END at the next end marker, with nothing read meanwhile */
+    wr(qts, INT_CLR, INT_TX_END(0));
+    wr(qts, INT_ENA, INT_TX_END(0));
+    e = pass_at + (PASS_HIGH + PASS_LOW) * APB_NS;
+    now = step_to(qts, now, e - 1);
+    g_assert_false(qtest_get_irq(qts, 0));
+    now = step_to(qts, now, e);
+    g_assert_true(qtest_get_irq(qts, 0));
+    wr(qts, INT_ENA, 0);
+    wr(qts, INT_CLR, INT_TX_END(0));
+
+    /* Watched: the next pass's third carrier rise latches at its moment */
+    qtest_writel(qts, GPIO_PIN(18), PIN_INT_RISING);
+    e = pass_at + (PASS + 16) * APB_NS;
+    now = step_to(qts, now, e - 1);
+    qtest_writel(qts, GPIO_STATUS_W1TC, 1u << 18);
+    g_assert_cmphex(qtest_readl(qts, GPIO_STATUS) & (1u << 18), ==, 0);
+    now = step_to(qts, now, e);
+    g_assert_cmphex(qtest_readl(qts, GPIO_STATUS) & (1u << 18), ==,
+                    1u << 18);
+    qtest_quit(qts);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.rmt/test]
+ * RX_END, enabled, reaches the interrupt line at the idle end to the
+ * nanosecond with nothing read meanwhile: 21 ticks of 1 us after the
+ * sampled last edge.
+ */
+static void test_rx_end_moment(void)
+{
+    QTestState *qts = start();
+    int64_t now, w;
+
+    qtest_irq_intercept_out_named(qts, "/machine/soc/rmt", "sysbus-irq");
+    qtest_writel(qts, IO_MUX_GPIO19, MCU_SEL_GPIO | FUN_IE);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_RMT_IN(1)), IN_SIG_IN_SEL | 19);
+    drive19(qts, 0);
+    wr(qts, APB_CONF, FIFO_MASK);
+    w = now = qtest_clock_step(qts, US);
+    chan_clock(qts, 1, DIV(40) | MEM_SIZE(1) | IDLE_THRES(20),
+               MEM_OWNER_RX);
+    wr(qts, CONF1(1), REF_ALWAYS_ON | MEM_OWNER_RX | RX_EN);
+    wr(qts, INT_ENA, INT_RX_END(1));
+
+    now = step_to(qts, now, w + US / 2);
+    drive19(qts, 1);
+    now = step_to(qts, now, w + 7 * US + US / 2);
+    drive19(qts, 0);
+    now = step_to(qts, now, w + 29 * US - 1);
+    g_assert_false(qtest_get_irq(qts, 0));
+    now = step_to(qts, now, w + 29 * US);
+    g_assert_true(qtest_get_irq(qts, 0));
+    g_assert_cmphex(qtest_readl(qts, RAM(1, 0)), ==, W(E(1, 7), E(0, 0)));
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -691,5 +844,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32/rmt/continuous", test_continuous);
     qtest_add_func("/esp32/rmt/rx-full", test_rx_full);
     qtest_add_func("/esp32/rmt/ref-tick", test_ref_tick);
+    qtest_add_func("/esp32/rmt/unwatched", test_unwatched);
+    qtest_add_func("/esp32/rmt/rx-end-moment", test_rx_end_moment);
     return g_test_run();
 }

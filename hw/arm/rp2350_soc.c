@@ -1158,7 +1158,8 @@ void rp2350_soc_system_reset(RP2350State *s, ResetType type)
  * oscillator, as is the clock muxes' PLL_USB reference input. GPIN0/1 and
  * the OTP's frequency counter clock have no source, so selecting them
  * stops a clock. clk_sys also reaches the SoC, which stops the processors
- * while it is stopped.
+ * while it is stopped. An access to CLOCKS first has the oscillators and
+ * PLLs take their start-ups and locks due by then.
  */
 /* [spec:nuos:req:emu.clock-tree] */
 static void rp2350_soc_wire_clocks(RP2350State *s)
@@ -1180,6 +1181,10 @@ static void rp2350_soc_wire_clocks(RP2350State *s)
     qdev_connect_clock_in(clocks, "lposc", s->lposc);
     qdev_connect_clock_in(clocks, "pll-sys", s->pll_sys.out);
     qdev_connect_clock_in(clocks, "pll-usb", s->pll_usb.out);
+    rp2350_clocks_add_feed(&s->clocks, &s->rosc.feed);
+    rp2350_clocks_add_feed(&s->clocks, &s->xosc.parent_obj.feed);
+    rp2350_clocks_add_feed(&s->clocks, &s->pll_sys.parent_obj.feed);
+    rp2350_clocks_add_feed(&s->clocks, &s->pll_usb.parent_obj.feed);
     qdev_connect_clock_in(DEVICE(&s->ticks), RP2350_TICKS_REF, CLK(s, REF));
     clock_set_source(s->clk_sys, CLK(s, SYS));
 }

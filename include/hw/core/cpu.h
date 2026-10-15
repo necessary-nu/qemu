@@ -485,6 +485,8 @@ struct qemu_work_item;
  * @node: QTAILQ of CPUs sharing TB cache.
  * @opaque: User data.
  * @mem_io_pc: Host Program Counter at which the memory was accessed.
+ * @access_held: The device the CPU's current load or store reached holds
+ *   it (cpu_hold_access()).
  * @accel: Pointer to accelerator specific state.
  * @vcpu_dirty: Hardware accelerator is not synchronized with QEMU state
  * @kvm_fd: vCPU file descriptor for KVM.
@@ -582,6 +584,7 @@ struct CPUState {
      * we store some rarely used information in the CPU context.
      */
     uintptr_t mem_io_pc;
+    bool access_held;
 
     /* Only used in KVM */
     int kvm_fd;
@@ -1095,6 +1098,21 @@ void cpu_reset_interrupt(CPUState *cpu, int mask);
  * Requests the CPU @cpu to exit execution.
  */
 void cpu_exit(CPUState *cpu);
+
+/**
+ * cpu_hold_access:
+ * @cpu: The CPU whose own load or store a device is handling, on its
+ *   thread.
+ *
+ * For a device that must not let the access complete, as when something
+ * it has done stops the CPU first (an expired watchdog whose reset of the
+ * CPU comes before the access would): the device answers the access with
+ * a failure, MEMTX_ERROR, and the CPU, rather than taking a fault, gives
+ * back the instruction, which has not executed, and leaves its block; it
+ * makes the instruction again when it next runs. Under TCG only; the
+ * hold lapses with the CPU's next access to a device.
+ */
+void cpu_hold_access(CPUState *cpu);
 
 /**
  * cpu_pause:
