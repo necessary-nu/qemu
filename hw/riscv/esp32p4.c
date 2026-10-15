@@ -3703,6 +3703,7 @@ static void esp32p4_init_parlio(ESP32P4MachineState *s)
                              &error_abort);
     object_property_set_link(OBJECT(dev), "clkrst", OBJECT(&s->clkrst),
                              &error_abort);
+    object_property_set_link(OBJECT(dev), "gpio", OBJECT(gpio), &error_abort);
     qdev_connect_clock_in(dev, "tx", qdev_get_clock_out(clkrst, "parlio-tx"));
     qdev_connect_clock_in(dev, "rx", qdev_get_clock_out(clkrst, "parlio-rx"));
     qdev_connect_clock_in(dev, "sys", qdev_get_clock_out(clkrst, "parlio-sys"));
