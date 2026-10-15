@@ -1726,10 +1726,14 @@ static void etm_events(ESP32P4GpioState *s, uint64_t pf, int64_t t)
     MAKE_64BIT_MASK(SIG_LOOPBACK_FIRST % 64, \
                     ESP32P4_GPIO_SIGS - SIG_LOOPBACK_FIRST)
 
-/* Whether a watcher of pad n watches it (esp32p4_gpio_watch_pads_set()) */
+/*
+ * Whether a watcher of pad n watches it (esp32p4_gpio_watch_pads_set()):
+ * none does on a pad without watchers.
+ */
 static bool pad_watching(ESP32P4GpioState *s, unsigned n)
 {
-    return (MAKE_64BIT_MASK(0, s->pad_watches[n]) &
+    return s->pad_watches[n] &&
+           (MAKE_64BIT_MASK(0, s->pad_watches[n]) &
             ~s->pad_watch_idle[n]) != 0;
 }
 
