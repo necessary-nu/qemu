@@ -163,6 +163,29 @@ typedef struct Esp32McpwmCore {
     uint64_t etm_cycle;
 } Esp32McpwmCore;
 
+/*
+ * An output's edges, as its wave (hw/gpio/esp32_line.h) describes them,
+ * in PWM_clk cycles from the core as it last changed (Esp32McpwmState's
+ * wave_core): its level at that cycle, `from`; the edges of the stretch
+ * before its edges repeat; and from cycle `rep` on, every `period` cycles,
+ * the edges at those offsets. Found when first asked for; ok if found.
+ */
+#define ESP32_MCPWM_PATTERN_EDGES 64
+
+typedef struct Esp32McpwmPattern {
+    bool found;
+    bool ok;
+    uint64_t from;
+    bool level0;
+    uint32_t npre;
+    uint64_t pre[ESP32_MCPWM_PATTERN_EDGES];
+    uint64_t rep;
+    uint64_t period;
+    uint32_t nrep;
+    uint64_t off[ESP32_MCPWM_PATTERN_EDGES];
+    uint64_t min_gap;
+} Esp32McpwmPattern;
+
 struct Esp32McpwmClass {
     SysBusDeviceClass parent_class;
 
@@ -247,8 +270,19 @@ struct Esp32McpwmState {
     DeviceState *gpio;
     uint32_t sig_base;
     Notifier route_notifier;
-    /* The outputs that reach a pad something watches, bit n for output n */
+    /*
+     * The outputs whose edges are timed one by one, bit n for output n: those
+     * that reach a pad something watches (out_watched) but a pulse counter
+     * taking their waves, and those such a counter takes (out_taken) whose
+     * edges no pattern describes; their waves, from the core as it was at
+     * its last change from outside (hw/gpio/esp32_line.h).
+     */
     uint8_t out_seen;
+    uint8_t out_watched;
+    uint8_t out_taken;
+    Esp32LineWave wave[ESP32_MCPWM_OUTS];
+    Esp32McpwmCore wave_core;
+    Esp32McpwmPattern pattern[ESP32_MCPWM_OUTS];
     bool updating;
     bool update_pending;
     /* The block is bringing the other line sources up to date. */
