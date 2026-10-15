@@ -230,9 +230,16 @@ struct ESP32P4CsiBridgeState {
     uint32_t line_bytes;
     /* CM: the frame's line count, for YUV420's alternate rows. */
     uint32_t cm_row;
-    /* The bytes up to the end of a frame that has ended, still buffered. */
-    uint32_t end_bytes;
-    bool end_pending;
+    /*
+     * The frames that have ended with words still in the buffer, oldest
+     * first, each one's bytes there (its last word carries its end), and
+     * their sum: the buffer's head is the oldest's, the rest past their
+     * sum the frame coming in.
+     */
+    uint32_t ends[ESP32P4_CSI_BUF_WORDS];
+    uint32_t ends_head;
+    uint32_t ends_num;
+    uint32_t ends_bytes;
 
     /* VDMA requests and the burst sizes in effect. */
     bool req;
