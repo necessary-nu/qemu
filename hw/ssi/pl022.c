@@ -470,6 +470,9 @@ static void pl022_set_fssin(void *opaque, int n, int level)
  * its moment, each at its own time: without icount their timers run late
  * on a loaded host, and until they do software would read BSY, the FIFOs
  * and the interrupts as of when the host got to them, not of the access.
+ * The moment is the access's time (line_time()), not the present: a DMA
+ * answering a frame's DREQ makes its access at that frame's end, however
+ * late the frame's timer ran, and takes no frame due after it.
  *
  * A frame that would end into a full receive FIFO is left to its timer.
  * Inside an access, whatever drains the FIFO cannot get to it between the
@@ -479,7 +482,7 @@ static void pl022_set_fssin(void *opaque, int n, int level)
  */
 static void pl022_catch_up(PL022State *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = line_time();
 
     while (timer_pending(s->frame_timer) &&
            timer_expire_time_ns(s->frame_timer) <= now &&
