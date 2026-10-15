@@ -11,6 +11,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/notify.h"
 #include "qemu/timer.h"
@@ -241,6 +242,8 @@ struct Esp32McpwmState {
     int64_t seen_ns;
     /* Edges have been lost to a host too slow for them (logged once) */
     bool lag_logged;
+    /* How far behind the timer's catch-ups end (esp32_line_caught_up()) */
+    Esp32LineLag lag;
     DeviceState *gpio;
     uint32_t sig_base;
     Notifier route_notifier;

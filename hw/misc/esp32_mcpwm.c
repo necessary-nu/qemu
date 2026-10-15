@@ -54,13 +54,15 @@
  * output edge is stamped with the moment it is due, however late the
  * timer's callback runs: whatever brings the block to a moment first does
  * all that fell due before it, edge by edge, each at its own time. Only
- * when that work is more than ESP32_LINE_MAX_LAG_NS (1 s) behind the
- * present as the block comes to it (a host slower than the edges it is to
- * drive, which would never catch up: include/hw/gpio/esp32_line.h) does
- * the block skip ahead, to the moment it is being brought to, the edges
- * in between lost; each output it then drives is stamped with the moment
- * it last changed, so that no edge carries a time other than its own.
- * Under icount it never does. An input acts at the time its change is
+ * when the host is slower than the edges it is to drive, which it would
+ * never catch up with, does the block skip ahead, to the moment it is
+ * being brought to, the edges in between lost: as its timer's catch-ups
+ * each end further behind the present than the last, beyond a
+ * scheduler's quantum, or its work is more than ESP32_LINE_MAX_LAG_NS
+ * (1 s) behind (esp32_line_pwm_skips(), include/hw/gpio/esp32_line.h).
+ * Each output it then drives is stamped with the moment it last changed,
+ * so that no edge carries a time other than its own. Under icount it
+ * never skips. An input acts at the time its change is
  * stamped with, so that a capture of an edge another block drives
  * through the GPIO matrix, or this block's own output coming back, reads
  * the capture timer at that edge. Whenever software samples the pads the
@@ -1844,15 +1846,16 @@ static void mcpwm_arm(Esp32McpwmState *s, bool armed)
  * [spec:nuos:req:emu.esp32.mcpwm]
  * [spec:nuos:req:emu.esp32p4.pwm]
  * The timer's work, due at due_ns, done by `limit`: a firing at its due
- * time, or, on the host's clock more than ESP32_LINE_MAX_LAG_NS behind
- * the present (esp32_line_lags()), a skip to `limit`, as a stream that
- * falls that far behind goes on from the present: a host that slow
- * cannot follow the edges, and a skip to any earlier moment would leave
- * the block behind still, skipping again at every edge.
+ * time, or, on the host's clock losing ground on the block or more than
+ * ESP32_LINE_MAX_LAG_NS behind the present (esp32_line_pwm_skips()), a
+ * skip to `limit`, as a stream that falls that far behind goes on from
+ * the present: a host that slow cannot follow the edges, and a skip to
+ * any earlier moment would leave the block behind still, skipping again
+ * at every edge.
  */
 static void mcpwm_due(Esp32McpwmState *s, int64_t limit)
 {
-    if (esp32_line_lags(s->due_ns)) {
+    if (esp32_line_pwm_skips(&s->lag, s->due_ns)) {
         if (!s->lag_logged) {
             s->lag_logged = true;
             qemu_log_mask(LOG_UNIMP, "esp32_mcpwm: the host is too slow for "
@@ -2058,16 +2061,14 @@ static void core_last_changes(const Esp32McpwmCore *c, uint64_t to,
 }
 
 /*
- * The timer's work more than ESP32_LINE_MAX_LAG_NS behind: the host is
- * slower than the edges it is to drive, and catching up edge by edge
- * would never finish. The block skips ahead to the moment it is run at
- * (esp32_line_time()): its
- * counters run on to it at once, and each output whose level there
- * differs from its line is driven stamped with the moment it last
- * changed, in the order of those moments. The edges in between are lost,
- * as coalesced ones are; every edge driven keeps its own time, so that a
- * capture of it is exact still. The ETM events of the stretch pulse once,
- * at the time of the latest.
+ * The timer's work that the host is too slow for (esp32_line_pwm_skips()):
+ * catching up edge by edge would never finish. The block skips ahead to
+ * the moment it is run at (esp32_line_time()): its counters run on to it
+ * at once, and each output whose level there differs from its line is
+ * driven stamped with the moment it last changed, in the order of those
+ * moments. The edges in between are lost, as coalesced ones are; every
+ * edge driven keeps its own time, so that a capture of it is exact still.
+ * The ETM events of the stretch pulse once, at the time of the latest.
  */
 static void mcpwm_skip_run(void *opaque)
 {
@@ -2117,21 +2118,27 @@ static void mcpwm_skip(Esp32McpwmState *s, int64_t t)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32.mcpwm]
+ * [spec:nuos:req:emu.esp32p4.pwm]
  * The timer's callback, at the moment it runs, does all the work due up
  * to that moment, each piece at its own due time, so that it leaves the
  * timer set after that moment: callbacks each due before the moment they
- * are run at would keep the main loop running timers.
+ * are run at would keep the main loop running timers. How far behind the
+ * present that leaves the block tells whether the host is losing ground
+ * on it (esp32_line_caught_up()).
  */
 static void mcpwm_timer_run(void *opaque)
 {
     Esp32McpwmState *s = opaque;
     int64_t limit = mcpwm_present(s);
 
+    esp32_line_catching_up(&s->lag);
     s->catching_up = true;
     s->armed = false;
     mcpwm_due(s, limit);
     s->catching_up = false;
     mcpwm_catch_up(s, limit);
+    esp32_line_caught_up(&s->lag, limit);
 }
 
 static void mcpwm_timer_cb(void *opaque)
