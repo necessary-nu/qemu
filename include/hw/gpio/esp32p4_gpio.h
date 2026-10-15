@@ -412,6 +412,8 @@ typedef struct ESP32P4GpioRoutes {
     uint32_t lp_edge_wakeup;
     /* The pads whose level something other than a sample sees */
     uint64_t watched;
+    /* The others whose output's wave an input signal takes in bulk */
+    uint64_t taken;
 } ESP32P4GpioRoutes;
 
 /* An MMIO region's block, ESP32P4_GPIO_MMIO_*, for its accessors. */
@@ -616,8 +618,15 @@ struct ESP32P4GpioState {
     bool dirty_all;
     /* The routing, as of the last round that recomputed everything */
     ESP32P4GpioRoutes routes;
-    /* routes.watched as the route notifiers were last told of it */
+    /* routes.watched and .taken as the route notifiers were last told */
     uint64_t watched_told;
+    uint64_t taken_told;
+    /*
+     * The outputs' waves and the input signals that take waves in bulk
+     * (esp32_line.h): the blocks' wiring, set as they realize.
+     */
+    Esp32LineWave *wave[ESP32P4_GPIO_SIGS];
+    uint64_t bulk_in[ESP32P4_GPIO_SIG_WORDS];
     /*
      * Each undriven pad's pulls up and down (conductances, nS; 0 for a
      * driven pad), the pads with their input enabled, and those whose
@@ -662,6 +671,22 @@ void esp32p4_gpio_add_route_notifier(ESP32P4GpioState *s, Notifier *n);
  * it up to date otherwise (esp32_line_sync()).
  */
 bool esp32p4_gpio_sig_out_watched(ESP32P4GpioState *s, unsigned sig);
+
+/*
+ * Outputs taken in bulk (hw/gpio/esp32_line.h): output signal sig's wave,
+ * which its block registers; whether input signal sig takes waves in
+ * bulk, which its block says; the wave input signal sig takes, through
+ * the matrix from a pad its output alone drives with nothing between, and
+ * whether the path inverts it (NULL if none); and whether output signal
+ * sig reaches such an input on a pad nothing else watches. An input
+ * taking a wave does not make its pad watched.
+ */
+void esp32p4_gpio_set_wave(ESP32P4GpioState *s, unsigned sig,
+                           Esp32LineWave *w);
+void esp32p4_gpio_set_bulk_in(ESP32P4GpioState *s, unsigned sig, bool on);
+Esp32LineWave *esp32p4_gpio_sig_in_wave(ESP32P4GpioState *s, unsigned sig,
+                                        bool *inverted);
+bool esp32p4_gpio_sig_out_taken(ESP32P4GpioState *s, unsigned sig);
 
 /*
  * Whether pad n is driven digitally, from outside the chip or by its own

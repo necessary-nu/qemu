@@ -136,6 +136,85 @@ void esp32_line_caught_up(Esp32LineLag *lag, int64_t reached_ns);
 bool esp32_line_pwm_skips(const Esp32LineLag *lag, int64_t due_ns);
 
 /*
+ * Periodic outputs taken in bulk.
+ *
+ * A PWM output (LEDC's channels, MCPWM's generators) whose edges only a
+ * block counting them takes (a PCNT signal input) need not be put on its
+ * line edge by edge, an event of the host's each: the counter can take the
+ * edges in bulk, worked out at its own accesses, and time only what it
+ * does with them (a threshold's interrupt). Such an output describes its
+ * edges as functions of time, an Esp32LineWave: its level at a moment, how
+ * many edges it has between two moments and when its j-th edge after a
+ * moment comes, each exactly as the output would drive it. A description
+ * holds for a stretch: until the output's settings change, which the
+ * output announces at the moment t they change, before and after it
+ * changes (esp32_line_wave_changing(), esp32_line_wave_changed()); its
+ * edges before t are the old description's, its level at t the new one's
+ * (which can differ from the old at once), and its edges after t the new
+ * one's. A block taking the output (esp32_line_wave_take()) first takes
+ * the old description's edges up to t, then, the output changed, its
+ * level at t and the new one's edges from there. A description may end
+ * of itself, at an update the output has waiting (until), which it
+ * announces as it comes.
+ *
+ * An output describes its edges only in stretches it can work out in
+ * closed form (a steady PWM, not a fade): otherwise (describes false) it
+ * drives every edge on its line, as an output something else watches
+ * does, and a taker follows the line.
+ *
+ * The GPIO matrix connects an output's wave to the input signals that
+ * take it in bulk (Esp32SigRoutesClass below): only through a plain path,
+ * a pad the output alone drives, push-pull, with no filter on its way in,
+ * that nothing else on the pad watches. A wave reaching only such inputs
+ * makes the output's pad unwatched by them (esp32_sig_out_watched()),
+ * and the output, describing its edges, drives its line only at its
+ * level of the moment as software samples the pads (esp32_line_sync()).
+ */
+typedef struct Esp32LineWave Esp32LineWave;
+
+typedef struct Esp32LineWaveOps {
+    /* Whether the output describes its edges from now on, as below. */
+    bool (*describes)(Esp32LineWave *w);
+    /* Its level at time t. */
+    bool (*level)(Esp32LineWave *w, int64_t t);
+    /* How many edges it has at times in (a, b]. */
+    uint64_t (*edges)(Esp32LineWave *w, int64_t a, int64_t b);
+    /* The time of its j-th edge after a (j >= 1); INT64_MAX if none. */
+    int64_t (*edge)(Esp32LineWave *w, int64_t a, uint64_t j);
+    /*
+     * A bound on its pulses: no level it takes lasts less than this many
+     * ns (0 if it may), for a filter that passes or removes them all.
+     */
+    int64_t (*min_hold)(Esp32LineWave *w);
+    /* When the description ends of itself; INT64_MAX if it does not. */
+    int64_t (*until)(Esp32LineWave *w);
+} Esp32LineWaveOps;
+
+struct Esp32LineWave {
+    const Esp32LineWaveOps *ops;
+    /* The output's block and its index there, for the ops */
+    void *opaque;
+    unsigned index;
+    /* The takers' notifiers, each given an Esp32LineWaveChange */
+    NotifierList takers;
+};
+
+typedef struct Esp32LineWaveChange {
+    Esp32LineWave *wave;
+    int64_t when;
+    /* false: the output is about to change; true: it has */
+    bool done;
+} Esp32LineWaveChange;
+
+void esp32_line_wave_init(Esp32LineWave *w, const Esp32LineWaveOps *ops,
+                          void *opaque, unsigned index);
+bool esp32_line_wave_taken(Esp32LineWave *w);
+void esp32_line_wave_take(Esp32LineWave *w, Notifier *n);
+void esp32_line_wave_drop(Notifier *n);
+void esp32_line_wave_changing(Esp32LineWave *w, int64_t when);
+void esp32_line_wave_changed(Esp32LineWave *w, int64_t when);
+
+/*
  * The routing of a GPIO matrix, for a block both chips have whose outputs
  * cost it work edge by edge: whether output signal sig reaches a pad
  * whose level anything but software sampling the pads sees (an input
@@ -143,6 +222,13 @@ bool esp32_line_pwm_skips(const Esp32LineLag *lag, int64_t due_ns);
  * the board listens to, ...), and a notifier the matrix calls whenever
  * that may have changed. The ESP32's and the ESP32-P4's matrices
  * implement it; a block holds a link to its machine's.
+ *
+ * For outputs taken in bulk (above): an output registers its wave for its
+ * signal (set_wave), and a block taking waves in bulk on an input signal
+ * says so (set_bulk_in); the input's wave is the one a plain path
+ * connects it to (sig_in_wave, NULL if none), and sig_out_taken tells an
+ * output whether such an input takes it. sig_out_watched leaves such
+ * inputs out for an output with a wave.
  */
 #define TYPE_ESP32_SIG_ROUTES "esp32-sig-routes"
 
@@ -151,6 +237,11 @@ typedef struct Esp32SigRoutesClass {
 
     bool (*sig_out_watched)(Object *matrix, unsigned sig);
     void (*add_route_notifier)(Object *matrix, Notifier *n);
+    void (*set_wave)(Object *matrix, unsigned sig, Esp32LineWave *w);
+    void (*set_bulk_in)(Object *matrix, unsigned sig, bool on);
+    Esp32LineWave *(*sig_in_wave)(Object *matrix, unsigned sig,
+                                  bool *inverted);
+    bool (*sig_out_taken)(Object *matrix, unsigned sig);
 } Esp32SigRoutesClass;
 
 DECLARE_CLASS_CHECKERS(Esp32SigRoutesClass, ESP32_SIG_ROUTES,
@@ -158,5 +249,10 @@ DECLARE_CLASS_CHECKERS(Esp32SigRoutesClass, ESP32_SIG_ROUTES,
 
 bool esp32_sig_out_watched(Object *matrix, unsigned sig);
 void esp32_sig_add_route_notifier(Object *matrix, Notifier *n);
+void esp32_sig_set_wave(Object *matrix, unsigned sig, Esp32LineWave *w);
+void esp32_sig_set_bulk_in(Object *matrix, unsigned sig, bool on);
+Esp32LineWave *esp32_sig_in_wave(Object *matrix, unsigned sig,
+                                 bool *inverted);
+bool esp32_sig_out_taken(Object *matrix, unsigned sig);
 
 #endif

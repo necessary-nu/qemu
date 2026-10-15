@@ -331,6 +331,13 @@ struct Esp32GpioState {
      */
     NotifierList route_notifiers;
     bool setup_changed;
+
+    /*
+     * The outputs' waves and the input signals that take waves in bulk
+     * (esp32_line.h): the blocks' wiring, set as they realize.
+     */
+    Esp32LineWave *wave[ESP32_GPIO_SIG_COUNT];
+    uint64_t bulk_in[DIV_ROUND_UP(ESP32_GPIO_SIG_COUNT, 64)];
 };
 
 typedef struct Esp32GpioClass {
@@ -350,6 +357,21 @@ uint64_t esp32_gpio_sig_out_pads(Esp32GpioState *s, unsigned sig);
 int esp32_gpio_sig_in_pad(Esp32GpioState *s, unsigned sig);
 void esp32_gpio_add_route_notifier(Esp32GpioState *s, Notifier *n);
 bool esp32_gpio_sig_out_watched(Esp32GpioState *s, unsigned sig);
+
+/*
+ * Outputs taken in bulk (hw/gpio/esp32_line.h): output signal sig's wave,
+ * which its block registers; whether input signal sig takes waves in
+ * bulk, which its block says; the wave input signal sig takes, through
+ * the matrix from a pad its output alone drives, and whether the path
+ * inverts it (NULL if none); and whether output signal sig reaches such
+ * an input on a pad nothing else watches. An input taking a wave does not
+ * make its pad watched.
+ */
+void esp32_gpio_set_wave(Esp32GpioState *s, unsigned sig, Esp32LineWave *w);
+void esp32_gpio_set_bulk_in(Esp32GpioState *s, unsigned sig, bool on);
+Esp32LineWave *esp32_gpio_sig_in_wave(Esp32GpioState *s, unsigned sig,
+                                      bool *inverted);
+bool esp32_gpio_sig_out_taken(Esp32GpioState *s, unsigned sig);
 
 /*
  * For a peripheral on IO_MUX functions of its own that drives an output
