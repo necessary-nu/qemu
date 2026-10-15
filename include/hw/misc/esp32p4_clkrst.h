@@ -834,6 +834,11 @@ struct ESP32P4ClkRstState {
     bool syncing;
     /* The SoC clocks' periods last checked against their limits. */
     uint64_t checked_soc[4];
+    /*
+     * The boot ROM's hand-off is being presented (only for the time it
+     * takes: no state of the machine's).
+     */
+    bool rom_handoff;
     /* In the device's own reset, which does not reset the gated blocks. */
     bool resetting;
     /* The cause the next system reset records; 0 for a chip reset. */
@@ -920,6 +925,18 @@ void esp32p4_clkrst_set_chip_reset_cause(ESP32P4ClkRstState *s,
  * enter phase sees it; 0 in a chip reset.
  */
 uint8_t esp32p4_clkrst_system_reset_cause(ESP32P4ClkRstState *s);
+
+/*
+ * -kernel's hand-off (hw/riscv/esp32p4_boot.c) presents the state the boot
+ * ROM leaves by making the ROM's register writes through the bus, while
+ * @handoff is set. They take effect as any write does, but are the ROM's,
+ * made in its place, not the guest's: they are not judged against the
+ * TRM's procedures for changing clocks, which the ROM does not keep to
+ * (it changes the flash core clock's divider with the clock's gate on),
+ * and log no guest error for them. The ROM itself, running from reset, is
+ * software on the chip like any other, and is judged.
+ */
+void esp32p4_clkrst_set_rom_handoff(ESP32P4ClkRstState *s, bool handoff);
 
 /* A divider's setting: integer part (at least 1), numerator, denominator. */
 typedef struct ESP32P4ClkDiv {
