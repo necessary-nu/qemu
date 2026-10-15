@@ -26,11 +26,12 @@
  * previous latch.
  *
  * Times are those of the signal lines (hw/gpio/esp32_line.h): an input
- * changes at the time its change is stamped with, and a register access
- * or the filter's timer first brings every source of line changes up to
- * the moment it acts at, so that a source sending late (the host running
- * behind virtual time without icount) neither shortens a pulse in the
- * filter's eyes nor adds a count that a later change would have filtered.
+ * changes at the time its change is stamped with, and a register access,
+ * the filter's timer or a change of APB_CLK first brings every source of
+ * line changes up to the moment it acts at, so that a source sending late
+ * (the host running behind virtual time without icount) neither shortens
+ * a pulse in the filter's eyes nor adds a count that a later change would
+ * have filtered.
  */
 
 #include "qemu/osdep.h"
@@ -269,15 +270,16 @@ static void pcnt_sync_sources(void *opaque)
 /*
  * [spec:nuos:req:emu.esp32.pcnt]
  * Bring every source of line changes, then the filters, up to now
- * (esp32_line_time()): a change a source has yet to send can still cut
- * short a pulse waiting in a filter.
+ * (esp32_line_time()), and return that moment: a change a source has yet
+ * to send can still cut short a pulse waiting in a filter.
  */
-static void pcnt_catch_up(Esp32PcntState *s)
+static int64_t pcnt_catch_up(Esp32PcntState *s)
 {
     int64_t t = esp32_line_time();
 
     esp32_line_run_at(t, pcnt_sync_sources, NULL);
     pcnt_sync(s, t);
+    return t;
 }
 
 static void pcnt_filter_cb(void *opaque)
@@ -484,22 +486,33 @@ static void esp32_pcnt_reset_hold(Object *obj, ResetType type)
     pcnt_update_irq(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.pcnt]
+ * APB_CLK is about to change: the line sources are brought up to now and
+ * the filters judge the changes matured by then at its old period
+ * (pcnt_catch_up()). As it changes, at the moment that has come to, the
+ * sources are brought up to that and the filters count its new period.
+ * With the clock stopped the filter's flops hold their state; a change
+ * waiting at the wire is filtered afresh once the clock restarts.
+ */
 static void esp32_pcnt_clk_update(void *opaque, ClockEvent event)
 {
     Esp32PcntState *s = opaque;
     bool running = clock_is_enabled(s->apb_clk);
-    int64_t now = esp32_line_time();
+    int64_t now;
 
-    /*
-     * With the clock stopped the filter's flops hold their state; a change
-     * waiting at the wire is filtered afresh once the clock restarts.
-     */
+    if (event == ClockPreUpdate) {
+        pcnt_catch_up(s);
+        return;
+    }
+    now = esp32_line_time();
     if (running && !s->clk_running) {
         for (unsigned i = 0; i < ESP32_PCNT_INPUT_COUNT; i++) {
             s->raw_since_ns[i] = now;
         }
     }
     s->clk_running = running;
+    esp32_line_run_at(now, pcnt_sync_sources, NULL);
     pcnt_sync(s, now);
 }
 
@@ -514,7 +527,7 @@ static void esp32_pcnt_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), pcnt_set_input, ESP32_PCNT_INPUT,
                             ESP32_PCNT_INPUT_COUNT);
     s->apb_clk = qdev_init_clock_in(DEVICE(obj), "apb", esp32_pcnt_clk_update,
-                                    s, ClockUpdate);
+                                    s, ClockPreUpdate | ClockUpdate);
     timer_init_ns(&s->filter_timer, QEMU_CLOCK_VIRTUAL, pcnt_filter_cb, s);
 }
 

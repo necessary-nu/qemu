@@ -45,11 +45,11 @@
  * channels, and an RMT input that changes in response takes the time of
  * the edge that caused it. The block is a line source: whenever software
  * samples the pads or reads a block that counts edges, the transmitters
- * are brought up to that moment first. A register or RAM access and the
- * block's timer act at one moment: with a receiver enabled, every line
- * source is brought up to it first, and the receivers run to that same
- * moment, so that a pulse is filtered by its width on the wire whatever
- * the host does.
+ * are brought up to that moment first. A register or RAM access, the
+ * block's timer and a clock change act at one moment: with a receiver
+ * enabled, every line source is brought up to it first, and the
+ * receivers run to that same moment, so that a pulse is filtered by its
+ * width on the wire whatever the host does.
  *
  * Behaviour the TRM leaves open, as modelled:
  * - The fields of TRM table 60.3-1 take effect when the channel's
@@ -2140,16 +2140,17 @@ static const MemoryRegionOps esp32p4_rmt_ram_ops = {
 };
 
 /*
- * rmt_sclk is about to change: bring the channels up to now with the old
- * period, and restart their cycle counts there, at its new exact period.
+ * rmt_sclk is about to change: bring the line sources and the channels up
+ * to now with the old period (rmt_catch_up()), and restart their cycle
+ * counts there, at its new exact period.
  */
 static void esp32p4_rmt_clk_update(void *opaque, ClockEvent event)
 {
     ESP32P4RmtState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now;
 
     if (event == ClockPreUpdate) {
-        rmt_sync(s, now);
+        now = rmt_catch_up(s);
         for (unsigned n = 0; n < NTX; n++) {
             s->tx[n].anchor_c = tx_cyc_at(s, &s->tx[n], now);
             s->tx[n].anchor_ns = now;
@@ -2159,7 +2160,7 @@ static void esp32p4_rmt_clk_update(void *opaque, ClockEvent event)
             s->rx[m].anchor_ns = now;
         }
     } else {
-        s->sclk_edges = esp32p4_clk_edges_or_at(s->sclk, now);
+        s->sclk_edges = esp32p4_clk_edges_or_at(s->sclk, esp32_line_time());
         rmt_changed(s);
         rmt_schedule(s);
     }

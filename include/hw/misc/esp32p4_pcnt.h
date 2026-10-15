@@ -11,6 +11,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
+#include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -75,6 +76,11 @@ struct ESP32P4PcntState {
     uint32_t date;
 
     bool clk_running;
+    /*
+     * APB_CLK's edges, as the filters count them: as the clock last
+     * changed, until it changes again.
+     */
+    ESP32P4ClkEdges apb_edges;
 
     /*
      * Per input: the level on the wire, the level past the glitch filter,

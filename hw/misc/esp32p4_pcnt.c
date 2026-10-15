@@ -36,9 +36,10 @@
  * changes (hw/gpio/esp32_line.h), not by when the model happens to run,
  * so a burst of edges delivered late, or a late timer, cannot lose an edge
  * or reorder edges between inputs. A register access and the filter's
- * timer act at one moment: the line sources are brought up to it first,
- * and the filters judge their waiting changes at that same moment, so a
- * pulse is filtered by its width on the wire whatever the host does.
+ * timer, and a change of APB_CLK, act at one moment: the line sources are
+ * brought up to it first, and the filters judge their waiting changes at
+ * that same moment, so a pulse is filtered by its width on the wire
+ * whatever the host does.
  *
  * Behaviour the TRM leaves open, as modelled:
  * - The step comparator (PCNT_DELTA_CHANGE_EN_Un, PCNT_Un_CHANGE_CONF),
@@ -286,9 +287,7 @@ static bool pcnt_pending(ESP32P4PcntState *s, unsigned i, int64_t *due)
     }
     *due = s->raw_since_ns[i];
     if (conf0 & CONF0_FILTER_EN) {
-        ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(s->apb_clk, *due);
-
-        *due = esp32p4_clk_edges_after(&e, *due, thres);
+        *due = esp32p4_clk_edges_after(&s->apb_edges, *due, thres);
     }
     return true;
 }
@@ -525,6 +524,7 @@ static const MemoryRegionOps esp32p4_pcnt_ops = {
 static void esp32p4_pcnt_reset_hold(Object *obj, ResetType type)
 {
     ESP32P4PcntState *s = ESP32P4_PCNT(obj);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     for (unsigned u = 0; u < NU; u++) {
         s->unit[u] = (ESP32P4PcntUnit) { .conf0 = CONF0_RESET };
@@ -535,6 +535,7 @@ static void esp32p4_pcnt_reset_hold(Object *obj, ResetType type)
     s->date = DATE_RESET;
     timer_del(&s->filter_timer);
     s->clk_running = clock_is_enabled(s->apb_clk);
+    s->apb_edges = esp32p4_clk_edges_or_at(s->apb_clk, now);
     for (unsigned i = 0; i < ESP32P4_PCNT_INPUTS; i++) {
         s->filt[i] = s->raw[i];
     }
@@ -545,16 +546,21 @@ static void esp32p4_pcnt_reset_exit(Object *obj, ResetType type)
     pcnt_update_irq(ESP32P4_PCNT(obj));
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.rmt-pcnt]
+ * APB_CLK changes at a moment: the line sources are brought up to it and
+ * the filters judge the changes matured by then counting the clock's
+ * edges as they were (pcnt_catch_up()), and from then on its new ones.
+ * With the clock stopped the filter's flops hold their state; a change
+ * waiting at the wire is filtered afresh once the clock restarts.
+ */
 static void esp32p4_pcnt_clk_update(void *opaque, ClockEvent event)
 {
     ESP32P4PcntState *s = opaque;
     bool running = clock_is_enabled(s->apb_clk);
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = pcnt_catch_up(s);
 
-    /*
-     * With the clock stopped the filter's flops hold their state; a change
-     * waiting at the wire is filtered afresh once the clock restarts.
-     */
+    s->apb_edges = esp32p4_clk_edges_or_at(s->apb_clk, now);
     if (running && !s->clk_running) {
         for (unsigned i = 0; i < ESP32P4_PCNT_INPUTS; i++) {
             s->raw_since_ns[i] = now;
@@ -600,8 +606,8 @@ static const VMStateDescription vmstate_esp32p4_pcnt_unit = {
 
 static const VMStateDescription vmstate_esp32p4_pcnt = {
     .name = TYPE_ESP32P4_PCNT,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(unit, ESP32P4PcntState, NU, 1,
                              vmstate_esp32p4_pcnt_unit, ESP32P4PcntUnit),
@@ -610,6 +616,7 @@ static const VMStateDescription vmstate_esp32p4_pcnt = {
         VMSTATE_UINT32(ctrl, ESP32P4PcntState),
         VMSTATE_UINT32(date, ESP32P4PcntState),
         VMSTATE_BOOL(clk_running, ESP32P4PcntState),
+        VMSTATE_ESP32P4_CLK_EDGES(apb_edges, ESP32P4PcntState),
         VMSTATE_UINT8_ARRAY(raw, ESP32P4PcntState, ESP32P4_PCNT_INPUTS),
         VMSTATE_UINT8_ARRAY(filt, ESP32P4PcntState, ESP32P4_PCNT_INPUTS),
         VMSTATE_INT64_ARRAY(raw_since_ns, ESP32P4PcntState,
