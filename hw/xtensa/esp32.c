@@ -1027,6 +1027,9 @@ static void esp32_soc_connect_sdio(Esp32SocState *s)
  * carries and drives the RX pad, an outside driver of its own
  * (esp32_gpio_ext_driver()), which the UART reaches only as software
  * routes it, and which fights any other driver there at another level.
+ * A terminal without a chardev (-serial none, or past the last -serial)
+ * neither drives its RX pad nor listens to its TX pad, so that an output
+ * on that pad (MCPWM's, LEDC's, RMT's) is not timed edge by edge for it.
  */
 static void esp32_soc_connect_lines(Esp32SocState *s)
 {
@@ -1076,10 +1079,12 @@ static void esp32_soc_connect_lines(Esp32SocState *s)
                                         qdev_get_gpio_in_named(uart,
                                             ESP32_UART_DSR, 0));
         }
-        qdev_connect_gpio_out_named(gpio, ESP32_GPIO_PAD_OUT,
-                                    s->terminal_tx_pad[i],
-                                    qdev_get_gpio_in_named(term,
-                                        ESP32_UART_TERMINAL_RX, 0));
+        if (esp32_uart_terminal_attached(&s->terminal[i])) {
+            qdev_connect_gpio_out_named(gpio, ESP32_GPIO_PAD_OUT,
+                                        s->terminal_tx_pad[i],
+                                        qdev_get_gpio_in_named(term,
+                                            ESP32_UART_TERMINAL_RX, 0));
+        }
         qdev_connect_gpio_out_named(term, ESP32_UART_TERMINAL_TX, 0,
                                     esp32_gpio_ext_in(&s->gpio, d,
                                         s->terminal_rx_pad[i]));

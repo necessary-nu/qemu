@@ -30,11 +30,13 @@
  * Without icount the host can run the timers late, by tens of
  * milliseconds under load: every change that fell due is then replayed
  * at its own time, so that a block timing the edges (PCNT's filter, an
- * RMT receiver) sees the pulses the channel made. Only changes more than
- * ESP32_LINE_MAX_LAG_NS (1 s) behind the present as the channel comes to
- * them (include/hw/gpio/esp32_line.h), a host slower than the edges it is
- * to drive, make the output skip to its level at the moment it is being
- * brought to, the changes in between lost.
+ * RMT receiver) sees the pulses the channel made. Only a host slower than
+ * the edges it is to drive, losing ground on the controller as its
+ * timers' catch-ups each end further behind than the last, or changes
+ * more than ESP32_LINE_MAX_LAG_NS (1 s) behind the present as the channel
+ * comes to them (esp32_line_pwm_skips(), include/hw/gpio/esp32_line.h),
+ * make the output skip to its level at the moment it is being brought
+ * to, the changes in between lost.
  */
 
 #include "qemu/osdep.h"
@@ -502,9 +504,9 @@ static void chan_rebase(Esp32LEDCState *s, unsigned n, uint64_t k_old,
  * its fade's end and its output changes, coalesced as the header comment
  * describes. While SIG_OUT_EN is clear the output holds IDLE_LV, and the
  * generator's edges change nothing outside: its level is taken only where
- * a load, or the caller, needs it. An edge that lags (esp32_line_lags())
- * skips the output to its level at limit, or before the load or fade end
- * that comes first.
+ * a load, or the caller, needs it. An edge the host is too slow for
+ * (esp32_line_pwm_skips()) skips the output to its level at limit, or
+ * before the load or fade end that comes first.
  */
 static void chan_eval(Esp32LEDCState *s, unsigned n, int64_t limit,
                       bool inclusive)
@@ -528,7 +530,7 @@ static void chan_eval(Esp32LEDCState *s, unsigned n, int64_t limit,
                 ch->gen_level = chan_level_at(s, n, x);
             }
         } else if (e != INT64_MAX && e < e_struct && e <= last &&
-                   esp32_line_lags(e)) {
+                   esp32_line_pwm_skips(&s->lag, e)) {
             int64_t x = MIN(last, e_struct - 1);
 
             if (!s->lag_logged) {
@@ -703,11 +705,20 @@ static void ledc_schedule(Esp32LEDCState *s)
     ledc_update_irq(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * A timer's catch-up: everything due up to the present as it runs, and
+ * how far behind the present that leaves the controller, which tells
+ * whether the host is losing ground on it (esp32_line_caught_up()).
+ */
 static void ledc_timer_cb(void *opaque)
 {
     Esp32LEDCState *s = ESP32_LEDC(opaque);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    ledc_advance(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), false);
+    esp32_line_catching_up(&s->lag);
+    ledc_advance(s, now, false);
+    esp32_line_caught_up(&s->lag, now);
     ledc_schedule(s);
 }
 

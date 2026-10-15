@@ -93,6 +93,76 @@ bool esp32_line_lags(int64_t due_ns)
            ESP32_LINE_MAX_LAG_NS;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * An output's own QEMU timer begins a catch-up, at the present, from
+ * where its last one left it.
+ */
+void esp32_line_catching_up(Esp32LineLag *lag)
+{
+    lag->catching_up = true;
+    lag->began_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * The catch-up has brought the output to @reached_ns, the present as it
+ * began: how far behind the present that leaves the output, and whether
+ * that is beyond the slack and further behind than the last one left it,
+ * one more catch-up of a run losing ground. Nothing under icount, where
+ * nothing falls behind.
+ */
+void esp32_line_caught_up(Esp32LineLag *lag, int64_t reached_ns)
+{
+    int64_t behind;
+
+    lag->catching_up = false;
+    if (icount_enabled()) {
+        return;
+    }
+    behind = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - reached_ns;
+    if (behind > ESP32_LINE_SLACK_NS && behind > lag->behind_ns) {
+        lag->losing = MIN(lag->losing + 1, ESP32_LINE_LOSING_RUN);
+    } else {
+        lag->losing = 0;
+    }
+    lag->behind_ns = behind;
+    lag->reached_ns = reached_ns;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * Whether a PWM output skips its edge due at @due_ns: the edge lags
+ * (esp32_line_lags()), or it is beyond the slack while the host is losing
+ * ground on the output: its last catch-up ended beyond the slack and
+ * further behind than the one before, and either the one before that
+ * did too, or the catch-up taking the edge has spent longer than the
+ * stretch it has covered since the last one, falling further behind
+ * still.
+ */
+bool esp32_line_pwm_skips(const Esp32LineLag *lag, int64_t due_ns)
+{
+    int64_t now, behind;
+
+    if (icount_enabled()) {
+        return false;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    behind = now - due_ns;
+    if (behind > ESP32_LINE_MAX_LAG_NS) {
+        return true;
+    }
+    if (behind <= ESP32_LINE_SLACK_NS || !lag->losing) {
+        return false;
+    }
+    return lag->losing >= ESP32_LINE_LOSING_RUN ||
+           (lag->catching_up &&
+            now - lag->began_ns > due_ns - lag->reached_ns);
+}
+
 /* [spec:nuos:req:emu.esp32.gpio] */
 /* [spec:nuos:req:emu.esp32p4.gpio] */
 bool esp32_sig_out_watched(Object *matrix, unsigned sig)

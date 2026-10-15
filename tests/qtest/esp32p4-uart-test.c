@@ -162,6 +162,21 @@
 #define PMU_WAKE_LP_UART               10
 #define PMU_STATE_ACTIVE               0x01
 
+#define HP_SYS_CLKRST_SOC_CLK_CTRL3    0x500e6020
+#define HP_SYS_CLKRST_PERI_CLK_CTRL22  0x500e609c
+#define LEDC_APB_CLK_EN                (1u << 0)
+#define LEDC_CLK_EN                    (1u << 2)
+#define LEDC                           0x500d3000
+#define LEDC_CH_CONF0(n)               (LEDC + 0x00 + 0x14 * (n))
+#define LEDC_CH_HPOINT(n)              (LEDC + 0x04 + 0x14 * (n))
+#define LEDC_CH_DUTY(n)                (LEDC + 0x08 + 0x14 * (n))
+#define LEDC_TIMER_CONF(x)             (LEDC + 0xa0 + 8 * (x))
+#define LEDC_SIG_OUT_EN                (1u << 2)
+#define LEDC_PARA_UP                   (1u << 4)
+#define LEDC_TCONF(res, div)           ((res) | ((uint32_t)(div) << 5))
+#define LEDC_T_RST                     (1u << 24)
+#define SIG_LEDC(n)                    (126 + (n))
+
 static QTestState *start(void)
 {
     return qtest_init("-M esp32p4,flash-size=16M -serial none");
@@ -1264,6 +1279,77 @@ static void test_board_serial_pads(void)
 }
 
 /*
+ * A serial port without a chardev is nothing on its pads. With only port
+ * 0 given one, LEDC's channel 0 on port 1's TXD pad, GPIO20, at a 50 ns
+ * period, high for its first 25 ns (40 million edges a second), reaches
+ * a pad nothing watches: its edges are not timed, and a second of them
+ * costs the host next to nothing (timed one by one they cost it tens of
+ * seconds), GPIO_IN reading the exact level as software samples it.
+ * Given a chardev, port 1 watches GPIO20 and receives exactly the frames
+ * UART1 sends there.
+ */
+/* [spec:nuos:req:emu.esp32p4.uart/test] */
+/* [spec:nuos:req:emu.esp32p4.pwm/test] */
+static void test_idle_serial_pads(void)
+{
+    static const char msg[] = "idle\r\n";
+    g_autofree char *dir = g_dir_make_tmp("esp32p4-serial-XXXXXX", NULL);
+    g_autofree char *port1 = g_build_filename(dir, "port1", NULL);
+    g_autofree char *got = NULL;
+    QTestState *qts;
+    int64_t t0, c, host;
+    size_t len;
+
+    qts = qtest_init("-M esp32p4,strap-mode=0x04 -serial null");
+    /* On an edge of XTAL_CLK, which runs from time 0 */
+    t0 = qtest_clock_step(qts, 25);
+    qtest_writel(qts, HP_SYS_CLKRST_SOC_CLK_CTRL3,
+                 qtest_readl(qts, HP_SYS_CLKRST_SOC_CLK_CTRL3) |
+                 LEDC_APB_CLK_EN);
+    qtest_writel(qts, HP_SYS_CLKRST_PERI_CLK_CTRL22, LEDC_CLK_EN);
+    qtest_writel(qts, IO_MUX_GPIO(20), MCU_SEL_GPIO | FUN_IE | FUN_DRV(2));
+    qtest_writel(qts, GPIO_FUNC_OUT(20), SIG_LEDC(0));
+    /* Resolution 1 bit, XTAL_CLK undivided: taken at the first overflow */
+    qtest_writel(qts, LEDC_TIMER_CONF(0), LEDC_TCONF(1, 256) | LEDC_T_RST);
+    qtest_writel(qts, LEDC_TIMER_CONF(0), LEDC_TCONF(1, 256));
+    qtest_writel(qts, LEDC_CH_HPOINT(0), 0);
+    qtest_writel(qts, LEDC_CH_DUTY(0), 1 << 4);
+    qtest_writel(qts, LEDC_CH_CONF0(0), LEDC_SIG_OUT_EN | LEDC_PARA_UP);
+
+    c = t0 + 50 + 1000 * 1000 * 1000;
+    host = g_get_monotonic_time();
+    qtest_clock_step(qts, c + 10 - t0);
+    host = g_get_monotonic_time() - host;
+    g_assert_cmpint(host, <, G_USEC_PER_SEC / 2);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 20), ==, 1u << 20);
+    qtest_clock_step(qts, 20);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 20), ==, 0);
+    qtest_clock_step(qts, 44);
+    g_assert_cmphex(qtest_readl(qts, GPIO_IN) & (1u << 20), ==, 1u << 20);
+    qtest_quit(qts);
+
+    qts = qtest_initf("-M esp32p4,strap-mode=0x04 -serial null "
+                      "-serial file:%s", port1);
+    qtest_writel(qts, IO_MUX_GPIO(20), MCU_SEL_GPIO | FUN_DRV(2));
+    qtest_writel(qts, GPIO_FUNC_OUT(20), SIG_UART1_TXD);
+    setup(qts, UART(1), CONF0_8N1);
+    /*
+     * The undriven pad read low from reset, a start bit to the terminal
+     * at UART1's reset baud rate: let that frame go by.
+     */
+    qtest_clock_step(qts, 200 * 1000);
+    for (int i = 0; msg[i]; i++) {
+        wr(qts, UART(1), FIFO, msg[i]);
+    }
+    qtest_clock_step(qts, (strlen(msg) + 2) * FRAME_NS);
+    g_assert(g_file_get_contents(port1, &got, &len, NULL));
+    g_assert_cmpmem(got, len, msg, strlen(msg));
+    qtest_quit(qts);
+    unlink(port1);
+    rmdir(dir);
+}
+
+/*
  * The boot ROM, run from reset with a blank 16 MiB flash, prints its
  * banner on UART0, through GPIO37 to serial port 0, and reports the
  * flash's invalid image header. The log is read while the ROM prints, a
@@ -1844,6 +1930,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/uart/pmu_wakeup", test_pmu_wakeup);
     qtest_add_func("esp32p4/uart/serial_port", test_serial_port);
     qtest_add_func("esp32p4/uart/board-serial-pads", test_board_serial_pads);
+    qtest_add_func("esp32p4/uart/idle-serial-pads", test_idle_serial_pads);
     qtest_add_func("esp32p4/uart/uhci_tx", test_uhci_tx);
     qtest_add_func("esp32p4/uart/uhci_rx", test_uhci_rx);
     qtest_add_func("esp32p4/uart/usj_registers", test_usj_registers);

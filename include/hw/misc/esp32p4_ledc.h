@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/notify.h"
@@ -175,6 +176,8 @@ struct ESP32P4LedcState {
     bool irq_level;
     /* Edges have been lost to a host too slow for them (logged once) */
     bool lag_logged;
+    /* How far behind the timer's catch-ups end (esp32_line_caught_up()) */
+    Esp32LineLag lag;
 };
 
 #endif
