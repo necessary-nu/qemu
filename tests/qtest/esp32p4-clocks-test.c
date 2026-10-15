@@ -37,8 +37,11 @@
 #define PERI_CLK_CTRL14     (HP_BASE + 0x50)
 #define PERI_CLK_CTRL110    (HP_BASE + 0x68)
 #define PERI_CLK_CTRL111    (HP_BASE + 0x6c)
+#define PERI_CLK_CTRL116    (HP_BASE + 0x80)
 #define PERI_CLK_CTRL20     (HP_BASE + 0x94)
 #define PERI_CLK_CTRL21     (HP_BASE + 0x98)
+#define PERI_CLK_CTRL23     (HP_BASE + 0xa0)
+#define PERI_CLK_CTRL24     (HP_BASE + 0xa4)
 #define ANA_PLL_CTRL0       (HP_BASE + 0xbc)
 #define HP_RST_EN0          (HP_BASE + 0xc0)
 #define HP_RST_EN1          (HP_BASE + 0xc4)
@@ -1185,6 +1188,149 @@ static void test_efuse(void)
     qtest_quit(qts);
 }
 
+/* A file for QEMU's guest error log. */
+static char *guest_error_log(void)
+{
+    char *log = NULL;
+    int fd = g_file_open_tmp("esp32p4-clocks-XXXXXX.log", &log, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    return log;
+}
+
+/* How many times @what is in the log @log. */
+static int logged(const char *log, const char *what)
+{
+    g_autofree char *text = NULL;
+    int n = 0;
+
+    g_assert_true(g_file_get_contents(log, &text, NULL, NULL));
+    for (const char *p = strstr(text, what); p; p = strstr(p + 1, what)) {
+        n++;
+    }
+    return n;
+}
+
+/*
+ * The TRM's procedures for changing clocks, which give no consequence for
+ * breaking them: the clock changes as written, and a guest error says so.
+ * A peripheral clock's source or divider changes with its gate off (TRM
+ * 11.3.3): with the gate on, while it runs, the change is logged; a mux
+ * with no gate of its own counts as running while a gated clock it feeds
+ * runs, a divider feeding none while it runs itself. The SoC clocks'
+ * dividers go one at a time (11.3.1): an update applying two is logged.
+ */
+/* [spec:nuos:req:emu.esp32p4.clocks/test] */
+static void test_procedures(void)
+{
+    g_autofree char *log = guest_error_log();
+    QTestState *qts = qtest_initf("-M esp32p4 -d guest_errors -D %s", log);
+    const char *uart0 = "HP_SYS_CLKRST_PERI_CLK_CTRL111 changes uart0-sclk's "
+                        "divider while it runs with its gate on";
+
+    /* UART0's function clock runs from reset, from XTAL_CLK. */
+    assert_hz(qts, "uart0-sclk", 40 * MHZ);
+    qtest_writel(qts, PERI_CLK_CTRL111, 0x04000000 | 1);
+    assert_hz(qts, "uart0-sclk", 20 * MHZ);
+    g_assert_cmpint(logged(log, uart0), ==, 1);
+    qtest_writel(qts, PERI_CLK_CTRL110, (2 << 24) | (1 << 26));
+    g_assert_cmpint(logged(log, "HP_SYS_CLKRST_PERI_CLK_CTRL110 changes "
+                           "uart0-sclk's source while it runs with its gate "
+                           "on"), ==, 1);
+    /* Its gate off with the source, then the divider, then on: in order. */
+    qtest_writel(qts, PERI_CLK_CTRL110, 0);
+    qtest_writel(qts, PERI_CLK_CTRL111, 0x04000000 | 3);
+    qtest_writel(qts, PERI_CLK_CTRL110, 1 << 26);
+    assert_hz(qts, "uart0-sclk", 10 * MHZ);
+    g_assert_cmpint(logged(log, "uart0-sclk"), ==, 2);
+
+    /*
+     * GPSPI2's source mux has no gate: its HS and master clocks' gates,
+     * on from reset, are the ones the procedure turns off.
+     */
+    qtest_writel(qts, PERI_CLK_CTRL116, 0x01100008 | 1);
+    g_assert_cmpint(logged(log, "changes gpspi2's source while it runs"),
+                    ==, 1);
+    qtest_writel(qts, PERI_CLK_CTRL116, 0x01000001);
+    qtest_writel(qts, PERI_CLK_CTRL116, 0x01000000);
+    g_assert_cmpint(logged(log, "gpspi2"), ==, 1);
+
+    /* SAR1's divider feeds no gated clock: it runs behind the ADC's. */
+    qtest_writel(qts, PERI_CLK_CTRL24, 0x00000405);
+    set_bits(qts, PERI_CLK_CTRL23, 1);
+    qtest_writel(qts, PERI_CLK_CTRL24, 0x00000406);
+    g_assert_cmpint(logged(log, "changes adc-sar1's divider"), ==, 1);
+    g_assert_cmpint(logged(log, "adc-sar1"), ==, 1);
+
+    /* The SDIO host's low-speed clock, divided by its edge count too. */
+    qtest_writel(qts, PERI_CLK_CTRL01, 0x401 | (1 << 24));
+    qtest_writel(qts, PERI_CLK_CTRL02, (3 << 17) | (1 << 27));
+    qtest_writel(qts, PERI_CLK_CTRL02, (3 << 17) | (1 << 27) | (1 << 8));
+    assert_hz(qts, "sdio-ls", 40 * MHZ);
+    g_assert_cmpint(logged(log, "HP_SYS_CLKRST_PERI_CLK_CTRL02 changes "
+                           "sdio-ls's divider while it runs with its gate "
+                           "on"), ==, 1);
+    qtest_writel(qts, PERI_CLK_CTRL01, 0x401);
+    qtest_writel(qts, PERI_CLK_CTRL02, (1 << 17) | (1 << 27) | (1 << 8));
+    qtest_writel(qts, PERI_CLK_CTRL01, 0x401 | (1 << 24));
+    assert_hz(qts, "sdio-ls", 80 * MHZ);
+    g_assert_cmpint(logged(log, "sdio-ls"), ==, 1);
+
+    /* The SoC dividers: CPU_CLK's alone, then MEM_CLK's and APB_CLK's. */
+    qtest_writel(qts, ROOT_CLK_CTRL0, (1 << 5) | (1 << 4));
+    assert_hz(qts, "cpu", 20 * MHZ);
+    g_assert_cmpint(logged(log, "SOC_CLK_DIV_UPDATE"), ==, 0);
+    qtest_writel(qts, ROOT_CLK_CTRL1, 0);
+    qtest_writel(qts, ROOT_CLK_CTRL2, 0);
+    qtest_writel(qts, ROOT_CLK_CTRL0, (1 << 5) | (1 << 4));
+    assert_hz(qts, "apb", 20 * MHZ);
+    g_assert_cmpint(logged(log, "SOC_CLK_DIV_UPDATE applies the dividers of "
+                           "MEM_CLK, APB_CLK at once"), ==, 1);
+    qtest_quit(qts);
+    unlink(log);
+}
+
+/*
+ * CPU_CLK's limit on v3.x is 400 MHz (the datasheet's "up to 400 MHz" and
+ * ESP-IDF's 400 MHz for v3.x, where the TRM's text keeps earlier
+ * silicon's 360 MHz): from the CPU PLL at 440 MHz it is logged, at
+ * 400 MHz it is not.
+ */
+/* [spec:nuos:req:emu.esp32p4.clocks/test] */
+static void test_cpu_limit(void)
+{
+    g_autofree char *log = guest_error_log();
+    QTestState *qts = qtest_initf("-M esp32p4 -d guest_errors -D %s", log);
+
+    qtest_writel(qts, ANA_CONF2, CONF2_CPU_PLL);
+    clear_bits(qts, ANA_PLL_CTRL0, 1 << 3);
+    ana_write(qts, SLAVE_CPU_PLL, 2, (5 << 4) | 0);
+    ana_write(qts, SLAVE_CPU_PLL, 3, 11);
+    qtest_clock_step(qts, 30 * US);
+    set_bits(qts, ANA_PLL_CTRL0, 1 << 3);
+    assert_hz(qts, "cpll", 440 * MHZ);
+
+    /* MEM_CLK by 3, the rest as from reset, then ROOT_CLK from the PLL. */
+    qtest_writel(qts, ROOT_CLK_CTRL1, 2);
+    qtest_writel(qts, ROOT_CLK_CTRL0, 1 << 4);
+    qtest_writel(qts, HP_CLK_CTRL, 0x1ffffffc | 1);
+    assert_hz(qts, "cpu", 440 * MHZ);
+    g_assert_cmpint(logged(log, "CPU_CLK at 440000000 Hz is above its "
+                           "400000000 Hz maximum"), ==, 1);
+    g_assert_cmpint(logged(log, "maximum"), ==, 1);
+
+    /* At 400 MHz, once the PLL relocks, it is within its limit. */
+    ana_write(qts, SLAVE_CPU_PLL, 3, 10);
+    qtest_clock_step(qts, 11 * US);
+    assert_hz(qts, "cpu", 400 * MHZ);
+    assert_hz(qts, "mem", 400 * MHZ / 3);
+    assert_hz(qts, "apb", 400 * MHZ / 6);
+    g_assert_cmpint(logged(log, "maximum"), ==, 1);
+    qtest_quit(qts);
+    unlink(log);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1202,5 +1348,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/clocks/core-resets", test_core_resets);
     qtest_add_func("/esp32p4/clocks/lp-uart-wakeup", test_lp_uart_wakeup);
     qtest_add_func("/esp32p4/clocks/efuse", test_efuse);
+    qtest_add_func("/esp32p4/clocks/procedures", test_procedures);
+    qtest_add_func("/esp32p4/clocks/cpu-limit", test_cpu_limit);
     return g_test_run();
 }
