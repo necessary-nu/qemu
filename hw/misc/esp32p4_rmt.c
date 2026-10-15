@@ -44,8 +44,12 @@
  * the watched transmitters' edges are delivered in time order across
  * channels, and an RMT input that changes in response takes the time of
  * the edge that caused it. The block is a line source: whenever software
- * samples the pads or reads a block that counts edges, the outputs are
- * brought up to the present first.
+ * samples the pads or reads a block that counts edges, the transmitters
+ * are brought up to that moment first. A register or RAM access and the
+ * block's timer act at one moment: with a receiver enabled, every line
+ * source is brought up to it first, and the receivers run to that same
+ * moment, so that a pulse is filtered by its width on the wire whatever
+ * the host does.
  *
  * Behaviour the TRM leaves open, as modelled:
  * - The fields of TRM table 60.3-1 take effect when the channel's
@@ -1552,16 +1556,31 @@ static bool rmt_receiving(ESP32P4RmtState *s)
     return false;
 }
 
-/*
- * Bring the other line sources up to the present, so that no input edge
- * older than now is still to come, then this block.
- */
-static void rmt_catch_up(ESP32P4RmtState *s)
+static void rmt_sync_sources(void *opaque)
 {
+    esp32_line_sync();
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.rmt-pcnt]
+ * Bring the block up to now (esp32_line_time()), and return that moment:
+ * with a receiver enabled, every source of line changes first, this
+ * block's transmitters among them, so that no input edge older than now
+ * is still to come when the receivers run up to it. The receivers run to
+ * the moment the sources were brought to, not to one read afresh: without
+ * icount virtual time runs on while the sources run, and a filter judged
+ * later than a source had got to would pass the start of a glitch whose
+ * end the source has yet to put out.
+ */
+static int64_t rmt_catch_up(ESP32P4RmtState *s)
+{
+    int64_t t = esp32_line_time();
+
     if (rmt_receiving(s)) {
-        esp32_line_sync();
+        esp32_line_run_at(t, rmt_sync_sources, NULL);
     }
-    rmt_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    rmt_sync(s, t);
+    return t;
 }
 
 static void rmt_timer_cb(void *opaque)
@@ -1574,6 +1593,15 @@ static void rmt_timer_cb(void *opaque)
     rmt_schedule(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.rmt-pcnt]
+ * The transmitters as a line source, for blocks that sample the pads or
+ * take the outputs' edges: brought up to the moment the sources are being
+ * brought to (esp32_line_time()). Only the transmitters: a receiver run up
+ * to that moment could judge its filter, or find its input idle, before
+ * another source, not yet brought up to it, has put out the edges due by
+ * then.
+ */
 static void rmt_line_sync(Notifier *n, void *data)
 {
     ESP32P4RmtState *s = container_of(n, ESP32P4RmtState, line_source);
@@ -1581,7 +1609,9 @@ static void rmt_line_sync(Notifier *n, void *data)
     if (s->syncing) {
         return;
     }
-    rmt_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    s->syncing = true;
+    tx_advance(s, esp32_line_time());
+    s->syncing = false;
     rmt_schedule(s);
 }
 
@@ -1653,7 +1683,7 @@ static void rmt_routes_changed(ESP32P4RmtState *s)
     }
     if (!s->syncing) {
         s->syncing = true;
-        tx_advance(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        tx_advance(s, esp32_line_time());
         s->syncing = false;
     }
     s->out_watched = watched;
@@ -1673,7 +1703,7 @@ static void tx_dma_ready(void *opaque)
 {
     ESP32P4RmtState *s = opaque;
 
-    rmt_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    rmt_catch_up(s);
     tx_dma_pull(s);
     rmt_changed(s);
     rmt_schedule(s);
@@ -1934,11 +1964,11 @@ static void esp32p4_rmt_write(void *opaque, hwaddr addr, uint64_t value,
                               unsigned size)
 {
     ESP32P4RmtState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint32_t v = value;
     unsigned n;
+    int64_t now;
 
-    rmt_catch_up(s);
+    now = rmt_catch_up(s);
     s->syncing = true;
     switch (addr) {
     case A_TX_DATA(0) ... A_TX_DATA(NTX - 1):
