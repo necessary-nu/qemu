@@ -1750,14 +1750,19 @@ static void pio_disturb(RP2350PIOState *s)
 /*
  * [spec:nuos:req:emu.pio]
  * Software samples the pads (line_sync()): the blocks run to the cycle of
- * line_time(), each pin change on the way reaching the pads at its own
- * time, which their timer, late without icount, has yet to bring.
+ * line_time(), clk_sys brought up to it first, each pin change on the way
+ * reaching the pads at its own time, which their timer, late without
+ * icount, has yet to bring.
  */
 static void pio_line_sync(Notifier *n, void *data)
 {
     RP2350PIOState *s = container_of(n, RP2350PIOState, line_source);
 
-    if (s->busy || !clock_is_enabled(s->clk)) {
+    if (s->busy) {
+        return;
+    }
+    clock_sync(s->clk);
+    if (!clock_is_enabled(s->clk)) {
         return;
     }
     pio_sync(s, pio_now(s));
@@ -2244,10 +2249,11 @@ static void pio_write_reg(RP2350PIOState *s, int b, hwaddr reg,
 }
 
 /*
- * Bring the blocks to the time of a register access. An access made from
- * within the blocks' own run (the DMA answering a DREQ they raised)
- * happens at the cycle the run has reached: the blocks are not run on to
- * the present first. Returns whether the access is such a one.
+ * Bring the blocks to the time of a register access, clk_sys first
+ * (clock_sync()). An access made from within the blocks' own run (the DMA
+ * answering a DREQ they raised) happens at the cycle the run has reached:
+ * the blocks are not run on to the present first. Returns whether the
+ * access is such a one.
  */
 static bool pio_access_begin(RP2350PIOState *s)
 {
@@ -2256,6 +2262,7 @@ static bool pio_access_begin(RP2350PIOState *s)
         s->spec_valid = false;
         return true;
     }
+    clock_sync(s->clk);
     pio_disturb(s);
     return false;
 }

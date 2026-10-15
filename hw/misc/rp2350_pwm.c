@@ -591,16 +591,19 @@ static void pwm_catch_up_all(RP2350PWMState *s)
 /*
  * [spec:nuos:req:emu.pwm]
  * Software samples the pads (line_sync()): every slice brought up to
- * line_time(), which its timer, late without icount, has yet to bring it
- * to: the edges due up to PWM_MAX_LATE_NS before, each at its own time,
+ * line_time(), clk_sys first, which its timer, late without icount, has
+ * yet to bring it to: the edges due up to PWM_MAX_LATE_NS before, each at its own time,
  * and a slice further behind taken to that moment at once, its outputs
  * showing their level there, as its late timer would take it.
  */
 static void pwm_line_sync(Notifier *n, void *data)
 {
     RP2350PWMState *s = container_of(n, RP2350PWMState, line_source);
-    int64_t when = line_time();
+    int64_t when;
     int i;
+
+    clock_sync(s->clk);
+    when = line_time();
 
     for (i = 0; i < RP2350_PWM_SLICES; i++) {
         RP2350PWMSlice *sl = &s->slice[i];
@@ -709,6 +712,10 @@ static void pwm_dreq_wanted(void *opaque, int n, int level)
     pwm_update(s, n);
 }
 
+/*
+ * An access first brings clk_sys up to its time (clock_sync()), so that
+ * the slices count by the clock as it is then.
+ */
 /* [spec:nuos:req:emu.pwm] */
 static uint64_t rp2350_pwm_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -717,6 +724,7 @@ static uint64_t rp2350_pwm_read(void *opaque, hwaddr addr, unsigned size)
     uint32_t v = 0;
     int i;
 
+    clock_sync(s->clk);
     if (reg < A_EN) {
         RP2350PWMSlice *sl;
 
@@ -787,6 +795,7 @@ static void rp2350_pwm_write(void *opaque, hwaddr addr, uint64_t value64,
     uint32_t value = value64;
     int i;
 
+    clock_sync(s->clk);
     if (reg < A_EN) {
         RP2350PWMSlice *sl;
         uint32_t v;

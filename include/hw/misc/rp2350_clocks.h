@@ -95,11 +95,14 @@ struct RP2350ClkRegsClass {
  * line_due_order_mod(), so that while none has fallen due an access runs
  * nothing and asks none of them.
  *
- * A block counting one of the tree's clocks (TIMER0/1, the watchdog,
- * POWMAN and its AON timer) brings the tree up to its register access
- * the same way, through clock_sync() of its clock, which the SoC sets on
- * the tree's clocks: it counts a change that has fallen due from its
- * time, before the change's timer has run.
+ * Every block timing from one of the tree's clocks (TIMER0/1, the
+ * watchdog, POWMAN and its AON timer, ADC, DMA, HSTX, PIO, PWM, USBCTRL,
+ * the TRNG, the UARTs, SPI and I2C controllers, the processors' DWT and
+ * CoreSight's timestamp) brings the tree up to its register access the
+ * same way, through clock_sync() of its clock, which the SoC sets on the
+ * tree's clocks: it counts or times a change that has fallen due from
+ * its time, before the change's timer has run, and a clock's gating
+ * as it is by then.
  */
 void rp2350_clkregs_join_order(RP2350ClkRegsState *s, LineDueOrder *o);
 

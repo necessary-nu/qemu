@@ -480,10 +480,18 @@ static uint32_t adc_read_reg(RP2350ADCState *s, hwaddr addr)
  * Narrow reads read the whole register and return their byte lanes, so
  * a byte or halfword read of FIFO (DMA into a byte buffer with FCS.SHIFT)
  * pops one sample.
+ *
+ * An access, read or write, first brings clk_adc up to its time
+ * (clock_sync()): a start, stop or change of rate that has fallen due,
+ * its event's timer late, gates and paces the conversions from its time.
  */
 static uint64_t rp2350_adc_read(void *opaque, hwaddr addr, unsigned size)
 {
-    uint32_t v = adc_read_reg(opaque, addr & ~3);
+    RP2350ADCState *s = opaque;
+    uint32_t v;
+
+    clock_sync(s->clk);
+    v = adc_read_reg(s, addr & ~3);
 
     return extract32(v, (addr & 3) * 8, size * 8);
 }
@@ -563,14 +571,17 @@ static void adc_write_reg(RP2350ADCState *s, hwaddr addr, uint32_t value)
 static void rp2350_adc_write(void *opaque, hwaddr addr, uint64_t value,
                              unsigned size)
 {
+    RP2350ADCState *s = opaque;
     uint32_t v = value;
+
+    clock_sync(s->clk);
 
     if (size == 1) {
         v = (v & 0xff) * 0x01010101u;
     } else if (size == 2) {
         v = (v & 0xffff) * 0x00010001u;
     }
-    adc_write_reg(opaque, addr & ~3, v);
+    adc_write_reg(s, addr & ~3, v);
 }
 
 static const MemoryRegionOps rp2350_adc_ops = {
