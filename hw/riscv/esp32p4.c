@@ -3488,6 +3488,8 @@ static void esp32p4_init_mipi(ESP32P4MachineState *s)
                           qdev_get_clock_out(clkrst, "mipi-dsi-dpi"));
     object_property_set_link(OBJECT(dbrg), "dsi-host", OBJECT(dsi),
                              &error_abort);
+    object_property_set_link(OBJECT(dbrg), "vdma", OBJECT(vdma),
+                             &error_abort);
     qdev_connect_clock_in(csi, "phy-cfg",
                           qdev_get_clock_out(clkrst, "mipi-csi-dphy-cfg"));
     qdev_connect_clock_in(cbrg, "bus",

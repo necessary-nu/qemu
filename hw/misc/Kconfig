@@ -338,4 +338,7 @@ config K230_DECOMP_GZIP
 config ESP32_MCPWM
     bool
 
+config ESP32_GATED_REGION
+    bool
+
 source macio/Kconfig

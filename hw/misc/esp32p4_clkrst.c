@@ -184,6 +184,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/gpio/esp32_line.h"
+#include "hw/misc/esp32_gated_region.h"
 #include "hw/misc/esp32p4_clkrst.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
@@ -1319,12 +1320,14 @@ struct ESP32P4ClkRstGate {
     DeviceState *dev;
     unsigned clock;
     unsigned reset;
-    MemoryRegion iomem;
-    AddressSpace dev_as;
+    Esp32GatedRegion region;
     bool held;
-    bool has_volatile;
-    hwaddr volatile_offset;
-    unsigned volatile_size;
+    /* The registers esp32p4_clkrst_gate_volatile() names */
+    unsigned n_volatile;
+    struct {
+        hwaddr offset;
+        unsigned size;
+    } volatile_reg[ESP32P4_CLKRST_GATE_VOLATILE_MAX];
     QTAILQ_ENTRY(ESP32P4ClkRstGate) next;
 };
 
@@ -2144,7 +2147,13 @@ void esp32p4_clkrst_sync(ESP32P4ClkRstState *s, int64_t now)
     }
     s->syncing = true;
     for (int i = 0; i < ESP32P4_NUM_CLKIN; i++) {
-        esp32p4_clk_sync_source(s->clk_in[i], now);
+        ESP32P4ClkSourceSync *src = &s->in_source[i];
+
+        esp32p4_clk_find_source(s->clk_in[i], src);
+        /* A device driving several inputs (the PLLs) syncs them all */
+        if (src->sync && (i == 0 || src->owner != src[-1].owner)) {
+            src->sync(src->owner, now);
+        }
     }
     for (;;) {
         int64_t due = now;
@@ -2683,58 +2692,36 @@ static void esp32p4_clkrst_clock_in_update(void *opaque, ClockEvent event)
     esp32p4_clkrst_update(opaque, false);
 }
 
-/* [spec:nuos:req:emu.esp32p4.clocks] */
-static MemTxResult esp32p4_clkrst_gate_read(void *opaque, hwaddr addr,
-                                            uint64_t *data, unsigned size,
-                                            MemTxAttrs attrs)
+/*
+ * [spec:nuos:req:emu.esp32p4.clocks]
+ * Whether the gate lets an access to its block through, the clock tree
+ * brought up to the access's time first.
+ */
+static bool esp32p4_clkrst_gate_pass(void *opaque, hwaddr addr,
+                                     unsigned size, bool is_write,
+                                     MemTxAttrs attrs)
 {
     ESP32P4ClkRstGate *g = opaque;
-    bool running;
-    uint8_t buf[8];
-    MemTxResult r;
 
     esp32p4_clkrst_sync(g->s, esp32_line_time());
-    running = !g->held && clock_is_enabled(g->s->clk[g->clock]);
-    if (!running && g->has_volatile &&
-        addr < g->volatile_offset + g->volatile_size &&
-        addr + size > g->volatile_offset) {
-        *data = 0;
-        return MEMTX_OK;
+    if (!g->held && clock_is_enabled(g->s->clk[g->clock])) {
+        return true;
     }
-    r = address_space_read(&g->dev_as, addr, attrs, buf, size);
-    *data = ldn_le_p(buf, size);
-    return r;
-}
-
-/* [spec:nuos:req:emu.esp32p4.clocks] */
-static MemTxResult esp32p4_clkrst_gate_write(void *opaque, hwaddr addr,
-                                             uint64_t data, unsigned size,
-                                             MemTxAttrs attrs)
-{
-    ESP32P4ClkRstGate *g = opaque;
-    uint8_t buf[8];
-
-    esp32p4_clkrst_sync(g->s, esp32_line_time());
-    if (g->held || !clock_is_enabled(g->s->clk[g->clock])) {
+    if (is_write) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write to %s at 0x%" HWADDR_PRIx
                       " while its clock is gated or it is held in reset\n",
-                      TYPE_ESP32P4_CLKRST, memory_region_name(&g->iomem),
-                      addr);
-        return MEMTX_OK;
+                      TYPE_ESP32P4_CLKRST,
+                      memory_region_name(&g->region.through), addr);
+        return false;
     }
-    stn_le_p(buf, size, data);
-    return address_space_write(&g->dev_as, addr, attrs, buf, size);
+    for (unsigned i = 0; i < g->n_volatile; i++) {
+        if (addr < g->volatile_reg[i].offset + g->volatile_reg[i].size &&
+            addr + size > g->volatile_reg[i].offset) {
+            return false;
+        }
+    }
+    return true;
 }
-
-static const MemoryRegionOps esp32p4_clkrst_gate_ops = {
-    .read_with_attrs = esp32p4_clkrst_gate_read,
-    .write_with_attrs = esp32p4_clkrst_gate_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
-    .impl.min_access_size = 1,
-    .impl.max_access_size = 4,
-};
 
 /* [spec:nuos:req:emu.esp32p4.clocks] */
 ESP32P4ClkRstGate *esp32p4_clkrst_map_gated(ESP32P4ClkRstState *s,
@@ -2744,8 +2731,6 @@ ESP32P4ClkRstGate *esp32p4_clkrst_map_gated(ESP32P4ClkRstState *s,
 {
     ESP32P4ClkRstGate *g = g_new0(ESP32P4ClkRstGate, 1);
     MemoryRegion *mr = sysbus_mmio_get_region(dev, n);
-    g_autofree char *as_name = g_strdup_printf("%s-gate",
-                                               memory_region_name(mr));
 
     assert(bus_clock < ESP32P4_NUM_CLOCKS &&
            reset <= ESP32P4_CLKRST_GATE_NO_RESET);
@@ -2754,33 +2739,21 @@ ESP32P4ClkRstGate *esp32p4_clkrst_map_gated(ESP32P4ClkRstState *s,
     g->clock = bus_clock;
     g->reset = reset;
     g->held = reset != ESP32P4_CLKRST_GATE_NO_RESET && s->reset_level[reset];
-    address_space_init(&g->dev_as, mr, as_name);
-    /*
-     * No owner: an owner's re-entrancy guard would block the forwarded
-     * access to the block's own region.
-     */
-    memory_region_init_io(&g->iomem, NULL, &esp32p4_clkrst_gate_ops, g,
-                          memory_region_name(mr), memory_region_size(mr));
-    memory_region_add_subregion_overlap(get_system_memory(), addr, &g->iomem,
-                                        priority);
+    esp32_gated_region_init(&g->region, g->dev, mr, memory_region_name(mr),
+                            esp32p4_clkrst_gate_pass, g);
+    memory_region_add_subregion_overlap(get_system_memory(), addr,
+                                        &g->region.mr, priority);
     QTAILQ_INSERT_TAIL(&s->gates, g, next);
     return g;
-}
-
-DeviceState *esp32p4_clkrst_gated_device(MemoryRegion *mr)
-{
-    if (mr->ops != &esp32p4_clkrst_gate_ops) {
-        return NULL;
-    }
-    return ((ESP32P4ClkRstGate *)mr->opaque)->dev;
 }
 
 void esp32p4_clkrst_gate_volatile(ESP32P4ClkRstGate *g, hwaddr offset,
                                   unsigned size)
 {
-    g->has_volatile = true;
-    g->volatile_offset = offset;
-    g->volatile_size = size;
+    assert(g->n_volatile < ESP32P4_CLKRST_GATE_VOLATILE_MAX);
+    g->volatile_reg[g->n_volatile].offset = offset;
+    g->volatile_reg[g->n_volatile].size = size;
+    g->n_volatile++;
 }
 
 /*

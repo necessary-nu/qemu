@@ -110,6 +110,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/gpio/esp32_line.h"
+#include "hw/misc/esp32_gated_region.h"
 #include "hw/misc/esp32p4_clkrst.h"
 #include "hw/misc/esp32p4_pms.h"
 #include "migration/vmstate.h"
@@ -1006,6 +1007,12 @@ static void dw_catch_up(ESP32P4DwGdmaState *s, int64_t now)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.dma] */
+void esp32p4_dw_gdma_sync(ESP32P4DwGdmaState *s, int64_t now)
+{
+    dw_catch_up(s, now);
+}
+
 /*
  * Let the engine look for work at the bus clock's next edge after the
  * change that calls for it, at esp32_line_time().
@@ -1567,7 +1574,7 @@ static const MemoryRegionOps esp32p4_dw_gdma_ops = {
  */
 static bool dw_region_in_access(MemoryRegion *mr)
 {
-    DeviceState *gated = esp32p4_clkrst_gated_device(mr);
+    DeviceState *gated = esp32_gated_region_device(mr);
 
     if (gated) {
         return gated->mem_reentrancy_guard.engaged_in_io;

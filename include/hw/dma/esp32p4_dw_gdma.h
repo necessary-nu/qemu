@@ -157,4 +157,14 @@ struct ESP32P4DwGdmaState {
     uint32_t rr_last[2];
 };
 
+/*
+ * Run the rounds of the bus that fell due by @now, in order, each at its
+ * own time, which VDMA's QEMU timer, late without icount, has yet to run.
+ * For a peripheral VDMA feeds (the DSI bridge's FIFO) that takes data out
+ * at @now, also while it catches up in one of its own register accesses:
+ * the rounds' writes reach it re-entrantly then, so the region they write
+ * must allow that (disable_reentrancy_guard).
+ */
+void esp32p4_dw_gdma_sync(ESP32P4DwGdmaState *s, int64_t now);
+
 #endif

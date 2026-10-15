@@ -553,6 +553,22 @@ MemoryRegion *memory_translate_iotlb(IOMMUTLBEntry *iotlb, hwaddr *xlat_p,
 typedef struct CoalescedMemoryRange CoalescedMemoryRange;
 typedef struct MemoryRegionIoeventfd MemoryRegionIoeventfd;
 
+/**
+ * typedef MemoryRegionGateFn: decides an access before its region does
+ *
+ * @opaque: the opaque memory_region_set_gate() was given
+ * @addr: the offset of the access within the region
+ * @size: the size of the access, in bytes
+ * @is_write: whether the access is a write
+ * @attrs: the access's attributes
+ *
+ * Returns true to let the access go on to its region's own checks and
+ * callbacks; false to complete it at once with MEMTX_OK, a read returning
+ * 0 and a write having no effect.
+ */
+typedef bool MemoryRegionGateFn(void *opaque, hwaddr addr, unsigned size,
+                                bool is_write, MemTxAttrs attrs);
+
 /** MemoryRegion:
  *
  * A struct representing a memory region.
@@ -606,6 +622,11 @@ struct MemoryRegion {
     bool disable_reentrancy_guard;
     /* RAM device region that does not require IOMMU mapping for P2P */
     bool ram_device_skip_iommu_map;
+
+    /* What meets each access first (memory_region_set_gate()) */
+    MemoryRegionGateFn *gate;
+    MemoryRegion *gate_front;
+    void *gate_opaque;
 };
 
 struct IOMMUMemoryRegion {
@@ -2139,6 +2160,34 @@ uint64_t memory_region_get_alignment(const MemoryRegion *mr);
  */
 void memory_region_del_subregion(MemoryRegion *mr,
                                  MemoryRegion *subregion);
+
+/**
+ * memory_region_set_gate: put a gate in front of a region
+ *
+ * Every access dispatched to @mr meets @front's access checks first, as
+ * an access to @front would, then @gate, and only then @mr's own checks
+ * and callbacks: what @mr would see behind a region of @front's checks
+ * whose callbacks asked @gate and forwarded the accesses it lets through
+ * to @mr, in one dispatch instead of two. An access @front's checks
+ * refuse ends in a decode error, as one @mr's own refuse does. Asking
+ * whether an access to @mr is valid (memory_region_access_valid(), and so
+ * address_space_access_valid()) asks @front's checks, as asking that
+ * region would. @front is never dispatched to.
+ *
+ * Accesses reach @mr split by @mr's own access sizes, not @front's: a
+ * caller wanting them split as @front would split them gives @front the
+ * same maximum access size and alignment.
+ *
+ * @mr: an I/O region with no subregions
+ * @front: the region whose checks an access meets first
+ * @gate: the gate, or NULL to remove the gate @mr has
+ * @opaque: passed to @gate
+ *
+ * Returns false, changing nothing, if @mr is a region of another kind or
+ * has subregions, or, setting a gate, already has one.
+ */
+bool memory_region_set_gate(MemoryRegion *mr, MemoryRegion *front,
+                            MemoryRegionGateFn *gate, void *opaque);
 
 /*
  * memory_region_set_enabled: dynamically enable or disable a region
