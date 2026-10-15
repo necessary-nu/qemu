@@ -24,7 +24,9 @@
 #define TIMG_REGFILE_SIZE 0x100
 
 static uint64_t esp32_timg_timer_get_count(Esp32TimgTimerState *s, uint64_t ns_now);
-static uint64_t esp32_timg_timer_count_to_ns(Esp32TimgTimerState *s, uint64_t count);
+static void esp32_timg_timer_sync(Esp32TimgTimerState *ts, uint64_t ns_now);
+static uint64_t esp32_timg_timer_due_ns(Esp32TimgTimerState *ts,
+                                        uint64_t count_to_alarm);
 static int esp32_timg_timer_direction(Esp32TimgTimerState *s);
 static uint64_t esp32_timg_apb_ns(Esp32TimgState *s, uint64_t ticks,
                                   uint32_t div);
@@ -338,7 +340,9 @@ static void esp32_timg_timer_reset(Esp32TimgTimerState* ts)
     ts->alarm_val = 0;
     ts->load_val = 0;
     ts->count_base = 0;
-    ts->ns_base = 0;
+    ts->pre = 0;
+    ts->ns_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    ts->synced = 0;
     esp32_timg_timer_update_config(ts);
 }
 
@@ -415,9 +419,10 @@ static void esp32_timg_apb_clk_update(void *opaque, ClockEvent event)
         Esp32TimgTimerState *ts = timers[i];
 
         if (event == ClockPreUpdate) {
-            ts->count_base = esp32_timg_timer_get_count(ts, ns_now);
-            ts->ns_base = ns_now;
+            esp32_timg_timer_sync(ts, ns_now);
         } else {
+            ts->ns_base = ns_now;
+            ts->synced = 0;
             esp32_timg_timer_update_alarm(ts, ns_now);
         }
     }
@@ -800,7 +805,7 @@ static void esp32_timg_xtal32k_clk_update(void *opaque, ClockEvent event)
  * When the alarm of timer @ts fell due: the time the counter reached
  * ALARM, which the QEMU timer's callback, running late, may be past
  * however far. An alarm fires once (ALARM_EN clears), so there are no
- * periods to replay. ns_base is when the alarm was armed from.
+ * periods to replay. The count was synced when the alarm was armed.
  */
 static uint64_t esp32_timg_timer_alarm_ns(Esp32TimgTimerState *ts,
                                           uint64_t ns_now)
@@ -808,13 +813,11 @@ static uint64_t esp32_timg_timer_alarm_ns(Esp32TimgTimerState *ts,
     int64_t count_to_alarm = ((int64_t)ts->alarm_val -
                               (int64_t)ts->count_base) *
                              esp32_timg_timer_direction(ts);
-    uint64_t due;
 
     if (count_to_alarm <= 0 || !clock_is_enabled(ts->parent->apb_clk)) {
         return ns_now;
     }
-    due = ts->ns_base + esp32_timg_timer_count_to_ns(ts, count_to_alarm);
-    return MIN(due, ns_now);
+    return MIN(esp32_timg_timer_due_ns(ts, count_to_alarm), ns_now);
 }
 
 static void esp32_timg_timer_cb(void *opaque)
@@ -901,21 +904,66 @@ static uint64_t esp32_timg_apb_ns(Esp32TimgState *s, uint64_t ticks,
     return clock_ticks_to_ns(s->apb_clk, ticks * prescale);
 }
 
-static uint64_t esp32_timg_timer_get_count(Esp32TimgTimerState *s, uint64_t ns_now)
+/* APB_CLK's edges since ns_base, by @ns_now */
+static uint64_t esp32_timg_timer_edges(Esp32TimgTimerState *ts,
+                                       uint64_t ns_now)
 {
-    if (!s->en || !clock_is_enabled(s->parent->apb_clk)) {
-        return s->count_base;
-    }
-    uint64_t ns_from_base = ns_now - s->ns_base;
-    uint64_t ticks_from_base =
-        esp32_timg_apb_ticks(s->parent, ns_from_base) / s->divider;
-    uint64_t count = esp32_timg_timer_direction(s) * ticks_from_base + s->count_base;
-    return count;
+    return ns_now > ts->ns_base ?
+           esp32_timg_apb_ticks(ts->parent, ns_now - ts->ns_base) : 0;
 }
 
-static uint64_t esp32_timg_timer_count_to_ns(Esp32TimgTimerState *s, uint64_t count)
+/* APB_CLK cycles timer @ts has counted since its sync point */
+static uint64_t esp32_timg_timer_cycles(Esp32TimgTimerState *ts,
+                                        uint64_t ns_now)
 {
-    return esp32_timg_apb_ns(s->parent, count, s->divider);
+    uint64_t edges;
+
+    if (!ts->en || !clock_is_enabled(ts->parent->apb_clk)) {
+        return 0;
+    }
+    edges = esp32_timg_timer_edges(ts, ns_now);
+    return edges > ts->synced ? edges - ts->synced : 0;
+}
+
+static uint64_t esp32_timg_timer_get_count(Esp32TimgTimerState *s,
+                                           uint64_t ns_now)
+{
+    uint64_t ticks = (s->pre + esp32_timg_timer_cycles(s, ns_now)) /
+                     s->divider;
+
+    return esp32_timg_timer_direction(s) * ticks + s->count_base;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * Fold the cycles counted up to @ns_now into the count and the
+ * prescaler; a stopped timer counts from the next edge after @ns_now.
+ */
+static void esp32_timg_timer_sync(Esp32TimgTimerState *ts, uint64_t ns_now)
+{
+    uint64_t cycles = esp32_timg_timer_cycles(ts, ns_now);
+
+    ts->count_base = esp32_timg_timer_get_count(ts, ns_now);
+    ts->pre = (ts->pre + cycles) % ts->divider;
+    ts->synced = esp32_timg_timer_edges(ts, ns_now);
+}
+
+/*
+ * When timer @ts, synced and counting, has counted @count_to_alarm
+ * ticks more: at the APB_CLK edge that ends the last.
+ */
+static uint64_t esp32_timg_timer_due_ns(Esp32TimgTimerState *ts,
+                                        uint64_t count_to_alarm)
+{
+    uint64_t cycles;
+
+    if (count_to_alarm > (UINT64_MAX - ts->synced) / ts->divider) {
+        return INT64_MAX;
+    }
+    cycles = count_to_alarm * ts->divider - ts->pre;
+    return MIN(ts->ns_base + clock_edge_ns(ts->parent->apb_clk,
+                                           ts->synced + cycles),
+               INT64_MAX);
 }
 
 static uint32_t esp32_timg_timer_div_from_reg(uint32_t reg_val)
@@ -929,16 +977,39 @@ static uint32_t esp32_timg_timer_div_from_reg(uint32_t reg_val)
     return reg_val;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * Take CONFIG as written. The count to date and the prescaler's cycles
+ * towards its next tick carry over every write: a new divider counts from
+ * them, the next tick coming when they reach it, or a whole new period on
+ * if they already have (as the ESP32-P4's model, hw/timer/esp32p4_timg.c,
+ * takes it). The TRM (10.2.1) has the timer disabled before its divider
+ * changes, the result otherwise "unpredictable": such a change is logged
+ * as a guest error.
+ */
 static void esp32_timg_timer_update_config(Esp32TimgTimerState *ts)
 {
     uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    ts->count_base = esp32_timg_timer_get_count(ts, ns_now);
-    ts->ns_base = ns_now;
+    int divider = esp32_timg_timer_div_from_reg(
+        FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, DIVIDER));
+    bool en = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, EN);
 
-    ts->en = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, EN);
+    esp32_timg_timer_sync(ts, ns_now);
+    if (ts->en && en && divider != ts->divider) {
+        Esp32TimgState *s = ts->parent;
+
+        qemu_log_mask(LOG_GUEST_ERROR, "%s%d: timer %s's divider changed "
+                      "while it counts\n", TYPE_ESP32_TIMG, s->id,
+                      ts == &s->t0 ? "T0" : ts == &s->t1 ? "T1" : "LACT");
+    }
+
+    ts->en = en;
     ts->inc = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, INCREASE);
     ts->autoreload = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, AUTORELOAD);
-    ts->divider = esp32_timg_timer_div_from_reg(FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, DIVIDER));
+    ts->divider = divider;
+    if (ts->pre >= divider) {
+        ts->pre = 0;
+    }
     ts->edge_int_en = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, EDGE_INT);
     ts->level_int_en = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, LEVEL_INT);
     ts->alarm = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, ALARM);
@@ -954,7 +1025,7 @@ static void esp32_timg_timer_reload(Esp32TimgTimerState *ts, uint64_t ns_now)
 {
     timer_del(&ts->alarm_timer);
 
-    ts->ns_base = ns_now;
+    esp32_timg_timer_sync(ts, ns_now);
     ts->count_base = ts->load_val;
 
     TIMG_DEBUG_LOG("%s: TG%d base=0x%llx ns=0x%llx\n", __func__, ts->parent->id,
@@ -970,6 +1041,7 @@ static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_n
         return;
     }
 
+    esp32_timg_timer_sync(ts, ns_now);
     int64_t count_to_alarm = ((int64_t) ts->alarm_val - (int64_t) ts->count_base)
                                 * esp32_timg_timer_direction(ts);
     if (count_to_alarm <= 0) {
@@ -978,12 +1050,12 @@ static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_n
         return;
     }
 
-    uint64_t ns_to_alarm = esp32_timg_timer_count_to_ns(ts, count_to_alarm);
+    uint64_t due = esp32_timg_timer_due_ns(ts, count_to_alarm);
 
-    TIMG_DEBUG_LOG("%s: TG%d count_to_alarm=0x%llx ns_to_alarm=0x%llx\n", __func__, ts->parent->id,
-                 count_to_alarm, ns_to_alarm);
+    TIMG_DEBUG_LOG("%s: TG%d count_to_alarm=0x%llx due=0x%llx\n",
+                   __func__, ts->parent->id, count_to_alarm, due);
 
-    timer_mod_anticipate_ns(&ts->alarm_timer, ns_now + ns_to_alarm);
+    timer_mod_anticipate_ns(&ts->alarm_timer, due);
 }
 
 /*
@@ -1160,6 +1232,8 @@ static void esp32_timg_realize(DeviceState *dev, Error **errp)
 
 static void esp32_timg_timer_init(Esp32TimgState *s, Esp32TimgTimerState *ts, Esp32TimgInterruptType int_type) {
     ts->parent = s;
+    /* The reset divisor, which the first reset's sync divides by */
+    ts->divider = 2;
     timer_init_ns(&ts->alarm_timer, QEMU_CLOCK_VIRTUAL, esp32_timg_timer_cb, ts);
     ts->int_type = int_type;
 }

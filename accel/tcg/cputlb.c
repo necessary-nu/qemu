@@ -1085,8 +1085,13 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         if (prot & PAGE_WRITE) {
             if (section->readonly) {
                 write_flags |= TLB_DISCARD_WRITE;
-            } else if (physical_memory_is_clean(iotlb)) {
-                write_flags |= TLB_NOTDIRTY;
+            } else {
+                if (physical_memory_is_clean(iotlb)) {
+                    write_flags |= TLB_NOTDIRTY;
+                }
+                if (memory_region_store_watched(section->mr, xlat)) {
+                    write_flags |= TLB_STORE_WATCH;
+                }
             }
         }
     } else {
@@ -1281,6 +1286,7 @@ io_prepare(hwaddr *out_offset, CPUState *cpu, CPUTLBEntryFull *full,
     mr_offset = full->xlat_offset + addr;
     cpu->mem_io_pc = retaddr;
     cpu->access_held = false;
+    cpu->access_held_exclusive = false;
     if (!cpu->neg.can_do_io) {
         cpu_io_recompile(cpu, retaddr);
     }
@@ -1295,10 +1301,17 @@ static void io_failed(CPUState *cpu, CPUTLBEntryFull *full, vaddr addr,
 {
     /*
      * A device holds the access (cpu_hold_access()): no fault, the
-     * instruction is made again when the CPU next runs.
+     * instruction is made again when the CPU next runs, or at once with
+     * every other CPU stopped (cpu_hold_access_exclusive()).
      */
     if (cpu->access_held) {
+        bool exclusive = cpu->access_held_exclusive;
+
         cpu->access_held = false;
+        cpu->access_held_exclusive = false;
+        if (exclusive) {
+            cpu_loop_exit_atomic(cpu, retaddr);
+        }
         cpu_loop_exit_restore(cpu, retaddr);
     }
     if (!cpu->ignore_memory_transaction_failures
@@ -1364,6 +1377,27 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
     if (!physical_memory_is_clean(ram_addr)) {
         trace_memory_notdirty_set_dirty(mem_vaddr);
         tlb_set_dirty(cpu, mem_vaddr);
+    }
+}
+
+/*
+ * Pass a store of @size bytes at @mem_vaddr, about to be made to the RAM
+ * the TLB entry @full maps, through the region's store watch
+ * (TLB_STORE_WATCH). A watch that refuses a store not made last in its
+ * block has it made again as the last, as an access to I/O is (@retaddr
+ * of 0 is a store from outside generated code, made as it comes).
+ */
+static void store_watch(CPUState *cpu, vaddr mem_vaddr, unsigned size,
+                        CPUTLBEntryFull *full, uintptr_t retaddr)
+{
+    MemoryRegion *mr = full->section->mr;
+    hwaddr offset = mem_vaddr + full->xlat_offset - mr->ram_block->offset;
+    bool last = cpu->neg.can_do_io || !retaddr;
+
+    if (!mr->store_watch->store(mr->store_watch_opaque, offset, size,
+                                last)) {
+        g_assert(!last);
+        cpu_io_recompile(cpu, retaddr);
     }
 }
 
@@ -1695,6 +1729,7 @@ static bool mmu_lookup1(CPUState *cpu, MMULookupPageData *data, MemOp memop,
  * @ra: return address into tcg generated code, or 0
  *
  * Trigger watchpoints for @data.addr:@data.size;
+ * pass writes through a RAM region's store watch;
  * record writes to protected clean pages.
  */
 static void mmu_watch_or_dirty(CPUState *cpu, MMULookupPageData *data,
@@ -1712,7 +1747,11 @@ static void mmu_watch_or_dirty(CPUState *cpu, MMULookupPageData *data,
         flags &= ~TLB_WATCHPOINT;
     }
 
-    /* Note that notdirty is only set for writes. */
+    /* The store watch and notdirty are only set for writes. */
+    if (flags & TLB_STORE_WATCH) {
+        store_watch(cpu, addr, size, full, ra);
+        flags &= ~TLB_STORE_WATCH;
+    }
     if (flags & TLB_NOTDIRTY) {
         notdirty_write(cpu, addr, size, full, ra);
         flags &= ~TLB_NOTDIRTY;
@@ -1756,7 +1795,8 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     crosspage = (addr ^ last) & TARGET_PAGE_MASK;
     if (likely(!crosspage)) {
         flags = l->page[0].flags;
-        if (unlikely(flags & (TLB_WATCHPOINT | TLB_NOTDIRTY))) {
+        if (unlikely(flags & (TLB_WATCHPOINT | TLB_NOTDIRTY |
+                              TLB_STORE_WATCH))) {
             mmu_watch_or_dirty(cpu, &l->page[0], type, ra);
         }
         if (unlikely(flags & TLB_BSWAP)) {
@@ -1782,7 +1822,8 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
         }
 
         flags = l->page[0].flags | l->page[1].flags;
-        if (unlikely(flags & (TLB_WATCHPOINT | TLB_NOTDIRTY))) {
+        if (unlikely(flags & (TLB_WATCHPOINT | TLB_NOTDIRTY |
+                              TLB_STORE_WATCH))) {
             mmu_watch_or_dirty(cpu, &l->page[0], type, ra);
             mmu_watch_or_dirty(cpu, &l->page[1], type, ra);
         }
@@ -1900,6 +1941,10 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
         }
         cpu_check_watchpoint(cpu, addr, size,
                              full->attrs, wp_flags, retaddr);
+    }
+
+    if (unlikely(tlb_addr & TLB_STORE_WATCH)) {
+        store_watch(cpu, addr, size, full, retaddr);
     }
 
     return hostaddr;
