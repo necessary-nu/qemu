@@ -3917,6 +3917,8 @@ static void esp32p4_init_rmt_pcnt(ESP32P4MachineState *s)
 
     object_initialize_child(OBJECT(s), "pcnt", &s->pcnt, TYPE_ESP32P4_PCNT);
     dev = DEVICE(&s->pcnt);
+    object_property_set_link(OBJECT(dev), "gpio", OBJECT(gpio),
+                             &error_abort);
     qdev_connect_clock_in(dev, "apb", qdev_get_clock_out(clkrst, "pcnt-apb"));
     sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
     esp32p4_clkrst_map_gated(&s->clkrst, SYS_BUS_DEVICE(dev), 0,

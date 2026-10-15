@@ -11,6 +11,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
+#include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -43,10 +44,29 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4PcntState, ESP32P4_PCNT)
  *     matrix input signals 141 + u (sig_ch0), 145 + u (sig_ch1), 149 + u
  *     (ctrl_ch0), 153 + u (ctrl_ch1) and 63 + u (rst).
  *   - Sysbus IRQ 0: PCNT_INTR (interrupt matrix source 111).
+ *   - Link "gpio": the GPIO matrix, through which the signal inputs take a
+ *     periodic output's edges in bulk (hw/gpio/esp32_line.h); without it
+ *     every input follows its line.
  *
  * The PCNT has no ETM events or tasks on the P4.
  */
 #define ESP32P4_PCNT_INPUT      "input"
+
+typedef struct ESP32P4PcntState ESP32P4PcntState;
+
+/*
+ * A signal input's wave: the one the matrix connects it to, whether the
+ * path inverts it, and whether the input takes it (its output describes
+ * its edges) rather than its line.
+ */
+typedef struct ESP32P4PcntBulk {
+    ESP32P4PcntState *s;
+    unsigned input;
+    Notifier taker;
+    Esp32LineWave *wave;
+    bool inv;
+    bool on;
+} ESP32P4PcntBulk;
 
 typedef struct ESP32P4PcntUnit {
     uint32_t conf0;
@@ -92,6 +112,20 @@ struct ESP32P4PcntState {
     uint8_t filt[ESP32P4_PCNT_INPUTS];
     int64_t raw_since_ns[ESP32P4_PCNT_INPUTS];
     QEMUTimer filter_timer;
+
+    /*
+     * Per input: the level on its line and when the input last took a
+     * change from it; and for a signal input taking a wave, the moment
+     * it has been brought to (raw, filt and raw_since_ns are as of then).
+     */
+    uint8_t line[ESP32P4_PCNT_INPUTS];
+    int64_t line_ns[ESP32P4_PCNT_INPUTS];
+    int64_t bulk_ns[ESP32P4_PCNT_INPUTS];
+    ESP32P4PcntBulk bulk[ESP32P4_PCNT_INPUTS];
+    /* bulk[].on, for migration */
+    bool bulk_on[ESP32P4_PCNT_INPUTS];
+    DeviceState *gpio;
+    Notifier route_notifier;
 };
 
 #endif

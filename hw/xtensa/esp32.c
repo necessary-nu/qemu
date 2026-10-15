@@ -1591,6 +1591,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
      * The pulse counter's signal and control inputs are GPIO matrix input
      * signals, reaching it from any pad through GPIO_FUNCn_IN_SEL.
      */
+    object_property_set_link(OBJECT(&s->pcnt), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
     qdev_realize(DEVICE(&s->pcnt), &s->periph_bus, &error_fatal);
     {
         Esp32PeriphGate *g = esp32_soc_add_gated_device(
