@@ -40,6 +40,7 @@ system_ss.add(when: 'CONFIG_HEX_QTIMER', if_true: files('qct-qtimer.c'))
 
 system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files('esp32_frc_timer.c', 'esp32_timg.c'))
 system_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_lp_timer.c',
-                                                    'esp32p4_lp_wdt.c',
-                                                    'esp32p4_systimer.c',
-                                                    'esp32p4_timg.c'))
+                                                    'esp32p4_systimer.c'))
+# The watchdogs, which reach into the cores.
+specific_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_lp_wdt.c',
+                                                      'esp32p4_timg.c'))
