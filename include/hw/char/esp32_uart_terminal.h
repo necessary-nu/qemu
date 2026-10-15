@@ -22,6 +22,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(Esp32UartTerminalState, ESP32_UART_TERMINAL)
 /*
  * The terminal's lines: RX (gpio-in) watches the pad carrying the chip's
  * TXD; TX (gpio-out) drives the pad carrying the chip's RXD from outside.
+ * A board connects RX only to a terminal with a chardev
+ * (esp32_uart_terminal_attached()): one without passes nothing on, and
+ * drives nothing on TX.
  */
 #define ESP32_UART_TERMINAL_RX  "esp32-uart-terminal-rx"
 #define ESP32_UART_TERMINAL_TX  "esp32-uart-terminal-tx"
@@ -67,5 +70,12 @@ struct Esp32UartTerminalState {
     Notifier format_notifier;
     Notifier line_source;
 };
+
+/*
+ * Whether the terminal has a chardev (its "chardev" property, set before
+ * it is realized): a port QEMU was given no -serial for, or -serial none,
+ * has none.
+ */
+bool esp32_uart_terminal_attached(Esp32UartTerminalState *s);
 
 #endif

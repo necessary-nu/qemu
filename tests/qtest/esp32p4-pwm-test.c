@@ -1063,12 +1063,12 @@ static void test_ledc_unrouted(void)
  * An LEDC output on a pad nothing watches: channel 0 as in ledc/unrouted
  * (a 50 ns period, high for its first 25 ns) on pad 30, whose line
  * nothing on the board listens to and from which no block takes an input
- * (the board watches GPIO0 to GPIO15 for the PMU's wakeup, and the serial
- * ports' TXD pads for their terminals). Its edges
- * are not timed: a second of them costs the host next to nothing, and
- * GPIO_IN reads the exact level at the moment software samples it. Given
- * a rising-edge interrupt type, the pad is watched: GPIO_STATUS latches
- * the next rising edge at its nanosecond.
+ * (the board watches GPIO0 to GPIO15 for the PMU's wakeup, and the TXD
+ * pads of the serial ports given a chardev for their terminals). Its
+ * edges are not timed: a second of them costs the host next to nothing,
+ * and GPIO_IN reads the exact level at the moment software samples it.
+ * Given a rising-edge interrupt type, the pad is watched: GPIO_STATUS
+ * latches the next rising edge at its nanosecond.
  */
 /* [spec:nuos:req:emu.esp32p4.pwm/test] */
 /* [spec:nuos:req:emu.esp32p4.gpio/test] */
