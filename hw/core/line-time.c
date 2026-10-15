@@ -126,6 +126,13 @@ void line_due_order_add(LineDueOrder *o, LineDueSource *src)
     o->next = INT64_MIN;
 }
 
+void line_due_order_changed(LineDueOrder *o)
+{
+    if (o) {
+        o->next = INT64_MIN;
+    }
+}
+
 /* Arm @t for an event of a source of @o (if any) at @when. */
 void line_due_order_mod(LineDueOrder *o, QEMUTimer *t, int64_t when)
 {

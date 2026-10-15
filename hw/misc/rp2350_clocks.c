@@ -1491,6 +1491,7 @@ static void xosc_set_gated(RP2350XOSCState *x, bool gated)
 static void xosc_wake(RP2350XOSCState *x)
 {
     x->dormant = false;
+    line_due_order_changed(x->parent_obj.order);
     x->parent_obj.regs[R_XOSC_DORMANT] = XOSC_DORMANT_WAKE;
     if (!x->enabled) {
         xosc_set_gated(x, false);
@@ -1545,6 +1546,8 @@ static void xosc_enter_dormant(RP2350XOSCState *x)
     }
     timer_del(x->startup_timer);
     x->dormant = true;
+    /* The AON timer's alarm, a wake event, comes into the order. */
+    line_due_order_changed(x->parent_obj.order);
     x->parent_obj.regs[R_XOSC_DORMANT] = XOSC_DORMANT_DORMANT;
     xosc_set_gated(x, true);
     xosc_update_out(x);
@@ -1674,6 +1677,7 @@ static void xosc_reset_hold(RP2350ClkRegsState *s)
     x->freq_range = 0;
     x->badwrite = false;
     x->dormant = false;
+    line_due_order_changed(x->parent_obj.order);
     x->gated = false;
     x->stable_ns = 0;
     x->count = 0;

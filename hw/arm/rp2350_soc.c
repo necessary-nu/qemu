@@ -1152,10 +1152,19 @@ static void rp2350_soc_domain_power(void *opaque, int domain, bool on)
     memory_region_set_enabled(&s->sram_off[i], !on);
 }
 
+/* Whether the XOSC or the ROSC is DORMANT, for the AON alarm to wake. */
+static bool rp2350_soc_osc_dormant(void *opaque)
+{
+    RP2350State *s = opaque;
+
+    return s->xosc.dormant || s->rosc.dormant_stopped;
+}
+
 static const RP2350PowmanOps rp2350_soc_powman_ops = {
     .procs_asleep = rp2350_soc_procs_asleep,
     .swcore_stop = rp2350_soc_swcore_stop,
     .domain_power = rp2350_soc_domain_power,
+    .osc_dormant = rp2350_soc_osc_dormant,
 };
 
 /* [spec:nuos:req:emu.powman] */

@@ -128,6 +128,13 @@ void line_due_order_catch_up(LineDueOrder *o);
 void line_due_order_mod(LineDueOrder *o, QEMUTimer *t, int64_t when);
 
 /*
+ * A telling source whose event can fall due earlier otherwise than by a
+ * timer it arms, as one that counts only while another block is in some
+ * state, has the order (if any) ask its sources afresh.
+ */
+void line_due_order_changed(LineDueOrder *o);
+
+/*
  * Changes that reach a device while it resolves another.
  *
  * A device that resolves its lines in rounds (pin muxing, a GPIO matrix)

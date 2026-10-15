@@ -282,6 +282,7 @@ static void rosc_wake(RP2350ROSCState *s)
     int64_t now = line_time();
 
     s->dormant_stopped = false;
+    line_due_order_changed(s->order);
     s->dormant = DORMANT_WAKE;
     s->count_ns = now;
     if (!rosc_ctrl_enabled(s->ctrl)) {
@@ -362,6 +363,8 @@ static void rosc_enter_dormant(RP2350ROSCState *s)
     rosc_count_sync(s);
     timer_del(s->startup_timer);
     s->dormant_stopped = true;
+    /* The AON timer's alarm, a wake event, comes into the order. */
+    line_due_order_changed(s->order);
     s->dormant = DORMANT_DORMANT;
     rosc_set_gated(s, true);
     /* A wake event already asserted restarts the oscillator at once. */
@@ -562,6 +565,7 @@ static void rp2350_rosc_hold_reset(Object *obj, ResetType type)
     s->randombit = 1;
     timer_del(s->startup_timer);
     s->dormant_stopped = false;
+    line_due_order_changed(s->order);
     s->gated = false;
 }
 
