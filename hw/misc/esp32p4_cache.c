@@ -6,64 +6,101 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * Reference: ESP32-P4 Technical Reference Manual (v3.x silicon), 9.3.2
- * (Internal Memory: the HP L2MEM configurations), 9.3.3.2 (Cache) and
- * 9.3.3.3 (Cache Operations); ESP-IDF's cache_reg.h for v3, which gives
- * the controller's registers, access and reset values (the TRM does not
- * document them); its cache_ll.h, the esp_mm component, and the v3 ROM's
- * Cache_* routines, which show how software drives them; and ESP-IDF's
- * linker scripts for v3, which place the L2 cache at L2MEM's start.
+ * (Internal Memory: the HP L2MEM configurations), 9.3.3.2 (Cache, figure
+ * 9.3-3) and 9.3.3.3 (Cache Operations); ESP-IDF's cache_reg.h for v3,
+ * which gives the controller's registers, access and reset values (the
+ * TRM does not document them); its cache_ll.h, esp_cache_msync.c, the
+ * esp_mm component, and the v3 ROM's Cache_* routines, which show how
+ * software drives them; and ESP-IDF's linker scripts for v3, which place
+ * the L2 cache at L2MEM's start.
  *
- * The HP cores reach the external memory through two levels of cache: an
- * L1 instruction cache per core and a shared L1 data cache, then the L2
- * cache; and HP L2MEM through the L1 caches. The other masters (DMA, the
- * LP core) reach both directly. The caches are virtually tagged: the MMU
- * (in the MSPI controllers, esp32p4_mspi.c) translates only what the L2
- * cache fetches and writes back.
+ * The HP cores reach the external memory through two levels of cache, and
+ * HP L2MEM through the first (TRM figure 9.3-3): each core's instruction
+ * fetches go through its own L1 instruction cache, both cores' loads and
+ * stores through the L1 data cache they share, and those caches' fills
+ * and write-backs to the L2 cache for the external memory, or to L2MEM.
+ * The other masters (DMA, the LP core) reach both memories directly. The
+ * caches are virtually tagged: the MMU (in the MSPI controllers,
+ * esp32p4_mspi.c) translates only what the L2 cache fetches and writes
+ * back.
  *
  * How the model keeps the caches' contents: software observes a write-back
  * cache only where its contents and the memory's differ, so the model
- * keeps the contents of each line at each level, with its state, and
- * never evicts a line: a cache as large as the windows it caches. A line
- * leaves a cache only when an operation or a reset invalidates it, or is
- * written back only when an operation writes it back. Software that
- * relies on a line having been evicted, as real caches of 64 KiB (L1) and
- * up to 512 KiB (L2) eventually do, sees what it would with a cache that
- * kept it; software that relies on a line not being in the cache sees it
- * stale. Each is a defect on the hardware too. For each 64-byte line:
+ * keeps the contents of each line in each cache, with its state, and never
+ * evicts a line: a cache as large as the windows it caches. A line leaves
+ * a cache only when an operation or a reset invalidates it, or is written
+ * back only when an operation writes it back. Software that relies on a
+ * line having been evicted, as real caches of 16 KiB (L1 instruction), 64
+ * KiB (L1 data) and up to 512 KiB (L2) eventually do, sees what it would
+ * with a cache that kept it; software that relies on a line not being in
+ * the cache sees it stale. Each is a defect on the hardware too. For each
+ * 64-byte line:
  *
- *   - the L1 contents, which the cores read and write, executing from
- *     them, at the speed of RAM; the L1 contents as it last filled,
- *     cleaned or wrote the line back, its being dirty being its differing
- *     from them (so a write of the value already there leaves it clean);
- *     and whether it is valid and locked;
+ *   - in each L1 cache, its contents and whether it is valid and locked,
+ *     and in the data cache whether it is dirty. A store marks its line
+ *     dirty whatever it writes, the value the line holds too, and a
+ *     write-back writes the whole line, as on the chip: over whatever the
+ *     next level was given behind the cache meanwhile, by DMA, by a core
+ *     through an uncached address or by the LP core.
  *   - for the external memory, the L2 contents, and whether the line is
  *     valid, dirty and locked there. With the L2's 128-byte lines, the
  *     two 64-byte lines of each share that state: the L2 holds, dirties,
  *     cleans, writes back and drops the 128 bytes as one.
  *
- * A core's access to a line the L1 does not hold fills the L1, from the L2
- * where it holds the line and otherwise from the memory through the L2,
+ * The caches are coherent only as the chip's are. An L1 cache fills a line
+ * from the L2 where it holds the line, otherwise from the memory through
+ * the L2, which then holds it too, and L2MEM's lines from L2MEM; the data
+ * cache writes its dirty lines back to the L2, or to L2MEM, or with the L2
+ * bypassed to the memory; and nothing passes between the L1 caches. So an
+ * instruction cache keeps what it filled, whatever is stored there since,
+ * until it is invalidated; and it fills a line that the data cache holds
+ * dirty with the line as the L2 or L2MEM holds it, without the stores.
+ * Code stored through the data cache runs once the data cache has written
+ * it back (to the L2 is enough for the external memory) and the
+ * instruction caches holding the line before have been invalidated, as
+ * ESP-IDF's esp_cache_msync() has it: a write-back of the data cache, then
+ * an invalidation of the caches. FENCE.I acts on no cache: the TRM gives
+ * it no part in them.
+ *
+ * A core's access to a line its L1 cache does not hold fills that cache,
  * 4 KiB at a time: the 64 lines that share the line's page, which is what
  * lets every access to a filled page run at full speed. The fill takes the
  * page's other lines as an L2 autoload of the neighbouring lines would.
  * Each core's accesses go through a translation per page (an IOMMU region
- * in its address space) to the L1 contents or, while the page is not all
- * held, to the controller. An access through those translations that no
- * core makes, qtest's, goes to the bus past the caches, as every other
- * master's does; a debugger's reads the L1 where it holds the line.
+ * in its address space), its instruction fetches apart from its loads and
+ * stores: the core's TLB fill keeps their translations apart
+ * (ESP32P4_MMU_IDX_IFETCH) and marks a fetch's accesses
+ * (ESP32P4_REQUESTER_IBUS). A fetch goes to the contents of the core's
+ * instruction cache, from which QEMU translates the code, and a load or
+ * store to the data cache's, while that cache holds all of the page;
+ * otherwise each goes to the controller. The data cache's contents are a
+ * ROM device to the cores: a load reads them directly, and a store goes to
+ * the controller, which marks its line dirty. Once every line of a page is
+ * dirty its stores go directly too, until an operation cleans or drops one
+ * of its lines. So each store to a page with a clean line calls into the
+ * model where loads and fetches do not, and an atomic memory operation
+ * there, under parallel TCG, stops the other cores while it runs. A core's
+ * translations change on its own thread, before it runs its next
+ * translation block: until then the core whose register write started an
+ * operation, and on the host's clock the other cores, still reach the
+ * contents as their translations allow, and a store there to a page that
+ * was all dirty leaves its line as the operation left it.
  *
- * What the model does not keep apart: the instruction caches and the data
- * cache share the L1 contents, so a core executes what was written
- * through the data cache without a write-back; invalidating only the
- * instruction caches drops the L1's clean lines (the data cache keeps the
- * dirty ones). The HP ROM is read through the L1 cache on the chip and
- * read directly here, as no line of it can differ.
+ * An access through those translations that no core makes, qtest's, goes
+ * to the bus past the caches, as every other master's does. A debugger's
+ * read takes the data cache's copy where it holds the line, and otherwise
+ * the L2's or the memory's, filling nothing; its write goes to every copy:
+ * each L1 cache's that holds the line, the data cache's then dirty, and
+ * where the data cache does not hold the line the L2's or the memory's.
+ * The HP ROM is read through the L1 caches on the chip and read directly
+ * here, as no line of it can differ.
  *
  * Operations (CACHE_SYNC_*, CACHE_LOCK_*, *_PRELOAD_*): each completes at
  * once, as the TRM gives no timing, setting its done bit and raising its
- * done interrupt. SYNC_MAP picks the caches: L1-ICache0 and 1 (bits 0 and
- * 1; 2 and 3 are reserved), the L1-DCache (bit 4), the L2 (bit 5). A
- * SYNC_SIZE of zero operates on the whole cache, as the ROM's
+ * done interrupt. SYNC_MAP picks the caches, as ESP-IDF's CACHE_MAP_*
+ * values name them, and each acts on its own lines alone: L1-ICache0 and 1
+ * (bits 0 and 1; 2 and 3 are reserved), the L1-DCache (bit 4), the L2
+ * (bit 5). A SYNC_SIZE of zero operates on the whole cache, as the ROM's
  * Cache_*_All() use it; otherwise on every line SYNC_ADDR to SYNC_ADDR +
  * SYNC_SIZE touches, in each cache's own line size: the L1's 64 bytes,
  * the L2's 64 or 128 (L2_CACHE_BLOCKSIZE_CONF). An operation acts on whole
@@ -79,39 +116,44 @@
  * range written to the registers unaligned is taken to name the lines it
  * touches likewise. Invalidate drops the lines (and their dirty data);
  * clean leaves the lines and makes them clean; write-back writes the
- * dirty lines to the next level, the L1's to the L2 (or to the memory for
- * L2MEM, or with the L2 bypassed) and the L2's to the memory, L1 before
- * L2; write-back-invalidate does both. An L1 write-back into a line the
- * L2 does not hold allocates the line there, reading the rest of a
- * 128-byte line from the memory as a miss would. Operating on
- * an address range leaves locked lines; on the whole cache, it does not.
- * A SYNC_MAP of zero, or more than one operation at once, completes with
+ * dirty lines to the next level, the data cache's to the L2 (or to L2MEM,
+ * or with the L2 bypassed to the memory) and the L2's to the memory, L1
+ * before L2; write-back-invalidate does both. The instruction caches,
+ * whose lines are never dirty, take write-back and clean as nothing to do
+ * (the TRM gives those for the data cache and the L2 only) and
+ * write-back-invalidate as an invalidation. A data cache write-back into
+ * a line the L2 does not hold allocates the line there, reading the rest
+ * of a 128-byte line from the memory as a miss would. Operating on an
+ * address range leaves locked lines; on the whole cache, it does not. A
+ * SYNC_MAP of zero, or more than one operation at once, completes with
  * SYNC_ERR and SYNC_ERR_CODE 0 or 1. Lock and unlock (LOCK_CTRL, with
- * LOCK_MAP, LOCK_ADDR and LOCK_SIZE) mark the lines held in the range;
- * prelock sections (*_PRELOCK_*) lock the lines filled inside them.
- * Preload fills the range's lines into the cache it names. Freeze sets
- * its done bit at once, there being no access in flight; autoload's
- * settings are held, its done bit always set, as fills already take whole
- * pages.
+ * LOCK_MAP, LOCK_ADDR and LOCK_SIZE) mark the lines each cache LOCK_MAP
+ * names holds in the range; each cache's prelock sections (*_PRELOCK_*)
+ * lock the lines it fills inside them. Each preload (*_PRELOAD_*) fills
+ * the range's lines into its own cache. Freeze sets its done bit at once,
+ * there being no access in flight; autoload's settings are held, its done
+ * bit always set, as fills already take whole pages.
  *
  * Access errors: where the next level answers a fill with an error (the
  * MSPI's port closed, or an invalid MMU entry while it answers those with
  * errors), the L2 records the access in L2_CACHE_ACS_FAIL_ADDR and raises
  * its FAIL interrupt, and with L2_CACHE_ACS_FAIL_CHECK_MODE set passes the
- * error to the L1, which records it in the L1-DCache's registers and
- * raises its FAIL interrupt, and with its check mode set passes it to the
- * core, which takes an access fault. An error not passed on reads as
- * zero, fills nothing and drops the write. The FAIL_ID and FAIL_ATTR
- * fields stay zero: their encoding is not published.
+ * error to the L1 cache the access is for, which records it in its
+ * registers (the L1-ICache<n>'s for core n's instruction fetches, the
+ * L1-DCache's for loads and stores) and raises its FAIL interrupt, and
+ * with its check mode set passes it to the core, which takes an access
+ * fault. An error not passed on reads as zero, fills nothing and drops the
+ * write. The FAIL_ID and FAIL_ATTR fields stay zero: their encoding is not
+ * published.
  *
- * Bypass and shut-down: L1_BYPASS_CACHE_CONF's ICache<n> or DCache bit
- * sends core n's accesses past the L1, to the L2 or L2MEM; with the L2
- * bypassed (L2_BYPASS_CACHE_CONF), the L1 fills from and writes back to
- * the memory directly. L1_ICACHE_CTRL_SHUT_IBUS<n> and L1_DCACHE_CTRL_
- * SHUT_DBUS<n> close core n's buses: an access fails as above in the
- * L1-DCache (or ICache<n> for the instruction bus). The model cannot tell
- * a core's instruction fetches from its data accesses apart there, so
- * either bit applies to both.
+ * Bypass and shut-down: L1_BYPASS_CACHE_CONF's ICache<n> bit sends core
+ * n's instruction fetches past its instruction cache, and its DCache bit
+ * both cores' loads and stores past the data cache, to the L2 or L2MEM;
+ * with the L2 bypassed (L2_BYPASS_CACHE_CONF), the L1 caches fill from and
+ * write back to the memory directly. L1_ICACHE_CTRL_SHUT_IBUS<n> closes
+ * core n's instruction bus and L1_DCACHE_CTRL_SHUT_DBUS<n> its data bus:
+ * an access on a closed bus fails as above, in the L1-ICache<n>'s
+ * registers or the L1-DCache's.
  *
  * The L2MEM split (TRM 9.3.2): the L2 cache occupies the start of L2MEM,
  * L2_CACHE_CACHESIZE_CONF's 128 KiB (at reset), 256 KiB or 512 KiB, or none
@@ -124,7 +166,7 @@
  *
  * The registers are behind L1CACHE_CPU_CLK and RST_EN_HP_CACHE; the four
  * cache resets ("cache-reset"), and HP_SYSTEM_CACHE_RESET_CONFIG's for the
- * L1 caches ("sys-cache-reset"), empty their caches.
+ * L1 caches ("sys-cache-reset"), each empty their own cache.
  *
  * Not modelled: the access counters (*_ACS_*_CNT), which count nothing
  * (logged as unimplemented when enabled); access to the tag and data
@@ -140,6 +182,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
 #include "qemu/bitmap.h"
 #include "qemu/bitops.h"
 #include "qemu/bswap.h"
@@ -154,6 +197,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/esp32p4_cache.h"
+#include "hw/misc/esp32p4_pms.h"
 #include "migration/vmstate.h"
 
 /*
@@ -774,6 +818,46 @@ static const hwaddr esp32p4_cache_int_groups[] = {
 #define FILL            4096
 #define LINES_PER_FILL  (FILL / ESP32P4_CACHE_LINE)
 
+#define L1_I0           ESP32P4_CACHE_L1_I0
+#define L1_I1           ESP32P4_CACHE_L1_I1
+#define L1_D            ESP32P4_CACHE_L1_D
+#define NL1             ESP32P4_CACHE_NL1
+
+/* What a translation reaches, in multiples of the view's size. */
+enum {
+    TARGET_L1D,
+    TARGET_L1D_RAM,
+    TARGET_L1I0,
+    TARGET_L1I1,
+    TARGET_MISS,
+    NTARGETS,
+};
+
+/* Each L1 cache's bit in SYNC_MAP and LOCK_MAP, and in the bypass. */
+static const uint32_t l1_map[NL1] = {
+    [L1_I0] = MAP_L1_I0,
+    [L1_I1] = MAP_L1_I1,
+    [L1_D] = MAP_L1_D,
+};
+
+static const uint32_t l1_bypass[NL1] = {
+    [L1_I0] = BYPASS_L1_ICACHE0,
+    [L1_I1] = BYPASS_L1_ICACHE1,
+    [L1_D] = BYPASS_L1_DCACHE,
+};
+
+static const hwaddr l1_prelock[NL1] = {
+    [L1_I0] = A_L1_ICACHE0_PRELOCK_CONF,
+    [L1_I1] = A_L1_ICACHE1_PRELOCK_CONF,
+    [L1_D] = A_L1_DCACHE_PRELOCK_CONF,
+};
+
+static const char *const l1_name[NL1] = {
+    [L1_I0] = "l1i0",
+    [L1_I1] = "l1i1",
+    [L1_D] = "l1d",
+};
+
 static const hwaddr esp32p4_cache_view_base[ESP32P4_CACHE_NVIEWS] = {
     [ESP32P4_CACHE_VIEW_FLASH] = 0x40000000,
     [ESP32P4_CACHE_VIEW_PSRAM] = 0x48000000,
@@ -841,7 +925,7 @@ static void cache_flush_cpu_page(CPUState *cs, run_on_cpu_data data)
 
 /*
  * Make every core translate its accesses to the page at `vaddr` anew, as
- * once the L1 holds all of it they go straight to its contents.
+ * once a cache holds all of it they go straight to its contents.
  */
 static void cache_flush_tlb_page(uint32_t vaddr)
 {
@@ -859,18 +943,50 @@ static int cache_core(void)
     return current_cpu && current_cpu->cpu_index == 1 ? 1 : 0;
 }
 
-static bool cache_l1_bypassed(ESP32P4CacheState *c, int core)
+/*
+ * Whether `attrs` are those of an HP core's instruction fetch
+ * (esp32p4_hp_attrs()), and if so whose.
+ */
+static bool cache_fetch(MemTxAttrs attrs, int *core)
 {
-    return reg(c, A_L1_BYPASS_CACHE_CONF) &
-           (BYPASS_L1_DCACHE | (core ? BYPASS_L1_ICACHE1 : BYPASS_L1_ICACHE0));
+    uint16_t rid = attrs.requester_id;
+    uint16_t kind = ESP32P4_REQUESTER_VALID | ESP32P4_REQUESTER_IS_DMA |
+                    ESP32P4_REQUESTER_IBUS;
+
+    if (attrs.unspecified ||
+        (rid & kind) != (ESP32P4_REQUESTER_VALID | ESP32P4_REQUESTER_IBUS)) {
+        return false;
+    }
+    *core = ESP32P4_REQUESTER_ID(rid) == ESP32P4_MASTER_HP_CORE1;
+    return true;
 }
 
-static bool cache_bus_shut(ESP32P4CacheState *c, int core, bool *dbus)
+/*
+ * The L1 cache a core's access goes through, the core's instruction cache
+ * for a fetch and the data cache for a load or a store, and the core.
+ */
+static int cache_access_l1(MemTxAttrs attrs, bool write, int *core)
 {
-    uint32_t bit = core ? SHUT_BUS1 : SHUT_BUS0;
+    if (!write && cache_fetch(attrs, core)) {
+        return L1_I0 + *core;
+    }
+    *core = cache_core();
+    return L1_D;
+}
 
-    *dbus = reg(c, A_L1_DCACHE_CTRL) & bit;
-    return *dbus || (reg(c, A_L1_ICACHE_CTRL) & bit);
+static bool cache_l1_bypassed(ESP32P4CacheState *c, int l1)
+{
+    return reg(c, A_L1_BYPASS_CACHE_CONF) & l1_bypass[l1];
+}
+
+/*
+ * Whether core `core`'s bus to L1 cache `l1` is shut: its instruction bus
+ * to its instruction cache, or its data bus to the data cache.
+ */
+static bool cache_bus_shut(ESP32P4CacheState *c, int l1, int core)
+{
+    return reg(c, l1 == L1_D ? A_L1_DCACHE_CTRL : A_L1_ICACHE_CTRL) &
+           (core ? SHUT_BUS1 : SHUT_BUS0);
 }
 
 static bool cache_l2_bypassed(ESP32P4CacheState *c)
@@ -915,36 +1031,90 @@ static bool view_occupied(ESP32P4CacheView *v, uint32_t off)
            off < v->cache->l2_cache_size;
 }
 
-static uint8_t *view_l1(ESP32P4CacheView *v)
+static uint8_t *view_l1(ESP32P4CacheView *v, int l1)
 {
-    return memory_region_get_ram_ptr(&v->l1);
-}
-
-static uint8_t *view_clean(ESP32P4CacheView *v)
-{
-    return memory_region_get_ram_ptr(&v->l1_clean);
+    return v->l1_host[l1];
 }
 
 static uint8_t *view_l2(ESP32P4CacheView *v)
 {
-    return memory_region_get_ram_ptr(&v->l2);
+    return v->l2_host;
 }
 
-/* Whether the cores' accesses to the page at `off` may go straight to L1. */
-static bool view_page_fast(ESP32P4CacheView *v, uint32_t off, int core)
+static uint32_t view_vaddr(ESP32P4CacheView *v, uint32_t off)
+{
+    return esp32p4_cache_view_base[v->kind] + off;
+}
+
+/* Whether L1 cache `l1` holds every line of the page from line `first`. */
+static bool l1_holds_page(ESP32P4CacheView *v, int l1, uint32_t first)
+{
+    return find_next_zero_bit(v->l1c[l1].valid, first + LINES_PER_FILL,
+                              first) >= first + LINES_PER_FILL;
+}
+
+/* Whether every line of the page from line `first` is dirty there. */
+static bool l1d_page_dirty(ESP32P4CacheView *v, uint32_t first)
+{
+    return find_next_zero_bit(v->l1d_dirty, first + LINES_PER_FILL,
+                              first) >= first + LINES_PER_FILL;
+}
+
+/*
+ * What core `core`'s instruction fetches from the page at `off` reach: the
+ * contents of its instruction cache while the fetches go through it and it
+ * holds the whole page, and otherwise the controller.
+ */
+static int view_fetch_target(ESP32P4CacheView *v, uint32_t off, int core)
+{
+    ESP32P4CacheState *c = v->cache;
+    int l1 = L1_I0 + core;
+
+    if (cache_l1_bypassed(c, l1) || cache_bus_shut(c, l1, core) ||
+        view_occupied(v, off) ||
+        !l1_holds_page(v, l1, off / ESP32P4_CACHE_LINE)) {
+        return TARGET_MISS;
+    }
+    /* The lines' contents after their valid bits: l1_fill_line(). */
+    smp_rmb();
+    return TARGET_L1I0 + core;
+}
+
+/*
+ * What core `core`'s loads and stores to the page at `off` reach: while
+ * they go through the data cache and it holds the whole page, its
+ * contents, a store going to the controller, which marks its line dirty,
+ * unless every line of the page is dirty already; and otherwise the
+ * controller. A page whose stores go directly is recorded in l1d_direct
+ * before its lines are looked at, and an operation that cleans or drops a
+ * dirty line looks at the record after it has (l1d_undirect()), so that
+ * one of the two sees what the other did, the cores on other threads.
+ */
+static int view_data_target(ESP32P4CacheView *v, uint32_t off, int core)
 {
     ESP32P4CacheState *c = v->cache;
     uint32_t first = off / ESP32P4_CACHE_LINE;
-    bool dbus;
 
-    if (cache_l1_bypassed(c, core) ||
-        cache_bus_shut(c, core, &dbus) || view_occupied(v, off)) {
-        return false;
+    if (cache_l1_bypassed(c, L1_D) || cache_bus_shut(c, L1_D, core) ||
+        view_occupied(v, off) || !l1_holds_page(v, L1_D, first)) {
+        return TARGET_MISS;
     }
-    return find_next_zero_bit(v->l1_valid, first + LINES_PER_FILL, first) >=
-           first + LINES_PER_FILL;
+    /* The lines' contents after their valid bits: l1_fill_line(). */
+    smp_rmb();
+    if (!l1d_page_dirty(v, first)) {
+        return TARGET_L1D;
+    }
+    set_bit_atomic(off / FILL, v->l1d_direct);
+    /* The record before the dirty bits: pairs with l1d_undirect()'s. */
+    smp_mb();
+    return l1d_page_dirty(v, first) ? TARGET_L1D_RAM : TARGET_L1D;
 }
 
+/*
+ * The translation of a core's access: an instruction fetch by its own
+ * IOMMU index (cache_view_attrs_to_index()), a load or store by the core's
+ * thread.
+ */
 /* [spec:nuos:req:emu.esp32p4.memory] */
 static IOMMUTLBEntry cache_view_translate(IOMMUMemoryRegion *iommu,
                                           hwaddr addr,
@@ -953,15 +1123,19 @@ static IOMMUTLBEntry cache_view_translate(IOMMUMemoryRegion *iommu,
 {
     ESP32P4CacheView *v = container_of(iommu, ESP32P4CacheView, iommu);
     hwaddr page = addr & ~(hwaddr)(FILL - 1);
-    bool fast = current_cpu && view_page_fast(v, page, cache_core());
+    int target = TARGET_MISS;
     IOMMUTLBEntry ret = {
         .target_as = &v->target_as,
         .iova = page,
-        .translated_addr = fast ? page : v->size + page,
         .addr_mask = FILL - 1,
         .perm = IOMMU_RW,
     };
 
+    if (current_cpu) {
+        target = iommu_idx ? view_fetch_target(v, page, iommu_idx - 1)
+                           : view_data_target(v, page, cache_core());
+    }
+    ret.translated_addr = target * v->size + page;
     return ret;
 }
 
@@ -1054,38 +1228,60 @@ static const MemoryRegionOps cache_l2mem_overlay_ops = {
 
 /* Lines */
 
-static bool line_dirty(ESP32P4CacheView *v, uint32_t line)
+/*
+ * Note a write of the model's to L1 cache `l1`'s contents for those that
+ * track writes to memory, a migration and a display: the data cache's
+ * contents are migrated as its RAM region. QEMU's own tracking of the code
+ * it translated has no part here: no code is translated from the data
+ * cache's contents, and an instruction cache's line has none translated
+ * from it while it is invalid, which is when the model fills it
+ * (l1_untranslate()).
+ */
+static void l1_written(ESP32P4CacheView *v, int l1, uint32_t off,
+                       unsigned len)
 {
-    uint32_t off = line * ESP32P4_CACHE_LINE;
+    MemoryRegion *mr = l1 == L1_D ? &v->l1d_ram : &v->l1[l1];
 
-    return memcmp(view_l1(v) + off, view_clean(v) + off,
-                  ESP32P4_CACHE_LINE) != 0;
+    if (memory_region_get_dirty_log_mask(mr) & ~(1 << DIRTY_MEMORY_CODE)) {
+        memory_region_set_dirty(mr, off, len);
+    }
 }
 
 /*
- * Put `data` into L1 line `line`, as filled: valid and clean. A fill can
- * be made while a core translates the instruction it fetches, so it may
- * not invalidate translations itself: the line's were invalidated when
- * the line left the L1 (l1_untranslate()), and none are made from a page
- * the L1 does not hold all of.
+ * Put `data` into line `line` of L1 cache `l1`, as filled: valid, and in
+ * the data cache clean. A fill can be made while a core translates the
+ * instruction it fetches, so it may not invalidate translations itself:
+ * an instruction cache line's were invalidated when the line left the
+ * cache (l1_untranslate()), and none are made from a page the cache does
+ * not hold all of. The contents are in place before the line is valid,
+ * for the cores on other threads, which translate a page to them once
+ * every line of it is (view_fetch_target(), view_data_target()).
  */
-static void l1_fill_line(ESP32P4CacheView *v, uint32_t line,
+static void l1_fill_line(ESP32P4CacheView *v, int l1, uint32_t line,
                          const uint8_t *data)
 {
     uint32_t off = line * ESP32P4_CACHE_LINE;
 
-    memcpy(view_l1(v) + off, data, ESP32P4_CACHE_LINE);
-    memory_region_set_dirty(&v->l1, off, ESP32P4_CACHE_LINE);
-    memcpy(view_clean(v) + off, data, ESP32P4_CACHE_LINE);
-    set_bit(line, v->l1_valid);
+    memcpy(view_l1(v, l1) + off, data, ESP32P4_CACHE_LINE);
+    l1_written(v, l1, off, ESP32P4_CACHE_LINE);
+    /* The contents before the valid bit: view_*_target() read them so. */
+    smp_wmb();
+    set_bit(line, v->l1c[l1].valid);
+    if (l1 == L1_D) {
+        clear_bit(line, v->l1d_dirty);
+    }
 }
 
-/* Drop what the cores translated from L1 lines [first, end). */
-static void l1_untranslate(ESP32P4CacheView *v, uint32_t first, uint32_t end)
+/*
+ * Drop what the cores translated from lines [first, end) of L1 cache `l1`:
+ * QEMU translates code from the instruction caches' contents alone.
+ */
+static void l1_untranslate(ESP32P4CacheView *v, int l1, uint32_t first,
+                           uint32_t end)
 {
-    ram_addr_t ra = memory_region_get_ram_addr(&v->l1);
+    ram_addr_t ra = memory_region_get_ram_addr(&v->l1[l1]);
 
-    if (tcg_enabled() && first < end) {
+    if (tcg_enabled() && l1 != L1_D && first < end) {
         tb_invalidate_phys_range(NULL, ra + first * ESP32P4_CACHE_LINE,
                                  ra + end * ESP32P4_CACHE_LINE - 1);
     }
@@ -1111,16 +1307,62 @@ static bool cache_prelocked(ESP32P4CacheState *c, hwaddr conf, bool l2,
     return false;
 }
 
-static bool l1_prelocked(ESP32P4CacheState *c, uint32_t vaddr)
+/*
+ * Make the cores translate the page holding data cache line `line` anew if
+ * one of them may store to it directly, as a line of it is no longer
+ * dirty: see view_data_target().
+ */
+static void l1d_undirect(ESP32P4CacheView *v, uint32_t line)
 {
-    return cache_prelocked(c, A_L1_DCACHE_PRELOCK_CONF, false, vaddr) ||
-           cache_prelocked(c, A_L1_ICACHE0_PRELOCK_CONF, false, vaddr) ||
-           cache_prelocked(c, A_L1_ICACHE1_PRELOCK_CONF, false, vaddr);
+    uint32_t page = line / LINES_PER_FILL;
+
+    /* The dirty bit before the record: pairs with view_data_target()'s. */
+    smp_mb();
+    if (test_bit(page, v->l1d_direct)) {
+        clear_bit_atomic(page, v->l1d_direct);
+        cache_flush_tlb_page(view_vaddr(v, page * FILL));
+    }
 }
 
-static uint32_t view_vaddr(ESP32P4CacheView *v, uint32_t off)
+static void l1d_clean_line(ESP32P4CacheView *v, uint32_t line)
 {
-    return esp32p4_cache_view_base[v->kind] + off;
+    if (test_bit(line, v->l1d_dirty)) {
+        clear_bit(line, v->l1d_dirty);
+        l1d_undirect(v, line);
+    }
+}
+
+/* Drop line `line` from L1 cache `l1`, and its dirty data with it. */
+static void l1_drop_line(ESP32P4CacheView *v, int l1, uint32_t line)
+{
+    clear_bit(line, v->l1c[l1].valid);
+    clear_bit(line, v->l1c[l1].lock);
+    if (l1 == L1_D) {
+        l1d_clean_line(v, line);
+    }
+}
+
+/*
+ * A core's store into the data cache, which holds the line (stores are
+ * aligned, so within a line): the line is dirty, whatever the store wrote.
+ * Once every line of the page is, the cores translate the page anew, to
+ * store to it directly.
+ */
+/* [spec:nuos:req:emu.esp32p4.memory] */
+static void l1d_store(ESP32P4CacheView *v, uint32_t off, const uint8_t *buf,
+                      unsigned size)
+{
+    uint32_t line = off / ESP32P4_CACHE_LINE;
+    uint32_t first = QEMU_ALIGN_DOWN(line, LINES_PER_FILL);
+
+    memcpy(view_l1(v, L1_D) + off, buf, size);
+    l1_written(v, L1_D, off, size);
+    if (!test_bit(line, v->l1d_dirty)) {
+        set_bit(line, v->l1d_dirty);
+        if (l1d_page_dirty(v, first)) {
+            cache_flush_tlb_page(view_vaddr(v, first * ESP32P4_CACHE_LINE));
+        }
+    }
 }
 
 /*
@@ -1174,9 +1416,9 @@ static bool l2_prelocked(ESP32P4CacheView *v, uint32_t line)
 }
 
 /*
- * Fill the L2 lines of the fill block at `off` that it does not hold and
- * that `need` marks, from the memory, into `buf` (the block's contents);
- * with the L2 bypassed, only read them. Returns the memory's answer.
+ * Read the fill block at `off` into `buf`, the L2's copy of each line it
+ * holds and the memory's of the others, and fill those into the L2 when
+ * `l2_alloc` says. Returns the memory's answer.
  */
 static MemTxResult l2_fill_block(ESP32P4CacheView *v, uint32_t off,
                                  uint8_t *buf, bool l2_alloc)
@@ -1211,22 +1453,20 @@ static MemTxResult l2_fill_block(ESP32P4CacheView *v, uint32_t off,
 }
 
 /*
- * Fill the L1 lines of the fill block holding `off` that it does not
- * hold. Returns the next level's answer; on an error nothing is filled.
+ * Fill the lines of the fill block at `start` that L1 cache `l1` does not
+ * hold, from the L2 or the memory through it, or from L2MEM: never from
+ * another L1 cache. Returns the next level's answer; on an error nothing
+ * is filled.
  */
 /* [spec:nuos:req:emu.esp32p4.memory] */
-static MemTxResult l1_fill_block(ESP32P4CacheView *v, uint32_t off)
+static MemTxResult l1_fill_missing(ESP32P4CacheView *v, int l1,
+                                   uint32_t start)
 {
     ESP32P4CacheState *c = v->cache;
-    uint32_t start = QEMU_ALIGN_DOWN(off, FILL);
     uint32_t first = start / ESP32P4_CACHE_LINE;
     uint8_t buf[FILL];
     uint32_t i;
 
-    if (find_next_zero_bit(v->l1_valid, first + LINES_PER_FILL, first) >=
-        first + LINES_PER_FILL) {
-        return MEMTX_OK;
-    }
     if (view_ext(v)) {
         bool all_l2 = find_next_zero_bit(v->l2_valid, first + LINES_PER_FILL,
                                          first) >= first + LINES_PER_FILL;
@@ -1242,22 +1482,33 @@ static MemTxResult l1_fill_block(ESP32P4CacheView *v, uint32_t off)
             }
         }
     } else {
-        memcpy(buf, (uint8_t *)memory_region_get_ram_ptr(c->l2mem_mr) +
-               start, FILL);
+        memcpy(buf, c->l2mem_host + start, FILL);
     }
     for (i = 0; i < LINES_PER_FILL; i++) {
         uint32_t line = first + i;
 
-        if (test_bit(line, v->l1_valid)) {
+        if (test_bit(line, v->l1c[l1].valid)) {
             continue;
         }
-        l1_fill_line(v, line, buf + i * ESP32P4_CACHE_LINE);
-        if (l1_prelocked(c, view_vaddr(v, line * ESP32P4_CACHE_LINE))) {
-            set_bit(line, v->l1_lock);
+        l1_fill_line(v, l1, line, buf + i * ESP32P4_CACHE_LINE);
+        if (cache_prelocked(c, l1_prelock[l1], false,
+                            view_vaddr(v, line * ESP32P4_CACHE_LINE))) {
+            set_bit(line, v->l1c[l1].lock);
         }
     }
     cache_flush_tlb_page(view_vaddr(v, start));
     return MEMTX_OK;
+}
+
+/* Fill the fill block holding `off` into L1 cache `l1`, as it needs. */
+static MemTxResult l1_fill_block(ESP32P4CacheView *v, int l1, uint32_t off)
+{
+    uint32_t start = QEMU_ALIGN_DOWN(off, FILL);
+
+    if (l1_holds_page(v, l1, start / ESP32P4_CACHE_LINE)) {
+        return MEMTX_OK;
+    }
+    return l1_fill_missing(v, l1, start);
 }
 
 /*
@@ -1269,8 +1520,7 @@ static void l2mem_store(ESP32P4CacheState *c, uint32_t off,
 {
     ram_addr_t ra = memory_region_get_ram_addr(c->l2mem_mr);
 
-    memcpy((uint8_t *)memory_region_get_ram_ptr(c->l2mem_mr) + off, data,
-           len);
+    memcpy(c->l2mem_host + off, data, len);
     memory_region_set_dirty(c->l2mem_mr, off, len);
     if (tcg_enabled()) {
         tb_invalidate_phys_range(NULL, ra + off, ra + off + len - 1);
@@ -1288,10 +1538,10 @@ static void l2_mark_dirty(ESP32P4CacheView *v, uint32_t line)
 }
 
 /*
- * Allocate the L2 line holding unit `line` for an L1 write-back into it,
- * which brings the line's other units from the memory where the L2 does
- * not hold them (only a 128-byte line has another), filled as a miss
- * fills them. Returns the memory's answer; on an error nothing is
+ * Allocate the L2 line holding unit `line` for a data cache write-back
+ * into it, which brings the line's other units from the memory where the
+ * L2 does not hold them (only a 128-byte line has another), filled as a
+ * miss fills them. Returns the memory's answer; on an error nothing is
  * allocated.
  */
 /* [spec:nuos:req:emu.esp32p4.memory] */
@@ -1344,14 +1594,19 @@ static MemTxResult l2_writeback_line(ESP32P4CacheView *v, uint32_t line)
     return r;
 }
 
-/* Write L1 line `line` back to the next level if it is dirty. */
+/*
+ * Write data cache line `line` back to the next level if it is dirty: the
+ * whole line, whatever its stores wrote.
+ */
+/* [spec:nuos:req:emu.esp32p4.memory] */
 static void l1_writeback_line(ESP32P4CacheView *v, uint32_t line)
 {
     ESP32P4CacheState *c = v->cache;
     uint32_t off = line * ESP32P4_CACHE_LINE;
-    uint8_t *data = view_l1(v) + off;
+    uint8_t *data = view_l1(v, L1_D) + off;
 
-    if (!test_bit(line, v->l1_valid) || !line_dirty(v, line)) {
+    if (!test_bit(line, v->l1c[L1_D].valid) ||
+        !test_bit(line, v->l1d_dirty)) {
         return;
     }
     if (!view_ext(v)) {
@@ -1371,15 +1626,14 @@ static void l1_writeback_line(ESP32P4CacheView *v, uint32_t line)
         memcpy(view_l2(v) + off, data, ESP32P4_CACHE_LINE);
         l2_mark_dirty(v, line);
     }
-    memcpy(view_clean(v) + off, data, ESP32P4_CACHE_LINE);
+    l1d_clean_line(v, line);
 }
 
-/* The cores' accesses that do not go straight to the L1 */
+/* The cores' accesses that do not go straight to an L1 cache's contents */
 
 /*
- * An access past the L1 (L1 bypassed for the core, or a debugger's): to
- * the L2's copy, or the memory. A debugger's access allocates nothing,
- * and reads from the L1 where it holds the line.
+ * An access past the L1 caches (the L1 cache bypassed, or a debugger's):
+ * to the L2's copy, or the memory. A debugger's access allocates nothing.
  */
 static MemTxResult cache_past_l1(ESP32P4CacheView *v, uint32_t off,
                                  uint8_t *buf, unsigned size, bool write,
@@ -1387,25 +1641,15 @@ static MemTxResult cache_past_l1(ESP32P4CacheView *v, uint32_t off,
 {
     ESP32P4CacheState *c = v->cache;
     uint32_t line = off / ESP32P4_CACHE_LINE;
-    uint8_t *l2mem = memory_region_get_ram_ptr(c->l2mem_mr);
     uint8_t block[FILL];
     uint32_t start = QEMU_ALIGN_DOWN(off, FILL);
     MemTxResult r;
 
-    if (debug && test_bit(line, v->l1_valid)) {
-        if (write) {
-            address_space_write(&v->target_as, off, MEMTXATTRS_UNSPECIFIED,
-                                buf, size);
-        } else {
-            memcpy(buf, view_l1(v) + off, size);
-        }
-        return MEMTX_OK;
-    }
     if (!view_ext(v)) {
         if (write) {
             l2mem_store(c, off, buf, size);
         } else {
-            memcpy(buf, l2mem + off, size);
+            memcpy(buf, c->l2mem_host + off, size);
         }
         return MEMTX_OK;
     }
@@ -1429,14 +1673,70 @@ static MemTxResult cache_past_l1(ESP32P4CacheView *v, uint32_t off,
     return MEMTX_OK;
 }
 
+/*
+ * A debugger's access: a read takes the data cache's copy where it holds
+ * the line, and otherwise the L2's or the memory's; a write goes to each
+ * L1 cache's copy, the data cache's then dirty, and where the data cache
+ * does not hold the line to the L2's or the memory's.
+ */
+static MemTxResult cache_debug_access(ESP32P4CacheView *v, uint32_t off,
+                                      uint8_t *buf, unsigned size,
+                                      bool write)
+{
+    MemTxResult r = MEMTX_OK;
+
+    while (size) {
+        uint32_t line = off / ESP32P4_CACHE_LINE;
+        unsigned n = MIN(size, ESP32P4_CACHE_LINE - off % ESP32P4_CACHE_LINE);
+        bool in_d = test_bit(line, v->l1c[L1_D].valid);
+        int l1;
+
+        if (!write) {
+            if (in_d) {
+                memcpy(buf, view_l1(v, L1_D) + off, n);
+            } else {
+                r |= cache_past_l1(v, off, buf, n, false, true);
+            }
+        } else {
+            for (l1 = 0; l1 < NL1; l1++) {
+                if (test_bit(line, v->l1c[l1].valid)) {
+                    ram_addr_t ra = memory_region_get_ram_addr(&v->l1[l1]);
+
+                    memcpy(view_l1(v, l1) + off, buf, n);
+                    l1_written(v, l1, off, n);
+                    if (tcg_enabled() && l1 != L1_D) {
+                        tb_invalidate_phys_range(NULL, ra + off,
+                                                 ra + off + n - 1);
+                    }
+                }
+            }
+            if (in_d) {
+                set_bit(line, v->l1d_dirty);
+            } else {
+                r |= cache_past_l1(v, off, buf, n, true, true);
+            }
+        }
+        off += n;
+        buf += n;
+        size -= n;
+    }
+    return r;
+}
+
+/*
+ * An access through a core's translations, by that core: through its
+ * instruction cache for a fetch, the data cache for a load or store. The
+ * memory system makes each access within a naturally aligned unit of its
+ * size, so within a line.
+ */
 /* [spec:nuos:req:emu.esp32p4.memory] */
 static MemTxResult cache_view_access(ESP32P4CacheView *v, uint32_t off,
                                      uint64_t *data, unsigned size,
                                      bool write, MemTxAttrs attrs)
 {
     ESP32P4CacheState *c = v->cache;
-    int core = cache_core();
     uint8_t buf[8];
+    int core, l1;
     bool dbus;
     MemTxResult r;
 
@@ -1457,53 +1757,66 @@ static MemTxResult cache_view_access(ESP32P4CacheView *v, uint32_t off,
     if (write) {
         stn_le_p(buf, size, *data);
     }
-    if (attrs.debug || cache_l1_bypassed(c, core)) {
-        r = cache_past_l1(v, off, buf, size, write, attrs.debug);
-        if (r != MEMTX_OK && !attrs.debug) {
-            r = cache_access_fail(c, view_vaddr(v, off), true, core, true);
-        }
+    if (attrs.debug) {
+        r = cache_debug_access(v, off, buf, size, write);
         if (!write) {
             *data = r == MEMTX_OK ? ldn_le_p(buf, size) : 0;
         }
         return r;
     }
-    if (cache_bus_shut(c, core, &dbus)) {
+    l1 = cache_access_l1(attrs, write, &core);
+    dbus = l1 == L1_D;
+    if (cache_l1_bypassed(c, l1)) {
+        r = cache_past_l1(v, off, buf, size, write, false);
+        if (r != MEMTX_OK) {
+            memset(buf, 0, sizeof(buf));
+            r = cache_access_fail(c, view_vaddr(v, off), true, core, dbus);
+        }
+        if (!write) {
+            *data = ldn_le_p(buf, size);
+        }
+        return r;
+    }
+    if (cache_bus_shut(c, l1, core)) {
         if (!write) {
             *data = 0;
         }
         return cache_access_fail(c, view_vaddr(v, off), false, core, dbus);
     }
-    r = l1_fill_block(v, off);
+    r = l1_fill_block(v, l1, off);
     if (r != MEMTX_OK) {
         if (!write) {
             *data = 0;
         }
-        return cache_access_fail(c, view_vaddr(v, off), true, core, true);
+        return cache_access_fail(c, view_vaddr(v, off), true, core, dbus);
     }
     if (write) {
-        address_space_write(&v->target_as, off, MEMTXATTRS_UNSPECIFIED, buf,
-                            size);
+        l1d_store(v, off, buf, size);
     } else {
-        *data = ldn_le_p(view_l1(v) + off, size);
+        *data = ldn_le_p(view_l1(v, l1) + off, size);
     }
     return MEMTX_OK;
 }
 
-static MemTxResult cache_miss_read(void *opaque, hwaddr addr, uint64_t *data,
+static MemTxResult cache_view_read(void *opaque, hwaddr addr, uint64_t *data,
                                    unsigned size, MemTxAttrs attrs)
 {
     return cache_view_access(opaque, addr, data, size, false, attrs);
 }
 
-static MemTxResult cache_miss_write(void *opaque, hwaddr addr, uint64_t data,
+static MemTxResult cache_view_write(void *opaque, hwaddr addr, uint64_t data,
                                     unsigned size, MemTxAttrs attrs)
 {
     return cache_view_access(opaque, addr, &data, size, true, attrs);
 }
 
-static const MemoryRegionOps cache_miss_ops = {
-    .read_with_attrs = cache_miss_read,
-    .write_with_attrs = cache_miss_write,
+/*
+ * The controller's side of a view: the accesses no cache's contents serve,
+ * and the stores to the data cache's contents.
+ */
+static const MemoryRegionOps cache_view_ops = {
+    .read_with_attrs = cache_view_read,
+    .write_with_attrs = cache_view_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 8,
@@ -1548,6 +1861,10 @@ static bool view_lines(ESP32P4CacheView *v, uint32_t vaddr, uint32_t size,
     return true;
 }
 
+/*
+ * Operation `op` on the lines of view `v` of each cache `map` names, each
+ * acting on its own lines. Returns whether an L1 cache dropped a line.
+ */
 /* [spec:nuos:req:emu.esp32p4.memory] */
 static bool cache_sync_view(ESP32P4CacheView *v, int op, uint32_t map,
                             uint32_t vaddr, uint32_t size)
@@ -1556,37 +1873,37 @@ static bool cache_sync_view(ESP32P4CacheView *v, int op, uint32_t map,
     bool all = size == 0;
     bool inval = op == OP_INVALIDATE || op == OP_WB_INVALIDATE;
     bool wb = op == OP_WRITEBACK || op == OP_WB_INVALIDATE;
-    uint32_t dropped_lo = UINT32_MAX, dropped_hi = 0;
+    bool dropped = false;
     uint32_t first, end, line;
+    int l1;
 
-    if ((map & (MAP_L1_D | MAP_L1_I)) &&
-        view_lines(v, vaddr, size, ESP32P4_CACHE_LINE, &first, &end)) {
-        for (line = find_next_bit(v->l1_valid, end, first); line < end;
-             line = find_next_bit(v->l1_valid, end, line + 1)) {
-            bool locked = !all && test_bit(line, v->l1_lock);
-            uint32_t off = line * ESP32P4_CACHE_LINE;
+    for (l1 = 0; l1 < NL1; l1++) {
+        unsigned long *valid = v->l1c[l1].valid;
+        uint32_t dropped_lo = UINT32_MAX, dropped_hi = 0;
 
-            if (map & MAP_L1_D) {
+        if (!(map & l1_map[l1]) ||
+            !view_lines(v, vaddr, size, ESP32P4_CACHE_LINE, &first, &end)) {
+            continue;
+        }
+        for (line = find_next_bit(valid, end, first); line < end;
+             line = find_next_bit(valid, end, line + 1)) {
+            bool locked = !all && test_bit(line, v->l1c[l1].lock);
+
+            if (l1 == L1_D) {
                 if (wb) {
                     l1_writeback_line(v, line);
                 } else if (op == OP_CLEAN) {
-                    memcpy(view_clean(v) + off, view_l1(v) + off,
-                           ESP32P4_CACHE_LINE);
+                    l1d_clean_line(v, line);
                 }
-                if (inval && !locked) {
-                    clear_bit(line, v->l1_valid);
-                    clear_bit(line, v->l1_lock);
-                    dropped_lo = MIN(dropped_lo, line);
-                    dropped_hi = line + 1;
-                }
-            } else if (inval && !locked && !line_dirty(v, line)) {
-                clear_bit(line, v->l1_valid);
-                clear_bit(line, v->l1_lock);
+            }
+            if (inval && !locked) {
+                l1_drop_line(v, l1, line);
                 dropped_lo = MIN(dropped_lo, line);
                 dropped_hi = line + 1;
             }
         }
-        l1_untranslate(v, dropped_lo, dropped_hi);
+        l1_untranslate(v, l1, dropped_lo, dropped_hi);
+        dropped |= dropped_lo < dropped_hi;
     }
     if ((map & MAP_L2) && view_ext(v) &&
         view_lines(v, vaddr, size, cache_l2_line(c), &first, &end)) {
@@ -1606,7 +1923,7 @@ static bool cache_sync_view(ESP32P4CacheView *v, int op, uint32_t map,
             }
         }
     }
-    return dropped_lo < dropped_hi;
+    return dropped;
 }
 
 /* [spec:nuos:req:emu.esp32p4.memory] */
@@ -1643,18 +1960,24 @@ static void cache_lock(ESP32P4CacheState *c, bool lock)
     uint32_t vaddr = reg(c, A_LOCK_ADDR);
     uint32_t size = extract32(reg(c, A_LOCK_SIZE), 0, 16);
     uint32_t first, end, line;
-    int i;
+    int i, l1;
 
     for (i = 0; size && i < ESP32P4_CACHE_NVIEWS; i++) {
         ESP32P4CacheView *v = &c->view[i];
 
-        if ((map & (MAP_L1_I | MAP_L1_D)) &&
-            view_lines(v, vaddr, size, ESP32P4_CACHE_LINE, &first, &end)) {
+        for (l1 = 0; l1 < NL1; l1++) {
+            ESP32P4CacheL1 *l = &v->l1c[l1];
+
+            if (!(map & l1_map[l1]) ||
+                !view_lines(v, vaddr, size, ESP32P4_CACHE_LINE, &first,
+                            &end)) {
+                continue;
+            }
             for (line = first; line < end; line++) {
                 if (!lock) {
-                    clear_bit(line, v->l1_lock);
-                } else if (test_bit(line, v->l1_valid)) {
-                    set_bit(line, v->l1_lock);
+                    clear_bit(line, l->lock);
+                } else if (test_bit(line, l->valid)) {
+                    set_bit(line, l->lock);
                 }
             }
         }
@@ -1674,12 +1997,13 @@ static void cache_lock(ESP32P4CacheState *c, bool lock)
 
 /*
  * A manual preload of the cache whose PRELOAD_CTRL is at `ctrl`: its range
- * filled into the L1, or into the L2.
+ * filled into L1 cache `l1`, or with `l1` negative into the L2.
  */
 /* [spec:nuos:req:emu.esp32p4.memory] */
-static void cache_preload(ESP32P4CacheState *c, hwaddr ctrl, bool l2,
+static void cache_preload(ESP32P4CacheState *c, hwaddr ctrl, int l1,
                           hwaddr int_group, uint32_t done_int)
 {
+    bool l2 = l1 < 0;
     uint32_t vaddr = reg(c, ctrl + 4);
     uint32_t size = extract32(reg(c, ctrl + 8), 0, l2 ? 16 : 14);
     uint8_t block[FILL];
@@ -1707,9 +2031,11 @@ static void cache_preload(ESP32P4CacheState *c, hwaddr ctrl, bool l2,
             if (view_occupied(v, off)) {
                 continue;
             }
-            r = l2 ? l2_fill_block(v, off, block, true) : l1_fill_block(v, off);
+            r = l2 ? l2_fill_block(v, off, block, true)
+                   : l1_fill_block(v, l1, off);
             if (r != MEMTX_OK) {
-                cache_access_fail(c, view_vaddr(v, off), true, 0, true);
+                cache_access_fail(c, view_vaddr(v, off), true, l1 == L1_I1,
+                                  l1 != L1_I0 && l1 != L1_I1);
             }
         }
     }
@@ -1859,18 +2185,23 @@ static void cache_write(void *opaque, hwaddr addr, uint64_t val,
         }
         break;
     case A_L1_ICACHE0_PRELOAD_CTRL:
+        if (*p & PRELOAD_ENA) {
+            cache_preload(c, a, L1_I0, A_SYNC_L1_INT_ENA, INT_L1_I0_PLD_DONE);
+        }
+        break;
     case A_L1_ICACHE1_PRELOAD_CTRL:
+        if (*p & PRELOAD_ENA) {
+            cache_preload(c, a, L1_I1, A_SYNC_L1_INT_ENA, INT_L1_I1_PLD_DONE);
+        }
+        break;
     case A_L1_DCACHE_PRELOAD_CTRL:
         if (*p & PRELOAD_ENA) {
-            cache_preload(c, a, false, A_SYNC_L1_INT_ENA,
-                          a == A_L1_DCACHE_PRELOAD_CTRL ? INT_L1_D_PLD_DONE :
-                          a == A_L1_ICACHE1_PRELOAD_CTRL ? INT_L1_I1_PLD_DONE
-                                                         : INT_L1_I0_PLD_DONE);
+            cache_preload(c, a, L1_D, A_SYNC_L1_INT_ENA, INT_L1_D_PLD_DONE);
         }
         break;
     case A_L2_PRELOAD_CTRL:
         if (*p & PRELOAD_ENA) {
-            cache_preload(c, a, true, A_L2_SYNC_INT_ENA, INT_L2_PLD_DONE);
+            cache_preload(c, a, -1, A_L2_SYNC_INT_ENA, INT_L2_PLD_DONE);
         }
         break;
     case A_L1_FREEZE_CTRL:
@@ -1960,7 +2291,7 @@ static void cache_set_l2mem_err_resp(void *opaque, int n, int level)
 static void cache_reset_hold(Object *obj, ResetType type)
 {
     ESP32P4CacheState *c = ESP32P4_CACHE(obj);
-    int i;
+    int i, l1;
 
     for (i = 0; i < ESP32P4_CACHE_NREGS; i++) {
         c->regs[i] = esp32p4_cache_regs[i].reset;
@@ -1968,12 +2299,16 @@ static void cache_reset_hold(Object *obj, ResetType type)
     for (i = 0; i < ESP32P4_CACHE_NVIEWS; i++) {
         ESP32P4CacheView *v = &c->view[i];
 
-        l1_untranslate(v, 0, v->nlines);
-        bitmap_zero(v->l1_valid, v->nlines);
-        bitmap_zero(v->l1_lock, v->nlines);
+        for (l1 = 0; l1 < NL1; l1++) {
+            l1_untranslate(v, l1, 0, v->nlines);
+            bitmap_zero(v->l1c[l1].valid, v->nlines);
+            bitmap_zero(v->l1c[l1].lock, v->nlines);
+        }
+        bitmap_zero(v->l1d_dirty, v->nlines);
         bitmap_zero(v->l2_valid, v->nlines);
         bitmap_zero(v->l2_dirty, v->nlines);
         bitmap_zero(v->l2_lock, v->nlines);
+        bitmap_zero(v->l1d_direct, v->npages);
     }
     c->regs[R(A_SYNC_CTRL)] = (reg(c, A_SYNC_CTRL) & ~SYNC_OPS) | SYNC_DONE;
     c->counters_logged = false;
@@ -1989,6 +2324,11 @@ static void cache_reset_exit(Object *obj, ResetType type)
     cache_update_irq(c);
 }
 
+/*
+ * A view's memory: each L1 cache's contents, the data cache's as a ROM
+ * device whose RAM a RAM region shares (which migrates it), and the L2's;
+ * the controller's region; and the space the translations reach them in.
+ */
 static void cache_view_init(ESP32P4CacheState *c, int kind, Error **errp)
 {
     ESP32P4CacheView *v = &c->view[kind];
@@ -1996,38 +2336,68 @@ static void cache_view_init(ESP32P4CacheState *c, int kind, Error **errp)
     const char *n = esp32p4_cache_view_name[kind];
     g_autofree char *iommu = g_strdup_printf("esp32p4.cache-%s", n);
     g_autofree char *target = g_strdup_printf("esp32p4.cache-%s-target", n);
-    g_autofree char *l1 = g_strdup_printf("esp32p4.cache-%s-l1", n);
-    g_autofree char *clean = g_strdup_printf("esp32p4.cache-%s-l1-clean", n);
+    g_autofree char *l1d_ram = g_strdup_printf("esp32p4.cache-%s-l1d-ram", n);
     g_autofree char *l2 = g_strdup_printf("esp32p4.cache-%s-l2", n);
     g_autofree char *miss = g_strdup_printf("esp32p4.cache-%s-miss", n);
+    int l1;
 
     v->cache = c;
     v->kind = kind;
     v->size = kind == ESP32P4_CACHE_VIEW_L2MEM ? L2MEM_SIZE
                                                : ESP32P4_MSPI_WINDOW_SIZE;
     v->nlines = v->size / ESP32P4_CACHE_LINE;
+    v->npages = v->size / FILL;
 
     memory_region_init_iommu(&v->iommu, sizeof(v->iommu),
                              TYPE_ESP32P4_CACHE_VIEW, obj, iommu, v->size);
-    memory_region_init(&v->target, obj, target, 2 * v->size);
-    if (!memory_region_init_ram(&v->l1, obj, l1, v->size, errp) ||
-        !memory_region_init_ram(&v->l1_clean, obj, clean, v->size, errp)) {
-        return;
+    memory_region_init(&v->target, obj, target, NTARGETS * v->size);
+    for (l1 = 0; l1 < NL1; l1++) {
+        g_autofree char *name = g_strdup_printf("esp32p4.cache-%s-%s", n,
+                                                l1_name[l1]);
+        bool ok = l1 == L1_D
+            ? memory_region_init_rom_device(&v->l1[l1], obj, &cache_view_ops,
+                                            v, name, v->size, errp)
+            : memory_region_init_ram(&v->l1[l1], obj, name, v->size, errp);
+
+        if (!ok) {
+            return;
+        }
     }
-    if (kind != ESP32P4_CACHE_VIEW_L2MEM &&
-        !memory_region_init_ram(&v->l2, obj, l2, v->size, errp)) {
-        return;
+    for (l1 = 0; l1 < NL1; l1++) {
+        v->l1_host[l1] = memory_region_get_ram_ptr(&v->l1[l1]);
     }
-    memory_region_init_io(&v->miss, obj, &cache_miss_ops, v, miss, v->size);
-    memory_region_add_subregion(&v->target, 0, &v->l1);
-    memory_region_add_subregion(&v->target, v->size, &v->miss);
+    vmstate_unregister_ram(&v->l1[L1_D], DEVICE(c));
+    memory_region_init_ram_ptr(&v->l1d_ram, obj, l1d_ram, v->size,
+                               v->l1_host[L1_D]);
+    vmstate_register_ram(&v->l1d_ram, DEVICE(c));
+    if (kind != ESP32P4_CACHE_VIEW_L2MEM) {
+        if (!memory_region_init_ram(&v->l2, obj, l2, v->size, errp)) {
+            return;
+        }
+        v->l2_host = memory_region_get_ram_ptr(&v->l2);
+    }
+    memory_region_init_io(&v->miss, obj, &cache_view_ops, v, miss, v->size);
+    memory_region_add_subregion(&v->target, TARGET_L1D * v->size,
+                                &v->l1[L1_D]);
+    memory_region_add_subregion(&v->target, TARGET_L1D_RAM * v->size,
+                                &v->l1d_ram);
+    memory_region_add_subregion(&v->target, TARGET_L1I0 * v->size,
+                                &v->l1[L1_I0]);
+    memory_region_add_subregion(&v->target, TARGET_L1I1 * v->size,
+                                &v->l1[L1_I1]);
+    memory_region_add_subregion(&v->target, TARGET_MISS * v->size, &v->miss);
     address_space_init(&v->target_as, &v->target, target);
 
-    v->l1_valid = bitmap_new(v->nlines);
-    v->l1_lock = bitmap_new(v->nlines);
+    for (l1 = 0; l1 < NL1; l1++) {
+        v->l1c[l1].valid = bitmap_new(v->nlines);
+        v->l1c[l1].lock = bitmap_new(v->nlines);
+        v->l1c[l1].nlines = v->nlines;
+    }
+    v->l1d_dirty = bitmap_new(v->nlines);
     v->l2_valid = bitmap_new(v->nlines);
     v->l2_dirty = bitmap_new(v->nlines);
     v->l2_lock = bitmap_new(v->nlines);
+    v->l1d_direct = bitmap_new(v->npages);
 }
 
 static void cache_realize(DeviceState *dev, Error **errp)
@@ -2053,6 +2423,7 @@ static void cache_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    c->l2mem_host = memory_region_get_ram_ptr(c->l2mem_mr);
     memory_region_init_io(&c->iomem, OBJECT(c), &cache_ops, c,
                           "esp32p4.cache", ESP32P4_CACHE_REGS_SIZE);
     memory_region_init_io(&c->l2mem_cached, OBJECT(c),
@@ -2089,34 +2460,54 @@ static void cache_init(Object *obj)
                             ESP32P4_CACHE_L2MEM_ERR_RESP, 1);
 }
 
+/*
+ * The cores' translations are emptied as a migration loads, so no page is
+ * stored to directly.
+ */
 static int cache_post_load(void *opaque, int version_id)
 {
     ESP32P4CacheState *c = opaque;
     uint32_t size = c->l2_cache_size;
+    int i;
 
+    for (i = 0; i < ESP32P4_CACHE_NVIEWS; i++) {
+        bitmap_zero(c->view[i].l1d_direct, c->view[i].npages);
+    }
     c->l2_cache_size = UINT32_MAX;
     cache_update_split(c);
     return size == c->l2_cache_size ? 0 : -EINVAL;
 }
 
-static const VMStateDescription vmstate_esp32p4_cache_view = {
-    .name = TYPE_ESP32P4_CACHE_VIEW,
+static const VMStateDescription vmstate_esp32p4_cache_l1 = {
+    .name = "esp32p4-cache-l1",
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
-        VMSTATE_BITMAP(l1_valid, ESP32P4CacheView, 1, nlines),
-        VMSTATE_BITMAP(l1_lock, ESP32P4CacheView, 1, nlines),
-        VMSTATE_BITMAP(l2_valid, ESP32P4CacheView, 1, nlines),
-        VMSTATE_BITMAP(l2_dirty, ESP32P4CacheView, 1, nlines),
-        VMSTATE_BITMAP(l2_lock, ESP32P4CacheView, 1, nlines),
+        VMSTATE_BITMAP(valid, ESP32P4CacheL1, 1, nlines),
+        VMSTATE_BITMAP(lock, ESP32P4CacheL1, 1, nlines),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_esp32p4_cache_view = {
+    .name = TYPE_ESP32P4_CACHE_VIEW,
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT_ARRAY(l1c, ESP32P4CacheView, ESP32P4_CACHE_NL1, 2,
+                             vmstate_esp32p4_cache_l1, ESP32P4CacheL1),
+        VMSTATE_BITMAP(l1d_dirty, ESP32P4CacheView, 2, nlines),
+        VMSTATE_BITMAP(l2_valid, ESP32P4CacheView, 2, nlines),
+        VMSTATE_BITMAP(l2_dirty, ESP32P4CacheView, 2, nlines),
+        VMSTATE_BITMAP(l2_lock, ESP32P4CacheView, 2, nlines),
         VMSTATE_END_OF_LIST()
     },
 };
 
 static const VMStateDescription vmstate_esp32p4_cache = {
     .name = TYPE_ESP32P4_CACHE,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = cache_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, ESP32P4CacheState, ESP32P4_CACHE_NREGS),
@@ -2128,7 +2519,7 @@ static const VMStateDescription vmstate_esp32p4_cache = {
         VMSTATE_BOOL(l2mem_err_resp, ESP32P4CacheState),
         VMSTATE_BOOL(counters_logged, ESP32P4CacheState),
         VMSTATE_STRUCT_ARRAY(view, ESP32P4CacheState, ESP32P4_CACHE_NVIEWS,
-                             1, vmstate_esp32p4_cache_view,
+                             2, vmstate_esp32p4_cache_view,
                              ESP32P4CacheView),
         VMSTATE_END_OF_LIST()
     },
@@ -2157,16 +2548,22 @@ static void esp32p4_cache_class_init(ObjectClass *klass, const void *data)
     device_class_set_props(dc, esp32p4_cache_properties);
 }
 
-/* Every core's accesses take the same translation. */
+/*
+ * A core's loads and stores take the data cache's translation, and each
+ * core's instruction fetches its instruction cache's.
+ */
+/* [spec:nuos:req:emu.esp32p4.memory] */
 static int cache_view_attrs_to_index(IOMMUMemoryRegion *iommu,
                                      MemTxAttrs attrs)
 {
-    return 0;
+    int core;
+
+    return cache_fetch(attrs, &core) ? 1 + core : 0;
 }
 
 static int cache_view_num_indexes(IOMMUMemoryRegion *iommu)
 {
-    return 1;
+    return 1 + ESP32P4_CACHE_L1_D;
 }
 
 static void esp32p4_cache_view_class_init(ObjectClass *klass,

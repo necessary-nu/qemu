@@ -795,6 +795,18 @@ static G_NORETURN void esp32p4_do_unaligned_access(CPUState *cs, vaddr addr,
 }
 
 /*
+ * The HP core's MMU indexes: its instruction fetches', apart from its
+ * loads' and stores' (ESP32P4_MMU_IDX_IFETCH).
+ */
+/* [spec:nuos:req:emu.esp32p4.memory] */
+static int esp32p4_hp_mmu_index(CPUState *cs, bool ifetch)
+{
+    int mmu_idx = riscv_env_mmu_index(cpu_env(cs), ifetch);
+
+    return ifetch ? mmu_idx | ESP32P4_MMU_IDX_IFETCH : mmu_idx;
+}
+
+/*
  * The hardware loop and PIE state the translation of a block depends on:
  * whether the loop instructions may be used, and whether a loop counts;
  * whether the PIE instructions may be used, and whether the PIE state is
@@ -1361,6 +1373,7 @@ static void esp32p4_hp_cpu_class_init(ObjectClass *oc, const void *data)
         esp32p4_hp_do_transaction_failed;
     esp32p4_hp_tcg_ops.do_unaligned_access = esp32p4_do_unaligned_access;
     esp32p4_hp_tcg_ops.tlb_fill = esp32p4_hp_tlb_fill;
+    esp32p4_hp_tcg_ops.mmu_index = esp32p4_hp_mmu_index;
     esp32p4_hp_tcg_ops.debug_excp_handler = esp32p4_debug_excp_handler;
     esp32p4_hp_tcg_ops.debug_check_breakpoint =
         esp32p4_debug_check_breakpoint;
