@@ -335,6 +335,35 @@ static inline uint64_t clock_ns_to_ticks(const Clock *clk, uint64_t ns)
 }
 
 /**
+ * clock_edge_ns:
+ * @clk: the clock to query
+ * @edge: one of the clock's edges, counted from time 0
+ *
+ * Returns the first nanosecond at or after the time of the clock's edge
+ * @edge, its edges falling at whole multiples of its period from time 0:
+ * the first time by which clock_ns_to_ticks() has counted @edge ticks. A
+ * block that counts a clock's edges with these two, rather than whole
+ * periods from a time of its own, counts exactly the edges between any
+ * two times and times an event at an edge to that nanosecond, at any
+ * period. Under icount a CPU executing at the clock's rate
+ * (icount_set_cpu_clock()) executes its instructions between those edges
+ * and makes its accesses at those nanoseconds.
+ *
+ * The result saturates at INT64_MAX. If the clock is stopped (ie it has
+ * period zero), returns 0.
+ */
+static inline uint64_t clock_edge_ns(const Clock *clk, uint64_t edge)
+{
+    uint64_t lo, hi;
+
+    mulu64(&lo, &hi, clk->period, edge);
+    if (hi >> 31) {
+        return INT64_MAX;
+    }
+    return ((hi << 32) | (lo >> 32)) + ((uint32_t)lo != 0);
+}
+
+/**
  * clock_is_enabled:
  * @clk: a clock
  *

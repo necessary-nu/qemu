@@ -54,9 +54,17 @@ static void systick_set_period_from_clock(SysTickState *s)
     /*
      * Set the ptimer period from whichever clock is selected.
      * Must be called from within a ptimer transaction block.
+     *
+     * On the processor clock the counter counts its edges, those the CPU
+     * runs its instructions between: a count started by a register write
+     * reaches zero, and the exception pends, at exactly the edge it
+     * gives, and SYST_CVR reads exactly the edges left. The reference
+     * clock is a board's, whose edges its own phase sets, which the clock
+     * does not carry: there the counter counts whole periods from its
+     * start.
      */
     if (s->control & SYSTICK_CLKSOURCE) {
-        ptimer_set_period_from_clock(s->ptimer, s->cpuclk, 1);
+        ptimer_set_period_from_clock_edges(s->ptimer, s->cpuclk);
     } else {
         ptimer_set_period_from_clock(s->ptimer, s->refclk, 1);
     }

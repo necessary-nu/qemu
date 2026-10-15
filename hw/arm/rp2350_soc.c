@@ -339,7 +339,8 @@ static bool rp2350_reset_gate_pass(RP2350ResetGate *gate, hwaddr addr,
     uint8_t buf[4];
 
     rp2350_resets_catch_up(&gate->soc->resets);
-    if (gate->soc->resets.held & BIT(gate->reset)) {
+    if ((gate->soc->resets.held | gate->soc->resets.corrupt) &
+        BIT(gate->reset)) {
         return false;
     }
     if (is_write) {
@@ -353,12 +354,23 @@ static bool rp2350_reset_gate_pass(RP2350ResetGate *gate, hwaddr addr,
     return true;
 }
 
+/* Why a gated subsystem does not answer, for the guest error. */
+static const char *rp2350_reset_gate_why(RP2350ResetGate *gate)
+{
+    if (gate->soc->resets.held & BIT(gate->reset)) {
+        return "while it is in reset";
+    }
+    return "after a clock glitch left it undefined, until it is reset";
+}
+
 /*
  * A subsystem in reset does not answer on the bus: reads of its registers
  * return zero and writes have no effect, without a bus error. Erratum
- * RP2350-E23 documents this: SYSINFO, left in reset, reads as zero.
+ * RP2350-E23 documents this: SYSINFO, left in reset, reads as zero. A
+ * subsystem a clock glitch left undefined is modelled the same way.
  */
 /* [spec:nuos:req:emu.resets] */
+/* [spec:nuos:req:emu.clock-tree] */
 static MemTxResult rp2350_reset_gate_read(void *opaque, hwaddr addr,
                                           uint64_t *data, unsigned size,
                                           MemTxAttrs attrs)
@@ -370,12 +382,14 @@ static MemTxResult rp2350_reset_gate_read(void *opaque, hwaddr addr,
         return res;
     }
     qemu_log_mask(LOG_GUEST_ERROR, "rp2350: read of %s offset 0x%"
-                  HWADDR_PRIx " while it is in reset\n", gate->name, addr);
+                  HWADDR_PRIx " %s\n", gate->name, addr,
+                  rp2350_reset_gate_why(gate));
     *data = 0;
     return MEMTX_OK;
 }
 
 /* [spec:nuos:req:emu.resets] */
+/* [spec:nuos:req:emu.clock-tree] */
 static MemTxResult rp2350_reset_gate_write(void *opaque, hwaddr addr,
                                            uint64_t value, unsigned size,
                                            MemTxAttrs attrs)
@@ -387,7 +401,8 @@ static MemTxResult rp2350_reset_gate_write(void *opaque, hwaddr addr,
         return res;
     }
     qemu_log_mask(LOG_GUEST_ERROR, "rp2350: write to %s offset 0x%"
-                  HWADDR_PRIx " while it is in reset\n", gate->name, addr);
+                  HWADDR_PRIx " %s\n", gate->name, addr,
+                  rp2350_reset_gate_why(gate));
     return MEMTX_OK;
 }
 
@@ -1153,13 +1168,52 @@ void rp2350_soc_system_reset(RP2350State *s, ResetType type)
 }
 
 /*
+ * A glitch reached a peripheral clock: its destinations not held in reset
+ * are left undefined, not answering on the bus and inert, until they are
+ * reset. clk_peri clocks the UARTs' and SPI controllers' serial logic
+ * (CLOCKS WAKE_EN1: CLK_PERI_UART0/1, CLK_PERI_SPI0/1), and clk_hstx,
+ * clk_usb and clk_adc each its one block.
+ */
+/* [spec:nuos:req:emu.clock-tree] */
+static bool rp2350_soc_clock_glitch(void *opaque, int clk, bool apply)
+{
+    static const uint32_t dests[RP2350_NUM_CLOCKS] = {
+        [RP2350_CLK_PERI] = BIT(RP2350_RESET_UART0) | BIT(RP2350_RESET_UART1) |
+                            BIT(RP2350_RESET_SPI0) | BIT(RP2350_RESET_SPI1),
+        [RP2350_CLK_HSTX] = BIT(RP2350_RESET_HSTX),
+        [RP2350_CLK_USB] = BIT(RP2350_RESET_USBCTRL),
+        [RP2350_CLK_ADC] = BIT(RP2350_RESET_ADC),
+    };
+    RP2350State *s = opaque;
+    uint32_t hit;
+    int i;
+
+    rp2350_resets_catch_up(&s->resets);
+    hit = dests[clk] & ~s->resets.held;
+    if (!apply) {
+        return hit != 0;
+    }
+    hit = rp2350_resets_corrupt(&s->resets, hit);
+    for (i = 0; i < RP2350_NUM_RESETS; i++) {
+        if (hit & BIT(i)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "rp2350: the %s glitch leaves %s "
+                          "undefined until it is reset\n",
+                          rp2350_clock_names[clk],
+                          rp2350_reset_blocks[i].name);
+        }
+    }
+    return hit != 0;
+}
+
+/*
  * The clock tree: the oscillators and PLLs feed CLOCKS, whose clk_ref
  * drives the TICKS generators. The PLLs' reference is the crystal
  * oscillator, as is the clock muxes' PLL_USB reference input. GPIN0/1 and
  * the OTP's frequency counter clock have no source, so selecting them
  * stops a clock. clk_sys also reaches the SoC, which stops the processors
  * while it is stopped. An access to CLOCKS first has the oscillators and
- * PLLs take their start-ups and locks due by then.
+ * PLLs take their start-ups and locks due by then. A glitch on a
+ * peripheral clock reaches the blocks it clocks.
  */
 /* [spec:nuos:req:emu.clock-tree] */
 static void rp2350_soc_wire_clocks(RP2350State *s)
@@ -1187,6 +1241,7 @@ static void rp2350_soc_wire_clocks(RP2350State *s)
     rp2350_clocks_add_feed(&s->clocks, &s->pll_usb.parent_obj.feed);
     qdev_connect_clock_in(DEVICE(&s->ticks), RP2350_TICKS_REF, CLK(s, REF));
     clock_set_source(s->clk_sys, CLK(s, SYS));
+    rp2350_clocks_set_glitch_fn(&s->clocks, rp2350_soc_clock_glitch, s);
 }
 
 /*

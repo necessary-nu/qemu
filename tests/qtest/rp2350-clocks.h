@@ -22,6 +22,9 @@
 #define RP2350_CLK_USB            8
 #define RP2350_CLK_ADC            9
 #define RP2350_CLK_CTRL_ENABLE    (1u << 11)
+#define RP2350_CLK_CTRL_ENABLED   (1u << 28)
+#define RP2350_ALIAS_SET          0x2000
+#define RP2350_ALIAS_CLR          0x3000
 
 #define RP2350_XOSC_BASE          0x40048000
 #define RP2350_XOSC_STABLE        (1u << 31)
@@ -58,12 +61,53 @@ static inline int64_t rp2350_pll_init(QTestState *qts, uint32_t pll,
 }
 
 /*
+ * Write a generator's CTRL through `alias` (0, or the SET or CLR alias),
+ * then poll a glitchless mux's SELECTED until it reads `selected`,
+ * stepping the clock 10 ns at a time, as software waits for the switch.
+ * Returns the virtual time after, or `now` if no step was needed.
+ */
+static inline int64_t rp2350_clk_switch(QTestState *qts, int64_t now, int clk,
+                                        uint32_t alias, uint32_t value,
+                                        uint32_t selected)
+{
+    int i;
+
+    qtest_writel(qts, RP2350_CLK_CTRL(clk) + alias, value);
+    for (i = 0; qtest_readl(qts, RP2350_CLK_SELECTED(clk)) != selected; i++) {
+        g_assert_cmpint(i, <, 100000);
+        now = qtest_clock_step(qts, 10);
+    }
+    return now;
+}
+
+/*
+ * Stop a generator without a glitchless mux as pico-sdk's clock_stop()
+ * does, then poll ENABLED until it clears (two cycles of its source),
+ * stepping the clock 10 ns at a time. Returns the virtual time after, or
+ * `now` if no step was needed.
+ */
+static inline int64_t rp2350_clk_stop(QTestState *qts, int64_t now, int clk)
+{
+    int i;
+
+    qtest_writel(qts, RP2350_CLK_CTRL(clk) + RP2350_ALIAS_CLR,
+                 RP2350_CLK_CTRL_ENABLE);
+    for (i = 0; qtest_readl(qts, RP2350_CLK_CTRL(clk)) &
+                RP2350_CLK_CTRL_ENABLED; i++) {
+        g_assert_cmpint(i, <, 100000);
+        now = qtest_clock_step(qts, 10);
+    }
+    return now;
+}
+
+/*
  * Bring the clock tree up as pico-sdk's runtime_init_clocks() does on a
  * Pico 2: clk_ref from the 12 MHz XOSC; clk_sys from PLL_SYS at 150 MHz,
  * and clk_peri and clk_hstx from clk_sys; clk_usb and clk_adc from PLL_USB
- * at 48 MHz. The TICKS generators are left stopped, for each test to
- * start the ones it uses. Returns the virtual time after, a whole number
- * of microseconds.
+ * at 48 MHz, each auxiliary mux changed only while its generator does not
+ * pass it. The TICKS generators are left stopped, for each test to start
+ * the ones it uses. Returns the virtual time after, a whole number of
+ * microseconds.
  */
 static inline int64_t rp2350_clocks_init(QTestState *qts)
 {
@@ -78,8 +122,9 @@ static inline int64_t rp2350_clocks_init(QTestState *qts)
     g_assert_cmphex(qtest_readl(qts, RP2350_XOSC_BASE + 0x4) &
                     RP2350_XOSC_STABLE, ==, RP2350_XOSC_STABLE);
 
-    qtest_writel(qts, RP2350_CLK_CTRL(RP2350_CLK_SYS), 0);
-    qtest_writel(qts, RP2350_CLK_CTRL(RP2350_CLK_REF), 0);
+    /* clk_sys and clk_ref switched cleanly off their auxiliary muxes. */
+    rp2350_clk_switch(qts, 0, RP2350_CLK_SYS, RP2350_ALIAS_CLR, 0x1, 0x1);
+    rp2350_clk_switch(qts, 0, RP2350_CLK_REF, RP2350_ALIAS_CLR, 0x3, 0x1);
 
     qtest_writel(qts, RP2350_CLOCKS_RESETS_CLR, done);
     qtest_clock_step(qts, 1000);
@@ -88,14 +133,12 @@ static inline int64_t rp2350_clocks_init(QTestState *qts)
     rp2350_pll_init(qts, RP2350_PLL_SYS_BASE, 125, 5, 2);
     now = rp2350_pll_init(qts, RP2350_PLL_USB_BASE, 100, 5, 5);
 
-    qtest_writel(qts, RP2350_CLK_CTRL(RP2350_CLK_REF), 2);
+    now = rp2350_clk_switch(qts, now, RP2350_CLK_REF, 0, 2, 4);
     qtest_writel(qts, RP2350_CLK_DIV(RP2350_CLK_REF), 1 << 16);
-    g_assert_cmphex(qtest_readl(qts, RP2350_CLK_SELECTED(RP2350_CLK_REF)),
-                    ==, 4);
+    /* clk_sys's AUXSRC to PLL_SYS while off it, then SRC to it. */
     qtest_writel(qts, RP2350_CLK_DIV(RP2350_CLK_SYS), 1 << 16);
-    qtest_writel(qts, RP2350_CLK_CTRL(RP2350_CLK_SYS), 1);
-    g_assert_cmphex(qtest_readl(qts, RP2350_CLK_SELECTED(RP2350_CLK_SYS)),
-                    ==, 2);
+    qtest_writel(qts, RP2350_CLK_CTRL(RP2350_CLK_SYS), 0);
+    now = rp2350_clk_switch(qts, now, RP2350_CLK_SYS, 0, 1, 2);
     for (i = RP2350_CLK_PERI; i <= RP2350_CLK_ADC; i++) {
         qtest_writel(qts, RP2350_CLK_CTRL(i), RP2350_CLK_CTRL_ENABLE);
         qtest_writel(qts, RP2350_CLK_DIV(i), 1 << 16);

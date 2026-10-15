@@ -419,6 +419,17 @@ static int64_t now_ns(void)
     return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
+/*
+ * DWT_CYCCNT counts the core clock's edges since dwt_cyccnt_ns. They fall
+ * at whole multiples of its period from virtual time 0, the edges every
+ * device timed on clk_sys counts, and those the core's instructions run
+ * between under icount, one a cycle (icount_set_cpu_clock()). An access
+ * comes at its edge's time rounded up to the nanosecond, by which the
+ * clock has made exactly the edges up to it: from an access at one edge
+ * to one at another the counter counts the edges between, at any period.
+ * Whole periods from dwt_cyccnt_ns would count one fewer whenever the
+ * later edge rounds up by less of a nanosecond than the earlier did.
+ */
 static uint32_t dwt_cyccnt(RP2350M33DebugState *s)
 {
     uint32_t ctrl = *s_reg(s, RP2350_M33_DEBUG_DWT, A_DWT_CTRL);
@@ -427,7 +438,8 @@ static uint32_t dwt_cyccnt(RP2350M33DebugState *s)
         return s->dwt_cyccnt;
     }
     return s->dwt_cyccnt +
-           (uint32_t)clock_ns_to_ticks(s->cpuclk, now_ns() - s->dwt_cyccnt_ns);
+           (uint32_t)(clock_ns_to_ticks(s->cpuclk, now_ns()) -
+                      clock_ns_to_ticks(s->cpuclk, s->dwt_cyccnt_ns));
 }
 
 /* Fold the count so far into dwt_cyccnt before its rate changes. */

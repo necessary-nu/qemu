@@ -553,6 +553,34 @@ static void test_pad_pulls(void)
     qtest_quit(qts);
 }
 
+/*
+ * The board's lines to its ESP32-C6, which is not modelled: GPIO54, the
+ * C6's CHIP_PU, held high by R13's 10 kOhm pull-up even against the pad's
+ * own 45 kOhm pull-down, low while the P4 drives it low; GPIO6, the C6's
+ * IO2, an input with no pull, the pad's own pulls deciding its level.
+ */
+/* [spec:nuos:req:emu.esp32p4.gpio/test] */
+static void test_board_c6_lines(void)
+{
+    QTestState *qts = start_plain();
+
+    gpio_mode(qts, 54, 0);
+    g_assert_true(gpio_in(qts, 54));
+    gpio_mode(qts, 54, FUN_WPD);
+    g_assert_true(gpio_in(qts, 54));
+    qtest_writel(qts, GPIO_OUT1_W1TC, 1u << (54 - 32));
+    qtest_writel(qts, GPIO_ENABLE1_W1TS, 1u << (54 - 32));
+    g_assert_false(gpio_in(qts, 54));
+    qtest_writel(qts, GPIO_ENABLE1, 0);
+    g_assert_true(gpio_in(qts, 54));
+
+    gpio_mode(qts, 6, FUN_WPU);
+    g_assert_true(gpio_in(qts, 6));
+    gpio_mode(qts, 6, FUN_WPD);
+    g_assert_false(gpio_in(qts, 6));
+    qtest_quit(qts);
+}
+
 /* pad-ext-driven and pad-ext-level drive pads, set while QEMU runs too. */
 /* [spec:nuos:req:emu.esp32p4.gpio/test] */
 static void test_pad_properties(void)
@@ -1526,6 +1554,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/gpio/strap", test_strap);
     qtest_add_func("esp32p4/gpio/pad_levels", test_pad_levels);
     qtest_add_func("esp32p4/gpio/pad_pulls", test_pad_pulls);
+    qtest_add_func("esp32p4/gpio/board_c6_lines", test_board_c6_lines);
     qtest_add_func("esp32p4/gpio/pad_properties", test_pad_properties);
     qtest_add_func("esp32p4/gpio/output_routing", test_output_routing);
     qtest_add_func("esp32p4/gpio/input_routing", test_input_routing);

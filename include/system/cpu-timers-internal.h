@@ -59,6 +59,8 @@ typedef struct TimersState {
      * 2^-32 ns. Each instruction accounts for its CPU's instruction time
      * (2^icount_time_shift ns, or a cycle of its icount clock) when it
      * executes, so the time already passed stays put when that changes.
+     * A warp to a deadline with CPUs executing at their clocks' rate
+     * sets the fraction to the deadline's (icount-common.c).
      */
     int64_t qemu_icount_time;
     uint32_t qemu_icount_time_frac;
