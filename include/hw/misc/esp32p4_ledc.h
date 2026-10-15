@@ -173,6 +173,8 @@ struct ESP32P4LedcState {
     /* The latest moment the block has acted at */
     int64_t seen_ns;
     bool irq_level;
+    /* Edges have been lost to a host too slow for them (logged once) */
+    bool lag_logged;
 };
 
 #endif
