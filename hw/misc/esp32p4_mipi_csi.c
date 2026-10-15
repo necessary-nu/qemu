@@ -98,7 +98,19 @@
  *     CSI_BRG_SYS_CLK stopped, or faster than its eight bytes a cycle,
  *     overflow the asynchronous FIFO (CSI_ASYNC_FIFO_OVF_INT, lost); a
  *     frame that lost bytes, or ended by another frame's start or by the
- *     bridge's disabling, is discarded (CSI_BRIG_DISCARD_INT). With
+ *     bridge's disabling, is discarded (CSI_BRIG_DISCARD_INT), the words
+ *     it got into the buffer going to VDMA as a frame of their own.
+ *   - Frames waiting in the buffer. A frame's end goes into the buffer
+ *     with its last word, so that frames that pile up there, VDMA not
+ *     taking them (its channel re-armed late), each end at their own
+ *     word: the bridge asks for the oldest frame's words, then the next
+ *     one's, each ending a request and so a block of its own, however
+ *     many there are. The TRM is silent on how the bridge keeps the ends
+ *     of several frames; this takes its buffer as a FIFO whose words
+ *     carry the frame's end (a capture with VDMA re-armed several frame
+ *     times late, each block's size then read from CH_STATUS, would
+ *     settle it). A frame none of whose bytes the full buffer could take
+ *     has no word to carry its end, and makes no block. With
  *     VADR_NUM_CHECK the frame's lines (packets, or with HAS_HSYNC_E clear
  *     its bytes over HADR_NUM words) are checked against VADR_NUM
  *     (VADR_NUM_GT/LT_INT). ESP-IDF writes HADR_NUM in pixels where the
@@ -110,11 +122,17 @@
  *     value and ESP-IDF's) the bridge asks for DMA_BURST_LEN words while it
  *     has them, then for single words at the frame's end, marking the
  *     request that ends the frame, or the block of DMABLK_SIZE bursts, as
- *     the last; with VDMA the flow controller the same, unmarked. After
- *     each acknowledge it waits DMA_REQ_INTERVAL bus cycles (the set bits:
- *     1 is one cycle, 0xFFFF sixteen). DMA_BURST_LEN and DMABLK_SIZE take
- *     effect at a frame's start, or with DMA_CFG_UPD_BY_BLK at a block's
- *     end as ESP-IDF's header has it (the TRM says the reverse),
+ *     the last; with VDMA the flow controller the same, unmarked. While
+ *     the frame is still coming in, a burst waits for a byte past it: the
+ *     frame's last word goes only with its end, which marks its request.
+ *     The TRM does not say how a frame of whole bursts, as ESP-IDF's
+ *     frames often are, ends its block, but has DMABLK_SIZE set above a
+ *     frame's bursts, so that the frame's end does; with the last burst
+ *     taken before the end came there would be no request left to mark.
+ *     After each acknowledge it waits DMA_REQ_INTERVAL bus cycles (the set
+ *     bits: 1 is one cycle, 0xFFFF sixteen). DMA_BURST_LEN and DMABLK_SIZE
+ *     take effect at a frame's start, or with DMA_CFG_UPD_BY_BLK at a
+ *     block's end as ESP-IDF's header has it (the TRM says the reverse),
  *     DMA_CFG_HAS_UPDATED_INT rising as they change.
  *     DMA_FORCE_RD_STATUS is kept: VDMA's status fetch reads the buffer
  *     like any read.
@@ -1050,10 +1068,13 @@ static void brg_set_req(ESP32P4CsiBridgeState *s, bool req, bool single,
     }
 }
 
-/* Words VDMA may read now: those of an ended frame first. */
+/*
+ * Words VDMA may read now: those of the oldest frame that has ended, up to
+ * its end; with none, those of the frame coming in.
+ */
 static uint32_t brg_words(ESP32P4CsiBridgeState *s)
 {
-    return (s->end_pending ? s->end_bytes : s->buf_num) / 8;
+    return (s->ends_num ? s->ends[s->ends_head] : s->buf_num) / 8;
 }
 
 static void brg_update_req(ESP32P4CsiBridgeState *s)
@@ -1070,12 +1091,13 @@ static void brg_update_req(ESP32P4CsiBridgeState *s)
         }
         return;
     }
-    if (words >= s->burst_len) {
+    if (s->ends_num ? words >= s->burst_len
+                    : s->buf_num > s->burst_len * 8) {
         bool last = s->bursts + 1 >= s->blk_size ||
-                    (s->end_pending && words == s->burst_len);
+                    (s->ends_num && words == s->burst_len);
 
         brg_set_req(s, true, false, fc && last);
-    } else if (s->end_pending && words) {
+    } else if (s->ends_num && words) {
         brg_set_req(s, false, true, fc && words == 1);
     } else {
         brg_set_req(s, false, false, false);
@@ -1233,7 +1255,7 @@ static uint64_t brg_mem_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4CsiBridgeState *s = opaque;
     uint8_t b[8] = { 0 };
-    uint32_t n;
+    uint32_t n, left;
 
     brg_stream_sync(s);
     brg_catch_up(s);
@@ -1248,10 +1270,17 @@ static uint64_t brg_mem_read(void *opaque, hwaddr addr, unsigned size)
     }
     s->buf_head = (s->buf_head + n) % BUF_BYTES;
     s->buf_num -= n;
-    if (s->end_pending) {
-        s->end_bytes -= MIN(n, s->end_bytes);
-        if (!s->end_bytes) {
-            s->end_pending = false;
+    /* A read past a frame's end goes on into the next frame's words. */
+    for (left = n; left && s->ends_num;) {
+        uint32_t *e = &s->ends[s->ends_head];
+        uint32_t k = MIN(left, *e);
+
+        *e -= k;
+        s->ends_bytes -= k;
+        left -= k;
+        if (!*e) {
+            s->ends_head = (s->ends_head + 1) % ARRAY_SIZE(s->ends);
+            s->ends_num--;
         }
     }
     return ldq_le_p(b);
@@ -1285,11 +1314,19 @@ static const MemoryRegionOps brg_mem_ops = {
 
 /* ---- CSI_Bridge's input (ISP_Tail's output) ---- */
 
-/* The frame that was coming in ends at the buffer's present end. */
+/*
+ * [spec:nuos:req:emu.esp32p4.mipi]
+ * The frame that was coming in ends at the buffer's present end: its last
+ * word there carries its end, behind the ends of the frames before it
+ * still in the buffer. A frame with no bytes there has no word to carry
+ * it. Each frame has at least a word of its own, so the buffer's words
+ * bound the ends it holds; a frame's end past them (bytes only part of a
+ * word, VDMA reading the buffer in narrower items) joins the one before.
+ */
 static void brg_frame_close(ESP32P4CsiBridgeState *s, bool discard)
 {
     uint8_t pad[8] = { 0 };
-    uint32_t cfg = breg(s, C_FRAME_CFG), lines = s->lines;
+    uint32_t cfg = breg(s, C_FRAME_CFG), lines = s->lines, mine;
 
     if (s->frame_bytes % 8 && !brg_buf_in(s, pad, 8 - s->frame_bytes % 8)) {
         discard = true;
@@ -1312,8 +1349,16 @@ static void brg_frame_close(ESP32P4CsiBridgeState *s, bool discard)
         brg_int(s, INT_DISCARD);
     }
     s->capturing = false;
-    s->end_pending = true;
-    s->end_bytes = s->buf_num;
+    mine = s->buf_num - s->ends_bytes;
+    if (mine && s->ends_num == ARRAY_SIZE(s->ends)) {
+        s->ends[(s->ends_head + s->ends_num - 1) % ARRAY_SIZE(s->ends)] +=
+            mine;
+        s->ends_bytes += mine;
+    } else if (mine) {
+        s->ends[(s->ends_head + s->ends_num) % ARRAY_SIZE(s->ends)] = mine;
+        s->ends_num++;
+        s->ends_bytes += mine;
+    }
     brg_update_req(s);
 }
 
@@ -1621,8 +1666,9 @@ static void brg_flush(ESP32P4CsiBridgeState *s)
     s->buf_head = 0;
     s->buf_num = 0;
     s->capturing = false;
-    s->end_pending = false;
-    s->end_bytes = 0;
+    s->ends_head = 0;
+    s->ends_num = 0;
+    s->ends_bytes = 0;
     s->bursts = 0;
     s->req_hold_ns = 0;
     timer_del(s->req_timer);
@@ -1798,10 +1844,23 @@ static void brg_finalize(Object *obj)
     timer_free(ESP32P4_CSI_BRIDGE(obj)->req_timer);
 }
 
+static int brg_post_load(void *opaque, int version_id)
+{
+    ESP32P4CsiBridgeState *s = opaque;
+
+    if (s->buf_head >= BUF_BYTES || s->buf_num > BUF_BYTES ||
+        s->ends_head >= ARRAY_SIZE(s->ends) ||
+        s->ends_num > ARRAY_SIZE(s->ends) || s->ends_bytes > s->buf_num) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_brg = {
     .name = TYPE_ESP32P4_CSI_BRIDGE,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .post_load = brg_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(req_timer, ESP32P4CsiBridgeState),
         VMSTATE_UINT32_ARRAY(regs, ESP32P4CsiBridgeState, 0x50 / 4),
@@ -1814,8 +1873,11 @@ static const VMStateDescription vmstate_brg = {
         VMSTATE_UINT32(lines, ESP32P4CsiBridgeState),
         VMSTATE_UINT32(frame_bytes, ESP32P4CsiBridgeState),
         VMSTATE_UINT32(cm_row, ESP32P4CsiBridgeState),
-        VMSTATE_UINT32(end_bytes, ESP32P4CsiBridgeState),
-        VMSTATE_BOOL(end_pending, ESP32P4CsiBridgeState),
+        VMSTATE_UINT32_ARRAY(ends, ESP32P4CsiBridgeState,
+                             ESP32P4_CSI_BUF_WORDS),
+        VMSTATE_UINT32(ends_head, ESP32P4CsiBridgeState),
+        VMSTATE_UINT32(ends_num, ESP32P4CsiBridgeState),
+        VMSTATE_UINT32(ends_bytes, ESP32P4CsiBridgeState),
         VMSTATE_BOOL(req, ESP32P4CsiBridgeState),
         VMSTATE_BOOL(req_single, ESP32P4CsiBridgeState),
         VMSTATE_BOOL(req_last, ESP32P4CsiBridgeState),

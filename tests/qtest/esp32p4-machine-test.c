@@ -31,6 +31,8 @@
 
 #define HP_SYS_CLKRST_SOC_CLK_CTRL0 0x500e6014
 #define HP_SYS_CLKRST_HP_RST_EN0    0x500e60c0
+#define HP_SYS_CLKRST_PERI_CLK_CTRL00 0x500e6030
+#define FLASH_CORE_CLK_DIV_NUM      (0xffu << 4)
 #define CORE1_CPU_CLK_EN            (1u << 4)
 #define RST_EN_CORE1_GLOBAL         (1u << 8)
 #define LP_SYS_BOOT_ADDR_HP_CORE1   0x50110164
@@ -529,6 +531,41 @@ static void test_kernel(void)
     unlink(rom_data);
 }
 
+/*
+ * The state -kernel presents is the boot ROM's, set in the ROM's place:
+ * presenting it, from the start and again at a system reset, logs no
+ * guest error, so that a guest's error log starts with the guest's own.
+ * The ROM's change of the flash core clock's divider with the clock's gate
+ * on is not the guest's breach of the TRM's procedure.
+ */
+/* [spec:nuos:req:emu.esp32p4.boot/test] */
+static void test_kernel_quiet(void)
+{
+    g_autofree char *elf = write_elf(0x4ff80000);
+    g_autofree char *log = NULL;
+    g_autofree char *text = NULL;
+    g_autofree char *regs = NULL;
+    QTestState *qts;
+    int fd;
+
+    fd = g_file_open_tmp("esp32p4-test-XXXXXX.log", &log, NULL);
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    qts = qtest_initf("-M esp32p4,flash-size=16M -kernel %s "
+                      "-d guest_errors -D %s", elf, log);
+    qtest_system_reset(qts);
+    regs = qtest_hmp(qts, "info registers -a");
+    g_assert_cmphex(dump_reg(regs, 0, "pc"), ==, 0x4ff80000);
+    g_assert_cmphex(qtest_readl(qts, HP_SYS_CLKRST_PERI_CLK_CTRL00) &
+                    FLASH_CORE_CLK_DIV_NUM, ==, 0);
+    qtest_quit(qts);
+
+    g_assert(g_file_get_contents(log, &text, NULL, NULL));
+    g_assert_cmpstr(text, ==, "");
+    unlink(log);
+    unlink(elf);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -539,6 +576,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/no-flash", test_no_flash);
     qtest_add_func("/esp32p4/cores", test_cores);
     qtest_add_func("/esp32p4/kernel", test_kernel);
+    qtest_add_func("/esp32p4/kernel/quiet", test_kernel_quiet);
 
     return g_test_run();
 }

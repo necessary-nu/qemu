@@ -109,7 +109,9 @@
  *     runs itself) is logged as a guest error, and takes effect as
  *     written. ESP-IDF's UART driver changes SCLK_DIV_NUM so, as it sets a
  *     baud rate. The HP root and SoC clocks (11.3.1) and the LP system's
- *     (11.3.2) have their own procedures.
+ *     (11.3.2) have their own procedures. The boot ROM's writes that
+ *     -kernel's hand-off makes in the ROM's place are not judged
+ *     (esp32p4_clkrst_set_rom_handoff()).
  *   - The PVT monitor's clocks from PLL_F160M_CLK, which ESP-IDF enables
  *     for them (pmu_pvt.c), and the LP ADC's function clock from its bus
  *     clock, LP_PERI_CLK, as TRM table 11.2-7 has it, and its SAR clocks
@@ -2500,7 +2502,7 @@ static void esp32p4_clkrst_update_soc_div(ESP32P4ClkRstState *s)
             n++;
         }
     }
-    if (n > 1) {
+    if (n > 1 && !s->rom_handoff) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: SOC_CLK_DIV_UPDATE applies the "
                       "dividers of %s at once, where they go one at a time "
                       "in their order\n", TYPE_ESP32P4_CLKRST,
@@ -2530,7 +2532,9 @@ static void esp32p4_clkrst_write(ESP32P4ClkRstState *s, int block,
     wt = esp32p4_clkrst_regs[idx].wt & lanes & v;
     r = &s->regs[idx];
     old = *r;
-    esp32p4_clkrst_check_in_use(s, idx, old, (old & ~rw) | (v & rw));
+    if (!s->rom_handoff) {
+        esp32p4_clkrst_check_in_use(s, idx, old, (old & ~rw) | (v & rw));
+    }
     *r = (old & ~rw) | (v & rw);
     esp32p4_clkrst_check_kept(idx, old, *r);
 
@@ -2542,7 +2546,8 @@ static void esp32p4_clkrst_write(ESP32P4ClkRstState *s, int block,
         break;
     case R_PERI_CLK_CTRL02:
         if (wt & SDIO_LS_CLK_EDGE_CFG_UPDATE) {
-            if (extract32(*r, 17, 4) != s->sdio_edge[2] &&
+            if (!s->rom_handoff &&
+                extract32(*r, 17, 4) != s->sdio_edge[2] &&
                 esp32p4_clkrst_runs_gated(s, C(SDIO_LS),
                                           &esp32p4_sdio_procedure[0].gate, 1,
                                           idx, *r)) {
@@ -2637,6 +2642,12 @@ static void esp32p4_clkrst_write(ESP32P4ClkRstState *s, int block,
         break;
     }
     esp32p4_clkrst_update(s, false);
+}
+
+/* [spec:nuos:req:emu.esp32p4.boot] */
+void esp32p4_clkrst_set_rom_handoff(ESP32P4ClkRstState *s, bool handoff)
+{
+    s->rom_handoff = handoff;
 }
 
 static uint64_t esp32p4_clkrst_hp_read(void *opaque, hwaddr addr,
