@@ -56,8 +56,10 @@
 #include "qemu/plugin.h"
 #include "cpu.h"
 #include "accel/tcg/cpu-loop.h"
+#include "accel/tcg/cpu-mmu-index.h"
 #include "accel/tcg/probe.h"
 #include "exec/helper-proto.h"
+#include "exec/target_page.h"
 #include "exec/tlb-flags.h"
 #include "system/memory.h"
 #include "target/riscv/esp32p4_cpu.h"
@@ -164,27 +166,33 @@ static void esp32p4_clic_claim(ESP32P4CPU *cpu, int id)
 
 /*
  * Fetch the vector table entry at @addr with the execute permission of
- * the current privilege mode, as an instruction fetch: true with the
+ * the current privilege mode, as an instruction fetch: at the address and
+ * with the attributes the core's fetch translation gives it, so through
+ * the core's instruction cache where it is cacheable. True with the
  * handler's address, or false with the core set up to raise the
  * instruction access fault the fetch takes.
  */
+/* [spec:nuos:req:emu.esp32p4.memory] */
 static bool esp32p4_clic_fetch_vector(ESP32P4CPU *cpu, target_ulong addr,
                                       target_ulong *handler)
 {
     CPURISCVState *env = &cpu->parent_obj.env;
     CPUState *cs = CPU(cpu);
-    int mmu_idx = riscv_env_mmu_index(env, true);
+    int mmu_idx = cpu_mmu_index(cs, true);
+    CPUTLBEntryFull *full;
     void *host;
     MemTxResult res;
     uint32_t entry;
 
     addr &= ~(target_ulong)3;
-    if (probe_access_flags(env, addr, 4, MMU_INST_FETCH, mmu_idx, true,
-                           &host, 0) & TLB_INVALID_MASK) {
+    if (probe_access_full(env, addr, 4, MMU_INST_FETCH, mmu_idx, true,
+                          &host, &full, 0) & TLB_INVALID_MASK) {
         cpu->bus_error = false;
     } else {
-        entry = address_space_ldl_le(cs->as, addr, MEMTXATTRS_UNSPECIFIED,
-                                     &res);
+        entry = address_space_ldl_le(cs->as,
+                                     (full->phys_addr & TARGET_PAGE_MASK) |
+                                     (addr & ~TARGET_PAGE_MASK),
+                                     full->attrs, &res);
         if (res == MEMTX_OK) {
             *handler = entry & ~(target_ulong)1;
             return true;

@@ -69,7 +69,9 @@ enum {
  *     LP core (2), each core's TLB fill marking its accesses so. The HP
  *     APM checks them against the core's (and mode's) registers in
  *     HP_PERI_PMS, or LP2HP_PERI_PMS for the LP core, the LP APM against
- *     HP2LP_PERI_PMS, or LP_PERI_PMS for the LP core.
+ *     HP2LP_PERI_PMS, or LP_PERI_PMS for the LP core. An HP core's
+ *     instruction fetches add ESP32P4_REQUESTER_IBUS, which the APMs take
+ *     as the core's, and the caches as the core's instruction bus's.
  *
  *   - ESP32P4_REQUESTER_DMA(master, id): DMA master @master, the
  *     ESP32P4_DMA_MASTER_* number of its read and write permission
@@ -117,6 +119,7 @@ enum {
  */
 #define ESP32P4_REQUESTER_VALID     0x8000
 #define ESP32P4_REQUESTER_IS_DMA    0x4000
+#define ESP32P4_REQUESTER_IBUS      0x2000
 #define ESP32P4_REQUESTER_CPU(id)   (ESP32P4_REQUESTER_VALID | (id))
 #define ESP32P4_REQUESTER_DMA(master, id) \
     (ESP32P4_REQUESTER_VALID | ESP32P4_REQUESTER_IS_DMA | \

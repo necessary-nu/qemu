@@ -63,7 +63,10 @@
  * is made in, MemTxAttrs.user set for user mode, and the core's identity
  * in MemTxAttrs.requester_id, as the bus carries them to the blocks that
  * check them: the access permission managers (hw/misc/esp32p4_pms.c) and
- * the interrupt matrix's secure fields.
+ * the interrupt matrix's secure fields. An instruction fetch, on an MMU
+ * index of its own (ESP32P4_MMU_IDX_IFETCH), is marked as the instruction
+ * bus's too (ESP32P4_REQUESTER_IBUS), for the caches, which serve the
+ * instruction bus from the core's L1 instruction cache.
  *
  * Cacheability (TRM 9.3.1, table 9.3-1): the 0x4xxxxxxx addresses (the
  * flash and PSRAM windows, the HP ROM and L2MEM) are reached through the
@@ -326,6 +329,25 @@ static int esp32p4_page_prot(int privs)
 }
 
 /*
+ * What the HP core's accesses of MMU index mmu_idx carry on the bus: the
+ * core, its mode, and for an instruction fetch the instruction bus.
+ */
+/* [spec:nuos:req:emu.esp32p4.memory] */
+MemTxAttrs esp32p4_hp_attrs(ESP32P4CPU *cpu, int mmu_idx)
+{
+    CPURISCVState *env = &cpu->parent_obj.env;
+    uint16_t rid = ESP32P4_REQUESTER_CPU(env->mhartid);
+
+    if (mmu_idx & ESP32P4_MMU_IDX_IFETCH) {
+        rid |= ESP32P4_REQUESTER_IBUS;
+    }
+    return (MemTxAttrs) {
+        .user = mmuidx_priv(mmu_idx) == PRV_U,
+        .requester_id = rid,
+    };
+}
+
+/*
  * The HP core's TLB fill: the core has no address translation, so the
  * checks above alone decide an access, which carries its privilege mode.
  */
@@ -338,10 +360,7 @@ bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,
     ESP32P4CPU *cpu = container_of(cs, ESP32P4CPU, parent_obj.parent_obj);
     CPURISCVState *env = &cpu->parent_obj.env;
     int priv = mmuidx_priv(mmu_idx);
-    MemTxAttrs attrs = {
-        .user = priv == PRV_U,
-        .requester_id = ESP32P4_REQUESTER_CPU(env->mhartid),
-    };
+    MemTxAttrs attrs = esp32p4_hp_attrs(cpu, mmu_idx);
     int privs = ESP32P4_RWX;
     uint64_t end = (uint64_t)address + MAX(size, 1);
     uint64_t page = address & TARGET_PAGE_MASK;
