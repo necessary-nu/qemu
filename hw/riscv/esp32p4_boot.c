@@ -55,8 +55,9 @@
  *     the ROM's stack frames below sp are not presented.
  *   - The clocks: as from reset, CPU_CLK on XTAL_CLK at 40 MHz (the ROM's
  *     delays count 40 cycles a microsecond) and the PLLs as from reset;
- *     the ROM changes only the flash controller's core clock source
- *     (PERI_CLK_CTRL00, to XTAL_CLK) and the SHA accelerator's clock.
+ *     the ROM changes only the flash controller's core clock divider
+ *     (PERI_CLK_CTRL00's FLASH_CORE_CLK_DIV_NUM, from 3 to 0: XTAL_CLK
+ *     undivided) and the SHA accelerator's clock.
  *   - Core 1: held in reset with its clock off, as the ROM on core 0
  *     leaves it; released, it runs the ROM, which waits for
  *     LP_SYSTEM_BOOT_ADDR_HP_CORE1.
@@ -237,8 +238,11 @@
 #define HP_SYS_CLKRST_HP_RST_EN0    0x500e60c0
 #define HP_SYS_CLKRST_HP_RST_EN1    0x500e60c4
 #define HP_SYS_CLKRST_HP_RST_EN2    0x500e60c8
-/* PERI_CLK_CTRL00's flash MSPI core clock source, set to XTAL_CLK. */
-#define FLASH_CORE_CLK_SRC          (3u << 4)
+/*
+ * PERI_CLK_CTRL00's FLASH_CORE_CLK_DIV_NUM, 3 from reset, which the ROM
+ * clears: the flash MSPI core clock XTAL_CLK undivided.
+ */
+#define FLASH_CORE_CLK_DIV_RESET    (3u << 4)
 #define RST_EN_SPI01                BIT(23)
 #define RST_EN_MSPI_AXI             BIT(24)
 #define RST_EN_UART0_APB            BIT(13)
@@ -465,7 +469,7 @@ static void rom_flash_boot(ESP32P4MachineState *s)
     }
     rom_wr(SPI0_BASE + SPI_MEM_CACHE_FCTRL, 0xc0000000);
     rom_wr(HP_SYS_CLKRST_SOC_CLK_CTRL0, rom_rd(HP_SYS_CLKRST_SOC_CLK_CTRL0));
-    rom_clr(HP_SYS_CLKRST_PERI_CLK_CTRL00, FLASH_CORE_CLK_SRC);
+    rom_clr(HP_SYS_CLKRST_PERI_CLK_CTRL00, FLASH_CORE_CLK_DIV_RESET);
     rom_set(HP_SYS_CLKRST_HP_RST_EN0, RST_EN_SPI01 | RST_EN_MSPI_AXI);
     rom_clr(HP_SYS_CLKRST_HP_RST_EN0, RST_EN_MSPI_AXI);
     rom_clr(HP_SYS_CLKRST_HP_RST_EN0, RST_EN_SPI01);
