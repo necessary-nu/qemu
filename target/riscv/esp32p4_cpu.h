@@ -104,6 +104,17 @@ OBJECT_DECLARE_TYPE(ESP32P4CPU, ESP32P4CPUClass, ESP32P4_CPU)
 typedef void (*ESP32P4LPBootFn)(void *opaque, uint32_t *pc,
                                 uint32_t *mtvec);
 
+/*
+ * The HP core's instruction fetches have MMU indexes of their own, their
+ * privilege mode's (riscv_env_mmu_index()) with this bit added, so that
+ * QEMU's TLB keeps their translations apart from the loads' and stores':
+ * the fetches go through the core's L1 instruction cache and the loads and
+ * stores through the L1 data cache, whose contents differ
+ * (hw/misc/esp32p4_cache.c). The TLB fill marks a fetch's accesses with
+ * ESP32P4_REQUESTER_IBUS.
+ */
+#define ESP32P4_MMU_IDX_IFETCH 0x10
+
 /* The HP core's hardware loops (TRM 2.7.1) and debug triggers (2.11.3). */
 #define ESP32P4_HWLP_LOOPS 2
 #define ESP32P4_TRIGGERS 3
@@ -698,6 +709,7 @@ RISCVException esp32p4_clic_nxti(ESP32P4CPU *cpu, int priv,
                                  target_ulong write_mask);
 
 /* esp32p4_pmp.c */
+MemTxAttrs esp32p4_hp_attrs(ESP32P4CPU *cpu, int mmu_idx);
 bool esp32p4_hp_tlb_fill(CPUState *cs, vaddr address, int size,
                          MMUAccessType access_type, int mmu_idx,
                          bool probe, uintptr_t retaddr);

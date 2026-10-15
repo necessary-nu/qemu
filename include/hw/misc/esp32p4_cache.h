@@ -81,6 +81,25 @@ enum {
     ESP32P4_CACHE_NRESETS,
 };
 
+/*
+ * The L1 caches, each with its own lines: HP core 0's and HP core 1's
+ * instruction caches and the data cache both cores share (TRM figure
+ * 9.3-3).
+ */
+enum {
+    ESP32P4_CACHE_L1_I0,
+    ESP32P4_CACHE_L1_I1,
+    ESP32P4_CACHE_L1_D,
+    ESP32P4_CACHE_NL1,
+};
+
+/* An L1 cache's state for the lines of a view, per 64-byte line. */
+typedef struct ESP32P4CacheL1 {
+    unsigned long *valid;
+    unsigned long *lock;
+    int32_t nlines;
+} ESP32P4CacheL1;
+
 typedef struct ESP32P4CacheView {
     IOMMUMemoryRegion iommu;
     struct ESP32P4CacheState *cache;
@@ -88,24 +107,35 @@ typedef struct ESP32P4CacheView {
     uint64_t size;
 
     /*
-     * What the translations reach: the L1 contents at 0, and the region
-     * through which the accesses the L1 does not hold go, at `size`.
+     * What the translations reach, `size` apart: the data cache's
+     * contents as a ROM device, which a load reads directly and a store
+     * writes through the controller; the same contents as RAM; each
+     * instruction cache's contents; and the region through which the
+     * accesses no cache's contents serve go.
      */
     MemoryRegion target;
     AddressSpace target_as;
-    MemoryRegion l1;
+    MemoryRegion l1[ESP32P4_CACHE_NL1];
+    MemoryRegion l1d_ram;
     MemoryRegion miss;
-    /* The L1 contents as last made clean, and the L2 contents. */
-    MemoryRegion l1_clean;
     MemoryRegion l2;
+    /* The host memory of each cache's contents. */
+    uint8_t *l1_host[ESP32P4_CACHE_NL1];
+    uint8_t *l2_host;
 
+    ESP32P4CacheL1 l1c[ESP32P4_CACHE_NL1];
     /* Per 64-byte line. */
-    unsigned long *l1_valid;
-    unsigned long *l1_lock;
+    unsigned long *l1d_dirty;
     unsigned long *l2_valid;
     unsigned long *l2_dirty;
     unsigned long *l2_lock;
     int32_t nlines;
+    /*
+     * Per 4 KiB page: whether a core may have been given a translation
+     * that stores to the data cache's contents directly.
+     */
+    unsigned long *l1d_direct;
+    int32_t npages;
 } ESP32P4CacheView;
 
 struct ESP32P4CacheState {
@@ -119,6 +149,7 @@ struct ESP32P4CacheState {
     ESP32P4MSPIState *flash_mspi;
     ESP32P4MSPIState *psram_mspi;
     MemoryRegion *l2mem_mr;
+    uint8_t *l2mem_host;
     ESP32P4HPSysState *hp_sys;
 
     qemu_irq irq;
