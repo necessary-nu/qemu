@@ -445,6 +445,54 @@ static void pcnt_bulk_advance(Esp32PcntState *s, unsigned i,
 }
 
 /*
+ * The unit's counter after a watch point's edge of its fast input, and the
+ * input's levels: the same after two such edges in a row, the edges from
+ * each to the next repeat.
+ */
+typedef struct PcntRepeat {
+    int input;
+    Esp32PcntUnit un;
+    bool raw;
+    bool filt;
+} PcntRepeat;
+
+static bool pcnt_unit_same(const Esp32PcntUnit *a, const Esp32PcntUnit *b)
+{
+    return a->cnt == b->cnt && a->status == b->status;
+}
+
+/*
+ * After a watch point's edge of the fast input i, the same state as after
+ * the one before, `period` filtered edges back: the edges repeat, every
+ * watch point matching as these did, the interrupt it raises already
+ * raised. Take whole repetitions at once, as many as end by `bound`.
+ */
+static void pcnt_bulk_repeat(Esp32PcntState *s, unsigned i, uint64_t period,
+                             int64_t bound)
+{
+    Esp32PcntFeed f = pcnt_feed(s, i);
+    uint64_t lo = 0, hi = 1, mid;
+
+    while (hi <= UINT64_MAX / 4 / period &&
+           esp32_pcnt_feed_time(&f, hi * period) <= bound) {
+        lo = hi;
+        hi *= 2;
+    }
+    while (hi - lo > 1) {
+        mid = lo + (hi - lo) / 2;
+        if (esp32_pcnt_feed_time(&f, mid * period) <= bound) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo) {
+        esp32_pcnt_feed_advance(&f, esp32_pcnt_feed_time(&f, lo * period));
+        pcnt_feed_store(s, i, &f);
+    }
+}
+
+/*
  * [spec:nuos:req:emu.esp32.pcnt]
  * Bring unit u up to time t: every change of its inputs that has matured
  * by then passed through the filter, oldest first, and its inputs taking
@@ -455,6 +503,8 @@ static void pcnt_bulk_advance(Esp32PcntState *s, unsigned i,
  */
 static void pcnt_sync_unit(Esp32PcntState *s, unsigned u, int64_t t)
 {
+    PcntRepeat rep = { .input = -1 };
+
     for (;;) {
         Esp32PcntFeed fa;
         int a = pcnt_bulk_fast(s, u, &fa);
@@ -502,10 +552,20 @@ static void pcnt_sync_unit(Esp32PcntState *s, unsigned u, int64_t t)
                 esp32_pcnt_feed_advance(&fa, ta);
                 pcnt_feed_store(s, a, &fa);
                 pcnt_edge(s, u, a % UI, s->filt[a]);
+                if (rep.input == a && s->raw[a] == s->filt[a] &&
+                    rep.raw == s->raw[a] && rep.filt == s->filt[a] &&
+                    pcnt_unit_same(&rep.un, &s->unit[u])) {
+                    pcnt_bulk_repeat(s, a, ma, MIN(la, MIN(tm, te) - 1));
+                }
+                rep = (PcntRepeat) {
+                    .input = a, .un = s->unit[u],
+                    .raw = s->raw[a], .filt = s->filt[a],
+                };
                 continue;
             }
             pcnt_bulk_advance(s, a, &fa, tm == y && mat < a ? y - 1 : y);
         }
+        rep.input = -1;
         if (tm <= te) {
             s->filt[mat] = s->raw[mat];
             pcnt_edge(s, u, mat % UI, s->filt[mat]);
@@ -627,10 +687,10 @@ static void pcnt_input_change(Esp32PcntState *s, int n, bool level,
                               int64_t t)
 {
     /* A change already held long enough happened before this one */
-    pcnt_sync(s, t);
+    pcnt_sync_unit(s, n / UI, t);
     s->raw[n] = level;
     s->raw_since_ns[n] = t;
-    pcnt_sync(s, t);
+    pcnt_sync_unit(s, n / UI, t);
 }
 
 /*
