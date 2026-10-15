@@ -33,8 +33,8 @@
  * RMT receiver) sees the pulses the channel made. Only changes more than
  * ESP32_LINE_MAX_LAG_NS (1 s) behind the present as the channel comes to
  * them (include/hw/gpio/esp32_line.h), a host slower than the edges it is
- * to drive, are lost: the output skips to its level at
- * esp32_line_lag_horizon() and goes on change by change from there.
+ * to drive, make the output skip to its level at the moment it is being
+ * brought to, the changes in between lost.
  */
 
 #include "qemu/osdep.h"
@@ -503,7 +503,8 @@ static void chan_rebase(Esp32LEDCState *s, unsigned n, uint64_t k_old,
  * describes. While SIG_OUT_EN is clear the output holds IDLE_LV, and the
  * generator's edges change nothing outside: its level is taken only where
  * a load, or the caller, needs it. An edge that lags (esp32_line_lags())
- * skips the output to its level at esp32_line_lag_horizon().
+ * skips the output to its level at limit, or before the load or fade end
+ * that comes first.
  */
 static void chan_eval(Esp32LEDCState *s, unsigned n, int64_t limit,
                       bool inclusive)
@@ -528,14 +529,13 @@ static void chan_eval(Esp32LEDCState *s, unsigned n, int64_t limit,
             }
         } else if (e != INT64_MAX && e < e_struct && e <= last &&
                    esp32_line_lags(e)) {
-            int64_t x = MIN(MIN(esp32_line_lag_horizon(), last),
-                            e_struct - 1);
+            int64_t x = MIN(last, e_struct - 1);
 
             if (!s->lag_logged) {
                 s->lag_logged = true;
                 qemu_log_mask(LOG_UNIMP, "esp32_ledc: the host is too slow "
-                              "for channel %u's edges: those a second "
-                              "behind are lost\n", n);
+                              "for channel %u's edges: they skip to the "
+                              "present\n", n);
             }
             ch->eval_ns = x;
             ch->gen_level = chan_level_at(s, n, x);

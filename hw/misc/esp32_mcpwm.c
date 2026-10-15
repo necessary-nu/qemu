@@ -57,15 +57,16 @@
  * when that work is more than ESP32_LINE_MAX_LAG_NS (1 s) behind the
  * present as the block comes to it (a host slower than the edges it is to
  * drive, which would never catch up: include/hw/gpio/esp32_line.h) does
- * the block skip ahead, to esp32_line_lag_horizon(), the edges in between
- * lost; each output it then drives is stamped with the moment it last
- * changed, so that no edge carries a time other than its own. Under
- * icount it never does. An input acts at the time its change is stamped with,
- * so that a capture of an edge another block drives through the GPIO
- * matrix, or this block's own output coming back, reads the capture timer
- * at that edge. Whenever software samples the pads the outputs are
- * brought to their exact levels; a register access first brings every
- * other source of line changes up to the moment it began, and acts there.
+ * the block skip ahead, to the moment it is being brought to, the edges
+ * in between lost; each output it then drives is stamped with the moment
+ * it last changed, so that no edge carries a time other than its own.
+ * Under icount it never does. An input acts at the time its change is
+ * stamped with, so that a capture of an edge another block drives
+ * through the GPIO matrix, or this block's own output coming back, reads
+ * the capture timer at that edge. Whenever software samples the pads the
+ * outputs are brought to their exact levels; a register access first
+ * brings every other source of line changes up to the moment it began,
+ * and acts there.
  *
  * The ESP32-P4's block (TRM chapter 59) is this one with:
  *   - Its clock, MCPWMn_CLK, from HP_SYS_CLKRST's source mux and divider:
@@ -1815,13 +1816,39 @@ static void mcpwm_timer_fire(Esp32McpwmState *s);
 static void mcpwm_skip(Esp32McpwmState *s, int64_t t);
 
 /*
+ * The timer set for due_ns (armed) or not. While the block catches up
+ * (catching_up) the QEMU timer is left as it is and set once the catch-up
+ * is over (mcpwm_timer_apply()): every firing on the way sets the timer
+ * for the next, and a QEMU timer set before every other at each would
+ * cost the main loop a wakeup every edge.
+ */
+static void mcpwm_timer_apply(Esp32McpwmState *s)
+{
+    if (!s->armed) {
+        timer_del(s->timer);
+    } else if (!timer_pending(s->timer) ||
+               timer_expire_time_ns(s->timer) != s->due_ns) {
+        timer_mod(s->timer, s->due_ns);
+    }
+}
+
+static void mcpwm_arm(Esp32McpwmState *s, bool armed)
+{
+    s->armed = armed;
+    if (!s->catching_up) {
+        mcpwm_timer_apply(s);
+    }
+}
+
+/*
  * [spec:nuos:req:emu.esp32.mcpwm]
  * [spec:nuos:req:emu.esp32p4.pwm]
  * The timer's work, due at due_ns, done by `limit`: a firing at its due
  * time, or, on the host's clock more than ESP32_LINE_MAX_LAG_NS behind
- * the present (esp32_line_lags()), a skip to esp32_line_lag_horizon(),
- * the earliest moment not that far behind, or to `limit` if that is
- * earlier.
+ * the present (esp32_line_lags()), a skip to `limit`, as a stream that
+ * falls that far behind goes on from the present: a host that slow
+ * cannot follow the edges, and a skip to any earlier moment would leave
+ * the block behind still, skipping again at every edge.
  */
 static void mcpwm_due(Esp32McpwmState *s, int64_t limit)
 {
@@ -1829,10 +1856,9 @@ static void mcpwm_due(Esp32McpwmState *s, int64_t limit)
         if (!s->lag_logged) {
             s->lag_logged = true;
             qemu_log_mask(LOG_UNIMP, "esp32_mcpwm: the host is too slow for "
-                          "the outputs' edges: those a second behind are "
-                          "lost\n");
+                          "the outputs' edges: they skip to the present\n");
         }
-        mcpwm_skip(s, MIN(esp32_line_lag_horizon(), limit));
+        mcpwm_skip(s, limit);
     } else {
         mcpwm_timer_fire(s);
     }
@@ -1847,10 +1873,16 @@ static void mcpwm_due(Esp32McpwmState *s, int64_t limit)
  */
 static void mcpwm_catch_up(Esp32McpwmState *s, int64_t limit)
 {
-    while (!s->in_timer_cb && timer_pending(s->timer) &&
-           s->due_ns <= limit) {
-        timer_del(s->timer);
+    bool outer = !s->catching_up;
+
+    s->catching_up = true;
+    while (!s->in_timer_cb && s->armed && s->due_ns <= limit) {
+        s->armed = false;
         mcpwm_due(s, limit);
+    }
+    if (outer) {
+        s->catching_up = false;
+        mcpwm_timer_apply(s);
     }
 }
 
@@ -1897,7 +1929,7 @@ static void mcpwm_schedule(Esp32McpwmState *s)
 
     s->schedule_stale = false;
     if (!clock_is_enabled(s->core_clk)) {
-        timer_del(s->timer);
+        mcpwm_arm(s, false);
         return;
     }
     w.driven = s->out_level;
@@ -1906,11 +1938,11 @@ static void mcpwm_schedule(Esp32McpwmState *s)
     w.etm = s->p4 ? core_etm_enabled(&s->core) : 0;
     seen = core_look_ahead(&s->core, &w, &when);
     if (seen == SEEN_NOTHING) {
-        timer_del(s->timer);
+        mcpwm_arm(s, false);
         return;
     }
     s->due_ns = mcpwm_ns_at(s, when);
-    timer_mod(s->timer, s->due_ns);
+    mcpwm_arm(s, true);
 }
 
 /*
@@ -2080,7 +2112,7 @@ static void mcpwm_skip_run(void *opaque)
 /* Skip to time t, the timer's work due before it undone (mcpwm_skip_run()) */
 static void mcpwm_skip(Esp32McpwmState *s, int64_t t)
 {
-    timer_del(s->timer);
+    mcpwm_arm(s, false);
     esp32_line_run_at(t, mcpwm_skip_run, s);
 }
 
@@ -2095,7 +2127,10 @@ static void mcpwm_timer_run(void *opaque)
     Esp32McpwmState *s = opaque;
     int64_t limit = mcpwm_present(s);
 
+    s->catching_up = true;
+    s->armed = false;
     mcpwm_due(s, limit);
+    s->catching_up = false;
     mcpwm_catch_up(s, limit);
 }
 
@@ -3024,7 +3059,8 @@ static void esp32_mcpwm_reset_hold(Object *obj, ResetType type)
     Esp32McpwmCore *c = &s->core;
     bool fault_in[ESP32_MCPWM_FAULTS];
 
-    timer_del(s->timer);
+    s->catching_up = false;
+    mcpwm_arm(s, false);
     mcpwm_changed(s);
     if (s->p4) {
         s->p4_edges = esp32p4_clk_edges_or_at(
@@ -3260,10 +3296,21 @@ static const VMStateDescription vmstate_esp32p4_mcpwm_period = {
     },
 };
 
+/* Whether the timer is set is the QEMU timer's, which migration carries */
+static int esp32_mcpwm_post_load(void *opaque, int version_id)
+{
+    Esp32McpwmState *s = opaque;
+
+    s->armed = timer_pending(s->timer);
+    s->catching_up = false;
+    return 0;
+}
+
 static const VMStateDescription vmstate_esp32_mcpwm = {
     .name = TYPE_ESP32_MCPWM,
     .version_id = 5,
     .minimum_version_id = 5,
+    .post_load = esp32_mcpwm_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(core_clk, Esp32McpwmState),
         VMSTATE_CLOCK(cap_clk, Esp32McpwmState),

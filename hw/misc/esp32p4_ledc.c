@@ -106,14 +106,15 @@
  * event is pulsed stamped with its time, in time order with the edges,
  * and a task acts at the time its pulse is stamped with. On the host's
  * clock an output the host held up catches up edge by edge, each at its
- * own time; only its edges more than ESP32_LINE_MAX_LAG_NS (1 s) behind
- * the present as it comes to them (the host slower than the edges it is
- * to drive, include/hw/gpio/esp32_line.h) are lost, the output taking up
- * its level at esp32_line_lag_horizon(), stamped with the moment that
- * level began, so that no edge carries a time other than its own; under
- * icount none is. An output that reaches no pad something watches (an input a modelled block
- * takes from it, an interrupt type, an ETM channel, a line the board
- * listens to: esp32p4_gpio_sig_out_watched()) is not timed edge by edge:
+ * own time; only an edge more than ESP32_LINE_MAX_LAG_NS (1 s) behind the
+ * present as it comes to it (the host slower than the edges it is to
+ * drive, include/hw/gpio/esp32_line.h) makes it skip to its level at the
+ * moment it is being brought to, stamped with the moment that level
+ * began, the edges in between lost, so that no edge carries a time other
+ * than its own; under icount none is. An output that reaches no pad
+ * something watches (an input a modelled block takes from it, an
+ * interrupt type, an ETM channel, a line the board listens to:
+ * esp32p4_gpio_sig_out_watched()) is not timed edge by edge:
  * nothing sees its edges, and it takes its level of the moment whenever
  * the controller is brought up to date, so that it costs the host nothing
  * however fast.
@@ -774,9 +775,11 @@ static int64_t chan_last_edge(ESP32P4LedcState *s, int n, int64_t from,
  * Run a channel's output up to limit (and including it with inclusive),
  * each edge at its own time. On the host's clock an edge more than
  * ESP32_LINE_MAX_LAG_NS behind the present as the output comes to it
- * (esp32_line_lags()) is lost with every other that lags: the output
- * skips to its level at esp32_line_lag_horizon(), stamped with the edge
- * that began that level, and goes on edge by edge from there.
+ * (esp32_line_lags()) makes the output skip to its level at limit,
+ * stamped with the edge that began that level, the edges in between
+ * lost: a host that slow cannot follow them, and a skip to any earlier
+ * moment would leave the output behind still, skipping again at every
+ * edge.
  */
 static void chan_eval(ESP32P4LedcState *s, int n, int64_t limit,
                       bool inclusive)
@@ -807,8 +810,7 @@ static void chan_eval(ESP32P4LedcState *s, int n, int64_t limit,
             break;
         }
         if (esp32_line_lags(e)) {
-            /* e <= x: e lags, and it is no later than last */
-            int64_t x = MIN(esp32_line_lag_horizon(), last);
+            int64_t x = last;
             bool level = chan_level_at(s, n, x);
             int64_t began = level == ch->out_level ? x :
                             chan_last_edge(s, n, ch->eval_ns, x);
@@ -816,8 +818,8 @@ static void chan_eval(ESP32P4LedcState *s, int n, int64_t limit,
             if (!s->lag_logged) {
                 s->lag_logged = true;
                 qemu_log_mask(LOG_UNIMP, "esp32p4_ledc: the host is too "
-                              "slow for channel %d's edges: those a second "
-                              "behind are lost\n", n);
+                              "slow for channel %d's edges: they skip to the "
+                              "present\n", n);
             }
             ch->eval_ns = x;
             ch->gen_level = level;

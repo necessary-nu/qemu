@@ -77,16 +77,13 @@ void esp32_line_sync(void);
  * for it, ever longer.
  *
  * A PWM output (LEDC's channels, MCPWM's generators), whose edges follow
- * a counter software reads, keeps its timing: its edges that lag are lost
- * instead, the output taking up its level at esp32_line_lag_horizon(),
- * the earliest time an event may be due at without lagging, stamped with
- * the moment that level began, and the edges after it each at its own
- * time.
+ * a counter software reads, keeps its timing: it goes on from the present
+ * by skipping to its level at the moment it is being brought to, stamped
+ * with the moment that level began, the edges in between lost.
  */
 #define ESP32_LINE_MAX_LAG_NS   NANOSECONDS_PER_SECOND
 
 bool esp32_line_lags(int64_t due_ns);
-int64_t esp32_line_lag_horizon(void);
 
 /*
  * The routing of a GPIO matrix, for a block both chips have whose outputs
