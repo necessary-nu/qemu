@@ -35,8 +35,10 @@
  * Input changes are timed by the virtual time stamps of the wire's
  * changes (hw/gpio/esp32_line.h), not by when the model happens to run,
  * so a burst of edges delivered late, or a late timer, cannot lose an edge
- * or reorder edges between inputs; whenever software reads the registers,
- * the line sources are brought up to the present first.
+ * or reorder edges between inputs. A register access and the filter's
+ * timer act at one moment: the line sources are brought up to it first,
+ * and the filters judge their waiting changes at that same moment, so a
+ * pulse is filtered by its width on the wire whatever the host does.
  *
  * Behaviour the TRM leaves open, as modelled:
  * - The step comparator (PCNT_DELTA_CHANGE_EN_Un, PCNT_Un_CHANGE_CONF),
@@ -330,11 +332,27 @@ static void pcnt_schedule(ESP32P4PcntState *s)
     }
 }
 
-/* Bring the line sources, then the filters, up to the present. */
-static void pcnt_catch_up(ESP32P4PcntState *s)
+static void pcnt_sync_sources(void *opaque)
 {
     esp32_line_sync();
-    pcnt_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.rmt-pcnt]
+ * Bring every source of line changes, then the filters, up to now
+ * (esp32_line_time()), and return that moment. The filters are judged at
+ * the moment the sources were brought to, not at one read afresh: without
+ * icount virtual time runs on while the sources run, and a filter judged
+ * later than a source had got to would pass the start of a glitch whose
+ * end the source has yet to put out.
+ */
+static int64_t pcnt_catch_up(ESP32P4PcntState *s)
+{
+    int64_t t = esp32_line_time();
+
+    esp32_line_run_at(t, pcnt_sync_sources, NULL);
+    pcnt_sync(s, t);
+    return t;
 }
 
 static void pcnt_filter_cb(void *opaque)
@@ -430,16 +448,17 @@ static void esp32p4_pcnt_write(void *opaque, hwaddr addr, uint64_t value,
     ESP32P4PcntState *s = opaque;
     uint32_t v = value;
     unsigned u;
+    int64_t now;
 
     /* Edges that matured before the write are counted under the old state */
-    pcnt_catch_up(s);
+    now = pcnt_catch_up(s);
     switch (addr) {
     case A_CONF0(0) ... A_CONF2(NU - 1):
         u = addr / 0x0c;
         if (addr % 0x0c == 0) {
             s->unit[u].conf0 = v;
             /* A new filter setting applies to changes already waiting */
-            pcnt_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+            pcnt_sync(s, now);
         } else if (addr % 0x0c == 4) {
             s->unit[u].conf1 = v;
         } else {
