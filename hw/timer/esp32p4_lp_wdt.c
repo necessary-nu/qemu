@@ -75,6 +75,7 @@
 #include "hw/timer/esp32p4_lp_wdt.h"
 #include "migration/vmstate.h"
 #include "system/runstate.h"
+#include "target/riscv/esp32p4_cpu.h"
 
 #define A_CONFIG0           0x00
 #define A_CONFIG1           0x04
@@ -547,17 +548,29 @@ static bool lp_wdt_read_reg(ESP32P4LPWdtState *s, hwaddr addr, uint32_t *v)
     }
 }
 
-static uint64_t lp_wdt_read(void *opaque, hwaddr addr, unsigned size)
+/*
+ * [spec:nuos:req:emu.esp32p4.timers]
+ * An access first takes what fell due by then; a reset or stall of the
+ * core making it among that (a stage's CPU or HP core reset, a system
+ * reset) comes before the access, which the core does not make
+ * (esp32p4_cpu_access_stopped()).
+ */
+static MemTxResult lp_wdt_read(void *opaque, hwaddr addr, uint64_t *data,
+                               unsigned size, MemTxAttrs attrs)
 {
     ESP32P4LPWdtState *s = opaque;
     uint32_t v;
 
     lp_wdt_access_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    if (esp32p4_cpu_access_stopped(attrs)) {
+        return MEMTX_ERROR;
+    }
     if (!lp_wdt_read_reg(s, addr & ~3, &v)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of reserved offset 0x%"
                       HWADDR_PRIx "\n", TYPE_ESP32P4_LP_WDT, addr);
     }
-    return extract32(v, (addr & 3) * 8, size * 8);
+    *data = extract32(v, (addr & 3) * 8, size * 8);
+    return MEMTX_OK;
 }
 
 /* [spec:nuos:req:emu.esp32p4.timers] */
@@ -664,8 +677,8 @@ static void lp_wdt_write_reg(ESP32P4LPWdtState *s, hwaddr addr,
     }
 }
 
-static void lp_wdt_write(void *opaque, hwaddr addr, uint64_t data,
-                         unsigned size)
+static MemTxResult lp_wdt_write(void *opaque, hwaddr addr, uint64_t data,
+                                unsigned size, MemTxAttrs attrs)
 {
     ESP32P4LPWdtState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -675,16 +688,20 @@ static void lp_wdt_write(void *opaque, hwaddr addr, uint64_t data,
     uint32_t old;
 
     lp_wdt_access_catch_up(s, now);
+    if (esp32p4_cpu_access_stopped(attrs)) {
+        return MEMTX_ERROR;
+    }
     lp_wdt_read_reg(s, addr & ~3, &old);
     if ((addr & ~3) == A_SWD_CONFIG) {
         old &= ~SWD_RESET_FLAG;
     }
     lp_wdt_write_reg(s, addr & ~3, (old & ~lanes) | ones, ones, now);
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps lp_wdt_ops = {
-    .read = lp_wdt_read,
-    .write = lp_wdt_write,
+    .read_with_attrs = lp_wdt_read,
+    .write_with_attrs = lp_wdt_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,

@@ -123,10 +123,13 @@
  *     is not modelled (logged).
  *   - Register accesses, VDMA's reads and its acknowledges, and the
  *     stream's arrivals, first end a request interval that fell due
- *     before them, at its time. A register access first brings in what
- *     the stream has brought by then, the camera's packets through the
- *     host (the "host" link) and the ISP's rows, whose QEMU timers run
- *     late without icount.
+ *     before them, at its time. A register access, VDMA's read of the
+ *     port and an access to VDMA's registers first bring in what the
+ *     stream has brought by then, the camera's packets through the host
+ *     (the "host" link) and the ISP's rows, whose QEMU timers run late
+ *     without icount; each of the stream's arrivals, and a register
+ *     access, first brings in VDMA's rounds due by then (the "vdma"
+ *     link), whose QEMU timer runs late as well.
  */
 
 #include "qemu/osdep.h"
@@ -1109,20 +1112,77 @@ void esp32p4_csi_bridge_sync_host(ESP32P4CsiBridgeState *s)
 
 /*
  * [spec:nuos:req:emu.esp32p4.mipi]
- * A register access at esp32_line_time(): first the stream the bridge
- * takes in, up to then, whose stages' QEMU timers, late without icount,
- * have yet to bring it: the camera's packets through the host, then the
- * ISP's rows due by then (its sync hook); each reaches the bridge at its
- * own time. Then the bridge's own request interval. The buffer's fill,
- * the interrupts and the requests to VDMA are then as at the access.
+ * The stream the bridge takes in, up to esp32_line_time(), whose stages'
+ * QEMU timers, late without icount, have yet to bring it: the camera's
+ * packets through the host, then the ISP's rows due by then (its sync
+ * hook); each reaches the bridge at its own time, VDMA's rounds due by
+ * then first (brg_dma_catch_up()). Not again while it is under way: an
+ * event it brings can have VDMA read the port.
  */
-static void brg_access_catch_up(ESP32P4CsiBridgeState *s)
+static void brg_stream_sync(ESP32P4CsiBridgeState *s)
 {
+    if (s->in_stream) {
+        return;
+    }
+    s->in_stream = true;
     esp32p4_csi_bridge_sync_host(s);
     if (s->isp_ops && s->isp_ops->sync) {
         s->isp_ops->sync(s->isp);
     }
-    brg_catch_up(s);
+    s->in_stream = false;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.mipi]
+ * The request intervals' ends and VDMA's rounds due by esp32_line_time(),
+ * in the order of their times, before the buffer takes the stream's next
+ * event or shows its fill: an interval's end raises the request a round
+ * of VDMA's takes, whose acknowledge starts the next interval, and VDMA's
+ * QEMU timer can run late as the bridge's does. Else the buffer would take
+ * the event short of the room VDMA had made by then (an overrun the chip
+ * never has), and show the words VDMA had read. VDMA's reads of the port
+ * come during the bridge's own register access, then, which the port
+ * allows.
+ */
+static void brg_dma_catch_up(ESP32P4CsiBridgeState *s)
+{
+    int64_t now = esp32_line_time();
+
+    for (;;) {
+        bool end = timer_pending(s->req_timer) && s->req_hold_ns <= now;
+
+        if (s->vdma) {
+            esp32p4_dw_gdma_sync(s->vdma, end ? s->req_hold_ns : now);
+        }
+        if (!timer_pending(s->req_timer) || s->req_hold_ns > now) {
+            return;
+        }
+        brg_catch_up(s);
+    }
+}
+
+/* An access to VDMA's registers: the stream and the requests up to it. */
+static void brg_vdma_source(Notifier *n, void *data)
+{
+    ESP32P4CsiBridgeState *s = container_of(n, ESP32P4CsiBridgeState,
+                                            vdma_source);
+
+    brg_stream_sync(s);
+    brg_dma_catch_up(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.mipi]
+ * A register access at esp32_line_time(): first the stream the bridge
+ * takes in, up to then, the request intervals and VDMA's rounds due
+ * before each of its events and by the access, all in the order of their
+ * times. The buffer's fill, the interrupts and the requests to VDMA are
+ * then as at the access.
+ */
+static void brg_access_catch_up(ESP32P4CsiBridgeState *s)
+{
+    brg_stream_sync(s);
+    brg_dma_catch_up(s);
 }
 
 static void brg_hs_ack(void *opaque, int n, int level)
@@ -1163,12 +1223,19 @@ static uint32_t brg_buf_in(ESP32P4CsiBridgeState *s, const uint8_t *b,
     return n;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.mipi]
+ * VDMA reads the port at esp32_line_time(), its round's time: the stream
+ * first brought up to then, which its stages' QEMU timers, late without
+ * icount, may have yet to bring.
+ */
 static uint64_t brg_mem_read(void *opaque, hwaddr addr, unsigned size)
 {
     ESP32P4CsiBridgeState *s = opaque;
     uint8_t b[8] = { 0 };
     uint32_t n;
 
+    brg_stream_sync(s);
     brg_catch_up(s);
     n = MIN(size, s->buf_num);
     if (n < size) {
@@ -1255,7 +1322,7 @@ static void tail_frame_start(void *opaque, uint8_t vc, uint16_t number,
 {
     ESP32P4CsiBridgeState *s = opaque;
 
-    brg_catch_up(s);
+    brg_dma_catch_up(s);
     if (s->capturing) {
         brg_frame_close(s, true);
     }
@@ -1278,7 +1345,7 @@ static void tail_line(void *opaque, const ESP32P4CsiIdiLine *l)
     g_autofree uint8_t *b = NULL;
     uint64_t f;
 
-    brg_catch_up(s);
+    brg_dma_catch_up(s);
     if (!s->capturing || l->dt < (dtc & 0x3f) || l->dt > extract32(dtc, 8, 6)) {
         return;
     }
@@ -1320,7 +1387,7 @@ static void tail_frame_end(void *opaque, uint8_t vc, uint16_t number,
 {
     ESP32P4CsiBridgeState *s = opaque;
 
-    brg_catch_up(s);
+    brg_dma_catch_up(s);
     if (s->capturing) {
         brg_frame_close(s, false);
     }
@@ -1700,6 +1767,8 @@ static void brg_init(Object *obj)
                           ESP32P4_CSI_REGS_SIZE);
     memory_region_init_io(&s->mem, obj, &brg_mem_ops, s,
                           "esp32p4.mipi-csi-mem", ESP32P4_CSI_MEM_SIZE);
+    /* VDMA's reads, which the stream's events bring in, during any access */
+    s->mem.disable_reentrancy_guard = true;
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
@@ -1712,6 +1781,16 @@ static void brg_init(Object *obj)
     qdev_init_gpio_out_named(dev, &s->enableclk, ESP32P4_CSI_ENABLECLK, 1);
     qdev_init_gpio_in_named(dev, brg_hs_ack, ESP32P4_CSI_HS_ACK, 1);
     s->req_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, brg_req_timer_cb, s);
+}
+
+static void brg_realize(DeviceState *dev, Error **errp)
+{
+    ESP32P4CsiBridgeState *s = ESP32P4_CSI_BRIDGE(dev);
+
+    if (s->vdma) {
+        s->vdma_source.notify = brg_vdma_source;
+        esp32p4_dw_gdma_add_source(s->vdma, &s->vdma_source);
+    }
 }
 
 static void brg_finalize(Object *obj)
@@ -1751,6 +1830,8 @@ static const VMStateDescription vmstate_brg = {
 static const Property brg_properties[] = {
     DEFINE_PROP_LINK("host", ESP32P4CsiBridgeState, host,
                      TYPE_ESP32P4_CSI_HOST, ESP32P4CsiHostState *),
+    DEFINE_PROP_LINK("vdma", ESP32P4CsiBridgeState, vdma,
+                     TYPE_ESP32P4_DW_GDMA, ESP32P4DwGdmaState *),
 };
 
 static void brg_class_init(ObjectClass *klass, const void *data)
@@ -1759,6 +1840,7 @@ static void brg_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->vmsd = &vmstate_brg;
+    dc->realize = brg_realize;
     device_class_set_props(dc, brg_properties);
     rc->phases.hold = brg_reset_hold;
     rc->phases.exit = brg_reset_exit;

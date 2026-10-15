@@ -205,6 +205,7 @@
 #include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_pmu.h"
 #include "migration/vmstate.h"
+#include "target/riscv/esp32p4_cpu.h"
 
 #define R(a)                    ((a) / 4)
 
@@ -1799,19 +1800,34 @@ static void pmu_catch_up(ESP32P4PMUState *s)
     }
 }
 
-static uint64_t esp32p4_pmu_read(void *opaque, hwaddr addr, unsigned size)
+/*
+ * [spec:nuos:req:emu.esp32p4.low-power]
+ * An access first takes what fell due by then; a step among that which
+ * stalls, clocks off or resets the core making it (the sleep sequence's,
+ * the LP CPU's sleep process) comes before the access, which the core
+ * does not make then (esp32p4_cpu_access_stopped()): a core stalled
+ * makes it as it goes on.
+ */
+static MemTxResult esp32p4_pmu_read(void *opaque, hwaddr addr,
+                                    uint64_t *data, unsigned size,
+                                    MemTxAttrs attrs)
 {
     ESP32P4PMUState *s = opaque;
     hwaddr reg = addr & ~3;
 
     pmu_catch_up(s);
+    if (esp32p4_cpu_access_stopped(attrs)) {
+        return MEMTX_ERROR;
+    }
     if (!esp32p4_pmu_regs[R(reg)].valid) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: read of %u bytes at reserved "
                       "offset 0x%" HWADDR_PRIx "\n", TYPE_ESP32P4_PMU, size,
                       addr);
-        return 0;
+        *data = 0;
+        return MEMTX_OK;
     }
-    return extract32(pmu_value(s, reg), (addr & 3) * 8, size * 8);
+    *data = extract32(pmu_value(s, reg), (addr & 3) * 8, size * 8);
+    return MEMTX_OK;
 }
 
 /* [spec:nuos:req:emu.esp32p4.low-power] */
@@ -1858,10 +1874,9 @@ static void pmu_log_unmodelled(ESP32P4PMUState *s, hwaddr reg, uint32_t v)
 }
 
 /* [spec:nuos:req:emu.esp32p4.low-power] */
-static void esp32p4_pmu_write(void *opaque, hwaddr addr, uint64_t value,
-                              unsigned size)
+static void pmu_write(ESP32P4PMUState *s, hwaddr addr, uint64_t value,
+                      unsigned size)
 {
-    ESP32P4PMUState *s = opaque;
     hwaddr reg = addr & ~3;
     unsigned shift = (addr & 3) * 8;
     uint32_t lanes = MAKE_64BIT_MASK(shift, size * 8);
@@ -1872,7 +1887,6 @@ static void esp32p4_pmu_write(void *opaque, hwaddr addr, uint64_t value,
     uint32_t old;
     int n;
 
-    pmu_catch_up(s);
     old = *r;
     if (!info->valid) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write of %u bytes at reserved "
@@ -1988,9 +2002,23 @@ static void esp32p4_pmu_write(void *opaque, hwaddr addr, uint64_t value,
     pmu_vo_drive(s, false);
 }
 
+static MemTxResult esp32p4_pmu_write(void *opaque, hwaddr addr,
+                                     uint64_t value, unsigned size,
+                                     MemTxAttrs attrs)
+{
+    ESP32P4PMUState *s = opaque;
+
+    pmu_catch_up(s);
+    if (esp32p4_cpu_access_stopped(attrs)) {
+        return MEMTX_ERROR;
+    }
+    pmu_write(s, addr, value, size);
+    return MEMTX_OK;
+}
+
 static const MemoryRegionOps esp32p4_pmu_ops = {
-    .read = esp32p4_pmu_read,
-    .write = esp32p4_pmu_write,
+    .read_with_attrs = esp32p4_pmu_read,
+    .write_with_attrs = esp32p4_pmu_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,

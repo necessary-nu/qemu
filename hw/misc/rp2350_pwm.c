@@ -588,6 +588,32 @@ static void pwm_catch_up_all(RP2350PWMState *s)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.pwm]
+ * Software samples the pads (line_sync()): every slice brought up to
+ * line_time(), which its timer, late without icount, has yet to bring it
+ * to: the edges due up to PWM_MAX_LATE_NS before, each at its own time,
+ * and a slice further behind taken to that moment at once, its outputs
+ * showing their level there, as its late timer would take it.
+ */
+static void pwm_line_sync(Notifier *n, void *data)
+{
+    RP2350PWMState *s = container_of(n, RP2350PWMState, line_source);
+    int64_t when = line_time();
+    int i;
+
+    for (i = 0; i < RP2350_PWM_SLICES; i++) {
+        RP2350PWMSlice *sl = &s->slice[i];
+
+        pwm_catch_up(s, i, when);
+        if (timer_pending(sl->timer) && sl->due_ns < when) {
+            timer_del(sl->timer);
+            pwm_sync(s, i, pwm_cycle_at(s, when));
+            pwm_update(s, i);
+        }
+    }
+}
+
 /* [spec:nuos:req:emu.pwm] */
 static void pwm_timer_cb(void *opaque)
 {
@@ -986,6 +1012,8 @@ static void rp2350_pwm_realize(DeviceState *dev, Error **errp)
         s->slice[i].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pwm_timer_cb,
                                          &s->slice[i]);
     }
+    s->line_source.notify = pwm_line_sync;
+    line_add_source(&s->line_source);
 }
 
 static const VMStateDescription vmstate_rp2350_pwm_slice = {

@@ -86,6 +86,7 @@
 #include "qemu/timer.h"
 #include "qapi/error.h"
 #include "migration/vmstate.h"
+#include "system/runstate.h"
 #include "system/tcg.h"
 #include "exec/translation-block.h"
 #include "hw/misc/esp32p4_pms.h"
@@ -230,6 +231,24 @@ MemTxResult esp32p4_cpu_bus_hold(ESP32P4CPU *cpu)
 {
     cpu->bus_hold = true;
     return MEMTX_ERROR;
+}
+
+/* [spec:nuos:req:emu.esp32p4.machine] */
+bool esp32p4_cpu_access_stopped(MemTxAttrs attrs)
+{
+    ESP32P4CPU *cpu = esp32p4_cpu_bus_waiter(attrs);
+    CPUState *cs;
+
+    if (!cpu) {
+        return false;
+    }
+    cs = CPU(cpu);
+    if (!esp32p4_cpu_held(cpu) && !cs->stop &&
+        qemu_reset_requested_get() == SHUTDOWN_CAUSE_NONE) {
+        return false;
+    }
+    cpu_hold_access(cs);
+    return true;
 }
 
 #ifdef CONFIG_TCG

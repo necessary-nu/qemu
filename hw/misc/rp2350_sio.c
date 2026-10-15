@@ -15,7 +15,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "exec/icount.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_sio.h"
 #include "migration/vmstate.h"
@@ -124,6 +126,22 @@ static uint32_t gpio_access_mask(RP2350SIOState *s, int hi, bool secure)
                          : 0;
 }
 
+/*
+ * [spec:nuos:req:emu.gpio]
+ * Software samples the pads: first every device whose outputs reach them
+ * puts out its changes due by then, each at its own time (line_sync()),
+ * which its QEMU timers, late without icount, have yet to. A core's
+ * coprocessor read in the middle of its block of code under icount, where
+ * it may not read the clock, takes them as they are: under icount their
+ * timers have run by its time.
+ */
+static void gpio_in_sync(void)
+{
+    if (!icount_enabled() || !current_cpu || current_cpu->neg.can_do_io) {
+        line_sync();
+    }
+}
+
 static uint32_t gpio_read(RP2350SIOState *s, hwaddr reg, bool secure)
 {
     uint32_t v;
@@ -133,6 +151,7 @@ static uint32_t gpio_read(RP2350SIOState *s, hwaddr reg, bool secure)
     case A_GPIO_IN:
     case A_GPIO_HI_IN:
         hi = reg == A_GPIO_HI_IN;
+        gpio_in_sync();
         v = s->gpio_in[hi];
         break;
     default:
@@ -416,6 +435,9 @@ static ARMMCoprocResult rp2350_gpioc_op(void *opaque, ARMCPU *cpu,
         if (extract32(insn, 21, 3) || group > 2) {
             return ARM_M_COPROC_UNDEF;
         }
+        if (group == 2) {
+            gpio_in_sync();
+        }
         *result = (group == 2 ? s->gpio_in[hi]
                               : gpio_group(s, group)[hi]) & pins[hi];
         return ARM_M_COPROC_OK;
@@ -429,6 +451,7 @@ static ARMMCoprocResult rp2350_gpioc_op(void *opaque, ARMCPU *cpu,
             return ARM_M_COPROC_UNDEF;
         }
         if (group == 2) {
+            gpio_in_sync();
             lo_v = s->gpio_in[0];
             hi_v = s->gpio_in[1];
         } else {

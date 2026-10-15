@@ -953,9 +953,8 @@ static void dw_arm(ESP32P4DwGdmaState *s, uint64_t cycle)
  * a cycle later; a round that granted nothing leaves the wake-up set.
  */
 /* [spec:nuos:req:emu.esp32p4.dma] */
-static void dw_run(void *opaque)
+static void dw_round(ESP32P4DwGdmaState *s)
 {
-    ESP32P4DwGdmaState *s = opaque;
     uint64_t cycle = s->due_cycle;
     uint32_t cost = 0;
     bool lli;
@@ -987,6 +986,22 @@ static void dw_run(void *opaque)
     }
 }
 
+/*
+ * A round, which no other runs within: a peripheral that brings its
+ * stream up to a transaction's time can wake the engine for an edge the
+ * round has passed (the CSI bridge, taking a camera's events due by a
+ * read of its port), and the round's own cycle and cost decide when the
+ * engine comes back, as for any request made during it.
+ */
+static void dw_run(void *opaque)
+{
+    ESP32P4DwGdmaState *s = opaque;
+
+    s->in_round = true;
+    dw_round(s);
+    s->in_round = false;
+}
+
 /* The round falls due: run it at its time, which a late timer has passed. */
 static void dw_timer_cb(void *opaque)
 {
@@ -1001,6 +1016,9 @@ static void dw_timer_cb(void *opaque)
  */
 static void dw_catch_up(ESP32P4DwGdmaState *s, int64_t now)
 {
+    if (s->in_round) {
+        return;
+    }
     while (timer_pending(s->timer) && dw_due_ns(s) <= now) {
         timer_del(s->timer);
         esp32_line_run_at(dw_due_ns(s), dw_run, s);
@@ -1010,6 +1028,37 @@ static void dw_catch_up(ESP32P4DwGdmaState *s, int64_t now)
 /* [spec:nuos:req:emu.esp32p4.dma] */
 void esp32p4_dw_gdma_sync(ESP32P4DwGdmaState *s, int64_t now)
 {
+    dw_catch_up(s, now);
+}
+
+/* [spec:nuos:req:emu.esp32p4.dma] */
+void esp32p4_dw_gdma_add_source(ESP32P4DwGdmaState *s, Notifier *n)
+{
+    notifier_list_add(&s->sources, n);
+}
+
+static void dw_notify_sources(void *opaque)
+{
+    ESP32P4DwGdmaState *s = opaque;
+
+    notifier_list_notify(&s->sources, NULL);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.dma]
+ * A register access at @now: first the streams that feed the handshakes
+ * brought up to then (esp32p4_dw_gdma_add_source()), which bring in the
+ * rounds due before each of their events; then the rounds left due by
+ * then. Without that, a channel waiting for a request the stream had
+ * raised by then, its QEMU timers late, would still be waiting.
+ */
+static void dw_access_catch_up(ESP32P4DwGdmaState *s, int64_t now)
+{
+    if (!s->syncing_sources) {
+        s->syncing_sources = true;
+        esp32_line_run_at(now, dw_notify_sources, s);
+        s->syncing_sources = false;
+    }
     dw_catch_up(s, now);
 }
 
@@ -1435,7 +1484,7 @@ static uint64_t esp32p4_dw_gdma_read(void *opaque, hwaddr addr,
     ESP32P4DwGdmaState *s = opaque;
     uint32_t v = 0;
 
-    dw_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    dw_access_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     if (addr >= 0x100 && addr < A_CHANNELS_END) {
         return ch_read(s, (addr >> 8) - 1, addr & 0xff);
     }
@@ -1491,7 +1540,7 @@ static void esp32p4_dw_gdma_write(void *opaque, hwaddr addr, uint64_t value,
     ESP32P4DwGdmaState *s = opaque;
     uint32_t v = value;
 
-    dw_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    dw_access_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     if (addr >= 0x100 && addr < A_CHANNELS_END) {
         ch_write(s, (addr >> 8) - 1, addr & 0xff, v);
         return;
@@ -1724,6 +1773,7 @@ static void esp32p4_dw_gdma_init(Object *obj)
     s->clk = qdev_init_clock_in(dev, "clk", dw_clk_update, s,
                                 ClockPreUpdate | ClockUpdate);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dw_timer_cb, s);
+    notifier_list_init(&s->sources);
 }
 
 static void esp32p4_dw_gdma_realize(DeviceState *dev, Error **errp)

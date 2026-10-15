@@ -104,6 +104,8 @@ struct RP2350PWMState {
     uint64_t base_cycle;
 
     RP2350PWMSlice slice[RP2350_PWM_SLICES];
+    /* Software sampling the pads brings the slices up to time first. */
+    Notifier line_source;
     uint32_t intr;
     uint32_t inte[RP2350_PWM_IRQS];
     uint32_t intf[RP2350_PWM_IRQS];
