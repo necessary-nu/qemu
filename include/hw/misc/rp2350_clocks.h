@@ -91,17 +91,20 @@ struct RP2350ClkRegsClass {
  * access of any of them runs up to the access's time first, the earliest
  * event first, so that an oscillator's start-up comes before a frequency
  * count's end due after it and after one due before it, whichever block
- * is accessed. A block counting one of the tree's clocks brings the tree
- * up to its access the same way (rp2350_clocks_sync()), so that it counts
- * a change that has fallen due, from its time, before its timer has run.
+ * is accessed. Each block arms its events' timers with
+ * line_due_order_mod(), so that while none has fallen due an access runs
+ * nothing and asks none of them.
+ *
+ * Every block timing from one of the tree's clocks (TIMER0/1, the
+ * watchdog, POWMAN and its AON timer, ADC, DMA, HSTX, PIO, PWM, USBCTRL,
+ * the TRNG, the UARTs, SPI and I2C controllers, the processors' DWT and
+ * CoreSight's timestamp) brings the tree up to its register access the
+ * same way, through clock_sync() of its clock, which the SoC sets on the
+ * tree's clocks: it counts or times a change that has fallen due from
+ * its time, before the change's timer has run, and a clock's gating
+ * as it is by then.
  */
 void rp2350_clkregs_join_order(RP2350ClkRegsState *s, LineDueOrder *o);
-
-/*
- * Bring the clock tree up to line_time(), if @clk comes from it: its
- * events due by then, each at its own time.
- */
-void rp2350_clocks_sync(Clock *clk);
 
 /*
  * The clock generators of CLOCKS, in register order. Each is a clock

@@ -803,6 +803,10 @@ static bool itm_stim_enabled(RP2350M33DebugState *s, unsigned port)
            (*s_reg(s, RP2350_M33_DEBUG_ITM, A_ITM_TER0) & (1u << port));
 }
 
+/*
+ * An access first brings the core clock up to its time (clock_sync()),
+ * so that DWT_CYCCNT counts a change that has fallen due from its time.
+ */
 /* [spec:nuos:req:emu.coresight] */
 static MemTxResult rp2350_m33_debug_read(void *opaque, hwaddr addr,
                                          uint64_t *data, unsigned size,
@@ -813,6 +817,7 @@ static MemTxResult rp2350_m33_debug_read(void *opaque, hwaddr addr,
     hwaddr offset = addr + c->info->bias;
     uint32_t v;
 
+    clock_sync(s->cpuclk);
     if (itm_stim_port(c, offset)) {
         unsigned port = offset / 4;
 
@@ -848,6 +853,7 @@ static MemTxResult rp2350_m33_debug_write(void *opaque, hwaddr addr,
     RP2350M33DebugState *s = c->s;
     hwaddr offset = addr + c->info->bias;
 
+    clock_sync(s->cpuclk);
     if (itm_stim_port(c, offset)) {
         unsigned port = offset / 4;
 

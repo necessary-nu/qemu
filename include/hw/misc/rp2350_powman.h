@@ -90,6 +90,12 @@ typedef struct RP2350PowmanOps {
      * its contents, or powering up.
      */
     void (*domain_power)(void *opaque, int domain, bool on);
+    /*
+     * Whether an oscillator is DORMANT, for the AON timer's alarm, a wake
+     * event, to restart; an oscillator entering or leaving DORMANT tells
+     * the clock tree's due order (line_due_order_changed()).
+     */
+    bool (*osc_dormant)(void *opaque);
 } RP2350PowmanOps;
 
 struct RP2350PowmanState {
@@ -114,6 +120,7 @@ struct RP2350PowmanState {
     QEMUTimer *alarm_timer;
     int64_t alarm_ns;
     LineDueSource alarm_due;
+    LineDueOrder *clock_order;
     /*
      * A tick source switch, which waits for the current source's tick, at
      * switch_ns.
@@ -210,7 +217,11 @@ void rp2350_powman_set_ops(RP2350PowmanState *s, const RP2350PowmanOps *ops,
 /*
  * The AON timer's alarm wakes a DORMANT oscillator: it joins the clock
  * tree's due order (rp2350_clocks.h), so that an access that brings the
- * tree up to its time finds the oscillator restarted at the alarm.
+ * tree up to its time finds the oscillator restarted at the alarm. While
+ * no oscillator is DORMANT (RP2350PowmanOps.osc_dormant) the alarm
+ * changes no clock, and the order does not wait for it: the blocks
+ * timing from the tree's clocks need not read the clock at each access
+ * to look out for it.
  */
 void rp2350_powman_join_clock_order(RP2350PowmanState *s, LineDueOrder *o);
 

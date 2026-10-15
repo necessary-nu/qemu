@@ -871,25 +871,32 @@ static void pl011_line_run_due(PL011State *s, int64_t now)
  * line sources come first (line_sync()): a transmitter in another device
  * (a serial adapter, another UART through the pins) puts out the bits
  * due by then, which reach this receiver at their times; then this
- * UART's own events up to that same moment.
+ * UART's own events up to that same moment. Before all of them UARTCLK
+ * comes up to time (clock_sync()), as a change of its rate, a stop or a
+ * start that has fallen due retimes the frames from the change's time.
  */
 static void pl011_line_catch_up(PL011State *s)
 {
     if (!s->line_level) {
         return;
     }
+    clock_sync(s->clk);
     pl011_line_run_due(s, line_sync());
 }
 
 /*
  * [spec:nuos:req:emu.uart]
  * UARTTXD's changes due by line_time(), for another device's receiver
- * that syncs its sources before an access: the transmitter's events only.
+ * that syncs its sources before an access: the transmitter's events only,
+ * once UARTCLK is up to time.
  */
 static void pl011_line_tx_sync(Notifier *n, void *data)
 {
     PL011State *s = container_of(n, PL011State, line_source);
-    int64_t now = line_time();
+    int64_t now;
+
+    clock_sync(s->clk);
+    now = line_time();
 
     while (timer_pending(s->tx_timer) &&
            timer_expire_time_ns(s->tx_timer) <= now) {
@@ -1195,7 +1202,9 @@ static void pl011_event(void *opaque, QEMUChrEvent event)
 
 /*
  * In line-level mode, carry the frames in progress across a change of
- * UARTCLK: before it, note the cycles they have run and the receive
+ * UARTCLK: before it, take the line events due by the change, each at its
+ * own time however late its timer runs, the line's sources brought up to
+ * it first, and note the cycles the frames have run and the receive
  * timeout has left; after it, re-time them at the new rate, or hold them
  * while the clock is stopped.
  */
@@ -1208,6 +1217,7 @@ static void pl011_line_clock_update(PL011State *s, ClockEvent event)
         if (!clock_get(s->clk)) {
             return;
         }
+        pl011_line_run_due(s, line_sync());
         if (s->tx_busy) {
             s->tx_held = clock_ns_to_ticks(s->clk, MAX(now - s->tx_start, 0));
             timer_del(s->tx_timer);

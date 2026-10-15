@@ -1152,10 +1152,19 @@ static void rp2350_soc_domain_power(void *opaque, int domain, bool on)
     memory_region_set_enabled(&s->sram_off[i], !on);
 }
 
+/* Whether the XOSC or the ROSC is DORMANT, for the AON alarm to wake. */
+static bool rp2350_soc_osc_dormant(void *opaque)
+{
+    RP2350State *s = opaque;
+
+    return s->xosc.dormant || s->rosc.dormant_stopped;
+}
+
 static const RP2350PowmanOps rp2350_soc_powman_ops = {
     .procs_asleep = rp2350_soc_procs_asleep,
     .swcore_stop = rp2350_soc_swcore_stop,
     .domain_power = rp2350_soc_domain_power,
+    .osc_dormant = rp2350_soc_osc_dormant,
 };
 
 /* [spec:nuos:req:emu.powman] */
@@ -1230,17 +1239,31 @@ static bool rp2350_soc_clock_glitch(void *opaque, int clk, bool apply)
  * stops a clock. clk_sys also reaches the SoC, which stops the processors
  * while it is stopped. The oscillators, the PLLs, CLOCKS and TICKS share
  * one due order (rp2350_clocks.h) with the AON timer's alarm, which wakes
- * a DORMANT oscillator: an access to any of them, or to a timer counting
- * their clocks, first takes the start-ups, locks, wakes and
- * frequency-count phases due by then, each at its own time, the earliest
- * first. A glitch on a peripheral clock reaches the blocks it clocks.
+ * a DORMANT oscillator: an access to any of them, or to a block timing
+ * from their clocks (clock_sync()), first takes the start-ups, locks,
+ * wakes and frequency-count phases due by then, each at its own time, the
+ * earliest first. A glitch on a peripheral clock reaches the blocks it
+ * clocks.
  */
+static void rp2350_soc_clocks_sync(void *opaque)
+{
+    RP2350State *s = opaque;
+
+    line_due_order_catch_up(&s->clock_order);
+}
+
 /* [spec:nuos:req:emu.clock-tree] */
 static void rp2350_soc_wire_clocks(RP2350State *s)
 {
     DeviceState *clocks = DEVICE(&s->clocks);
     DeviceState *rosc = DEVICE(&s->rosc);
     Clock *xosc = s->xosc.out;
+    Clock *tree[] = {
+        xosc, s->pll_sys.out, s->pll_usb.out,
+        qdev_get_clock_out(rosc, RP2350_ROSC_CLK),
+        qdev_get_clock_out(rosc, RP2350_ROSC_CLK_PH),
+    };
+    int i;
 
     clock_set_hz(s->lposc, RP2350_LPOSC_HZ);
     qdev_prop_set_uint32(DEVICE(&s->xosc), "xtal-hz", s->xosc_hz);
@@ -1268,6 +1291,15 @@ static void rp2350_soc_wire_clocks(RP2350State *s)
     rp2350_clkregs_join_order(RP2350_CLKREGS(&s->pll_sys), &s->clock_order);
     rp2350_rosc_join_order(&s->rosc, &s->clock_order);
     rp2350_clkregs_join_order(RP2350_CLKREGS(&s->xosc), &s->clock_order);
+    for (i = 0; i < ARRAY_SIZE(tree); i++) {
+        clock_set_sync(tree[i], rp2350_soc_clocks_sync, s);
+    }
+    for (i = 0; i < RP2350_NUM_CLOCKS; i++) {
+        clock_set_sync(s->clocks.clk[i], rp2350_soc_clocks_sync, s);
+    }
+    for (i = 0; i < RP2350_NUM_TICKS; i++) {
+        clock_set_sync(s->ticks.tick[i], rp2350_soc_clocks_sync, s);
+    }
     qdev_connect_clock_in(DEVICE(&s->ticks), RP2350_TICKS_REF, CLK(s, REF));
     clock_set_source(s->clk_sys, CLK(s, SYS));
     rp2350_clocks_set_glitch_fn(&s->clocks, rp2350_soc_clock_glitch, s);

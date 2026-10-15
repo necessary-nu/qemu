@@ -141,13 +141,16 @@ static void uart_line_tx_start(UARTLineState *s, int64_t now)
     if (s->tx_bit >= 0) {
         return;
     }
-    if (s->tx_break) {
+    if (s->tx_break && !s->tx_break_after) {
         s->tx_break = false;
         s->tx_frame = 0;
         s->tx_len = BREAK_BITS;
     } else if (!fifo8_is_empty(&s->tx_queue)) {
         s->tx_frame = (fifo8_pop(&s->tx_queue) << 1) | (1u << 9);
         s->tx_len = FRAME_BITS;
+        if (s->tx_break) {
+            s->tx_break_after--;
+        }
         qemu_chr_fe_accept_input(&s->chr);
     } else {
         return;
@@ -213,8 +216,9 @@ static void uart_line_event(void *opaque, QEMUChrEvent event)
 {
     UARTLineState *s = opaque;
 
-    if (event == CHR_EVENT_BREAK) {
+    if (event == CHR_EVENT_BREAK && !s->tx_break) {
         s->tx_break = true;
+        s->tx_break_after = fifo8_num_used(&s->tx_queue);
         uart_line_tx_start(s, line_time());
     }
 }
@@ -229,6 +233,7 @@ static void uart_line_reset_hold(Object *obj, ResetType type)
     s->rx_break = false;
     s->tx_bit = -1;
     s->tx_break = false;
+    s->tx_break_after = 0;
     fifo8_reset(&s->tx_queue);
 }
 
@@ -282,10 +287,21 @@ static void uart_line_unrealize(DeviceState *dev)
     line_remove_source(&UART_LINE(dev)->line_source);
 }
 
+static int uart_line_post_load(void *opaque, int version_id)
+{
+    UARTLineState *s = opaque;
+
+    if (s->tx_break_after > fifo8_num_used(&s->tx_queue)) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_uart_line = {
     .name = TYPE_UART_LINE,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .post_load = uart_line_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(rx_timer, UARTLineState),
         VMSTATE_INT64(rx_start, UARTLineState),
@@ -304,6 +320,7 @@ static const VMStateDescription vmstate_uart_line = {
         VMSTATE_INT32(tx_bit, UARTLineState),
         VMSTATE_UINT8(txd, UARTLineState),
         VMSTATE_BOOL(tx_break, UARTLineState),
+        VMSTATE_UINT32(tx_break_after, UARTLineState),
         VMSTATE_END_OF_LIST()
     },
 };

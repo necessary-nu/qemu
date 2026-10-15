@@ -13,7 +13,7 @@
  * current rate. It stops while paused and while the clock it counts is
  * stopped. A change of the clock counts from the change's time
  * (line_time()), however late the event making it ran, and an access
- * first brings the clock tree up to its time (rp2350_clocks_sync()).
+ * first brings the clock tree up to its time (clock_sync()).
  * Debug pause is not modelled.
  */
 
@@ -25,7 +25,6 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
-#include "hw/misc/rp2350_clocks.h"
 #include "hw/timer/rp2350_timer.h"
 #include "migration/vmstate.h"
 
@@ -262,8 +261,8 @@ static int64_t timer_access_catch_up(RP2350TimerState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    rp2350_clocks_sync(s->tick);
-    rp2350_clocks_sync(s->clk_sys);
+    clock_sync(s->tick);
+    clock_sync(s->clk_sys);
     timer_fire_due(s, now);
     return now;
 }

@@ -506,6 +506,17 @@ static uint64_t aon_next_second(uint64_t t)
 }
 
 /*
+ * Whether the alarm would wake an oscillator, which is DORMANT: only then
+ * does it change the clock tree, and its time matter to the tree's due
+ * order.
+ */
+static bool aon_alarm_wakes(RP2350PowmanState *s)
+{
+    return !s->ops || !s->ops->osc_dormant ||
+           s->ops->osc_dormant(s->ops_opaque);
+}
+
+/*
  * Re-evaluate the alarm comparison, whose rising edge sets TIMER.ALARM,
  * and schedule the tick on which the count next reaches the alarm.
  */
@@ -530,7 +541,8 @@ static void aon_update(RP2350PowmanState *s)
 
         if (ns < INT64_MAX - s->aon_start_ns) {
             s->alarm_ns = s->aon_start_ns + ns;
-            timer_mod(s->alarm_timer, s->alarm_ns);
+            line_due_order_mod(aon_alarm_wakes(s) ? s->clock_order : NULL,
+                               s->alarm_timer, s->alarm_ns);
         }
     }
     powman_update_irq(s);
@@ -555,11 +567,15 @@ static void aon_alarm_cb(void *opaque)
     line_run_at(s->alarm_ns, aon_alarm_at, s);
 }
 
+/* The alarm, in the clock tree's order while it would wake an oscillator. */
 static int64_t aon_alarm_next_due(LineDueSource *src)
 {
     RP2350PowmanState *s = container_of(src, RP2350PowmanState, alarm_due);
 
-    return timer_pending(s->alarm_timer) ? s->alarm_ns : INT64_MAX;
+    if (!timer_pending(s->alarm_timer) || !aon_alarm_wakes(s)) {
+        return INT64_MAX;
+    }
+    return s->alarm_ns;
 }
 
 static void aon_alarm_run_due(LineDueSource *src)
@@ -576,6 +592,8 @@ void rp2350_powman_join_clock_order(RP2350PowmanState *s, LineDueOrder *o)
 {
     s->alarm_due.next_due = aon_alarm_next_due;
     s->alarm_due.run = aon_alarm_run_due;
+    s->alarm_due.tells = true;
+    s->clock_order = o;
     line_due_order_add(o, &s->alarm_due);
 }
 
@@ -1375,7 +1393,7 @@ static void powman_catch_up(RP2350PowmanState *s)
      * clk_ref, the fast POWMAN clock and the XOSC tick, as of now, and
      * with it the alarm if it came before.
      */
-    rp2350_clocks_sync(s->clk_ref);
+    clock_sync(s->clk_ref);
     for (;;) {
         QEMUTimer *t[] = {
             s->alarm_timer, s->switch_timer, s->vreg_timer, s->seq_timer,

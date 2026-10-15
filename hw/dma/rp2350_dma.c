@@ -1593,7 +1593,9 @@ static MemTxResult reg_write(RP2350DMAState *s, hwaddr addr, uint32_t value,
 
 /*
  * The registers are 32 bits wide: a narrow write is replicated across the
- * bus and writes the whole register; a narrow read returns its lanes.
+ * bus and writes the whole register; a narrow read returns its lanes. An
+ * access first brings clk_sys up to its time (clock_sync()), so that the
+ * engine runs by the clock as it is then.
  */
 /* [spec:nuos:req:emu.dma] */
 static MemTxResult rp2350_dma_read(void *opaque, hwaddr addr, uint64_t *data,
@@ -1603,6 +1605,7 @@ static MemTxResult rp2350_dma_read(void *opaque, hwaddr addr, uint64_t *data,
     uint32_t v;
     MemTxResult r;
 
+    clock_sync(s->clk);
     engine_catch_up(s);
     r = reg_read(s, rp2350_atomic_reg(addr & ~3), access_level(attrs), &v,
                  "read");
@@ -1623,6 +1626,7 @@ static MemTxResult rp2350_dma_write(void *opaque, hwaddr addr, uint64_t value,
     } else if (size == 2) {
         v = (v & 0xffff) * 0x00010001u;
     }
+    clock_sync(s->clk);
     engine_catch_up(s);
     r = reg_write(s, addr & ~3, v, access_level(attrs));
     update_outputs(s);
