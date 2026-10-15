@@ -117,6 +117,11 @@ struct ESP32P4MSPIState {
     bool spi1_cs_held;
     /* The status reads FLASH_WAITI_CTRL makes follow the transaction. */
     bool spi1_waiti;
+    /*
+     * SPI0's address phase, as USER1 last set it, logged as longer than
+     * the address.
+     */
+    bool spi0_addr_logged;
 
     /* The manual encryption block: its state and the ciphertext. */
     uint32_t xts_state;

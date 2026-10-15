@@ -161,8 +161,27 @@ static void flash_program(QTestState *qts, uint32_t addr, const uint32_t *w,
     spi1_run(qts, SPI1_FLASH, CMD_PP);
 }
 
+/*
+ * SPI0's flash reads set up as the boot ROM leaves them (esp32p4_boot.c):
+ * DIO, command BBh from USER2, 28 address bits (the address and the mode
+ * bits' upper half, WB_MODE's 0) and 2 dummy cycles, the first driven
+ * high. Out of reset SPI0 sends FAST_READ (0Bh) with no dummy phase, which
+ * reads the flash a byte late, as the chip would.
+ */
+static void spi0_rom_read_setup(QTestState *qts)
+{
+    qtest_writel(qts, SPI0_FLASH + 0x008, 0x00ac200c);
+    qtest_writel(qts, SPI0_FLASH + 0x018, 0x200000c0);
+    qtest_writel(qts, SPI0_FLASH + 0x01c, 0x6c000041);
+    qtest_writel(qts, SPI0_FLASH + 0x020, 0x700000bb);
+    qtest_writel(qts, SPI0_FLASH + 0x02c, 0);
+    qtest_writel(qts, SPI0_FLASH + CACHE_FCTRL,
+                 qtest_readl(qts, SPI0_FLASH + CACHE_FCTRL) | 0x5);
+}
+
 static void map_flash(QTestState *qts, uint32_t entry, uint32_t page)
 {
+    spi0_rom_read_setup(qts);
     qtest_writel(qts, SPI0_FLASH + CACHE_FCTRL,
                  qtest_readl(qts, SPI0_FLASH + CACHE_FCTRL) &
                  ~CLOSE_AXI_INF_EN);
