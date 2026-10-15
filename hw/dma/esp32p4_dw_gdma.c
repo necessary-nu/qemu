@@ -1007,6 +1007,12 @@ static void dw_catch_up(ESP32P4DwGdmaState *s, int64_t now)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.dma] */
+void esp32p4_dw_gdma_sync(ESP32P4DwGdmaState *s, int64_t now)
+{
+    dw_catch_up(s, now);
+}
+
 /*
  * Let the engine look for work at the bus clock's next edge after the
  * change that calls for it, at esp32_line_time().
