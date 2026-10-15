@@ -112,25 +112,71 @@ static uint64_t period_scale(uint64_t a, uint64_t num, uint64_t den)
     return hi ? UINT64_MAX : lo;
 }
 
-/* Whether timer @t has fallen due: pending, its time come. */
-static bool clkregs_due(QEMUTimer *t)
-{
-    return timer_pending(t) &&
-           timer_expire_time_ns(t) <= qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-}
-
 /*
- * A register access first takes the block's events due by its moment
- * (each block's catch_up): software then reads a status (an oscillator's
- * startup, a PLL's lock, the frequency counter's result) as of the
- * access, not of when the host ran its timer.
+ * A register access first takes the clock tree's events due by its
+ * moment, in the order of their times across the blocks, each at its own
+ * time: software then reads a status (an oscillator's startup, a PLL's
+ * lock, the frequency counter's result) as of the access, not of when
+ * the host ran its timer.
  */
+/* [spec:nuos:req:emu.clock-tree] */
 static void rp2350_clkregs_catch_up(RP2350ClkRegsState *s)
 {
     RP2350ClkRegsClass *c = RP2350_CLKREGS_GET_CLASS(s);
+    int64_t now = line_time();
 
-    if (c->catch_up) {
-        c->catch_up(s);
+    if (s->order) {
+        line_due_order_run(s->order, now);
+        return;
+    }
+    while (c->next_due && c->next_due(s) <= now) {
+        c->run_due(s);
+    }
+}
+
+static int64_t rp2350_clkregs_next_due(LineDueSource *src)
+{
+    RP2350ClkRegsState *s = container_of(src, RP2350ClkRegsState, due);
+
+    return RP2350_CLKREGS_GET_CLASS(s)->next_due(s);
+}
+
+static void rp2350_clkregs_run_due(LineDueSource *src)
+{
+    RP2350ClkRegsState *s = container_of(src, RP2350ClkRegsState, due);
+
+    RP2350_CLKREGS_GET_CLASS(s)->run_due(s);
+}
+
+/* [spec:nuos:req:emu.clock-tree] */
+void rp2350_clkregs_join_order(RP2350ClkRegsState *s, LineDueOrder *o)
+{
+    RP2350ClkRegsClass *c = RP2350_CLKREGS_GET_CLASS(s);
+
+    s->order = o;
+    if (c->next_due) {
+        s->due.next_due = rp2350_clkregs_next_due;
+        s->due.run = rp2350_clkregs_run_due;
+        line_due_order_add(o, &s->due);
+    }
+}
+
+/*
+ * The clock tree's clocks are outputs of its blocks: CLOCKS' generators,
+ * TICKS' ticks, the oscillators' and PLLs' outputs.
+ */
+/* [spec:nuos:req:emu.clock-tree] */
+void rp2350_clocks_sync(Clock *clk)
+{
+    Clock *root = clk;
+    Object *owner;
+
+    while (root->source) {
+        root = root->source;
+    }
+    owner = OBJECT(root)->parent;
+    if (owner && object_dynamic_cast(owner, TYPE_RP2350_CLKREGS)) {
+        rp2350_clkregs_catch_up(RP2350_CLKREGS(owner));
     }
 }
 
@@ -198,16 +244,10 @@ static void rp2350_clkregs_hold_reset(Object *obj, ResetType type)
     }
 }
 
-static void rp2350_clkregs_feed(Notifier *n, void *data)
-{
-    rp2350_clkregs_catch_up(container_of(n, RP2350ClkRegsState, feed));
-}
-
 static void rp2350_clkregs_init(Object *obj)
 {
     RP2350ClkRegsState *s = RP2350_CLKREGS(obj);
 
-    s->feed.notify = rp2350_clkregs_feed;
     memory_region_init_io(&s->iomem, obj, &rp2350_clkregs_ops, s,
                           object_get_typename(obj), RP2350_ATOMIC_REGION_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
@@ -478,11 +518,13 @@ static int gl_input_source(int n, uint32_t ctrl, int in)
     return SRC_GEN(RP2350_CLK_REF);
 }
 
-/* Whether glitchless mux g is in a switch, which has yet to complete. */
+/*
+ * Whether glitchless mux g is in a switch, which has yet to complete, at
+ * the time of the access or change at hand.
+ */
 static bool gl_switching(RP2350ClocksState *s, int g)
 {
-    return s->gl_from[g] != GL_NONE &&
-           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->gl_done_ns[g];
+    return s->gl_from[g] != GL_NONE && line_time() < s->gl_done_ns[g];
 }
 
 /*
@@ -503,8 +545,7 @@ static bool gl_exposed(RP2350ClocksState *s, int n, int in)
         return src == in;
     }
     return s->gl_from[g] == in ||
-           (src == in &&
-            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->gl_leave_ns[g]);
+           (src == in && line_time() >= s->gl_leave_ns[g]);
 }
 
 /* The input generator n's muxes select. */
@@ -588,8 +629,7 @@ static void clk_update_enabled(RP2350ClocksState *s, int n, uint64_t src)
         s->stop_ns[n] = 0;
     } else if (s->enabled & BIT(n)) {
         s->enabled &= ~BIT(n);
-        s->stop_ns[n] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                        cycles_ns(src, 2);
+        s->stop_ns[n] = line_time() + cycles_ns(src, 2);
     }
 }
 
@@ -599,8 +639,7 @@ static void clk_update_enabled(RP2350ClocksState *s, int n, uint64_t src)
  */
 static bool clk_running(RP2350ClocksState *s, int n)
 {
-    return (s->enabled & BIT(n)) ||
-           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->stop_ns[n];
+    return (s->enabled & BIT(n)) || line_time() < s->stop_ns[n];
 }
 
 static void clocks_update_irq(RP2350ClocksState *s)
@@ -611,19 +650,18 @@ static void clocks_update_irq(RP2350ClocksState *s)
 }
 
 static void fc0_source_changed(RP2350ClocksState *s);
-static void fc0_cb(void *opaque);
+static void fc0_at(void *opaque);
 
 /*
  * Arm or disarm the resuscitation timer: it runs while resus is enabled
- * and clk_sys, as its source and divider make it, is stopped, and only
- * while clk_ref runs to time it.
+ * and clk_sys, as its source and divider make it, is stopped, from the
+ * stop, and only while clk_ref runs to time it.
  */
 /* [spec:nuos:req:emu.clock-tree] */
 static void clocks_resus_arm(RP2350ClocksState *s, uint64_t sys)
 {
     uint32_t ctrl = s->parent_obj.regs[R_RESUS_CTRL];
     uint64_t ref = clock_get(s->clk[RP2350_CLK_REF]);
-    int64_t when;
 
     if (sys || s->resussed || !(ctrl & RESUS_CTRL_ENABLE) ||
         (ctrl & RESUS_CTRL_CLEAR) || !ref) {
@@ -633,10 +671,10 @@ static void clocks_resus_arm(RP2350ClocksState *s, uint64_t sys)
     if (timer_pending(s->resus_timer)) {
         return;
     }
-    when = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-           clock_ticks_to_ns(s->clk[RP2350_CLK_REF],
-                             (ctrl & RESUS_CTRL_TIMEOUT) + 1);
-    timer_mod(s->resus_timer, when);
+    s->resus_ns = line_time() +
+                  clock_ticks_to_ns(s->clk[RP2350_CLK_REF],
+                                    (ctrl & RESUS_CTRL_TIMEOUT) + 1);
+    timer_mod(s->resus_timer, s->resus_ns);
 }
 
 /*
@@ -678,19 +716,27 @@ static void clocks_update(RP2350ClocksState *s)
     }
     fc0_source_changed(s);
     if (s->fc0_stalled && clock_get(s->clk[RP2350_CLK_REF])) {
-        /* The phase clk_ref's stop held up ends now. */
-        s->fc0_end_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        fc0_cb(s);
+        /* The phase clk_ref's stop held up ends as clk_ref restarts. */
+        s->fc0_end_ns = line_time();
+        fc0_at(s);
     }
 }
 
-static void clocks_resus_cb(void *opaque)
+/* clk_sys has been stopped for the timeout: it switches to clk_ref. */
+static void clocks_resus_at(void *opaque)
 {
     RP2350ClocksState *s = opaque;
 
     s->resussed = true;
     clocks_update(s);
     clocks_update_irq(s);
+}
+
+static void clocks_resus_cb(void *opaque)
+{
+    RP2350ClocksState *s = opaque;
+
+    line_run_at(s->resus_ns, clocks_resus_at, s);
 }
 
 /*
@@ -707,7 +753,7 @@ static void gl_switch(RP2350ClocksState *s, int n, uint32_t old, uint32_t ctrl)
 {
     int g = clk_glitchless(n);
     int to = ctrl & clk_src_mask(n);
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = line_time();
     uint64_t period;
 
     if (!gl_switching(s, g) || now >= s->gl_leave_ns[g]) {
@@ -868,31 +914,39 @@ static void clk_write_ctrl(RP2350ClocksState *s, int n, uint32_t old,
     clocks_update(s);
 }
 
-/* [spec:nuos:req:emu.clock-tree] */
-void rp2350_clocks_add_feed(RP2350ClocksState *s, Notifier *n)
+static int64_t clocks_resus_due(RP2350ClocksState *s)
 {
-    notifier_list_add(&s->feeds, n);
+    return timer_pending(s->resus_timer) ? s->resus_ns : INT64_MAX;
+}
+
+static int64_t clocks_fc0_due(RP2350ClocksState *s)
+{
+    return timer_pending(s->fc0_timer) ? s->fc0_end_ns : INT64_MAX;
 }
 
 /*
- * The frequency counter's delay and interval end, and the resuscitation,
- * when due; a count that ends starts the next phase, which may be due
- * too. First the blocks feeding the sources take theirs (an oscillator's
- * start-up, a PLL's lock), so that the sources are as they are by now.
+ * The block's next event: the resuscitation, or the end of the frequency
+ * counter's delay or interval, which may start the next phase.
  */
 /* [spec:nuos:req:emu.clock-tree] */
-static void clocks_catch_up(RP2350ClkRegsState *rs)
+static int64_t clocks_next_due(RP2350ClkRegsState *rs)
 {
     RP2350ClocksState *s = RP2350_CLOCKS(rs);
 
-    notifier_list_notify(&s->feeds, NULL);
-    if (clkregs_due(s->resus_timer)) {
+    return MIN(clocks_resus_due(s), clocks_fc0_due(s));
+}
+
+static void clocks_run_due(RP2350ClkRegsState *rs)
+{
+    RP2350ClocksState *s = RP2350_CLOCKS(rs);
+    int64_t resus = clocks_resus_due(s), fc0 = clocks_fc0_due(s);
+
+    if (resus <= fc0) {
         timer_del(s->resus_timer);
-        clocks_resus_cb(s);
-    }
-    while (clkregs_due(s->fc0_timer)) {
+        line_run_at(resus, clocks_resus_at, s);
+    } else {
         timer_del(s->fc0_timer);
-        fc0_cb(s);
+        line_run_at(fc0, fc0_at, s);
     }
 }
 
@@ -977,11 +1031,11 @@ static void fc0_source_changed(RP2350ClocksState *s)
     switch (s->fc0_phase) {
     case FC0_WAITING:
         if (period) {
-            fc0_start_count(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+            fc0_start_count(s, line_time());
         }
         break;
     case FC0_COUNTING:
-        fc0_accumulate(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        fc0_accumulate(s, line_time());
         if (s->fc0_last_period && !period) {
             s->fc0_died = true;
         }
@@ -1024,9 +1078,10 @@ static void fc0_finish(RP2350ClocksState *s)
 /*
  * The end of the delay or of the test interval, counted in clk_ref
  * cycles and taken at the virtual time it falls due, however late the
- * timer runs: with clk_ref stopped, nothing ends until it runs again.
+ * timer runs (line_time() is fc0_end_ns): with clk_ref stopped, nothing
+ * ends until it runs again.
  */
-static void fc0_cb(void *opaque)
+static void fc0_at(void *opaque)
 {
     RP2350ClocksState *s = opaque;
 
@@ -1052,6 +1107,13 @@ static void fc0_cb(void *opaque)
     }
 }
 
+static void fc0_cb(void *opaque)
+{
+    RP2350ClocksState *s = opaque;
+
+    line_run_at(s->fc0_end_ns, fc0_at, s);
+}
+
 /*
  * Writing FC0_SRC starts a count, even of no clock: FC0_DELAY clk_ref
  * cycles for the mux to settle, then, once the clock under test runs,
@@ -1071,7 +1133,7 @@ static void fc0_start(RP2350ClocksState *s)
     s->fc0_died = false;
     regs[R_FC0_STATUS] = FC0_STATUS_RUNNING;
     regs[R_FC0_RESULT] = 0;
-    fc0_wait_ref(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), regs[R_FC0_DELAY]);
+    fc0_wait_ref(s, line_time(), regs[R_FC0_DELAY]);
 }
 
 /* [spec:nuos:req:emu.clocks] */
@@ -1102,8 +1164,8 @@ static uint32_t clocks_read(RP2350ClkRegsState *rs, unsigned reg)
                 int g = clk_glitchless(n);
 
                 if (gl_switching(s, g)) {
-                    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) <
-                           s->gl_leave_ns[g] ? 1u << s->gl_from[g] : 0;
+                    return line_time() < s->gl_leave_ns[g] ?
+                           1u << s->gl_from[g] : 0;
                 }
                 if (!source_period(s, clk_source(s, n))) {
                     return 0;
@@ -1208,6 +1270,7 @@ static void clocks_reset_hold(RP2350ClkRegsState *rs)
 
     timer_del(s->resus_timer);
     timer_del(s->fc0_timer);
+    s->resus_ns = 0;
     s->enabled = 0;
     for (i = 0; i < RP2350_NUM_CLOCKS; i++) {
         s->stop_ns[i] = 0;
@@ -1254,15 +1317,14 @@ static void rp2350_clocks_init(Object *obj)
         s->clk[i] = qdev_init_clock_out(dev, rp2350_clock_names[i]);
     }
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
-    notifier_list_init(&s->feeds);
     s->resus_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, clocks_resus_cb, s);
     s->fc0_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, fc0_cb, s);
 }
 
 static const VMStateDescription vmstate_rp2350_clocks = {
     .name = TYPE_RP2350_CLOCKS,
-    .version_id = 4,
-    .minimum_version_id = 4,
+    .version_id = 5,
+    .minimum_version_id = 5,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(parent_obj.regs, RP2350ClocksState,
                              RP2350_CLKREGS_MAX),
@@ -1279,6 +1341,7 @@ static const VMStateDescription vmstate_rp2350_clocks = {
         VMSTATE_BOOL(sys_glitched, RP2350ClocksState),
         VMSTATE_BOOL(resussed, RP2350ClocksState),
         VMSTATE_TIMER_PTR(resus_timer, RP2350ClocksState),
+        VMSTATE_INT64(resus_ns, RP2350ClocksState),
         VMSTATE_TIMER_PTR(fc0_timer, RP2350ClocksState),
         VMSTATE_UINT32(fc0_phase, RP2350ClocksState),
         VMSTATE_BOOL(fc0_stalled, RP2350ClocksState),
@@ -1333,7 +1396,8 @@ static void rp2350_clocks_class_init(ObjectClass *klass, const void *data)
     c->read = clocks_read;
     c->write = clocks_write;
     c->written = clocks_written;
-    c->catch_up = clocks_catch_up;
+    c->next_due = clocks_next_due;
+    c->run_due = clocks_run_due;
     c->reset_hold = clocks_reset_hold;
     rc->phases.exit = rp2350_clocks_exit_reset;
     dc->vmsd = &vmstate_rp2350_clocks;
@@ -1388,8 +1452,7 @@ static int64_t xosc_startup_ns(RP2350XOSCState *x)
 
 static bool xosc_stable(RP2350XOSCState *x)
 {
-    return x->enabled && !x->dormant &&
-           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= x->stable_ns;
+    return x->enabled && !x->dormant && line_time() >= x->stable_ns;
 }
 
 /* The oscillator's output runs once it is stable and not gated. */
@@ -1400,7 +1463,7 @@ static bool xosc_running(RP2350XOSCState *x)
 
 static uint32_t xosc_count_now(RP2350XOSCState *x)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = line_time();
     uint64_t ticks;
 
     if (!clock_is_enabled(x->out) || !x->count || now <= x->count_ns) {
@@ -1411,21 +1474,24 @@ static uint32_t xosc_count_now(RP2350XOSCState *x)
 }
 
 /*
- * Drive the output from the oscillator's state, bringing COUNT up to
- * date at the old rate first.
+ * Drive the output from the oscillator's state as of the change at hand
+ * (line_time()), bringing COUNT up to date at the old rate first.
  */
 /* [spec:nuos:req:emu.clock-tree] */
 static void xosc_update_out(RP2350XOSCState *x)
 {
     x->count = xosc_count_now(x);
-    x->count_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    x->count_ns = line_time();
     clock_update_hz(x->out, xosc_running(x) ? x->xtal_hz : 0);
 }
 
-/* The crystal starts oscillating; it is STABLE once the delay expires. */
+/*
+ * The crystal starts oscillating, with the write or the wake event that
+ * starts it; it is STABLE once the delay expires.
+ */
 static void xosc_start(RP2350XOSCState *x)
 {
-    x->stable_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + xosc_startup_ns(x);
+    x->stable_ns = line_time() + xosc_startup_ns(x);
     timer_mod(x->startup_timer, x->stable_ns);
 }
 
@@ -1450,7 +1516,13 @@ static void xosc_wake(RP2350XOSCState *x)
     xosc_start(x);
 }
 
-static void xosc_startup_cb(void *opaque)
+/*
+ * The end of the startup delay: the output starts, at stable_ns however
+ * late the timer runs, and the blocks it clocks take it then.
+ */
+/* [spec:nuos:req:emu.clocks] */
+/* [spec:nuos:req:emu.clock-tree] */
+static void xosc_startup_at(void *opaque)
 {
     RP2350XOSCState *x = opaque;
 
@@ -1460,16 +1532,26 @@ static void xosc_startup_cb(void *opaque)
     xosc_update_out(x);
 }
 
-/* The end of the startup delay, when due: the output starts. */
-/* [spec:nuos:req:emu.clocks] */
-static void xosc_catch_up(RP2350ClkRegsState *s)
+static void xosc_startup_cb(void *opaque)
+{
+    RP2350XOSCState *x = opaque;
+
+    line_run_at(x->stable_ns, xosc_startup_at, x);
+}
+
+static int64_t xosc_next_due(RP2350ClkRegsState *s)
 {
     RP2350XOSCState *x = RP2350_XOSC(s);
 
-    if (clkregs_due(x->startup_timer)) {
-        timer_del(x->startup_timer);
-        xosc_startup_cb(x);
-    }
+    return timer_pending(x->startup_timer) ? x->stable_ns : INT64_MAX;
+}
+
+static void xosc_run_due(RP2350ClkRegsState *s)
+{
+    RP2350XOSCState *x = RP2350_XOSC(s);
+
+    timer_del(x->startup_timer);
+    line_run_at(x->stable_ns, xosc_startup_at, x);
 }
 
 /* [spec:nuos:req:emu.clocks] */
@@ -1556,7 +1638,7 @@ static bool xosc_write(RP2350ClkRegsState *s, unsigned reg, hwaddr addr,
         if (x->count && x->count < 4) {
             x->count = 4;
         }
-        x->count_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        x->count_ns = line_time();
         return true;
     }
     return false;
@@ -1679,7 +1761,8 @@ static void rp2350_xosc_class_init(ObjectClass *klass, const void *data)
     c->read = xosc_read;
     c->write = xosc_write;
     c->written = xosc_written;
-    c->catch_up = xosc_catch_up;
+    c->next_due = xosc_next_due;
+    c->run_due = xosc_run_due;
     c->reset_hold = xosc_reset_hold;
     rc->phases.exit = rp2350_xosc_exit_reset;
     dc->realize = rp2350_xosc_realize;
@@ -1809,15 +1892,22 @@ static void pll_update(RP2350PLLState *p, bool relock)
                           object_get_canonical_path_component(OBJECT(p)),
                           vco_hz);
         }
+        /* It counts its reference's cycles from the change at hand. */
         p->locking = true;
-        p->lock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+        p->lock_ns = line_time() +
                      clock_ticks_to_ns(p->ref, PLL_LOCK_REF_CYCLES * refdiv);
         timer_mod(p->lock_timer, p->lock_ns);
     }
     pll_update_out(p);
 }
 
-static void pll_lock_cb(void *opaque)
+/*
+ * The VCO locks, at lock_ns however late the timer runs: the output
+ * starts then, and the blocks it clocks take it then.
+ */
+/* [spec:nuos:req:emu.clocks] */
+/* [spec:nuos:req:emu.clock-tree] */
+static void pll_lock_at(void *opaque)
 {
     RP2350PLLState *p = opaque;
 
@@ -1826,16 +1916,26 @@ static void pll_lock_cb(void *opaque)
     pll_update_out(p);
 }
 
-/* The lock, when due. */
-/* [spec:nuos:req:emu.clocks] */
-static void pll_catch_up(RP2350ClkRegsState *s)
+static void pll_lock_cb(void *opaque)
+{
+    RP2350PLLState *p = opaque;
+
+    line_run_at(p->lock_ns, pll_lock_at, p);
+}
+
+static int64_t pll_next_due(RP2350ClkRegsState *s)
 {
     RP2350PLLState *p = RP2350_PLL(s);
 
-    if (clkregs_due(p->lock_timer)) {
-        timer_del(p->lock_timer);
-        pll_lock_cb(p);
-    }
+    return timer_pending(p->lock_timer) ? p->lock_ns : INT64_MAX;
+}
+
+static void pll_run_due(RP2350ClkRegsState *s)
+{
+    RP2350PLLState *p = RP2350_PLL(s);
+
+    timer_del(p->lock_timer);
+    line_run_at(p->lock_ns, pll_lock_at, p);
 }
 
 static void pll_ref_changed(void *opaque, ClockEvent event)
@@ -1968,7 +2068,8 @@ static void rp2350_pll_class_init(ObjectClass *klass, const void *data)
     c->read = pll_read;
     c->write = pll_write;
     c->written = pll_written;
-    c->catch_up = pll_catch_up;
+    c->next_due = pll_next_due;
+    c->run_due = pll_run_due;
     c->reset_hold = pll_reset_hold;
     rc->phases.exit = rp2350_pll_exit_reset;
     dc->vmsd = &vmstate_rp2350_pll;
@@ -2023,8 +2124,9 @@ static void tick_update(RP2350TicksState *t, int n)
             period = ref * cycles;
         }
     }
+    /* The count starts afresh with clk_ref's change, at its time. */
     if (period != clock_get(t->tick[n])) {
-        t->phase_ns[n] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        t->phase_ns[n] = line_time();
     }
     clock_update(t->tick[n], period);
 }
@@ -2043,7 +2145,7 @@ static uint32_t ticks_read(RP2350ClkRegsState *s, unsigned reg)
         /* The clk_ref cycles left before the next tick. */
         if (clock_is_enabled(t->tick[n])) {
             uint32_t cycles = s->regs[reg - 1];
-            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            int64_t now = line_time();
 
             return cycles - clock_ns_to_ticks(t->ref, now - t->phase_ns[n]) %
                             cycles;

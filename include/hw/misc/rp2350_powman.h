@@ -10,6 +10,7 @@
 #define HW_MISC_RP2350_POWMAN_H
 
 #include "hw/core/clock.h"
+#include "hw/core/line-time.h"
 #include "hw/core/sysbus.h"
 #include "hw/gpio/rp2350_gpio.h"
 #include "hw/misc/rp2350_psm.h"
@@ -99,9 +100,19 @@ struct RP2350PowmanState {
     qemu_irq alarm_wake;
     /* Sequencer steps, and polling the processors while WAITING. */
     QEMUTimer *seq_timer;
+    /*
+     * The tick on which the AON timer reaches its alarm, at alarm_ns; a
+     * DORMANT wake event, in the clock tree's due order.
+     */
     QEMUTimer *alarm_timer;
-    /* A tick source switch, which waits for the current source's tick. */
+    int64_t alarm_ns;
+    LineDueSource alarm_due;
+    /*
+     * A tick source switch, which waits for the current source's tick, at
+     * switch_ns.
+     */
     QEMUTimer *switch_timer;
+    int64_t switch_ns;
     QEMUTimer *vreg_timer;
 
     /* Properties */
@@ -188,6 +199,13 @@ struct RP2350PowmanState {
 
 void rp2350_powman_set_ops(RP2350PowmanState *s, const RP2350PowmanOps *ops,
                            void *opaque);
+
+/*
+ * The AON timer's alarm wakes a DORMANT oscillator: it joins the clock
+ * tree's due order (rp2350_clocks.h), so that an access that brings the
+ * tree up to its time finds the oscillator restarted at the alarm.
+ */
+void rp2350_powman_join_clock_order(RP2350PowmanState *s, LineDueOrder *o);
 
 /* Whether `domain` is powered (STATE.CURRENT). */
 bool rp2350_powman_domain_on(RP2350PowmanState *s, int domain);

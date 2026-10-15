@@ -897,8 +897,9 @@ static const MemoryRegionOps rp2350_pwm_ops = {
 };
 
 /*
- * A change of clk_sys frequency: run every slice to the change at the old
- * rate, then count from there at the new one.
+ * A change of clk_sys frequency, at its time (line_time()) however late
+ * the event making it ran, never before the last: run every slice to the
+ * change at the old rate, then count from there at the new one.
  */
 static void rp2350_pwm_clk_update(void *opaque, ClockEvent event)
 {
@@ -909,14 +910,14 @@ static void rp2350_pwm_clk_update(void *opaque, ClockEvent event)
         return;
     }
     if (event == ClockPreUpdate) {
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        uint64_t cycle = pwm_cycle_at(s, now);
+        int64_t when = MAX(line_time(), s->base_ns);
+        uint64_t cycle = pwm_cycle_at(s, when);
         int i;
 
         for (i = 0; i < RP2350_PWM_SLICES; i++) {
             pwm_sync(s, i, cycle);
         }
-        s->base_ns = now;
+        s->base_ns = when;
         s->base_cycle = cycle;
     } else {
         pwm_update_all(s);

@@ -1211,9 +1211,12 @@ static bool rp2350_soc_clock_glitch(void *opaque, int clk, bool apply)
  * oscillator, as is the clock muxes' PLL_USB reference input. GPIN0/1 and
  * the OTP's frequency counter clock have no source, so selecting them
  * stops a clock. clk_sys also reaches the SoC, which stops the processors
- * while it is stopped. An access to CLOCKS first has the oscillators and
- * PLLs take their start-ups and locks due by then. A glitch on a
- * peripheral clock reaches the blocks it clocks.
+ * while it is stopped. The oscillators, the PLLs, CLOCKS and TICKS share
+ * one due order (rp2350_clocks.h) with the AON timer's alarm, which wakes
+ * a DORMANT oscillator: an access to any of them, or to a timer counting
+ * their clocks, first takes the start-ups, locks, wakes and
+ * frequency-count phases due by then, each at its own time, the earliest
+ * first. A glitch on a peripheral clock reaches the blocks it clocks.
  */
 /* [spec:nuos:req:emu.clock-tree] */
 static void rp2350_soc_wire_clocks(RP2350State *s)
@@ -1235,10 +1238,19 @@ static void rp2350_soc_wire_clocks(RP2350State *s)
     qdev_connect_clock_in(clocks, "lposc", s->lposc);
     qdev_connect_clock_in(clocks, "pll-sys", s->pll_sys.out);
     qdev_connect_clock_in(clocks, "pll-usb", s->pll_usb.out);
-    rp2350_clocks_add_feed(&s->clocks, &s->rosc.feed);
-    rp2350_clocks_add_feed(&s->clocks, &s->xosc.parent_obj.feed);
-    rp2350_clocks_add_feed(&s->clocks, &s->pll_sys.parent_obj.feed);
-    rp2350_clocks_add_feed(&s->clocks, &s->pll_usb.parent_obj.feed);
+    /*
+     * Events due at the same time run sources first: the oscillators,
+     * then the PLLs, then CLOCKS (the order runs its latest join first).
+     * The AON timer's alarm, a DORMANT wake event, joins it too.
+     */
+    line_due_order_init(&s->clock_order);
+    rp2350_powman_join_clock_order(&s->powman, &s->clock_order);
+    rp2350_clkregs_join_order(RP2350_CLKREGS(&s->clocks), &s->clock_order);
+    rp2350_clkregs_join_order(RP2350_CLKREGS(&s->ticks), &s->clock_order);
+    rp2350_clkregs_join_order(RP2350_CLKREGS(&s->pll_usb), &s->clock_order);
+    rp2350_clkregs_join_order(RP2350_CLKREGS(&s->pll_sys), &s->clock_order);
+    rp2350_rosc_join_order(&s->rosc, &s->clock_order);
+    rp2350_clkregs_join_order(RP2350_CLKREGS(&s->xosc), &s->clock_order);
     qdev_connect_clock_in(DEVICE(&s->ticks), RP2350_TICKS_REF, CLK(s, REF));
     clock_set_source(s->clk_sys, CLK(s, SYS));
     rp2350_clocks_set_glitch_fn(&s->clocks, rp2350_soc_clock_glitch, s);
