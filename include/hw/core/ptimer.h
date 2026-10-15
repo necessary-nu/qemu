@@ -215,6 +215,32 @@ void ptimer_set_period_from_clock(ptimer_state *s, const Clock *clock,
                                   unsigned int divisor);
 
 /**
+ * ptimer_set_period_from_clock_edges - Count a Clock's edges
+ * @s: ptimer to configure
+ * @clk: pointer to Clock object to take period from
+ *
+ * As ptimer_set_period_from_clock() with @divisor 1, except that the
+ * timer counts the clock's edges rather than whole periods from when it
+ * starts, reloads or changes period: edges at whole multiples of the
+ * clock's period from virtual time 0, the edges every device timed on
+ * the clock counts, and under icount those between which a CPU executing
+ * at the clock's rate runs its instructions (icount_set_cpu_clock()).
+ * Started or changed at a time, the timer counts from the clock's last
+ * edge at or before it; each count, and each expiry, comes at its edge's
+ * time rounded up to the nanosecond, where an access a CPU completes at
+ * that edge comes. A timer started by an access at one edge then expires
+ * at exactly the edge its count gives, and reads exactly the edges left
+ * at an access at any other, whatever fractions of a nanosecond the edges
+ * fall at. A period below a nanosecond, which more than one edge can fall
+ * within, counts whole periods, as does a periodic timer whose reload
+ * lasts under 10 us without icount, which ptimer slows down to that.
+ *
+ * This function will assert if it is called outside a
+ * ptimer_transaction_begin/commit block.
+ */
+void ptimer_set_period_from_clock_edges(ptimer_state *s, const Clock *clk);
+
+/**
  * ptimer_set_freq - Set counter frequency in Hz
  * @s: ptimer to configure
  * @freq: counter frequency in Hz
