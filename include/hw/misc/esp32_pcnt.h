@@ -11,6 +11,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
+#include "hw/gpio/esp32_line.h"
 #include "qemu/timer.h"
 
 #define TYPE_ESP32_PCNT "esp32.pcnt"
@@ -30,6 +31,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(Esp32PcntState, ESP32_PCNT)
  */
 #define ESP32_PCNT_INPUT        "esp32-pcnt-input"
 #define ESP32_PCNT_SIG(u)       ((u) < 5 ? 39 + 4 * (u) : 71 + 4 * ((u) - 5))
+
+typedef struct Esp32PcntState Esp32PcntState;
+
+/*
+ * A signal input's wave (hw/gpio/esp32_line.h): the one the GPIO matrix
+ * (link "gpio") connects it to, whether the path inverts it, and whether
+ * the input takes it, its output describing its edges, rather than its
+ * line.
+ */
+typedef struct Esp32PcntBulk {
+    Esp32PcntState *s;
+    unsigned input;
+    Notifier taker;
+    Esp32LineWave *wave;
+    bool inv;
+    bool on;
+} Esp32PcntBulk;
 
 typedef struct Esp32PcntUnit {
     uint32_t conf0;
@@ -66,6 +84,20 @@ struct Esp32PcntState {
     uint8_t filt[ESP32_PCNT_INPUT_COUNT];
     int64_t raw_since_ns[ESP32_PCNT_INPUT_COUNT];
     QEMUTimer filter_timer;
+
+    /*
+     * Per input: the level on its line and when the input last took a
+     * change from it; and for a signal input taking a wave, the moment
+     * it has been brought to (raw, filt and raw_since_ns are as of then).
+     */
+    uint8_t line[ESP32_PCNT_INPUT_COUNT];
+    int64_t line_ns[ESP32_PCNT_INPUT_COUNT];
+    int64_t bulk_ns[ESP32_PCNT_INPUT_COUNT];
+    Esp32PcntBulk bulk[ESP32_PCNT_INPUT_COUNT];
+    /* bulk[].on, for migration */
+    bool bulk_on[ESP32_PCNT_INPUT_COUNT];
+    DeviceState *gpio;
+    Notifier route_notifier;
 };
 
 #endif

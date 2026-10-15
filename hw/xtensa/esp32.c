@@ -35,6 +35,7 @@
 #include "core-esp32/core-isa.h"
 #include "qemu/datadir.h"
 #include "system/system.h"
+#include "system/qtest.h"
 #include "system/reset.h"
 #include "system/cpus.h"
 #include "exec/icount.h"
@@ -1376,6 +1377,9 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_gated_device(s, &s->aes, DR_REG_AES_BASE, ESP32_GATE_PERI,
                                R_DPORT_PERI_AES_MASK, R_DPORT_PERI_AES_MASK);
 
+    object_property_set_link(OBJECT(&s->ledc), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
+    qdev_prop_set_uint32(DEVICE(&s->ledc), "sig-base", ESP32_SIG_LEDC_HS0);
     qdev_realize(DEVICE(&s->ledc), &s->periph_bus, &error_fatal);
     {
         Esp32PeriphGate *g = esp32_soc_add_gated_device(
@@ -1590,6 +1594,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
      * The pulse counter's signal and control inputs are GPIO matrix input
      * signals, reaching it from any pad through GPIO_FUNCn_IN_SEL.
      */
+    object_property_set_link(OBJECT(&s->pcnt), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
     qdev_realize(DEVICE(&s->pcnt), &s->periph_bus, &error_fatal);
     {
         Esp32PeriphGate *g = esp32_soc_add_gated_device(
@@ -2840,10 +2846,12 @@ static void esp32_machine_init(MachineState *machine)
     BlockBackend* blk = NULL;
     DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
     if (dinfo) {
-        qemu_log("Adding SPI flash device\n");
         blk = blk_by_legacy_dinfo(dinfo);
-    } else {
-        qemu_log("Not initializing SPI Flash\n");
+    } else if (!machine->kernel_filename && !machine->firmware &&
+               !qtest_enabled()) {
+        /* Only the boot ROM, which an ELF replaces, boots from the flash */
+        warn_report("esp32: no flash is configured (-drive if=mtd): the "
+                    "boot ROM has nothing to boot from");
     }
 
     Esp32MachineState *ms = ESP32_MACHINE(machine);

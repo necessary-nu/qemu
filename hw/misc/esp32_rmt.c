@@ -43,11 +43,11 @@
  * another block's output through the matrix, or another channel's,
  * measures the transmitted durations exactly. The block is a line source:
  * a block that samples the pads brings the transmitters up to the moment
- * it samples at, and a register access or the block's timer, while a
- * receiver is enabled, first brings every other source up to the moment
- * it acts at, so that an edge sent late (the host running behind virtual
- * time without icount) still reaches the receiver before it records the
- * time after it.
+ * it samples at, and a register access, the block's timer or a clock
+ * change, while a receiver is enabled, first brings every other source up
+ * to the moment it acts at, so that an edge sent late (the host running
+ * behind virtual time without icount) still reaches the receiver before
+ * it records the time after it.
  *
  * Behaviour the TRM leaves open, as modelled:
  * - TX_START starts the transmitter when written as 1 while it is idle,
@@ -985,12 +985,12 @@ static void rmt_sync_sources(void *opaque)
 
 /*
  * [spec:nuos:req:emu.esp32.rmt]
- * Bring the block up to now (esp32_line_time()): with a receiver enabled,
- * every source of line changes first, this block's transmitters among
- * them, so that no input edge older than now is still to come when the
- * receivers run up to now.
+ * Bring the block up to now (esp32_line_time()), and return that moment:
+ * with a receiver enabled, every source of line changes first, this
+ * block's transmitters among them, so that no input edge older than now
+ * is still to come when the receivers run up to now.
  */
-static void rmt_catch_up(Esp32RmtState *s)
+static int64_t rmt_catch_up(Esp32RmtState *s)
 {
     int64_t t = esp32_line_time();
 
@@ -998,6 +998,7 @@ static void rmt_catch_up(Esp32RmtState *s)
         esp32_line_run_at(t, rmt_sync_sources, NULL);
     }
     rmt_sync(s, t);
+    return t;
 }
 
 static void rmt_timer_cb(void *opaque)
@@ -1427,16 +1428,18 @@ static const MemoryRegionOps esp32_rmt_ram_ops = {
 };
 
 /*
- * A clock is about to change: bring the channels up to now with the old
- * period, and restart their cycle counts there.
+ * [spec:nuos:req:emu.esp32.rmt]
+ * A clock is about to change: bring the line sources and the channels up
+ * to now with the old period (rmt_catch_up()), and restart their cycle
+ * counts there.
  */
 static void esp32_rmt_clk_update(void *opaque, ClockEvent event)
 {
     Esp32RmtState *s = opaque;
-    int64_t now = esp32_line_time();
+    int64_t now;
 
     if (event == ClockPreUpdate) {
-        rmt_sync(s, now);
+        now = rmt_catch_up(s);
         for (unsigned n = 0; n < ESP32_RMT_CHANNELS; n++) {
             reanchor(s, &s->ch[n], now);
         }

@@ -158,9 +158,14 @@ struct ESP32P4LedcState {
     Notifier route_notifier;
     /*
      * Each channel's output reaches a pad something watches, so that its
-     * edges are timed
+     * edges are timed: one something but an input taking its wave watches
+     * (out_watched), or one such an input takes while the channel does not
+     * describe its edges (out_taken); its wave (hw/gpio/esp32_line.h).
      */
     bool out_seen[ESP32P4_LEDC_CHANNELS];
+    bool out_watched[ESP32P4_LEDC_CHANNELS];
+    bool out_taken[ESP32P4_LEDC_CHANNELS];
+    Esp32LineWave wave[ESP32P4_LEDC_CHANNELS];
 
     ESP32P4LedcTimer t[ESP32P4_LEDC_TIMERS];
     ESP32P4LedcChannel ch[ESP32P4_LEDC_CHANNELS];
