@@ -274,9 +274,11 @@ typedef struct ESP32P4AssistOps {
  * insn: an instruction at @pc in privilege mode @priv starts, so the one
  *   before it has retired; @kind is the instruction's ESP32P4_TRACE_KIND_*
  *   and its length (ESP32P4_TRACE_LEN_4 for 4 bytes, else 2). Each start
- *   is reported once, however often QEMU executes the instruction: an
- *   MMIO access unwound to run again alone (cpu_io_recompile()) does not
- *   report its start again.
+ *   is reported once, however often QEMU executes the instruction: one
+ *   the core unwound and executes again (an MMIO access run again alone
+ *   under icount, cpu_io_recompile(), a load or store a device held on
+ *   the bus, an atomic access to I/O made again with the other cores
+ *   stopped) does not report its start again.
  * trap: a trap is taken to @handler: an interrupt (@interrupt) or an
  *   exception, its cause @cause and trap value @tval, at @epc, from
  *   privilege mode @priv; @retired says whether the instruction last
@@ -469,6 +471,14 @@ struct ESP32P4CPU {
     void *trace_opaque;
     bool trace_en;
     bool trap_after_retire;
+    /*
+     * The instruction whose start the trace last had, at trace_start_pc,
+     * while trace_started; trace_unwound once the core has unwound it to
+     * the start, not retired, for it to execute again or trap.
+     */
+    uint32_t trace_start_pc;
+    bool trace_started;
+    bool trace_unwound;
 
     /*
      * The LP core's own state (tselect, tdata1 and tdata2 above serve its
@@ -661,6 +671,7 @@ int esp32p4_cpu_bus(uint32_t addr, bool fetch);
 void esp32p4_trace_connect(ESP32P4CPU *cpu, const ESP32P4TraceOps *ops,
                            void *opaque);
 void esp32p4_trace_set_enabled(ESP32P4CPU *cpu, bool en);
+void esp32p4_trace_unwound(ESP32P4CPU *cpu, bool unwound);
 void esp32p4_trace_trap(ESP32P4CPU *cpu, uint32_t epc, uint32_t cause,
                         bool interrupt, uint32_t tval, int priv,
                         bool retired);

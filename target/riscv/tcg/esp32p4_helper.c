@@ -61,7 +61,7 @@ void helper_esp32p4_hwlp_set(CPURISCVState *env, uint32_t desc,
  * the whole TB on entry: give back the instructions after it. Restoring
  * the state to the loop's last instruction gives it back too, and takes
  * it out of the instructions the core has retired, though it completed:
- * charge and count it again.
+ * charge and count it again, and keep it retiring in the trace.
  */
 static void esp32p4_hwlp_charge(CPURISCVState *env, uintptr_t ra)
 {
@@ -70,6 +70,7 @@ static void esp32p4_hwlp_charge(CPURISCVState *env, uintptr_t ra)
     if (icount_enabled() && cpu_restore_state(cs, ra)) {
         cs->neg.icount_decr.u16.low--;
         esp32p4_cpu_from_env(env)->insns++;
+        esp32p4_trace_unwound(esp32p4_cpu_from_env(env), false);
     }
 }
 
@@ -312,33 +313,69 @@ void esp32p4_trace_connect(ESP32P4CPU *cpu, const ESP32P4TraceOps *ops,
 /*
  * The trace encoder starts or stops tracing the core: the core leaves its
  * chain of translated blocks, translated with or without the reports, at
- * the next block.
+ * the next block. What the trace had of the instruction last started
+ * goes with the trace that had it.
  */
 /* [spec:nuos:req:emu.esp32p4.debug] */
 void esp32p4_trace_set_enabled(ESP32P4CPU *cpu, bool en)
 {
     if (qatomic_read(&cpu->trace_en) != en) {
+        qatomic_set(&cpu->trace_started, false);
+        qatomic_set(&cpu->trace_unwound, false);
         qatomic_set(&cpu->trace_en, en);
         cpu_exit(CPU(cpu));
     }
 }
 
-/* [spec:nuos:req:emu.esp32p4.debug] */
+/*
+ * [spec:nuos:req:emu.esp32p4.debug]
+ * The core unwinds the instruction it is executing to its start
+ * (cpu_restore_state()): it has not retired, and will execute again or
+ * trap, its start already reported. @unwound false takes that back, for
+ * an instruction that completed though the core unwound to it.
+ */
+void esp32p4_trace_unwound(ESP32P4CPU *cpu, bool unwound)
+{
+    cpu->trace_unwound = unwound && cpu->trace_started;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.debug]
+ * An instruction starts: the one unwound starting again is the same
+ * instruction, which the trace has, and is not reported twice.
+ */
 void helper_esp32p4_trace_insn(CPURISCVState *env, target_ulong pc,
                                uint32_t kind)
 {
     ESP32P4CPU *cpu = esp32p4_cpu_from_env(env);
 
-    if (cpu->trace_ops && qatomic_read(&cpu->trace_en)) {
+    if (cpu->trace_unwound) {
+        cpu->trace_unwound = false;
+        if (pc == cpu->trace_start_pc) {
+            return;
+        }
+    }
+    cpu->trace_started = cpu->trace_ops && qatomic_read(&cpu->trace_en);
+    if (cpu->trace_started) {
+        cpu->trace_start_pc = pc;
         cpu->trace_ops->insn(cpu->trace_opaque, pc, kind, env->priv);
     }
 }
 
-/* [spec:nuos:req:emu.esp32p4.debug] */
+/*
+ * [spec:nuos:req:emu.esp32p4.debug]
+ * A trap: the instruction last started retired before it as @retired
+ * says, unless the core unwound it, when it did not.
+ */
 void esp32p4_trace_trap(ESP32P4CPU *cpu, uint32_t epc, uint32_t cause,
                         bool interrupt, uint32_t tval, int priv,
                         bool retired)
 {
+    if (cpu->trace_unwound) {
+        retired = false;
+    }
+    cpu->trace_unwound = false;
+    cpu->trace_started = false;
     if (cpu->trace_ops && qatomic_read(&cpu->trace_en)) {
         cpu->trace_ops->trap(cpu->trace_opaque, epc, cause, interrupt, tval,
                              cpu->parent_obj.env.pc, priv, retired);
