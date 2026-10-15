@@ -1377,6 +1377,9 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_gated_device(s, &s->aes, DR_REG_AES_BASE, ESP32_GATE_PERI,
                                R_DPORT_PERI_AES_MASK, R_DPORT_PERI_AES_MASK);
 
+    object_property_set_link(OBJECT(&s->ledc), "gpio", OBJECT(&s->gpio),
+                             &error_abort);
+    qdev_prop_set_uint32(DEVICE(&s->ledc), "sig-base", ESP32_SIG_LEDC_HS0);
     qdev_realize(DEVICE(&s->ledc), &s->periph_bus, &error_fatal);
     {
         Esp32PeriphGate *g = esp32_soc_add_gated_device(

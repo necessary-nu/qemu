@@ -37,6 +37,15 @@
  * comes to them (esp32_line_pwm_skips(), include/hw/gpio/esp32_line.h),
  * make the output skip to its level at the moment it is being brought
  * to, the changes in between lost.
+ *
+ * A channel's output that only a pulse counter takes, in bulk through the
+ * channel's wave (hw/gpio/esp32_line.h), has no edges driven: outside a
+ * fade the channel describes them in closed form, cycle by cycle of its
+ * timer, the cycles' edges repeating every sixteen (DUTY[3:0]'s dither),
+ * each at its exact time, and the counter takes them when it looks; the
+ * output takes its level of the moment as the controller is brought up
+ * to date. Every change to the channel, its timer or their clocks is
+ * announced at its moment to the counters taking it.
  */
 
 #include "qemu/osdep.h"
@@ -46,6 +55,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/misc/esp32_ledc.h"
 #include "hw/gpio/esp32_gpio.h"
 #include "migration/vmstate.h"
@@ -498,6 +508,260 @@ static void chan_rebase(Esp32LEDCState *s, unsigned n, uint64_t k_old,
     ch->eval_ns = when - 1;
 }
 
+/* Waves (hw/gpio/esp32_line.h) */
+
+static void chan_sample(Esp32LEDCState *s, unsigned n, int64_t now);
+
+/*
+ * The counts at which channel n's generator changes level in cycle k of
+ * its timer, into c, in order, and how many (as chan_next_edge() finds
+ * them).
+ */
+static unsigned chan_cycle_edges(Esp32LEDCState *s, unsigned n, uint64_t k,
+                                 uint64_t *c)
+{
+    Esp32LedcChannel *ch = &s->ch[n];
+    Esp32LedcTimer *t = chan_timer(s, n);
+    uint64_t period = timer_period(t), hp = ch->act_hpoint, lp;
+    unsigned m = 0;
+    bool high;
+
+    if (!ch->active || hp >= period) {
+        return 0;
+    }
+    lp = chan_lpoint(ch, k);
+    high = hp < lp;
+    if (chan_start_level(ch, t, k) != high) {
+        c[m++] = hp;
+    }
+    if (high && lp < period) {
+        c[m++] = lp;
+    }
+    return m;
+}
+
+/*
+ * The edges of the cycles after the generator's base cycle, which repeat
+ * every sixteen outside a fade: per[j] for the cycles k with
+ * (k - k_base) % 16 == j, and their sum.
+ */
+static unsigned chan_cycle_table(Esp32LEDCState *s, unsigned n, unsigned *per)
+{
+    Esp32LedcChannel *ch = &s->ch[n];
+    unsigned sum = 0;
+    uint64_t c[2];
+
+    for (unsigned i = 0; i < 16; i++) {
+        uint64_t k = ch->k_base + 1 + i;
+
+        per[(k - ch->k_base) & 15] = chan_cycle_edges(s, n, k, c);
+        sum += per[(k - ch->k_base) & 15];
+    }
+    return sum;
+}
+
+/* The generator's edges from its base cycle up to count v of cycle k. */
+static uint64_t chan_edges_to(Esp32LEDCState *s, unsigned n, uint64_t k,
+                              uint64_t v)
+{
+    Esp32LedcChannel *ch = &s->ch[n];
+    unsigned per[16], sum, m;
+    uint64_t c[2], total, full;
+
+    if (k < ch->k_base) {
+        return 0;
+    }
+    m = chan_cycle_edges(s, n, ch->k_base, c);
+    if (k == ch->k_base) {
+        return (m > 0 && c[0] <= v) + (m > 1 && c[1] <= v);
+    }
+    total = m;
+    full = k - ch->k_base - 1;
+    if (full) {
+        sum = chan_cycle_table(s, n, per);
+        total += full / 16 * sum;
+        for (uint64_t i = 0; i < full % 16; i++) {
+            total += per[(1 + i) & 15];
+        }
+    }
+    m = chan_cycle_edges(s, n, k, c);
+    return total + (m > 0 && c[0] <= v) + (m > 1 && c[1] <= v);
+}
+
+/* The time of the generator's m-th edge (m >= 1) from its base cycle. */
+static int64_t chan_edge_time(Esp32LEDCState *s, unsigned n, uint64_t m)
+{
+    Esp32LedcChannel *ch = &s->ch[n];
+    Esp32LedcTimer *t = chan_timer(s, n);
+    unsigned per[16], sum, e0;
+    uint64_t c[2], k, q, r, i;
+
+    e0 = chan_cycle_edges(s, n, ch->k_base, c);
+    if (m <= e0) {
+        return due_time(t, timer_time(t, ch->k_base, c[m - 1]));
+    }
+    m -= e0;
+    sum = chan_cycle_table(s, n, per);
+    if (!sum) {
+        return INT64_MAX;
+    }
+    q = (m - 1) / sum;
+    r = m - q * sum;
+    for (i = 0; r > per[(1 + i) & 15]; i++) {
+        r -= per[(1 + i) & 15];
+    }
+    if (q > (UINT64_MAX - ch->k_base) / 32) {
+        return INT64_MAX;
+    }
+    k = ch->k_base + 1 + q * 16 + i;
+    chan_cycle_edges(s, n, k, c);
+    return due_time(t, timer_time(t, k, c[r - 1]));
+}
+
+static Esp32LEDCState *wave_ledc(Esp32LineWave *w)
+{
+    return w->opaque;
+}
+
+/* Outside a fade under way, the channel's edges are worked out below. */
+static bool ledc_wave_describes(Esp32LineWave *w)
+{
+    Esp32LedcChannel *ch = &wave_ledc(w)->ch[w->index];
+
+    return !chan_sig_out(ch) || !ch->active || !ch->fade ||
+           !ch->fade_end_due;
+}
+
+static bool ledc_wave_level(Esp32LineWave *w, int64_t t)
+{
+    Esp32LEDCState *s = wave_ledc(w);
+    Esp32LedcChannel *ch = &s->ch[w->index];
+
+    if (!chan_sig_out(ch)) {
+        return FIELD_EX32(ch->conf0, LEDC_CH_CONF0, IDLE_LV);
+    }
+    return chan_level_at(s, w->index, t);
+}
+
+static uint64_t ledc_wave_edges_by(Esp32LEDCState *s, unsigned n, int64_t x)
+{
+    uint64_t k, v;
+
+    if (!chan_sig_out(&s->ch[n])) {
+        return 0;
+    }
+    timer_pos(chan_timer(s, n), x, &k, &v);
+    return chan_edges_to(s, n, k, v);
+}
+
+static uint64_t ledc_wave_edges(Esp32LineWave *w, int64_t a, int64_t b)
+{
+    Esp32LEDCState *s = wave_ledc(w);
+
+    if (b <= a) {
+        return 0;
+    }
+    return ledc_wave_edges_by(s, w->index, b) -
+           ledc_wave_edges_by(s, w->index, a);
+}
+
+static int64_t ledc_wave_edge(Esp32LineWave *w, int64_t a, uint64_t j)
+{
+    Esp32LEDCState *s = wave_ledc(w);
+
+    if (!chan_sig_out(&s->ch[w->index])) {
+        return INT64_MAX;
+    }
+    return chan_edge_time(s, w->index,
+                          ledc_wave_edges_by(s, w->index, a) + j);
+}
+
+/*
+ * The shortest level the output holds: high for DUTY[24:4] counts or one
+ * more, low for the rest of the cycle, a count at least q / 2^32 ns long.
+ */
+static int64_t ledc_wave_min_hold(Esp32LineWave *w)
+{
+    Esp32LEDCState *s = wave_ledc(w);
+    Esp32LedcChannel *ch = &s->ch[w->index];
+    Esp32LedcTimer *t = chan_timer(s, w->index);
+    uint64_t d = ch->act_duty, period = timer_period(t), counts, ns;
+
+    if (!chan_sig_out(ch) || !ch->active || (d >> 4) >= period) {
+        return 0;
+    }
+    counts = MIN(d >> 4, period - (d >> 4) - ((d & 0xf) != 0));
+    ns = mul_shr32(counts, t->q);
+    return ns >= INT64_MAX ? 0 : (int64_t)ns - (ns > 0);
+}
+
+/* The next update the channel or its timer has waiting. */
+static int64_t ledc_wave_until(Esp32LineWave *w)
+{
+    Esp32LEDCState *s = wave_ledc(w);
+    unsigned n = w->index;
+    Esp32LedcTimer *t = chan_timer(s, n);
+    int64_t until = MIN(chan_load_time(s, n), chan_fade_end_time(s, n));
+
+    if (t->q && t->pending) {
+        until = MIN(until, due_time(t, timer_time(t, t->pend_cycle, 0)));
+    }
+    return until;
+}
+
+static const Esp32LineWaveOps ledc_wave_ops = {
+    .describes = ledc_wave_describes,
+    .level = ledc_wave_level,
+    .edges = ledc_wave_edges,
+    .edge = ledc_wave_edge,
+    .min_hold = ledc_wave_min_hold,
+    .until = ledc_wave_until,
+};
+
+/*
+ * Whether channel n's output is taken in bulk alone: a pulse counter takes
+ * its wave, nothing else watches its pad, and it describes its edges. Its
+ * edges are then not driven.
+ */
+static bool chan_bulk(Esp32LEDCState *s, unsigned n)
+{
+    return s->out_taken[n] && !s->out_watched[n] &&
+           ledc_wave_describes(&s->wave[n]);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * Channel n may change at `when`: the counters taking its wave take its
+ * edges before then as they were; or it has, and they go on from there.
+ */
+static void chan_wave_changing(Esp32LEDCState *s, unsigned n, int64_t when)
+{
+    if (esp32_line_wave_taken(&s->wave[n])) {
+        esp32_line_wave_changing(&s->wave[n], when);
+    }
+}
+
+static void chan_wave_changed(Esp32LEDCState *s, unsigned n, int64_t when)
+{
+    if (esp32_line_wave_taken(&s->wave[n])) {
+        esp32_line_wave_changed(&s->wave[n], when);
+    }
+}
+
+static void ledc_waves_changing(Esp32LEDCState *s, int64_t when)
+{
+    for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
+        chan_wave_changing(s, n, when);
+    }
+}
+
+static void ledc_waves_changed(Esp32LEDCState *s, int64_t when)
+{
+    for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
+        chan_wave_changed(s, n, when);
+    }
+}
+
 /*
  * [spec:nuos:req:emu.esp32.gpio]
  * Run a channel up to limit (and including it with inclusive): its loads,
@@ -512,17 +776,26 @@ static void chan_eval(Esp32LEDCState *s, unsigned n, int64_t limit,
                       bool inclusive)
 {
     Esp32LedcChannel *ch = &s->ch[n];
-    bool out = chan_sig_out(ch);
     int64_t last = inclusive ? limit : limit - 1;
 
     for (;;) {
+        bool out = chan_sig_out(ch);
+        bool bulk = chan_bulk(s, n);
         int64_t e_load = chan_load_time(s, n);
         int64_t e_fend = chan_fade_end_time(s, n);
         int64_t e_struct = MIN(e_load, e_fend);
-        int64_t e = out ? chan_next_edge(s, n, ch->eval_ns) : INT64_MAX;
+        int64_t e = out && !bulk ? chan_next_edge(s, n, ch->eval_ns) :
+                    INT64_MAX;
         int64_t next;
 
-        if (!out) {
+        if (bulk) {
+            /* The output at its level of the moment, as a sample has it */
+            int64_t x = MIN(last, e_struct - 1);
+
+            if (x > ch->eval_ns) {
+                chan_sample(s, n, x);
+            }
+        } else if (!out) {
             int64_t x = MIN(last, e_struct - 1);
 
             if (x > ch->eval_ns) {
@@ -553,11 +826,15 @@ static void chan_eval(Esp32LEDCState *s, unsigned n, int64_t limit,
             break;
         }
         if (next == e_fend) {
+            chan_wave_changing(s, n, e_fend);
             chan_fade_ended(s, n);
+            chan_wave_changed(s, n, e_fend);
         } else if (next == e_load) {
             uint64_t k = s->ch[n].load_cycle;
 
+            chan_wave_changing(s, n, e_load);
             chan_load(s, n, e_load, k);
+            chan_wave_changed(s, n, e_load);
         } else {
             ch->eval_ns = e;
             ch->gen_level = chan_level_at(s, n, e);
@@ -640,6 +917,7 @@ static void ledc_advance(Esp32LEDCState *s, int64_t now, bool sample)
         for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
             if (chan_timer_idx(s, n) == best) {
                 chan_eval(s, n, tb, false);
+                chan_wave_changing(s, n, tb);
             }
         }
         timer_ovf_check(s, best, tb);
@@ -652,6 +930,7 @@ static void ledc_advance(Esp32LEDCState *s, int64_t now, bool sample)
         for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
             if (chan_timer_idx(s, n) == best) {
                 chan_rebase(s, n, t->anchor_cycle, t->anchor_cycle, tb);
+                chan_wave_changed(s, n, tb);
             }
         }
     }
@@ -688,8 +967,8 @@ static void ledc_schedule(Esp32LEDCState *s)
     }
     for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
         Esp32LedcChannel *ch = &s->ch[n];
-        int64_t e = chan_sig_out(ch) ? chan_next_edge(s, n, ch->eval_ns) :
-                                       INT64_MAX;
+        int64_t e = chan_sig_out(ch) && !chan_bulk(s, n) ?
+                    chan_next_edge(s, n, ch->eval_ns) : INT64_MAX;
         int64_t next;
 
         if (e != INT64_MAX) {
@@ -737,6 +1016,34 @@ static void ledc_line_sync(Notifier *n, void *data)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * Which channels' outputs only a pulse counter takes (esp32_sig_out_taken())
+ * and which something else watches: an output taken alone is driven only
+ * at its level of the moment while its channel describes its edges
+ * (chan_bulk()), first brought up to now as it was.
+ */
+static void ledc_route_notify(Notifier *notifier, void *data)
+{
+    Esp32LEDCState *s = container_of(notifier, Esp32LEDCState,
+                                     route_notifier);
+    int64_t now = esp32_line_time();
+
+    ledc_advance(s, now, false);
+    for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
+        bool was = chan_bulk(s, n);
+
+        s->out_watched[n] = esp32_sig_out_watched(OBJECT(s->gpio),
+                                                  s->sig_base + n);
+        s->out_taken[n] = esp32_sig_out_taken(OBJECT(s->gpio),
+                                              s->sig_base + n);
+        if (was && !chan_bulk(s, n)) {
+            chan_sample(s, n, now);
+        }
+    }
+    ledc_schedule(s);
+}
+
+/*
  * [spec:nuos:req:emu.esp32.clock-gating]
  * The counters keep their counts across a change of clock; the time of
  * each later tick follows the new frequency.
@@ -748,12 +1055,14 @@ static void ledc_clk_update(void *opaque, ClockEvent event)
 
     if (event == ClockPreUpdate) {
         ledc_advance(s, now, false);
+        ledc_waves_changing(s, now);
         return;
     }
     for (unsigned i = 0; i < ESP32_LEDC_TIMER_CNT; i++) {
         timer_reanchor(&s->timer[i], now);
         s->timer[i].q = timer_q(s, i);
     }
+    ledc_waves_changed(s, now);
     ledc_schedule(s);
 }
 
@@ -954,6 +1263,7 @@ static void esp32_ledc_write(void *opaque, hwaddr addr,
     uint32_t v = value;
 
     ledc_advance(s, now, false);
+    ledc_waves_changing(s, now);
     if (addr < A_LEDC_TIMER_CONF) {
         unsigned n = addr / LEDC_CH_STRIDE;
         Esp32LedcChannel *ch = &s->ch[n];
@@ -1028,6 +1338,7 @@ static void esp32_ledc_write(void *opaque, hwaddr addr,
         }
     }
     ledc_advance(s, now, false);
+    ledc_waves_changed(s, now);
     ledc_schedule(s);
 }
 
@@ -1049,6 +1360,7 @@ static void esp32_ledc_reset_hold(Object *obj, ResetType type)
     Esp32LEDCState *s = ESP32_LEDC(obj);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    ledc_waves_changing(s, now);
     for (unsigned i = 0; i < ESP32_LEDC_TIMER_CNT; i++) {
         Esp32LedcTimer *t = &s->timer[i];
 
@@ -1095,6 +1407,7 @@ static void esp32_ledc_reset_hold(Object *obj, ResetType type)
     s->int_ena = 0;
     s->conf = 0;
     s->date = LEDC_DATE_RESET;
+    ledc_waves_changed(s, now);
 }
 
 static void esp32_ledc_reset_exit(Object *obj, ResetType type)
@@ -1134,12 +1447,32 @@ static void esp32_ledc_init(Object *obj)
         timer_init_ns(&s->ch[n].timer, QEMU_CLOCK_VIRTUAL, ledc_timer_cb, s);
     }
     s->line_source.notify = ledc_line_sync;
+    s->route_notifier.notify = ledc_route_notify;
+    for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
+        esp32_line_wave_init(&s->wave[n], &ledc_wave_ops, s, n);
+        s->out_watched[n] = true;
+    }
 }
 
 static void esp32_ledc_realize(DeviceState *dev, Error **errp)
 {
-    esp32_line_add_source(&ESP32_LEDC(dev)->line_source);
+    Esp32LEDCState *s = ESP32_LEDC(dev);
+
+    esp32_line_add_source(&s->line_source);
+    if (s->gpio) {
+        esp32_sig_add_route_notifier(OBJECT(s->gpio), &s->route_notifier);
+        for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
+            esp32_sig_set_wave(OBJECT(s->gpio), s->sig_base + n,
+                               &s->wave[n]);
+        }
+    }
 }
+
+static const Property esp32_ledc_properties[] = {
+    DEFINE_PROP_LINK("gpio", Esp32LEDCState, gpio, TYPE_DEVICE,
+                     DeviceState *),
+    DEFINE_PROP_UINT32("sig-base", Esp32LEDCState, sig_base, 0),
+};
 
 static const VMStateDescription vmstate_esp32_ledc_timer = {
     .name = "esp32-ledc-timer",
@@ -1196,8 +1529,8 @@ static const VMStateDescription vmstate_esp32_ledc_channel = {
 
 static const VMStateDescription vmstate_esp32_ledc = {
     .name = TYPE_ESP32_LEDC,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(apb_clk, Esp32LEDCState),
         VMSTATE_CLOCK(ref_tick_clk, Esp32LEDCState),
@@ -1210,6 +1543,9 @@ static const VMStateDescription vmstate_esp32_ledc = {
         VMSTATE_UINT32(int_ena, Esp32LEDCState),
         VMSTATE_UINT32(conf, Esp32LEDCState),
         VMSTATE_UINT32(date, Esp32LEDCState),
+        VMSTATE_BOOL_ARRAY(out_watched, Esp32LEDCState,
+                           ESP32_LEDC_CHANNEL_CNT),
+        VMSTATE_BOOL_ARRAY(out_taken, Esp32LEDCState, ESP32_LEDC_CHANNEL_CNT),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1223,6 +1559,7 @@ static void esp32_ledc_class_init(ObjectClass *klass, const void *data)
     rc->phases.exit = esp32_ledc_reset_exit;
     dc->realize = esp32_ledc_realize;
     dc->vmsd = &vmstate_esp32_ledc;
+    device_class_set_props(dc, esp32_ledc_properties);
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] */

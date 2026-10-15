@@ -120,4 +120,18 @@ typedef struct Esp32LEDCState {
     Esp32LineLag lag;
 
     Notifier line_source;
+
+    /*
+     * Link "gpio", the GPIO matrix, and property "sig-base", the output
+     * signal of channel 0: each channel's output that only a pulse counter
+     * takes, in bulk through its wave (hw/gpio/esp32_line.h), is driven
+     * only at its level of the moment while the channel describes its
+     * edges (out_taken, something else watching out_watched).
+     */
+    DeviceState *gpio;
+    uint32_t sig_base;
+    Notifier route_notifier;
+    bool out_watched[ESP32_LEDC_CHANNEL_CNT];
+    bool out_taken[ESP32_LEDC_CHANNEL_CNT];
+    Esp32LineWave wave[ESP32_LEDC_CHANNEL_CNT];
 } Esp32LEDCState;

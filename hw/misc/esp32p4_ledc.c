@@ -119,7 +119,12 @@
  * esp32p4_gpio_sig_out_watched()) is not timed edge by edge:
  * nothing sees its edges, and it takes its level of the moment whenever
  * the controller is brought up to date, so that it costs the host nothing
- * however fast.
+ * however fast. Nor is one only a pulse counter takes in bulk, through
+ * the channel's wave (hw/gpio/esp32_line.h): outside a fade the channel
+ * describes its edges in closed form, cycle by cycle of its timer, the
+ * cycles' edges repeating every sixteen (DUTY[3:0]'s dither); every
+ * change to the channel, its timer or LEDC_CLK is announced at its
+ * moment to the counters taking it. During a fade it drives its edges.
  *
  * Not modelled: the light-sleep output (TRM 58.2), which needs the PMU;
  * LEDC_CLK_EN and GAMMA_RAM_CLK_EN, clock gating that software cannot
@@ -749,6 +754,272 @@ static void chan_sample(ESP32P4LedcState *s, int n, int64_t x)
     chan_drive(s, n, x);
 }
 
+/* Waves (hw/gpio/esp32_line.h) */
+
+/*
+ * The counts at which channel n's generator changes level in cycle k of
+ * its timer, into c, in order, and how many (as chan_next_edge() finds
+ * them).
+ */
+static unsigned chan_cycle_edges(ESP32P4LedcState *s, int n, uint64_t k,
+                                 uint64_t *c)
+{
+    ESP32P4LedcChannel *ch = &s->ch[n];
+    uint64_t period = timer_period(chan_timer(s, n)), hp = ch->act_hpoint;
+    uint64_t lp;
+    unsigned m = 0;
+    bool high;
+
+    if (!ch->active || hp >= period) {
+        return 0;
+    }
+    lp = chan_lpoint(s, n, k);
+    high = hp < lp;
+    if (chan_start_level(s, n, k) != high) {
+        c[m++] = hp;
+    }
+    if (high && lp < period) {
+        c[m++] = lp;
+    }
+    return m;
+}
+
+/*
+ * The edges of the cycles after the generator's base cycle, which repeat
+ * every sixteen (outside a fade): per[j] for the cycles k with
+ * (k - k_dither) % 16 == j, and their sum.
+ */
+static unsigned chan_cycle_table(ESP32P4LedcState *s, int n, unsigned *per)
+{
+    ESP32P4LedcChannel *ch = &s->ch[n];
+    unsigned sum = 0;
+    uint64_t c[2];
+
+    for (unsigned i = 0; i < 16; i++) {
+        uint64_t k = ch->k_base + 1 + i;
+
+        per[(k - ch->k_dither) & 15] = chan_cycle_edges(s, n, k, c);
+        sum += per[(k - ch->k_dither) & 15];
+    }
+    return sum;
+}
+
+/*
+ * The edges of channel n's generator from its base cycle up to count v of
+ * cycle k, inclusive.
+ */
+static uint64_t chan_edges_to(ESP32P4LedcState *s, int n, uint64_t k,
+                              uint64_t v)
+{
+    ESP32P4LedcChannel *ch = &s->ch[n];
+    unsigned per[16], sum, m;
+    uint64_t c[2], total = 0, full, j0;
+
+    if (k < ch->k_base) {
+        return 0;
+    }
+    m = chan_cycle_edges(s, n, ch->k_base, c);
+    if (k == ch->k_base) {
+        return (m > 0 && c[0] <= v) + (m > 1 && c[1] <= v);
+    }
+    total = m;
+    full = k - ch->k_base - 1;
+    if (full) {
+        sum = chan_cycle_table(s, n, per);
+        j0 = (ch->k_base + 1 - ch->k_dither) & 15;
+        total += full / 16 * sum;
+        for (uint64_t i = 0; i < full % 16; i++) {
+            total += per[(j0 + i) & 15];
+        }
+    }
+    m = chan_cycle_edges(s, n, k, c);
+    return total + (m > 0 && c[0] <= v) + (m > 1 && c[1] <= v);
+}
+
+static ESP32P4LedcState *wave_ledc(Esp32LineWave *w)
+{
+    return w->opaque;
+}
+
+/* Outside a fade under way, the channel's edges are worked out below. */
+static bool ledc_wave_describes(Esp32LineWave *w)
+{
+    ESP32P4LedcChannel *ch = &wave_ledc(w)->ch[w->index];
+
+    return !ch->sig_out_en || !ch->active || !ch->fading || ch->paused;
+}
+
+static bool ledc_wave_level(Esp32LineWave *w, int64_t t)
+{
+    ESP32P4LedcState *s = wave_ledc(w);
+    ESP32P4LedcChannel *ch = &s->ch[w->index];
+
+    if (!ch->sig_out_en) {
+        return ch->conf0 & CONF0_IDLE_LV;
+    }
+    return chan_level_at(s, w->index, t);
+}
+
+/* The channel's edges by time x, from its generator's base cycle. */
+static uint64_t ledc_wave_edges_by(ESP32P4LedcState *s, int n, int64_t x)
+{
+    uint64_t k, v;
+
+    if (!s->ch[n].sig_out_en) {
+        return 0;
+    }
+    timer_pos(chan_timer(s, n), x, &k, &v);
+    return chan_edges_to(s, n, k, v);
+}
+
+static uint64_t ledc_wave_edges(Esp32LineWave *w, int64_t a, int64_t b)
+{
+    ESP32P4LedcState *s = wave_ledc(w);
+
+    if (b <= a) {
+        return 0;
+    }
+    return ledc_wave_edges_by(s, w->index, b) -
+           ledc_wave_edges_by(s, w->index, a);
+}
+
+/* The time of the generator's m-th edge (m >= 1) from its base cycle. */
+static int64_t chan_edge_time(ESP32P4LedcState *s, int n, uint64_t m)
+{
+    ESP32P4LedcChannel *ch = &s->ch[n];
+    ESP32P4LedcTimer *t = chan_timer(s, n);
+    unsigned per[16], sum, e0;
+    uint64_t c[2], k, j0, q, r, i;
+
+    e0 = chan_cycle_edges(s, n, ch->k_base, c);
+    if (m <= e0) {
+        return due_time(t, timer_time(t, ch->k_base, c[m - 1]));
+    }
+    m -= e0;
+    sum = chan_cycle_table(s, n, per);
+    if (!sum) {
+        return INT64_MAX;
+    }
+    q = (m - 1) / sum;
+    r = m - q * sum;
+    j0 = (ch->k_base + 1 - ch->k_dither) & 15;
+    for (i = 0; r > per[(j0 + i) & 15]; i++) {
+        r -= per[(j0 + i) & 15];
+    }
+    if (q > (UINT64_MAX - ch->k_base) / 32) {
+        return INT64_MAX;
+    }
+    k = ch->k_base + 1 + q * 16 + i;
+    chan_cycle_edges(s, n, k, c);
+    return due_time(t, timer_time(t, k, c[r - 1]));
+}
+
+static int64_t ledc_wave_edge(Esp32LineWave *w, int64_t a, uint64_t j)
+{
+    ESP32P4LedcState *s = wave_ledc(w);
+
+    if (!s->ch[w->index].sig_out_en) {
+        return INT64_MAX;
+    }
+    return chan_edge_time(s, w->index, ledc_wave_edges_by(s, w->index, a) +
+                          j);
+}
+
+/*
+ * The shortest level the output holds: high for DUTY[24:4] counts or one
+ * more, low for the rest of the cycle, each count at least the divider's
+ * whole part of LEDC_CLK's cycles.
+ */
+static int64_t ledc_wave_min_hold(Esp32LineWave *w)
+{
+    ESP32P4LedcState *s = wave_ledc(w);
+    ESP32P4LedcChannel *ch = &s->ch[w->index];
+    ESP32P4LedcTimer *t = chan_timer(s, w->index);
+    uint64_t d = ch->d_anchor, period = timer_period(t);
+    uint64_t counts = MIN(d >> 4, period - (d >> 4) - ((d & 0xf) != 0));
+    int64_t ns;
+
+    if (!ch->sig_out_en || !ch->active || (d >> 4) >= period || !counts) {
+        return 0;
+    }
+    ns = esp32p4_clk_cycles_ns_floor(esp32p4_clk_exact(s->clk),
+                                     counts * (t->div >> 8));
+    return ns == INT64_MAX ? 0 : MAX(ns - 1, 0);
+}
+
+/* The next update the channel or its timer has waiting. */
+static int64_t ledc_wave_until(Esp32LineWave *w)
+{
+    ESP32P4LedcState *s = wave_ledc(w);
+    ESP32P4LedcChannel *ch = &s->ch[w->index];
+    ESP32P4LedcTimer *t = chan_timer(s, w->index);
+    int64_t until = INT64_MAX;
+
+    if (ch->load_pending) {
+        until = MIN(until, due_time(t, timer_time(t, ch->load_cycle, 0)));
+    }
+    if (ch->op_pending) {
+        until = MIN(until, due_time(t, timer_time(t, ch->op_cycle, 0)));
+    }
+    if ((t->pend_div || t->pend_res) && timer_runs(t)) {
+        until = MIN(until, due_time(t, timer_time(t, t->pend_cycle, 0)));
+    }
+    return until;
+}
+
+static const Esp32LineWaveOps ledc_wave_ops = {
+    .describes = ledc_wave_describes,
+    .level = ledc_wave_level,
+    .edges = ledc_wave_edges,
+    .edge = ledc_wave_edge,
+    .min_hold = ledc_wave_min_hold,
+    .until = ledc_wave_until,
+};
+
+/*
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * Whether channel n's edges are timed one by one: something watches its
+ * pad, or a counter takes its wave while it does not describe its edges.
+ * A channel that comes to be has its level of the moment at `now`.
+ */
+static void chan_update_seen(ESP32P4LedcState *s, int n, int64_t now)
+{
+    bool seen = s->out_watched[n] ||
+                (s->out_taken[n] && !ledc_wave_describes(&s->wave[n]));
+
+    if (seen && !s->out_seen[n]) {
+        chan_sample(s, n, now);
+    }
+    s->out_seen[n] = seen;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * The channels may change at `when`: the counters taking their waves take
+ * their edges before it as they were.
+ */
+static void ledc_waves_changing(ESP32P4LedcState *s, int64_t when)
+{
+    for (int n = 0; n < ESP32P4_LEDC_CHANNELS; n++) {
+        if (esp32_line_wave_taken(&s->wave[n])) {
+            esp32_line_wave_changing(&s->wave[n], when);
+        }
+    }
+}
+
+/* They have: the counters go on from their new edges. */
+static void ledc_waves_changed(ESP32P4LedcState *s, int64_t when)
+{
+    for (int n = 0; n < ESP32P4_LEDC_CHANNELS; n++) {
+        if (s->out_taken[n]) {
+            chan_update_seen(s, n, when);
+        }
+        if (esp32_line_wave_taken(&s->wave[n])) {
+            esp32_line_wave_changed(&s->wave[n], when);
+        }
+    }
+}
+
 /*
  * The time of the last edge of channel n at or before x, after `from`,
  * from which its level has not changed: INT64_MIN if none. Only the last
@@ -1295,6 +1566,7 @@ static void ledc_advance(ESP32P4LedcState *s, int64_t now)
             continue;
         }
         ledc_catch_up(s, te);
+        ledc_waves_changing(s, te);
         switch (kind) {
         case EV_TIMER_UPDATE:
             timer_take_update(s, idx, te, s->t[idx].pend_cycle);
@@ -1318,6 +1590,7 @@ static void ledc_advance(ESP32P4LedcState *s, int64_t now)
             chan_load(s, idx, te, s->ch[idx].load_cycle);
             break;
         }
+        ledc_waves_changed(s, te);
     }
     ledc_catch_up(s, now);
     for (int n = 0; n < ESP32P4_LEDC_CHANNELS; n++) {
@@ -1437,13 +1710,11 @@ static void ledc_routes_changed(ESP32P4LedcState *s)
 
     ledc_advance(s, now);
     for (int n = 0; n < ESP32P4_LEDC_CHANNELS; n++) {
-        bool seen = !s->gpio ||
-                    esp32p4_gpio_sig_out_watched(s->gpio, s->sig_base + n);
-
-        if (seen && !s->out_seen[n]) {
-            chan_sample(s, n, now);
-        }
-        s->out_seen[n] = seen;
+        s->out_watched[n] = !s->gpio ||
+            esp32p4_gpio_sig_out_watched(s->gpio, s->sig_base + n);
+        s->out_taken[n] = s->gpio &&
+            esp32p4_gpio_sig_out_taken(s->gpio, s->sig_base + n);
+        chan_update_seen(s, n, now);
     }
     ledc_schedule(s);
 }
@@ -1466,12 +1737,14 @@ static void ledc_clk_update(void *opaque, ClockEvent event)
 
     if (event == ClockPreUpdate) {
         ledc_advance(s, now);
+        ledc_waves_changing(s, now);
         return;
     }
     for (int x = 0; x < ESP32P4_LEDC_TIMERS; x++) {
         timer_reanchor(&s->t[x], now);
         timer_set_q(s, x);
     }
+    ledc_waves_changed(s, now);
     ledc_schedule(s);
 }
 
@@ -1670,6 +1943,7 @@ static void esp32p4_ledc_write(void *opaque, hwaddr addr, uint64_t value,
     uint32_t v = value;
 
     ledc_advance(s, now);
+    ledc_waves_changing(s, now);
     if (addr < A_TIMER_BASE) {
         int n = addr / CH_STRIDE;
         ESP32P4LedcChannel *ch = &s->ch[n];
@@ -1751,6 +2025,7 @@ static void esp32p4_ledc_write(void *opaque, hwaddr addr, uint64_t value,
         }
     }
     ledc_advance(s, now);
+    ledc_waves_changed(s, now);
     ledc_schedule(s);
 }
 
@@ -1787,6 +2062,7 @@ static void esp32p4_ledc_etm_task(void *opaque, int line, int level)
     }
     now = ledc_now(s);
     ledc_advance(s, now);
+    ledc_waves_changing(s, now);
     switch (kind) {
     case TASK_RES_UPDATE: {
         ESP32P4LedcTimer *t = &s->t[i];
@@ -1846,6 +2122,7 @@ static void esp32p4_ledc_etm_task(void *opaque, int line, int level)
         break;
     }
     ledc_advance(s, now);
+    ledc_waves_changed(s, now);
     ledc_schedule(s);
 }
 
@@ -1859,6 +2136,7 @@ static void esp32p4_ledc_reset_hold(Object *obj, ResetType type)
     ESP32P4LedcState *s = ESP32P4_LEDC(obj);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    ledc_waves_changing(s, now);
     timer_del(&s->timer);
     s->seen_ns = now;
     for (int x = 0; x < ESP32P4_LEDC_TIMERS; x++) {
@@ -1880,6 +2158,7 @@ static void esp32p4_ledc_reset_hold(Object *obj, ResetType type)
     memset(s->evt_task_en, 0, sizeof(s->evt_task_en));
     s->conf = 0;
     s->date = DATE_RESET;
+    ledc_waves_changed(s, now);
 }
 
 static void esp32p4_ledc_reset_exit(Object *obj, ResetType type)
@@ -1914,6 +2193,9 @@ static void esp32p4_ledc_init(Object *obj)
     timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, ledc_timer_cb, s);
     s->line_source.notify = ledc_line_sync;
     s->route_notifier.notify = ledc_route_notify;
+    for (int n = 0; n < ESP32P4_LEDC_CHANNELS; n++) {
+        esp32_line_wave_init(&s->wave[n], &ledc_wave_ops, s, n);
+    }
 }
 
 static void esp32p4_ledc_realize(DeviceState *dev, Error **errp)
@@ -1923,6 +2205,9 @@ static void esp32p4_ledc_realize(DeviceState *dev, Error **errp)
     esp32_line_add_source(&s->line_source);
     if (s->gpio) {
         esp32p4_gpio_add_route_notifier(s->gpio, &s->route_notifier);
+        for (int n = 0; n < ESP32P4_LEDC_CHANNELS; n++) {
+            esp32p4_gpio_set_wave(s->gpio, s->sig_base + n, &s->wave[n]);
+        }
     }
 }
 
@@ -2001,8 +2286,8 @@ static const VMStateDescription vmstate_esp32p4_ledc_channel = {
 
 static const VMStateDescription vmstate_esp32p4_ledc = {
     .name = TYPE_ESP32P4_LEDC,
-    .version_id = 4,
-    .minimum_version_id = 4,
+    .version_id = 5,
+    .minimum_version_id = 5,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(clk, ESP32P4LedcState),
         VMSTATE_TIMER(timer, ESP32P4LedcState),
@@ -2021,6 +2306,10 @@ static const VMStateDescription vmstate_esp32p4_ledc = {
         VMSTATE_INT64(seen_ns, ESP32P4LedcState),
         VMSTATE_BOOL(irq_level, ESP32P4LedcState),
         VMSTATE_BOOL_ARRAY(out_seen, ESP32P4LedcState,
+                           ESP32P4_LEDC_CHANNELS),
+        VMSTATE_BOOL_ARRAY(out_watched, ESP32P4LedcState,
+                           ESP32P4_LEDC_CHANNELS),
+        VMSTATE_BOOL_ARRAY(out_taken, ESP32P4LedcState,
                            ESP32P4_LEDC_CHANNELS),
         VMSTATE_END_OF_LIST()
     },
