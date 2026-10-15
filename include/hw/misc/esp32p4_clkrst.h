@@ -875,13 +875,6 @@ void esp32p4_clkrst_gate_volatile(ESP32P4ClkRstGate *g, hwaddr offset,
                                   unsigned size);
 
 /*
- * The block a gated mapping's region @mr leads to, or NULL for a region
- * that is not one: for a DMA master that must see whether the block is in
- * the middle of an access, which the gate has no owner to show.
- */
-DeviceState *esp32p4_clkrst_gated_device(MemoryRegion *mr);
-
-/*
  * Bring the clock tree up to @now: the changes its sources (the PLLs) and
  * its own CPU resets have due by then, each at its own time, which their
  * QEMU timers, running late, have not made yet. Every access to its

@@ -841,52 +841,26 @@ static void esp32_periph_clk_update(void *opaque, int n, int level)
  * peripheral is held in reset. A read that would have a side effect, such
  * as popping a FIFO, returns 0 and has none.
  */
-static MemTxResult esp32_gate_read(void *opaque, hwaddr addr, uint64_t *data,
-                                   unsigned size, MemTxAttrs attrs)
+static bool esp32_gate_pass(void *opaque, hwaddr addr, unsigned size,
+                            bool is_write, MemTxAttrs attrs)
 {
     Esp32GateWindow *w = opaque;
     Esp32PeriphGate *g = w->gate;
-    uint8_t buf[8];
-    MemTxResult r;
 
-    if (!esp32_gate_running(g) && g->has_volatile_reg && w == &g->window[0] &&
-        addr < g->volatile_reg + 4 && addr + size > g->volatile_reg) {
-        *data = 0;
-        return MEMTX_OK;
+    if (esp32_gate_running(g)) {
+        return true;
     }
-    r = address_space_read(&w->dev_as, addr, attrs, buf, size);
-    *data = ldn_le_p(buf, size);
-    return r;
-}
-
-static MemTxResult esp32_gate_write(void *opaque, hwaddr addr, uint64_t data,
-                                    unsigned size, MemTxAttrs attrs)
-{
-    Esp32GateWindow *w = opaque;
-    Esp32PeriphGate *g = w->gate;
-    uint8_t buf[8];
-
-    if (!esp32_gate_running(g)) {
+    if (is_write) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "esp32: write to %s at 0x%" HWADDR_PRIx " while its "
                       "clock is gated or it is held in reset\n",
                       object_get_canonical_path_component(OBJECT(g->dev)),
                       addr);
-        return MEMTX_OK;
+        return false;
     }
-    stn_le_p(buf, size, data);
-    return address_space_write(&w->dev_as, addr, attrs, buf, size);
+    return !(g->has_volatile_reg && w == &g->window[0] &&
+             addr < g->volatile_reg + 4 && addr + size > g->volatile_reg);
 }
-
-static const MemoryRegionOps esp32_gate_ops = {
-    .read_with_attrs = esp32_gate_read,
-    .write_with_attrs = esp32_gate_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
-    .impl.min_access_size = 1,
-    .impl.max_access_size = 4,
-};
 
 /*
  * Map a register block of a gated peripheral at addr, and, like the other
@@ -905,21 +879,16 @@ static void esp32_gate_map(Esp32PeriphGate *g, MemoryRegion *dev_mr,
     w->gate = g;
     name = g_strdup_printf("%s-gate",
                            object_get_canonical_path_component(OBJECT(g->dev)));
-    address_space_init(&w->dev_as, dev_mr, name);
-    /*
-     * No owner: an owner's re-entrancy guard would block the forwarded
-     * access to the peripheral's own region, and one shared by all gates
-     * would block a peripheral reaching another through its gate.
-     */
-    memory_region_init_io(&w->iomem, NULL, &esp32_gate_ops, w,
-                          name, memory_region_size(dev_mr));
-    memory_region_add_subregion_overlap(sys_mem, addr, &w->iomem, priority);
+    esp32_gated_region_init(&w->region, g->dev, dev_mr, name,
+                            esp32_gate_pass, w);
+    memory_region_add_subregion_overlap(sys_mem, addr, &w->region.mr,
+                                        priority);
     if (apb_alias) {
         MemoryRegion *alias = g_new(MemoryRegion, 1);
         char *alias_name = g_strdup_printf("mr-apb-0x%08x", (uint32_t)addr);
 
         memory_region_init_alias(alias, NULL, alias_name,
-                                 &w->iomem, 0, memory_region_size(dev_mr));
+                                 &w->region.mr, 0, memory_region_size(dev_mr));
         memory_region_add_subregion_overlap(sys_mem,
                                             addr - DR_REG_DPORT_APB_BASE +
                                             APB_REG_BASE, alias, priority);
