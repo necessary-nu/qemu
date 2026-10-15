@@ -10,8 +10,8 @@
 #define HW_MISC_RP2350_CLOCKS_H
 
 #include "hw/core/clock.h"
+#include "hw/core/line-time.h"
 #include "hw/core/sysbus.h"
-#include "qemu/notify.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -39,8 +39,9 @@ struct RP2350ClkRegsState {
 
     MemoryRegion iomem;
     uint32_t regs[RP2350_CLKREGS_MAX];
-    /* Takes the block's events due by now, for CLOCKS if it feeds it. */
-    Notifier feed;
+    /* The block's timed events, in the clock tree's due order. */
+    LineDueSource due;
+    LineDueOrder *order;
 };
 
 struct RP2350ClkRegsClass {
@@ -64,11 +65,43 @@ struct RP2350ClkRegsClass {
     /* Resets state beyond the register file. */
     void (*reset_hold)(RP2350ClkRegsState *s);
     /*
-     * Takes the block's events due by the present, before a register
-     * access: without icount their timers run late.
+     * The block's next timed event (an oscillator's start-up, a PLL's
+     * lock, the end of a phase of the frequency count): when it falls
+     * due, INT64_MAX for none; and running it at that time. NULL for a
+     * block with no timed events.
      */
-    void (*catch_up)(RP2350ClkRegsState *s);
+    int64_t (*next_due)(RP2350ClkRegsState *s);
+    void (*run_due)(RP2350ClkRegsState *s);
 };
+
+/*
+ * The clock tree's changes at their own times.
+ *
+ * The oscillators, the PLLs and CLOCKS change their outputs at times of
+ * their own, on QEMU timers that run late without icount. Each change
+ * happens at its time however late its timer runs (line_run_at()): it
+ * propagates through the tree with that stamp, and every block it reaches
+ * times it by line_time(), as a PLL counts its lock from its reference's
+ * start, TICKS its next tick from clk_ref's change, and a timer its next
+ * count from its tick's.
+ *
+ * The blocks' events join one LineDueOrder (rp2350_clkregs_join_order(),
+ * rp2350_rosc_join_order(), and the AON timer's alarm, which wakes a
+ * DORMANT oscillator: rp2350_powman_join_clock_order()), which a register
+ * access of any of them runs up to the access's time first, the earliest
+ * event first, so that an oscillator's start-up comes before a frequency
+ * count's end due after it and after one due before it, whichever block
+ * is accessed. A block counting one of the tree's clocks brings the tree
+ * up to its access the same way (rp2350_clocks_sync()), so that it counts
+ * a change that has fallen due, from its time, before its timer has run.
+ */
+void rp2350_clkregs_join_order(RP2350ClkRegsState *s, LineDueOrder *o);
+
+/*
+ * Bring the clock tree up to line_time(), if @clk comes from it: its
+ * events due by then, each at its own time.
+ */
+void rp2350_clocks_sync(Clock *clk);
 
 /*
  * The clock generators of CLOCKS, in register order. Each is a clock
@@ -161,10 +194,11 @@ struct RP2350ClocksState {
     /*
      * The clk_sys resuscitation circuit: whether it has switched clk_sys
      * to clk_ref, and the timer that fires once clk_sys has been stopped
-     * for CLK_SYS_RESUS_CTRL.TIMEOUT clk_ref cycles.
+     * for CLK_SYS_RESUS_CTRL.TIMEOUT clk_ref cycles, at resus_ns.
      */
     bool resussed;
     QEMUTimer *resus_timer;
+    int64_t resus_ns;
 
     /*
      * The frequency counter: the phase of its count, when that phase ends
@@ -181,20 +215,7 @@ struct RP2350ClocksState {
     uint64_t fc0_edges;
     uint64_t fc0_last_period;
     int64_t fc0_last_ns;
-
-    /* The blocks feeding the clock sources (rp2350_clocks_add_feed()). */
-    NotifierList feeds;
 };
-
-/*
- * A block whose outputs feed CLOCKS's clock sources (an oscillator, a
- * PLL) and change at times of their own, on QEMU timers that run late
- * without icount: @n takes its events due by now, which CLOCKS has each
- * feed do before a register access, so that what an access sees and sets
- * going (a frequency count, a glitchless switch) starts from the sources
- * as they are then.
- */
-void rp2350_clocks_add_feed(RP2350ClocksState *s, Notifier *n);
 
 /* Have @fn handle glitches that reach the peripheral clocks. */
 void rp2350_clocks_set_glitch_fn(RP2350ClocksState *s, RP2350ClocksGlitchFn *fn,

@@ -11,16 +11,21 @@
  * software sets CYCLES to clk_ref's frequency in MHz) or, when SOURCE
  * selects it, clk_sys cycles (the "clk-sys" clock), at the clock's
  * current rate. It stops while paused and while the clock it counts is
- * stopped. Debug pause is not modelled.
+ * stopped. A change of the clock counts from the change's time
+ * (line_time()), however late the event making it ran, and an access
+ * first brings the clock tree up to its time (rp2350_clocks_sync()).
+ * Debug pause is not modelled.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
+#include "hw/misc/rp2350_clocks.h"
 #include "hw/timer/rp2350_timer.h"
 #include "migration/vmstate.h"
 
@@ -116,7 +121,7 @@ static void timer_fire(RP2350TimerState *s, int n)
  */
 static void timer_schedule(RP2350TimerState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = MAX(line_time(), s->sync_ns);
     uint64_t elapsed = timer_elapsed(s, now);
     uint32_t lo = s->count + elapsed;
     int i;
@@ -144,11 +149,13 @@ static void timer_schedule(RP2350TimerState *s)
 /*
  * Fold elapsed counts into the counter, keeping sync_ns on a count
  * boundary so that the time towards the next count is not lost. Called
- * before anything that changes the count, rate or run state.
+ * before anything that changes the count, rate or run state, at the time
+ * of the access or change at hand; never before sync_ns, which the
+ * counter has already counted up to.
  */
 static void timer_sync(RP2350TimerState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = MAX(line_time(), s->sync_ns);
     uint64_t n = timer_elapsed(s, now);
 
     if (!s->running) {
@@ -167,12 +174,14 @@ static void timer_restart(RP2350TimerState *s)
 }
 
 /*
- * The clock the counter counts changes rate, starts or stops: count up to
- * the change at the old rate, then start the next count afresh at the
- * new one.
+ * The clock the counter counts changes rate, starts or stops, at the
+ * change's time (line_time()), however late the event making it ran:
+ * count up to the change at the old rate, then start the next count
+ * afresh at the new one.
  */
 static void timer_fire_due(RP2350TimerState *s, int64_t now);
 
+/* [spec:nuos:req:emu.clock-tree] */
 static void timer_clock_changed(RP2350TimerState *s, Clock *clk,
                                 ClockEvent event)
 {
@@ -185,11 +194,11 @@ static void timer_clock_changed(RP2350TimerState *s, Clock *clk,
          * without icount, fires at the old rate: re-armed at the new one
          * it would wait for the count to wrap.
          */
-        timer_fire_due(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        timer_fire_due(s, line_time());
         timer_sync(s);
         return;
     }
-    s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->sync_ns = MAX(line_time(), s->sync_ns);
     timer_restart(s);
 }
 
@@ -207,7 +216,13 @@ static void timer_sys_changed(void *opaque, ClockEvent event)
     timer_clock_changed(s, s->clk_sys, event);
 }
 
-/* Fire every armed alarm whose target the counter has reached by now. */
+/*
+ * Fire every armed alarm whose target the counter has reached by now,
+ * its interrupt at the time the alarm fell due (line_set_at()), however
+ * late its timer runs or an access takes it: a core that the interrupt
+ * wakes from a sleep wakes then.
+ */
+/* [spec:nuos:req:emu.timer] */
 static void timer_fire_due(RP2350TimerState *s, int64_t now)
 {
     int i;
@@ -215,9 +230,14 @@ static void timer_fire_due(RP2350TimerState *s, int64_t now)
     for (i = 0; i < RP2350_TIMER_ALARMS; i++) {
         if ((s->armed & (1u << i)) && s->alarm_due_ns[i] >= 0 &&
             s->alarm_due_ns[i] <= now) {
+            int64_t due = s->alarm_due_ns[i];
+
             s->alarm_due_ns[i] = -1;
             timer_del(s->alarm_timer[i]);
-            timer_fire(s, i);
+            s->armed &= ~(1u << i);
+            s->intr |= 1u << i;
+            line_set_at(s->irq[i], ((s->intr | s->intf) & s->inte) >> i & 1,
+                        due);
         }
     }
 }
@@ -229,19 +249,31 @@ static void timer_alarm_cb(void *opaque)
 
 /*
  * [spec:nuos:req:emu.timer]
- * A register access first fires the alarms the counter has reached by its
- * moment: without icount the alarms' QEMU timers run late, and until they
- * do software would read the counter past an alarm whose interrupt has
+ * [spec:nuos:req:emu.clock-tree]
+ * A register access first brings the clock tree up to its moment, so that
+ * the counter counts a change of its clock that has fallen due (an
+ * oscillator's start-up, a PLL's lock) from its time, and then fires the
+ * alarms the counter has reached by then: without icount the QEMU timers
+ * of both run late, and until they do software would read the counter
+ * as if its clock had not changed, or past an alarm whose interrupt has
  * not yet been raised, as no software sees on the chip.
  */
+static int64_t timer_access_catch_up(RP2350TimerState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    rp2350_clocks_sync(s->tick);
+    rp2350_clocks_sync(s->clk_sys);
+    timer_fire_due(s, now);
+    return now;
+}
+
 static uint64_t rp2350_timer_read(void *opaque, hwaddr addr, unsigned size)
 {
     RP2350TimerState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = timer_access_catch_up(s);
     hwaddr reg = rp2350_atomic_reg(addr);
     uint64_t count;
-
-    timer_fire_due(s, now);
 
     switch (reg) {
     case A_TIMEHR:
@@ -291,7 +323,7 @@ static void rp2350_timer_write(void *opaque, hwaddr addr, uint64_t value,
     uint32_t source;
     int n;
 
-    timer_fire_due(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    timer_access_catch_up(s);
 
     switch (reg) {
     case A_TIMEHW:
@@ -336,7 +368,7 @@ static void rp2350_timer_write(void *opaque, hwaddr addr, uint64_t value,
         if (source != s->source) {
             /* A change of clock starts the next count afresh. */
             s->source = source;
-            s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            s->sync_ns = MAX(line_time(), s->sync_ns);
         }
         timer_restart(s);
         break;

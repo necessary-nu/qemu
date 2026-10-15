@@ -45,6 +45,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_rosc.h"
@@ -178,7 +179,7 @@ static uint32_t rosc_output_hz(RP2350ROSCState *s)
 
 static uint32_t rosc_count_now(RP2350ROSCState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = line_time();
     uint64_t ticks;
 
     if (!rosc_running(s) || !s->count) {
@@ -191,12 +192,12 @@ static uint32_t rosc_count_now(RP2350ROSCState *s)
 
 /*
  * Bring COUNT up to date before anything that changes its rate or stops
- * the oscillator.
+ * the oscillator, at the time of the access or change at hand.
  */
 static void rosc_count_sync(RP2350ROSCState *s)
 {
     s->count = rosc_count_now(s);
-    s->count_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->count_ns = line_time();
 }
 
 static uint32_t rosc_randombit(RP2350ROSCState *s)
@@ -227,7 +228,7 @@ static uint32_t rosc_status(RP2350ROSCState *s)
     }
     if (rosc_running(s)) {
         st |= STATUS_DIV_RUNNING;
-        if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->stable_ns) {
+        if (line_time() >= s->stable_ns) {
             st |= STATUS_STABLE;
         }
     }
@@ -239,7 +240,8 @@ static uint32_t rosc_status(RP2350ROSCState *s)
 
 /*
  * Drive the divider's outputs: running once the oscillator is enabled and
- * stable and DORMANT does not gate it.
+ * stable and DORMANT does not gate it, as of the access or change at hand
+ * (line_time()).
  */
 /* [spec:nuos:req:emu.clock-tree] */
 static void rosc_update_clocks(RP2350ROSCState *s)
@@ -248,8 +250,7 @@ static void rosc_update_clocks(RP2350ROSCState *s)
                     PHASE_PASSWD || (s->phase & PHASE_ENABLE);
     uint32_t hz = 0;
 
-    if (rosc_running(s) && !s->gated &&
-        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->stable_ns) {
+    if (rosc_running(s) && !s->gated && line_time() >= s->stable_ns) {
         hz = rosc_output_hz(s);
     }
     clock_update_hz(s->out, hz);
@@ -272,13 +273,13 @@ static void rosc_set_gated(RP2350ROSCState *s, bool gated)
 
 /*
  * A wake event restarts the oscillator in the configuration it stopped
- * in; its output is ungated once it is stable. A disabled oscillator has
- * nothing to restart.
+ * in, at the event's time; its output is ungated once it is stable. A
+ * disabled oscillator has nothing to restart.
  */
 /* [spec:nuos:req:emu.rosc-trng] */
 static void rosc_wake(RP2350ROSCState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = line_time();
 
     s->dormant_stopped = false;
     s->dormant = DORMANT_WAKE;
@@ -291,7 +292,12 @@ static void rosc_wake(RP2350ROSCState *s)
     timer_mod(s->startup_timer, s->stable_ns);
 }
 
-static void rosc_startup_cb(void *opaque)
+/*
+ * [spec:nuos:req:emu.rosc-trng]
+ * The end of the start-up: the outputs run from stable_ns however late
+ * the timer runs, and the blocks they clock take them then.
+ */
+static void rosc_startup_at(void *opaque)
 {
     RP2350ROSCState *s = opaque;
 
@@ -301,27 +307,51 @@ static void rosc_startup_cb(void *opaque)
     rosc_update_clocks(s);
 }
 
+static void rosc_startup_cb(void *opaque)
+{
+    RP2350ROSCState *s = opaque;
+
+    line_run_at(s->stable_ns, rosc_startup_at, s);
+}
+
+static int64_t rosc_next_due(LineDueSource *src)
+{
+    RP2350ROSCState *s = container_of(src, RP2350ROSCState, due);
+
+    return timer_pending(s->startup_timer) ? s->stable_ns : INT64_MAX;
+}
+
+static void rosc_run_due(LineDueSource *src)
+{
+    RP2350ROSCState *s = container_of(src, RP2350ROSCState, due);
+
+    timer_del(s->startup_timer);
+    line_run_at(s->stable_ns, rosc_startup_at, s);
+}
+
 /*
  * [spec:nuos:req:emu.rosc-trng]
- * The start-up that has ended by now, which its timer, running late
- * without icount, has yet to take: the outputs run from then. A register
- * access takes it first, and so does one of CLOCKS, which the outputs
- * feed (the "feed" notifier): software that waited out the start-up then
- * counts, or switches to, a running oscillator.
+ * A register access first takes the clock tree's events due by then, the
+ * start-up among them, in their order (rp2350_clocks.h): software that
+ * waited out the start-up finds the oscillator running, and so do CLOCKS
+ * and the blocks counting the clocks it feeds.
  */
 static void rosc_catch_up(RP2350ROSCState *s)
 {
-    if (timer_pending(s->startup_timer) &&
-        timer_expire_time_ns(s->startup_timer) <=
-        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
-        timer_del(s->startup_timer);
-        rosc_startup_cb(s);
+    int64_t now = line_time();
+
+    if (s->order) {
+        line_due_order_run(s->order, now);
+    } else if (rosc_next_due(&s->due) <= now) {
+        rosc_run_due(&s->due);
     }
 }
 
-static void rosc_feed(Notifier *n, void *data)
+/* [spec:nuos:req:emu.clock-tree] */
+void rp2350_rosc_join_order(RP2350ROSCState *s, LineDueOrder *o)
 {
-    rosc_catch_up(container_of(n, RP2350ROSCState, feed));
+    s->order = o;
+    line_due_order_add(o, &s->due);
 }
 
 /* [spec:nuos:req:emu.rosc-trng] */
@@ -401,9 +431,8 @@ static void rosc_write_ctrl(RP2350ROSCState *s, uint32_t value)
     rosc_count_sync(s);
     s->ctrl = value & CTRL_MASK;
     if (!was_running && rosc_running(s)) {
-        s->stable_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                       ROSC_STARTUP_NS;
-        s->count_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->stable_ns = line_time() + ROSC_STARTUP_NS;
+        s->count_ns = line_time();
         timer_mod(s->startup_timer, s->stable_ns);
     }
     rosc_update_clocks(s);
@@ -490,7 +519,7 @@ static void rp2350_rosc_write(void *opaque, hwaddr addr, uint64_t value64,
     case A_COUNT:
         value = rp2350_atomic_apply(addr, rosc_count_now(s), value);
         s->count = value & COUNT_MASK;
-        s->count_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->count_ns = line_time();
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: write to bad offset 0x%"
@@ -552,7 +581,8 @@ static void rp2350_rosc_init(Object *obj)
                           TYPE_RP2350_ROSC, RP2350_ATOMIC_REGION_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     s->startup_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rosc_startup_cb, s);
-    s->feed.notify = rosc_feed;
+    s->due.next_due = rosc_next_due;
+    s->due.run = rosc_run_due;
     qdev_init_gpio_in_named(DEVICE(obj), rosc_set_wake,
                             RP2350_OSC_DORMANT_WAKE, 1);
     s->out = qdev_init_clock_out(DEVICE(obj), RP2350_ROSC_CLK);

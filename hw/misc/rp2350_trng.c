@@ -26,6 +26,7 @@
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_trng.h"
@@ -189,12 +190,13 @@ static int64_t trng_cycles_ns(RP2350TRNGState *s, uint64_t cycles)
 }
 
 /*
- * Account for the samples taken since sync_ns. sync_ns advances only by
- * whole samples, so a partly elapsed sample period is not lost.
+ * Account for the samples taken since sync_ns, up to the time of the
+ * access or change at hand (line_time()). sync_ns advances only by whole
+ * samples, so a partly elapsed sample period is not lost.
  */
 static void trng_sync(RP2350TRNGState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = MAX(line_time(), s->sync_ns);
     uint64_t period = trng_sample_period(s);
     uint64_t taken;
 
@@ -468,8 +470,9 @@ static void rp2350_trng_hold_reset(Object *obj, ResetType type)
 }
 
 /*
- * rng_clk changes rate, starts or stops: count the samples taken at the
- * old rate, and the next sample afresh at the new one.
+ * rng_clk changes rate, starts or stops, at the change's time
+ * (line_time()) however late the event making it ran: count the samples
+ * taken at the old rate, and the next sample afresh at the new one.
  */
 static void trng_clk_changed(void *opaque, ClockEvent event)
 {
@@ -480,7 +483,7 @@ static void trng_clk_changed(void *opaque, ClockEvent event)
         trng_sync(s);
         return;
     }
-    s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->sync_ns = MAX(line_time(), s->sync_ns);
     trng_schedule(s);
 }
 

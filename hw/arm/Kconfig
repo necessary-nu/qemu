@@ -283,6 +283,7 @@ config ARM_V7M
     default y
     depends on TCG && ARM
     select PTIMER
+    select LINE_TIME
 
 config ALLWINNER_A10
     bool

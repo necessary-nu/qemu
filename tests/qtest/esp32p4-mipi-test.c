@@ -129,6 +129,7 @@
 #define V_CH_CFG0           0x20
 #define V_CH_CFG1           0x24
 #define V_LLP0              0x28
+#define V_STATUS0           0x30
 #define V_INTST_ENA0        0x80
 #define V_INTSTATUS         0x88
 #define V_INTSIG_ENA0       0x90
@@ -1348,6 +1349,142 @@ static void test_csi_vdma_singles(void)
     qtest_quit(qts);
 }
 
+/*
+ * VDMA channel 2 from the bridge's port to MEM, the bridge the flow
+ * controller, 64-bit items in bursts of 8 (the bridge's DMA_BURST_LEN
+ * below), BLOCK_TS @max items, which the bridge's last request ends
+ * sooner.
+ */
+static void csi_dma_arm(QTestState *qts, uint32_t max)
+{
+    qtest_writel(qts, V_CH(2) + V_INTCLEAR0, 0xffffffff);
+    qtest_writel(qts, V_CH(2) + V_SAR0, CSI_MEM);
+    qtest_writel(qts, V_CH(2) + V_DAR0, MEM);
+    qtest_writel(qts, V_CH(2) + V_BLOCK_TS0, max - 1);
+    qtest_writel(qts, V_CH(2) + V_CTL0, 1u << 2 | 1u << 4 | 3u << 8 |
+                 3u << 11 | 2u << 14 | 2u << 18);
+    qtest_writel(qts, V_CH(2) + V_CTL1, 0);
+    qtest_writel(qts, V_CHEN0, 2 | 2u << 8);
+}
+
+/* Step up to @us for channel 2's block to be done: its items, or 0. */
+static uint32_t csi_dma_block(QTestState *qts, int us)
+{
+    for (int i = 0; i < us; i++) {
+        step(qts, NS_PER_US);
+        if (qtest_readl(qts, V_CH(2) + V_INTSTATUS) & DMA_TFR_DONE) {
+            return qtest_readl(qts, V_CH(2) + V_STATUS0) & 0x3fffff;
+        }
+    }
+    return 0;
+}
+
+/* A frame through the host's hook: number @no, one RAW8 line of @n. */
+static void csi_frame(QTestState *qts, uint16_t no, const uint8_t *line,
+                      uint16_t n)
+{
+    csi_send(qts, 0, 0x00, no, NULL, 0, 0, 0);
+    csi_send(qts, 0, 0x2a, n, line, 0, 0, 0);
+    csi_send(qts, 0, 0x01, no, NULL, 0, 0, 0);
+}
+
+/* MEM holds @line's @n bytes, then 0x5a to @n + 64. */
+static void csi_mem_is(QTestState *qts, const uint8_t *line, uint32_t n)
+{
+    g_autofree uint8_t *got = g_malloc(n + 64);
+
+    qtest_memread(qts, MEM, got, n + 64);
+    g_assert_cmpmem(got, n, line, n);
+    for (int i = 0; i < 64; i++) {
+        g_assert_cmphex(got[n + i], ==, 0x5a);
+    }
+}
+
+static void csi_mem_clear(QTestState *qts, uint32_t n)
+{
+    g_autofree uint8_t *b = g_malloc(n);
+
+    memset(b, 0x5a, n);
+    qtest_memwrite(qts, MEM, b, n);
+}
+
+/*
+ * The ends of the frames in the CSI bridge's buffer, each frame one RAW8
+ * line through the host's hook, VDMA channel 2 taking them with the
+ * bridge the flow controller in bursts of 8 words:
+ *   - a frame of 64 bytes, a whole burst, VDMA armed: the burst waits in
+ *     the buffer for the frame's end, which ends the block with it;
+ *   - three such frames waiting in the buffer, VDMA armed for each in
+ *     turn with room for more: each block is one frame, the next ones'
+ *     words left in the buffer;
+ *   - eight frames of 2 KiB filling the buffer, VDMA not taking them, and
+ *     a ninth, which overruns (CSI_BUF_OVERRUN, CSI_BRIG_DISCARD at its
+ *     end) with nothing of it in the buffer: the eight come out a block
+ *     each, and the ninth makes none.
+ */
+/* [spec:nuos:req:emu.esp32p4.mipi/test] */
+static void test_csi_frame_ends(void)
+{
+    QTestState *qts = machine(NULL);
+    static uint8_t line[9][2048];
+
+    for (int k = 0; k < 9; k++) {
+        for (int i = 0; i < sizeof(line[k]); i++) {
+            line[k][i] = i * 7 + k * 31 + 1;
+        }
+    }
+    csi_up(qts, 0x00, 2);
+    qtest_writel(qts, CB_DATA_TYPE_CFG, 0x2f12);
+    qtest_writel(qts, CB_DMA_REQ_CFG, 0x20000 | 8);
+    qtest_writel(qts, CB_FRAME_CFG, 1u << 24 | 8u << 12 | 1);
+    qtest_writel(qts, V_CFG0, 3);
+    qtest_writel(qts, V_CH(2) + V_CH_CFG0, 0);
+    qtest_writel(qts, V_CH(2) + V_CH_CFG1, 4 | 1u << 4 | 1u << 7 | 1u << 17);
+    qtest_writel(qts, V_CH(2) + V_INTST_ENA0, 0xffffffff);
+    qtest_writel(qts, CB_CSI_EN, 1);
+
+    csi_mem_clear(qts, 4096);
+    csi_dma_arm(qts, 1024);
+    csi_send(qts, 0, 0x00, 1, NULL, 0, 0, 0);
+    csi_send(qts, 0, 0x2a, 64, line[0], 0, 0, 0);
+    step(qts, 10 * NS_PER_US);
+    g_assert_cmpuint(qtest_readl(qts, CB_BUF_FLOW_CTL) >> 16, ==, 8);
+    g_assert_false(qtest_readl(qts, V_CH(2) + V_INTSTATUS) & DMA_TFR_DONE);
+    csi_send(qts, 0, 0x01, 1, NULL, 0, 0, 0);
+    g_assert_cmpuint(csi_dma_block(qts, 100), ==, 8);
+    csi_mem_is(qts, line[0], 64);
+
+    for (int k = 0; k < 3; k++) {
+        csi_frame(qts, 2 + k, line[k], 64);
+    }
+    step(qts, 10 * NS_PER_US);
+    g_assert_cmpuint(qtest_readl(qts, CB_BUF_FLOW_CTL) >> 16, ==, 24);
+    for (int k = 0; k < 3; k++) {
+        csi_mem_clear(qts, 4096);
+        csi_dma_arm(qts, 1024);
+        g_assert_cmpuint(csi_dma_block(qts, 100), ==, 8);
+        csi_mem_is(qts, line[k], 64);
+        g_assert_cmpuint(qtest_readl(qts, CB_BUF_FLOW_CTL) >> 16, ==,
+                         8 * (2 - k));
+    }
+
+    for (int k = 0; k < 9; k++) {
+        csi_frame(qts, 5 + k, line[k], sizeof(line[k]));
+    }
+    g_assert_cmpuint(qtest_readl(qts, CB_BUF_FLOW_CTL) >> 16, ==, 2048);
+    g_assert_cmphex(qtest_readl(qts, CB_INT_RAW) & 0xc, ==, 0xc);
+    for (int k = 0; k < 8; k++) {
+        csi_mem_clear(qts, 4096);
+        csi_dma_arm(qts, 1024);
+        g_assert_cmpuint(csi_dma_block(qts, 1000), ==, 256);
+        csi_mem_is(qts, line[k], sizeof(line[k]));
+    }
+    g_assert_cmpuint(qtest_readl(qts, CB_BUF_FLOW_CTL) >> 16, ==, 0);
+    csi_dma_arm(qts, 1024);
+    g_assert_cmpuint(csi_dma_block(qts, 100), ==, 0);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1364,5 +1501,6 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/mipi/csi/bridge", test_csi_bridge);
     qtest_add_func("esp32p4/mipi/csi/capture", test_csi_capture);
     qtest_add_func("esp32p4/mipi/csi/vdma-singles", test_csi_vdma_singles);
+    qtest_add_func("esp32p4/mipi/csi/frame-ends", test_csi_frame_ends);
     return g_test_run();
 }

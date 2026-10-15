@@ -479,7 +479,8 @@ static void dw_timer_in(DesignWareI2CState *s, uint64_t cycles)
 static void dw_clk_update(void *opaque, ClockEvent event)
 {
     DesignWareI2CState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /* The change's time, however late the event making it ran. */
+    int64_t now = line_time();
 
     if (event == ClockPreUpdate) {
         if (clock_get(s->clk) && timer_pending(s->timer)) {

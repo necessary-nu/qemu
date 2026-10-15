@@ -656,6 +656,11 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
 }
 
 #ifndef CONFIG_USER_ONLY
+/*
+ * The halt ends, if the CPU has work: a sleep it was in ends at the time
+ * of the event that woke it, which the event gave as it reached the CPU,
+ * not at this moment, when the CPU's thread got to it (cpu_sleep_exit()).
+ */
 static inline bool cpu_handle_halt(CPUState *cpu)
 {
     const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
@@ -666,6 +671,7 @@ static inline bool cpu_handle_halt(CPUState *cpu)
     }
 
     cpu->halted = 0; /* allow execution */
+    cpu_sleep_exit(cpu);
 
     return false;
 }

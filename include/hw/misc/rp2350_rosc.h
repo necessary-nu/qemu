@@ -25,8 +25,9 @@ struct RP2350ROSCState {
     /* The divider's outputs, rosc_clksrc and rosc_clksrc_ph. */
     Clock *out;
     Clock *out_ph;
-    /* Takes a start-up due by now, for CLOCKS (rp2350_clocks_add_feed()). */
-    Notifier feed;
+    /* Its start-up, in the clock tree's due order (rp2350_clocks.h). */
+    LineDueSource due;
+    LineDueOrder *order;
 
     /* Registers as last written (raw, including invalid codes). */
     uint32_t ctrl;
@@ -69,6 +70,9 @@ struct RP2350ROSCState {
 /* Named clock outputs of ROSC: rosc_clksrc and rosc_clksrc_ph. */
 #define RP2350_ROSC_CLK "clk"
 #define RP2350_ROSC_CLK_PH "clk-ph"
+
+/* Join the clock tree's due order (rp2350_clkregs_join_order()). */
+void rp2350_rosc_join_order(RP2350ROSCState *s, LineDueOrder *o);
 
 /*
  * Configure the ROSC as the boot ROM's early boot path leaves it: DIV
