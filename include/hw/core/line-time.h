@@ -40,6 +40,16 @@ void line_set_at(qemu_irq line, int level, int64_t when_ns);
 void line_run_at(int64_t when_ns, void (*fn)(void *opaque), void *opaque);
 
 /*
+ * The time of the event at hand, for a receiver that must know when an
+ * event fell due however late it came, as a core's sleep ends at the time
+ * of the interrupt that woke it: a stamped change's time; otherwise, in
+ * the callback of a QEMU_CLOCK_VIRTUAL timer, the timer's deadline, the
+ * time of the event a device set it for, which without icount the
+ * callback can run well after; otherwise the present.
+ */
+int64_t line_event_time(void);
+
+/*
  * Sources a receiver brings up to its time.
  *
  * A transmitter times its bits on QEMU timers of its own, which without

@@ -8,7 +8,8 @@
  * Reference: RP2350 Datasheet, "Watchdog". The counter in CTRL.TIME
  * counts down once per tick of the TICKS block's WATCHDOG generator, which
  * divides clk_ref by its CYCLES setting (the "tick" clock), at the tick's
- * current rate. When the counter reaches zero, or
+ * current rate, a change of the tick counting from the change's time
+ * (line_time()). When the counter reaches zero, or
  * TRIGGER is written, the watchdog records why in REASON and requests a
  * reset, which the PSM carries out (see rp2350_psm.c) unless POWMAN.WDSEL
  * makes it a chip-level reset (see rp2350_powman.c). The watchdog itself
@@ -30,8 +31,10 @@
 #include "qapi/error.h"
 #include "hw/core/cpu.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/misc/rp2350_atomic.h"
+#include "hw/misc/rp2350_clocks.h"
 #include "hw/watchdog/rp2350_watchdog.h"
 #include "migration/vmstate.h"
 #include "system/cpus.h"
@@ -83,11 +86,13 @@ static uint32_t wd_time(RP2350WatchdogState *s, int64_t now)
 /*
  * Fold elapsed ticks into the counter, keeping sync_ns on a tick boundary
  * so that partial ticks are not lost. Called before anything that changes
- * the count, the rate or whether the counter runs.
+ * the count, the rate or whether the counter runs, at the time of the
+ * access or change at hand; never before sync_ns, which the counter has
+ * already counted up to.
  */
 static void wd_sync(RP2350WatchdogState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = MAX(line_time(), s->sync_ns);
     uint64_t n = wd_elapsed(s, now);
 
     if (!s->running) {
@@ -132,9 +137,11 @@ static void wd_expired(void *opaque)
 }
 
 /*
- * The WATCHDOG tick started, stopped or changed rate: count up to the
- * change at the old rate, and the next tick afresh at the new one.
+ * The WATCHDOG tick started, stopped or changed rate, at the change's
+ * time however late the event making it ran: count up to the change at
+ * the old rate, and the next tick afresh at the new one.
  */
+/* [spec:nuos:req:emu.clock-tree] */
 static void wd_tick_changed(void *opaque, ClockEvent event)
 {
     RP2350WatchdogState *s = opaque;
@@ -143,7 +150,7 @@ static void wd_tick_changed(void *opaque, ClockEvent event)
         wd_sync(s);
         return;
     }
-    s->sync_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->sync_ns = MAX(line_time(), s->sync_ns);
     wd_restart(s);
 }
 
@@ -161,11 +168,16 @@ static void wd_tick_changed(void *opaque, ClockEvent event)
  * it. The access is then held (cpu_hold_access()): the processor stops
  * at the instruction, which has not executed, for the reset. True if it
  * is.
+ *
+ * First the clock tree comes up to the access (rp2350_clocks_sync()), so
+ * that the count follows a change of its tick that has fallen due from
+ * the change's time.
  */
 static bool wd_catch_up(RP2350WatchdogState *s, MemTxAttrs attrs)
 {
     CPUState *cs = current_cpu;
 
+    rp2350_clocks_sync(s->tick);
     if (!timer_pending(s->expiry) ||
         timer_expire_time_ns(s->expiry) >
         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {

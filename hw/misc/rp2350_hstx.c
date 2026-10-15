@@ -1045,8 +1045,9 @@ static void rp2350_hstx_clk_update(void *opaque, ClockEvent event)
         return;
     }
     if (event == ClockPreUpdate) {
+        /* At the change's time, however late the event making it ran. */
         hstx_sync(s);
-        s->base_ns = hstx_now();
+        s->base_ns = MAX(line_time(), s->base_ns);
         s->base_cycle = s->core.cycle;
     } else {
         hstx_update(s);

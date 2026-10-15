@@ -83,6 +83,9 @@ static QEMUClock qemu_clocks[QEMU_CLOCK_MAX];
  */
 static int64_t late_timers_ns;
 
+/* The deadline of the QEMU_CLOCK_VIRTUAL timer this thread is running. */
+static __thread int64_t running_deadline = INT64_MIN;
+
 /* A QEMUTimerList is a list of timers attached to a clock. More
  * than one QEMUTimerList can be attached to each clock, for instance
  * used by different AioContexts / threads. Each clock also has
@@ -671,7 +674,7 @@ bool timer_expired(const QEMUTimer *timer_head, int64_t current_time)
 bool timerlist_run_timers(QEMUTimerList *timer_list)
 {
     QEMUTimer *ts;
-    int64_t current_time;
+    int64_t current_time, deadline, outer;
     bool progress = false;
     QEMUTimerCB *cb;
     void *opaque;
@@ -738,13 +741,19 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
         /* remove timer from the list before calling the callback */
         timer_list->active_timers = ts->next;
         ts->next = NULL;
+        deadline = ts->expire_time;
         ts->expire_time = -1;
         cb = ts->cb;
         opaque = ts->opaque;
 
         /* run the callback (the timer list can be modified) */
         qemu_mutex_unlock(&timer_list->active_timers_lock);
+        outer = running_deadline;
+        if (timer_list->clock->type == QEMU_CLOCK_VIRTUAL) {
+            running_deadline = deadline;
+        }
         cb(opaque);
+        running_deadline = outer;
         qemu_mutex_lock(&timer_list->active_timers_lock);
 
         progress = true;
@@ -845,6 +854,11 @@ void qemu_init_clocks(QEMUTimerListNotifyCB *notify_cb)
 uint64_t timer_expire_time_ns(const QEMUTimer *ts)
 {
     return timer_pending(ts) ? ts->expire_time : -1;
+}
+
+int64_t timer_running_deadline_ns(void)
+{
+    return running_deadline;
 }
 
 bool qemu_clock_run_all_timers(void)

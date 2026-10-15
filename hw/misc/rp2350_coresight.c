@@ -34,6 +34,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_coresight.h"
@@ -707,9 +708,10 @@ static MemTxResult memap_write(RP2350CoreSightState *s, MemAP *ap,
 
 /* Timestamp generator. */
 
+/* The count at the time of the access or change at hand. */
 static uint64_t tsgen_now(RP2350CoreSightState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = MAX(line_time(), s->tsgen_epoch_ns);
 
     if (!(s->tsgen_cntcr & CNTCR_EN)) {
         return s->tsgen_count;
@@ -717,10 +719,14 @@ static uint64_t tsgen_now(RP2350CoreSightState *s)
     return s->tsgen_count + clock_ns_to_ticks(s->clk, now - s->tsgen_epoch_ns);
 }
 
+/*
+ * Fold the count into tsgen_count, before a change of its clock (at the
+ * change's time, however late the event making it ran) or of CNTCR.
+ */
 static void tsgen_sync(RP2350CoreSightState *s)
 {
     s->tsgen_count = tsgen_now(s);
-    s->tsgen_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->tsgen_epoch_ns = MAX(line_time(), s->tsgen_epoch_ns);
 }
 
 static void tsgen_clk_update(void *opaque, ClockEvent event)

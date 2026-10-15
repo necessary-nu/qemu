@@ -51,6 +51,7 @@
 #include "qapi/error.h"
 #include "hw/core/cpu.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/dma/rp2350_dma.h"
@@ -247,14 +248,17 @@ static unsigned ch_mode(RP2350DMAChannel *c)
  * having been reached at virtual time base_ns at the current rate.
  */
 /* [spec:nuos:req:emu.clock-tree] */
-static uint64_t now_cycle(RP2350DMAState *s)
+static uint64_t cycle_at(RP2350DMAState *s, int64_t ns)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-
-    if (now <= s->base_ns) {
+    if (ns <= s->base_ns) {
         return s->base_cycle;
     }
-    return s->base_cycle + clock_ns_to_ticks(s->clk, now - s->base_ns);
+    return s->base_cycle + clock_ns_to_ticks(s->clk, ns - s->base_ns);
+}
+
+static uint64_t now_cycle(RP2350DMAState *s)
+{
+    return cycle_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 /*
@@ -1707,16 +1711,20 @@ static void rp2350_dma_reset_exit(Object *obj, ResetType type)
 }
 
 /*
- * clk_sys changes rate, starts or stops: cycles up to now count at the old
- * rate, and the engine's timer is re-armed for the new one.
+ * clk_sys changes rate, starts or stops, at the change's time
+ * (line_time()) however late the event making it ran, never before the
+ * last: cycles up to it count at the old rate, and the engine's timer is
+ * re-armed for the new one.
  */
 static void rp2350_dma_clk_changed(void *opaque, ClockEvent event)
 {
     RP2350DMAState *s = opaque;
 
     if (event == ClockPreUpdate) {
-        s->base_cycle = now_cycle(s);
-        s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int64_t when = MAX(line_time(), s->base_ns);
+
+        s->base_cycle = cycle_at(s, when);
+        s->base_ns = when;
         return;
     }
     if (s->timer) {

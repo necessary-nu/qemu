@@ -31,6 +31,19 @@ int64_t line_time(void)
     return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
+int64_t line_event_time(void)
+{
+    int64_t deadline = timer_running_deadline_ns();
+
+    if (line_stamp != INT64_MIN) {
+        return line_stamp;
+    }
+    if (deadline != INT64_MIN) {
+        return deadline;
+    }
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
 void line_set_at(qemu_irq line, int level, int64_t when_ns)
 {
     int64_t outer = line_stamp;

@@ -724,6 +724,17 @@ bool timer_expired(const QEMUTimer *timer_head, int64_t current_time);
 uint64_t timer_expire_time_ns(const QEMUTimer *ts);
 
 /**
+ * timer_running_deadline_ns:
+ *
+ * The deadline of the QEMU_CLOCK_VIRTUAL timer whose callback this thread
+ * is running, the time of the event the timer was set for however late it
+ * runs; INT64_MIN outside such a callback.
+ *
+ * Returns: the deadline in nanoseconds, or INT64_MIN
+ */
+int64_t timer_running_deadline_ns(void);
+
+/**
  * timer_get:
  * @f: the file
  * @ts: the timer
