@@ -14,6 +14,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/gpio/rp2350_gpio.h"
 #include "hw/misc/rp2350_psm.h"
+#include "hw/watchdog/rp2350_watchdog.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -96,6 +97,12 @@ typedef struct RP2350PowmanOps {
      * the clock tree's due order (line_due_order_changed()).
      */
     bool (*osc_dormant)(void *opaque);
+    /*
+     * A chip-level reset is queued, a system reset that resets the
+     * processors once every vCPU has paused: on the chip they stop at
+     * once.
+     */
+    void (*reset_queued)(void *opaque);
 } RP2350PowmanOps;
 
 struct RP2350PowmanState {
@@ -131,6 +138,8 @@ struct RP2350PowmanState {
 
     /* Properties */
     RP2350PSMState *psm;
+    /* The watchdog, whose reset request comes through here. */
+    RP2350WatchdogState *watchdog;
     uint32_t lposc_hz;
     /* clk_ref: the fast POWMAN clock, and the AON timer's XOSC source. */
     Clock *clk_ref;

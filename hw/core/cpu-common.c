@@ -132,6 +132,8 @@ static void cpu_common_reset_hold(Object *obj, ResetType type)
     cpu->exception_index = -1;
     cpu->crash_occurred = false;
     cpu->cflags_next_tb = -1;
+    /* A reset a board queued (cpu_hold_accesses_for_reset()) has come. */
+    qatomic_set(&cpu->reset_queued, false);
 
     cpu_exec_reset_hold(cpu);
 }

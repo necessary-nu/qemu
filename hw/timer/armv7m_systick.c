@@ -13,6 +13,7 @@
 #include "hw/timer/armv7m_systick.h"
 #include "migration/vmstate.h"
 #include "hw/core/irq.h"
+#include "hw/core/line-time.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
@@ -92,18 +93,38 @@ static void systick_follow_clock(SysTickState *s)
 /*
  * Change the ptimer period to follow the selected clock, stopping the
  * ptimer first if that clock has stopped so it never runs with a zero
- * period.
+ * period. The change is taken at its own time (line_time()), however
+ * late it reaches the counter: the counter runs as it was up to then, and
+ * as the clock now runs from then.
  */
 static void systick_clock_changed(SysTickState *s)
 {
-    ptimer_run_due(s->ptimer);
-    ptimer_transaction_begin(s->ptimer);
+    int64_t when = line_time();
+
+    ptimer_run_due_at(s->ptimer, when);
+    ptimer_transaction_begin_at(s->ptimer, when);
     if (!clock_is_enabled(systick_clock(s))) {
         ptimer_stop(s->ptimer);
     }
     systick_set_period_from_clock(s);
     systick_follow_clock(s);
     ptimer_transaction_commit(s->ptimer);
+}
+
+/*
+ * A board's reference clock can change while the processor runs, as
+ * one its clock tree makes at a time of its own, which without icount
+ * reaches the counter only once the tree's timer has run: an access that
+ * reads or counts it first brings it up to time (clock_sync()), so that
+ * the counter, or SYST_CALIB, follows a change that has fallen due from
+ * the change's time. The processor clock changes, while the processor
+ * runs, only at its own register writes.
+ */
+static void systick_sync(SysTickState *s, bool refclk)
+{
+    if (refclk || !(s->control & SYSTICK_CLKSOURCE)) {
+        clock_sync(s->refclk);
+    }
 }
 
 static void systick_timer_tick(void *opaque)
@@ -138,6 +159,7 @@ static MemTxResult systick_read(void *opaque, hwaddr addr, uint64_t *data,
     }
 
     /* The counter, and COUNTFLAG, as of the access. */
+    systick_sync(s, addr == 0xc);
     ptimer_run_due(s->ptimer);
 
     switch (addr) {
@@ -202,6 +224,7 @@ static MemTxResult systick_write(void *opaque, hwaddr addr,
     }
 
     trace_systick_write(addr, value, size);
+    systick_sync(s, addr == 0x0 && !(value & SYSTICK_CLKSOURCE));
     ptimer_run_due(s->ptimer);
 
     switch (addr) {

@@ -1295,6 +1295,20 @@ io_prepare(hwaddr *out_offset, CPUState *cpu, CPUTLBEntryFull *full,
     return section;
 }
 
+/*
+ * A reset of the CPU is queued (cpu_hold_accesses_for_reset()): the access
+ * is held, as one a device holds, before it reaches the device. Checked
+ * with the BQL held, which whatever queues the reset holds too, so that
+ * an access the CPU makes after the reset was queued, from whichever
+ * thread, never reaches the device.
+ */
+static inline void io_check_reset_queued(CPUState *cpu, uintptr_t retaddr)
+{
+    if (unlikely(qatomic_read(&cpu->reset_queued))) {
+        cpu_loop_exit_restore(cpu, retaddr);
+    }
+}
+
 static void io_failed(CPUState *cpu, CPUTLBEntryFull *full, vaddr addr,
                       unsigned size, MMUAccessType access_type, int mmu_idx,
                       MemTxResult response, uintptr_t retaddr)
@@ -2000,6 +2014,7 @@ static uint64_t int_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
         this_size = 1 << this_mop;
         this_mop |= MO_BE;
 
+        io_check_reset_queued(cpu, ra);
         r = memory_region_dispatch_read(mr, mr_offset, &val,
                                         this_mop, full->attrs);
         if (unlikely(r != MEMTX_OK)) {
@@ -2513,6 +2528,7 @@ static uint64_t int_st_mmio_leN(CPUState *cpu, CPUTLBEntryFull *full,
         this_size = 1 << this_mop;
         this_mop |= MO_LE;
 
+        io_check_reset_queued(cpu, ra);
         r = memory_region_dispatch_write(mr, mr_offset, val_le,
                                          this_mop, full->attrs);
         if (unlikely(r != MEMTX_OK)) {

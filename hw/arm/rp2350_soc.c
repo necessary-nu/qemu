@@ -581,13 +581,18 @@ static void rp2350_soc_boot_vectors(RP2350State *s)
     s->powman.bootdis &= ~RP2350_POWMAN_BOOTDIS_NOW;
 }
 
-/* Power a core off: it stays halted until a reset powers it on. */
+/*
+ * Power a core off: it stays halted until a reset powers it on, and makes
+ * no access to a device meanwhile, should it be running on to the end of
+ * its block (cpu_hold_accesses_for_reset()).
+ */
 static void rp2350_soc_core_off(RP2350State *s, int n)
 {
     ARMCPU *cpu = s->armv7m[n].cpu;
 
     CPU(cpu)->halted = 1;
     arm_set_cpu_power_state(cpu, PSCI_OFF);
+    cpu_hold_accesses_for_reset(CPU(cpu));
 }
 
 /*
@@ -693,6 +698,26 @@ static void rp2350_soc_psm_reset(void *opaque, uint32_t reset, uint32_t held,
 }
 
 /*
+ * A PSM sequence that resets processors is queued, to run once every vCPU
+ * has paused. On the chip the reset comes at once and they make no access
+ * after it; here they make none to a device until it runs
+ * (cpu_hold_accesses_for_reset()). The sequence resets each core whose
+ * processor stage is in `reset`, and both with the processor cold reset.
+ */
+/* [spec:nuos:req:emu.watchdog] */
+static void rp2350_soc_psm_queued(void *opaque, uint32_t reset)
+{
+    RP2350State *s = opaque;
+    int i;
+
+    for (i = 0; i < RP2350_NUM_CORES; i++) {
+        if (reset & (BIT(RP2350_PSM_PROC0 + i) | BIT(RP2350_PSM_PROC_COLD))) {
+            cpu_hold_accesses_for_reset(CPU(s->armv7m[i].cpu));
+        }
+    }
+}
+
+/*
  * A core's AIRCR.SYSRESETREQ is a warm reset of that core alone, "not the
  * wider system" (datasheet, M33 AIRCR): the other core, the peripherals,
  * SRAM, the PSM and POWMAN carry on, and no chip-level reset reason is
@@ -702,7 +727,8 @@ static void rp2350_soc_psm_reset(void *opaque, uint32_t reset, uint32_t held,
  * reset of either core by SYSRESETREQ clears the watchdog's REASON, so
  * that code started afresh does not see a stale timeout.
  *
- * The requesting core stops at the end of its current instruction block
+ * The requesting core stops at the end of its current instruction block,
+ * making no access to a device meanwhile (cpu_hold_accesses_for_reset()),
  * and the reset runs once every vCPU has paused, from the requesting
  * core's thread as the PSM's processor resets do; the other core resumes
  * where it was.
@@ -751,6 +777,7 @@ static void rp2350_soc_sysresetreq(void *opaque, int n, int level)
         rp2350_soc_sysresetreq_run(s);
         return;
     }
+    cpu_hold_accesses_for_reset(CPU(s->armv7m[n].cpu));
     if (current_cpu) {
         async_run_on_cpu(current_cpu, rp2350_soc_sysresetreq_on_cpu,
                          RUN_ON_CPU_HOST_PTR(s));
@@ -1160,11 +1187,27 @@ static bool rp2350_soc_osc_dormant(void *opaque)
     return s->xosc.dormant || s->rosc.dormant_stopped;
 }
 
+/*
+ * POWMAN queued a chip-level reset: until the main loop carries it out,
+ * the processors make no access to a device (cpu_hold_accesses_for_reset()).
+ */
+/* [spec:nuos:req:emu.powman] */
+static void rp2350_soc_reset_queued(void *opaque)
+{
+    RP2350State *s = opaque;
+    int i;
+
+    for (i = 0; i < RP2350_NUM_CORES; i++) {
+        cpu_hold_accesses_for_reset(CPU(s->armv7m[i].cpu));
+    }
+}
+
 static const RP2350PowmanOps rp2350_soc_powman_ops = {
     .procs_asleep = rp2350_soc_procs_asleep,
     .swcore_stop = rp2350_soc_swcore_stop,
     .domain_power = rp2350_soc_domain_power,
     .osc_dormant = rp2350_soc_osc_dormant,
+    .reset_queued = rp2350_soc_reset_queued,
 };
 
 /* [spec:nuos:req:emu.powman] */
@@ -1737,7 +1780,10 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     }
 
     /* [spec:nuos:req:emu.watchdog] */
-    rp2350_psm_set_reset_fn(&s->psm, rp2350_soc_psm_reset, s);
+    rp2350_psm_set_reset_fn(&s->psm, rp2350_soc_psm_reset,
+                            rp2350_soc_psm_queued, s);
+    object_property_set_link(OBJECT(&s->psm), "watchdog",
+                             OBJECT(&s->watchdog), &error_abort);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->psm), errp)) {
         return;
     }
@@ -1762,6 +1808,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
         object_property_set_link(OBJECT(sbd), "psm", OBJECT(&s->psm),
                                  &error_abort);
+        object_property_set_link(OBJECT(sbd), "watchdog",
+                                 OBJECT(&s->watchdog), &error_abort);
         qdev_prop_set_uint32(powman, "lposc-hz", RP2350_LPOSC_HZ);
         qdev_connect_clock_in(powman, "clk-ref", CLK(s, REF));
         qdev_prop_set_uint32(powman, "bonded-gpios", RP2350_GPIO_QFN60_PINS);
@@ -2459,8 +2507,14 @@ static void rp2350_soc_hold_reset(Object *obj, ResetType type)
 static int rp2350_soc_post_load(void *opaque, int version_id)
 {
     RP2350State *s = opaque;
+    int i;
 
     if (s->sysresetreq_pending) {
+        for (i = 0; i < RP2350_NUM_CORES; i++) {
+            if (s->sysresetreq_pending & BIT(i)) {
+                cpu_hold_accesses_for_reset(CPU(s->armv7m[i].cpu));
+            }
+        }
         qemu_bh_schedule(s->sysresetreq_bh);
     }
     return 0;
