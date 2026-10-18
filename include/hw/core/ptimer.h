@@ -150,6 +150,21 @@ void ptimer_free(ptimer_state *s);
 void ptimer_transaction_begin(ptimer_state *s);
 
 /**
+ * ptimer_transaction_begin_at() - Start a transaction at a time of its own
+ * @s: ptimer
+ * @when: the virtual time, no later than the present, the changes made in
+ *        the transaction take effect at
+ *
+ * As ptimer_transaction_begin(), for a change that belongs to an earlier
+ * time than the present, such as a change of the timer's clock that
+ * reaches the device after the time it was made at: the count is taken
+ * at @when, and the counter (re)started in the transaction counts from
+ * @when. A time before the running timer's last start or expiry is taken
+ * as that. Take the expiries due by @when first (ptimer_run_due_at()).
+ */
+void ptimer_transaction_begin_at(ptimer_state *s, int64_t when);
+
+/**
  * ptimer_transaction_commit() - Commit a ptimer modification transaction
  *
  * This function must be called after calls to functions which modify
@@ -177,6 +192,16 @@ void ptimer_transaction_commit(ptimer_state *s);
  * commit block.
  */
 void ptimer_run_due(ptimer_state *s);
+
+/**
+ * ptimer_run_due_at - Take the expiries that fell due by a time
+ * @s: ptimer
+ * @when: a virtual time no later than the present
+ *
+ * As ptimer_run_due(), up to @when rather than the present: for a change
+ * made at @when, before which the timer ran as it was.
+ */
+void ptimer_run_due_at(ptimer_state *s, int64_t when);
 
 /**
  * ptimer_set_period - Set counter increment interval in nanoseconds
