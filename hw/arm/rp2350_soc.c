@@ -1898,7 +1898,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     /*
      * PWM. Each slice's A and B drive their GPIO function signals, and B
      * returns the OR of the pins selecting it. The DREQ_PWM_WRAP0-11
-     * outputs ("dreq-wrap") are connected with the DMA's other sources.
+     * outputs ("dreq-wrap") are connected with the DMA's other sources;
+     * an access first brings up the DMA ("dma"), which sets CC and TOP.
      */
     /* [spec:nuos:req:emu.pwm] */
     {
@@ -1907,6 +1908,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         int n;
 
         qdev_connect_clock_in(dev, "clk", CLK(s, SYS));
+        object_property_set_link(OBJECT(dev), "dma", OBJECT(&s->dma),
+                                 &error_abort);
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
@@ -1933,7 +1936,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
      * PIO0-2. Each block drives its GPIO function signals and sees every
      * pin; the IO bank delivers the same pin levels to all three PIO
      * ports, so the blocks take them from PIO0's. The DREQ_PIOx_TXn/RXn
-     * outputs are connected with the DMA's other sources.
+     * outputs are connected with the DMA's other sources; an access first
+     * brings up the DMA ("dma"), which fills and drains the FIFOs.
      */
     /* [spec:nuos:req:emu.pio] */
     {
@@ -1943,6 +1947,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
         qdev_connect_clock_in(dev, "clk", CLK(s, SYS));
         object_property_set_link(OBJECT(dev), "gpio", OBJECT(&s->gpio),
+                                 &error_abort);
+        object_property_set_link(OBJECT(dev), "dma", OBJECT(&s->dma),
                                  &error_abort);
         if (!sysbus_realize(sbd, errp)) {
             return;
@@ -1991,7 +1997,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     /*
      * HSTX, clocked by clk_hstx. Its eight outputs drive the HSTX
      * function of GPIOs 12-19. DREQ_HSTX is connected with the DMA's other
-     * sources.
+     * sources; an access first brings up the DMA ("dma"), which fills the
+     * FIFO.
      */
     /* [spec:nuos:req:emu.hstx] */
     {
@@ -2001,6 +2008,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
         /* [spec:nuos:req:emu.clock-tree] */
         qdev_connect_clock_in(dev, "clk", CLK(s, HSTX));
+        object_property_set_link(OBJECT(dev), "dma", OBJECT(&s->dma),
+                                 &error_abort);
         if (!sysbus_realize(sbd, errp)) {
             return;
         }

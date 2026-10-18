@@ -127,6 +127,8 @@ struct RP2350HSTXState {
     MemoryRegion ctrl_iomem;
     MemoryRegion fifo_iomem;
     Clock *clk;
+    /* The DMA, which feeds the FIFO: an access syncs it first. */
+    struct RP2350DMAState *dma;
     QEMUTimer *timer;
     /* The virtual time the timer is due at. */
     int64_t due_ns;

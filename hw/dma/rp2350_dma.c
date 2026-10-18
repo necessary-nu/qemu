@@ -13,11 +13,19 @@
  * nothing happens while it is stopped), round-robin over the requesting
  * channels with high-priority channels first. The model keeps a cycle
  * count, `cycle`, up to which the engine has run. Each run of the engine
- * issues the transfers of every cycle between the last run and now;
- * then, while a channel paced by a DREQ requests, it goes on issuing
- * transfers in the cycles after now, one a cycle, so that a DREQ is
- * answered when it is raised rather than when a timer next fires. The
- * engine runs:
+ * is for a moment (engine_moment()): without icount the time of the event
+ * at hand (line_event_time(), hw/core/line-time.h), an access's, a DREQ
+ * change's, or a timer's deadline however late the timer fires; under
+ * icount the present. It issues the transfers of every cycle between the
+ * last run and that moment; then, while a channel paced by a DREQ
+ * requests, it goes on issuing transfers in the cycles after the moment,
+ * one a cycle, so that a DREQ is answered when it is raised rather than
+ * when a timer next fires. Without icount, where the host's clock is
+ * virtual time and the timers run late, each transfer reaches a device
+ * at its own time (engine_issue()), so that a device it feeds takes it in
+ * its cycle, and a run from a timer stops at its deadline, leaving later
+ * transfers to their own timers in deadline order with other devices': a
+ * stream it feeds or drains keeps its pace. The engine runs:
  *
  *  - from inside a DREQ change, unless the change comes from a vCPU's
  *    register access or a transfer would reach a device in the middle of
@@ -35,7 +43,8 @@
  *
  * A register access issues no transfer of its own accord: it brings the
  * idle engine (and the pacing timers) up to date, and issues the transfers
- * only the engine's timer, late, has yet to issue (engine_catch_up()).
+ * only the engine's timers, late, have yet to issue (engine_run_due()), as
+ * does a register access of a block the DMA feeds (rp2350_dma_sync()).
  *
  * Each transfer completes before the next is issued, so the bus pipeline
  * is never observable: FIFO_LEVELS reads zero, BUSY falls as the last
@@ -49,6 +58,7 @@
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
+#include "exec/icount.h"
 #include "hw/core/cpu.h"
 #include "hw/core/irq.h"
 #include "hw/core/line-time.h"
@@ -254,11 +264,6 @@ static uint64_t cycle_at(RP2350DMAState *s, int64_t ns)
         return s->base_cycle;
     }
     return s->base_cycle + clock_ns_to_ticks(s->clk, ns - s->base_ns);
-}
-
-static uint64_t now_cycle(RP2350DMAState *s)
-{
-    return cycle_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 /*
@@ -945,16 +950,78 @@ static bool ch_targets_free(RP2350DMAState *s, int n)
 }
 
 /*
- * Run the engine up to now and, outside ENGINE_SYNC, past now while a
- * DREQ-paced channel requests, by at most ENGINE_QUANTUM cycles. Returns
- * false if an ENGINE_SERVICE run stopped short of a transfer that would
- * re-enter a device in the middle of a register access.
+ * The moment a run of the engine is for. Without icount the timers run
+ * late, and a DREQ can come well after its time: the time of the event
+ * at hand (line_event_time()). Under icount, where the timers run within
+ * an instruction of their deadlines and the DREQs come with the present's
+ * instruction, the present.
+ */
+static int64_t engine_moment(void)
+{
+    if (icount_enabled()) {
+        return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    }
+    return line_event_time();
+}
+
+/* A transfer, to be issued at its time. */
+typedef struct EngineTransfer {
+    RP2350DMAState *s;
+    int n;
+} EngineTransfer;
+
+static void engine_transfer(void *opaque)
+{
+    EngineTransfer *t = opaque;
+
+    ch_transfer(t->s, t->n);
+}
+
+/*
+ * Issue channel n's transfer of the cycle the engine has reached, in a
+ * run for the moment `at` whose transfers from cycle `from` on answer
+ * what came at that moment. Without icount it reaches a device at its own
+ * time, never later than the present (line_run_at()), so that a device
+ * the engine catches up on takes each transfer in its cycle: one due
+ * before the moment at the end of its cycle; one answering the moment as
+ * many cycles after it as it comes after `from`. An access can have run
+ * the engine itself on past a DREQ that a late timer delivers after it:
+ * the answer still comes in the cycles after the DREQ's time, not the
+ * engine's. Under icount, where the engine runs at the present, at the
+ * time of the change at hand (line_time()).
+ */
+static void engine_issue(RP2350DMAState *s, int n, int64_t at, uint64_t from)
+{
+    EngineTransfer t = { .s = s, .n = n };
+    int64_t when;
+
+    if (icount_enabled()) {
+        ch_transfer(s, n);
+        return;
+    }
+    if (s->cycle < from) {
+        when = cycle_ns(s, s->cycle + 1);
+    } else {
+        when = at + clock_ticks_to_ns(s->clk, s->cycle + 1 - from);
+    }
+    line_run_at(MIN(when, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)),
+                engine_transfer, &t);
+}
+
+/*
+ * Run the engine up to its moment (engine_moment()) and, outside
+ * ENGINE_SYNC, past it while a DREQ-paced channel requests, by at most
+ * ENGINE_QUANTUM cycles, each transfer at its own time (engine_issue()).
+ * Returns false if an ENGINE_SERVICE run stopped short of a transfer that
+ * would re-enter a device in the middle of a register access.
  */
 /* [spec:nuos:req:emu.dma] */
 static bool engine_run(RP2350DMAState *s, EngineMode mode)
 {
-    uint64_t target = now_cycle(s);
-    uint64_t limit = MAX(s->cycle, target) + ENGINE_QUANTUM;
+    int64_t at = engine_moment();
+    uint64_t target = cycle_at(s, at);
+    uint64_t from = MAX(s->cycle, target);
+    uint64_t limit = from + ENGINE_QUANTUM;
     bool done = true;
 
     /* Nothing runs, not even ahead of now, while clk_sys is stopped. */
@@ -1022,7 +1089,7 @@ static bool engine_run(RP2350DMAState *s, EngineMode mode)
         if (s->ch[n].dreq_credit) {
             s->ch[n].dreq_credit--;
         }
-        ch_transfer(s, n);
+        engine_issue(s, n, at, from);
         s->cycle++;
     }
     s->running = false;
@@ -1181,29 +1248,79 @@ static void dreq_set(void *opaque, int dreq, int level)
     engine_kick(s);
 }
 
+/* A timer's run, at its deadline, as engine_run_due() takes it. */
+typedef struct EngineDue {
+    RP2350DMAState *s;
+    bool done;
+} EngineDue;
+
+static void engine_service(void *opaque)
+{
+    EngineDue *d = opaque;
+
+    d->done = engine_run(d->s, ENGINE_SERVICE);
+}
+
 /*
  * [spec:nuos:req:emu.dma]
- * Before a register access: the work the engine's timer has come for,
- * which without icount it can be well after, while software polls
- * CH_CTRL's BUSY, TRANS_COUNT or INTR, as the pico-sdk's
- * dma_channel_wait_for_finish_blocking() does. The transfers due are
- * issued as that timer would issue them, but for one that would reach a
- * device in the middle of an access, this one's register block included,
- * which is left to the end of the access; then the idle engine and the
- * pacing timers come up to now. Only a timer that has come brings the
- * transfers forward.
+ * Before a register access of the DMA, or of a block it feeds: the work
+ * the engine's timers have come for by then, which without icount they
+ * can run well after, as software polls CH_CTRL's BUSY, TRANS_COUNT or
+ * INTR, as the pico-sdk's dma_channel_wait_for_finish_blocking() does, or
+ * the state of a FIFO the DMA fills. Each timer that has come, the
+ * earliest first, issues the transfers due as it would have, at its
+ * deadline, each at its own time, but for one that would reach a device
+ * in the middle of an access, the DMA's own register block included,
+ * which is left to the end of the access. Only a timer that has come
+ * brings the transfers forward.
  */
-static void engine_catch_up(RP2350DMAState *s)
+static void engine_run_due(RP2350DMAState *s)
 {
-    if (timer_pending(s->timer) &&
-        timer_expire_time_ns(s->timer) <=
-        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
-        if (!engine_run(s, ENGINE_SERVICE)) {
+    int64_t at = engine_moment();
+
+    while (!s->running) {
+        EngineDue d = { .s = s };
+        QEMUTimer *t = NULL;
+        int64_t due = at;
+
+        if (timer_pending(s->defer) && timer_expire_time_ns(s->defer) <= due) {
+            t = s->defer;
+            due = timer_expire_time_ns(t);
+        }
+        if (timer_pending(s->timer) && timer_expire_time_ns(s->timer) <= due &&
+            (!t || timer_expire_time_ns(s->timer) < due)) {
+            t = s->timer;
+            due = timer_expire_time_ns(t);
+        }
+        if (!t) {
+            return;
+        }
+        timer_del(t);
+        line_run_at(due, engine_service, &d);
+        if (!d.done) {
             engine_defer(s);
+            engine_kick(s);
+            return;
         }
         engine_kick(s);
     }
+}
+
+/*
+ * Before a register access: the work the engine's timers have come for,
+ * then the idle engine and the pacing timers up to the access's time.
+ */
+static void engine_catch_up(RP2350DMAState *s)
+{
+    engine_run_due(s);
     engine_run(s, ENGINE_SYNC);
+}
+
+/* [spec:nuos:req:emu.dma] */
+void rp2350_dma_sync(RP2350DMAState *s)
+{
+    clock_sync(s->clk);
+    engine_run_due(s);
 }
 
 /* Registers. */

@@ -36,6 +36,15 @@
  * that runs itself forward over a span of time should change its DREQ at
  * each event in that span, and treat register accesses made meanwhile as
  * happening at that event.
+ *
+ * A block the DMA feeds or drains, whose state software reads while the
+ * DMA moves its data (a FIFO's level, a stream's pace), calls
+ * rp2350_dma_sync() first thing at each register access: without icount
+ * the DMA's timers run late, and the transfers due before the access are
+ * issued there, each at its own time, so that the block takes them as it
+ * would have, before the access does anything. The block's registers
+ * must then admit the DMA's accesses from within its own (its memory
+ * regions' disable_reentrancy_guard).
  */
 
 #ifndef HW_DMA_RP2350_DMA_H
@@ -166,5 +175,7 @@ struct RP2350DMAState {
     int64_t base_ns;
     bool running;
 };
+
+void rp2350_dma_sync(RP2350DMAState *s);
 
 #endif

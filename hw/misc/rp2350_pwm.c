@@ -57,6 +57,8 @@
 #include "hw/core/irq.h"
 #include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/dma/rp2350_dma.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_pwm.h"
 #include "migration/vmstate.h"
@@ -615,8 +617,9 @@ static void pwm_bring_up_all(RP2350PWMState *s, int64_t when)
 /*
  * [spec:nuos:req:emu.pwm]
  * Software samples the pads (line_sync()): every slice brought up to
- * line_time(), clk_sys first, which its timer, late without icount, has
- * yet to bring it to: the edges due before then, each at its own time.
+ * line_time(), clk_sys and the DMA's transfers to it first, which its
+ * timer, late without icount, has yet to bring it to: the edges due
+ * before then, each at its own time.
  */
 static void pwm_line_sync(Notifier *n, void *data)
 {
@@ -624,6 +627,9 @@ static void pwm_line_sync(Notifier *n, void *data)
     int64_t when;
     int i;
 
+    if (s->dma) {
+        rp2350_dma_sync(s->dma);
+    }
     clock_sync(s->clk);
     when = line_time();
 
@@ -736,11 +742,12 @@ static void pwm_dreq_wanted(void *opaque, int n, int level)
 }
 
 /*
- * An access first brings clk_sys up to its time (clock_sync()), so that
- * the slices count by the clock as it is then. It acts at one moment,
- * line_time() read once as it begins: without icount the virtual clock
- * moves on while a slice catches up, and a slice taken on to a later
- * moment than its catch-up's would skip the edges between.
+ * An access first brings the DMA up to its time, whose transfers due by
+ * then set CC or TOP at their own times (rp2350_dma_sync()), and clk_sys
+ * (clock_sync()), so that the slices count by the clock as it is then. It
+ * acts at one moment, line_time() read once as it begins: without icount
+ * the virtual clock moves on while a slice catches up, and a slice taken
+ * on to a later moment than its catch-up's would skip the edges between.
  */
 /* [spec:nuos:req:emu.pwm] */
 static uint64_t rp2350_pwm_read(void *opaque, hwaddr addr, unsigned size)
@@ -751,6 +758,9 @@ static uint64_t rp2350_pwm_read(void *opaque, hwaddr addr, unsigned size)
     int64_t when;
     int i;
 
+    if (s->dma) {
+        rp2350_dma_sync(s->dma);
+    }
     clock_sync(s->clk);
     when = line_time();
     if (reg < A_EN) {
@@ -823,6 +833,9 @@ static void rp2350_pwm_write(void *opaque, hwaddr addr, uint64_t value64,
     int64_t when;
     int i;
 
+    if (s->dma) {
+        rp2350_dma_sync(s->dma);
+    }
     clock_sync(s->clk);
     when = line_time();
     if (reg < A_EN) {
@@ -1019,6 +1032,8 @@ static void rp2350_pwm_init(Object *obj)
 
     memory_region_init_io(&s->iomem, obj, &rp2350_pwm_ops, s, TYPE_RP2350_PWM,
                           RP2350_ATOMIC_REGION_SIZE);
+    /* The DMA's transfers due before an access come in from within it. */
+    s->iomem.disable_reentrancy_guard = true;
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     for (i = 0; i < RP2350_PWM_IRQS; i++) {
         sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[i]);
@@ -1110,6 +1125,11 @@ static const VMStateDescription vmstate_rp2350_pwm = {
     },
 };
 
+static const Property rp2350_pwm_properties[] = {
+    DEFINE_PROP_LINK("dma", RP2350PWMState, dma, TYPE_RP2350_DMA,
+                     RP2350DMAState *),
+};
+
 static void rp2350_pwm_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1119,6 +1139,7 @@ static void rp2350_pwm_class_init(ObjectClass *klass, const void *data)
     rc->phases.hold = rp2350_pwm_hold_reset;
     rc->phases.exit = rp2350_pwm_exit_reset;
     dc->vmsd = &vmstate_rp2350_pwm;
+    device_class_set_props(dc, rp2350_pwm_properties);
 }
 
 /* [spec:nuos:req:emu.pwm] */

@@ -29,10 +29,10 @@
  * DREQ_HSTX), every pin-refresh-ns while it is shifting, to drive its
  * GPIO outputs at that coarse resolution, and at the cycle in which it
  * stops shifting, to drive their final levels. A coupled-mode PIO output
- * change is taken in the cycle of its time (hw/core/line-time.h), and a
- * timer firing runs the block to its deadline only, however late it
- * fires, so that a PIO change due before the firing but delivered after
- * it still finds the block in time for it.
+ * change, or a FIFO write the DMA makes, is taken in the cycle of its
+ * time (hw/core/line-time.h), and a timer firing runs the block to its
+ * deadline only, however late it fires, so that a change due before the
+ * firing but delivered after it still finds the block in time for it.
  * Without icount, where the host's clock is virtual time and the timer
  * runs late, only a block more than LINE_MAX_LAG_NS behind as its timer
  * fires (line_lags()), which the host cannot keep up with, slips
@@ -70,6 +70,7 @@
 #include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/dma/rp2350_dma.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_hstx.h"
 #include "migration/vmstate.h"
@@ -879,9 +880,22 @@ static uint32_t bus_value(hwaddr addr, uint64_t value, unsigned size,
 }
 
 /*
- * An access to either window first brings clk_hstx up to its time
- * (clock_sync()): a change that has fallen due, its event's timer late,
- * shifts from its time.
+ * Before a register access: the FIFO writes the DMA has due by its time,
+ * each at its own time (rp2350_dma_sync()), as without icount the DMA's
+ * timers run late; then clk_hstx.
+ */
+static void hstx_access_begin(RP2350HSTXState *s)
+{
+    if (s->dma) {
+        rp2350_dma_sync(s->dma);
+    }
+    clock_sync(s->clk);
+}
+
+/*
+ * An access to either window first brings the DMA's FIFO writes due by
+ * its time (hstx_access_begin()), and clk_hstx (clock_sync()): a change
+ * that has fallen due, its event's timer late, shifts from its time.
  */
 /* [spec:nuos:req:emu.hstx] */
 static uint64_t rp2350_hstx_ctrl_read(void *opaque, hwaddr addr,
@@ -891,7 +905,7 @@ static uint64_t rp2350_hstx_ctrl_read(void *opaque, hwaddr addr,
     hwaddr reg = rp2350_atomic_reg(addr) & ~3;
     uint32_t v = 0;
 
-    clock_sync(s->clk);
+    hstx_access_begin(s);
     switch (reg) {
     case A_CSR:
         v = s->csr;
@@ -922,7 +936,7 @@ static void rp2350_hstx_ctrl_write(void *opaque, hwaddr addr, uint64_t value,
     hwaddr reg = rp2350_atomic_reg(window) & ~3;
     uint32_t v = bus_value(addr, value, size, !(addr & NO_REPLICATE));
 
-    clock_sync(s->clk);
+    hstx_access_begin(s);
     hstx_sync(s);
     switch (reg) {
     case A_CSR: {
@@ -974,7 +988,7 @@ static uint64_t rp2350_hstx_fifo_read(void *opaque, hwaddr addr,
     RP2350HSTXState *s = opaque;
     uint32_t v = 0;
 
-    clock_sync(s->clk);
+    hstx_access_begin(s);
     switch (addr & ~3) {
     case A_STAT:
         hstx_sync(s);
@@ -1006,7 +1020,7 @@ static void rp2350_hstx_fifo_write(void *opaque, hwaddr addr, uint64_t value,
     RP2350HSTXCore *c = &s->core;
     uint32_t v = bus_value(addr, value, size, true);
 
-    clock_sync(s->clk);
+    hstx_access_begin(s);
     switch (addr & ~3) {
     case A_STAT:
         if (v & STAT_WOF) {
@@ -1174,6 +1188,9 @@ static void rp2350_hstx_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->ctrl_iomem);
     memory_region_init_io(&s->fifo_iomem, obj, &rp2350_hstx_fifo_ops, s,
                           "rp2350-hstx-fifo", RP2350_HSTX_FIFO_SIZE);
+    /* The DMA's FIFO writes due before an access come in from within it. */
+    s->ctrl_iomem.disable_reentrancy_guard = true;
+    s->fifo_iomem.disable_reentrancy_guard = true;
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->fifo_iomem);
     qdev_init_gpio_out_named(dev, s->out, RP2350_HSTX_OUT, RP2350_HSTX_BITS);
     qdev_init_gpio_out_named(dev, s->oe, RP2350_HSTX_OE, RP2350_HSTX_BITS);
@@ -1203,6 +1220,8 @@ static void rp2350_hstx_realize(DeviceState *dev, Error **errp)
 static const Property rp2350_hstx_properties[] = {
     DEFINE_PROP_UINT32("pin-refresh-ns", RP2350HSTXState, pin_refresh_ns,
                        10000),
+    DEFINE_PROP_LINK("dma", RP2350HSTXState, dma, TYPE_RP2350_DMA,
+                     RP2350DMAState *),
 };
 
 static const VMStateDescription vmstate_rp2350_hstx_core = {

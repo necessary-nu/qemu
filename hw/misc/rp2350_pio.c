@@ -90,6 +90,7 @@
 #include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/dma/rp2350_dma.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_pio.h"
 #include "exec/icount.h"
@@ -1775,9 +1776,9 @@ static void pio_disturb(RP2350PIOState *s)
 /*
  * [spec:nuos:req:emu.pio]
  * Software samples the pads (line_sync()): the blocks run to the cycle of
- * line_time(), clk_sys brought up to it first, each pin change on the way
- * reaching the pads at its own time, which their timer, late without
- * icount, has yet to bring.
+ * line_time(), clk_sys and the DMA's transfers to and from the FIFOs
+ * brought up to it first, each pin change on the way reaching the pads at
+ * its own time, which their timer, late without icount, has yet to bring.
  */
 static void pio_line_sync(Notifier *n, void *data)
 {
@@ -1785,6 +1786,9 @@ static void pio_line_sync(Notifier *n, void *data)
 
     if (s->busy) {
         return;
+    }
+    if (s->dma) {
+        rp2350_dma_sync(s->dma);
     }
     clock_sync(s->clk);
     if (!clock_is_enabled(s->clk)) {
@@ -2274,11 +2278,12 @@ static void pio_write_reg(RP2350PIOState *s, int b, hwaddr reg,
 }
 
 /*
- * Bring the blocks to the time of a register access, clk_sys first
- * (clock_sync()). An access made from within the blocks' own run (the DMA
- * answering a DREQ they raised) happens at the cycle the run has reached:
- * the blocks are not run on to the present first. Returns whether the
- * access is such a one.
+ * Bring the blocks to the time of a register access, the DMA's transfers
+ * to and from the FIFOs due by then (rp2350_dma_sync()) and clk_sys
+ * (clock_sync()) first. An access made from within the blocks' own run
+ * (the DMA answering a DREQ they raised) happens at the cycle the run has
+ * reached: the blocks are not run on to the present first. Returns
+ * whether the access is such a one.
  */
 static bool pio_access_begin(RP2350PIOState *s)
 {
@@ -2286,6 +2291,9 @@ static bool pio_access_begin(RP2350PIOState *s)
         core_settle_loops(&s->core);
         s->spec_valid = false;
         return true;
+    }
+    if (s->dma) {
+        rp2350_dma_sync(s->dma);
     }
     clock_sync(s->clk);
     pio_disturb(s);
@@ -2476,6 +2484,8 @@ static void rp2350_pio_init(Object *obj)
         s->win[b].block = b;
         memory_region_init_io(&s->win[b].iomem, obj, &rp2350_pio_ops,
                               &s->win[b], name, RP2350_ATOMIC_REGION_SIZE);
+        /* The DMA's transfers due before an access come in from within it. */
+        s->win[b].iomem.disable_reentrancy_guard = true;
         sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->win[b].iomem);
     }
     for (b = 0; b < RP2350_PIO_IRQS; b++) {
@@ -2506,6 +2516,8 @@ static void rp2350_pio_realize(DeviceState *dev, Error **errp)
 static const Property rp2350_pio_properties[] = {
     DEFINE_PROP_LINK("gpio", RP2350PIOState, gpio, TYPE_RP2350_GPIO,
                      RP2350GPIOState *),
+    DEFINE_PROP_LINK("dma", RP2350PIOState, dma, TYPE_RP2350_DMA,
+                     RP2350DMAState *),
 };
 
 static const VMStateDescription vmstate_rp2350_pio_sm = {

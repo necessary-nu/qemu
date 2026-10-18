@@ -194,6 +194,8 @@ struct RP2350PIOState {
     RP2350PIOWindow win[RP2350_PIO_BLOCKS];
     Clock *clk;
     RP2350GPIOState *gpio;
+    /* The DMA, which feeds and drains the FIFOs: an access syncs it first. */
+    struct RP2350DMAState *dma;
     QEMUTimer *timer;
     /* The virtual time timer is due at: the run ahead's end. */
     int64_t due_ns;

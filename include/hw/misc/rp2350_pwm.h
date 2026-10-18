@@ -107,6 +107,8 @@ struct RP2350PWMState {
     uint64_t base_cycle;
 
     RP2350PWMSlice slice[RP2350_PWM_SLICES];
+    /* The DMA, which sets the slices' CC and TOP: an access syncs it first. */
+    struct RP2350DMAState *dma;
     /* Software sampling the pads brings the slices up to time first. */
     Notifier line_source;
     /* A slice has skipped edges the host was too slow for (logged once). */
