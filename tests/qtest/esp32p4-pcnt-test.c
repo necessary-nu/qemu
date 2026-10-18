@@ -57,6 +57,11 @@
 #define DELTA_CHANGE_EN(u)  (1u << (8 + (u)))
 
 #define CLKRST              0x500e6000u
+#define ROOT_CLK_CTRL0      (CLKRST + 0x04)
+#define ROOT_CLK_CTRL2      (CLKRST + 0x0c)
+#define SOC_CLK_DIV_UPDATE  (1u << 4)
+#define APB_DIV_SHIFT       16
+#define APB_DIV_MASK        (0xffu << APB_DIV_SHIFT)
 #define SOC_CLK_CTRL2       (CLKRST + 0x1c)
 #define PERI_CLK_CTRL22     (CLKRST + 0x9c)
 #define HP_RST_EN1          (CLKRST + 0xc4)
@@ -462,6 +467,98 @@ static void test_block_reset(void)
     stop();
 }
 
+/* APB_CLK = SYS_CLK (20 MHz) / div, as clk_ll_apb_set_divider() does. */
+static void apb_div(uint32_t div)
+{
+    wr(ROOT_CLK_CTRL2, (rd(ROOT_CLK_CTRL2) & ~APB_DIV_MASK) |
+                       ((div - 1) << APB_DIV_SHIFT));
+    wr(ROOT_CLK_CTRL0, rd(ROOT_CLK_CTRL0) | SOC_CLK_DIV_UPDATE);
+}
+
+/*
+ * Unit 0's count, `was`, steps as the rising edge waiting in its filter
+ * comes through at t, not a nanosecond sooner; then pad 20 goes low for
+ * long enough that the fall comes through too.
+ */
+static void expect_edge_at(int64_t t, int16_t was)
+{
+    clock_to(t - 1);
+    g_assert_cmpint(count(0), ==, was);
+    clock_to(t);
+    g_assert_cmpint(count(0), ==, was + 1);
+    drive(20, 0);
+    step(10000);
+}
+
+/*
+ * The filter counts APB_CLK's edges, the old clock's up to a change and
+ * the new clock's after it: a change held back across a change of the
+ * clock's rate, or across the clock stopped and started again by its
+ * gate, keeps the edges it held for before, the count not restarting.
+ * SYS_CLK's edges are every 50 ns from time 0, APB_CLK's every 100 ns
+ * from reset; a new divider takes effect at the edge of SYS_CLK that
+ * would have ended its period.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_filter_span(void)
+{
+    int64_t t;
+
+    start();
+    pad_to(20, SIG_CH0(0));
+    unit_setup(0, POS_MODE(0, INC) | FILTER_EN | FILTER(10), 0,
+               lims(1000, -1000));
+
+    /*
+     * 3 edges at 10 MHz, then 7 at 20 MHz from t + 400: t + 700, not
+     * t + 550 (10 of 20 MHz's).
+     */
+    clock_to(10000);
+    t = now;
+    clock_to(t + 50);
+    drive(20, 1);
+    clock_to(t + 350);
+    apb_div(1);
+    expect_edge_at(t + 700, 0);
+
+    /*
+     * 3 edges at 20 MHz, then 7 at 10 MHz from t + 250: t + 850, not
+     * t + 950.
+     */
+    t = now;
+    clock_to(t + 25);
+    drive(20, 1);
+    clock_to(t + 175);
+    apb_div(2);
+    expect_edge_at(t + 850, 1);
+
+    /*
+     * 3 edges at 10 MHz, the clock gated from t + 350 to t + 2350, then 7
+     * from t + 2400: t + 3000, not t + 3300.
+     */
+    t = now;
+    clock_to(t + 50);
+    drive(20, 1);
+    clock_to(t + 350);
+    wr(SOC_CLK_CTRL2, rd(SOC_CLK_CTRL2) & ~PCNT_APB_CLK_EN);
+    clock_to(t + 2350);
+    wr(SOC_CLK_CTRL2, rd(SOC_CLK_CTRL2) | PCNT_APB_CLK_EN);
+    expect_edge_at(t + 3000, 2);
+
+    /*
+     * A change made while the clock is gated counts from its restart, at
+     * t + 1050: 10 edges from t + 1100.
+     */
+    t = now;
+    wr(SOC_CLK_CTRL2, rd(SOC_CLK_CTRL2) & ~PCNT_APB_CLK_EN);
+    clock_to(t + 50);
+    drive(20, 1);
+    clock_to(t + 1050);
+    wr(SOC_CLK_CTRL2, rd(SOC_CLK_CTRL2) | PCNT_APB_CLK_EN);
+    expect_edge_at(t + 2000, 3);
+    stop();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -474,5 +571,6 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/pcnt/step", test_step);
     qtest_add_func("esp32p4/pcnt/rmt_pulses", test_rmt_pulses);
     qtest_add_func("esp32p4/pcnt/block_reset", test_block_reset);
+    qtest_add_func("esp32p4/pcnt/filter_span", test_filter_span);
     return g_test_run();
 }

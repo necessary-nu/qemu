@@ -15,6 +15,12 @@
  * frame out bit by bit at the baud rate, and the receiver samples frames
  * from its RXD input; what is on the other end of the lines (a terminal,
  * another UART, a loop back through the matrix) is the board's business.
+ *
+ * The transmitter is a line source (hw/gpio/esp32_line.h): a block that
+ * samples its TX pad, software reading GPIO_IN or a pulse counter or RMT
+ * receiver taking it through the matrix, first brings it up to the moment
+ * it samples at, every bit due by then put out stamped with its own time,
+ * however late the host runs the transmitter's timer.
  */
 
 #include "qemu/osdep.h"
@@ -439,6 +445,11 @@ static void uart_tx_timer_cb(void *opaque)
     uart_tx_advance(ESP32_UART(opaque));
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * The line sources' sync (esp32_line_sync()): the transmitter up to the
+ * moment the pads are sampled at.
+ */
 static void uart_line_sync(Notifier *n, void *data)
 {
     uart_tx_advance(container_of(n, ESP32UARTState, line_source));

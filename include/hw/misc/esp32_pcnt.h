@@ -78,11 +78,15 @@ struct Esp32PcntState {
      * Per input: the level on the wire, the level past the glitch filter,
      * and when the wire last changed. The two levels differ while the
      * filter is holding a change back; the timer runs to the earliest
-     * time such a change matures.
+     * time such a change matures. A change held back across a change of
+     * APB_CLK counts on from the moment of that change, which
+     * raw_since_ns then holds, having held for `held` cycles before it,
+     * in units of 2^-32 of a cycle.
      */
     uint8_t raw[ESP32_PCNT_INPUT_COUNT];
     uint8_t filt[ESP32_PCNT_INPUT_COUNT];
     int64_t raw_since_ns[ESP32_PCNT_INPUT_COUNT];
+    uint64_t held[ESP32_PCNT_INPUT_COUNT];
     QEMUTimer filter_timer;
 
     /*

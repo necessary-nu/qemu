@@ -18,8 +18,14 @@
  * LCTRL_MODE). All four inputs of a unit pass through the unit's glitch
  * filter, clocked by APB_CLK: with FILTER_EN, a level change reaches the
  * counter once it has held for FILTER_THRES cycles, and a shorter pulse
- * is lost. Each unit also has a clear signal, which holds its counter at
- * 0 while high, as PULSE_CNT_RST does; it is not filtered.
+ * is lost. The filter counts the clock's edges (TRM 51.4: pulses
+ * "shorter than PCNT_FILTER_THRES_Un APB clock cycles"), so a change it
+ * holds back while APB_CLK changes rate counts the old clock's edges up
+ * to the change and the new clock's after it: nothing in the block
+ * restarts the count as the clock changes. With the clock stopped it
+ * counts none, and counts on once the clock restarts. Each unit also has
+ * a clear signal, which holds its counter at 0 while high, as
+ * PULSE_CNT_RST does; it is not filtered.
  *
  * Five comparators watch each counter as it counts: the two thresholds
  * and zero match on equality, the high limit on count >= H_LIM and the
@@ -313,16 +319,25 @@ static void pcnt_edge(ESP32P4PcntState *s, unsigned u, unsigned k,
     }
 }
 
-/* When a change of input i at e reaches the counter past the filter. */
+/*
+ * [spec:nuos:req:emu.esp32p4.rmt-pcnt]
+ * When a change of input i at e reaches the counter past the filter: at
+ * the FILTER_THRES-th edge of APB_CLK after it, the edges the change
+ * waiting at raw_since_ns had held for before the clock last changed
+ * (held) among them.
+ */
 static int64_t pcnt_filter_due(ESP32P4PcntState *s, unsigned i, int64_t e)
 {
     uint32_t conf0 = s->unit[i / UI].conf0;
+    uint32_t n = conf0 & CONF0_FILTER_THRES;
 
     if (!(conf0 & CONF0_FILTER_EN)) {
         return e;
     }
-    return esp32p4_clk_edges_after(&s->apb_edges, e,
-                                   conf0 & CONF0_FILTER_THRES);
+    if (e == s->raw_since_ns[i] && s->raw[i] != s->filt[i]) {
+        n -= MIN(n, s->held[i]);
+    }
+    return esp32p4_clk_edges_after(&s->apb_edges, e, n);
 }
 
 /*
@@ -331,17 +346,18 @@ static int64_t pcnt_filter_due(ESP32P4PcntState *s, unsigned i, int64_t e)
  */
 static bool pcnt_pending(ESP32P4PcntState *s, unsigned i, int64_t *due)
 {
-    uint32_t conf0 = s->unit[i / UI].conf0;
-    uint32_t thres = conf0 & CONF0_FILTER_THRES;
-
     if (!s->clk_running || s->raw[i] == s->filt[i]) {
         return false;
     }
-    *due = s->raw_since_ns[i];
-    if (conf0 & CONF0_FILTER_EN) {
-        *due = esp32p4_clk_edges_after(&s->apb_edges, *due, thres);
-    }
+    *due = pcnt_filter_due(s, i, s->raw_since_ns[i]);
     return true;
+}
+
+/* Input i's wire changed at t: the filter counts afresh from there. */
+static void pcnt_raw_since(ESP32P4PcntState *s, unsigned i, int64_t t)
+{
+    s->raw_since_ns[i] = t;
+    s->held[i] = 0;
 }
 
 /* Inputs taking a wave in bulk */
@@ -398,7 +414,9 @@ static void pcnt_feed_store(ESP32P4PcntState *s, unsigned i,
     s->bulk_ns[i] = f->pos;
     s->raw[i] = f->raw;
     s->filt[i] = f->filt;
-    s->raw_since_ns[i] = f->raw_since;
+    if (f->raw_since != s->raw_since_ns[i]) {
+        pcnt_raw_since(s, i, f->raw_since);
+    }
 }
 
 /*
@@ -663,6 +681,7 @@ static void pcnt_sync_unit(ESP32P4PcntState *s, unsigned u, int64_t t)
         rep.input = -1;
         if (tm <= te) {
             s->filt[mat] = s->raw[mat];
+            s->held[mat] = 0;
             pcnt_edge(s, u, mat % UI, s->filt[mat]);
         } else {
             Esp32PcntFeed f = pcnt_feed(s, edge_in);
@@ -685,7 +704,7 @@ static void pcnt_sync_unit(ESP32P4PcntState *s, unsigned u, int64_t t)
             uint64_t nr = w->ops->edges(w, s->bulk_ns[i], lim);
 
             if (nr) {
-                s->raw_since_ns[i] = w->ops->edge(w, s->bulk_ns[i], nr);
+                pcnt_raw_since(s, i, w->ops->edge(w, s->bulk_ns[i], nr));
             }
             s->raw[i] = w->ops->level(w, lim) ^ s->bulk[i].inv;
         }
@@ -812,7 +831,7 @@ static void pcnt_input_change(ESP32P4PcntState *s, int n, bool level,
     /* Changes already held long enough happened before this one */
     pcnt_sync_unit(s, u, t);
     s->raw[n] = level;
-    s->raw_since_ns[n] = t;
+    pcnt_raw_since(s, n, t);
     if (n % UI == ESP32P4_PCNT_RST) {
         if (pcnt_held(s, u)) {
             pcnt_clear(s, u);
@@ -1131,6 +1150,7 @@ static void esp32p4_pcnt_reset_hold(Object *obj, ResetType type)
             s->bulk_ns[i] = now;
         }
         s->filt[i] = s->raw[i];
+        s->held[i] = 0;
     }
 }
 
@@ -1141,25 +1161,47 @@ static void esp32p4_pcnt_reset_exit(Object *obj, ResetType type)
 
 /*
  * [spec:nuos:req:emu.esp32p4.rmt-pcnt]
+ * APB_CLK's edges change at t: each change still waiting in a filter has
+ * held for the edges after it up to t, at the clock's old rate, and goes
+ * on counting from t in the new edges, the count kept (held). A stopped
+ * clock has no edges: a change waiting while it is stopped holds its
+ * count, and one made while it is stopped counts from its restart.
+ */
+static void pcnt_hold(ESP32P4PcntState *s, int64_t t)
+{
+    for (unsigned i = 0; i < ESP32P4_PCNT_INPUTS; i++) {
+        uint64_t n;
+
+        if (i % UI == ESP32P4_PCNT_RST || s->raw[i] == s->filt[i] ||
+            s->raw_since_ns[i] >= t) {
+            continue;
+        }
+        if (s->clk_running) {
+            n = s->held[i] + esp32p4_clk_edges_between(&s->apb_edges,
+                                                       s->raw_since_ns[i], t);
+            s->held[i] = MIN(n, UINT16_MAX);
+        }
+        s->raw_since_ns[i] = t;
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.rmt-pcnt]
  * APB_CLK changes at a moment: the line sources are brought up to it and
  * the filters judge the changes matured by then counting the clock's
- * edges as they were (pcnt_catch_up()), and from then on its new ones.
- * With the clock stopped the filter's flops hold their state; a change
- * waiting at the wire is filtered afresh once the clock restarts.
+ * edges as they were (pcnt_catch_up()), and from then on its new ones,
+ * the changes still waiting keeping the edges they have held for
+ * (pcnt_hold()). With the clock stopped the filter's flops hold their
+ * state.
  */
 static void esp32p4_pcnt_clk_update(void *opaque, ClockEvent event)
 {
     ESP32P4PcntState *s = opaque;
-    bool running = clock_is_enabled(s->apb_clk);
     int64_t now = pcnt_catch_up(s);
 
+    pcnt_hold(s, now);
     s->apb_edges = esp32p4_clk_edges_or_at(s->apb_clk, now);
-    if (running && !s->clk_running) {
-        for (unsigned i = 0; i < ESP32P4_PCNT_INPUTS; i++) {
-            s->raw_since_ns[i] = now;
-        }
-    }
-    s->clk_running = running;
+    s->clk_running = clock_is_enabled(s->apb_clk);
     pcnt_sync(s, now);
     pcnt_schedule(s);
 }
@@ -1271,8 +1313,8 @@ static int esp32p4_pcnt_pre_save(void *opaque)
 
 static const VMStateDescription vmstate_esp32p4_pcnt = {
     .name = TYPE_ESP32P4_PCNT,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .pre_save = esp32p4_pcnt_pre_save,
     .post_load = esp32p4_pcnt_post_load,
     .fields = (const VMStateField[]) {
@@ -1288,6 +1330,7 @@ static const VMStateDescription vmstate_esp32p4_pcnt = {
         VMSTATE_UINT8_ARRAY(filt, ESP32P4PcntState, ESP32P4_PCNT_INPUTS),
         VMSTATE_INT64_ARRAY(raw_since_ns, ESP32P4PcntState,
                             ESP32P4_PCNT_INPUTS),
+        VMSTATE_UINT16_ARRAY(held, ESP32P4PcntState, ESP32P4_PCNT_INPUTS),
         VMSTATE_TIMER(filter_timer, ESP32P4PcntState),
         VMSTATE_CLOCK(apb_clk, ESP32P4PcntState),
         VMSTATE_UINT8_ARRAY(line, ESP32P4PcntState, ESP32P4_PCNT_INPUTS),

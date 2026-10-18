@@ -13,6 +13,8 @@
 #define DPORT_PERIP_RST_EN  0x3ff000c4
 #define PERIP_PCNT          (1u << 10)
 #define PERIP_CLK_EN_RESET  0xf9c1e06fu
+#define SYSCON_SYSCLK_CONF  0x3ff66000
+#define PRE_DIV_MASK        0x3ffu
 
 #define PCNT                0x3ff57000
 #define PCNT_CONF0(u)       (PCNT + 0x00 + 0x0c * (u))
@@ -436,6 +438,71 @@ static void test_gated(void)
     qtest_quit(qts);
 }
 
+/* CPU_CLK and APB_CLK = XTAL_CLK (40 MHz) / div. */
+static void set_pre_div(QTestState *qts, uint32_t div)
+{
+    uint32_t v = qtest_readl(qts, SYSCON_SYSCLK_CONF) & ~PRE_DIV_MASK;
+
+    qtest_writel(qts, SYSCON_SYSCLK_CONF, v | (div - 1));
+}
+
+/*
+ * Unit 1's count, `was`, steps as the rising edge waiting in its filter
+ * comes through `after` ns from now, not a nanosecond sooner; then the pad
+ * goes low for long enough that the fall comes through too.
+ */
+static void expect_edge_at(QTestState *qts, int64_t after, int16_t was)
+{
+    qtest_clock_step(qts, after - 1);
+    g_assert_cmpint(count(qts, 1), ==, was);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpint(count(qts, 1), ==, was + 1);
+    drive(qts, PAD_SIG, 0);
+    qtest_clock_step(qts, 1000 * APB_NS);
+}
+
+/*
+ * The filter counts APB_CLK's cycles, at the rate each passed at: a change
+ * held back across a change of the clock's rate, or across the clock
+ * stopped and started again by its gate, keeps the cycles it held for
+ * before, the count not restarting.
+ */
+/* [spec:nuos:req:emu.esp32.pcnt/test] */
+static void test_filter_span(void)
+{
+    QTestState *qts = start();
+
+    setup_unit(qts, 1, CH_POS(0, INC) | FILTER_EN | FILTER_THRES(10), 0);
+
+    /* 4 cycles at 40 MHz, then 6 at 20 MHz: 300 ns more, not 500 */
+    drive(qts, PAD_SIG, 1);
+    qtest_clock_step(qts, 4 * APB_NS);
+    set_pre_div(qts, 2);
+    expect_edge_at(qts, 6 * 2 * APB_NS, 0);
+
+    /* 4 cycles at 20 MHz, then 6 at 40 MHz: 150 ns more, not 250 */
+    drive(qts, PAD_SIG, 1);
+    qtest_clock_step(qts, 4 * 2 * APB_NS);
+    set_pre_div(qts, 1);
+    expect_edge_at(qts, 6 * APB_NS, 1);
+
+    /* 4 cycles, the clock gated for 1 us, then 6 more: not 10 more */
+    drive(qts, PAD_SIG, 1);
+    qtest_clock_step(qts, 4 * APB_NS);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET);
+    qtest_clock_step(qts, 1000);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET | PERIP_PCNT);
+    expect_edge_at(qts, 6 * APB_NS, 2);
+
+    /* A change made while the clock is gated counts from its restart */
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET);
+    drive(qts, PAD_SIG, 1);
+    qtest_clock_step(qts, 1000);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET | PERIP_PCNT);
+    expect_edge_at(qts, 10 * APB_NS, 3);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -446,6 +513,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32-pcnt/watchpoints", test_watchpoints);
     qtest_add_func("esp32-pcnt/filter", test_filter);
     qtest_add_func("esp32-pcnt/gated", test_gated);
+    qtest_add_func("esp32-pcnt/filter-span", test_filter_span);
 
     return g_test_run();
 }

@@ -16,7 +16,11 @@
  * a level (bit 15) and a period in channel clock ticks (bits 14:0); a
  * period of 0 marks the end. Each channel's base clock is APB_CLK or
  * REF_TICK (REF_ALWAYS_ON), divided by DIV_CNT (0 meaning 256) into the
- * channel clock.
+ * channel clock. In continuous mode (TX_CONTI_MODE) the transmitter
+ * starts the data again after an end marker, one channel clock tick at
+ * the idle level between passes (TRM 30.2.2: "there will be an idle level
+ * lasting one clk_div cycle between N and N+1 transmissions"), so that
+ * entries N ticks long repeat every N + 1.
  *
  * Timing runs on QEMU_CLOCK_VIRTUAL; there are no per-tick events. The
  * channels run on whenever the block is brought up to a moment (a register
@@ -451,7 +455,10 @@ static void tx_end(Esp32RmtState *s, Esp32RmtChannel *c, unsigned n,
     c->tx_half = 0;
     raise_int(s, INT_TX_END(n));
     if (ch_conf1(c, CONF1_TX_CONTI_MODE)) {
-        /* One channel clock tick at the idle level between passes */
+        /*
+         * One channel clock tick at the idle level between passes, as the
+         * TRM gives it (30.2.2), before the next pass's first entry.
+         */
         c->tx_state = ESP32_RMT_TX_STARTING;
         c->tx_event_c = cyc + ch_div(c);
         c->tx_thr_count = 0;
