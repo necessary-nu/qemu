@@ -51,6 +51,14 @@
  * with the wrong PID is acknowledged and dropped, and IN data carries the
  * device's PID, a mismatch with HCTSIZ.PID being a toggle error.
  *
+ * The DMA engine's accesses the integration's bus holds (the ESP32-P4's
+ * PSRAM or flash controller while it cannot take an access) wait, and
+ * the channel's transaction with them: a transaction whose OUT data, or
+ * descriptor, or periodic frame list entry would be read is not started,
+ * and the bus starts nothing else meanwhile; the end of one whose IN data
+ * or descriptor write-back would be written is not taken, the bus waiting
+ * with it. Both go on once the bus takes the accesses.
+ *
  * Where hardware retries a NAKed transaction at once, this model retries
  * it in the next (micro)frame, which the device cannot tell apart and
  * spares the host's CPU. Split transactions need a high-speed hub's
@@ -1236,6 +1244,133 @@ static void ddma_result(DWC2OTGState *s, int ch, int result, uint32_t actual)
     dwc2_otg_update_irq(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.usb]
+ * Whether taking the end of the transaction on the bus (its IN data and
+ * the descriptor it writes back) waits on the integration's bus.
+ */
+static bool host_result_waits(DWC2OTGState *s)
+{
+    DWC2OTGHostChan *c = &s->hc[s->xact_chan];
+    uint32_t actual = s->xact_actual, desc;
+    bool in = s->xact_token == DWC2_TOKEN_IN;
+
+    if (!s->dma_wait || !dwc2_otg_dma_enabled(s)) {
+        return false;
+    }
+    desc = qtd_addr(c, qtd_index(c));
+    if (host_ddma(s) && chan_type(c) == USB_ENDPOINT_XFER_ISOC) {
+        bool ok = s->xact_result == XACT_ACK &&
+                  actual <= (c->qtd_status & HOST_DMA_ISOC_NBYTES_MASK);
+
+        return (ok && in && dwc2_otg_dma_waits(s, c->qtd_buf, actual, true)) ||
+               dwc2_otg_dma_waits(s, desc, 4, true);
+    }
+    if (host_ddma(s)) {
+        uint32_t nbytes = c->qtd_status & QTD_NBYTES_MASK;
+
+        switch (s->xact_result) {
+        case XACT_ACK:
+            if (in && dwc2_otg_dma_waits(s, c->qtd_buf + c->qtd_done, actual,
+                                         true)) {
+                return true;
+            }
+            return ((in && actual < chan_mps(c)) ||
+                    c->qtd_done + (in ? actual : s->xact_len) >= nbytes) &&
+                   dwc2_otg_dma_waits(s, desc, 4, true);
+        case XACT_NAK:
+        case XACT_TOGGLE_ERR:
+            return false;
+        case XACT_STALL:
+        case XACT_BABBLE:
+            return dwc2_otg_dma_waits(s, desc, 4, true);
+        default:
+            return c->err_cnt + 1 >= 3 && dwc2_otg_dma_waits(s, desc, 4, true);
+        }
+    }
+    return s->xact_result == XACT_ACK && in &&
+           dwc2_otg_dma_waits(s, c->hcdma, actual, true);
+}
+
+static bool chan_due(DWC2OTGState *s, DWC2OTGHostChan *c);
+
+/*
+ * [spec:nuos:req:emu.esp32p4.usb]
+ * Whether starting channel @ch's next transaction (chan_start()) waits on
+ * the integration's bus: the periodic frame list entry it is scheduled
+ * by, its descriptor and its OUT data, as chan_start() would read them.
+ */
+static bool chan_start_waits(DWC2OTGState *s, int ch)
+{
+    DWC2OTGHostChan *c = &s->hc[ch];
+    uint32_t q[2], mps = MIN(chan_mps(c), 1024), status, buf, done, addr;
+
+    if (!s->dma_wait || !dwc2_otg_dma_enabled(s) || c->nak_wait ||
+        c->halt_req) {
+        return false;
+    }
+    if (host_ddma(s) && chan_periodic(c) && !c->frame_done &&
+        (s->hcfg & HCFG_PERSCHEDENA)) {
+        uint32_t len = 8 << ((s->hcfg & HCFG_FRLISTEN_MASK) >>
+                             HCFG_FRLISTEN_SHIFT);
+        uint32_t frame = s->port_speed == DWC2_SPEED_HIGH ? s->frnum >> 3
+                                                          : s->frnum;
+
+        if (dwc2_otg_dma_waits(s, s->hflbaddr + (frame % len) * 4, 4,
+                               false)) {
+            return true;
+        }
+    }
+    if (chan_periodic(c) && !chan_due(s, c)) {
+        return false;
+    }
+    if (!host_ddma(s)) {
+        return chan_pktcnt(c) && chan_token(c, false) != DWC2_TOKEN_IN &&
+               dwc2_otg_dma_waits(s, c->hcdma, MIN(chan_xfersize(c), mps),
+                                  false);
+    }
+    if (chan_type(c) == USB_ENDPOINT_XFER_ISOC) {
+        addr = qtd_addr(c, s->frnum % qtd_count(c));
+        if (dwc2_otg_dma_waits(s, addr, 8, false)) {
+            return true;
+        }
+        if (!dwc2_otg_dma_read(s, addr, q, sizeof(q)) ||
+            !(le32_to_cpu(q[0]) & HOST_DMA_A) || chan_is_in(c)) {
+            return false;
+        }
+        return dwc2_otg_dma_waits(s, le32_to_cpu(q[1]),
+                                  MIN(le32_to_cpu(q[0]) &
+                                      HOST_DMA_ISOC_NBYTES_MASK, 1024),
+                                  false);
+    }
+    if (c->qtd_open) {
+        status = c->qtd_status;
+        buf = c->qtd_buf;
+        done = c->qtd_done;
+    } else {
+        addr = qtd_addr(c, qtd_index(c));
+        if (dwc2_otg_dma_waits(s, addr, 8, false)) {
+            return true;
+        }
+        if (!dwc2_otg_dma_read(s, addr, q, sizeof(q))) {
+            return false;
+        }
+        status = le32_to_cpu(q[0]);
+        buf = le32_to_cpu(q[1]);
+        done = 0;
+        if (!(status & HOST_DMA_A)) {
+            return false;
+        }
+    }
+    if (chan_token(c, (status & HOST_DMA_SUP) && done == 0 &&
+                      !chan_is_in(c)) == DWC2_TOKEN_IN) {
+        return false;
+    }
+    return dwc2_otg_dma_waits(s, buf + done,
+                              MIN((status & QTD_NBYTES_MASK) - done, mps),
+                              false);
+}
+
 /* Scheduling */
 
 /* Whether periodic channel @c may send in this (micro)frame. */
@@ -1418,7 +1553,7 @@ void dwc2_otg_host_bus(void *opaque)
     int i, ch;
 
     if (s->xact_busy) {
-        if (s->xact_async) {
+        if (s->xact_async || host_result_waits(s)) {
             return;
         }
         s->xact_busy = false;
@@ -1451,13 +1586,22 @@ void dwc2_otg_host_bus(void *opaque)
         return;
     }
     for (ch = 0; ch < s->num_chans; ch++) {
-        if (chan_periodic(&s->hc[ch]) && chan_start(s, ch)) {
+        if (!chan_periodic(&s->hc[ch]) || !(s->hc[ch].hcchar & HCCHAR_CHENA)) {
+            continue;
+        }
+        if (chan_start_waits(s, ch) || chan_start(s, ch)) {
             return;
         }
     }
     for (i = 0; i < s->num_chans; i++) {
         ch = (s->np_next + i) % s->num_chans;
-        if (!chan_periodic(&s->hc[ch]) && chan_start(s, ch)) {
+        if (chan_periodic(&s->hc[ch]) || !(s->hc[ch].hcchar & HCCHAR_CHENA)) {
+            continue;
+        }
+        if (chan_start_waits(s, ch)) {
+            return;
+        }
+        if (chan_start(s, ch)) {
             s->np_next = (ch + 1) % s->num_chans;
             return;
         }

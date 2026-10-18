@@ -94,6 +94,9 @@ bool dwc2_otg_dma_read(DWC2OTGState *s, uint32_t addr, void *buf,
                        uint32_t len);
 bool dwc2_otg_dma_write(DWC2OTGState *s, uint32_t addr, const void *buf,
                         uint32_t len);
+/* Whether the DMA engine's access waits on the integration's bus. */
+bool dwc2_otg_dma_waits(DWC2OTGState *s, uint32_t addr, uint32_t len,
+                        bool write);
 
 /* FIFOs */
 uint32_t dwc2_otg_rx_free(DWC2OTGState *s);
@@ -151,6 +154,7 @@ void dwc2_otg_dev_rx_popped(DWC2OTGState *s, uint32_t status);
 uint32_t dwc2_otg_daint(DWC2OTGState *s);
 uint32_t dwc2_otg_deachint(DWC2OTGState *s);
 void dwc2_otg_dev_kick(DWC2OTGState *s);
+void dwc2_otg_dev_dma_ready(DWC2OTGState *s);
 void dwc2_otg_dev_idle(void *opaque);
 void dwc2_otg_dev_eopf(void *opaque);
 extern const VMStateDescription vmstate_dwc2_otg_ep;

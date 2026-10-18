@@ -4455,6 +4455,7 @@ static void esp32p4_init_usb(ESP32P4MachineState *s)
     dwc2_otg_set_dma(&s->usb_hs, esp32p4_pms_bus_as(&s->pms),
                      esp32p4_dma_attrs(ESP32P4_DMA_MASTER_USB_OTG_HS,
                                        ESP32P4_ICM_ID_USB_OTG_HS));
+    esp32p4_usb_dma_wait_init(&s->usb_hs_wait, &s->usb_hs);
     qdev_connect_clock_in(hs, "utmi", qdev_get_clock_out(utmi, "utmi"));
     sysbus_realize(SYS_BUS_DEVICE(hs), &error_fatal);
     esp32p4_map_usb_core(s, &s->usb_hs, ESP32P4_USB_OTG_HS_BASE,
@@ -4498,6 +4499,7 @@ static void esp32p4_init_usb(ESP32P4MachineState *s)
     dwc2_otg_set_dma(&s->usb_fs, esp32p4_pms_bus_as(&s->pms),
                      esp32p4_dma_attrs(ESP32P4_DMA_MASTER_USB_OTG_FS,
                                        ESP32P4_ICM_ID_USB_OTG_FS));
+    esp32p4_usb_dma_wait_init(&s->usb_fs_wait, &s->usb_fs);
     qdev_connect_clock_in(fs, "fsphy",
                           qdev_get_clock_out(clkrst, "usb-otg11-48m"));
     sysbus_realize(SYS_BUS_DEVICE(fs), &error_fatal);

@@ -575,6 +575,40 @@ static bool dwmac_dma_rw(Esp32DwmacState *s, uint32_t addr, void *buf,
     return true;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.emac]
+ * Whether the DMA's access waits on the bus (the class's dma_wait()).
+ */
+static bool dwmac_dma_waits(Esp32DwmacState *s, uint32_t addr, uint32_t len,
+                            bool write)
+{
+    Esp32DwmacClass *k = dwmac_class(s);
+
+    return len && k->dma_wait && k->dma_wait(s, addr, len, write);
+}
+
+/*
+ * A descriptor's @words words at @addr for working out the DMA's next
+ * step, read as the DMA reads them but without its bus error: false if
+ * the bus refuses them, which the step itself then meets.
+ */
+static bool dwmac_plan_read(Esp32DwmacState *s, uint32_t addr, uint32_t *d,
+                            unsigned words)
+{
+    Esp32DwmacClass *k = dwmac_class(s);
+    MemTxAttrs attrs = k->dma_attrs ? k->dma_attrs(s) : MEMTXATTRS_UNSPECIFIED;
+
+    if ((k->dma_ok && !k->dma_ok(s, addr, words * 4)) ||
+        address_space_read(s->dma_as, addr, attrs, d, words * 4) !=
+        MEMTX_OK) {
+        return false;
+    }
+    for (unsigned i = 0; i < words; i++) {
+        d[i] = le32_to_cpu(d[i]);
+    }
+    return true;
+}
+
 static bool dwmac_dma_read(Esp32DwmacState *s, uint32_t addr, void *buf,
                            uint32_t len, unsigned code)
 {
@@ -1887,6 +1921,22 @@ static void dwmac_tx_close(Esp32DwmacState *s, uint32_t status)
     }
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.emac]
+ * Whether closing the frame's last descriptor with @status waits on the
+ * bus: its read, the timestamp's words and its write-back.
+ */
+static bool dwmac_tx_close_waits(Esp32DwmacState *s, uint32_t status)
+{
+    uint32_t addr = s->tx_last_desc;
+
+    return dwmac_dma_waits(s, addr, 4, false) ||
+           ((status & TDES0_TTSS) &&
+            (dwmac_dma_waits(s, addr + DES6_OFF, 4, true) ||
+             dwmac_dma_waits(s, addr + DES7_OFF, 4, true))) ||
+           dwmac_dma_waits(s, addr, 4, true);
+}
+
 /* Leave the running state when DMAOPERATION_MODE.ST has been cleared. */
 static bool dwmac_tx_maybe_stop(Esp32DwmacState *s)
 {
@@ -1899,6 +1949,39 @@ static bool dwmac_tx_maybe_stop(Esp32DwmacState *s)
         dwmac_raise(s, ST_TPS);
     }
     return true;
+}
+
+/*
+ * The DMA closes the frame sent or flushed (tx_closing) once the close's
+ * accesses can be made, and goes on.
+ */
+static void dwmac_tx_finish(Esp32DwmacState *s)
+{
+    if (s->tx_closing) {
+        if (dwmac_tx_close_waits(s, s->tx_status)) {
+            /* The MAC goes on sending what it owes, a pause frame. */
+            dwmac_tx_kick(s);
+            return;
+        }
+        s->tx_closing = false;
+        dwmac_tx_close(s, s->tx_status);
+        if (s->tx_jabber) {
+            /* A jabber timeout stops the transmit process. */
+            s->tx_jabber = false;
+            s->tx_gathering = false;
+            if (!s->tx_fatal) {
+                s->tx_state = TS_STOPPED;
+            }
+            dwmac_raise(s, ST_TJT | ST_TPS);
+            dwmac_tx_kick(s);
+            return;
+        }
+        if (!s->tx_fatal && !dwmac_tx_maybe_stop(s)) {
+            s->tx_state = TS_FETCHING;
+        }
+    }
+    dwmac_tx_kick(s);
+    dwmac_tx_dma(s);
 }
 
 static void dwmac_tx_end(void *opaque)
@@ -1919,24 +2002,53 @@ static void dwmac_tx_end(void *opaque)
         if (!s->tx_jabber) {
             dwmac_wire_out(s, s->tx_frame, s->tx_wire_len);
         }
-        dwmac_tx_close(s, s->tx_status);
-        if (s->tx_jabber) {
-            /* A jabber timeout stops the transmit process. */
-            s->tx_jabber = false;
-            s->tx_gathering = false;
-            if (!s->tx_fatal) {
-                s->tx_state = TS_STOPPED;
-            }
-            dwmac_raise(s, ST_TJT | ST_TPS);
-            dwmac_tx_kick(s);
-            return;
-        }
-        if (!s->tx_fatal && !dwmac_tx_maybe_stop(s)) {
-            s->tx_state = TS_FETCHING;
-        }
+        s->tx_closing = true;
     }
-    dwmac_tx_kick(s);
-    dwmac_tx_dma(s);
+    dwmac_tx_finish(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.emac]
+ * Whether the transmit DMA's descriptor at @addr waits on the bus: its
+ * read, its buffers' reads and the write-back that hands it back (a
+ * frame's last one is handed back by its close), or, one the host owns
+ * ending a frame the MAC has begun, that frame's close.
+ */
+static bool dwmac_tx_desc_waits(Esp32DwmacState *s, uint32_t addr)
+{
+    static const uint32_t ttc_bytes[] = { 64, 128, 192, 256, 40, 32, 24, 16 };
+    uint32_t d[4], len;
+
+    if (!dwmac_class(s)->dma_wait) {
+        return false;
+    }
+    if (dwmac_dma_waits(s, addr, 16, false)) {
+        return true;
+    }
+    if (!dwmac_plan_read(s, addr, d, 4)) {
+        return false;
+    }
+    if (!(d[0] & TDES0_OWN)) {
+        uint32_t start = (s->op_mode & OP_TSF) ?
+                         dwmac_class(s)->tx_fifo_size :
+                         ttc_bytes[(s->op_mode >> OP_TTC_SHIFT) & 7];
+
+        return s->tx_gathering && s->tx_len >= start &&
+               dwmac_tx_close_waits(s, TDES0_UF | TDES0_ES);
+    }
+    len = (!s->tx_gathering || (d[0] & TDES0_FS)) ? 0 : s->tx_len;
+    for (unsigned i = 0; i < 2; i++) {
+        uint32_t want = i ? ((d[0] & TDES0_TCH) ? 0 :
+                             (d[1] >> TDES1_TBS2_SHIFT) & TDES_BS_MASK)
+                          : d[1] & TDES_BS_MASK;
+        uint32_t take = MIN(want, ESP32_DWMAC_MAX_FRAME - len);
+
+        if (dwmac_dma_waits(s, d[2 + i], take, false)) {
+            return true;
+        }
+        len += take;
+    }
+    return !(d[0] & TDES0_LS) && dwmac_dma_waits(s, addr, 4, true);
 }
 
 /*
@@ -1959,10 +2071,13 @@ static void dwmac_tx_dma(Esp32DwmacState *s)
         uint32_t b1, b2, next;
 
         if (s->tx_fatal || s->tx_state == TS_STOPPED || s->tx_ready ||
-            !dwmac_live(s) || dwmac_tx_maybe_stop(s)) {
+            s->tx_closing || !dwmac_live(s) || dwmac_tx_maybe_stop(s)) {
             return;
         }
         s->tx_state = TS_FETCHING;
+        if (dwmac_tx_desc_waits(s, addr)) {
+            return;
+        }
         if (!dwmac_desc_read(s, addr, d, 4, EB_TX_DESC_READ)) {
             return;
         }
@@ -2049,11 +2164,10 @@ static void dwmac_tx_flush(Esp32DwmacState *s)
 {
     if (s->tx_ready && !s->tx_on_wire) {
         s->tx_ready = false;
-        dwmac_tx_close(s, TDES0_FF | TDES0_ES);
-        if (!s->tx_fatal && !dwmac_tx_maybe_stop(s)) {
-            s->tx_state = TS_FETCHING;
-        }
-        dwmac_tx_dma(s);
+        s->tx_jabber = false;
+        s->tx_status = TDES0_FF | TDES0_ES;
+        s->tx_closing = true;
+        dwmac_tx_finish(s);
     }
 }
 
@@ -2168,6 +2282,81 @@ static void dwmac_pause_end(void *opaque)
 
     s->paused = false;
     dwmac_tx_kick(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.emac]
+ * Whether delivering a frame of @len bytes with status @status
+ * (dwmac_rx_dma_frame()) waits on the bus: its descriptors' reads, its
+ * buffers' writes and its descriptors' write-backs, as the delivery would
+ * make them. The frame stays in the FIFO, and the DMA with it, until none
+ * waits.
+ */
+static bool dwmac_rx_frame_waits(Esp32DwmacState *s, uint32_t len,
+                                 uint32_t status)
+{
+    bool atds = s->bus_mode & BUS_MODE_ATDS;
+    bool ptp = dwmac_class(s)->has_ptp;
+    uint32_t addr = s->rx_desc, d[4], pos = 0, nd, rdes0;
+
+    if (!dwmac_class(s)->dma_wait) {
+        return false;
+    }
+    if (dwmac_dma_waits(s, addr, 16, false)) {
+        return true;
+    }
+    if (!dwmac_plan_read(s, addr, d, 4) || !(d[0] & RDES0_OWN)) {
+        return false;
+    }
+    if (ptp && !atds) {
+        status &= ~RDES0_TSA;
+    }
+    for (unsigned n = 0; n < DESC_WALK_LIMIT; n++) {
+        uint32_t b1 = d[1] & TDES_BS_MASK;
+        uint32_t b2 = (d[1] & RDES1_RCH) ? 0 :
+                      (d[1] >> RDES1_RBS2_SHIFT) & TDES_BS_MASK;
+        uint32_t next;
+
+        for (unsigned i = 0; i < 2; i++) {
+            uint32_t n2 = MIN(i ? b2 : b1, len - pos);
+
+            if (dwmac_dma_waits(s, d[2 + i], n2, true)) {
+                return true;
+            }
+            pos += n2;
+        }
+        next = dwmac_next_desc(s, addr, d[1] & RDES1_RER, d[1] & RDES1_RCH,
+                               d[3], s->rx_base);
+        rdes0 = status;
+        if (pos != len) {
+            if (dwmac_dma_waits(s, next, 4, false)) {
+                return true;
+            }
+            if (!dwmac_plan_read(s, next, &nd, 1)) {
+                return false;
+            }
+            if (nd & RDES0_OWN) {
+                if (dwmac_dma_waits(s, addr, 4, true) ||
+                    dwmac_dma_waits(s, next, 16, false)) {
+                    return true;
+                }
+                addr = next;
+                if (!dwmac_plan_read(s, addr, d, 4)) {
+                    return false;
+                }
+                continue;
+            }
+            rdes0 = status & ~RDES0_ESA;
+        }
+        return (atds && (rdes0 & RDES0_ESA) &&
+                (ptp || (s->config & CFG_IPC)) &&
+                dwmac_dma_waits(s, addr + DES4_OFF, 4, true)) ||
+               (ptp && (rdes0 & RDES0_TSA) &&
+                (dwmac_dma_waits(s, addr + DES6_OFF, 4, true) ||
+                 dwmac_dma_waits(s, addr + DES7_OFF, 4, true))) ||
+               dwmac_dma_waits(s, addr, 4, true);
+    }
+    return false;
 }
 
 /*
@@ -2330,6 +2519,10 @@ static void dwmac_rx_dma(Esp32DwmacState *s)
 {
     while (s->rx_fifo_count && !s->rx_fatal && s->rx_state != RS_STOPPED &&
            (s->op_mode & OP_SR) && dwmac_live(s)) {
+        if (dwmac_rx_frame_waits(s, s->rx_fifo_len[0],
+                                 s->rx_fifo_rdes0[0])) {
+            return;
+        }
         if (!dwmac_rx_dma_frame(s, s->rx_fifo, s->rx_fifo_len[0],
                                 s->rx_fifo_rdes0[0], s->rx_fifo_rdes4[0],
                                 s->rx_fifo_ts[0])) {
@@ -2565,8 +2758,12 @@ static void dwmac_mac_rx(Esp32DwmacState *s, const uint8_t *f, size_t len)
         if (data_len > k->rx_fifo_size && !s->rx_fifo_count &&
             !(s->op_mode & OP_RSF) && (s->op_mode & OP_SR) &&
             s->rx_state != RS_STOPPED && !s->rx_fatal) {
-            /* Cut-through: a frame longer than the FIFO streams out. */
-            if (dwmac_rx_dma_frame(s, f, data_len, status, rdes4, ts)) {
+            /*
+             * Cut-through: a frame longer than the FIFO streams out, unless
+             * the DMA waits on the bus, when it overflows the FIFO.
+             */
+            if (!dwmac_rx_frame_waits(s, data_len, status) &&
+                dwmac_rx_dma_frame(s, f, data_len, status, rdes4, ts)) {
                 return;
             }
         }
@@ -2764,6 +2961,7 @@ static void dwmac_regs_reset(Esp32DwmacState *s)
     s->tx_tdes1 = 0;
     s->tx_last_desc = 0;
     s->tx_status = 0;
+    s->tx_closing = false;
     s->tx_ts = 0;
     s->pause_pending = false;
     s->pause_quanta = 0;
@@ -3289,6 +3487,13 @@ void esp32_dwmac_mii_changed(Esp32DwmacState *s)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.emac] */
+void esp32_dwmac_dma_ready(Esp32DwmacState *s)
+{
+    dwmac_tx_finish(s);
+    dwmac_rx_dma(s);
+}
+
 bool esp32_dwmac_sw_reset_pending(Esp32DwmacState *s)
 {
     return s->sw_reset_pending;
@@ -3431,8 +3636,8 @@ static const Property esp32_dwmac_properties[] = {
 
 const VMStateDescription vmstate_esp32_dwmac = {
     .name = TYPE_ESP32_DWMAC,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(held, Esp32DwmacState),
         VMSTATE_UINT32(bus_mode, Esp32DwmacState),
@@ -3487,6 +3692,7 @@ const VMStateDescription vmstate_esp32_dwmac = {
         VMSTATE_UINT32(tx_tdes1, Esp32DwmacState),
         VMSTATE_UINT32(tx_last_desc, Esp32DwmacState),
         VMSTATE_UINT32(tx_status, Esp32DwmacState),
+        VMSTATE_BOOL(tx_closing, Esp32DwmacState),
         VMSTATE_UINT64(tx_ts, Esp32DwmacState),
         VMSTATE_TIMER(tx_timer, Esp32DwmacState),
         VMSTATE_BOOL(pause_pending, Esp32DwmacState),

@@ -13,6 +13,7 @@
 #include "hw/core/clock.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "qemu/timer.h"
+#include "qemu/notify.h"
 #include "qom/object.h"
 #include "system/memory.h"
 
@@ -378,6 +379,17 @@ struct ESP32P4Dma2dState {
     /* The arbiters: the last channel granted and their slots' starts. */
     uint32_t rr_last[2];
     int64_t slot_start[2];
+    /*
+     * The channel whose transaction a memory controller's AXI port holds
+     * (esp32p4_mspi_dma_wait()), for each arbiter, or -1: the arbiter's
+     * bus waits, and makes it first once the port takes it, which
+     * @bus_wait is told of. @probe is set while a transaction is worked
+     * out without being made, to find its accesses.
+     */
+    int32_t stall_grant[2];
+    Notifier bus_wait;
+    bool probe;
+    bool probe_held;
     /* The peripherals to tell of data, room or a descriptor. */
     uint32_t notify;
 

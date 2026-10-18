@@ -273,7 +273,10 @@ static void test_psram(void)
     esp32p4_psram_spi1_opi(qts);
     esp32p4_psram_dqs_on(qts);
 
-    /* Mode registers 0 to 3 as ESP-IDF reads them: 16 bits at 0 and 2. */
+    /*
+     * Mode registers 0 to 3 as ESP-IDF reads them: 16 bits at 0 and 2; MR3
+     * with RBXen (row boundary crossing) and 4x refresh.
+     */
     spi1_user(qts, SPI1_PSRAM, 0x4040, 16, 0, 32, ESP32P4_PSRAM_PUP_DUMMY, 0,
               2);
     g_assert_cmphex(qtest_readl(qts, SPI1_PSRAM + W(0)) & 0xffff, ==,
@@ -281,7 +284,7 @@ static void test_psram(void)
     spi1_user(qts, SPI1_PSRAM, 0x4040, 16, 2, 32, ESP32P4_PSRAM_PUP_DUMMY, 0,
               2);
     g_assert_cmphex(qtest_readl(qts, SPI1_PSRAM + W(0)) & 0xffff, ==,
-                    0x20df);
+                    0xa0df);
 
     /* Synchronous write and read, and the same memory through SPI0. */
     qtest_writel(qts, SPI1_PSRAM + W(0), 0xa5a55a5a);

@@ -173,6 +173,12 @@ bool esp32p4_mspi_iomux_flash_idle(ESP32P4MspiIomuxState *s, unsigned io)
  * [spec:nuos:req:emu.esp32p4.memory]
  * Where PSRAM data line dq samples a DDR beat (see the top of the file).
  */
+bool esp32p4_mspi_iomux_psram_strobe_on(ESP32P4MspiIomuxState *s,
+                                        unsigned lane)
+{
+    return FIELD_EX32(s->regs[lane ? R_PSRAM_DQS1 : R_PSRAM_DQS0], DQS, XPD);
+}
+
 ESP32P4MspiSample esp32p4_mspi_iomux_psram_sample(ESP32P4MspiIomuxState *s,
                                                   unsigned dq, bool falling,
                                                   uint64_t period_ps)

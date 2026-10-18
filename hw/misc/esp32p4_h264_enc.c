@@ -384,6 +384,25 @@ size_t h264e_take(H264Enc *e, uint8_t *buf, size_t max)
     return out;
 }
 
+size_t h264e_take_len(const H264Enc *e)
+{
+    size_t in = 0, out = 0;
+    int zeros = e->zeros;
+
+    while (in < e->rbsp_len) {
+        uint8_t b = e->rbsp[in];
+
+        out++;
+        if (zeros >= 2 && b <= 3) {
+            zeros = 0;
+            continue;
+        }
+        zeros = b ? 0 : zeros + 1;
+        in++;
+    }
+    return out;
+}
+
 /* Planes */
 
 void h264e_init(H264Enc *e)

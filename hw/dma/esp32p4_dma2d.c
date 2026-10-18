@@ -89,7 +89,12 @@
  * VA, hb or vb 0 in 2D mode or size 0 in 1D mode, or a bus error on the
  * read, raises DSCR_ERR and leaves the channel idle. A bus error on a
  * data access does not stop the transfer: a read gives zeros and a write
- * is lost, and AXI_ERR counts it.
+ * is lost, and AXI_ERR counts it. A transaction whose accesses a memory
+ * controller's AXI port holds (the flash's or the PSRAM's while it cannot
+ * take an access: its clocks stopped, held in reset, AXI_REQ_EN clear;
+ * esp32p4_mspi_dma_wait()) waits, and the arbiter that granted it with
+ * it, without an error, until the port takes accesses again; it is then
+ * made, before the arbiter grants another (chan_stalls()).
  *
  * Every memory access is a 2D-DMA master's on the bus through the access
  * permission managers (include/hw/misc/esp32p4_pms.h): DMA2D_JPEG for a
@@ -155,6 +160,7 @@
 #include "hw/dma/esp32p4_dma2d.h"
 #include "hw/gpio/esp32_line.h"
 #include "hw/misc/esp32p4_pms.h"
+#include "hw/ssi/esp32p4_mspi.h"
 #include "migration/vmstate.h"
 
 #define IN  ESP32P4_DMA2D_IN
@@ -404,6 +410,9 @@ static void dma2d_update_irq(ESP32P4Dma2dState *s, int dir, int ch)
 {
     ESP32P4Dma2dChan *c = &s->ch[dir][ch];
 
+    if (s->probe) {
+        return;
+    }
     qemu_set_irq(s->irq[irq_index(dir, ch)], !!(c->int_raw & c->int_ena));
 }
 
@@ -427,7 +436,7 @@ static void dma2d_event(ESP32P4Dma2dState *s, int base, int dir, int ch)
     int64_t t = esp32_line_time();
     qemu_irq line;
 
-    if (ch >= (dir == IN ? 2 : 3)) {
+    if (ch >= (dir == IN ? 2 : 3) || s->probe) {
         return;
     }
     line = s->etm_event[base + ch];
@@ -488,12 +497,29 @@ static bool dma2d_reachable(ESP32P4Dma2dState *s, uint32_t addr, uint32_t len)
            (addr >= s->extr_mem_start && last <= s->extr_mem_end);
 }
 
+/*
+ * An access of channel @ch of direction @dir. While a transaction is
+ * worked out (@probe) none is made: an access is only asked about, and
+ * marks the transaction held if a memory controller's AXI port holds it;
+ * a read gives zeros, which no access after it in the same transaction
+ * depends on.
+ */
 static bool dma2d_bus(ESP32P4Dma2dState *s, int dir, int ch, uint32_t addr,
                       void *buf, uint32_t len, bool write)
 {
     MemTxResult r;
 
     if (!len) {
+        return true;
+    }
+    if (s->probe) {
+        if (esp32p4_mspi_dma_wait(s->as, addr, len, chan_attrs(s, dir, ch),
+                                  write, &s->bus_wait)) {
+            s->probe_held = true;
+        }
+        if (!write) {
+            memset(buf, 0, len);
+        }
         return true;
     }
     r = address_space_rw(s->as, addr, chan_attrs(s, dir, ch), buf, len,
@@ -790,9 +816,10 @@ static uint32_t csc_stream(const CscCfg *k, ESP32P4Dma2dChan *c,
 }
 
 /* Drop a partial pixel at the end of a descriptor's data. */
-static void csc_flush(ESP32P4Dma2dChan *c, int dir, int ch)
+static void csc_flush(ESP32P4Dma2dState *s, ESP32P4Dma2dChan *c, int dir,
+                      int ch)
 {
-    if (c->ncarry || (c->csc_pend & BIT(24))) {
+    if ((c->ncarry || (c->csc_pend & BIT(24))) && !s->probe) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: %s channel %d: a descriptor ends "
                       "within a pixel the color space conversion needs "
                       "whole\n", TYPE_ESP32P4_DMA2D, dir_name(dir), ch);
@@ -953,9 +980,11 @@ static void chan_desc_error(ESP32P4Dma2dState *s, int dir, int ch,
 {
     ESP32P4Dma2dChan *c = &s->ch[dir][ch];
 
-    qemu_log_mask(LOG_GUEST_ERROR, "%s: %s channel %d: the descriptor at "
-                  "0x%08" PRIx32 " %s\n", TYPE_ESP32P4_DMA2D, dir_name(dir),
-                  ch, addr, why);
+    if (!s->probe) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: %s channel %d: the descriptor at "
+                      "0x%08" PRIx32 " %s\n", TYPE_ESP32P4_DMA2D,
+                      dir_name(dir), ch, addr, why);
+    }
     chan_halt(c);
     dma2d_raise(s, dir, ch, dir == IN ? IN_DSCR_ERR : OUT_DSCR_ERR);
 }
@@ -999,13 +1028,14 @@ static uint32_t chan_fetch(ESP32P4Dma2dState *s, int dir, int ch)
                    !(dir == IN && chan_port(c))) {
             why = "has a reserved pbyte";
         }
-        if (!why && !d.en_2d && (c->dw[2] & DW2_MOD)) {
+        if (!why && !d.en_2d && (c->dw[2] & DW2_MOD) && !s->probe) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: %s channel %d: the 1D "
                           "descriptor at 0x%08" PRIx32 " has mod set\n",
                           TYPE_ESP32P4_DMA2D, dir_name(dir), ch, addr);
         }
         if (!why && d.en_2d && !(dir == IN && chan_port(c)) &&
-            (desc_nibbles(&d) & 1) && ((d.x | d.hb | d.ha) & 1)) {
+            (desc_nibbles(&d) & 1) && ((d.x | d.hb | d.ha) & 1) &&
+            !s->probe) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: %s channel %d: the "
                           "descriptor at 0x%08" PRIx32 " has an odd X, hb "
                           "or HA at %u nibbles a pixel\n",
@@ -1419,7 +1449,7 @@ static uint32_t tx_desc_done(ESP32P4Dma2dState *s, int ch)
     uint8_t *flags;
 
     if (eof) {
-        csc_flush(c, OUT, ch);
+        csc_flush(s, c, OUT, ch);
     }
     /* A descriptor whose last byte has left, or that had none, a mark. */
     if (!f->num || f->desc[last] != c->dscr_bf0 ||
@@ -1583,7 +1613,7 @@ static uint32_t rx_close(ESP32P4Dma2dState *s, int ch, bool eof, bool err)
     dw[1] = cpu_to_le32(dw[1]);
     dma2d_bus(s, IN, ch, addr, dw, 4 * n, true);
     if (eof || err) {
-        csc_flush(c, IN, ch);
+        csc_flush(s, c, IN, ch);
     }
     dma2d_event(s, EVT_IN_DONE, IN, ch);
     if (eof || err) {
@@ -1814,9 +1844,11 @@ static uint32_t rx_mcu_service(ESP32P4Dma2dState *s)
         mcu_geometry(rx_mcu_format(s, c), &mcu_bytes, &mw, &mh);
         want = (pw / mw) * (ph / mh) * mcu_bytes;
         if (want > ESP32P4_DMA2D_RO_MAX) {
-            qemu_log_mask(LOG_UNIMP, "%s: an hb x vb block of %u bytes of "
-                          "MCUs is larger than the model's reorder RAM\n",
-                          TYPE_ESP32P4_DMA2D, want);
+            if (!s->probe) {
+                qemu_log_mask(LOG_UNIMP, "%s: an hb x vb block of %u bytes "
+                              "of MCUs is larger than the model's reorder "
+                              "RAM\n", TYPE_ESP32P4_DMA2D, want);
+            }
             want = ESP32P4_DMA2D_RO_MAX;
         }
         while (s->ro_num < want && c->fifo.num && !c->stage_flags) {
@@ -1965,6 +1997,58 @@ static void m2m_move(ESP32P4Dma2dState *s, int ch)
         }
     }
     rx_check_empty(s, ch);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.dma]
+ * Whether the transaction channel @ch of direction @dir would make next
+ * waits on a memory controller's AXI port (esp32p4_mspi_dma_wait()): a
+ * descriptor read, a data burst or padding read, and the descriptor
+ * write-back and next-pointer re-read that close a descriptor. On the
+ * chip the transaction is under way and the bus waits with it; the model
+ * makes none of it until the port takes them all. The transaction is
+ * worked out by running it with its accesses only asked about (@probe),
+ * on the channel's state and the reorder RAM, which are then put back:
+ * which accesses a transaction makes never depends on what it reads.
+ * While no port holds accesses no access can wait, and nothing is asked.
+ */
+static bool chan_stalls(ESP32P4Dma2dState *s, int dir, int ch)
+{
+    ESP32P4Dma2dChan *saved;
+    uint32_t axi_err = s->axi_err, notify = s->notify;
+    uint32_t ro_num = s->ro_num, ro_out_len = s->ro_out_len;
+    g_autofree uint8_t *ro_buf = NULL;
+    g_autofree uint8_t *ro_out = NULL;
+    bool held;
+
+    if (!esp32p4_mspi_dma_holds()) {
+        return false;
+    }
+    saved = g_memdup2(&s->ch[dir][ch], sizeof(s->ch[dir][ch]));
+    if (dir == IN && ch == 0) {
+        ro_buf = g_memdup2(s->ro_buf, s->ro_buf_size);
+        ro_out = g_memdup2(s->ro_out, s->ro_buf_size);
+    }
+    s->probe = true;
+    s->probe_held = false;
+    if (dir == OUT) {
+        tx_service(s, ch);
+    } else {
+        rx_service(s, ch);
+    }
+    held = s->probe_held;
+    s->probe = false;
+    s->ch[dir][ch] = *saved;
+    g_free(saved);
+    s->axi_err = axi_err;
+    s->notify = notify;
+    s->ro_num = ro_num;
+    s->ro_out_len = ro_out_len;
+    if (ro_buf) {
+        memcpy(s->ro_buf, ro_buf, s->ro_buf_size);
+        memcpy(s->ro_out, ro_out, s->ro_buf_size);
+    }
+    return held;
 }
 
 /* Arbitration */
@@ -2169,10 +2253,20 @@ static void dma2d_round(void *opaque)
         m2m_move(s, ch);
     }
     for (int arb = 0; arb < 2; arb++) {
-        bool hold;
-        int g = arb_grant(s, arb, cycle, &hold);
+        bool hold = false;
+        int g = s->stall_grant[arb];
 
-        if (g >= 0) {
+        /* A transaction the AXI port held goes first, once it takes it. */
+        s->stall_grant[arb] = -1;
+        if (g >= 0 && !chan_requests(s, arb_dir(arb), g)) {
+            g = -1;
+        }
+        if (g < 0) {
+            g = arb_grant(s, arb, cycle, &hold);
+        }
+        if (g >= 0 && chan_stalls(s, arb_dir(arb), g)) {
+            s->stall_grant[arb] = g;
+        } else if (g >= 0) {
             uint32_t c = arb == 0 ? tx_service(s, g) : rx_service(s, g);
 
             cost = MAX(cost, MAX(c, 1));
@@ -2279,6 +2373,18 @@ static void dma2d_kick(ESP32P4Dma2dState *s)
         dma2d_arm_round(s, esp32p4_clk_count_at(&s->bus_edges,
                                                 esp32_line_time()) + 1);
     }
+}
+
+/*
+ * A memory controller's AXI port takes accesses again: the transactions
+ * it held go on, from the bus cycle after.
+ */
+static void dma2d_bus_ready(Notifier *n, void *data)
+{
+    ESP32P4Dma2dState *s = container_of(n, ESP32P4Dma2dState, bus_wait);
+
+    notifier_remove(n);
+    dma2d_kick(s);
 }
 
 /*
@@ -3118,6 +3224,10 @@ static void esp32p4_dma2d_reset_hold(Object *obj, ResetType type)
     s->date = DATE_RESET;
     s->rr_last[0] = s->rr_last[1] = 0;
     s->slot_start[0] = s->slot_start[1] = 0;
+    s->stall_grant[0] = s->stall_grant[1] = -1;
+    if (QLIST_IS_INSERTED(&s->bus_wait, node)) {
+        notifier_remove(&s->bus_wait);
+    }
     s->notify = 0;
     s->ro_num = 0;
     s->ro_out_len = 0;
@@ -3156,6 +3266,8 @@ static void esp32p4_dma2d_init(Object *obj)
     s->clk = qdev_init_clock_in(DEVICE(obj), "clk", dma2d_clk_update, s,
                                 ClockPreUpdate | ClockUpdate);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dma2d_timer_cb, s);
+    s->bus_wait.notify = dma2d_bus_ready;
+    s->stall_grant[0] = s->stall_grant[1] = -1;
     s->ro_buf_size = ESP32P4_DMA2D_RO_MAX;
     s->ro_buf = g_malloc0(ESP32P4_DMA2D_RO_MAX);
     s->ro_out = g_malloc0(ESP32P4_DMA2D_RO_MAX);
@@ -3284,10 +3396,25 @@ static const VMStateDescription vmstate_esp32p4_dma2d_chan = {
     },
 };
 
+/*
+ * A transaction an AXI port held: ask again, which waits on the port anew
+ * if it still holds it.
+ */
+static int esp32p4_dma2d_post_load(void *opaque, int version_id)
+{
+    ESP32P4Dma2dState *s = opaque;
+
+    if (s->stall_grant[0] >= 0 || s->stall_grant[1] >= 0) {
+        dma2d_kick(s);
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_esp32p4_dma2d = {
     .name = TYPE_ESP32P4_DMA2D,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .post_load = esp32p4_dma2d_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_2DARRAY(ch, ESP32P4Dma2dState, 2,
                                ESP32P4_DMA2D_CHANNELS, 1,
@@ -3307,6 +3434,7 @@ static const VMStateDescription vmstate_esp32p4_dma2d = {
                            ESP32P4_DMA2D_ETM_TASKS),
         VMSTATE_UINT32_ARRAY(rr_last, ESP32P4Dma2dState, 2),
         VMSTATE_INT64_ARRAY(slot_start, ESP32P4Dma2dState, 2),
+        VMSTATE_INT32_ARRAY(stall_grant, ESP32P4Dma2dState, 2),
         VMSTATE_UINT32(notify, ESP32P4Dma2dState),
         VMSTATE_VBUFFER_UINT32(ro_buf, ESP32P4Dma2dState, 1, NULL,
                                ro_buf_size),
