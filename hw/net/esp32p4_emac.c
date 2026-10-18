@@ -132,6 +132,25 @@ static MemTxAttrs p4_emac_dma_attrs(Esp32DwmacState *d)
     return esp32p4_dma_attrs(ESP32P4_DMA_MASTER_GMAC, ESP32P4_ICM_ID_GMAC);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.emac]
+ * The DMA's access waits on a memory controller's held AXI port (the
+ * flash's or the PSRAM's while it cannot take an access: its clocks
+ * stopped, held in reset, AXI_REQ_EN clear; esp32p4_mspi_dma_wait()),
+ * without an error, until the port takes accesses again.
+ */
+static bool p4_emac_dma_wait(Esp32DwmacState *d, uint32_t addr, uint32_t len,
+                             bool write)
+{
+    return esp32p4_mspi_dma_wait_on(&p4_emac(d)->dma_wait, d->dma_as, addr,
+                                    len, p4_emac_dma_attrs(d), write);
+}
+
+static void p4_emac_dma_ready(void *opaque)
+{
+    esp32_dwmac_dma_ready(ESP32_DWMAC(opaque));
+}
+
 static bool p4_emac_pad(uint8_t pad)
 {
     return pad < ESP32P4_GPIO_PADS;
@@ -478,6 +497,7 @@ static void p4_emac_reset_hold(Object *obj, ResetType type)
     if (k->parent_phases.hold) {
         k->parent_phases.hold(obj, type);
     }
+    esp32p4_mspi_dma_wait_cancel(&ESP32P4_EMAC(obj)->dma_wait);
 }
 
 /*
@@ -525,6 +545,7 @@ static void p4_emac_init(Object *obj)
     qdev_init_gpio_out_named(dev, s->rst_clk_n, ESP32P4_EMAC_RST_N, 2);
     s->route_notifier.notify = p4_emac_route_changed;
     s->mdi = true;
+    esp32p4_mspi_dma_wait_init(&s->dma_wait, p4_emac_dma_ready, s);
 }
 
 static void p4_emac_realize(DeviceState *dev, Error **errp)
@@ -564,10 +585,18 @@ static const Property p4_emac_properties[] = {
     DEFINE_PROP_UINT8("pad-ref-clk", ESP32P4EmacState, pad_ref_clk, 50),
 };
 
+/* A DMA access a held port held: the DMA asks again. */
+static int p4_emac_post_load(void *opaque, int version_id)
+{
+    esp32p4_mspi_dma_wait_retry(&ESP32P4_EMAC(opaque)->dma_wait);
+    return 0;
+}
+
 static const VMStateDescription vmstate_p4_emac = {
     .name = TYPE_ESP32P4_EMAC,
     .version_id = 3,
     .minimum_version_id = 3,
+    .post_load = p4_emac_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT(parent_obj, ESP32P4EmacState, 1, vmstate_esp32_dwmac,
                        Esp32DwmacState),
@@ -614,6 +643,7 @@ static void p4_emac_class_init(ObjectClass *klass, const void *data)
     dk->tx_clk = p4_emac_tx_clk;
     dk->rx_clk = p4_emac_rx_clk;
     dk->dma_attrs = p4_emac_dma_attrs;
+    dk->dma_wait = p4_emac_dma_wait;
     dk->mdio_path = p4_emac_mdio_path;
     dk->mdio_drive = p4_emac_mdio_drive;
     dk->tx_path = p4_emac_tx_path;

@@ -136,6 +136,16 @@ struct Esp32DwmacClass {
     /* The attributes of the DMA's accesses; NULL for unspecified ones */
     MemTxAttrs (*dma_attrs)(Esp32DwmacState *s);
     /*
+     * Whether the DMA's access of @len bytes at @addr (a write with
+     * @write) waits on the bus, as one a memory controller's held port
+     * takes does on the integration's; NULL where none does. The DMA then
+     * makes none of the step it is in (a transmit descriptor's gathering,
+     * a frame's close, a received frame's delivery) and goes on once the
+     * integration calls esp32_dwmac_dma_ready().
+     */
+    bool (*dma_wait)(Esp32DwmacState *s, uint32_t addr, uint32_t len,
+                     bool write);
+    /*
      * The MII's routing to the PHY, NULL for a PHY wired straight to the
      * MAC: where a management frame goes (mdio_path), whether the
      * transmit and receive data paths reach the PHY (tx_path, rx_path),
@@ -243,6 +253,11 @@ struct Esp32DwmacState {
     uint32_t tx_tdes1;
     uint32_t tx_last_desc;
     uint32_t tx_status;
+    /*
+     * The frame sent (or flushed) waits for the DMA to close its
+     * descriptor with tx_status, the close's accesses waiting on the bus.
+     */
+    bool tx_closing;
     uint64_t tx_ts;
     QEMUTimer tx_timer;
     /*
@@ -327,6 +342,12 @@ void esp32_dwmac_set_held(Esp32DwmacState *s, bool held);
 
 /* Whether a software reset is still waiting for the MII clocks. */
 bool esp32_dwmac_sw_reset_pending(Esp32DwmacState *s);
+
+/*
+ * The bus takes the accesses the class's dma_wait() held, at the present:
+ * the DMA goes on.
+ */
+void esp32_dwmac_dma_ready(Esp32DwmacState *s);
 
 /*
  * The system time now, as the PTP block outputs it (ptp_timestamp_o):

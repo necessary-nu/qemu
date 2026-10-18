@@ -64,7 +64,7 @@ static uint64_t esp32_timg_wdt_get_count(Esp32TimgWdtState *ws,
 
 static inline void set_low_word(uint64_t *dst, uint32_t word)
 {
-    *dst = (*dst & ~UINT32_MAX) | word;
+    *dst = (*dst & ~(uint64_t)UINT32_MAX) | word;
 }
 
 static inline void set_high_word(uint64_t *dst, uint32_t word)
@@ -262,11 +262,15 @@ static void esp32_timg_write(void *opaque, hwaddr addr,
     case A_TIMG_T1ALARMLO:
     case A_TIMG_LACTALARMLO:
         set_low_word(&ts->alarm_val, value);
+        esp32_timg_timer_update_alarm(ts,
+                                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         break;
     case A_TIMG_T0ALARMHI:
     case A_TIMG_T1ALARMHI:
     case A_TIMG_LACTALARMHI:
         set_high_word(&ts->alarm_val, value);
+        esp32_timg_timer_update_alarm(ts,
+                                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         break;
 
     case A_TIMG_WDTCONFIG0:
@@ -802,38 +806,45 @@ static void esp32_timg_xtal32k_clk_update(void *opaque, ClockEvent event)
 
 /*
  * [spec:nuos:req:emu.esp32.clock-gating]
- * When the alarm of timer @ts fell due: the time the counter reached
- * ALARM, which the QEMU timer's callback, running late, may be past
- * however far. An alarm fires once (ALARM_EN clears), so there are no
- * periods to replay. The count was synced when the alarm was armed.
+ * Whether timer @ts's count, synced, has reached its alarm value in its
+ * direction; if not, *@ahead is the ticks it has still to count. The
+ * alarm is triggered when the count matches the alarm value and, for an
+ * alarm set "too late", at once when the count is higher (counting up)
+ * or lower (counting down) than it (TRM 10.2.3; ESP-IDF's gptimer tests
+ * gptimer_trig_alarm_with_old_count and gptimer_one_shot_alarm rely on
+ * this on the ESP32 too). Higher and lower are taken as the 64-bit
+ * registers' unsigned values, as the TRM states them: unlike the later
+ * chips, whose TRMs bound the "passed" range to half the counter's, the
+ * ESP32's has no range, so an alarm is never left for the counter to
+ * come round to after it wraps.
  */
-static uint64_t esp32_timg_timer_alarm_ns(Esp32TimgTimerState *ts,
-                                          uint64_t ns_now)
+static bool esp32_timg_timer_alarm_reached(Esp32TimgTimerState *ts,
+                                           uint64_t *ahead)
 {
-    int64_t count_to_alarm = ((int64_t)ts->alarm_val -
-                              (int64_t)ts->count_base) *
-                             esp32_timg_timer_direction(ts);
-
-    if (count_to_alarm <= 0 || !clock_is_enabled(ts->parent->apb_clk)) {
-        return ns_now;
+    if (ts->inc ? ts->count_base >= ts->alarm_val
+                : ts->count_base <= ts->alarm_val) {
+        return true;
     }
-    return MIN(esp32_timg_timer_due_ns(ts, count_to_alarm), ns_now);
+    *ahead = ts->inc ? ts->alarm_val - ts->count_base
+                     : ts->count_base - ts->alarm_val;
+    return false;
 }
 
-static void esp32_timg_timer_cb(void *opaque)
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * The alarm of timer @ts occurs at @ns: TIMGn_Tx_ALARM_EN clears itself
+ * (TRM 10.2.3, register 10.1), the interrupt is raised, and with
+ * AUTORELOAD the count is reloaded from LOAD as of @ns.
+ */
+static void esp32_timg_timer_fire(Esp32TimgTimerState *ts, uint64_t ns)
 {
-    Esp32TimgTimerState *ts = (Esp32TimgTimerState*) opaque;
     Esp32TimgState *s = ts->parent;
-    /*
-     * The alarm acts at its own time: an autoreload restarts the count
-     * from then, so a periodic alarm keeps its period however late the
-     * host runs the callback.
-     */
-    uint64_t ns_now = esp32_timg_timer_alarm_ns(
-        ts, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-
-    TIMG_DEBUG_LOG("%s: TG%d ns=0x%llx\n", __func__, s->id, ns_now);
     uint32_t int_mask = 1 << (ts->int_type);
+
+    TIMG_DEBUG_LOG("%s: TG%d ns=0x%llx\n", __func__, s->id, ns);
+    timer_del(&ts->alarm_timer);
+    ts->alarm = false;
+    ts->config_reg &= ~R_TIMG_T0CONFIG_ALARM_MASK;
 
     if (ts->level_int_en) {
         s->int_raw |= int_mask;
@@ -848,14 +859,30 @@ static void esp32_timg_timer_cb(void *opaque)
         }
     }
 
-    ts->alarm = false;
-
     if (ts->autoreload) {
-        esp32_timg_timer_reload(ts, ns_now);
-    } else {
-        /* ignore overflow modulo 64 bits */
-        timer_del(&ts->alarm_timer);
+        esp32_timg_timer_reload(ts, ns);
     }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * The alarm acts at its own time, the counter reaching the alarm value,
+ * which the QEMU timer's callback, running late, may be past however
+ * far: an autoreload restarts the count from then, so a periodic alarm
+ * keeps its period however late the host runs the callback. An alarm
+ * occurs once (ALARM_EN clears), so there are no periods to replay. The
+ * count was synced when the alarm was armed.
+ */
+static void esp32_timg_timer_cb(void *opaque)
+{
+    Esp32TimgTimerState *ts = (Esp32TimgTimerState*) opaque;
+    uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t ahead;
+
+    if (!esp32_timg_timer_alarm_reached(ts, &ahead)) {
+        ns_now = MIN(esp32_timg_timer_due_ns(ts, ahead), ns_now);
+    }
+    esp32_timg_timer_fire(ts, ns_now);
 }
 
 static void esp32_timg_int_update_inttype(Esp32TimgState *s, uint32_t int_st, Esp32TimgInterruptType it)
@@ -1034,28 +1061,42 @@ static void esp32_timg_timer_reload(Esp32TimgTimerState *ts, uint64_t ns_now)
     esp32_timg_timer_update_alarm(ts, ns_now);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * Compare timer @ts's count with its alarm value as of @ns_now, after a
+ * change to either, to ALARM_EN, the direction, the timer's enable or
+ * APB_CLK: an alarm the count has reached occurs at once, and one ahead
+ * is scheduled for when the count gets there. The comparison needs
+ * APB_CLK to run but not TIMGn_Tx_EN: the TRM (10.2.2, 10.2.3) freezes
+ * only the count with EN, and has an alarm armed late triggered "upon
+ * loading the alarm registers" whatever EN is (silent on EN itself; the
+ * ESP32-P4's model, hw/timer/esp32p4_timg.c, takes it the same way). A
+ * frozen count ahead of its alarm waits for EN.
+ */
 static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_now)
 {
-    if (!ts->en || !ts->alarm || !clock_is_enabled(ts->parent->apb_clk)) {
-        timer_del(&ts->alarm_timer);
+    uint64_t ahead;
+
+    timer_del(&ts->alarm_timer);
+    if (!ts->alarm || !clock_is_enabled(ts->parent->apb_clk)) {
         return;
     }
 
     esp32_timg_timer_sync(ts, ns_now);
-    int64_t count_to_alarm = ((int64_t) ts->alarm_val - (int64_t) ts->count_base)
-                                * esp32_timg_timer_direction(ts);
-    if (count_to_alarm <= 0) {
-        /* ignore overflow modulo 64 bits */
-        timer_del(&ts->alarm_timer);
+    if (esp32_timg_timer_alarm_reached(ts, &ahead)) {
+        esp32_timg_timer_fire(ts, ns_now);
+        return;
+    }
+    if (!ts->en) {
         return;
     }
 
-    uint64_t due = esp32_timg_timer_due_ns(ts, count_to_alarm);
+    uint64_t due = esp32_timg_timer_due_ns(ts, ahead);
 
-    TIMG_DEBUG_LOG("%s: TG%d count_to_alarm=0x%llx due=0x%llx\n",
-                   __func__, ts->parent->id, count_to_alarm, due);
+    TIMG_DEBUG_LOG("%s: TG%d ahead=0x%llx due=0x%llx\n",
+                   __func__, ts->parent->id, ahead, due);
 
-    timer_mod_anticipate_ns(&ts->alarm_timer, due);
+    timer_mod_ns(&ts->alarm_timer, due);
 }
 
 /*

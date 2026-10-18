@@ -13,6 +13,7 @@
 #include "hw/misc/esp32p4_clk_period.h"
 #include "hw/gpio/esp32p4_gpio.h"
 #include "hw/misc/esp32p4_pms.h"
+#include "hw/ssi/esp32p4_mspi.h"
 
 #define TYPE_ESP32P4_EMAC "esp32p4-emac"
 OBJECT_DECLARE_TYPE(ESP32P4EmacState, ESP32P4EmacClass, ESP32P4_EMAC)
@@ -80,6 +81,8 @@ struct ESP32P4EmacState {
     ESP32P4PmsState *pms;
     ESP32P4GpioState *gpio;
     Notifier route_notifier;
+    /* The DMA's wait on a memory controller's held AXI port */
+    ESP32P4MspiDmaWait dma_wait;
 
     Clock *rmii_clk;
     Clock *rx_clk;

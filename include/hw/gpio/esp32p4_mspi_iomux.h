@@ -49,11 +49,17 @@ typedef enum ESP32P4MspiSample {
  * esp32p4_mspi_iomux_flash_idle(): the level flash data line io reads
  * while nothing on the bus drives it, as its pad's pulls hold it.
  *
+ * esp32p4_mspi_iomux_psram_strobe_on(): whether the controller sees the
+ * die's strobe on DQS0 or DQS1 at all.
+ *
  * esp32p4_mspi_iomux_psram_sample(): where PSRAM data pin dq samples the
  * DDR beat its strobe's rising (or with falling, falling) edge launches,
  * at an SPI clock period of period_ps.
  */
 bool esp32p4_mspi_iomux_flash_idle(ESP32P4MspiIomuxState *s, unsigned io);
+/* Whether strobe `lane`'s (DQS0, DQS1) input is powered up. */
+bool esp32p4_mspi_iomux_psram_strobe_on(ESP32P4MspiIomuxState *s,
+                                        unsigned lane);
 ESP32P4MspiSample esp32p4_mspi_iomux_psram_sample(ESP32P4MspiIomuxState *s,
                                                   unsigned dq, bool falling,
                                                   uint64_t period_ps);

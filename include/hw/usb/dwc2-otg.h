@@ -202,6 +202,14 @@ struct DWC2OTGState {
     /* The DMA engine's view of memory and the attributes of its accesses. */
     AddressSpace *dma_as;
     MemTxAttrs dma_attrs;
+    /*
+     * The integration's bus, which may hold the DMA engine's accesses
+     * (dwc2_otg_set_dma_wait()), and the timer that goes on with what
+     * waited once dwc2_otg_dma_ready() says it takes them.
+     */
+    bool (*dma_wait)(void *opaque, uint32_t addr, uint32_t len, bool write);
+    void *dma_wait_opaque;
+    QEMUTimer *dma_retry_timer;
 
     /* Configuration: the core's identification and hardware parameters. */
     uint32_t snpsid;
@@ -361,5 +369,20 @@ struct DWC2OTGState {
  * by default, system memory without attributes. Call before realize.
  */
 void dwc2_otg_set_dma(DWC2OTGState *s, AddressSpace *as, MemTxAttrs attrs);
+
+/*
+ * The integration's bus may hold the DMA engine's accesses: @fn(@opaque,
+ * addr, len, write) says whether one waits, as one a memory controller's
+ * held port takes does. The engine then makes none of the step it is in:
+ * a host channel's transaction neither starts nor ends, the bus waiting
+ * with it; a device endpoint NAKs the host's token, as with its FIFO
+ * empty or full; a SETUP waits in the core. It goes on once the
+ * integration calls dwc2_otg_dma_ready(). Call before realize.
+ */
+void dwc2_otg_set_dma_wait(DWC2OTGState *s,
+                           bool (*fn)(void *opaque, uint32_t addr,
+                                      uint32_t len, bool write),
+                           void *opaque);
+void dwc2_otg_dma_ready(DWC2OTGState *s);
 
 #endif

@@ -384,6 +384,8 @@ struct ESP32P4MachineState {
     /* The USB 2.0 OTG controllers, high and full speed, and their PHYs. */
     DWC2OTGState usb_hs;
     DWC2OTGState usb_fs;
+    ESP32P4UsbDmaWait usb_hs_wait;
+    ESP32P4UsbDmaWait usb_fs_wait;
     ESP32P4UsbUtmiState usb_utmi;
     ESP32P4UsbWrapState usb_wrap;
     SSIBus *flash_bus;

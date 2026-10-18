@@ -184,6 +184,8 @@ void h264e_finish(H264Enc *e);
  * emulation prevention bytes in place.
  */
 size_t h264e_take(H264Enc *e, uint8_t *buf, size_t max);
+/* The bytes h264e_take() would give for all that is pending. */
+size_t h264e_take_len(const H264Enc *e);
 size_t h264e_pending(H264Enc *e);
 
 #endif
