@@ -119,6 +119,30 @@ struct ESP32P4MSPIState {
     /* The status reads FLASH_WAITI_CTRL makes follow the transaction. */
     bool spi1_waiti;
     /*
+     * The transaction is a program, erase or status write (its wait-idle
+     * status reads poll the flash's WIP from spi1_poll_from on), whose
+     * busy flash SPI0 has been logged reading.
+     */
+    bool spi1_pe;
+    int64_t spi1_poll_from;
+    bool busy_read_logged;
+    /*
+     * Auto-suspend (FLASH_SUS_CTRL's FLASH_PES_EN): the step under way
+     * (an MSPI_ASUS_* of esp32p4_mspi.c) and the time it ends, its timer;
+     * the SUS checks failed; SPI0's accesses to the suspended flash, one
+     * since the lock delay began (`touched`) and any since the suspend
+     * (`served`); an SPI0 access waiting through a resume for the next
+     * suspend; and a step waiting for the core clock.
+     */
+    QEMUTimer asus_timer;
+    uint32_t asus;
+    int64_t asus_at;
+    uint32_t asus_fails;
+    bool asus_touched;
+    bool asus_served;
+    bool asus_again;
+    bool asus_clk_wait;
+    /*
      * The hazards logged for SPI0's set-up as its registers last set it
      * (MSPI_LOGGED_*): logged once until software writes SPI0's registers.
      */
