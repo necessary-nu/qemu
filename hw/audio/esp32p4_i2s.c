@@ -2255,9 +2255,9 @@ static void i2s_etm_deferred_apply(ESP32P4I2sState *c)
  * Run @u's periods that have ended by @upto, each at its end, with GDMA's
  * rounds due before it run first, so that the FIFOs hold what they would
  * have. On the host's clock a unit the host held up catches up period by
- * period; only a unit ESP32_LINE_MAX_LAG_NS behind (include/hw/gpio/
- * esp32_line.h), which the host cannot follow, slips: its clock's timing
- * restarts at the present, the periods between not run (logged).
+ * period; only a unit LINE_MAX_LAG_NS behind (hw/core/line-time.h),
+ * which the host cannot follow, slips: its clock's timing restarts at the
+ * present, the periods between not run (logged).
  */
 static void unit_run_until(ESP32P4I2sState *s, ESP32P4I2sUnit *u,
                            int64_t upto)
@@ -2273,7 +2273,7 @@ static void unit_run_until(ESP32P4I2sState *s, ESP32P4I2sUnit *u,
     s->in_run = true;
     while (unit_own_clock(s, u) && u->frame_ticks &&
            (t = unit_event_time(s, u, u->events + 1)) <= upto) {
-        if (esp32_line_lags(t)) {
+        if (line_lags(t)) {
             if (!s->logged_lag) {
                 qemu_log_mask(LOG_UNIMP, "esp32p4_i2s: %s: the host is too "
                               "slow for %s's clock: its timing restarts at "

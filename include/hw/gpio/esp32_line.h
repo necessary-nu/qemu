@@ -54,67 +54,36 @@ void esp32_line_add_source(Notifier *n);
 void esp32_line_sync(void);
 
 /*
- * Streams on the host's clock.
+ * Streams and PWM outputs on the host's clock: see hw/core/line-time.h.
  *
- * A stream (a unit's clock edges, a sensor's or a panel's lines, an audio
- * port's frames) takes each of its events at the event's own time, however
- * late the QEMU timer that runs it: under icount virtual time waits for
- * the stream, which never falls behind. On the host's clock QEMU's main
- * loop runs late, by however long the host holds it up, and a stream
- * catches up: it takes the events that fell due at their due times, in
- * order, with what feeds or takes its data (DMA, a peer on the pads)
- * brought up to each event's time first, so that a frame or transfer in
- * progress completes as it would have.
- *
- * Only a stream more than ESP32_LINE_MAX_LAG_NS behind the present, as it
- * comes to take an event (esp32_line_lags()), slips: it goes on from the
- * present, as the stream says (logged). The bound is far beyond the host's
- * pauses: a scheduler holds a thread up for a quantum of about 10 ms, a
- * host loaded several times over its cores for tens of milliseconds at a
- * time. A stream a second behind is one whose events cost the host more
- * than their own time, which it can never catch up with; slipping then
- * keeps the catch-up from holding QEMU's main loop, and the cores waiting
- * for it, ever longer.
- *
- * A PWM output (LEDC's channels, MCPWM's generators), whose edges follow
- * a counter software reads, keeps its timing: it goes on from the present
- * by skipping to its level at the moment it is being brought to, stamped
- * with the moment that level began, the edges in between lost.
- *
- * It does so as soon as the host is losing ground on it, not only a
- * second behind (esp32_line_pwm_skips()). Its own QEMU timer's catch-ups,
- * each doing the work due by the present as the timer runs, bring it up
+ * A PWM output here (LEDC's channels, MCPWM's generators) skips to its
+ * level at the moment it is being brought to, stamped with the moment
+ * that level began, the edges in between lost. Its own QEMU timer's catch-ups
+ * each do the work due by the present as the timer runs, bringing it up
  * to that moment (esp32_line_catching_up(), esp32_line_caught_up(), with
  * an Esp32LineLag per output): a host keeping up ends each within a
- * scheduler's quantum of the present, ESP32_LINE_SLACK_NS, or nearer than
- * it ended the last. One losing ground on the output ends a catch-up
- * beyond the slack and further behind than the last, and the next falls
- * further behind still, taking longer than the stretch it covers; the
- * output skips an edge beyond the slack as soon as the catch-up taking it
- * shows that, or after ESP32_LINE_LOSING_RUN catch-ups running ended so,
- * as the main loop's work as a whole outruns the host (two outputs, each
- * cheaper than its own edges, together dearer). Edges that cost the host
- * more than their own time would otherwise hold the main loop, and the
- * cores waiting on it, for up to a second at a time before the bound. An
- * output only briefly behind, after a pause of the host, ends its first
- * catch-up further behind than the one before the pause, but covers the
- * stretch the pause left faster than it goes by, and ends each catch-up
- * after nearer the present: it keeps the bound alone, and every edge.
+ * scheduler's quantum of the present, LINE_SLACK_NS, or nearer than it
+ * ended the last. One losing ground on the output ends a catch-up beyond
+ * the slack and further behind than the last, and the next falls further
+ * behind still, taking longer than the stretch it covers; the output
+ * skips an edge beyond the slack as soon as the catch-up taking it shows
+ * that, or after LINE_LOSING_RUN catch-ups running ended so, as the main
+ * loop's work as a whole outruns the host (two outputs, each cheaper than
+ * its own edges, together dearer) (esp32_line_pwm_skips()). An output only
+ * briefly behind, after a pause of the host, ends its first catch-up
+ * further behind than the one before the pause, but covers the stretch
+ * the pause left faster than it goes by, and ends each catch-up after
+ * nearer the present: it keeps the bound alone, and every edge.
  *
- * The streams keep the bound alone. A stream that slips moves its data
- * later (a frame restarts, a transfer resumes, a port's timing restarts)
- * where a skip only drops edges of a waveform that keeps its phase, so
- * that a slip on a false alarm costs more; and several streams take one
- * event a timer callback, in time order with every other timer, so that
- * how far behind each callback ends counts the main loop's other work
- * too, which, after a pause of the host, falls behind with the stream
- * across several callbacks before all of it catches up.
+ * The streams keep the bound alone (line_lags()). A stream that slips
+ * moves its data later (a frame restarts, a transfer resumes, a port's
+ * timing restarts) where a skip only drops edges of a waveform that keeps
+ * its phase, so that a slip on a false alarm costs more; and several
+ * streams take one event a timer callback, in time order with every other
+ * timer, so that how far behind each callback ends counts the main loop's
+ * other work too, which, after a pause of the host, falls behind with the
+ * stream across several callbacks before all of it catches up.
  */
-#define ESP32_LINE_MAX_LAG_NS   NANOSECONDS_PER_SECOND
-#define ESP32_LINE_SLACK_NS     (10 * SCALE_MS)
-#define ESP32_LINE_LOSING_RUN   2
-
-bool esp32_line_lags(int64_t due_ns);
 
 /*
  * An output's catch-ups by its own timer: the moment the last brought it

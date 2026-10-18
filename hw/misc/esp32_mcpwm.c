@@ -66,8 +66,8 @@
  * never catch up with, does the block skip ahead, to the moment it is
  * being brought to, the edges in between lost: as its timer's catch-ups
  * each end further behind the present than the last, beyond a
- * scheduler's quantum, or its work is more than ESP32_LINE_MAX_LAG_NS
- * (1 s) behind (esp32_line_pwm_skips(), include/hw/gpio/esp32_line.h).
+ * scheduler's quantum, or its work is more than LINE_MAX_LAG_NS (1 s)
+ * behind (esp32_line_pwm_skips(), include/hw/gpio/esp32_line.h).
  * Each output it then drives is stamped with the moment it last changed,
  * so that no edge carries a time other than its own. Under icount it
  * never skips. An input acts at the time its change is
@@ -1855,7 +1855,7 @@ static void mcpwm_arm(Esp32McpwmState *s, bool armed)
  * [spec:nuos:req:emu.esp32p4.pwm]
  * The timer's work, due at due_ns, done by `limit`: a firing at its due
  * time, or, on the host's clock losing ground on the block or more than
- * ESP32_LINE_MAX_LAG_NS behind the present (esp32_line_pwm_skips()), a
+ * LINE_MAX_LAG_NS behind the present (esp32_line_pwm_skips()), a
  * skip to `limit`, as a stream that falls that far behind goes on from
  * the present: a host that slow cannot follow the edges, and a skip to
  * any earlier moment would leave the block behind still, skipping again

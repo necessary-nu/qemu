@@ -265,8 +265,16 @@ struct RP2350State {
 
     MemoryRegion rom;
     MemoryRegion sram;
-    /* Over SRAM0 and SRAM1 while their power domain is down. */
-    MemoryRegion sram_off[2];
+    /*
+     * SRAM as the bus sees it: a gate that takes an access on to SRAM,
+     * or, in a power domain that is down, to sram_off (an IOMMU, whose
+     * translation the power state picks, so that a domain powering down
+     * or up changes no memory map).
+     */
+    IOMMUMemoryRegion sram_gate;
+    hwaddr sram_gate_page;
+    MemoryRegion sram_off;
+    AddressSpace sram_off_as;
     /* SRAM, for clearing a domain that powers down. */
     AddressSpace sram_as;
 

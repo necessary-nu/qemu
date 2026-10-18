@@ -1507,9 +1507,9 @@ static void mst_edge_at(void *opaque)
  * [spec:nuos:req:emu.esp32p4.i2s]
  * Run the master's edges due by @now, each at its own time, and arm the
  * timer for the end of the frame after. On the host's clock an edge
- * ESP32_LINE_MAX_LAG_NS behind the present (include/hw/gpio/
- * esp32_line.h), which the host cannot follow, restarts the clocks'
- * timing at the present, the frames between not run.
+ * LINE_MAX_LAG_NS behind the present (hw/core/line-time.h), which the
+ * host cannot follow, restarts the clocks' timing at the present, the
+ * frames between not run.
  */
 static void mst_catch_up(ES8311State *s, int64_t now)
 {
@@ -1521,7 +1521,7 @@ static void mst_catch_up(ES8311State *s, int64_t now)
         if (t > now) {
             break;
         }
-        if (esp32_line_lags(t)) {
+        if (line_lags(t)) {
             log_once(s, LOG_LAG, LOG_UNIMP, "the host is too slow for the "
                      "master clocks: their timing restarts at the present");
             s->mst_anchor_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);

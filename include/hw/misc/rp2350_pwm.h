@@ -9,6 +9,7 @@
 #ifndef HW_MISC_RP2350_PWM_H
 #define HW_MISC_RP2350_PWM_H
 
+#include "hw/core/line-time.h"
 #include "hw/core/sysbus.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -83,6 +84,8 @@ typedef struct RP2350PWMSlice {
     bool dreq_wanted;
     /* The virtual time the timer is due at. */
     int64_t due_ns;
+    /* How the host keeps up with the slice's edges (line_lag_too_slow()). */
+    LineLag lag;
 
     /* Levels last driven on the GPIO lines, per channel. */
     uint8_t out_level[2];
@@ -104,8 +107,12 @@ struct RP2350PWMState {
     uint64_t base_cycle;
 
     RP2350PWMSlice slice[RP2350_PWM_SLICES];
+    /* The DMA, which sets the slices' CC and TOP: an access syncs it first. */
+    struct RP2350DMAState *dma;
     /* Software sampling the pads brings the slices up to time first. */
     Notifier line_source;
+    /* A slice has skipped edges the host was too slow for (logged once). */
+    bool lag_logged;
     uint32_t intr;
     uint32_t inte[RP2350_PWM_IRQS];
     uint32_t intf[RP2350_PWM_IRQS];
