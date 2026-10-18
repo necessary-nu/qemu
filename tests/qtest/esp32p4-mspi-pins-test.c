@@ -58,6 +58,9 @@
 #define SRAM_CLK            0x050
 #define W(n)                (0x058 + 4 * (n))
 #define DDR                 0x0d4
+#define SPI1_TIMING_CALI    0x180
+#define TIMING_CALI_EN      (1u << 1)
+#define EXTRA_DUMMY(n)      ((uint32_t)(n) << 2)
 #define SMEM_DDR            0x0d8
 #define MMU_ITEM_CONTENT    0x37c
 #define MMU_ITEM_INDEX      0x380
@@ -326,8 +329,10 @@ static void data_delay(unsigned dlc)
  * the data; the data lines delayed 1.5 ns, at 240 MHz, sampled before
  * their beats, each byte reads the one before; the strobe delayed 1.5 ns,
  * after them, each reads the one after; the rising edges' delay alone,
- * the even beats only. DQS_LOOP takes no strobe; in SDR the die takes no
- * command at all.
+ * the even beats only. DQS_LOOP takes no strobe: the controller samples on
+ * its own clock, and the die's data, tDQSCK (4.25 ns) behind its clock,
+ * come two beats late at 240 MHz, until an extra dummy clock; in SDR the
+ * die takes no command at all.
  */
 /* [spec:nuos:req:emu.esp32p4.memory/test] */
 static void test_psram_strobe(void)
@@ -380,12 +385,21 @@ static void test_psram_strobe(void)
     g_assert_cmphex(got[1], ==, 0x88886666);
 
     /*
-     * DQS_LOOP: the controller's own strobe. In SDR the die takes no
-     * command: nothing drives the lines.
+     * DQS_LOOP: the controller's own clock, two beats early at 240 MHz,
+     * the die's data lagging its clock by tDQSCK; an extra dummy clock
+     * (SPI1's TIMING_CALI) puts the samples on the data. In SDR the die
+     * takes no command: nothing drives the lines. The strobe's delay
+     * lines, left set, change nothing.
      */
     wr(SPI1_PSRAM + DDR, rd(SPI1_PSRAM + DDR) | DDR_DQS_LOOP);
     psram_read(0x100, got, 2);
+    g_assert_cmphex(got[0], ==, 0x22110000);
+    g_assert_cmphex(got[1], ==, 0x66554433);
+    wr(SPI1_PSRAM + SPI1_TIMING_CALI, TIMING_CALI_EN | EXTRA_DUMMY(1));
+    psram_read(0x100, got, 2);
     g_assert_cmphex(got[0], ==, ref[0]);
+    g_assert_cmphex(got[1], ==, ref[1]);
+    wr(SPI1_PSRAM + SPI1_TIMING_CALI, 0);
     wr(SPI1_PSRAM + DDR, rd(SPI1_PSRAM + DDR) & ~(DDR_DQS_LOOP | DDR_EN));
     wr(PSRAM_DQS(0), 0);
     psram_read(0x100, got, 2);

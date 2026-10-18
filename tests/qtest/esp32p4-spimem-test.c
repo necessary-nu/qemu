@@ -39,6 +39,11 @@
 #define INT_CLR             0x0c4
 #define INT_RAW             0x0c8
 #define INT_ST              0x0cc
+#define DDR                 0x0d4
+#define SMEM_DDR            0x0d8
+#define DDR_EN              (1u << 0)
+#define DDR_VAR_DUMMY       (1u << 1)
+#define DQS_LOOP            (1u << 21)
 #define XTS_PLAIN(n)        (0x300 + 4 * (n))
 #define XTS_LINESIZE        0x340
 #define XTS_DESTINATION     0x344
@@ -403,6 +408,39 @@ static void test_spi0_data_lengths(void)
     qtest_quit(qts);
 }
 
+/*
+ * Fields the v3 headers make hardware read-only (HRO) though the IP's
+ * other instances use them: SPI0's user command (CMD's USR), in both
+ * controllers, and the flash controller's DDR mode (FMEM_DDR_EN,
+ * FMEM_VAR_DUMMY, DQS_LOOP, on SPI0 and SPI1): a write leaves them as
+ * from reset and starts nothing. The PSRAM controller's DDR fields take
+ * what is written.
+ */
+/* [spec:nuos:req:emu.esp32p4.memory/test] */
+static void test_hro_fields(void)
+{
+    static const uint32_t spi0[] = { SPI0_FLASH, SPI0_PSRAM };
+    QTestState *qts = start();
+
+    for (int i = 0; i < ARRAY_SIZE(spi0); i++) {
+        uint32_t raw = qtest_readl(qts, spi0[i] + INT_RAW);
+
+        qtest_writel(qts, spi0[i] + CMD, CMD_USR);
+        g_assert_cmphex(qtest_readl(qts, spi0[i] + CMD), ==, 0);
+        g_assert_cmphex(qtest_readl(qts, spi0[i] + INT_RAW), ==, raw);
+    }
+    qtest_writel(qts, SPI0_FLASH + DDR, DDR_EN | DDR_VAR_DUMMY | DQS_LOOP);
+    g_assert_cmphex(qtest_readl(qts, SPI0_FLASH + DDR), ==, 0x3020);
+    qtest_writel(qts, SPI0_FLASH + SMEM_DDR, DDR_EN | DDR_VAR_DUMMY);
+    g_assert_cmphex(qtest_readl(qts, SPI0_FLASH + SMEM_DDR), ==, 0x3020);
+    qtest_writel(qts, SPI1_FLASH + DDR, DDR_EN | DDR_VAR_DUMMY);
+    g_assert_cmphex(qtest_readl(qts, SPI1_FLASH + DDR), ==, 0x20);
+    qtest_writel(qts, SPI0_PSRAM + SMEM_DDR, DDR_EN | DDR_VAR_DUMMY);
+    g_assert_cmphex(qtest_readl(qts, SPI0_PSRAM + SMEM_DDR), ==,
+                    DDR_EN | DDR_VAR_DUMMY);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -413,5 +451,6 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/spimem/xts-manual", test_xts_manual);
     qtest_add_func("/esp32p4/spimem/spi0-data-lengths",
                    test_spi0_data_lengths);
+    qtest_add_func("/esp32p4/spimem/hro-fields", test_hro_fields);
     return g_test_run();
 }

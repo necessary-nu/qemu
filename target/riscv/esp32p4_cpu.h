@@ -278,7 +278,11 @@ typedef struct ESP32P4AssistOps {
  *   the core unwound and executes again (an MMIO access run again alone
  *   under icount, cpu_io_recompile(), a load or store a device held on
  *   the bus, an atomic access to I/O made again with the other cores
- *   stopped) does not report its start again.
+ *   stopped, one the encoder stalled) does not report its start again.
+ *   Returns true for the encoder's stall request (TRACE_STALL_ENA): the
+ *   encoder has called esp32p4_cpu_trace_stall(), and the core stops
+ *   before the instruction, which it executes once the encoder calls
+ *   esp32p4_cpu_trace_unstall().
  * trap: a trap is taken to @handler: an interrupt (@interrupt) or an
  *   exception, its cause @cause and trap value @tval, at @epc, from
  *   privilege mode @priv; @retired says whether the instruction last
@@ -299,7 +303,7 @@ enum {
 #define ESP32P4_TRACE_LEN_4     BIT(3)
 
 typedef struct ESP32P4TraceOps {
-    void (*insn)(void *opaque, uint32_t pc, uint32_t kind, int priv);
+    bool (*insn)(void *opaque, uint32_t pc, uint32_t kind, int priv);
     void (*trap)(void *opaque, uint32_t epc, uint32_t cause, bool interrupt,
                  uint32_t tval, uint32_t handler, int priv, bool retired);
     void (*trigger)(void *opaque, int action, bool before);
@@ -438,6 +442,11 @@ struct ESP32P4CPU {
      */
     bool bus_wait;
     bool bus_hold;
+    /*
+     * The wait is the trace encoder's stall (esp32p4_cpu_trace_stall()),
+     * not a device's on the bus, which the event counters count.
+     */
+    bool trace_stall;
     /*
      * The PC at the core's last trap: LP_SYSTEM_LP_CPU_EXC_PC on the LP
      * core, the debug assistant's LASTPC_BEFORE_EXCEPTION on an HP core.
@@ -618,6 +627,20 @@ bool esp32p4_cpu_mid_block(void);
 ESP32P4CPU *esp32p4_cpu_bus_waiter(MemTxAttrs attrs);
 MemTxResult esp32p4_cpu_bus_hold(ESP32P4CPU *cpu);
 void esp32p4_cpu_bus_release(ESP32P4CPU *cpu);
+
+/*
+ * The trace encoder's stall request (TRACE_STALL_ENA, TRM 3.5.3): the
+ * encoder, from the core's report of an instruction's start and under
+ * its own lock, marks the core to stop (esp32p4_cpu_trace_stall()) and
+ * returns true from the report; the core stops before the instruction,
+ * as a held bus access stops it (neither running nor taking an interrupt;
+ * its clock and cycle counter running on), until the encoder, under the
+ * same lock, calls esp32p4_cpu_trace_unstall(). Marking under the lock the
+ * release takes means a release from another thread before the core has
+ * stopped still lets it go on. A reset of the core ends the stall.
+ */
+void esp32p4_cpu_trace_stall(ESP32P4CPU *cpu);
+void esp32p4_cpu_trace_unstall(ESP32P4CPU *cpu);
 
 /*
  * An access a reset comes before. A device that first takes, at a core's

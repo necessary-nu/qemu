@@ -294,7 +294,9 @@ static void esp32p4_cpu_bus_go(CPUState *cs, run_on_cpu_data data)
     }
     qatomic_set(&cpu->bus_wait, false);
 #ifdef CONFIG_TCG
-    esp32p4_counters_bus_wait(cpu, false);
+    if (!qatomic_xchg(&cpu->trace_stall, false)) {
+        esp32p4_counters_bus_wait(cpu, false);
+    }
     cs->cflags_next_tb = cs->tcg_cflags | CF_NOIRQ | 1;
 #endif
     if (!esp32p4_cpu_held(cpu) && !cpu->clock_halted) {
@@ -308,6 +310,25 @@ void esp32p4_cpu_bus_release(ESP32P4CPU *cpu)
     if (qatomic_read(&cpu->bus_wait)) {
         async_run_on_cpu(CPU(cpu), esp32p4_cpu_bus_go, RUN_ON_CPU_NULL);
     }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.debug]
+ * The trace encoder's stall request: the core waits as on a held bus
+ * access, from the instruction whose report the encoder answers
+ * (helper_esp32p4_trace_insn() stops it there), not counting the wait as
+ * the bus's.
+ */
+void esp32p4_cpu_trace_stall(ESP32P4CPU *cpu)
+{
+    qatomic_set(&cpu->trace_stall, true);
+    qatomic_set(&cpu->bus_wait, true);
+}
+
+/* [spec:nuos:req:emu.esp32p4.debug] */
+void esp32p4_cpu_trace_unstall(ESP32P4CPU *cpu)
+{
+    esp32p4_cpu_bus_release(cpu);
 }
 
 /* Waiters for stops of cores on other threads: see esp32p4_cpu_await(). */
@@ -943,6 +964,7 @@ static void esp32p4_cpu_reset_hold(Object *obj, ResetType type)
     CPU(obj)->halted = esp32p4_cpu_held(cpu);
     cpu->clock_halted = !cpu->reset && esp32p4_cpu_clock_off(cpu);
     qatomic_set(&cpu->bus_wait, false);
+    qatomic_set(&cpu->trace_stall, false);
     cpu->bus_hold = false;
 #ifdef CONFIG_TCG
     esp32p4_counters_reset(cpu);
@@ -1201,12 +1223,13 @@ static const VMStateDescription vmstate_esp32p4_counters = {
 /* The inputs from the system registers and the debug assistant's state. */
 static const VMStateDescription vmstate_esp32p4_debug = {
     .name = "esp32p4-cpu/debug",
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(err_resp_dis, ESP32P4CPU),
         VMSTATE_BOOL(wakeup, ESP32P4CPU),
         VMSTATE_BOOL(bus_wait, ESP32P4CPU),
+        VMSTATE_BOOL(trace_stall, ESP32P4CPU),
         VMSTATE_UINT32(exc_pc, ESP32P4CPU),
         VMSTATE_UINT32(assist_watch, ESP32P4CPU),
         VMSTATE_UINT32_ARRAY(assist_lo, ESP32P4CPU, ESP32P4_ASSIST_REGIONS),
