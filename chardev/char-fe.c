@@ -160,6 +160,17 @@ void qemu_chr_fe_accept_input(CharFrontend *c)
     qemu_notify_event();
 }
 
+void qemu_chr_fe_poll_input(CharFrontend *c)
+{
+    Chardev *s = c->chr;
+
+    if (!s || !CHARDEV_GET_CLASS(s)->chr_poll_input || s->gcontext ||
+        qemu_chr_replay(s)) {
+        return;
+    }
+    CHARDEV_GET_CLASS(s)->chr_poll_input(s);
+}
+
 void qemu_chr_fe_printf(CharFrontend *c, const char *fmt, ...)
 {
     char buf[CHR_READ_BUF_LEN];

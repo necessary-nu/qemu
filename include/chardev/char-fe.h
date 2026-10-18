@@ -142,6 +142,27 @@ void qemu_chr_fe_take_focus(CharFrontend *c);
 void qemu_chr_fe_accept_input(CharFrontend *c);
 
 /**
+ * qemu_chr_fe_poll_input:
+ *
+ * Take the input the backend has ready now, without waiting for the main
+ * loop to find it: the frontend's fd_can_read and fd_read handlers are
+ * called, as the main loop calls them, before this returns, if the
+ * backend has input ready and the frontend has room for it. A frontend
+ * that needs its next input at a moment of the guest's (a serial line
+ * whose next frame is due) so takes the input already given to the
+ * backend, such as a file's, at that moment, rather than at whatever
+ * moment the main loop next polls the backend, which under icount is the
+ * host's.
+ *
+ * Does nothing for a backend that cannot be polled so (only file
+ * descriptors are), one whose handlers run in a context other than the
+ * main loop's, or one under record/replay, whose input the replay log
+ * delivers. Called with the BQL held, as the main loop calls the
+ * handlers.
+ */
+void qemu_chr_fe_poll_input(CharFrontend *c);
+
+/**
  * qemu_chr_fe_disconnect:
  *
  * Close a fd accepted by character backend.
