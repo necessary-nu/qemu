@@ -299,6 +299,13 @@ struct ChardevClass {
     /* called by frontend when it can read */
     void (*chr_accept_input)(Chardev *chr);
 
+    /*
+     * Deliver the input the backend has ready now to the frontend's
+     * handlers, as the main loop does once its poll finds it, without
+     * waiting for any (qemu_chr_fe_poll_input()).
+     */
+    void (*chr_poll_input)(Chardev *chr);
+
     /* set terminal echo */
     void (*chr_set_echo)(Chardev *chr, bool echo);
 
