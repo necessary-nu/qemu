@@ -56,13 +56,17 @@ bool esp32_pcnt_feed_aligned(const Esp32PcntFeed *f)
            esp32_pcnt_feed_next_raw(f);
 }
 
-/* How many filtered edges come in (pos, x], aligned and passing. */
+/*
+ * How many filtered edges come by x, aligned and passing: a change waiting
+ * at pos, if due by then, which can be at pos itself (one that changed the
+ * input's level there, unfiltered), and the wave's edges in (pos, x].
+ */
 uint64_t esp32_pcnt_feed_count(const Esp32PcntFeed *f, int64_t x)
 {
     Esp32LineWave *w = f->w;
     uint64_t n = 0, j;
 
-    if (x <= f->pos) {
+    if (x < f->pos) {
         return 0;
     }
     if (f->raw != f->filt) {
@@ -102,15 +106,15 @@ int64_t esp32_pcnt_feed_time(const Esp32PcntFeed *f, uint64_t m)
 }
 
 /*
- * Bring the feed to x, aligned and passing: its level, when it last
- * changed, and its level past the filter.
+ * Bring the feed to x, at or after pos, aligned and passing: its level,
+ * when it last changed, and its level past the filter.
  */
 void esp32_pcnt_feed_advance(Esp32PcntFeed *f, int64_t x)
 {
     Esp32LineWave *w = f->w;
     uint64_t nf, nr;
 
-    if (x <= f->pos) {
+    if (x < f->pos) {
         return;
     }
     nf = esp32_pcnt_feed_count(f, x);

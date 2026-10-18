@@ -63,11 +63,14 @@
 #define APB_DIV_SHIFT       16
 #define APB_DIV_MASK        (0xffu << APB_DIV_SHIFT)
 #define SOC_CLK_CTRL2       (CLKRST + 0x1c)
+#define SOC_CLK_CTRL3       (CLKRST + 0x20)
 #define PERI_CLK_CTRL22     (CLKRST + 0x9c)
 #define HP_RST_EN1          (CLKRST + 0xc4)
 #define RMT_SYS_CLK_EN      (1u << 0)
 #define PCNT_APB_CLK_EN     (1u << 30)
 #define RMT_CLK_EN          (1u << 5)
+#define LEDC_APB_CLK_EN     (1u << 0)
+#define LEDC_CLK_EN         (1u << 2)
 #define RST_EN_PCNT         (1u << 30)
 
 #define GPIO                0x500e0000u
@@ -100,6 +103,18 @@
 #define RMT_TX_SIM          (RMT + 0xc4)
 #define RMT_REF_CNT_RST     (RMT + 0xc8)
 #define RMT_RAM(w)          (RMT + 0x800 + 4 * (w))
+
+/* The LEDC, for a wave the PCNT takes in bulk */
+#define LEDC                0x500d3000u
+#define LEDC_CH_CONF0(n)    (LEDC + 0x00 + 0x14 * (n))
+#define LEDC_CH_HPOINT(n)   (LEDC + 0x04 + 0x14 * (n))
+#define LEDC_CH_DUTY(n)     (LEDC + 0x08 + 0x14 * (n))
+#define LEDC_TIMER_CONF(x)  (LEDC + 0xa0 + 8 * (x))
+#define LEDC_SIG_OUT_EN     (1u << 2)
+#define LEDC_PARA_UP        (1u << 4)
+#define LEDC_TCONF(res, div) ((res) | ((uint32_t)(div) << 5))
+#define LEDC_T_RST          (1u << 24)
+#define SIG_LEDC(n)         (126 + (n))
 
 #define APB_NS              100
 
@@ -559,6 +574,74 @@ static void test_filter_span(void)
     stop();
 }
 
+/*
+ * LEDC timer x from XTAL_CLK, a count every 25 ns, 3 bits: started at t,
+ * its 200 ns cycles count from t; a channel set up then takes its settings
+ * in at the first overflow, at t + 200, which is returned.
+ */
+static int64_t ledc_timer_start(int x, int64_t t)
+{
+    clock_to(t);
+    wr(LEDC_TIMER_CONF(x), LEDC_TCONF(3, 256) | LEDC_T_RST);
+    wr(LEDC_TIMER_CONF(x), LEDC_TCONF(3, 256));
+    return t + 200;
+}
+
+/*
+ * LEDC channel n on timer x, high for the first 7 counts of each cycle
+ * and low for the last, on pad `pad`.
+ */
+static void ledc_dip_channel(int n, int x, int pad)
+{
+    wr(LEDC_CH_HPOINT(n), 0);
+    wr(LEDC_CH_DUTY(n), 7u << 4);
+    wr(LEDC_CH_CONF0(n), x | LEDC_SIG_OUT_EN | LEDC_PARA_UP);
+    wr(IO_MUX_GPIO(pad), MCU_SEL_GPIO | FUN_IE | FUN_DRV2);
+    wr(GPIO_FUNC_OUT(pad), SIG_LEDC(n));
+}
+
+/* Unit u's channel 0 signal from pad `pad`. */
+static void route(int pad, int u)
+{
+    wr(GPIO_FUNC_IN(SIG_CH0(u)), IN_SIG_IN_SEL | pad);
+}
+
+static void ledc_on(void)
+{
+    wr(SOC_CLK_CTRL3, rd(SOC_CLK_CTRL3) | LEDC_APB_CLK_EN);
+    /* LEDC_CLK from XTAL_CLK */
+    wr(PERI_CLK_CTRL22, (rd(PERI_CLK_CTRL22) & ~3u) | LEDC_CLK_EN);
+}
+
+/*
+ * A wave taken in bulk whose level changes as it is taken up, the LEDC
+ * channel going high as its first cycle starts, at c: unit 2 counts that
+ * rise there, unfiltered, and its step to 1 meets THRES0, latched and
+ * raising the unit's interrupt at that moment.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_wave_join_watch(void)
+{
+    int64_t c;
+
+    start();
+    ledc_on();
+    unit_setup(2, POS_MODE(0, INC) | THR_THRES0_EN, 1, lims(1000, -1000));
+    c = ledc_timer_start(0, 10025);
+    ledc_dip_channel(0, 0, 26);
+    route(26, 2);
+    clock_to(c - 1);
+    g_assert_cmpint(count(2), ==, 0);
+    g_assert_cmphex(rd(INT_RAW), ==, 0);
+    clock_to(c);
+    g_assert_cmpint(count(2), ==, 1);
+    g_assert_cmphex(rd(INT_RAW), ==, 1u << 2);
+    g_assert_cmphex(rd(STATUS(2)), ==, ST_THRES0 | 3);
+    clock_to(c + 1000);
+    g_assert_cmpint(count(2), ==, 6);
+    stop();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -572,5 +655,6 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/pcnt/rmt_pulses", test_rmt_pulses);
     qtest_add_func("esp32p4/pcnt/block_reset", test_block_reset);
     qtest_add_func("esp32p4/pcnt/filter_span", test_filter_span);
+    qtest_add_func("esp32p4/pcnt/wave_join_watch", test_wave_join_watch);
     return g_test_run();
 }

@@ -12,6 +12,7 @@
 #define DPORT_PERIP_CLK_EN  0x3ff000c0
 #define DPORT_PERIP_RST_EN  0x3ff000c4
 #define PERIP_PCNT          (1u << 10)
+#define PERIP_LEDC          (1u << 11)
 #define PERIP_CLK_EN_RESET  0xf9c1e06fu
 #define SYSCON_SYSCLK_CONF  0x3ff66000
 #define PRE_DIV_MASK        0x3ffu
@@ -62,12 +63,14 @@
 
 #define GPIO                0x3ff44000
 #define GPIO_FUNC_IN(s)     (GPIO + 0x130 + 4 * (s))
+#define GPIO_FUNC_OUT(n)    (GPIO + 0x530 + 4 * (n))
 #define IN_SIG_IN_SEL       (1u << 7)
 #define IN_CONST_LOW        0x30
 #define IN_CONST_HIGH       0x38
 #define IO_MUX              0x3ff49000
 #define IO_MUX_GPIO18       (IO_MUX + 0x70)
 #define IO_MUX_GPIO19       (IO_MUX + 0x74)
+#define IO_MUX_GPIO22       (IO_MUX + 0x80)
 #define FUN_IE              (1u << 9)
 #define MCU_SEL_GPIO        (2u << 12)
 
@@ -84,6 +87,22 @@
 
 #define PAD_SIG             18
 #define PAD_CTRL            19
+
+/* LEDC high-speed channel 0 on high-speed timer 0 */
+#define LEDC                0x3ff59000
+#define LEDC_CONF0(n)       (LEDC + 0x14 * (n) + 0x00)
+#define LEDC_HPOINT(n)      (LEDC + 0x14 * (n) + 0x04)
+#define LEDC_DUTY(n)        (LEDC + 0x14 * (n) + 0x08)
+#define LEDC_CONF1(n)       (LEDC + 0x14 * (n) + 0x0c)
+#define LEDC_HSTIMER0_CONF  (LEDC + 0x140)
+#define LEDC_SIG_OUT_EN     (1u << 2)
+/* Take DUTY in as the next cycle starts: a fade of no steps */
+#define LEDC_SET_DUTY       ((1u << 31) | (1u << 30))
+/* APB_CLK undivided: 3 bits, a count every 25 ns */
+#define LEDC_HSTIMER_FAST   (3u | (256u << 5) | (1u << 25))
+#define LEDC_TIMER_RST      (1u << 24)
+#define SIG_LEDC_HS(n)      (71 + (n))
+#define PAD_LEDC            22
 
 /* APB_CLK after reset: 40 MHz from the crystal */
 #define APB_NS              25
@@ -503,6 +522,51 @@ static void test_filter_span(void)
     qtest_quit(qts);
 }
 
+/* Run virtual time on to t, at or after the present. */
+static void clock_to(QTestState *qts, int64_t t)
+{
+    g_assert_cmpint(qtest_clock_set(qts, t), ==, t);
+}
+
+/*
+ * A wave taken in bulk whose level changes as it is taken up: LEDC
+ * high-speed channel 0, high from count 0 for 7 of its timer's 8 counts
+ * of 25 ns, goes high as it is set up at t0. Unit 2 counts that rise
+ * there, unfiltered, and its step to 1 meets THRES0, latched and
+ * raising the unit's interrupt at that moment; then a rise every 200 ns.
+ */
+/* [spec:nuos:req:emu.esp32.pcnt/test] */
+static void test_wave_join_watch(void)
+{
+    QTestState *qts = start();
+    int64_t t0 = 1000;
+
+    clock_to(qts, t0);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET | PERIP_PCNT |
+                 PERIP_LEDC);
+    qtest_writel(qts, DPORT_PERIP_RST_EN,
+                 qtest_readl(qts, DPORT_PERIP_RST_EN) & ~PERIP_LEDC);
+    setup_unit(qts, 2, CH_POS(0, INC) | THR_THRES0_EN, 0);
+    qtest_writel(qts, PCNT_CONF1(2), 1);
+    qtest_writel(qts, IO_MUX_GPIO22, MCU_SEL_GPIO | FUN_IE);
+    qtest_writel(qts, GPIO_FUNC_OUT(PAD_LEDC), SIG_LEDC_HS(0));
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_CH0(2)), IN_SIG_IN_SEL | PAD_LEDC);
+    g_assert_cmpint(count(qts, 2), ==, 0);
+
+    qtest_writel(qts, LEDC_HSTIMER0_CONF, LEDC_HSTIMER_FAST | LEDC_TIMER_RST);
+    qtest_writel(qts, LEDC_HPOINT(0), 0);
+    qtest_writel(qts, LEDC_DUTY(0), 7u << 4);
+    qtest_writel(qts, LEDC_CONF0(0), LEDC_SIG_OUT_EN);
+    qtest_writel(qts, LEDC_CONF1(0), LEDC_SET_DUTY);
+    qtest_writel(qts, LEDC_HSTIMER0_CONF, LEDC_HSTIMER_FAST);
+    g_assert_cmpint(count(qts, 2), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, PCNT_INT_RAW), ==, 1u << 2);
+    g_assert_cmphex(qtest_readl(qts, PCNT_STATUS(2)), ==, ST_THRES0 | ZM_POS);
+    clock_to(qts, t0 + 1000);
+    g_assert_cmpint(count(qts, 2), ==, 6);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -514,6 +578,7 @@ int main(int argc, char **argv)
     qtest_add_func("esp32-pcnt/filter", test_filter);
     qtest_add_func("esp32-pcnt/gated", test_gated);
     qtest_add_func("esp32-pcnt/filter-span", test_filter_span);
+    qtest_add_func("esp32-pcnt/wave-join-watch", test_wave_join_watch);
 
     return g_test_run();
 }

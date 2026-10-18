@@ -472,13 +472,16 @@ static int64_t pcnt_bulk_match(Esp32PcntState *s, unsigned i,
     return t > limit ? INT64_MAX : t;
 }
 
-/* Bring the fast input i (f) to x, taking its filtered edges by then. */
+/*
+ * Bring the fast input i (f) to x, taking its filtered edges by then: a
+ * change waiting at the moment it has been brought to, due then, as well.
+ */
 static void pcnt_bulk_advance(Esp32PcntState *s, unsigned i,
                               Esp32PcntFeed *f, int64_t x)
 {
     int dn, da;
 
-    if (x <= f->pos) {
+    if (x < f->pos) {
         return;
     }
     pcnt_bulk_steps(s, i, f, &dn, &da);
