@@ -218,6 +218,11 @@ bool esp32p4_mspi_dma_wait_on(ESP32P4MspiDmaWait *w, AddressSpace *as,
                               bool write);
 /* Forget a wait (the master's reset): `ready` is not called for it. */
 void esp32p4_mspi_dma_wait_cancel(ESP32P4MspiDmaWait *w);
+/*
+ * Call `ready` at the present, for the master to ask again: after a
+ * migration, which carries no wait's place on a controller's list.
+ */
+void esp32p4_mspi_dma_wait_retry(ESP32P4MspiDmaWait *w);
 
 /*
  * The AXI port through which the cache, the direct windows and the DMA

@@ -3147,6 +3147,11 @@ void esp32p4_mspi_dma_wait_cancel(ESP32P4MspiDmaWait *w)
     timer_del(w->timer);
 }
 
+void esp32p4_mspi_dma_wait_retry(ESP32P4MspiDmaWait *w)
+{
+    timer_mod(w->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
 /* Let the cores' held accesses go once the AXI port takes them. */
 static void mspi_axi_wake(ESP32P4MSPIState *s)
 {

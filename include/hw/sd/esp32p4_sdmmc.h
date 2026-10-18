@@ -13,6 +13,7 @@
 #include "hw/gpio/esp32p4_gpio.h"
 #include "hw/misc/esp32p4_clkrst.h"
 #include "hw/misc/esp32p4_pms.h"
+#include "hw/ssi/esp32p4_mspi.h"
 
 #define TYPE_ESP32P4_SDMMC "esp32p4-sdmmc"
 OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4SdmmcState, ESP32P4_SDMMC)
@@ -65,6 +66,8 @@ struct ESP32P4SdmmcState {
     Clock *sam_clk;
     Notifier route_notifier;
     Notifier line_source;
+    /* The IDMAC's wait on a memory controller's held AXI port */
+    ESP32P4MspiDmaWait dma_wait;
     qemu_irq pad_out[DWC_SDMMC_MAX_SLOTS * DWC_SDMMC_LINES];
     qemu_irq pad_oe[DWC_SDMMC_MAX_SLOTS * DWC_SDMMC_LINES];
 

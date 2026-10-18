@@ -36,7 +36,11 @@
  * while SDIO_LS_DRV_CLK and SDIO_LS_SAM_CLK run too. The IDMAC's accesses
  * go through the permission managers as DMA master SDMMC, AHB master ID 6
  * (ESP32P4_ICM_ID_SDMMC): one the DMA APM refuses ends with a fatal bus
- * error, and the AXI ICM records it.
+ * error, and the AXI ICM records it. One a memory controller's AXI port
+ * holds (the flash's or the PSRAM's while it cannot take an access: its
+ * clocks stopped, held in reset, AXI_REQ_EN clear; esp32p4_mspi_dma_wait())
+ * waits, and the IDMAC with it, without an error, until the port takes
+ * accesses again (the controller's dma_wait()).
  *
  * [spec:nuos:req:emu.esp32p4.sd-uhs]
  * Sampling (TRM 57.10). The host samples CMD and DAT on its sample clock,
@@ -321,6 +325,25 @@ static void esp32p4_sdmmc_clock_update(void *opaque, ClockEvent event)
     dwc_sdmmc_clock_changed(DWC_SDMMC(opaque));
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * The IDMAC's access waits on a memory controller's held AXI port, until
+ * esp32p4_sdmmc_dma_ready() lets it go on.
+ */
+static bool esp32p4_sdmmc_dma_wait(DWCSDMMCState *d, uint32_t addr,
+                                   uint32_t len, bool write)
+{
+    ESP32P4SdmmcState *s = ESP32P4_SDMMC(d);
+
+    return esp32p4_mspi_dma_wait_on(&s->dma_wait, d->dma_as, addr, len,
+                                    d->dma_attrs, write);
+}
+
+static void esp32p4_sdmmc_dma_ready(void *opaque)
+{
+    dwc_sdmmc_dma_ready(DWC_SDMMC(opaque));
+}
+
 static void esp32p4_sdmmc_init(Object *obj)
 {
     ESP32P4SdmmcState *s = ESP32P4_SDMMC(obj);
@@ -338,6 +361,7 @@ static void esp32p4_sdmmc_init(Object *obj)
                              DWC_SDMMC_MAX_SLOTS * DWC_SDMMC_LINES);
     s->route_notifier.notify = esp32p4_sdmmc_route_changed;
     s->line_source.notify = esp32p4_sdmmc_line_sync;
+    esp32p4_mspi_dma_wait_init(&s->dma_wait, esp32p4_sdmmc_dma_ready, s);
     d->num_slots = 2;
     d->fifo_depth = 512;
     d->cmd_mask = 0xb0ffffff;
@@ -395,6 +419,7 @@ static void esp32p4_sdmmc_reset_hold(Object *obj, ResetType type)
     }
     s->dll_clk_conf = 0;
     s->dll_conf = 0;
+    esp32p4_mspi_dma_wait_cancel(&s->dma_wait);
 }
 
 /*
@@ -426,10 +451,20 @@ static void esp32p4_sdmmc_reset_exit(Object *obj, ResetType type)
     }
 }
 
+/* An IDMAC access a held port held: the IDMAC asks again. */
+static int esp32p4_sdmmc_post_load(void *opaque, int version_id)
+{
+    ESP32P4SdmmcState *s = opaque;
+
+    esp32p4_mspi_dma_wait_retry(&s->dma_wait);
+    return 0;
+}
+
 static const VMStateDescription vmstate_esp32p4_sdmmc = {
     .name = TYPE_ESP32P4_SDMMC,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = esp32p4_sdmmc_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT(parent_obj, ESP32P4SdmmcState, 2, vmstate_dwc_sdmmc,
                        DWCSDMMCState),
@@ -487,6 +522,7 @@ static void esp32p4_sdmmc_class_init(ObjectClass *klass, const void *data)
     sc->clock_after = esp32p4_sdmmc_clock_after;
     sc->sample_ok = esp32p4_sdmmc_sample_ok;
     sc->lines = esp32p4_sdmmc_lines;
+    sc->dma_wait = esp32p4_sdmmc_dma_wait;
 }
 
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */
