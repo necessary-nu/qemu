@@ -491,6 +491,9 @@ struct qemu_work_item;
  *   it (cpu_hold_access()).
  * @access_held_exclusive: And has the CPU make it again with every other
  *   CPU stopped (cpu_hold_access_exclusive()).
+ * @reset_queued: A reset of the CPU is queued, which it has yet to stop
+ *   for: its loads and stores to devices are held until the reset
+ *   (cpu_hold_accesses_for_reset()).
  * @accel: Pointer to accelerator specific state.
  * @vcpu_dirty: Hardware accelerator is not synchronized with QEMU state
  * @kvm_fd: vCPU file descriptor for KVM.
@@ -617,6 +620,7 @@ struct CPUState {
     uintptr_t mem_io_pc;
     bool access_held;
     bool access_held_exclusive;
+    bool reset_queued;
 
     /* Only used in KVM */
     int kvm_fd;
@@ -1164,6 +1168,33 @@ void cpu_hold_access(CPUState *cpu);
  * before that CPU's next instruction. The device makes the access then.
  */
 void cpu_hold_access_exclusive(CPUState *cpu);
+
+/**
+ * cpu_hold_accesses_for_reset:
+ * @cpu: A CPU whose reset a board has queued, to be carried out once the
+ *   CPU has stopped; with the BQL held.
+ *
+ * On the chip the reset comes at once: the CPU makes no access after its
+ * moment. Here the CPU runs on until it stops, which without icount can
+ * be well after, whichever thread queued the reset. Until the reset
+ * (cpu_reset(), which ends this), each load or store @cpu makes to a
+ * device is held as cpu_hold_access() holds one, before it reaches the
+ * device: the instruction is given back, not executed, and the CPU leaves
+ * its block. Under TCG only.
+ */
+void cpu_hold_accesses_for_reset(CPUState *cpu);
+
+/**
+ * cpu_reset_holds_access:
+ * @attrs: The attributes of an access a device is handling, whose
+ *   handling may have queued a reset of the CPU making it.
+ *
+ * Returns: true, the access held (cpu_hold_access()), if it is the
+ * current CPU's own load or store and a reset of that CPU is queued
+ * (cpu_hold_accesses_for_reset()); the device then answers MEMTX_ERROR,
+ * having made no access.
+ */
+bool cpu_reset_holds_access(MemTxAttrs attrs);
 
 /**
  * cpu_sleep_enter:

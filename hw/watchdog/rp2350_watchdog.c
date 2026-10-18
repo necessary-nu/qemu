@@ -36,7 +36,6 @@
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/watchdog/rp2350_watchdog.h"
 #include "migration/vmstate.h"
-#include "system/cpus.h"
 
 #define A_CTRL       0x00
 #define A_LOAD       0x04
@@ -163,10 +162,11 @@ static void wd_tick_changed(void *opaque, ClockEvent event)
  *
  * A reset the expiry asks of the processor making the access comes before
  * the access, which the chip never makes: the PSM's reset of the
- * processor, queued as work for it, or a chip-level reset, which stops
- * it. The access is then held (cpu_hold_access()): the processor stops
- * at the instruction, which has not executed, for the reset. True if it
- * is.
+ * processor or a chip-level reset, queued to run once the processor
+ * stops. The access is then held (cpu_reset_holds_access()): the
+ * processor stops at the instruction, which has not executed, for the
+ * reset. An access the processor makes once the expiry's timer has fired
+ * it is held the same way before it reaches here. True if it is.
  *
  * First the clock tree comes up to the access (clock_sync()), so that
  * the count follows a change of its tick that has fallen due from the
@@ -174,22 +174,19 @@ static void wd_tick_changed(void *opaque, ClockEvent event)
  */
 static bool wd_catch_up(RP2350WatchdogState *s, MemTxAttrs attrs)
 {
-    CPUState *cs = current_cpu;
+    rp2350_watchdog_catch_up(s);
+    return cpu_reset_holds_access(attrs);
+}
 
+void rp2350_watchdog_catch_up(RP2350WatchdogState *s)
+{
     clock_sync(s->tick);
-    if (!timer_pending(s->expiry) ||
-        timer_expire_time_ns(s->expiry) >
+    if (timer_pending(s->expiry) &&
+        timer_expire_time_ns(s->expiry) <=
         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
-        return false;
+        timer_del(s->expiry);
+        wd_expired(s);
     }
-    timer_del(s->expiry);
-    wd_expired(s);
-    if (!cs || !qemu_cpu_is_self(cs) || attrs.debug || attrs.unspecified ||
-        (cpu_work_list_empty(cs) && !cs->stop)) {
-        return false;
-    }
-    cpu_hold_access(cs);
-    return true;
 }
 
 static uint32_t wd_ctrl(RP2350WatchdogState *s)

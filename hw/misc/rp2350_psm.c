@@ -32,6 +32,7 @@
 #include "qemu/main-loop.h"
 #include "hw/core/cpu.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_psm.h"
 #include "migration/vmstate.h"
@@ -91,8 +92,10 @@ static void psm_run_on_cpu(CPUState *cs, run_on_cpu_data data)
  * Run the sequence for `stages`. Device resets take effect at once, but
  * a sequence that resets a processor waits for every vCPU to pause; a
  * core requesting it stops at the end of its current instruction block,
- * as on hardware it stops at once. Under qtest no vCPU executes, so there
- * is nothing to wait for.
+ * as on hardware it stops at once. Meanwhile the processors it resets
+ * make no access to a device (queued_fn), whichever thread asked for it:
+ * a core's own write, or a timer's expiry, which can run while the core
+ * runs on. Under qtest no vCPU executes, so there is nothing to wait for.
  */
 static void psm_request(RP2350PSMState *s, uint32_t stages, bool watchdog)
 {
@@ -101,6 +104,9 @@ static void psm_request(RP2350PSMState *s, uint32_t stages, bool watchdog)
     if (!(s->pending & PSM_PROCS) || qtest_enabled()) {
         psm_sequence(s);
         return;
+    }
+    if (s->queued_fn) {
+        s->queued_fn(s->reset_opaque, s->pending);
     }
     if (current_cpu) {
         async_run_on_cpu(current_cpu, psm_run_on_cpu, RUN_ON_CPU_HOST_PTR(s));
@@ -142,32 +148,62 @@ static void psm_powman_reset(void *opaque, int n, int level)
     }
 }
 
+/*
+ * The watchdog's reset request comes here: an access first has it fire if
+ * its count has reached zero by then, as its timer, which without icount
+ * can run well after, would have, so that the sequence it asks for is the
+ * one WDSEL and FRCE_OFF selected then. A sequence that resets the
+ * processor making the access comes before the access, which is then
+ * held (cpu_reset_holds_access()). True if it is.
+ */
 /* [spec:nuos:req:emu.watchdog] */
-static uint64_t rp2350_psm_read(void *opaque, hwaddr addr, unsigned size)
+static bool psm_catch_up(RP2350PSMState *s, MemTxAttrs attrs)
+{
+    if (s->watchdog) {
+        rp2350_watchdog_catch_up(s->watchdog);
+    }
+    return cpu_reset_holds_access(attrs);
+}
+
+/* [spec:nuos:req:emu.watchdog] */
+static MemTxResult rp2350_psm_read(void *opaque, hwaddr addr, uint64_t *data,
+                                   unsigned size, MemTxAttrs attrs)
 {
     RP2350PSMState *s = opaque;
 
+    if (psm_catch_up(s, attrs)) {
+        return MEMTX_ERROR;
+    }
     switch (rp2350_atomic_reg(addr)) {
     case A_FRCE_ON:
-        return s->frce_on;
+        *data = s->frce_on;
+        return MEMTX_OK;
     case A_FRCE_OFF:
-        return s->frce_off;
+        *data = s->frce_off;
+        return MEMTX_OK;
     case A_WDSEL:
-        return s->wdsel;
+        *data = s->wdsel;
+        return MEMTX_OK;
     case A_DONE:
-        return RP2350_PSM_ALL & ~psm_sequence_from(s->frce_off);
+        *data = RP2350_PSM_ALL & ~psm_sequence_from(s->frce_off);
+        return MEMTX_OK;
     }
     qemu_log_mask(LOG_GUEST_ERROR, "rp2350-psm: read of bad offset 0x%"
                   HWADDR_PRIx "\n", addr);
-    return 0;
+    *data = 0;
+    return MEMTX_OK;
 }
 
-static void rp2350_psm_write(void *opaque, hwaddr addr, uint64_t value,
-                             unsigned size)
+static MemTxResult rp2350_psm_write(void *opaque, hwaddr addr,
+                                    uint64_t value, unsigned size,
+                                    MemTxAttrs attrs)
 {
     RP2350PSMState *s = opaque;
     uint32_t held;
 
+    if (psm_catch_up(s, attrs)) {
+        return MEMTX_ERROR;
+    }
     switch (rp2350_atomic_reg(addr)) {
     case A_FRCE_ON:
         s->frce_on = rp2350_atomic_apply(addr, s->frce_on, value) &
@@ -197,20 +233,22 @@ static void rp2350_psm_write(void *opaque, hwaddr addr, uint64_t value,
                       HWADDR_PRIx "\n", addr);
         break;
     }
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps rp2350_psm_ops = {
-    .read = rp2350_psm_read,
-    .write = rp2350_psm_write,
+    .read_with_attrs = rp2350_psm_read,
+    .write_with_attrs = rp2350_psm_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 4,
     .valid.max_access_size = 4,
 };
 
 void rp2350_psm_set_reset_fn(RP2350PSMState *s, RP2350PSMResetFn *fn,
-                             void *opaque)
+                             RP2350PSMQueuedFn *queued, void *opaque)
 {
     s->reset_fn = fn;
+    s->queued_fn = queued;
     s->reset_opaque = opaque;
 }
 
@@ -230,6 +268,9 @@ static int rp2350_psm_post_load(void *opaque, int version_id)
     RP2350PSMState *s = opaque;
 
     if (s->pending || s->pending_watchdog) {
+        if ((s->pending & PSM_PROCS) && s->queued_fn) {
+            s->queued_fn(s->reset_opaque, s->pending);
+        }
         qemu_bh_schedule(s->bh);
     }
     return 0;
@@ -246,6 +287,11 @@ static void rp2350_psm_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), psm_powman_reset, "powman-reset", 1);
     s->bh = qemu_bh_new(psm_run, s);
 }
+
+static const Property rp2350_psm_properties[] = {
+    DEFINE_PROP_LINK("watchdog", RP2350PSMState, watchdog,
+                     TYPE_RP2350_WATCHDOG, RP2350WatchdogState *),
+};
 
 static const VMStateDescription vmstate_rp2350_psm = {
     .name = TYPE_RP2350_PSM,
@@ -270,6 +316,7 @@ static void rp2350_psm_class_init(ObjectClass *klass, const void *data)
 
     rc->phases.hold = rp2350_psm_hold_reset;
     dc->vmsd = &vmstate_rp2350_psm;
+    device_class_set_props(dc, rp2350_psm_properties);
 }
 
 static const TypeInfo rp2350_psm_info = {

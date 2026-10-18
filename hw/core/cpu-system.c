@@ -126,6 +126,23 @@ int cpu_slept_at(CPUState *cpu, int64_t when)
     return log->lost ? -1 : 0;
 }
 
+void cpu_hold_accesses_for_reset(CPUState *cpu)
+{
+    qatomic_set(&cpu->reset_queued, true);
+}
+
+bool cpu_reset_holds_access(MemTxAttrs attrs)
+{
+    CPUState *cs = current_cpu;
+
+    if (!cs || !qemu_cpu_is_self(cs) || attrs.debug || attrs.unspecified ||
+        !qatomic_read(&cs->reset_queued)) {
+        return false;
+    }
+    cpu_hold_access(cs);
+    return true;
+}
+
 bool cpu_paging_enabled(const CPUState *cpu)
 {
     if (cpu->cc->sysemu_ops->get_paging_enabled) {

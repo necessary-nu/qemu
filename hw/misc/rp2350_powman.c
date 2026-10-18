@@ -87,6 +87,7 @@
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
+#include "hw/core/cpu.h"
 #include "hw/core/irq.h"
 #include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
@@ -911,12 +912,19 @@ static void powman_seq_wait(RP2350PowmanState *s, int64_t now)
     timer_mod(s->seq_timer, s->seq_ns);
 }
 
-/* Ask for a system reset that this device carries out as `kind`. */
+/*
+ * Ask for a system reset that this device carries out as `kind`. It comes
+ * once the main loop has paused every vCPU; until then the processors,
+ * which on the chip it stops at once, make no access (reset_queued).
+ */
 static void powman_chip_reset(RP2350PowmanState *s, PowmanReset kind,
                               ShutdownCause cause)
 {
     s->next_reset = kind;
     qemu_system_reset_request(cause);
+    if (s->ops && s->ops->reset_queued) {
+        s->ops->reset_queued(s->ops_opaque);
+    }
 }
 
 /*
@@ -1383,11 +1391,21 @@ static bool powman_nonsec_reg(hwaddr reg)
  * alarm, polls USING_*, or waits on UPDATE_IN_PROGRESS, whose stale value
  * would also drop a VREG write; and the power sequencer's steps
  * (powman_seq_at()), while software polls STATE.CHANGING or WAITING,
- * each at its time. Only a timer that has come is run.
+ * each at its time. Only a timer that has come is run. First the
+ * watchdog, whose reset request comes through here, fires if its count
+ * has reached zero by then. A step or a reset request that stops the
+ * processor making the access, powering the switched core down or
+ * resetting the processor or the chip, comes before the access, which is
+ * then held (cpu_reset_holds_access()).
  */
 static void powman_catch_up(RP2350PowmanState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    /* The watchdog's request comes through here: it first, if it is due. */
+    if (s->watchdog) {
+        rp2350_watchdog_catch_up(s->watchdog);
+    }
 
     /*
      * clk_ref, the fast POWMAN clock and the XOSC tick, as of now, and
@@ -1429,6 +1447,9 @@ static MemTxResult rp2350_powman_read(void *opaque, hwaddr addr,
     uint32_t v;
 
     powman_catch_up(s);
+    if (cpu_reset_holds_access(attrs)) {
+        return MEMTX_ERROR;
+    }
     if (!attrs.secure && !attrs.unspecified && !powman_nonsec_reg(reg)) {
         qemu_log_mask(LOG_GUEST_ERROR, "rp2350-powman: Non-secure read of "
                       "offset 0x%" HWADDR_PRIx "\n", reg);
@@ -1633,6 +1654,9 @@ static MemTxResult rp2350_powman_write(void *opaque, hwaddr addr,
     uint32_t v = value, old, eff;
 
     powman_catch_up(s);
+    if (cpu_reset_holds_access(attrs)) {
+        return MEMTX_ERROR;
+    }
     /* A narrow write is replicated across the bus and writes the whole. */
     if (size == 1) {
         v = (v & 0xff) * 0x01010101u;
@@ -2022,6 +2046,8 @@ static const VMStateDescription vmstate_rp2350_powman = {
 static const Property rp2350_powman_properties[] = {
     DEFINE_PROP_LINK("psm", RP2350PowmanState, psm, TYPE_RP2350_PSM,
                      RP2350PSMState *),
+    DEFINE_PROP_LINK("watchdog", RP2350PowmanState, watchdog,
+                     TYPE_RP2350_WATCHDOG, RP2350WatchdogState *),
     DEFINE_PROP_UINT32("lposc-hz", RP2350PowmanState, lposc_hz, 32768),
     DEFINE_PROP_UINT32("bonded-gpios", RP2350PowmanState, bonded_gpios,
                        RP2350_GPIO_BANK0_PINS),
