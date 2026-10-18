@@ -135,6 +135,15 @@ struct DWCSDMMCClass {
      * dwc_sdmmc_lines_changed().
      */
     void (*lines)(DWCSDMMCState *s, unsigned slot, DWCSDMMCLines *l);
+    /*
+     * Whether the IDMAC's access of @len bytes at @addr (a write with
+     * @write) waits on the bus, as one a memory controller's held port
+     * takes does on the integration's; by default (NULL) none does. The
+     * IDMAC then makes none of the step it is in, and goes on once the
+     * integration calls dwc_sdmmc_dma_ready().
+     */
+    bool (*dma_wait)(DWCSDMMCState *s, uint32_t addr, uint32_t len,
+                     bool write);
 };
 
 /* The command the CIU has on the bus, or is about to take. */
@@ -152,6 +161,8 @@ typedef enum DWCSDMMCIdmacState {
     DWC_IDMAC_IDLE,
     /* Stopped at a descriptor the host owns, until PLDMND. */
     DWC_IDMAC_SUSPEND,
+    /* Reading the descriptor at DSCADDR, its read waiting on the bus. */
+    DWC_IDMAC_FETCH,
     /* Holding a descriptor, moving data as the FIFO asks. */
     DWC_IDMAC_ACTIVE,
     /* Stopped by a bus error, until a DMA reset. */
@@ -372,5 +383,11 @@ void dwc_sdmmc_set_card_power(DWCSDMMCState *s, unsigned slot, bool on);
  * waiting for DAT0 and the voltage switch follow.
  */
 void dwc_sdmmc_lines_changed(DWCSDMMCState *s);
+
+/*
+ * The bus takes the accesses the class's dma_wait() held, at the present:
+ * the IDMAC goes on.
+ */
+void dwc_sdmmc_dma_ready(DWCSDMMCState *s);
 
 #endif /* DWC_SDMMC_H */

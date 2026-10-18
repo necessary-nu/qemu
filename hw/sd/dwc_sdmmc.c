@@ -321,6 +321,7 @@
 /* IDSTS.FSM's states that the model shows */
 #define FSM_IDLE                0
 #define FSM_SUSPEND             1
+#define FSM_DESC_RD             2
 #define FSM_RD_REQ_WAIT         4
 #define FSM_WR_REQ_WAIT         5
 
@@ -1725,10 +1726,30 @@ static unsigned dwc_idmac_code(DWCSDMMCState *s)
     return s->xfer_dir == XFER_READ ? FBE_CODE_RX : FBE_CODE_TX;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * Whether the IDMAC's access waits on the bus (the class's dma_wait()).
+ */
+static bool dwc_idmac_waits(DWCSDMMCState *s, uint32_t addr, uint32_t len,
+                            bool write)
+{
+    DWCSDMMCClass *k = DWC_SDMMC_GET_CLASS(s);
+
+    return len && k->dma_wait && k->dma_wait(s, addr, len, write);
+}
+
+/*
+ * Read the descriptor at DSCADDR, or, while its read waits on the bus,
+ * wait in DWC_IDMAC_FETCH to read it.
+ */
 static void dwc_idmac_fetch(DWCSDMMCState *s)
 {
     uint32_t d[4];
 
+    s->idmac_state = DWC_IDMAC_FETCH;
+    if (dwc_idmac_waits(s, s->dscaddr, sizeof(d), false)) {
+        return;
+    }
     if (address_space_read(s->dma_as, s->dscaddr, s->dma_attrs, d,
                            sizeof(d)) != MEMTX_OK) {
         dwc_idmac_fatal(s, dwc_idmac_code(s));
@@ -1792,6 +1813,56 @@ static void dwc_idmac_close(DWCSDMMCState *s, bool end_of_data)
         s->dscaddr += 16 + skip;
     }
     dwc_idmac_fetch(s);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.sdmmc]
+ * Whether the IDMAC's next step (dwc_idmac_step()) waits on the bus: its
+ * data access and the write-back that closes its descriptor, as the step
+ * would make them; the step is made only once neither waits. The read of
+ * the next descriptor that follows a close waits on its own
+ * (dwc_idmac_fetch()).
+ */
+static bool dwc_idmac_step_waits(DWCSDMMCState *s)
+{
+    uint32_t des0 = s->idmac_desc[0];
+    uint32_t des1 = s->idmac_desc[1];
+    bool chained = des0 & DES0_CH;
+    uint32_t size = s->idmac_buf == 0 ? DES1_BS1(des1)
+                                      : (chained ? 0 : DES1_BS2(des1));
+    uint32_t addr = (s->idmac_desc[2 + s->idmac_buf] & ~3u) +
+                    s->idmac_buf_off;
+    uint32_t n;
+    bool close;
+
+    if (!DWC_SDMMC_GET_CLASS(s)->dma_wait || !s->data_dma ||
+        s->xfer_dir == XFER_NONE) {
+        return false;
+    }
+    if (s->idmac_buf_off >= size) {
+        return !(s->idmac_buf == 0 && !chained) &&
+               dwc_idmac_waits(s, s->dscaddr, 4, true);
+    }
+    if (s->xfer_dir == XFER_READ) {
+        if (!s->fifo_count ||
+            (s->data_active && dwc_fifo_words(s) <= dwc_rx_wmark(s))) {
+            return false;
+        }
+        n = MIN(MIN(s->fifo_count, size - s->idmac_buf_off), 512);
+        close = (s->data_total && s->tbbcnt + n >= s->data_total) ||
+                (!s->data_active && s->fifo_count == n);
+        return dwc_idmac_waits(s, addr, n, true) ||
+               (close && dwc_idmac_waits(s, s->dscaddr, 4, true));
+    }
+    if (!s->data_started || dwc_fifo_words(s) > dwc_tx_wmark(s)) {
+        return false;
+    }
+    n = s->data_total ? s->data_total - s->tbbcnt : UINT32_MAX;
+    n = MIN(MIN(n, size - s->idmac_buf_off), dwc_fifo_free(s));
+    n = MIN(n, 512);
+    close = s->data_total && s->tbbcnt + n >= s->data_total;
+    return n && (dwc_idmac_waits(s, addr, n, false) ||
+                 (close && dwc_idmac_waits(s, s->dscaddr, 4, true)));
 }
 
 /* [spec:nuos:req:emu.esp32p4.sdmmc] */
@@ -1870,9 +1941,19 @@ static bool dwc_idmac_step(DWCSDMMCState *s)
 
 static void dwc_idmac_run(DWCSDMMCState *s)
 {
-    while (dwc_idmac_enabled(s) && s->idmac_state == DWC_IDMAC_ACTIVE &&
-           dwc_idmac_step(s)) {
+    while (dwc_idmac_enabled(s)) {
+        if (s->idmac_state == DWC_IDMAC_FETCH) {
+            dwc_idmac_fetch(s);
+            if (s->idmac_state == DWC_IDMAC_FETCH) {
+                break;
+            }
+            continue;
+        }
         /* Each step moves a buffer's worth or closes a descriptor. */
+        if (s->idmac_state != DWC_IDMAC_ACTIVE || dwc_idmac_step_waits(s) ||
+            !dwc_idmac_step(s)) {
+            break;
+        }
     }
 }
 
@@ -2346,6 +2427,8 @@ static bool dwc_reg_read(DWCSDMMCState *s, hwaddr offset, uint32_t *v)
 
         if (s->idmac_state == DWC_IDMAC_SUSPEND) {
             fsm = FSM_SUSPEND;
+        } else if (s->idmac_state == DWC_IDMAC_FETCH) {
+            fsm = FSM_DESC_RD;
         } else if (s->idmac_state == DWC_IDMAC_ACTIVE) {
             fsm = s->xfer_dir == XFER_READ ? FSM_WR_REQ_WAIT
                                            : FSM_RD_REQ_WAIT;
@@ -2853,6 +2936,17 @@ static void dwc_lines_changed_now(void *opaque)
 void dwc_sdmmc_lines_changed(DWCSDMMCState *s)
 {
     dwc_at_present(dwc_lines_changed_now, s);
+}
+
+static void dwc_dma_ready_now(void *opaque)
+{
+    dwc_sdmmc_update(opaque);
+}
+
+/* [spec:nuos:req:emu.esp32p4.sdmmc] */
+void dwc_sdmmc_dma_ready(DWCSDMMCState *s)
+{
+    dwc_at_present(dwc_dma_ready_now, s);
 }
 
 /* [spec:nuos:req:emu.sd-card-timing] */

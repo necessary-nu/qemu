@@ -14,6 +14,7 @@
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "hw/usb/dwc2-otg.h"
+#include "hw/ssi/esp32p4_mspi.h"
 #include "qom/object.h"
 
 /*
@@ -142,5 +143,19 @@ struct ESP32P4UsbUtmiState {
     bool drvvbus;
     bool host_attached;
 };
+
+/*
+ * An OTG core's DMA waiting on a memory controller's held AXI port (the
+ * flash's or the PSRAM's while it cannot take an access: its clocks
+ * stopped, held in reset, AXI_REQ_EN clear; esp32p4_mspi_dma_wait()),
+ * through dwc2_otg_set_dma_wait(): esp32p4_usb_dma_wait_init() sets it
+ * up for @core, after dwc2_otg_set_dma() and before realize.
+ */
+typedef struct ESP32P4UsbDmaWait {
+    ESP32P4MspiDmaWait wait;
+    DWC2OTGState *core;
+} ESP32P4UsbDmaWait;
+
+void esp32p4_usb_dma_wait_init(ESP32P4UsbDmaWait *w, DWC2OTGState *core);
 
 #endif

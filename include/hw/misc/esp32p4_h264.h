@@ -12,6 +12,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/misc/esp32p4_clkwait.h"
 #include "hw/misc/esp32p4_h264_enc.h"
+#include "hw/ssi/esp32p4_mspi.h"
 #include "qom/object.h"
 
 #define TYPE_ESP32P4_H264 "esp32p4-h264"
@@ -76,6 +77,8 @@ struct ESP32P4H264State {
     Clock *clk;
     Object *pms;
     AddressSpace *as;
+    /* The DMA's wait on a memory controller's held AXI port */
+    ESP32P4MspiDmaWait dma_wait;
 
     /* The encoder's registers. */
     bool frame_mode;

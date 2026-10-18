@@ -45,6 +45,12 @@
  *     IOC raises XferCompl, and L or a short packet ends the transfer. A
  *     control write's status stage raises DOEPINT0.StsPhseRcvd.
  *
+ * The DMA engine's accesses the integration's bus holds (the ESP32-P4's
+ * PSRAM or flash controller while it cannot take an access) wait: an
+ * endpoint whose descriptor or data the DMA cannot move NAKs the host's
+ * token, as with its FIFO empty (IN) or full (OUT), and a SETUP waits in
+ * the core, until the bus takes the accesses.
+ *
  * The hosts are full-speed hosts, so a high-speed core enumerates at full
  * speed (DSTS.EnumSpd). Not modelled, and logged as unimplemented: the
  * frame parity of isochronous endpoints, isochronous endpoints in
@@ -269,6 +275,15 @@ void dwc2_otg_dev_kick(DWC2OTGState *s)
     usb_devport_kick(&s->devport);
 }
 
+static void dev_deliver_setup(DWC2OTGState *s);
+
+/* The bus takes the DMA's accesses: a SETUP waiting goes to memory. */
+void dwc2_otg_dev_dma_ready(DWC2OTGState *s)
+{
+    dev_deliver_setup(s);
+    dwc2_otg_dev_kick(s);
+}
+
 /* SETUP delivery and the setup phase */
 
 static void dev_setup_reset(DWC2OTGState *s)
@@ -318,6 +333,59 @@ static bool ep_desc_fetch(DWC2OTGState *s, DWC2OTGDevEp *e)
     e->desc_done = 0;
     e->dmab = e->desc_buf;
     return true;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.usb]
+ * Whether moving @n bytes (@n from the descriptor's bytes left, with -1)
+ * of endpoint @e's data in direction @in waits on the integration's bus:
+ * its descriptor's read and DMA Busy write-back, the data, and the close
+ * that ends the descriptor, @close_on deciding whether it does from the
+ * bytes the descriptor has left and those moved; buffer DMA, the data at
+ * DxEPDMA.
+ */
+static bool ep_dma_waits(DWC2OTGState *s, DWC2OTGDevEp *e, bool in,
+                         uint32_t n, uint32_t mps, bool setup)
+{
+    uint32_t d[2], status, buf, done, nbytes;
+
+    if (!s->dma_wait || !dwc2_otg_dma_enabled(s)) {
+        return false;
+    }
+    if (!dev_ddma(s)) {
+        return dwc2_otg_dma_waits(s, e->dma, n, !in);
+    }
+    if (e->desc_open) {
+        status = e->desc_status;
+        buf = e->desc_buf;
+        done = e->desc_done;
+    } else {
+        if (dwc2_otg_dma_waits(s, e->desc_addr, 8, false)) {
+            return true;
+        }
+        if (!dwc2_otg_dma_read(s, e->desc_addr, d, sizeof(d))) {
+            return false;
+        }
+        status = le32_to_cpu(d[0]);
+        buf = le32_to_cpu(d[1]);
+        done = 0;
+        if ((status & DEV_DMA_BUFF_STS_MASK) !=
+            (DEV_DMA_BUFF_STS_HREADY << DEV_DMA_BUFF_STS_SHIFT)) {
+            return false;
+        }
+        if (dwc2_otg_dma_waits(s, e->desc_addr, 4, true)) {
+            return true;
+        }
+    }
+    nbytes = status & DEV_DMA_NBYTES_MASK;
+    if (setup) {
+        return dwc2_otg_dma_waits(s, buf, 8, true) ||
+               dwc2_otg_dma_waits(s, e->desc_addr, 4, true);
+    }
+    n = MIN(n, nbytes - MIN(done, nbytes));
+    return dwc2_otg_dma_waits(s, buf + done, n, !in) ||
+           ((done + n >= nbytes || (!in && n < mps)) &&
+            dwc2_otg_dma_waits(s, e->desc_addr, 4, true));
 }
 
 /*
@@ -371,7 +439,7 @@ static void dev_deliver_setup(DWC2OTGState *s)
     uint32_t supcnt;
 
     if (!s->setup_bufs || !dwc2_otg_dma_enabled(s) ||
-        !(e->ctl & DXEPCTL_EPENA)) {
+        !(e->ctl & DXEPCTL_EPENA) || ep_dma_waits(s, e, false, 8, 8, true)) {
         return;
     }
     if (dev_ddma(s)) {
@@ -677,6 +745,19 @@ static USBDevPortHandshake devport_in(void *opaque, uint8_t addr,
         return iso ? USB_DEVPORT_NORESP : USB_DEVPORT_NAK;
     }
     mps = MIN(ep_mps(s, e, ep), sizeof(data));
+    if (dwc2_otg_dma_enabled(s) && !(dev_ddma(s) && iso) &&
+        (dev_ddma(s) || ep_pktcnt(e, ep, true)) &&
+        ep_dma_waits(s, e, true, dev_ddma(s) ? mps
+                                            : MIN(ep_xfersize(e, ep), mps),
+                     mps, false)) {
+        /* The DMA has not brought the data into the FIFO: it is empty. */
+        if (type != USB_ENDPOINT_XFER_INT && !iso) {
+            e->intr |= DXEPINT_INTKNTXFEMP;
+        }
+        e->intr |= DXEPINT_NAKINTRPT;
+        dwc2_otg_update_irq(s);
+        return iso ? USB_DEVPORT_NORESP : USB_DEVPORT_NAK;
+    }
     if (dev_ddma(s)) {
         uint32_t nbytes;
 
@@ -821,6 +902,13 @@ static USBDevPortHandshake devport_out(void *opaque, uint8_t addr,
     if (!iso && pid != ep_toggle(s, e, ep, false)) {
         /* A retransmission of data already taken. */
         return USB_DEVPORT_ACK;
+    }
+    if (dma && !(dev_ddma(s) && iso) &&
+        ep_dma_waits(s, e, false,
+                     dev_ddma(s) ? len : MIN(len, ep_xfersize(e, ep)), mps,
+                     false)) {
+        /* The DMA cannot empty the FIFO: it has no room for the packet. */
+        return iso ? USB_DEVPORT_NORESP : USB_DEVPORT_NAK;
     }
     if (dev_ddma(s)) {
         uint32_t nbytes, room;
