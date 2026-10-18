@@ -222,8 +222,11 @@
  * AXI_REQ_EN is clear (esp32p4_mspi_axi_ready()): on the chip the access
  * never completes and the bus hangs. A core's access through the window
  * or the caches waits on the bus until the port takes accesses again,
- * and is then made; another master's, which cannot wait here, is refused
- * with an error response and logged.
+ * and is then made. A DMA master's waits likewise, with its channel, for
+ * GDMA-AHB, GDMA-AXI and VDMA, which ask before each transaction
+ * (esp32p4_mspi_dma_wait()) and make it once the port takes it; another
+ * master's (qtest's, or a DMA master that does not ask) is refused with
+ * an error response and logged.
  *
  * Not modelled: ECC on the external memory (FMEM/SMEM ECC, the PSRAM's
  * 16-to-18 byte mode and its address conversion), logged as unimplemented
@@ -2838,12 +2841,61 @@ bool esp32p4_mspi_axi_ready(ESP32P4MSPIState *s, MemTxAttrs attrs,
     return false;
 }
 
+static const MemoryRegionOps mspi_window_ops;
+
+/*
+ * [spec:nuos:req:emu.esp32p4.memory]
+ * A DMA master's access the AXI port holds, as it holds a core's: checked
+ * by the master before it makes the access, so that it makes the access
+ * once the port takes it, not before.
+ */
+bool esp32p4_mspi_dma_wait(AddressSpace *as, hwaddr addr, hwaddr len,
+                           MemTxAttrs attrs, bool write, Notifier *n)
+{
+    RCU_READ_LOCK_GUARD();
+
+    for (int i = 0; i < 2 && len; i++) {
+        hwaddr xlat, l = 1;
+        MemoryRegion *mr = address_space_translate(as, i ? addr + len - 1
+                                                         : addr,
+                                                   &xlat, &l, write, attrs);
+        ESP32P4MSPIState *s;
+        const char *why;
+
+        if (mr->ops != &mspi_window_ops) {
+            continue;
+        }
+        s = mr->opaque;
+        why = mspi_axi_stall(s);
+        if (!why) {
+            continue;
+        }
+        if (!QLIST_IS_INSERTED(n, node)) {
+            notifier_list_add(&s->dma_waiters, n);
+        }
+        if (!s->dma_wait_logged) {
+            s->dma_wait_logged = true;
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: a DMA master's %s at "
+                          "0x%08" HWADDR_PRIx " waits on the bus, not "
+                          "completing while %s\n", mspi_name(s),
+                          write ? "write" : "read", addr, why);
+        }
+        return true;
+    }
+    return false;
+}
+
 /* Let the cores' held accesses go once the AXI port takes them. */
 static void mspi_axi_wake(ESP32P4MSPIState *s)
 {
     uint32_t waiting = s->axi_waiting;
 
-    if (!waiting || mspi_axi_stall(s)) {
+    if (mspi_axi_stall(s)) {
+        return;
+    }
+    s->dma_wait_logged = false;
+    notifier_list_notify(&s->dma_waiters, s);
+    if (!waiting) {
         return;
     }
     s->axi_waiting = 0;
@@ -4031,6 +4083,7 @@ static void mspi_init(Object *obj)
     qdev_init_gpio_in_named(dev, mspi_download_boot,
                             ESP32P4_MSPI_DOWNLOAD_BOOT, 1);
     qdev_init_gpio_in_named(dev, mspi_brown_out, ESP32P4_MSPI_BROWN_OUT, 1);
+    notifier_list_init(&s->dma_waiters);
     s->sys_clk = qdev_init_clock_in(dev, "sys", mspi_sys_clk_update, s,
                                     ClockUpdate);
     s->core_clk = qdev_init_clock_in(dev, "core", mspi_core_clk_update, s,
