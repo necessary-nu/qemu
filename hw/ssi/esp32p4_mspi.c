@@ -241,11 +241,13 @@
  * own clock, through SMEM_DIN_MODE's and SMEM_DIN_NUM's delays, the die's
  * data following its clock by tDQSCK (psram_loop_init()).
  *
- * Not modelled: ECC on the external memory (FMEM/SMEM ECC, the PSRAM's
- * 16-to-18 byte mode and its address conversion), logged as unimplemented
- * when enabled; the flash controller's FMEM_VAR_DUMMY, for flashes with a
- * strobe, which the chip's quad flash has not; SPI0's own user command
- * (USR, which the headers mark reserved).
+ * Hardware read-only on v3, as the headers give them, and logged when
+ * written (spi0_hro_fields()): SPI0's own user command (CMD's USR), and the
+ * flash controller's DDR mode (its FMEM_VAR_DUMMY among it) and ECC.
+ *
+ * Not modelled: the PSRAM controller's ECC (the 16-to-18 byte mode and its
+ * address conversion), whose layout and code no document gives
+ * (spi0_check_unimp()), logged as unimplemented when enabled.
  */
 
 #include "qemu/osdep.h"
@@ -280,7 +282,8 @@
  * -H2) has them, the headers hide registers of SPI0 that it has (v1's hid
  * RD_STATUS and CACHE_SCTRL, which v3's name), and the v3 boot ROM's
  * SPI_init() sets both to 256 bits in every flash boot. They hold what is
- * written: SPI0's user command, which would use them, is not modelled.
+ * written: SPI0's user command, which would use them, is hardware
+ * read-only on v3 (spi0_hro_fields()).
  */
 typedef struct {
     const char *name;
@@ -655,7 +658,9 @@ static const ESP32P4MSPIReg esp32p4_spi1_psram_regs[ESP32P4_MSPI_NREGS] = {
 #undef REG
 
 /* SPI0's registers. */
+#define R0_CMD                  (0x000 / 4)
 #define R0_CTRL                 (0x008 / 4)
+#define R0_DDR                  (0x0d4 / 4)
 #define R0_CTRL1                (0x00c / 4)
 #define R0_USER                 (0x018 / 4)
 #define R0_USER1                (0x01c / 4)
@@ -776,9 +781,13 @@ static const ESP32P4MSPIReg esp32p4_spi1_psram_regs[ESP32P4_MSPI_NREGS] = {
 #define PMS_ATTR_NONSECURE_ECC  BIT(5)
 #define PMS_REGION_ALIGN        0x1000
 
+#define ECC_CTRL_FMEM_ECC_ERR_INT_EN BIT(17)
 #define ECC_CTRL_FMEM_ECC_ADDR_EN   BIT(20)
 #define ECC_CTRL_USR_ECC_ADDR_EN    BIT(21)
+#define SMEM_ECC_CTRL_ECC_ERR_INT_EN BIT(17)
 #define SMEM_ECC_CTRL_ECC_ADDR_EN   BIT(20)
+#define SMEM_AC_ECC_16TO18_BYTE_EN  BIT(16)
+#define CMD0_USR                    BIT(18)
 
 #define RESP_EN_AW_MMU_VLD      BIT(0)
 #define RESP_EN_AR_MMU_VLD      BIT(7)
@@ -4656,6 +4665,79 @@ static void spi0_mmu_write(ESP32P4MSPIState *s, uint32_t v)
     s->mmu[idx] = v;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.memory]
+ * The fields of SPI0's register `r` that the v3 headers make hardware
+ * read-only ("HRO": software cannot change them) though they act on the
+ * IP's other instances: SPI0's user command (CMD's USR, "only used when
+ * AXI_REQ_EN is cleared", whose USER phases are HRO too), and on the
+ * flash controller its DDR mode (FMEM_DDR_EN, FMEM_VAR_DUMMY,
+ * FMEM_DDR_DQS_LOOP and SMEM's: the chip's flash is quad SPI, without a
+ * strobe) and its ECC (ECC_16TO18_BYTE_EN, ECC_CTRL's and SMEM_ECC_CTRL's
+ * enables). A write changing them changes nothing, as on the chip, and is
+ * logged: software expecting them to act would go wrong there. *what
+ * names them.
+ */
+static uint32_t spi0_hro_fields(ESP32P4MSPIState *s, unsigned r,
+                                const char **what)
+{
+    switch (r) {
+    case R0_CMD:
+        *what = "SPI0's user command (CMD's USR)";
+        return CMD0_USR;
+    case R0_DDR:
+    case R0_SMEM_DDR:
+        *what = "the flash controller's DDR mode";
+        return s->psram ? 0 : DDR_FMEM_DDR_EN | DDR_FMEM_VAR_DUMMY |
+                              DDR_DQS_LOOP;
+    case R0_CTRL2:
+        *what = "the flash controller's ECC (CTRL2's ECC_16TO18_BYTE_EN)";
+        return s->psram ? 0 : CTRL2_ECC_16TO18_BYTE_EN;
+    case R0_ECC_CTRL:
+        *what = "the flash controller's ECC (ECC_CTRL's enables)";
+        return s->psram ? 0 : ECC_CTRL_FMEM_ECC_ERR_INT_EN |
+                              ECC_CTRL_FMEM_ECC_ADDR_EN |
+                              ECC_CTRL_USR_ECC_ADDR_EN;
+    case R0_SMEM_ECC_CTRL:
+        *what = "the flash controller's ECC (SMEM_ECC_CTRL's enables)";
+        return s->psram ? 0 : SMEM_ECC_CTRL_ECC_ERR_INT_EN |
+                              SMEM_ECC_CTRL_ECC_ADDR_EN;
+    default:
+        return 0;
+    }
+}
+
+static void spi0_check_hro(ESP32P4MSPIState *s, unsigned r, uint32_t v,
+                           uint32_t mask)
+{
+    const char *what = NULL;
+    uint32_t hro = spi0_hro_fields(s, r, &what);
+
+    if ((v ^ spi0_regs(s)[r].reset) & hro & mask) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: %s is hardware read-only on the "
+                      "ESP32-P4 v3 (HRO in its headers): the write changes "
+                      "nothing\n", mspi_name(s), what);
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.memory]
+ * ECC on the external memory, which the PSRAM controller has (SMEM_AC's
+ * SMEM_ECC_16TO18_BYTE_EN, SMEM_ECC_CTRL's SMEM_ECC_ADDR_EN, the MSPI
+ * PMS sections' ECC attributes, as ESP-IDF's s_configure_psram_ecc() sets
+ * them), is not modelled: the headers give the controls and ESP-IDF says
+ * only that "1/8 of the PSRAM total size will be reserved for
+ * error-correcting code", while how 16 data bytes and their 2 ECC bytes
+ * lie in the die, how SMEM_ECC_ADDR_EN converts an address (16 to 18 bytes
+ * at a time, or each page's first 7/8, with SMEM_ECC_SKIP_PAGE_CORNER),
+ * and the code itself, whose syndrome ECC_ERR_BITS reports, no document
+ * gives. The data go to the die unconverted and without ECC bytes, which
+ * SPI0 reads back as written, as it does with ECC on the chip; no ECC
+ * error is ever found (ECC_ERR_INT, ECC_ERR_CNT, ECC_ERR_ADDR), as none
+ * is on the chip without a fault, which the emulator does not make. What
+ * differs is what SPI1 reads of the die's raw contents, and the space ECC
+ * takes. Logged as unimplemented when enabled.
+ */
 static void spi0_check_unimp(ESP32P4MSPIState *s, unsigned r)
 {
     bool ecc = false;
@@ -4664,6 +4746,9 @@ static void spi0_check_unimp(ESP32P4MSPIState *s, unsigned r)
     switch (r) {
     case R0_CTRL2:
         ecc = s->spi0[r] & CTRL2_ECC_16TO18_BYTE_EN;
+        break;
+    case R0_SMEM_AC:
+        ecc = s->spi0[r] & SMEM_AC_ECC_16TO18_BYTE_EN;
         break;
     case R0_ECC_CTRL:
         ecc = s->spi0[r] & (ECC_CTRL_FMEM_ECC_ADDR_EN |
@@ -4689,7 +4774,9 @@ static void spi0_check_unimp(ESP32P4MSPIState *s, unsigned r)
     }
     if (ecc) {
         qemu_log_mask(LOG_UNIMP, "%s: ECC on the external memory is not "
-                      "modelled\n", mspi_name(s));
+                      "modelled: the data go to the memory as they are, "
+                      "without ECC bytes or address conversion\n",
+                      mspi_name(s));
     }
 }
 
@@ -4730,6 +4817,7 @@ static void mspi_spi0_write(void *opaque, hwaddr addr, uint64_t val,
         spi0_mmu_write(s, (spi0_reg_read(s, r) & ~mask) | (v & mask));
         break;
     default:
+        spi0_check_hro(s, r, v, mask);
         trig = reg_write(regs, s->spi0, r, v, mask);
         if (r == R0_INT_RAW) {
             v &= regs[R0_INT_RAW].w1c & mask;
@@ -4855,6 +4943,14 @@ static void mspi_spi1_write(void *opaque, hwaddr addr, uint64_t val,
         s->spi1[R1_INT_RAW] &= ~(v & regs[R1_INT_CLR].wt & mask);
         break;
     default:
+        if (!s->psram && r == R1_DDR &&
+            ((v ^ regs[r].reset) & mask &
+             (DDR_FMEM_DDR_EN | DDR_FMEM_VAR_DUMMY | DDR_DQS_LOOP))) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: SPI1's DDR mode is hardware "
+                          "read-only on the flash controller (HRO in the v3 "
+                          "headers): the write changes nothing\n",
+                          mspi_name(s));
+        }
         if (reg_write(regs, s->spi1, r, v, mask) && r == R1_CTRL2) {
             spi1_abort(s);
             mspi_axi_wake(s);
