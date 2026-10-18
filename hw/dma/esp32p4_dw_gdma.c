@@ -73,10 +73,14 @@
  * drops the FIFO and disables it at once, raising CH_ABORTED. A bus error
  * (an access the DMA APM refuses, SLV_ERR, or an address its AXI master
  * has no path to, DEC_ERR) raises the SRC_, DST_ or LLI_ error and ends
- * the transfer: the channel is disabled. Both masters reach the memories
- * at their 0x4... addresses, master 1 also the CSI and DSI bridges'
- * buffers (TRM 7.4, 9.3.4): the bus decides (hw/misc/esp32p4_pms.c), and
- * an address above 32 bits reaches nothing.
+ * the transfer: the channel is disabled. A transaction, or a block's end,
+ * whose accesses a memory controller's AXI port holds (the flash's or the
+ * PSRAM's while it cannot take an access, esp32p4_mspi_dma_wait()) waits,
+ * and its arbiter with it, without an error, until the port takes
+ * accesses again; it is then made. Both masters reach the memories at
+ * their 0x4... addresses, master 1 also the CSI and DSI bridges' buffers
+ * (TRM 7.4, 9.3.4): the bus decides (hw/misc/esp32p4_pms.c), and an
+ * address above 32 bits reaches nothing.
  *
  * Every access is DMA master GDMA_CHn (n the channel less one) on the bus
  * through the APMs (include/hw/misc/esp32p4_pms.h), recorded by the ICM
@@ -113,6 +117,7 @@
 #include "hw/misc/esp32_gated_region.h"
 #include "hw/misc/esp32p4_clkrst.h"
 #include "hw/misc/esp32p4_pms.h"
+#include "hw/ssi/esp32p4_mspi.h"
 #include "migration/vmstate.h"
 
 #define NCH                 ESP32P4_DW_GDMA_CHANNELS
@@ -453,6 +458,22 @@ static bool ch_bus(ESP32P4DwGdmaState *s, int n, int master, uint32_t hi,
 static uint32_t beats(uint32_t bytes)
 {
     return MAX(1, DIV_ROUND_UP(bytes, 8));
+}
+
+/*
+ * Whether an access by channel @n on AXI master @master waits on a memory
+ * controller's AXI port (esp32p4_mspi_dma_wait()); an address above 32
+ * bits reaches nothing, and does not.
+ */
+static bool ch_waits(ESP32P4DwGdmaState *s, int n, int master, uint32_t hi,
+                     uint32_t addr, uint32_t len, bool write)
+{
+    MemTxAttrs attrs = esp32p4_dma_attrs(ESP32P4_DMA_MASTER_GDMA_CH0 + n,
+        ESP32P4_ICM_ID_AXI(master ? ESP32P4_ICM_CID_VDMA_M2
+                                  : ESP32P4_ICM_CID_VDMA_M1, n));
+
+    return !hi && len && esp32p4_mspi_dma_wait(s->as, addr, len, attrs,
+                                               write, &s->bus_wait);
 }
 
 /* Blocks */
@@ -834,6 +855,62 @@ static uint32_t ch_dst_xfer(ESP32P4DwGdmaState *s, int n)
 }
 
 /*
+ * [spec:nuos:req:emu.esp32p4.dma]
+ * Whether the accesses ending channel @n's block make (ch_block_end():
+ * the status fetches, the LLI's write-back) wait on a memory controller's
+ * AXI port, which then holds the block's end until it takes them all.
+ */
+static bool ch_block_end_stalls(ESP32P4DwGdmaState *s, int n)
+{
+    ESP32P4DwGdmaChan *c = &s->ch[n];
+    int lms = c->llp0 & LLP0_LMS;
+
+    return ((c->ctl1 & CTL1_SRC_STAT_EN) &&
+            ch_waits(s, n, c->ctl0 & CTL0_SMS ? 1 : 0, c->sstatar_hi,
+                     c->sstatar, 4, false)) ||
+           ((c->ctl1 & CTL1_DST_STAT_EN) &&
+            ch_waits(s, n, c->ctl0 & CTL0_DMS ? 1 : 0, c->dstatar_hi,
+                     c->dstatar, 4, false)) ||
+           (ch_lli(c) &&
+            ch_waits(s, n, lms, c->llp1, c->cur_lli + LLI_CTL0,
+                     LLI_STATUS_HI + 4 - LLI_CTL0, true));
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.dma]
+ * Whether channel @n's next read transaction (its LLI fetch, or a source
+ * transaction), or its next write one, waits on a memory controller's
+ * AXI port.
+ */
+static bool ch_read_stalls(ESP32P4DwGdmaState *s, int n)
+{
+    ESP32P4DwGdmaChan *c = &s->ch[n];
+    uint32_t start, bytes;
+    bool last;
+
+    if (c->phase == P_SETUP) {
+        return ch_waits(s, n, c->llp0 & LLP0_LMS, c->llp1,
+                        c->llp0 & LLP0_LOC, LLI_FETCH_BYTES, false);
+    }
+    bytes = src_plan(s, c, &start, &last);
+    return ch_waits(s, n, c->ctl0 & CTL0_SMS ? 1 : 0, c->sar_hi, c->sar,
+                    c->ctl0 & CTL0_SINC ? MIN(bytes, ch_width(c, true))
+                                        : bytes, false);
+}
+
+static bool ch_write_stalls(ESP32P4DwGdmaState *s, int n)
+{
+    ESP32P4DwGdmaChan *c = &s->ch[n];
+    uint32_t start, bytes;
+    bool last;
+
+    bytes = dst_plan(s, c, &start, &last);
+    return ch_waits(s, n, c->ctl0 & CTL0_DMS ? 1 : 0, c->dar_hi, c->dar,
+                    c->ctl0 & CTL0_DINC ? MIN(bytes, ch_width(c, false))
+                                        : bytes, true);
+}
+
+/*
  * What a channel does without the bus: set up its next block, finish
  * one, and complete a suspension or a disable once its FIFO is empty.
  */
@@ -859,6 +936,9 @@ static uint32_t ch_progress(ESP32P4DwGdmaState *s, int n)
         bool done = ch_fc_dst(c) ? c->dst_done
                                  : c->src_done && !c->fifo_num;
 
+        if (done && ch_block_end_stalls(s, n)) {
+            return 0;
+        }
         if (done) {
             cycles = ch_block_end(s, n);
         } else if (c->susp && !c->fifo_num) {
@@ -966,8 +1046,24 @@ static void dw_round(ESP32P4DwGdmaState *s)
     for (int n = 0; n < NCH; n++) {
         cost += ch_progress(s, n);
     }
-    r = dw_grant(s, false, &lli);
-    w = dw_grant(s, true, &lli);
+    /* Transactions the AXI port held go first, once it takes them. */
+    r = s->stall_grant[0];
+    w = s->stall_grant[1];
+    s->stall_grant[0] = s->stall_grant[1] = -1;
+    if (r < 0 || !ch_reads(s, r, &lli)) {
+        r = dw_grant(s, false, &lli);
+    }
+    if (w < 0 || !ch_writes(s, w)) {
+        w = dw_grant(s, true, &lli);
+    }
+    if (r >= 0 && ch_read_stalls(s, r)) {
+        s->stall_grant[0] = r;
+        r = -1;
+    }
+    if (w >= 0 && s->ch[w].enabled && ch_write_stalls(s, w)) {
+        s->stall_grant[1] = w;
+        w = -1;
+    }
     if (r >= 0) {
         if (s->ch[r].phase == P_SETUP) {
             cost = MAX(cost, ch_fetch_lli(s, r));
@@ -1072,6 +1168,18 @@ static void dw_kick(ESP32P4DwGdmaState *s)
         dw_arm(s, esp32p4_clk_count_at(&s->bus_edges,
                                        esp32_line_time()) + 1);
     }
+}
+
+/*
+ * A memory controller's AXI port takes accesses again: the transactions
+ * it held go on, from the bus clock's next edge.
+ */
+static void dw_bus_ready(Notifier *n, void *data)
+{
+    ESP32P4DwGdmaState *s = container_of(n, ESP32P4DwGdmaState, bus_wait);
+
+    notifier_remove(n);
+    dw_kick(s);
 }
 
 /*
@@ -1746,6 +1854,10 @@ static void esp32p4_dw_gdma_reset_hold(Object *obj, ResetType type)
     s->lowpower_cfg0 = LOWPOWER0_RESET;
     s->lowpower_cfg1 = LOWPOWER1_RESET;
     s->rr_last[0] = s->rr_last[1] = 0;
+    s->stall_grant[0] = s->stall_grant[1] = -1;
+    if (QLIST_IS_INSERTED(&s->bus_wait, node)) {
+        notifier_remove(&s->bus_wait);
+    }
 }
 
 static void esp32p4_dw_gdma_reset_exit(Object *obj, ResetType type)
@@ -1774,6 +1886,8 @@ static void esp32p4_dw_gdma_init(Object *obj)
                                 ClockPreUpdate | ClockUpdate);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dw_timer_cb, s);
     notifier_list_init(&s->sources);
+    s->bus_wait.notify = dw_bus_ready;
+    s->stall_grant[0] = s->stall_grant[1] = -1;
 }
 
 static void esp32p4_dw_gdma_realize(DeviceState *dev, Error **errp)
@@ -1860,10 +1974,28 @@ static const VMStateDescription vmstate_esp32p4_dw_gdma_chan = {
     },
 };
 
+/*
+ * A transaction or block end an AXI port held: ask again, which waits on
+ * the port anew if it still holds it. Its Notifier is not migrated.
+ */
+static int esp32p4_dw_gdma_post_load(void *opaque, int version_id)
+{
+    ESP32P4DwGdmaState *s = opaque;
+
+    for (int n = 0; n < NCH; n++) {
+        if (s->ch[n].enabled) {
+            dw_kick(s);
+            break;
+        }
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_esp32p4_dw_gdma = {
     .name = TYPE_ESP32P4_DW_GDMA,
-    .version_id = 4,
-    .minimum_version_id = 4,
+    .version_id = 5,
+    .minimum_version_id = 5,
+    .post_load = esp32p4_dw_gdma_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(ch, ESP32P4DwGdmaState, NCH, 1,
                              vmstate_esp32p4_dw_gdma_chan,
@@ -1879,6 +2011,7 @@ static const VMStateDescription vmstate_esp32p4_dw_gdma = {
                            ESP32P4_DW_GDMA_HS),
         VMSTATE_BOOL_ARRAY(hs_last, ESP32P4DwGdmaState, ESP32P4_DW_GDMA_HS),
         VMSTATE_UINT32_ARRAY(rr_last, ESP32P4DwGdmaState, 2),
+        VMSTATE_INT32_ARRAY(stall_grant, ESP32P4DwGdmaState, 2),
         VMSTATE_CLOCK(clk, ESP32P4DwGdmaState),
         VMSTATE_ESP32P4_CLK_COUNT(bus_edges, ESP32P4DwGdmaState),
         VMSTATE_UINT64(due_cycle, ESP32P4DwGdmaState),

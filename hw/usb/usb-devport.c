@@ -10,6 +10,12 @@
  * answers it as its own state machines decide; the hosts only choose which
  * transactions to run and when, at full speed (12 Mb/s) with an SOF each
  * millisecond.
+ *
+ * The bridge's frames and steps each run at their time however late QEMU
+ * runs their timers (line_run_at()), each timed from the one before, and
+ * its device controller takes those due before a register access first
+ * (usb_devport_next()), as on the chip software finds every transaction
+ * of the host's that has come by then.
  */
 
 #include "qemu/osdep.h"
@@ -17,6 +23,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "chardev/char-fe.h"
+#include "hw/core/line-time.h"
 #include "hw/usb/usb.h"
 #include "hw/usb/usb-devport.h"
 #include "migration/vmstate.h"
@@ -75,9 +82,16 @@ typedef enum {
     BR_FAIL,
 } BrResult;
 
+/* The present, or the time of the bridge's event being taken. */
 static int64_t br_now(void)
 {
-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return line_time();
+}
+
+static void br_timer_at(USBDevPort *p, int64_t when)
+{
+    p->br_due = when;
+    timer_mod(p->br_timer, when);
 }
 
 static int64_t br_xact_ns(uint32_t len)
@@ -238,7 +252,7 @@ static void br_set_state(USBDevPort *p, USBDevPortBridgeState state,
 {
     p->br_state = state;
     p->br_waiting = false;
-    timer_mod(p->br_timer, br_now() + delay);
+    br_timer_at(p, br_now() + delay);
 }
 
 /* Start enumeration step `step`. */
@@ -389,7 +403,7 @@ static void br_frame(void *opaque)
     p->ops->sof(p->opaque, p->br_frame);
     if (p->br_waiting) {
         p->br_waiting = false;
-        timer_mod(p->br_timer, br_now() + br_xact_ns(0));
+        br_timer_at(p, br_now() + br_xact_ns(0));
     }
 }
 
@@ -482,7 +496,47 @@ static void br_run(void *opaque)
         p->br_waiting = true;
         return;
     }
-    timer_mod(p->br_timer, br_now() + ns);
+    br_timer_at(p, br_now() + ns);
+}
+
+/* A frame or step runs at its time however late its timer runs. */
+static void br_frame_cb(void *opaque)
+{
+    USBDevPort *p = opaque;
+
+    line_run_at(p->br_frame_ns, br_frame, p);
+}
+
+static void br_run_cb(void *opaque)
+{
+    USBDevPort *p = opaque;
+
+    line_run_at(p->br_due, br_run, p);
+}
+
+/* [spec:nuos:req:emu.esp32p4.usb] */
+bool usb_devport_next(USBDevPort *p, int64_t *due, QEMUTimer **timer,
+                      void (**run)(void *opaque))
+{
+    bool found = false;
+
+    if (!p->br_timer) {
+        return false;
+    }
+    if (timer_pending(p->br_frame_timer) && p->br_frame_ns <= *due) {
+        *due = p->br_frame_ns;
+        *timer = p->br_frame_timer;
+        *run = br_frame;
+        found = true;
+    }
+    if (timer_pending(p->br_timer) && p->br_due <= *due &&
+        (!found || p->br_due < *due)) {
+        *due = p->br_due;
+        *timer = p->br_timer;
+        *run = br_run;
+        found = true;
+    }
+    return found;
 }
 
 void usb_devport_kick(USBDevPort *p)
@@ -493,7 +547,7 @@ void usb_devport_kick(USBDevPort *p)
         p->br_waiting = false;
         if (!timer_pending(p->br_timer) ||
             timer_expire_time_ns(p->br_timer) > when) {
-            timer_mod(p->br_timer, when);
+            br_timer_at(p, when);
         }
     }
 }
@@ -704,8 +758,8 @@ bool usb_devport_realize(USBDevPort *p, Error **errp)
                    "on the one device port; set at most one", p->name);
         return false;
     }
-    p->br_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, br_run, p);
-    p->br_frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, br_frame, p);
+    p->br_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, br_run_cb, p);
+    p->br_frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, br_frame_cb, p);
     if (qemu_chr_fe_backend_connected(&p->cdc_chr)) {
         qemu_chr_fe_set_handlers(&p->cdc_chr, br_can_receive, br_receive,
                                  br_event, NULL, p, NULL, true);
@@ -731,11 +785,12 @@ void usb_devport_reset(USBDevPort *p)
 
 const VMStateDescription vmstate_usb_devport = {
     .name = "usb-devport",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(br_state, USBDevPort),
         VMSTATE_TIMER_PTR(br_timer, USBDevPort),
+        VMSTATE_INT64(br_due, USBDevPort),
         VMSTATE_TIMER_PTR(br_frame_timer, USBDevPort),
         VMSTATE_UINT16(br_frame, USBDevPort),
         VMSTATE_INT64(br_frame_ns, USBDevPort),

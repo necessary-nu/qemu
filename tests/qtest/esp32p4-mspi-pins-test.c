@@ -88,7 +88,16 @@
 #define TDQSQ_PS            400
 #define STEP_PS             100
 
+/*
+ * MR0 for 240 MHz: fixed latency, read latency code 6 (FLC 18, up to
+ * 250 MHz), the read dummy phase that matches it; the power-up code 2
+ * allows 133 MHz at most, faster reads of the array being undefined.
+ */
+#define MR0_FIXED_LC6       0x38
+#define FLC18_RD_DUMMY      (2 * (18 - 1))
+
 static QTestState *qts;
+static int rd_dummy;
 
 static uint32_t rd(uint32_t a)
 {
@@ -288,11 +297,18 @@ static void psram_read(uint32_t addr, uint32_t *data, int words)
     for (int i = 0; i < words; i++) {
         wr(SPI1_PSRAM + W(i), 0);
     }
-    spi1_user(SPI1_PSRAM, PSRAM_SYNC_READ, 16, addr, 32,
-              ESP32P4_PSRAM_PUP_DUMMY, 0, 4 * words);
+    spi1_user(SPI1_PSRAM, PSRAM_SYNC_READ, 16, addr, 32, rd_dummy, 0,
+              4 * words);
     for (int i = 0; i < words; i++) {
         data[i] = rd(SPI1_PSRAM + W(i));
     }
+}
+
+/* Mode register @ma written with @v, at its write latency of 1. */
+static void psram_mr_write(uint32_t ma, uint32_t v)
+{
+    wr(SPI1_PSRAM + W(0), v);
+    spi1_user(SPI1_PSRAM, PSRAM_REG_WRITE, 16, ma, 32, 0, 1, 0);
 }
 
 /* Every data line's delay line at @dlc. */
@@ -323,7 +339,10 @@ static void test_psram_strobe(void)
 
     qts = qtest_init("-M esp32p4,strap-mode=0");
     esp32p4_psram_spi1_opi(qts);
+    rd_dummy = ESP32P4_PSRAM_PUP_DUMMY;
     psram_write(0x100, ref, 2);
+    psram_mr_write(0, MR0_FIXED_LC6);
+    rd_dummy = FLC18_RD_DUMMY;
     t = psram_fast();
     g_assert_cmpuint(t, >=, 4100);
     g_assert_cmpuint(t, <=, 4200);
@@ -378,8 +397,11 @@ static void test_psram_strobe(void)
  * The die in x16 mode (MR8 bit 6), the ports' data on 16 lines (SPI0's
  * SRAM_CMD SDIN_HEX): two bytes a beat, the even on DQ0 to DQ7 with DQS0,
  * the odd on DQ8 to DQ15 with DQS1. DQS1 off: the odd bytes read 0. DQ8
- * to DQ15 delayed: the odd bytes take the beat before's. Through SPI0 and
- * the MMU, with SMEM_DDR, alike; in SDR the die takes no command.
+ * to DQ15 delayed: the odd bytes take the beat before's. In x16 the die
+ * counts its address in words: the bytes written at 0x200 in x8 are at
+ * word 0x100 for SPI1, and at 0x200 for SPI0, which on 16 lines sends
+ * the word address of the window's byte. Through SPI0 and the MMU, with
+ * SMEM_DDR, alike; in SDR the die takes no command.
  */
 /* [spec:nuos:req:emu.esp32p4.memory/test] */
 static void test_psram_x16(void)
@@ -389,25 +411,27 @@ static void test_psram_x16(void)
 
     qts = qtest_init("-M esp32p4,strap-mode=0");
     esp32p4_psram_spi1_opi(qts);
+    rd_dummy = ESP32P4_PSRAM_PUP_DUMMY;
     psram_write(0x200, ref, 2);
-    wr(SPI1_PSRAM + W(0), mr8);
-    spi1_user(SPI1_PSRAM, PSRAM_REG_WRITE, 16, 8, 32, 0, 1, 0);
+    psram_mr_write(8, mr8);
+    psram_mr_write(0, MR0_FIXED_LC6);
+    rd_dummy = FLC18_RD_DUMMY;
     psram_fast();
     /* Both ports' data on 16 lines, which SPI0's SRAM_CMD sets. */
-    esp32p4_psram_spi0_opi(qts, true, ESP32P4_PSRAM_PUP_DUMMY,
+    esp32p4_psram_spi0_opi(qts, true, FLC18_RD_DUMMY,
                            ESP32P4_PSRAM_PUP_DUMMY);
     wr(PSRAM_DQS(0), DQS_XPD);
-    psram_read(0x200, got, 2);
+    psram_read(0x100, got, 2);
     g_assert_cmphex(got[0], ==, 0x00330011);
     g_assert_cmphex(got[1], ==, 0x00770055);
     wr(PSRAM_DQS(1), DQS_XPD);
-    psram_read(0x200, got, 2);
+    psram_read(0x100, got, 2);
     g_assert_cmphex(got[0], ==, ref[0]);
     g_assert_cmphex(got[1], ==, ref[1]);
     for (int i = 0; i < 8; i++) {
         wr(PSRAM_PIN1(2 + i), P_DLC(15));
     }
-    psram_read(0x200, got, 2);
+    psram_read(0x100, got, 2);
     g_assert_cmphex(got[0], ==, 0x22330011);
     g_assert_cmphex(got[1], ==, 0x66774455);
 
