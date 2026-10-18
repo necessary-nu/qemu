@@ -1235,15 +1235,21 @@ static MemTxResult window_write32(RP2350CoreSightView *view, hwaddr addr,
 /*
  * The components are 32-bit registers. A narrow write is replicated
  * across the bus by the processor and writes the whole register; a
- * narrow read returns its byte lanes.
+ * narrow read returns its byte lanes. An access first brings the
+ * timestamp generator's clock up to its time (clock_sync()), so that the
+ * count follows a change that has fallen due from its time.
  */
 /* [spec:nuos:req:emu.coresight] */
 static MemTxResult rp2350_coresight_read(void *opaque, hwaddr addr,
                                          uint64_t *data, unsigned size,
                                          MemTxAttrs attrs)
 {
+    RP2350CoreSightView *view = opaque;
     uint32_t v = 0;
-    MemTxResult r = window_read32(opaque, addr & ~3, &v);
+    MemTxResult r;
+
+    clock_sync(view->cs->clk);
+    r = window_read32(view, addr & ~3, &v);
 
     *data = extract32(v, (addr & 3) * 8, size * 8);
     return r;
@@ -1254,14 +1260,16 @@ static MemTxResult rp2350_coresight_write(void *opaque, hwaddr addr,
                                           uint64_t value, unsigned size,
                                           MemTxAttrs attrs)
 {
+    RP2350CoreSightView *view = opaque;
     uint32_t v = value;
 
+    clock_sync(view->cs->clk);
     if (size == 1) {
         v = (v & 0xff) * 0x01010101u;
     } else if (size == 2) {
         v = (v & 0xffff) * 0x00010001u;
     }
-    return window_write32(opaque, addr & ~3, v);
+    return window_write32(view, addr & ~3, v);
 }
 
 static const MemoryRegionOps rp2350_coresight_ops = {

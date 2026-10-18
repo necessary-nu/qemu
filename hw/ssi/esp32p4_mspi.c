@@ -54,36 +54,80 @@
  * or system reset clears it. The physical page wraps at the memory's size.
  *
  * The flash: the M25P80 model's part on the SSI bus "ssi", selected by
- * chip select 0 (SSI_GPIO_CS line 0). SPI1's transactions are driven onto
- * the bus as QEMU's flash models take them, a byte a transfer whatever
- * the line count, with the chip select raised at the transaction's last
- * cycle, when the flash starts the program or erase it was given:
- * the command, the address (USR_ADDR_BITLEN + 1 bits, most significant byte
- * first), the dummy phase as (cycles * address lines + 7) / 8 bytes (as
- * the mode bits of a DIO or QIO read go in the address or dummy phase),
- * then the data. Reads through SPI0 are a READ (0x03) of the flash's
- * contents with a 24-bit address, or, while CACHE_FCTRL's
- * CACHE_USR_ADDR_4BYTE is set (as ESP-IDF sets it for a flash over
- * 16 MiB), a READ4 (0x13) with a 32-bit one: the address length is
- * followed, but SPI0's command, line, dummy and timing settings are held
- * and do not change what a read returns, since the TRM does not document
- * them, so a configuration the hardware could not read with reads as one
- * it could. The built-in block erase is the 64 KiB one (0xD8), which the
- * ROM and ESP-IDF erase blocks with; the headers' "(32KB)" contradicts
- * them. A page program takes its length from ADDR[31:24].
+ * chip select 0 (SSI_GPIO_CS line 0). SPI0's reads and SPI1's
+ * transactions take one path onto it (flash_wire_xfer()): a clock of the
+ * SPI bus at a time, the controller drives the flash's four data lines in
+ * each phase as its registers set it up, and the flash takes and sends
+ * each byte on the lines its own command uses (m25p80_io_lines()), bytes
+ * passing to and from the M25P80 model as their clocks complete. So a
+ * set-up the flash does not expect reads as the chip would: a command,
+ * address or mode byte on the wrong lines garbled, the data shifted by a
+ * dummy phase too short or too long, the bits of a line nothing drives at
+ * its pad's pull, a flash that refuses the command (a quad one with QE
+ * clear) not driving the lines at all. A phase on one or two lines leaves
+ * IO2 and IO3, WP# and HOLD#, driven at CTRL's WP_REG level and high. The
+ * mode bits a DIO or QIO read sends after the address, M7-M0, come from
+ * the address or the dummy phase, whichever covers them, and a flash in
+ * continuous read mode (M5-4 = 10b) takes the next transaction's command
+ * as address bits. SPI1's chip select is raised at its transaction's last
+ * cycle, when the flash starts the program or erase it was given.
  *
- * The PSRAM: the in-package AP Memory 256 Mbit x16 die, on SPI1_MEM_S's
- * chip select 1, as a RAM region (the "psram-mr" link) behind its mode
- * registers. SPI1 speaks its 16-bit OPI commands: synchronous and burst
- * read (0x0000, 0x2020) and write (0x8080, 0xA0A0) at byte addresses, the
- * same the MMU's pages reach, and mode register read (0x4040) and write
- * (0xC0C0) at the register's number. MR1 holds vendor 0x0D (AP Memory),
- * MR2 0xDF (256 Mbit, generation 4, known good die) and MR3 0x20 (slow
- * refresh), the values ESP-IDF's driver reads from this die; MR0, MR4 and
- * MR8, which the driver sets, start at zero, as their reset values are not
- * published. Writing 0xF0 to MR6 puts the die into half sleep, where it
- * keeps its contents and takes no command until a transaction, or SPI1's
- * MISC_CS_KEEP_ACTIVE with its chip select enabled, wakes it.
+ * SPI0's read (spi0_flash_xfer()): the command USER2 gives with
+ * CACHE_FCTRL's CACHE_FLASH_USR_CMD set, as the ROM and ESP-IDF set it,
+ * else the one CTRL's read mode selects (03h, 0Bh, 3Bh, 6Bh, BBh, EBh, or
+ * with CACHE_USR_ADDR_4BYTE 13h, 0Ch, 3Ch, 6Ch, BCh, ECh: the TRM does not
+ * name them), on four lines with FCMD_QUAD; USER1's address phase on the
+ * read mode's lines, from the top of the 24-bit address followed by
+ * RD_STATUS's WB_MODE (the mode bits the ROM's 28-bit address phase ends
+ * with), or of the 32-bit address with CACHE_USR_ADDR_4BYTE; USER1's dummy
+ * cycles with USR_DUMMY, no SPI clock in them with USR_DUMMY_IDLE, the
+ * first half of them driven at the dummy-out levels (D_POL on IO0, Q_POL
+ * on IO1, WP_REG on IO2, IO3 high) with FDUMMY_RIN, as the headers give
+ * SPI0's FDUMMY_RIN; the data on the read mode's lines. CTRL's FREAD_*
+ * bits count with FASTRD_MODE set, as the headers say, on SPI0 and SPI1
+ * alike; CACHE_FCTRL's FADDR/FDIN bits whatever it says. SPI1's user
+ * transactions take CTRL's read mode for their address and data phases
+ * too, as ESP-IDF's setting it for each command implies; its built-in
+ * read does, and its other built-in commands are on one line, as the
+ * ROM's status reads in DIO mode need. Its dummy phase is driven
+ * throughout with FDUMMY_RIN for a transaction that reads data,
+ * FDUMMY_WOUT for one that does not. An address phase longer than the 32
+ * bits the controller holds sends, after them, bits the TRM leaves
+ * undefined: the model sends the worst case, the mode bits 0x20 that put
+ * a flash in continuous read mode, and logs the hazard as a guest error.
+ * Each AXI read of the flash is one SPI0 transaction.
+ *
+ * The built-in block erase is the 64 KiB one (0xD8), which the ROM and
+ * ESP-IDF erase blocks with; the headers' "(32KB)" contradicts them. A
+ * page program takes its length from ADDR[31:24].
+ *
+ * The PSRAM: the in-package AP Memory 256 Mbit x16 die (APS256XXN), on
+ * SPI1_MEM_S's chip select 1 and SPI0's window, as a RAM region (the
+ * "psram-mr" link) behind its mode registers. SPI0's accesses and SPI1's
+ * transactions both reach it as the die takes them (psram_die_xfer()):
+ * only in its OPI DDR form, a 16-bit command and a 32-bit address on 8
+ * lines; its synchronous and linear burst read (0x0000, 0x2020) and write
+ * (0x8080, 0xA0A0) at byte addresses, the same the MMU's pages reach, with
+ * MR8's burst wrap, mode register read (0x4040) and write (0xC0C0) at the
+ * register's number, global reset (0xFFFF); its data from the latency its
+ * mode registers give (MR0's read latency code, variable or fixed; MR4's
+ * write latency code; 1 for a register write), which a dummy phase of 2 *
+ * (latency - 1) clock edges matches; data a beat on each clock edge, two
+ * bytes on DQ0 to DQ15 with MR8's X16, else one on DQ0 to DQ7. A port's
+ * data lines are 16 with SPI0's SRAM_CMD SDIN_HEX or SDOUT_HEX (for both
+ * ports), else CTRL's or SRAM_CMD's. So SPI0 left as from reset (an SPI
+ * command on one line, SDR) reaches nothing, the die's power-up latencies
+ * under dummy phases set for others shift the data, and an X8 die read on
+ * 16 lines leaves every other byte to the undriven lines. MR1 holds vendor
+ * 0x0D (AP Memory), MR2 0xDF (256 Mbit, generation 4, known good die) and
+ * MR3 0x20 (slow refresh), the values ESP-IDF's driver reads from this
+ * die; MR0, MR4 and MR8 power up as the datasheet gives them (0x08, 0x40,
+ * 0x05: latency codes 5, X8, 32-byte hybrid wrap). Writing 0xF0 to MR6
+ * puts the die into half sleep, where it keeps its contents and takes no
+ * command until a transaction, or SPI1's MISC_CS_KEEP_ACTIVE with its chip
+ * select enabled, wakes it. SPI0 splits its accesses at SMEM_ECC_CTRL's
+ * page corners with SMEM_AC's SMEM_SPLIT_TRANS_EN (set from reset); the
+ * die wraps a burst at its 2048-byte page.
  *
  * The pads (hw/gpio/esp32p4_mspi_iomux.c, the "pins" link). A DDR read of
  * the die, SPI1's or SPI0's (their DDR registers' DDR_EN set, DQS_LOOP
@@ -92,9 +136,8 @@
  * SPI clock the read runs at (the core clock over CLOCK's divider for
  * SPI1, SRAM_CLK's for SPI0); a line sampled outside its beat's valid
  * window takes the bit of a neighbouring beat, and with the strobe's
- * input powered down a line captures 0. An SDR read samples on the SPI
- * clock, which the timing tuning registers below would place, and reads
- * the die as it is. The flash's data lines, where no flash drives them
+ * input powered down a line captures 0. The flash's data lines, where no
+ * flash drives them
  * (no flash on the bus, or chip select 1 alone), read as their pads'
  * pulls hold them.
  *
@@ -165,18 +208,27 @@
  * raises SPI0's SLV_ST_END and MST_ST_END.
  *
  * The registers are behind the "sys" bus clock (mapped through the clock
- * and reset tree's gate); the AXI port refuses accesses while it is
- * stopped or the controller is held in reset. The "apb-reset" and
- * "axi-reset" inputs hold the controller in reset.
+ * and reset tree's gate). The "apb-reset" and "axi-reset" inputs hold the
+ * controller in reset. The AXI port takes no access while its bus clock
+ * is stopped or the controller is held in reset, nor, unless closed (when
+ * it answers errors), while its core clock is stopped or CACHE_FCTRL's
+ * AXI_REQ_EN is clear (esp32p4_mspi_axi_ready()): on the chip the access
+ * never completes and the bus hangs. A core's access through the window
+ * or the caches waits on the bus until the port takes accesses again,
+ * and is then made; another master's, which cannot wait here, is refused
+ * with an error response and logged.
  *
  * Not modelled: ECC on the external memory (FMEM/SMEM ECC, the PSRAM's
  * 16-to-18 byte mode and its address conversion), logged as unimplemented
- * when enabled; the timing tuning registers, which are held and change
- * nothing as every setting reads correctly; auto-suspend and auto-resume
- * (FLASH_SUS_CTRL's PES_EN and PER_EN), with which the controller would
- * suspend a busy flash for SPI0's reads: SPI0 reads a busy flash as it
- * answers, ignoring them; SPI0's own user command (USR, which the
- * headers mark reserved).
+ * when enabled; the flash timing tuning registers, which are held and
+ * change nothing as every setting reads correctly; the die's refresh
+ * collisions, which would push variable-latency reads out to twice LC
+ * (SMEM_VAR_DUMMY's subject); its maximum clock for each latency code;
+ * X16's word addressing, the die taken as byte-addressed in both modes;
+ * auto-suspend and auto-resume (FLASH_SUS_CTRL's PES_EN and PER_EN), with
+ * which the controller would suspend a busy flash for SPI0's reads: SPI0
+ * reads a busy flash as it answers, ignoring them; SPI0's own user command
+ * (USR, which the headers mark reserved).
  */
 
 #include "qemu/osdep.h"
@@ -191,8 +243,10 @@
 #include "hw/block/flash.h"
 #include "hw/gpio/esp32p4_mspi_iomux.h"
 #include "hw/ssi/esp32p4_mspi.h"
+#include "hw/core/cpu.h"
 #include "migration/vmstate.h"
 #include "system/memory.h"
+#include "target/riscv/esp32p4_cpu.h"
 
 /*
  * Each register's name, reset value and fields by access, from the v3
@@ -585,7 +639,15 @@ static const ESP32P4MSPIReg esp32p4_spi1_psram_regs[ESP32P4_MSPI_NREGS] = {
 /* SPI0's registers. */
 #define R0_CTRL                 (0x008 / 4)
 #define R0_CTRL1                (0x00c / 4)
+#define R0_USER                 (0x018 / 4)
+#define R0_USER1                (0x01c / 4)
+#define R0_USER2                (0x020 / 4)
+#define R0_RD_STATUS            (0x02c / 4)
 #define R0_CACHE_FCTRL          (0x03c / 4)
+#define R0_CACHE_SCTRL          (0x040 / 4)
+#define R0_SRAM_CMD             (0x044 / 4)
+#define R0_SRAM_DRD_CMD         (0x048 / 4)
+#define R0_SRAM_DWR_CMD         (0x04c / 4)
 #define R0_SRAM_CLK             (0x050 / 4)
 #define R0_SMEM_DDR             (0x0d8 / 4)
 #define R0_INT_ENA              (0x0c0 / 4)
@@ -603,6 +665,7 @@ static const ESP32P4MSPIReg esp32p4_spi1_psram_regs[ESP32P4_MSPI_NREGS] = {
 #define R0_AXI_ERR_ADDR         (0x170 / 4)
 #define R0_SMEM_ECC_CTRL        (0x174 / 4)
 #define R0_AXI_ERR_RESP_EN      (0x17c / 4)
+#define R0_SMEM_AC              (0x1a0 / 4)
 #define R0_XTS_PLAIN            (0x300 / 4)
 #define R0_XTS_LINESIZE         (0x340 / 4)
 #define R0_XTS_DESTINATION      (0x344 / 4)
@@ -620,7 +683,39 @@ static const ESP32P4MSPIReg esp32p4_spi1_psram_regs[ESP32P4_MSPI_NREGS] = {
 #define CTRL1_AW_SIZE0_1_SUPPORT_EN BIT(22)
 #define CTRL2_ECC_16TO18_BYTE_EN    BIT(14)
 #define CACHE_FCTRL_CLOSE_AXI_INF_EN BIT(31)
+#define CACHE_FCTRL_AXI_REQ_EN      BIT(0)
+
+/* The PSRAM controller's SPI0 set-up for its window. */
+#define SCTRL_SADDR_4BYTE           BIT(0)
+#define SCTRL_SRAM_DIO              BIT(1)
+#define SCTRL_SRAM_QIO              BIT(2)
+#define SCTRL_WR_SRAM_DUMMY         BIT(3)
+#define SCTRL_RD_SRAM_DUMMY         BIT(4)
+#define SCTRL_SRAM_USR_RCMD         BIT(5)
+#define SCTRL_RDUMMY_CYCLELEN(v)    extract32((v), 6, 6)
+#define SCTRL_ADDR_BITLEN(v)        extract32((v), 14, 6)
+#define SCTRL_SRAM_USR_WCMD         BIT(20)
+#define SCTRL_WDUMMY_CYCLELEN(v)    extract32((v), 22, 6)
+#define SCMD_SWB_MODE(v)            extract32((v), 2, 8)
+#define SCMD_SDIN_DUAL              BIT(10)
+#define SCMD_SDOUT_DUAL             BIT(11)
+#define SCMD_SADDR_DUAL             BIT(12)
+#define SCMD_SDIN_QUAD              BIT(14)
+#define SCMD_SDOUT_QUAD             BIT(15)
+#define SCMD_SADDR_QUAD             BIT(16)
+#define SCMD_SCMD_QUAD              BIT(17)
+#define SCMD_SDIN_OCT               BIT(18)
+#define SCMD_SDOUT_OCT              BIT(19)
+#define SCMD_SADDR_OCT              BIT(20)
+#define SCMD_SCMD_OCT               BIT(21)
+#define SCMD_SDIN_HEX               BIT(26)
+#define SCMD_SDOUT_HEX              BIT(27)
+#define SRAM_CMD_VALUE(v)           extract32((v), 0, 16)
+#define SRAM_CMD_BITLEN(v)          extract32((v), 28, 4)
+#define SMEM_AC_SPLIT_TRANS_EN      BIT(31)
+#define SMEM_ECC_PAGE_SIZE(v)       extract32((v), 18, 2)
 #define CACHE_FCTRL_USR_ADDR_4BYTE  BIT(1)
+#define CACHE_FCTRL_FLASH_USR_CMD   BIT(2)
 
 #define INT0_SLV_ST_END         BIT(3)
 #define INT0_MST_ST_END         BIT(4)
@@ -660,6 +755,11 @@ static const ESP32P4MSPIReg esp32p4_spi1_psram_regs[ESP32P4_MSPI_NREGS] = {
 #define MMU_PSRAM_VALID         BIT(11)
 #define MMU_PSRAM_SENSITIVE     BIT(12)
 #define MMU_MAX_PAGE_SHIFT      16
+
+/* The hazards of SPI0's set-up logged until its registers change. */
+#define MSPI_LOGGED_ADDR        BIT(0)
+#define MSPI_LOGGED_PSRAM_CMD   BIT(1)
+#define MSPI_LOGGED_PSRAM_LAT   BIT(2)
 
 /* The manual encryption block's states (XTS_STATE). */
 enum {
@@ -712,6 +812,8 @@ enum {
 #define CMD_FLASH_READ          BIT(31)
 #define CMD_OPS                 0xfffc0000u
 
+#define CTRL_FDUMMY_RIN         BIT(2)
+#define CTRL_FDUMMY_WOUT        BIT(3)
 #define CTRL_FDOUT_OCT          BIT(4)
 #define CTRL_FDIN_OCT           BIT(5)
 #define CTRL_FADDR_OCT          BIT(6)
@@ -720,7 +822,10 @@ enum {
 #define CTRL_FASTRD_MODE        BIT(13)
 #define CTRL_FREAD_DUAL         BIT(14)
 #define CTRL_RESANDRES          BIT(15)
+#define CTRL_Q_POL              BIT(18)
+#define CTRL_D_POL              BIT(19)
 #define CTRL_FREAD_QUAD         BIT(20)
+#define CTRL_WP_REG             BIT(21)
 #define CTRL_WRSR_2B            BIT(22)
 #define CTRL_FREAD_DIO          BIT(23)
 #define CTRL_FREAD_QIO          BIT(24)
@@ -737,6 +842,7 @@ enum {
 #define USER_FWRITE_DIO         BIT(14)
 #define USER_FWRITE_QIO         BIT(15)
 #define USER_MISO_HIGHPART      BIT(24)
+#define USER_USR_DUMMY_IDLE     BIT(26)
 #define USER_MOSI_HIGHPART      BIT(25)
 #define USER_USR_MOSI           BIT(27)
 #define USER_USR_MISO           BIT(28)
@@ -777,6 +883,7 @@ enum {
 #define SUS_PER_COMMAND(v)      extract32((v), 16, 16)
 #define DDR_FMEM_DDR_EN         BIT(0)
 #define DDR_FMEM_DDR_CMD_DIS    BIT(4)
+#define DDR_FMEM_VAR_DUMMY      BIT(1)
 #define DDR_DQS_LOOP            BIT(21)
 
 #define INT1_PER_END            BIT(0)
@@ -794,29 +901,40 @@ enum {
 #define FLASH_RDSR      0x05
 #define FLASH_WREN      0x06
 #define FLASH_FAST_READ 0x0b
+#define FLASH_FAST_READ4 0x0c
 #define FLASH_READ4     0x13
 #define FLASH_SE        0x20
 #define FLASH_DOR       0x3b
+#define FLASH_DOR4      0x3c
 #define FLASH_CE        0x60
 #define FLASH_QOR       0x6b
+#define FLASH_QOR4      0x6c
 #define FLASH_RDID      0x9f
 #define FLASH_HPM       0xa3
 #define FLASH_RES       0xab
 #define FLASH_DP        0xb9
 #define FLASH_DIOR      0xbb
+#define FLASH_DIOR4     0xbc
 #define FLASH_BE        0xd8
 #define FLASH_QIOR      0xeb
+#define FLASH_QIOR4     0xec
 
-/* The PSRAM die's OPI commands. */
-#define PSRAM_SYNC_READ     0x0000
-#define PSRAM_BURST_READ    0x2020
-#define PSRAM_REG_READ      0x4040
-#define PSRAM_SYNC_WRITE    0x8080
-#define PSRAM_BURST_WRITE   0xa0a0
-#define PSRAM_REG_WRITE     0xc0c0
+/* The PSRAM die's MR6 value that puts it in half sleep. */
 #define PSRAM_HALFSLEEP     0xf0
 /* MR8's X16: the die's data on DQ0 to DQ15, else on DQ0 to DQ7. */
 #define PSRAM_MR8_X16       BIT(6)
+#define PSRAM_MR8_BT        BIT(2)
+#define PSRAM_MR0_LT        BIT(5)
+/* The instructions of the die's 16-bit commands, their first byte. */
+#define PSRAM_INST_SYNC_READ    0x00
+#define PSRAM_INST_BURST_READ   0x20
+#define PSRAM_INST_REG_READ     0x40
+#define PSRAM_INST_SYNC_WRITE   0x80
+#define PSRAM_INST_BURST_WRITE  0xa0
+#define PSRAM_INST_REG_WRITE    0xc0
+#define PSRAM_INST_RESET        0xff
+/* The die's page: its row, 2048 bytes (or 1024 16-bit words in X16). */
+#define PSRAM_PAGE          2048
 
 /* The key purposes of TRM table 9.4-2 and ESP-IDF's for v3. */
 #define PURPOSE_XTS_AES_256_KEY_1       2
@@ -1133,28 +1251,6 @@ static uint32_t psram_size(ESP32P4MSPIState *s)
     return memory_region_size(s->psram_mr);
 }
 
-static void psram_access(ESP32P4MSPIState *s, uint32_t addr, uint8_t *buf,
-                         uint32_t len, bool write)
-{
-    uint8_t *mem = memory_region_get_ram_ptr(s->psram_mr);
-    uint32_t size = psram_size(s);
-
-    while (len) {
-        uint32_t off = addr % size;
-        uint32_t n = MIN(len, size - off);
-
-        if (write) {
-            memcpy(mem + off, buf, n);
-            memory_region_set_dirty(s->psram_mr, off, n);
-        } else {
-            memcpy(buf, mem + off, n);
-        }
-        addr += n;
-        buf += n;
-        len -= n;
-    }
-}
-
 /*
  * [spec:nuos:req:emu.esp32p4.memory]
  * The `len` bytes the die sends in a read, as the controller captures them
@@ -1217,13 +1313,23 @@ static bool psram_x16(ESP32P4MSPIState *s)
     return s->psram_mr_regs[8] & PSRAM_MR8_X16;
 }
 
-/* [spec:nuos:req:emu.esp32p4.memory] */
+/*
+ * [spec:nuos:req:emu.esp32p4.memory]
+ * The die's mode registers at power-up and after a global reset
+ * (APS256XXN datasheet, tables 3 to 21): MR0 0x08, variable latency with
+ * read latency code 2 (LC 5) and full drive strength; MR4 0x40, write
+ * latency code 2 (WLC 5), 4x refresh, the whole array refreshed; MR8
+ * 0x05, X8, 32-byte hybrid wrap bursts.
+ */
 static void psram_reset_mrs(ESP32P4MSPIState *s)
 {
     memset(s->psram_mr_regs, 0, sizeof(s->psram_mr_regs));
+    s->psram_mr_regs[0] = 0x08;
     s->psram_mr_regs[1] = 0x0d;
     s->psram_mr_regs[2] = 0xdf;
     s->psram_mr_regs[3] = 0x20;
+    s->psram_mr_regs[4] = 0x40;
+    s->psram_mr_regs[8] = 0x05;
     s->psram_halfsleep = false;
 }
 
@@ -1256,27 +1362,156 @@ static void psram_write_mr(ESP32P4MSPIState *s, unsigned mr, uint8_t v)
 
 /* The flash on the SSI bus */
 
-/* The data lines a read's data phase uses, from CTRL and CACHE_FCTRL. */
+/*
+ * An MSPI transaction: its phases, and how many lines each takes. The
+ * address phase goes on the wire as the top `addr_bits` bits of
+ * `addr_wire`; `addr` is the address it is for, as the MSPI PMS and the
+ * PSRAM die take it.
+ */
+typedef struct {
+    uint32_t cmd;
+    unsigned cmd_bits;
+    uint32_t addr;
+    uint64_t addr_wire;
+    unsigned addr_bits;
+    unsigned dummy;
+    /*
+     * The dummy phase: its first `dummy_out` cycles with the controller
+     * driving IO0 to IO3 at `dummy_level` (bit n for IOn, as CTRL's
+     * FDUMMY_RIN or FDUMMY_WOUT, D_POL, Q_POL and WP_REG give them); no
+     * SPI clock at all in it with `dummy_idle` (USER's USR_DUMMY_IDLE).
+     */
+    unsigned dummy_out;
+    uint8_t dummy_level;
+    bool dummy_idle;
+    /* The levels it drives WP# (IO2) and HOLD# (IO3) at, bits 2 and 3. */
+    uint8_t idle_level;
+    unsigned mosi_bytes;
+    uint32_t miso_bytes;
+    unsigned cmd_lines;
+    unsigned addr_lines;
+    unsigned dout_lines;
+    unsigned din_lines;
+    /* For the MSPI PMS: whether it reads, or writes, at its address. */
+    bool reads;
+    bool writes;
+    uint8_t mosi[64];
+    uint8_t miso[64];
+} ESP32P4MSPIXfer;
+
+/*
+ * The mode bits the address phase's bits past the controller's 32 carry
+ * (see xfer_set_addr()): M7-M0 = 0x20, M5-4 = 10b, which the GigaDevice
+ * and Winbond parts take as continuous read mode.
+ */
+#define ADDR_UNDEFINED_BITS 0x20
+
+/*
+ * The address phase of `bits` bits from the 32-bit value `reg` the
+ * controller holds, sent from its top. The controller holds no more than
+ * 32 bits: what an address phase longer than that sends after them, the
+ * TRM leaves undefined. Silicon sends something there, which a flash
+ * reading with mode bits takes as its M7-M0, so the model sends the worst
+ * case, the bits that put it in continuous read mode, ADDR_UNDEFINED_BITS
+ * over and over from the 33rd bit on; continuous read mode takes the
+ * next transaction's command as address bits. Returns whether it did.
+ */
+static bool xfer_set_addr(ESP32P4MSPIXfer *x, uint32_t reg, unsigned bits)
+{
+    unsigned i;
+
+    x->addr_bits = bits;
+    x->addr_wire = (uint64_t)reg << 32;
+    for (i = 32; i < bits; i++) {
+        uint64_t b = (ADDR_UNDEFINED_BITS >> (7 - (i - 32) % 8)) & 1;
+
+        x->addr_wire |= b << (63 - i);
+    }
+    return bits > 32;
+}
+
+static void log_addr_undefined(ESP32P4MSPIState *s, const char *port,
+                               unsigned bits)
+{
+    qemu_log_mask(LOG_GUEST_ERROR, "%s: %s's address phase is %u bits, "
+                  "longer than the 32-bit address; the %u bits after the "
+                  "address are undefined, and are sent as the mode bits "
+                  "0x%02x that put a flash in continuous read mode\n",
+                  mspi_name(s), port, bits, bits - 32, ADDR_UNDEFINED_BITS);
+}
+
+/*
+ * The lines a read's address and data phases take: CTRL's read mode,
+ * whose FREAD_* bits count with FASTRD_MODE set, or CACHE_FCTRL's bits
+ * for each phase.
+ */
+static unsigned addr_lines(uint32_t ctrl, uint32_t fctrl)
+{
+    uint32_t fr = ctrl & CTRL_FASTRD_MODE ? ctrl : 0;
+
+    if (ctrl & CTRL_FADDR_OCT) {
+        return 8;
+    }
+    if ((fr & CTRL_FREAD_QIO) || (fctrl & FCTRL_FADDR_QUAD)) {
+        return 4;
+    }
+    if ((fr & CTRL_FREAD_DIO) || (fctrl & FCTRL_FADDR_DUAL)) {
+        return 2;
+    }
+    return 1;
+}
+
 static unsigned din_lines(uint32_t ctrl, uint32_t fctrl)
 {
+    uint32_t fr = ctrl & CTRL_FASTRD_MODE ? ctrl : 0;
+
     if (ctrl & CTRL_FDIN_OCT) {
         return 8;
     }
-    if ((ctrl & (CTRL_FREAD_QIO | CTRL_FREAD_QUAD)) ||
+    if ((fr & (CTRL_FREAD_QIO | CTRL_FREAD_QUAD)) ||
         (fctrl & FCTRL_FDIN_QUAD)) {
         return 4;
     }
-    if ((ctrl & (CTRL_FREAD_DIO | CTRL_FREAD_DUAL)) ||
+    if ((fr & (CTRL_FREAD_DIO | CTRL_FREAD_DUAL)) ||
         (fctrl & FCTRL_FDIN_DUAL)) {
         return 2;
     }
     return 1;
 }
 
+/*
+ * The lines CTRL's dummy-out levels set: D_POL on IO0 (MOSI), Q_POL on
+ * IO1 (MISO), WP_REG on IO2; HOLD# (IO3) high.
+ */
+static uint8_t ctrl_dummy_level(uint32_t ctrl)
+{
+    return (ctrl & CTRL_D_POL ? BIT(0) : 0) | (ctrl & CTRL_Q_POL ? BIT(1) : 0) |
+           (ctrl & CTRL_WP_REG ? BIT(2) : 0) | BIT(3);
+}
+
+static uint8_t ctrl_idle_level(uint32_t ctrl)
+{
+    return (ctrl & CTRL_WP_REG ? BIT(2) : 0) | BIT(3);
+}
+
 /* Whether a flash chip is on the bus. */
 static bool flash_present(ESP32P4MSPIState *s)
 {
     return !QTAILQ_EMPTY(&BUS(s->bus)->children);
+}
+
+/* The levels the flash's four data lines rest at, bit n for IOn. */
+static uint8_t flash_pads_idle(ESP32P4MSPIState *s)
+{
+    uint8_t v = 0;
+
+    if (!s->pins) {
+        return 0;
+    }
+    for (unsigned io = 0; io < ESP32P4_MSPI_IOMUX_FLASH_IOS && io < 4; io++) {
+        v |= (uint8_t)esp32p4_mspi_iomux_flash_idle(s->pins, io) << io;
+    }
+    return v;
 }
 
 /*
@@ -1287,26 +1522,18 @@ static bool flash_present(ESP32P4MSPIState *s)
  */
 static uint8_t flash_idle_byte(ESP32P4MSPIState *s, unsigned lines)
 {
-    unsigned clock = 0;
+    unsigned clock = flash_pads_idle(s);
 
-    if (!s->pins) {
-        return 0;
-    }
-    if (lines == 1) {
-        return esp32p4_mspi_iomux_flash_idle(s->pins, 1) ? 0xff : 0;
-    }
-    for (unsigned io = 0; io < MIN(lines, ESP32P4_MSPI_IOMUX_FLASH_IOS);
-         io++) {
-        clock |= (unsigned)esp32p4_mspi_iomux_flash_idle(s->pins, io) << io;
-    }
     switch (lines) {
+    case 1:
+        return clock & BIT(1) ? 0xff : 0;
     case 2:
-        return clock * 0x55;
+        return (clock & 3) * 0x55;
     case 4:
-        return clock * 0x11;
+        return (clock & 15) * 0x11;
     default:
         /* The flash has no IO4 to IO7 pads. */
-        return clock;
+        return clock & 15;
     }
 }
 
@@ -1324,12 +1551,255 @@ static void spi1_release_cs(ESP32P4MSPIState *s)
     }
 }
 
+/*
+ * The flash's side of a transaction, a clock at a time: the bits of each
+ * byte it takes or sends, on the lines its command and phase use
+ * (m25p80_io_lines()), the byte passing to or from the M25P80 model once
+ * its clocks are done.
+ */
+typedef struct {
+    DeviceState *flash;
+    SSIBus *bus;
+    unsigned lines;
+    unsigned clock;
+    bool drives;
+    uint8_t in;
+    uint8_t out;
+} ESP32P4FlashWire;
+
+/*
+ * One clock of the flash, `level` on its lines: returns the levels it
+ * drives, and in *oe the lines it drives.
+ */
+static uint8_t flash_wire_clock(ESP32P4FlashWire *f, uint8_t level,
+                                uint8_t *oe)
+{
+    unsigned shift;
+    uint8_t mask;
+
+    if (f->clock == 0) {
+        f->lines = m25p80_io_lines(f->flash);
+        f->drives = m25p80_drives_output(f->flash);
+        f->in = 0;
+        if (f->drives) {
+            f->out = ssi_transfer(f->bus, 0xff);
+        }
+    }
+    mask = MAKE_64BIT_MASK(0, f->lines);
+    shift = 8 - (f->clock + 1) * f->lines;
+    *oe = 0;
+    if (f->drives) {
+        uint8_t bits = (f->out >> shift) & mask;
+
+        *oe = f->lines == 1 ? BIT(1) : mask;
+        level = f->lines == 1 ? bits << 1 : bits;
+    } else {
+        f->in |= (level & mask) << shift;
+        level = 0;
+    }
+    if (++f->clock * f->lines == 8) {
+        if (!f->drives) {
+            ssi_transfer(f->bus, f->in);
+        }
+        f->clock = 0;
+    }
+    return level;
+}
+
+/*
+ * The flash's byte the chip select ends part way: the clocks it took, the
+ * rest high, as an input byte goes to the model whole (the parts refuse
+ * to act on a program, erase or status write clocked past its last byte).
+ */
+static void flash_wire_end(ESP32P4FlashWire *f)
+{
+    if (f->clock && !f->drives) {
+        ssi_transfer(f->bus,
+                     f->in | MAKE_64BIT_MASK(0, 8 - f->clock * f->lines));
+    }
+}
+
+/*
+ * The bits clock `k` of a phase carries from a value of `nbits` bits
+ * aligned to bit 63, `w` a clock: the earliest on the highest line.
+ */
+static uint8_t wire_bits(uint64_t v, unsigned nbits, uint64_t k, unsigned w)
+{
+    uint8_t r = 0;
+
+    for (unsigned j = 0; j < w; j++) {
+        uint64_t idx = k * w + j;
+
+        r = r << 1 | (idx < nbits ? (v >> (63 - idx)) & 1 : 0);
+    }
+    return r;
+}
+
+/* What the controller drives on IO0 to IO3 for a phase of `w` lines. */
+static uint8_t wire_oe(unsigned w)
+{
+    return w == 1 ? 0xd : 0xf;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.memory]
+ * Transaction `x` on the flash on chip select 0, which the caller
+ * selects, a clock of the SPI bus at a time: the command, the address and
+ * the write data from the controller's lines in each phase, its dummy
+ * phase's levels, and the read data from the lines it samples into `in`,
+ * as the flash takes and sends each byte on its own lines for its command
+ * (m25p80_io_lines()), whatever the controller's phases are. A phase on
+ * one or two lines leaves IO2 and IO3, WP# and HOLD#, driven at the
+ * controller's idle levels; a line neither drives rests at its pad's
+ * pull. While HOLD# is its function (QE clear) and IO3 is low, the flash
+ * ignores the clock.
+ */
+static void flash_wire_xfer(ESP32P4MSPIState *s, const ESP32P4MSPIXfer *x,
+                            uint8_t *in)
+{
+    ESP32P4FlashWire f = { .flash = ssi_get_cs(s->bus, 0), .bus = s->bus };
+    unsigned widest = MAX(MAX(x->cmd_lines, x->addr_lines),
+                          MAX(x->din_lines, x->dout_lines));
+    uint8_t idle_oe = widest <= 2 ? 0xc : 0;
+    uint8_t pads = flash_pads_idle(s);
+    bool hold_en = m25p80_hold_enabled(f.flash);
+    uint64_t addr_at = DIV_ROUND_UP(x->cmd_bits, x->cmd_lines);
+    uint64_t dummy_at = addr_at + DIV_ROUND_UP(x->addr_bits, x->addr_lines);
+    uint64_t out_at = dummy_at + x->dummy;
+    uint64_t in_at = out_at + DIV_ROUND_UP(x->mosi_bytes * 8, x->dout_lines);
+    uint64_t total = in_at + DIV_ROUND_UP((uint64_t)x->miso_bytes * 8,
+                                          x->din_lines);
+    uint64_t got = 0;
+
+    memset(in, 0, x->miso_bytes);
+    for (uint64_t c = 0; c < total; c++) {
+        uint8_t level = x->idle_level, oe = idle_oe, foe = 0, fv = 0;
+        uint8_t at_flash, bus, bits;
+        unsigned in_w = 0;
+
+        if (c < addr_at) {
+            oe = wire_oe(x->cmd_lines);
+            level = wire_bits((uint64_t)x->cmd << (64 - x->cmd_bits),
+                              x->cmd_bits, c, x->cmd_lines) |
+                    (x->cmd_lines <= 2 ? x->idle_level : 0);
+        } else if (c < dummy_at) {
+            oe = wire_oe(x->addr_lines);
+            level = wire_bits(x->addr_wire, x->addr_bits, c - addr_at,
+                              x->addr_lines) |
+                    (x->addr_lines <= 2 ? x->idle_level : 0);
+        } else if (c < out_at) {
+            if (x->dummy_idle) {
+                continue;
+            }
+            if (c - dummy_at < x->dummy_out) {
+                oe = 0xf;
+                level = x->dummy_level;
+            }
+        } else if (c < in_at) {
+            unsigned w = x->dout_lines;
+            uint64_t k = c - out_at, b = k * w / 8;
+
+            oe = wire_oe(w);
+            level = wire_bits((uint64_t)x->mosi[b] << 56, 8, k - b * 8 / w,
+                              w) |
+                    (w <= 2 ? x->idle_level : 0);
+        } else {
+            in_w = x->din_lines;
+        }
+        level &= oe;
+        at_flash = level | (pads & ~oe);
+        if (!(hold_en && !(at_flash & BIT(3)))) {
+            fv = flash_wire_clock(&f, at_flash, &foe);
+        }
+        if (!in_w) {
+            continue;
+        }
+        bus = (fv & foe) | (level & ~foe) | (pads & ~(foe | oe));
+        bits = in_w == 1 ? (bus >> 1) & 1
+                         : bus & MAKE_64BIT_MASK(0, MIN(in_w, 4));
+        for (unsigned j = 0; j < in_w && got < x->miso_bytes * 8ull;
+             j++, got++) {
+            if ((bits >> (in_w - 1 - j)) & 1) {
+                in[got / 8] |= 0x80 >> (got % 8);
+            }
+        }
+    }
+    flash_wire_end(&f);
+}
+
+/* The command SPI0 and SPI1's built-in read send for CTRL's read mode. */
+static uint32_t read_mode_cmd(uint32_t ctrl, bool four)
+{
+    if (!(ctrl & CTRL_FASTRD_MODE)) {
+        return four ? FLASH_READ4 : FLASH_READ;
+    } else if (ctrl & CTRL_FREAD_QIO) {
+        return four ? FLASH_QIOR4 : FLASH_QIOR;
+    } else if (ctrl & CTRL_FREAD_DIO) {
+        return four ? FLASH_DIOR4 : FLASH_DIOR;
+    } else if (ctrl & CTRL_FREAD_QUAD) {
+        return four ? FLASH_QOR4 : FLASH_QOR;
+    } else if (ctrl & CTRL_FREAD_DUAL) {
+        return four ? FLASH_DOR4 : FLASH_DOR;
+    }
+    return four ? FLASH_FAST_READ4 : FLASH_FAST_READ;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.memory]
+ * SPI0's read of `len` bytes of the flash at `addr`, as its registers set
+ * it up: the command USER2 gives with CACHE_FCTRL's CACHE_FLASH_USR_CMD,
+ * else CTRL's read mode's, on four lines with FCMD_QUAD; USER1's address
+ * phase on the read mode's lines, of the 24-bit address followed by
+ * RD_STATUS's WB_MODE, or with CACHE_USR_ADDR_4BYTE of the 32-bit
+ * address; USER1's dummy cycles with USR_DUMMY, the first half of them
+ * driven at CTRL's dummy-out levels with FDUMMY_RIN; the data on the read
+ * mode's lines.
+ */
+static void spi0_flash_xfer(ESP32P4MSPIState *s, uint32_t addr, uint32_t len,
+                            ESP32P4MSPIXfer *x)
+{
+    uint32_t ctrl = s->spi0[R0_CTRL], fctrl = s->spi0[R0_CACHE_FCTRL];
+    uint32_t user = s->spi0[R0_USER], user1 = s->spi0[R0_USER1];
+    bool four = fctrl & CACHE_FCTRL_USR_ADDR_4BYTE;
+    uint32_t wb = extract32(s->spi0[R0_RD_STATUS], 16, 8);
+
+    memset(x, 0, sizeof(*x));
+    x->cmd_lines = ctrl & CTRL_FCMD_QUAD ? 4 : 1;
+    x->addr_lines = addr_lines(ctrl, fctrl);
+    x->din_lines = din_lines(ctrl, fctrl);
+    x->dout_lines = 1;
+    if (fctrl & CACHE_FCTRL_FLASH_USR_CMD) {
+        x->cmd = USER2_COMMAND_VALUE(s->spi0[R0_USER2]);
+        x->cmd_bits = USER2_COMMAND_BITLEN(s->spi0[R0_USER2]) + 1;
+    } else {
+        x->cmd = read_mode_cmd(ctrl, four);
+        x->cmd_bits = 8;
+    }
+    x->addr = four ? addr : addr & 0xffffff;
+    if (xfer_set_addr(x, four ? addr : (addr & 0xffffff) << 8 | wb,
+                      USER1_ADDR_BITLEN(user1) + 1) &&
+        !(s->spi0_logged & MSPI_LOGGED_ADDR)) {
+        s->spi0_logged |= MSPI_LOGGED_ADDR;
+        log_addr_undefined(s, "SPI0", x->addr_bits);
+    }
+    if (user & USER_USR_DUMMY) {
+        x->dummy = USER1_DUMMY_CYCLELEN(user1) + 1;
+    }
+    if (ctrl & CTRL_FDUMMY_RIN) {
+        x->dummy_out = DIV_ROUND_UP(x->dummy, 2);
+    }
+    x->dummy_level = ctrl_dummy_level(ctrl);
+    x->dummy_idle = user & USER_USR_DUMMY_IDLE;
+    x->idle_level = ctrl_idle_level(ctrl);
+    x->miso_bytes = len;
+    x->reads = true;
+}
+
 /* SPI0's read of `len` bytes of the flash at `addr`. */
 static void flash_read(ESP32P4MSPIState *s, uint32_t addr, uint8_t *buf,
                        uint32_t len)
 {
-    bool four = s->spi0[R0_CACHE_FCTRL] & CACHE_FCTRL_USR_ADDR_4BYTE;
-    uint32_t i;
+    ESP32P4MSPIXfer x;
 
     if (!flash_present(s)) {
         memset(buf, flash_idle_byte(s, din_lines(s->spi0[R0_CTRL],
@@ -1337,16 +1807,444 @@ static void flash_read(ESP32P4MSPIState *s, uint32_t addr, uint8_t *buf,
                len);
         return;
     }
+    spi0_flash_xfer(s, addr, len, &x);
     spi1_release_cs(s);
     flash_select(s, 0, true);
-    ssi_transfer(s->bus, four ? FLASH_READ4 : FLASH_READ);
-    for (i = four ? 0 : 1; i < 4; i++) {
-        ssi_transfer(s->bus, extract32(addr, 24 - 8 * i, 8));
-    }
-    for (i = 0; i < len; i++) {
-        buf[i] = ssi_transfer(s->bus, 0);
-    }
+    flash_wire_xfer(s, &x, buf);
     flash_select(s, 0, false);
+}
+
+/* The PSRAM die's transactions */
+
+/*
+ * The die's latencies in SPI clocks (APS256XXN datasheet, tables 5, 6 and
+ * 15): reads by MR0's read latency code, variable (LC) and fixed (FLC);
+ * writes by MR4's write latency code (its bits in the datasheet's order).
+ * The reserved codes 111 are taken as the longest.
+ */
+static const uint8_t psram_lc[8] = { 3, 4, 5, 6, 7, 9, 10, 10 };
+static const uint8_t psram_flc[8] = { 6, 8, 10, 12, 14, 16, 18, 18 };
+static const uint8_t psram_wlc[8] = { 3, 7, 5, 9, 4, 8, 6, 9 };
+
+/*
+ * The die's latency for instruction `inst` at SPI clock `hz`: a register
+ * write's is 1; a register read's LC, less one above 200 MHz; a memory
+ * read's LC with variable latency (no refresh collides with it here; the
+ * die would push its data out to twice LC when one does) or FLC; a
+ * memory write's WLC.
+ */
+static unsigned psram_latency(ESP32P4MSPIState *s, uint8_t inst,
+                              uint64_t hz)
+{
+    uint8_t mr0 = s->psram_mr_regs[0];
+    unsigned rl = extract32(mr0, 2, 3);
+
+    switch (inst) {
+    case PSRAM_INST_REG_WRITE:
+        return 1;
+    case PSRAM_INST_REG_READ:
+        return psram_lc[rl] - (hz > 200000000 ? 1 : 0);
+    case PSRAM_INST_SYNC_WRITE:
+    case PSRAM_INST_BURST_WRITE:
+        return psram_wlc[extract32(s->psram_mr_regs[4], 5, 3)];
+    default:
+        return mr0 & PSRAM_MR0_LT ? psram_flc[rl] : psram_lc[rl];
+    }
+}
+
+/*
+ * The die's address of byte `i` of a burst from `start` (tables 20 and
+ * 21): a linear burst (20h, A0h) wraps within its 2048-byte page; a
+ * synchronous one within MR8's burst length (16, 32 or 64 bytes, or words
+ * in X16; or the page), and with hybrid wrap (MR8's BT) only once, going
+ * on through the page from the end of the wrapped burst. The die is
+ * addressed by bytes as the MMU's pages reach it.
+ */
+static uint32_t psram_burst_addr(ESP32P4MSPIState *s, uint32_t start,
+                                 uint32_t i, bool linear)
+{
+    static const uint32_t lens[4] = { 16, 32, 64, PSRAM_PAGE };
+    uint8_t mr8 = s->psram_mr_regs[8];
+    uint32_t page = start & ~(PSRAM_PAGE - 1u);
+
+    if (!linear) {
+        uint32_t bl = lens[mr8 & 3] * ((mr8 & 3) != 3 && psram_x16(s) ? 2 : 1);
+        uint32_t block = start & ~(bl - 1);
+
+        if (!(mr8 & PSRAM_MR8_BT) || i < bl) {
+            return block + (start - block + i) % bl;
+        }
+        i -= bl;
+        start = block + bl;
+    }
+    return page + (start - page + i) % PSRAM_PAGE;
+}
+
+static uint8_t psram_byte(ESP32P4MSPIState *s, uint32_t addr)
+{
+    uint8_t *mem = memory_region_get_ram_ptr(s->psram_mr);
+
+    return mem[addr % psram_size(s)];
+}
+
+static void psram_set_byte(ESP32P4MSPIState *s, uint32_t addr, uint8_t v)
+{
+    uint8_t *mem = memory_region_get_ram_ptr(s->psram_mr);
+    uint32_t off = addr % psram_size(s);
+
+    mem[off] = v;
+    memory_region_set_dirty(s->psram_mr, off, 1);
+}
+
+/*
+ * Whether to log a hazard `bit`: each time without `logged`, else once
+ * until `logged` is cleared.
+ */
+static bool psram_log(uint32_t *logged, uint32_t bit)
+{
+    if (!logged) {
+        return true;
+    }
+    if (*logged & bit) {
+        return false;
+    }
+    *logged |= bit;
+    return true;
+}
+
+/* The mode register a register read sends after register `ma`'s. */
+static unsigned psram_mr_next(unsigned ma)
+{
+    return ma == 4 ? 8 : ma == 8 ? 0 : ma + 1;
+}
+
+/*
+ * The levels the die drives on DQ0 to DQ15 (DQ0 to DQ7 in bits 7:0) at its
+ * data beat `j` of a read with instruction `inst` from `addr`: nothing
+ * before its first beat, and on DQ8 to DQ15 nothing in X8 nor for a
+ * register read, whose two registers repeat on DQ0 to DQ7 (figure 12).
+ * The lines nothing drives read 0.
+ */
+static uint16_t psram_die_beat(ESP32P4MSPIState *s, uint8_t inst,
+                               uint32_t addr, int64_t j)
+{
+    bool linear = inst == PSRAM_INST_BURST_READ;
+
+    if (j < 0) {
+        return 0;
+    }
+    if (inst == PSRAM_INST_REG_READ) {
+        unsigned mr = j & 1 ? psram_mr_next(addr & 0xff) : addr & 0xff;
+
+        return mr < ESP32P4_MSPI_PSRAM_MRS ? s->psram_mr_regs[mr] : 0;
+    }
+    if (psram_x16(s)) {
+        return psram_byte(s, psram_burst_addr(s, addr, 2 * j, linear)) |
+               psram_byte(s, psram_burst_addr(s, addr, 2 * j + 1, linear)) <<
+               8;
+    }
+    return psram_byte(s, psram_burst_addr(s, addr, j, linear));
+}
+
+/*
+ * The controller's data beat `i` of `data` on `lines` data lines: two
+ * bytes on DQ0 to DQ15 (the first on DQ0 to DQ7), one on DQ0 to DQ7, or
+ * the bits of each beat on DQ0 up (one line: DQ0).
+ */
+static uint16_t psram_ctrl_beat(const uint8_t *data, uint32_t len,
+                                unsigned lines, uint64_t i)
+{
+    uint16_t v = 0;
+
+    if (lines >= 8) {
+        for (unsigned b = 0; b < lines / 8; b++) {
+            uint64_t at = i * (lines / 8) + b;
+
+            v |= (at < len ? data[at] : 0) << (8 * b);
+        }
+        return v;
+    }
+    for (unsigned j = 0; j < lines; j++) {
+        uint64_t bit = i * lines + j;
+
+        v = v << 1 | (bit < len * 8ull ? (data[bit / 8] >> (7 - bit % 8)) & 1
+                                       : 0);
+    }
+    return v;
+}
+
+/* Store beat `i` the controller samples, `v` on DQ0 to DQ15, in `data`. */
+static void psram_ctrl_take(uint8_t *data, uint32_t len, unsigned lines,
+                            uint64_t i, uint16_t v)
+{
+    if (lines >= 8) {
+        for (unsigned b = 0; b < lines / 8; b++) {
+            uint64_t at = i * (lines / 8) + b;
+
+            if (at < len) {
+                data[at] = v >> (8 * b);
+            }
+        }
+        return;
+    }
+    if (lines == 1) {
+        v >>= 1;
+    }
+    for (unsigned j = 0; j < lines; j++) {
+        uint64_t bit = i * lines + j;
+
+        if (bit < len * 8ull && (v >> (lines - 1 - j)) & 1) {
+            data[bit / 8] |= 0x80 >> (bit % 8);
+        }
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.memory]
+ * Transaction `x` on the PSRAM die, as the die takes it (APS256XXN
+ * datasheet, 7.3 to 7.7): its data phase `data`, `len` bytes, written to
+ * it (`write`) or read, on `lines` data lines, at SPI clock `hz`. The die
+ * takes only its OPI DDR form: a 16-bit command on DQ0 to DQ7 in one clock,
+ * both its edges (the instruction its first byte), and a 32-bit address in
+ * two; anything else it does not decode, and it answers nothing (`what`
+ * names the transaction in the log). It then counts its latency for the
+ * instruction from its mode registers, and sends or takes its data from
+ * there, a beat on each clock edge: the controller's dummy phase, in clock
+ * edges in DDR, matches it at 2 * (latency - 1) edges (as ESP-IDF's
+ * settings have it), and a dummy phase longer or shorter shifts the data
+ * by as many beats. A read beat before the die drives the lines reads 0;
+ * the die takes the beats a write sends late from the lines the dummy
+ * phase leaves, as 0, and misses those it sends early; the controller
+ * masks the bytes of a beat past its data. A register write takes its
+ * first beat's DQ0 to DQ7 alone. A read the die answers as a
+ * write (an instruction for the other direction) writes the undriven
+ * lines' 0s; a write it answers as a read writes nothing.
+ */
+static void psram_die_xfer(ESP32P4MSPIState *s, const ESP32P4MSPIXfer *x,
+                           bool ddr, bool cmd_ddr, unsigned lines,
+                           uint8_t *data, uint32_t len, bool write,
+                           uint64_t hz, const char *what, uint32_t *logged)
+{
+    uint32_t addr = x->addr_wire >> 32;
+    uint64_t beats = DIV_ROUND_UP((uint64_t)len * 8, lines);
+    uint8_t inst = x->cmd >> 8;
+    bool die_writes;
+    int64_t k, end;
+
+    if (!write) {
+        memset(data, 0, len);
+    }
+    if (!ddr || !cmd_ddr || x->cmd_bits != 16 || x->cmd_lines != 8 ||
+        x->addr_bits != 32 || x->addr_lines != 8) {
+        if (psram_log(logged, MSPI_LOGGED_PSRAM_CMD)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: %s to the PSRAM die is not an "
+                          "OPI DDR command (a %u-bit command on %u lines, a "
+                          "%u-bit address on %u lines, %s): the die takes no "
+                          "command and answers nothing\n", mspi_name(s),
+                          what, x->cmd_bits, x->cmd_lines, x->addr_bits,
+                          x->addr_lines, ddr ? (cmd_ddr ? "DDR"
+                                                        : "command in SDR")
+                                             : "SDR");
+        }
+        return;
+    }
+    switch (inst) {
+    case PSRAM_INST_SYNC_READ:
+    case PSRAM_INST_BURST_READ:
+    case PSRAM_INST_REG_READ:
+        die_writes = false;
+        break;
+    case PSRAM_INST_SYNC_WRITE:
+    case PSRAM_INST_BURST_WRITE:
+    case PSRAM_INST_REG_WRITE:
+        die_writes = true;
+        break;
+    case PSRAM_INST_RESET:
+        psram_reset_mrs(s);
+        return;
+    default:
+        if (psram_log(logged, MSPI_LOGGED_PSRAM_CMD)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: %s: unknown PSRAM instruction "
+                          "0x%02x\n", mspi_name(s), what, inst);
+        }
+        return;
+    }
+    k = (int64_t)x->dummy - 2 * ((int64_t)psram_latency(s, inst, hz) - 1);
+    if (k && inst != PSRAM_INST_REG_READ &&
+        psram_log(logged, MSPI_LOGGED_PSRAM_LAT)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: %s's dummy phase of %u edges "
+                      "does not match the PSRAM die's latency of %u clocks "
+                      "(%u edges): its data is %" PRId64 " beats %s\n",
+                      mspi_name(s), what, x->dummy,
+                      psram_latency(s, inst, hz),
+                      2 * (psram_latency(s, inst, hz) - 1),
+                      k < 0 ? -k : k, k < 0 ? "early" : "late");
+    }
+    if (die_writes != write && psram_log(logged, MSPI_LOGGED_PSRAM_CMD)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: %s with PSRAM instruction 0x%02x "
+                      "for the other direction\n", mspi_name(s), what, inst);
+    }
+    if (!die_writes) {
+        if (!write) {
+            for (uint64_t i = 0; i < beats; i++) {
+                psram_ctrl_take(data, len, lines, i,
+                                psram_die_beat(s, inst, addr, i + k));
+            }
+        }
+        return;
+    }
+    /* The die takes beats 0 to end - 1, beat j the controller's j - k. */
+    end = (int64_t)beats + k;
+    if (inst == PSRAM_INST_REG_WRITE) {
+        uint16_t v = write && -k >= 0 && -k < (int64_t)beats
+                     ? psram_ctrl_beat(data, len, lines, -k) : 0;
+
+        if (end > 0) {
+            psram_write_mr(s, addr & 0xff, v & 0xff);
+        }
+        return;
+    }
+    for (int64_t j = 0; j < end; j++) {
+        int64_t i = j - k;
+        uint16_t v = write && i >= 0 ? psram_ctrl_beat(data, len, lines, i)
+                                     : 0;
+        bool linear = inst == PSRAM_INST_BURST_WRITE;
+        /*
+         * The data mask: the controller masks a beat's bytes past its
+         * data (an AXI write narrower than the beat).
+         */
+        bool lo = !write || i < 0 || lines < 8 ||
+                  (uint64_t)i * (lines / 8) < len;
+        bool hi = !write || i < 0 || lines < 16 ||
+                  (uint64_t)i * 2 + 1 < len;
+
+        if (psram_x16(s)) {
+            if (lo) {
+                psram_set_byte(s, psram_burst_addr(s, addr, 2 * j, linear),
+                               v);
+            }
+            if (hi) {
+                psram_set_byte(s, psram_burst_addr(s, addr, 2 * j + 1,
+                                                   linear), v >> 8);
+            }
+        } else if (lo) {
+            psram_set_byte(s, psram_burst_addr(s, addr, j, linear), v);
+        }
+    }
+}
+
+/* The SPI clock of a port's CLOCK or SRAM_CLK register `clk`. */
+static uint64_t mspi_spi_hz(ESP32P4MSPIState *s, uint32_t clk)
+{
+    uint64_t div = clk & CLOCK_CLK_EQU_SYSCLK ? 1 : CLOCK_CLKCNT_N(clk) + 1;
+
+    return clock_get_hz(s->core_clk) / div;
+}
+
+/* The lines of an SPI0 PSRAM phase: SRAM_CMD's and CACHE_SCTRL's bits. */
+static unsigned spi0_psram_lines(uint32_t cmd, uint32_t sctrl, uint32_t hex,
+                                 uint32_t oct, uint32_t quad, uint32_t dual)
+{
+    if (cmd & hex) {
+        return 16;
+    }
+    if (cmd & oct) {
+        return 8;
+    }
+    if ((cmd & quad) || (sctrl & SCTRL_SRAM_QIO)) {
+        return 4;
+    }
+    if ((cmd & dual) || (sctrl & SCTRL_SRAM_DIO)) {
+        return 2;
+    }
+    return 1;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.memory]
+ * SPI0's access to the PSRAM die of `len` bytes at `addr` (no more than
+ * its page holds), as SPI0's registers set it up: the command of
+ * SRAM_DRD_CMD (reads) or SRAM_DWR_CMD (writes) with CACHE_SCTRL's
+ * CACHE_SRAM_USR_RCMD or _WCMD (else an SPI READ, 03h, or WRITE, 02h, of
+ * 8 bits: the TRM does not name SPI0's own), on SRAM_CMD's command lines;
+ * CACHE_SCTRL's address phase, of the 32-bit address with
+ * CACHE_USR_SADDR_4BYTE, else of the 24-bit one followed by SWB_MODE, on
+ * SRAM_CMD's address lines; the read or write dummy cycles CACHE_SCTRL
+ * enables; the data on SRAM_CMD's data lines, 16 with SDIN_HEX or
+ * SDOUT_HEX; and SMEM_DDR's DDR mode. The read goes through the pads'
+ * capture as SPI0's DDR read.
+ */
+static void spi0_psram_access(ESP32P4MSPIState *s, uint32_t addr,
+                              uint8_t *data, uint32_t len, bool write)
+{
+    uint32_t sctrl = s->spi0[R0_CACHE_SCTRL], cmd = s->spi0[R0_SRAM_CMD];
+    uint32_t ddr = s->spi0[R0_SMEM_DDR];
+    uint32_t ucmd = s->spi0[write ? R0_SRAM_DWR_CMD : R0_SRAM_DRD_CMD];
+    bool four = sctrl & SCTRL_SADDR_4BYTE;
+    unsigned lines;
+    ESP32P4MSPIXfer x;
+
+    memset(&x, 0, sizeof(x));
+    if (sctrl & (write ? SCTRL_SRAM_USR_WCMD : SCTRL_SRAM_USR_RCMD)) {
+        x.cmd = SRAM_CMD_VALUE(ucmd);
+        x.cmd_bits = SRAM_CMD_BITLEN(ucmd) + 1;
+    } else {
+        x.cmd = write ? FLASH_PP : FLASH_READ;
+        x.cmd_bits = 8;
+    }
+    x.cmd_lines = spi0_psram_lines(cmd, sctrl, 0, SCMD_SCMD_OCT,
+                                   SCMD_SCMD_QUAD, 0);
+    x.addr_lines = spi0_psram_lines(cmd, sctrl, 0, SCMD_SADDR_OCT,
+                                    SCMD_SADDR_QUAD, SCMD_SADDR_DUAL);
+    lines = write ? spi0_psram_lines(cmd, sctrl, SCMD_SDOUT_HEX,
+                                     SCMD_SDOUT_OCT, SCMD_SDOUT_QUAD,
+                                     SCMD_SDOUT_DUAL)
+                  : spi0_psram_lines(cmd, sctrl, SCMD_SDIN_HEX,
+                                     SCMD_SDIN_OCT, SCMD_SDIN_QUAD,
+                                     SCMD_SDIN_DUAL);
+    x.addr = addr;
+    if (xfer_set_addr(&x, four ? addr : (addr & 0xffffff) << 8 |
+                      SCMD_SWB_MODE(cmd),
+                      SCTRL_ADDR_BITLEN(sctrl) + 1) &&
+        !(s->spi0_logged & MSPI_LOGGED_ADDR)) {
+        s->spi0_logged |= MSPI_LOGGED_ADDR;
+        log_addr_undefined(s, "SPI0", x.addr_bits);
+    }
+    if (sctrl & (write ? SCTRL_WR_SRAM_DUMMY : SCTRL_RD_SRAM_DUMMY)) {
+        x.dummy = (write ? SCTRL_WDUMMY_CYCLELEN(sctrl)
+                         : SCTRL_RDUMMY_CYCLELEN(sctrl)) + 1;
+    }
+    psram_die_xfer(s, &x, ddr & DDR_FMEM_DDR_EN, !(ddr & DDR_FMEM_DDR_CMD_DIS),
+                   lines, data, len, write,
+                   mspi_spi_hz(s, s->spi0[R0_SRAM_CLK]),
+                   write ? "SPI0's write" : "SPI0's read", &s->spi0_logged);
+    if (!write) {
+        psram_capture(s, false, lines == 16, data, len);
+    }
+}
+
+/*
+ * SPI0's access to the PSRAM of `len` bytes at `addr`, split, with
+ * SMEM_AC's SMEM_SPLIT_TRANS_EN (set from reset), into a transaction for
+ * each page of SMEM_ECC_CTRL's SMEM_PAGE_SIZE it touches. Without the
+ * split, a transaction past the die's page wraps there.
+ */
+static void psram_spi0(ESP32P4MSPIState *s, uint32_t addr, uint8_t *data,
+                       uint32_t len, bool write)
+{
+    uint32_t page = 256u << SMEM_ECC_PAGE_SIZE(s->spi0[R0_SMEM_ECC_CTRL]);
+
+    while (len) {
+        uint32_t n = len;
+
+        if (s->spi0[R0_SMEM_AC] & SMEM_AC_SPLIT_TRANS_EN) {
+            n = MIN(len, page - addr % page);
+        }
+        spi0_psram_access(s, addr, data, n, write);
+        addr += n;
+        data += n;
+        len -= n;
+    }
 }
 
 /* The AXI port and the MMU */
@@ -1397,8 +2295,7 @@ static void axi_mem_read(ESP32P4MSPIState *s, uint32_t paddr, uint8_t *buf,
     g_autofree uint8_t *tmp = g_malloc(end - start);
 
     if (s->psram) {
-        psram_access(s, start, tmp, end - start, false);
-        psram_capture(s, false, psram_x16(s), tmp, end - start);
+        psram_spi0(s, start, tmp, end - start, false);
     } else {
         flash_read(s, start, tmp, end - start);
     }
@@ -1417,19 +2314,19 @@ static void axi_psram_write(ESP32P4MSPIState *s, uint32_t paddr,
     g_autofree uint8_t *tmp = NULL;
 
     if (!key) {
-        psram_access(s, paddr, (uint8_t *)buf, len, true);
+        psram_spi0(s, paddr, (uint8_t *)buf, len, true);
         return;
     }
     start = QEMU_ALIGN_DOWN(paddr, XTS_BLOCK);
     end = QEMU_ALIGN_UP(paddr + len, XTS_BLOCK);
     tmp = g_malloc(end - start);
     if (start != paddr || end != paddr + len) {
-        psram_access(s, start, tmp, end - start, false);
+        psram_spi0(s, start, tmp, end - start, false);
         xts_crypt(key, 1, start, tmp, end - start, false);
     }
     memcpy(tmp + (paddr - start), buf, len);
     xts_crypt(key, 1, start, tmp, end - start, true);
-    psram_access(s, start, tmp, end - start, true);
+    psram_spi0(s, start, tmp, end - start, true);
 }
 
 /* [spec:nuos:req:emu.esp32p4.memory] */
@@ -1509,6 +2406,78 @@ static MemTxResult mspi_axi(ESP32P4MSPIState *s, uint32_t addr, uint8_t *buf,
     return result;
 }
 
+/*
+ * Why the AXI port takes no access now (see esp32p4_mspi_axi_ready()), or
+ * NULL when it does: an AXI slave held in reset or without its bus clock
+ * answers nothing; a closed port answers errors at once; a controller
+ * without its core clock, or with AXI_REQ_EN clear, queues the access but
+ * never runs it.
+ */
+static const char *mspi_axi_stall(ESP32P4MSPIState *s)
+{
+    if (mspi_in_reset(s)) {
+        return "the controller is held in reset";
+    }
+    if (!clock_is_enabled(s->sys_clk)) {
+        return "the controller's bus clock is stopped";
+    }
+    if (s->spi0[R0_CACHE_FCTRL] & CACHE_FCTRL_CLOSE_AXI_INF_EN) {
+        return NULL;
+    }
+    if (!clock_is_enabled(s->core_clk)) {
+        return "the controller's core clock is stopped";
+    }
+    if (!(s->spi0[R0_CACHE_FCTRL] & CACHE_FCTRL_AXI_REQ_EN)) {
+        return "CACHE_FCTRL's AXI_REQ_EN is clear";
+    }
+    return NULL;
+}
+
+/* [spec:nuos:req:emu.esp32p4.memory] */
+bool esp32p4_mspi_axi_ready(ESP32P4MSPIState *s, MemTxAttrs attrs,
+                            MemTxResult *res)
+{
+    const char *why = mspi_axi_stall(s);
+    ESP32P4CPU *cpu;
+
+    if (!why) {
+        return true;
+    }
+    cpu = esp32p4_cpu_bus_waiter(attrs);
+    if (cpu) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: core %d's access waits on the "
+                      "bus, never completing while %s\n", mspi_name(s),
+                      CPU(cpu)->cpu_index, why);
+        s->axi_waiting |= BIT(CPU(cpu)->cpu_index);
+        *res = esp32p4_cpu_bus_hold(cpu);
+        return false;
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "%s: an access by a master that cannot "
+                  "wait here, while %s: refused\n", mspi_name(s), why);
+    *res = MEMTX_ERROR;
+    return false;
+}
+
+/* Let the cores' held accesses go once the AXI port takes them. */
+static void mspi_axi_wake(ESP32P4MSPIState *s)
+{
+    uint32_t waiting = s->axi_waiting;
+
+    if (!waiting || mspi_axi_stall(s)) {
+        return;
+    }
+    s->axi_waiting = 0;
+    while (waiting) {
+        int n = ctz32(waiting);
+        CPUState *cs = qemu_get_cpu(n);
+
+        waiting &= waiting - 1;
+        if (cs && object_dynamic_cast(OBJECT(cs), TYPE_ESP32P4_CPU)) {
+            esp32p4_cpu_bus_release(ESP32P4_CPU(cs));
+        }
+    }
+}
+
 /* [spec:nuos:req:emu.esp32p4.memory] */
 MemTxResult esp32p4_mspi_axi_read(ESP32P4MSPIState *s, uint32_t addr,
                                   uint8_t *buf, uint32_t len)
@@ -1541,6 +2510,10 @@ static MemTxResult mspi_window_read(void *opaque, hwaddr addr, uint64_t *data,
     uint8_t buf[8];
     MemTxResult r;
 
+    if (!esp32p4_mspi_axi_ready(s, attrs, &r)) {
+        *data = 0;
+        return r;
+    }
     if (size < 4 && !(s->spi0[R0_CTRL1] & CTRL1_AR_SIZE0_1_SUPPORT_EN)) {
         *data = 0;
         return MEMTX_ERROR;
@@ -1556,7 +2529,11 @@ static MemTxResult mspi_window_write(void *opaque, hwaddr addr, uint64_t data,
 {
     ESP32P4MSPIState *s = opaque;
     uint8_t buf[8];
+    MemTxResult r;
 
+    if (!esp32p4_mspi_axi_ready(s, attrs, &r)) {
+        return r;
+    }
     if (size < 4 && !(s->spi0[R0_CTRL1] & CTRL1_AW_SIZE0_1_SUPPORT_EN)) {
         return MEMTX_ERROR;
     }
@@ -1576,26 +2553,6 @@ static const MemoryRegionOps mspi_window_ops = {
 
 /* SPI1 */
 
-/* An SPI1 transaction: its phases, and how many lines each takes. */
-typedef struct {
-    uint32_t cmd;
-    unsigned cmd_bits;
-    uint32_t addr;
-    unsigned addr_bits;
-    unsigned dummy;
-    unsigned mosi_bytes;
-    unsigned miso_bytes;
-    unsigned cmd_lines;
-    unsigned addr_lines;
-    unsigned dout_lines;
-    unsigned din_lines;
-    /* For the MSPI PMS: whether it reads, or writes, at its address. */
-    bool reads;
-    bool writes;
-    uint8_t mosi[64];
-    uint8_t miso[64];
-} ESP32P4MSPIXfer;
-
 static unsigned spi1_cmd_lines(ESP32P4MSPIState *s)
 {
     uint32_t ctrl = s->spi1[R1_CTRL];
@@ -1605,19 +2562,7 @@ static unsigned spi1_cmd_lines(ESP32P4MSPIState *s)
 
 static unsigned spi1_addr_lines(ESP32P4MSPIState *s)
 {
-    uint32_t ctrl = s->spi1[R1_CTRL];
-    uint32_t fctrl = s->spi1[R1_CACHE_FCTRL];
-
-    if (ctrl & CTRL_FADDR_OCT) {
-        return 8;
-    }
-    if ((ctrl & CTRL_FREAD_QIO) || (fctrl & FCTRL_FADDR_QUAD)) {
-        return 4;
-    }
-    if ((ctrl & CTRL_FREAD_DIO) || (fctrl & FCTRL_FADDR_DUAL)) {
-        return 2;
-    }
-    return 1;
+    return addr_lines(s->spi1[R1_CTRL], s->spi1[R1_CACHE_FCTRL]);
 }
 
 static unsigned spi1_din_lines(ESP32P4MSPIState *s)
@@ -1664,16 +2609,47 @@ static void spi1_xfer_init(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x)
     x->addr_lines = spi1_addr_lines(s);
     x->din_lines = spi1_din_lines(s);
     x->dout_lines = spi1_dout_lines(s);
+    x->dummy_level = ctrl_dummy_level(s->spi1[R1_CTRL]);
+    x->idle_level = ctrl_idle_level(s->spi1[R1_CTRL]);
 }
 
-/* The address phase of the built-in commands: ADDR, 24 or 32 bits. */
+/*
+ * The address phase of `bits` bits from ADDR, its low bits up to 32, as
+ * software sets it (ESP-IDF's spimem_flash_ll_set_usr_address()).
+ */
+static void spi1_xfer_set_addr(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x,
+                               unsigned bits)
+{
+    uint32_t reg = s->spi1[R1_ADDR];
+
+    x->addr = bits < 32 ? reg & MAKE_64BIT_MASK(0, bits) : reg;
+    if (xfer_set_addr(x, bits < 32 ? x->addr << (32 - bits) : reg, bits)) {
+        log_addr_undefined(s, "SPI1", bits);
+    }
+}
+
+/*
+ * The dummy phase's driven cycles: all of them with CTRL's FDUMMY_RIN for
+ * a transaction that reads data, FDUMMY_WOUT for one that does not.
+ */
+static void spi1_xfer_dummy_out(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x)
+{
+    uint32_t ctrl = s->spi1[R1_CTRL];
+
+    x->dummy_out = (ctrl & (x->miso_bytes ? CTRL_FDUMMY_RIN
+                                          : CTRL_FDUMMY_WOUT)) ? x->dummy : 0;
+}
+
+/*
+ * The address phase of the built-in commands: ADDR, 24 or 32 bits; and
+ * their lines, one for everything but the read's, which CTRL's read mode
+ * sets.
+ */
 static void spi1_xfer_addr(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x)
 {
-    x->addr_bits = USER1_ADDR_BITLEN(s->spi1[R1_USER1]) + 1 > 24 ? 32 : 24;
-    x->addr = s->spi1[R1_ADDR];
-    if (x->addr_bits == 24) {
-        x->addr &= 0xffffff;
-    }
+    spi1_xfer_set_addr(s, x,
+                       USER1_ADDR_BITLEN(s->spi1[R1_USER1]) + 1 > 24 ? 32
+                                                                     : 24);
 }
 
 /* The user-defined transaction of SPI1's USER, USER1, USER2 and buffer. */
@@ -1688,15 +2664,12 @@ static void spi1_xfer_user(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x)
         x->cmd_bits = USER2_COMMAND_BITLEN(s->spi1[R1_USER2]) + 1;
     }
     if (user & USER_USR_ADDR) {
-        x->addr_bits = USER1_ADDR_BITLEN(s->spi1[R1_USER1]) + 1;
-        x->addr = s->spi1[R1_ADDR];
-        if (x->addr_bits < 32) {
-            x->addr &= MAKE_64BIT_MASK(0, x->addr_bits);
-        }
+        spi1_xfer_set_addr(s, x, USER1_ADDR_BITLEN(s->spi1[R1_USER1]) + 1);
     }
     if (user & USER_USR_DUMMY) {
         x->dummy = USER1_DUMMY_CYCLELEN(s->spi1[R1_USER1]) + 1;
     }
+    x->dummy_idle = user & USER_USR_DUMMY_IDLE;
     if (user & USER_USR_MOSI) {
         bits = DLEN(s->spi1[R1_MOSI_DLEN]) + 1;
         x->mosi_bytes = DIV_ROUND_UP(bits, 8);
@@ -1713,6 +2686,7 @@ static void spi1_xfer_user(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x)
     }
     spi1_buf_read(s, (user & USER_MOSI_HIGHPART) ? 8 : 0, x->mosi,
                   x->mosi_bytes);
+    spi1_xfer_dummy_out(s, x);
     x->reads = x->addr_bits && x->miso_bytes;
     x->writes = x->addr_bits &&
                 (x->mosi_bytes || (s->spi1[R1_CMD] & CMD_FLASH_PE));
@@ -1785,16 +2759,13 @@ static bool spi1_pms_check(ESP32P4MSPIState *s, const ESP32P4MSPIXfer *x)
 }
 
 /*
- * Run a transaction on the flash's bus, chip select `cs`. Nothing is on
- * chip select 1, nor on chip select 0 of a board without flash: unless the
- * flash drives them, selected too, the data lines read as their pads'
- * pulls hold them.
+ * Run a transaction on the flash's bus, chip select `cs`, as
+ * flash_wire_xfer() puts it on the lines. Nothing is on chip select 1,
+ * nor on chip select 0 of a board without flash: unless the flash drives
+ * them, selected too, the data lines read as their pads' pulls hold them.
  */
 static void spi1_flash_xfer(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x, int cs)
 {
-    unsigned dummy_bytes = DIV_ROUND_UP(x->dummy * x->addr_lines, 8);
-    unsigned i;
-
     if (cs != 0 || !flash_present(s)) {
         if (cs == 0 || (s->spi1[R1_MISC] & MISC_CS0_DIS) ||
             !flash_present(s)) {
@@ -1807,28 +2778,24 @@ static void spi1_flash_xfer(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x, int cs)
         xts_substitute(s, x->addr, x->mosi, x->mosi_bytes);
     }
     flash_select(s, 0, true);
-    for (i = DIV_ROUND_UP(x->cmd_bits, 8); i > 0; i--) {
-        ssi_transfer(s->bus, extract32(x->cmd, 8 * (i - 1), 8));
-    }
-    for (i = DIV_ROUND_UP(x->addr_bits, 8); i > 0; i--) {
-        ssi_transfer(s->bus, extract32(x->addr, 8 * (i - 1), 8));
-    }
-    for (i = 0; i < dummy_bytes; i++) {
-        ssi_transfer(s->bus, 0);
-    }
-    for (i = 0; i < x->mosi_bytes; i++) {
-        ssi_transfer(s->bus, x->mosi[i]);
-    }
-    for (i = 0; i < x->miso_bytes; i++) {
-        x->miso[i] = ssi_transfer(s->bus, 0);
-    }
+    flash_wire_xfer(s, x, x->miso);
     s->spi1_cs_held = true;
 }
 
-/* Run a transaction on the PSRAM die, chip select 1. */
+/*
+ * Run a transaction on the PSRAM die, chip select 1, as the die takes it
+ * (psram_die_xfer()): SPI1's command, address and dummy phases on CTRL's
+ * lines (FCMD_OCT, FADDR_OCT), its data on FDIN_OCT's or FDOUT_OCT's, or
+ * on 16 with SPI0's SRAM_CMD SDIN_HEX or SDOUT_HEX, which set the PSRAM
+ * controller's data lines for both ports (ESP-IDF's
+ * psram_ctrlr_ll_enable_hex_data_line_mode() for either sets them), in
+ * SPI1's DDR mode. A read goes through the pads' capture.
+ */
 static void spi1_psram_xfer(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x, int cs)
 {
-    unsigned i;
+    uint32_t ddr = s->spi1[R1_DDR], scmd = s->spi0[R0_SRAM_CMD];
+    bool read = x->miso_bytes;
+    unsigned lines;
 
     if (cs != 1) {
         return;
@@ -1838,41 +2805,18 @@ static void spi1_psram_xfer(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x, int cs)
         s->psram_halfsleep = false;
         return;
     }
-    if (x->cmd_bits != 16) {
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: PSRAM command of %u bits; the "
-                      "die takes 16-bit OPI commands\n", mspi_name(s),
-                      x->cmd_bits);
-        return;
+    if (read) {
+        lines = scmd & SCMD_SDIN_HEX ? 16 : x->din_lines;
+    } else {
+        lines = scmd & SCMD_SDOUT_HEX ? 16 : x->dout_lines;
     }
-    switch (x->cmd) {
-    case PSRAM_SYNC_READ:
-    case PSRAM_BURST_READ:
-        psram_access(s, x->addr, x->miso, x->miso_bytes, false);
-        psram_capture(s, true, psram_x16(s), x->miso, x->miso_bytes);
-        break;
-    case PSRAM_SYNC_WRITE:
-    case PSRAM_BURST_WRITE:
-        psram_access(s, x->addr, x->mosi, x->mosi_bytes, true);
-        break;
-    case PSRAM_REG_READ:
-        for (i = 0; i < x->miso_bytes; i++) {
-            unsigned mr = x->addr + i;
-
-            x->miso[i] = mr < ESP32P4_MSPI_PSRAM_MRS ? s->psram_mr_regs[mr]
-                                                     : 0;
-        }
-        /* The die sends its registers on DQ0 to DQ7. */
-        psram_capture(s, true, false, x->miso, x->miso_bytes);
-        break;
-    case PSRAM_REG_WRITE:
-        for (i = 0; i < x->mosi_bytes; i++) {
-            psram_write_mr(s, x->addr + i, x->mosi[i]);
-        }
-        break;
-    default:
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: unknown PSRAM command 0x%04x\n",
-                      mspi_name(s), x->cmd);
-        break;
+    psram_die_xfer(s, x, ddr & DDR_FMEM_DDR_EN, !(ddr & DDR_FMEM_DDR_CMD_DIS),
+                   lines, read ? x->miso : x->mosi,
+                   read ? x->miso_bytes : x->mosi_bytes, !read,
+                   mspi_spi_hz(s, s->spi1[R1_CLOCK]), "SPI1's transaction",
+                   NULL);
+    if (read) {
+        psram_capture(s, true, lines == 16, x->miso, x->miso_bytes);
     }
 }
 
@@ -1943,29 +2887,6 @@ static uint64_t spi1_hold_cycles(ESP32P4MSPIState *s, uint32_t dly_128)
            (s->spi1[R1_SUS_STATUS] & dly_128 ? 128 : 4);
 }
 
-/*
- * The command and line setting of SPI1's built-in read, from CTRL's read
- * mode.
- */
-static void spi1_read_cmd(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x)
-{
-    uint32_t ctrl = s->spi1[R1_CTRL];
-
-    if (!(ctrl & CTRL_FASTRD_MODE)) {
-        x->cmd = FLASH_READ;
-    } else if (ctrl & CTRL_FREAD_QIO) {
-        x->cmd = FLASH_QIOR;
-    } else if (ctrl & CTRL_FREAD_DIO) {
-        x->cmd = FLASH_DIOR;
-    } else if (ctrl & CTRL_FREAD_QUAD) {
-        x->cmd = FLASH_QOR;
-    } else if (ctrl & CTRL_FREAD_DUAL) {
-        x->cmd = FLASH_DOR;
-    } else {
-        x->cmd = FLASH_FAST_READ;
-    }
-}
-
 /* [spec:nuos:req:emu.esp32p4.memory] */
 static void spi1_start(ESP32P4MSPIState *s, uint32_t cmd)
 {
@@ -1986,7 +2907,13 @@ static void spi1_start(ESP32P4MSPIState *s, uint32_t cmd)
     }
     spi1_xfer_init(s, &x);
     x.cmd_bits = 8;
-    x.cmd_lines = 1;
+    if (op != CMD_USR) {
+        x.cmd_lines = 1;
+        if (op != CMD_FLASH_READ) {
+            x.addr_lines = 1;
+            x.din_lines = 1;
+        }
+    }
 
     switch (op) {
     case CMD_USR:
@@ -1995,13 +2922,14 @@ static void spi1_start(ESP32P4MSPIState *s, uint32_t cmd)
         to_buf = x.miso_bytes;
         break;
     case CMD_FLASH_READ:
-        spi1_read_cmd(s, &x);
+        x.cmd = read_mode_cmd(s->spi1[R1_CTRL], false);
         spi1_xfer_addr(s, &x);
         if (s->spi1[R1_USER] & USER_USR_DUMMY) {
             x.dummy = USER1_DUMMY_CYCLELEN(s->spi1[R1_USER1]) + 1;
         }
         x.miso_bytes = MIN(DIV_ROUND_UP(DLEN(s->spi1[R1_MISO_DLEN]) + 1, 8),
                            64);
+        spi1_xfer_dummy_out(s, &x);
         x.reads = true;
         to_buf = true;
         break;
@@ -2438,8 +3366,10 @@ static void mspi_spi0_write(void *opaque, hwaddr addr, uint64_t val,
             }
         }
         spi0_check_unimp(s, r);
+        s->spi0_logged = 0;
         break;
     }
+    mspi_axi_wake(s);
     mspi_update_irq(s);
 }
 
@@ -2559,6 +3489,7 @@ static void mspi_reset_regs(ESP32P4MSPIState *s)
         s->spi1[i] = r1[i].reset;
     }
     s->spi0[R0_MMU_ITEM_CONTENT] = 0;
+    s->spi0_logged = 0;
     memset(s->xts_plain, 0, sizeof(s->xts_plain));
     memset(s->xts_cipher, 0, sizeof(s->xts_cipher));
     s->xts_state = XTS_IDLE;
@@ -2571,6 +3502,7 @@ static void mspi_set_reset(ESP32P4MSPIState *s, bool *line, bool level)
     *line = level;
     if (mspi_in_reset(s) != was) {
         mspi_reset_regs(s);
+        mspi_axi_wake(s);
         mspi_update_irq(s);
     }
 }
@@ -2620,6 +3552,12 @@ static void mspi_core_clk_update(void *opaque, ClockEvent event)
     if (s->spi1_waiting && clock_is_enabled(s->core_clk)) {
         spi1_schedule(s);
     }
+    mspi_axi_wake(s);
+}
+
+static void mspi_sys_clk_update(void *opaque, ClockEvent event)
+{
+    mspi_axi_wake(opaque);
 }
 
 static void mspi_reset_hold(Object *obj, ResetType type)
@@ -2688,7 +3626,8 @@ static void mspi_init(Object *obj)
     qdev_init_gpio_in_named(dev, mspi_download_boot,
                             ESP32P4_MSPI_DOWNLOAD_BOOT, 1);
     qdev_init_gpio_in_named(dev, mspi_brown_out, ESP32P4_MSPI_BROWN_OUT, 1);
-    s->sys_clk = qdev_init_clock_in(dev, "sys", NULL, NULL, 0);
+    s->sys_clk = qdev_init_clock_in(dev, "sys", mspi_sys_clk_update, s,
+                                    ClockUpdate);
     s->core_clk = qdev_init_clock_in(dev, "core", mspi_core_clk_update, s,
                                      ClockUpdate);
     timer_init_ns(&s->spi1_timer, QEMU_CLOCK_VIRTUAL, spi1_end, s);
@@ -2696,8 +3635,8 @@ static void mspi_init(Object *obj)
 
 static const VMStateDescription vmstate_esp32p4_mspi = {
     .name = TYPE_ESP32P4_MSPI,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(spi0, ESP32P4MSPIState, ESP32P4_MSPI_NREGS),
         VMSTATE_UINT32_ARRAY(spi1, ESP32P4MSPIState, ESP32P4_MSPI_NREGS),
@@ -2722,6 +3661,7 @@ static const VMStateDescription vmstate_esp32p4_mspi = {
         VMSTATE_BOOL(axi_reset, ESP32P4MSPIState),
         VMSTATE_UINT32(crypto_ctrl, ESP32P4MSPIState),
         VMSTATE_BOOL(download_boot, ESP32P4MSPIState),
+        VMSTATE_UINT32(axi_waiting, ESP32P4MSPIState),
         VMSTATE_CLOCK(sys_clk, ESP32P4MSPIState),
         VMSTATE_CLOCK(core_clk, ESP32P4MSPIState),
         VMSTATE_END_OF_LIST()

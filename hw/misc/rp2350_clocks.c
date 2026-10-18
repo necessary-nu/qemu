@@ -123,12 +123,13 @@ static uint64_t period_scale(uint64_t a, uint64_t num, uint64_t den)
 static void rp2350_clkregs_catch_up(RP2350ClkRegsState *s)
 {
     RP2350ClkRegsClass *c = RP2350_CLKREGS_GET_CLASS(s);
-    int64_t now = line_time();
+    int64_t now;
 
     if (s->order) {
-        line_due_order_run(s->order, now);
+        line_due_order_catch_up(s->order);
         return;
     }
+    now = line_time();
     while (c->next_due && c->next_due(s) <= now) {
         c->run_due(s);
     }
@@ -157,26 +158,8 @@ void rp2350_clkregs_join_order(RP2350ClkRegsState *s, LineDueOrder *o)
     if (c->next_due) {
         s->due.next_due = rp2350_clkregs_next_due;
         s->due.run = rp2350_clkregs_run_due;
+        s->due.tells = true;
         line_due_order_add(o, &s->due);
-    }
-}
-
-/*
- * The clock tree's clocks are outputs of its blocks: CLOCKS' generators,
- * TICKS' ticks, the oscillators' and PLLs' outputs.
- */
-/* [spec:nuos:req:emu.clock-tree] */
-void rp2350_clocks_sync(Clock *clk)
-{
-    Clock *root = clk;
-    Object *owner;
-
-    while (root->source) {
-        root = root->source;
-    }
-    owner = OBJECT(root)->parent;
-    if (owner && object_dynamic_cast(owner, TYPE_RP2350_CLKREGS)) {
-        rp2350_clkregs_catch_up(RP2350_CLKREGS(owner));
     }
 }
 
@@ -674,7 +657,7 @@ static void clocks_resus_arm(RP2350ClocksState *s, uint64_t sys)
     s->resus_ns = line_time() +
                   clock_ticks_to_ns(s->clk[RP2350_CLK_REF],
                                     (ctrl & RESUS_CTRL_TIMEOUT) + 1);
-    timer_mod(s->resus_timer, s->resus_ns);
+    line_due_order_mod(s->parent_obj.order, s->resus_timer, s->resus_ns);
 }
 
 /*
@@ -987,7 +970,7 @@ static void fc0_wait_ref(RP2350ClocksState *s, int64_t from, uint64_t cycles)
         ns++;
     }
     s->fc0_end_ns = from + ns;
-    timer_mod(s->fc0_timer, s->fc0_end_ns);
+    line_due_order_mod(s->parent_obj.order, s->fc0_timer, s->fc0_end_ns);
 }
 
 /*
@@ -1492,7 +1475,7 @@ static void xosc_update_out(RP2350XOSCState *x)
 static void xosc_start(RP2350XOSCState *x)
 {
     x->stable_ns = line_time() + xosc_startup_ns(x);
-    timer_mod(x->startup_timer, x->stable_ns);
+    line_due_order_mod(x->parent_obj.order, x->startup_timer, x->stable_ns);
 }
 
 static void xosc_set_gated(RP2350XOSCState *x, bool gated)
@@ -1508,6 +1491,7 @@ static void xosc_set_gated(RP2350XOSCState *x, bool gated)
 static void xosc_wake(RP2350XOSCState *x)
 {
     x->dormant = false;
+    line_due_order_changed(x->parent_obj.order);
     x->parent_obj.regs[R_XOSC_DORMANT] = XOSC_DORMANT_WAKE;
     if (!x->enabled) {
         xosc_set_gated(x, false);
@@ -1562,6 +1546,8 @@ static void xosc_enter_dormant(RP2350XOSCState *x)
     }
     timer_del(x->startup_timer);
     x->dormant = true;
+    /* The AON timer's alarm, a wake event, comes into the order. */
+    line_due_order_changed(x->parent_obj.order);
     x->parent_obj.regs[R_XOSC_DORMANT] = XOSC_DORMANT_DORMANT;
     xosc_set_gated(x, true);
     xosc_update_out(x);
@@ -1691,6 +1677,7 @@ static void xosc_reset_hold(RP2350ClkRegsState *s)
     x->freq_range = 0;
     x->badwrite = false;
     x->dormant = false;
+    line_due_order_changed(x->parent_obj.order);
     x->gated = false;
     x->stable_ns = 0;
     x->count = 0;
@@ -1896,7 +1883,7 @@ static void pll_update(RP2350PLLState *p, bool relock)
         p->locking = true;
         p->lock_ns = line_time() +
                      clock_ticks_to_ns(p->ref, PLL_LOCK_REF_CYCLES * refdiv);
-        timer_mod(p->lock_timer, p->lock_ns);
+        line_due_order_mod(p->parent_obj.order, p->lock_timer, p->lock_ns);
     }
     pll_update_out(p);
 }

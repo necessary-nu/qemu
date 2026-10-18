@@ -34,7 +34,6 @@
 #include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/misc/rp2350_atomic.h"
-#include "hw/misc/rp2350_clocks.h"
 #include "hw/watchdog/rp2350_watchdog.h"
 #include "migration/vmstate.h"
 #include "system/cpus.h"
@@ -169,15 +168,15 @@ static void wd_tick_changed(void *opaque, ClockEvent event)
  * at the instruction, which has not executed, for the reset. True if it
  * is.
  *
- * First the clock tree comes up to the access (rp2350_clocks_sync()), so
- * that the count follows a change of its tick that has fallen due from
- * the change's time.
+ * First the clock tree comes up to the access (clock_sync()), so that
+ * the count follows a change of its tick that has fallen due from the
+ * change's time.
  */
 static bool wd_catch_up(RP2350WatchdogState *s, MemTxAttrs attrs)
 {
     CPUState *cs = current_cpu;
 
-    rp2350_clocks_sync(s->tick);
+    clock_sync(s->tick);
     if (!timer_pending(s->expiry) ||
         timer_expire_time_ns(s->expiry) >
         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {

@@ -18,8 +18,9 @@
  * (w25q16jv, w25q32rv, gd25q256e, gd25q32c) to this file, which replaces
  * its generic command decoder for them; its other entries behave as
  * before. The bus is QEMU's byte-wide SSI bus, so a phase of dummy clocks
- * counts as the bytes those clocks carry on the phase's lines, and the
- * line count of a command (SPI, dual, quad, QPI) is not seen.
+ * counts as the bytes those clocks carry on the phase's lines; a board that
+ * clocks the lines itself asks which lines each byte goes on
+ * (m25chip_io_lines()), and assembles the bytes from them.
  *
  * Commands and registers, per part, as the datasheets' instruction tables
  * give them: the three status registers with their volatile and
@@ -32,7 +33,8 @@
  * GD25Q256E, with their OTP lock bits), the unique ID (64 bits, 128 on the
  * GigaDevice parts; the "unique-id" property, as hex digits, sets it),
  * JEDEC and device IDs (9Fh, 90h, 92h, 94h, ABh), power-down, software
- * reset, continuous read mode (M5-4 = 10b after BBh/EBh/E7h), burst with
+ * reset, continuous read mode (M5-4 = 10b after BBh, EBh and E7h, and the
+ * GD25Q256E's 4-byte-address BCh and ECh), burst with
  * wrap (77h), the W25Q32RV's QPI mode and read parameters (38h/FFh, C0h,
  * 0Ch), the GD25Q256E's 3- and 4-byte addressing (B7h/E9h, ADS, ADP, the
  * extended address register's A24 and the 4-byte-address commands) and
@@ -2055,6 +2057,51 @@ bool m25chip_drives_output(M25Chip *c)
 uint8_t m25chip_continuous_cmd(M25Chip *c)
 {
     return c->cont_cmd;
+}
+
+/*
+ * [spec:nuos:req:emu.flash-chip]
+ * [spec:nuos:req:emu.esp32p4.flash-chip]
+ * The data lines the chip takes or drives its next byte on, as the
+ * datasheets' instruction tables give them: the opcode on IO0 (on IO0 to
+ * IO3 in QPI mode); the address, mode bits and dummy clocks of BBh, BCh
+ * and 92h on IO0 and IO1, and of EBh, ECh, E7h, 94h and 77h's wrap bits
+ * on IO0 to IO3; the data of 3Bh, 3Ch, BBh, BCh and 92h on two lines, of
+ * 6Bh, 6Ch, EBh, ECh, E7h, 94h, 32h and 34h on four; everything else on
+ * one (SO, IO1, out; SI, IO0, in).
+ */
+unsigned m25chip_io_lines(M25Chip *c)
+{
+    if (c->qpi) {
+        return 4;
+    }
+    switch (c->phase) {
+    case PH_ADDR:
+    case PH_SKIP:
+        switch (c->cmd) {
+        case 0xbb: case 0xbc: case 0x92:
+            return 2;
+        case 0xeb: case 0xec: case 0xe7: case 0x94: case 0x77:
+            return 4;
+        }
+        return 1;
+    case PH_OUT:
+    case PH_ARRAY:
+        switch (c->cmd) {
+        case 0x3b: case 0x3c: case 0xbb: case 0xbc: case 0x92:
+            return 2;
+        case 0x6b: case 0x6c: case 0xeb: case 0xec: case 0xe7: case 0x94:
+            return 4;
+        }
+        return 1;
+    case PH_DATA:
+        switch (c->cmd) {
+        case 0x32: case 0x34: case 0x77:
+            return 4;
+        }
+        return 1;
+    }
+    return 1;
 }
 
 /* [spec:nuos:req:emu.flash-timing] */

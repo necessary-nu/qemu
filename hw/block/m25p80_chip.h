@@ -124,6 +124,7 @@ void m25chip_power_on(M25Chip *c);
 bool m25chip_quad_enabled(M25Chip *c);
 bool m25chip_drives_output(M25Chip *c);
 uint8_t m25chip_continuous_cmd(M25Chip *c);
+unsigned m25chip_io_lines(M25Chip *c);
 void m25chip_set_cs(M25Chip *c, bool high);
 uint8_t m25chip_transfer(M25Chip *c, uint8_t tx);
 int64_t m25chip_busy_until(M25Chip *c);

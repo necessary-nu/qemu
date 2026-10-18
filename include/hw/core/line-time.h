@@ -13,6 +13,7 @@
 #include "migration/vmstate.h"
 #include "qemu/notify.h"
 #include "qemu/queue.h"
+#include "qemu/timer.h"
 
 /*
  * Levels move between devices as qemu_irq level changes, which carry no
@@ -86,23 +87,52 @@ int64_t line_sync(void);
  * nothing while a system reset is pending, which undoes what would come
  * after its request, and called again from inside an event it leaves the
  * order to the run under way.
+ *
+ * A source whose events each have a QEMU timer at their time can arm it
+ * with line_due_order_mod(), which tells the order when the event falls
+ * due, and say so (`tells`). While all its sources tell it, the order
+ * knows when the earliest of their events can fall due, and a run to a
+ * moment before then asks none of them: line_due_order_catch_up(), which
+ * runs the events due by line_time(), costs a comparison while nothing
+ * has fallen due, and while nothing is pending does not read the clock.
+ * Devices that bring the order up to time at each register access, as
+ * those timing from a clock its sources change do, cost nothing more
+ * while it has nothing to run.
  */
 typedef struct LineDueSource LineDueSource;
 
 struct LineDueSource {
     int64_t (*next_due)(LineDueSource *src);
     void (*run)(LineDueSource *src);
+    /* The source arms its events' timers with line_due_order_mod(). */
+    bool tells;
     QLIST_ENTRY(LineDueSource) next;
 };
 
 typedef struct LineDueOrder {
     QLIST_HEAD(, LineDueSource) sources;
     bool running;
+    /*
+     * While every source tells it of its events (untold 0), none falls
+     * due before next: INT64_MAX while none is pending, INT64_MIN while
+     * that is to be found.
+     */
+    unsigned untold;
+    int64_t next;
 } LineDueOrder;
 
 void line_due_order_init(LineDueOrder *o);
 void line_due_order_add(LineDueOrder *o, LineDueSource *src);
 void line_due_order_run(LineDueOrder *o, int64_t now);
+void line_due_order_catch_up(LineDueOrder *o);
+void line_due_order_mod(LineDueOrder *o, QEMUTimer *t, int64_t when);
+
+/*
+ * A telling source whose event can fall due earlier otherwise than by a
+ * timer it arms, as one that counts only while another block is in some
+ * state, has the order (if any) ask its sources afresh.
+ */
+void line_due_order_changed(LineDueOrder *o);
 
 /*
  * Changes that reach a device while it resolves another.

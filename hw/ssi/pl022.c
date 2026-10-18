@@ -377,9 +377,10 @@ static void pl022_xfer_at(PL022State *s, int64_t start)
     pl022_update(s);
 }
 
+/* Frames from the time of the access or change at hand (line_time()). */
 static void pl022_xfer(PL022State *s)
 {
-    pl022_xfer_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    pl022_xfer_at(s, line_time());
 }
 
 /*
@@ -473,6 +474,9 @@ static void pl022_set_fssin(void *opaque, int n, int level)
  * The moment is the access's time (line_time()), not the present: a DMA
  * answering a frame's DREQ makes its access at that frame's end, however
  * late the frame's timer ran, and takes no frame due after it.
+ * SSPCLK comes up to time before them (clock_sync()): a start, stop or
+ * change of rate that has fallen due, its event's timer late, times the
+ * frames from its time.
  *
  * A frame that would end into a full receive FIFO is left to its timer.
  * Inside an access, whatever drains the FIFO cannot get to it between the
@@ -503,6 +507,7 @@ static uint64_t pl022_read(void *opaque, hwaddr offset,
     PL022State *s = (PL022State *)opaque;
     int val;
 
+    clock_sync(s->clk);
     pl022_catch_up(s);
 
     if (offset >= 0xfe0 && offset < 0x1000) {
@@ -582,6 +587,7 @@ static void pl022_write(void *opaque, hwaddr offset,
 {
     PL022State *s = (PL022State *)opaque;
 
+    clock_sync(s->clk);
     pl022_catch_up(s);
 
     switch (offset) {
@@ -758,9 +764,11 @@ static const VMStateDescription vmstate_pl022 = {
 };
 
 /*
- * SSPCLK changes rate, stops or starts: the frame on the wire keeps the
- * cycles it has left, held while the clock is stopped, and once the clock
- * runs the transmitter carries on.
+ * SSPCLK changes rate, stops or starts: the frame ends and the receive
+ * timeout due by the change come first, each at its own time however
+ * late its timer runs; the frame on the wire keeps the cycles it has
+ * left, held while the clock is stopped, and once the clock runs the
+ * transmitter carries on from the change.
  */
 static void pl022_clk_update(void *opaque, ClockEvent event)
 {
@@ -769,6 +777,7 @@ static void pl022_clk_update(void *opaque, ClockEvent event)
     int64_t now = line_time();
 
     if (event == ClockPreUpdate) {
+        pl022_catch_up(s);
         if (s->busy && timer_pending(s->frame_timer)) {
             s->frame_left = clock_ns_to_ticks(s->clk,
                                               MAX(s->frame_end - now, 0));

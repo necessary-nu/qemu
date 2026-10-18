@@ -858,6 +858,11 @@ static uint32_t bus_value(hwaddr addr, uint64_t value, unsigned size,
     }
 }
 
+/*
+ * An access to either window first brings clk_hstx up to its time
+ * (clock_sync()): a change that has fallen due, its event's timer late,
+ * shifts from its time.
+ */
 /* [spec:nuos:req:emu.hstx] */
 static uint64_t rp2350_hstx_ctrl_read(void *opaque, hwaddr addr,
                                       unsigned size)
@@ -866,6 +871,7 @@ static uint64_t rp2350_hstx_ctrl_read(void *opaque, hwaddr addr,
     hwaddr reg = rp2350_atomic_reg(addr) & ~3;
     uint32_t v = 0;
 
+    clock_sync(s->clk);
     switch (reg) {
     case A_CSR:
         v = s->csr;
@@ -896,6 +902,7 @@ static void rp2350_hstx_ctrl_write(void *opaque, hwaddr addr, uint64_t value,
     hwaddr reg = rp2350_atomic_reg(window) & ~3;
     uint32_t v = bus_value(addr, value, size, !(addr & NO_REPLICATE));
 
+    clock_sync(s->clk);
     hstx_sync(s);
     switch (reg) {
     case A_CSR: {
@@ -947,6 +954,7 @@ static uint64_t rp2350_hstx_fifo_read(void *opaque, hwaddr addr,
     RP2350HSTXState *s = opaque;
     uint32_t v = 0;
 
+    clock_sync(s->clk);
     switch (addr & ~3) {
     case A_STAT:
         hstx_sync(s);
@@ -978,6 +986,7 @@ static void rp2350_hstx_fifo_write(void *opaque, hwaddr addr, uint64_t value,
     RP2350HSTXCore *c = &s->core;
     uint32_t v = bus_value(addr, value, size, true);
 
+    clock_sync(s->clk);
     switch (addr & ~3) {
     case A_STAT:
         if (v & STAT_WOF) {

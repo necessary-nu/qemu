@@ -1880,12 +1880,18 @@ static void usb_catch_up(RP2350USBCtrlState *s)
     }
 }
 
+/*
+ * An access to the registers or the DPRAM first brings clk_usb up to its
+ * time (clock_sync()): the PHY counts a start, stop or change of rate
+ * that has fallen due, its event's timer late, from its time.
+ */
 static uint64_t rp2350_usbctrl_regs_read(void *opaque, hwaddr addr,
                                          unsigned size)
 {
     RP2350USBCtrlState *s = opaque;
     uint32_t v;
 
+    clock_sync(s->clk);
     usb_catch_up(s);
     v = usb_reg_read(s, rp2350_atomic_reg(addr & ~3));
 
@@ -1898,6 +1904,7 @@ static void rp2350_usbctrl_regs_write(void *opaque, hwaddr addr,
     RP2350USBCtrlState *s = opaque;
     uint32_t v = value;
 
+    clock_sync(s->clk);
     usb_catch_up(s);
     if (size == 1) {
         v = (v & 0xff) * 0x01010101u;
@@ -1928,6 +1935,7 @@ static uint64_t rp2350_usbctrl_dpram_read(void *opaque, hwaddr addr,
 {
     RP2350USBCtrlState *s = opaque;
 
+    clock_sync(s->clk);
     usb_catch_up(s);
     return ldn_le_p(&s->dpram[addr], size);
 }
@@ -1938,6 +1946,7 @@ static void rp2350_usbctrl_dpram_write(void *opaque, hwaddr addr,
 {
     RP2350USBCtrlState *s = opaque;
 
+    clock_sync(s->clk);
     usb_catch_up(s);
     stn_le_p(&s->dpram[addr], size, value);
     if (addr < DPRAM_BUF_CTRL_START || addr >= DPRAM_BUF_CTRL_END) {

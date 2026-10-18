@@ -74,6 +74,16 @@ bool m25p80_drives_output(DeviceState *dev);
 uint8_t m25p80_continuous_cmd(DeviceState *dev);
 
 /*
+ * For a board that clocks the part's lines itself: how many data lines
+ * (1, 2 or 4) the part takes, or drives, its next byte on, as its command
+ * and the phase of it the transaction has reached say. On one line the
+ * part takes its input on IO0 (SI) and drives its output on IO1 (SO); on
+ * two or four, IO0 to IO1 or IO3, the highest-numbered line carrying the
+ * highest bit of each clock's.
+ */
+unsigned m25p80_io_lines(DeviceState *dev);
+
+/*
  * The part's supply leaves its operating range: whatever program or erase
  * it was running is cut short. It comes back: the part starts again as at
  * power-up, a datasheet part also taking no command for its tVSL.

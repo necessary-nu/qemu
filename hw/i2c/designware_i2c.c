@@ -472,9 +472,13 @@ static void dw_timer_in(DesignWareI2CState *s, uint64_t cycles)
     timer_mod(s->timer, s->timer_due);
 }
 
+static void dw_i2c_catch_up(DesignWareI2CState *s);
+
 /*
- * ic_clk changes rate, stops or starts: the timer keeps the cycles it
- * has left, held while the clock is stopped.
+ * ic_clk changes rate, stops or starts: the steps and polls due by the
+ * change come first, each at its own time however late the timer runs;
+ * the timer keeps the cycles it has left, held while the clock is
+ * stopped.
  */
 static void dw_clk_update(void *opaque, ClockEvent event)
 {
@@ -483,6 +487,7 @@ static void dw_clk_update(void *opaque, ClockEvent event)
     int64_t now = line_time();
 
     if (event == ClockPreUpdate) {
+        dw_i2c_catch_up(s);
         if (clock_get(s->clk) && timer_pending(s->timer)) {
             s->timer_held = true;
             s->held_cycles = clock_ns_to_ticks(s->clk,
@@ -1093,12 +1098,13 @@ static void dw_i2c_timer(void *opaque)
  * each at its time: without icount their timer can run well after, while
  * software polls IC_STATUS, RAW_INTR_STAT, TXFLR and RXFLR, as the
  * pico-sdk's blocking transfers do, or reads DATA_CMD. Only a timer that
- * has come is run.
+ * has come is run. An access brings ic_clk up to its time first
+ * (clock_sync()), so that a change that has fallen due, its event's timer
+ * late, times the steps from its time.
  */
 static void dw_i2c_catch_up(DesignWareI2CState *s)
 {
-    while (timer_pending(s->timer) &&
-           s->timer_due <= qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+    while (timer_pending(s->timer) && s->timer_due <= line_time()) {
         timer_del(s->timer);
         line_run_at(s->timer_due, dw_i2c_timer_at, s);
     }
@@ -1284,6 +1290,7 @@ static uint64_t dw_i2c_read(void *opaque, hwaddr addr, unsigned size)
     DesignWareI2CState *s = opaque;
     DesignWareI2CClass *dc = DESIGNWARE_I2C_GET_CLASS(s);
 
+    clock_sync(s->clk);
     dw_i2c_catch_up(s);
     switch (addr) {
     case A_CON:
@@ -1403,6 +1410,7 @@ static void dw_i2c_write(void *opaque, hwaddr addr, uint64_t value,
     DesignWareI2CClass *dc = DESIGNWARE_I2C_GET_CLASS(s);
     uint32_t speed;
 
+    clock_sync(s->clk);
     dw_i2c_catch_up(s);
     switch (addr) {
     case A_CON:

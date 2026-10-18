@@ -305,6 +305,10 @@ static void trng_reset_state(RP2350TRNGState *s)
     s->entropy_bits = 0;
 }
 
+/*
+ * An access first brings rng_clk up to its time (clock_sync()), so that
+ * the samples are counted by the clock as it is then.
+ */
 /* [spec:nuos:req:emu.rosc-trng] */
 static uint64_t rp2350_trng_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -312,6 +316,7 @@ static uint64_t rp2350_trng_read(void *opaque, hwaddr addr, unsigned size)
     hwaddr reg = rp2350_atomic_reg(addr);
     uint32_t v;
 
+    clock_sync(s->clk);
     trng_catch_up(s);
     switch (reg) {
     case A_RNG_IMR:
@@ -379,6 +384,7 @@ static void rp2350_trng_write(void *opaque, hwaddr addr, uint64_t value64,
     hwaddr reg = rp2350_atomic_reg(addr);
     uint32_t value = value64;
 
+    clock_sync(s->clk);
     trng_catch_up(s);
     switch (reg) {
     case A_RNG_IMR:

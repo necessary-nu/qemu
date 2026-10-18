@@ -282,6 +282,7 @@ static void rosc_wake(RP2350ROSCState *s)
     int64_t now = line_time();
 
     s->dormant_stopped = false;
+    line_due_order_changed(s->order);
     s->dormant = DORMANT_WAKE;
     s->count_ns = now;
     if (!rosc_ctrl_enabled(s->ctrl)) {
@@ -289,7 +290,7 @@ static void rosc_wake(RP2350ROSCState *s)
         return;
     }
     s->stable_ns = now + ROSC_STARTUP_NS;
-    timer_mod(s->startup_timer, s->stable_ns);
+    line_due_order_mod(s->order, s->startup_timer, s->stable_ns);
 }
 
 /*
@@ -338,11 +339,9 @@ static void rosc_run_due(LineDueSource *src)
  */
 static void rosc_catch_up(RP2350ROSCState *s)
 {
-    int64_t now = line_time();
-
     if (s->order) {
-        line_due_order_run(s->order, now);
-    } else if (rosc_next_due(&s->due) <= now) {
+        line_due_order_catch_up(s->order);
+    } else if (rosc_next_due(&s->due) <= line_time()) {
         rosc_run_due(&s->due);
     }
 }
@@ -351,6 +350,7 @@ static void rosc_catch_up(RP2350ROSCState *s)
 void rp2350_rosc_join_order(RP2350ROSCState *s, LineDueOrder *o)
 {
     s->order = o;
+    s->due.tells = true;
     line_due_order_add(o, &s->due);
 }
 
@@ -363,6 +363,8 @@ static void rosc_enter_dormant(RP2350ROSCState *s)
     rosc_count_sync(s);
     timer_del(s->startup_timer);
     s->dormant_stopped = true;
+    /* The AON timer's alarm, a wake event, comes into the order. */
+    line_due_order_changed(s->order);
     s->dormant = DORMANT_DORMANT;
     rosc_set_gated(s, true);
     /* A wake event already asserted restarts the oscillator at once. */
@@ -433,7 +435,7 @@ static void rosc_write_ctrl(RP2350ROSCState *s, uint32_t value)
     if (!was_running && rosc_running(s)) {
         s->stable_ns = line_time() + ROSC_STARTUP_NS;
         s->count_ns = line_time();
-        timer_mod(s->startup_timer, s->stable_ns);
+        line_due_order_mod(s->order, s->startup_timer, s->stable_ns);
     }
     rosc_update_clocks(s);
 }
@@ -563,6 +565,7 @@ static void rp2350_rosc_hold_reset(Object *obj, ResetType type)
     s->randombit = 1;
     timer_del(s->startup_timer);
     s->dormant_stopped = false;
+    line_due_order_changed(s->order);
     s->gated = false;
 }
 
