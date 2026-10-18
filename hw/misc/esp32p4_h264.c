@@ -693,6 +693,140 @@ static int rx_push(ESP32P4H264State *s, int n, const uint8_t *data,
     return PUSH_DONE;
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.h264]
+ * Waiting on a memory controller's held AXI port (the flash's or the
+ * PSRAM's while it cannot take an access: its clocks stopped, held in
+ * reset, AXI_REQ_EN clear; esp32p4_mspi_dma_wait()): before each step of
+ * its work (a row's inputs, a row's results, a reference row's move, row
+ * 0's early bottom lines) the DMA asks about every access of the step, as
+ * its channels would make them, and makes none of it until the port takes
+ * them all, the encoder waiting with it, as it waits for a missing input;
+ * h264_kick() then retries it. These work out a step's accesses without
+ * making any: a channel's descriptors are read for it, their checks left
+ * to the step.
+ */
+static bool h264_waits(ESP32P4H264State *s, bool rx, int n, uint32_t addr,
+                       uint32_t len, bool write)
+{
+    return len && esp32p4_mspi_dma_wait_on(&s->dma_wait, s->as, addr, len,
+                                           chan_attrs(rx, n), write);
+}
+
+/* The descriptor at @addr for a plan: false if the channel would not take it. */
+static bool h264_plan_desc(ESP32P4H264State *s, bool rx, int n,
+                           uint32_t addr, uint32_t *dw)
+{
+    uint8_t raw[16];
+
+    if ((addr & 7) || !h264_in_range(s, true, addr, 16) ||
+        address_space_read(s->as, addr, chan_attrs(rx, n), raw, 16) !=
+        MEMTX_OK) {
+        return false;
+    }
+    for (int i = 0; i < 4; i++) {
+        dw[i] = ldl_le_p(raw + 4 * i);
+    }
+    return true;
+}
+
+/* Whether tx_pull() of @need bytes from 1D TX channel @n waits. */
+static bool tx_pull_waits(ESP32P4H264State *s, int n, uint32_t need)
+{
+    ESP32P4H264Chan *c = &s->tx[n];
+    uint32_t addr = c->desc_addr, pos = c->pos, dw[4];
+    bool hd = c->have_desc;
+
+    if (hd) {
+        memcpy(dw, c->dw, sizeof(dw));
+    }
+    for (int guard = 0; need && guard < 256; guard++) {
+        uint32_t len, k;
+
+        if (!hd) {
+            if (!addr) {
+                return false;
+            }
+            if (h264_waits(s, false, n, addr, 16, false)) {
+                return true;
+            }
+            if (!h264_plan_desc(s, false, n, addr, dw)) {
+                return false;
+            }
+            pos = 0;
+            hd = true;
+        }
+        len = desc_len(dw);
+        k = MIN(need, len - MIN(pos, len));
+        if (h264_waits(s, false, n, dw[2] + pos, k, false)) {
+            return true;
+        }
+        need -= k;
+        pos += k;
+        if (pos >= len) {
+            if ((chan_ctrl(s, false, n) & TX_AUTO_WRBACK) &&
+                h264_waits(s, false, n, addr, 4, true)) {
+                return true;
+            }
+            addr = dw[3];
+            hd = false;
+        }
+    }
+    return false;
+}
+
+/* Whether rx_push() of @len bytes to RX channel @n, with @eof, waits. */
+static bool rx_push_waits(ESP32P4H264State *s, int n, uint32_t len, bool eof)
+{
+    ESP32P4H264Chan *c = &s->rx[n];
+    uint32_t addr = c->desc_addr, pos = c->pos, dw[4];
+    bool hd = c->have_desc, run = c->running == LINK_RUN;
+
+    if ((chan_ctrl(s, true, n) & (CH_RST | CH_CMD_DISABLE)) ||
+        c->running == LINK_IDLE) {
+        return false;
+    }
+    if (hd) {
+        memcpy(dw, c->dw, sizeof(dw));
+    }
+    for (int guard = 0; (len || eof) && run && guard < 1 << 20; guard++) {
+        uint32_t size, k;
+
+        if (!hd) {
+            if (!addr) {
+                return false;
+            }
+            if (h264_waits(s, true, n, addr, 16, false)) {
+                return true;
+            }
+            if (!h264_plan_desc(s, true, n, addr, dw)) {
+                return false;
+            }
+            pos = 0;
+            hd = true;
+        }
+        size = desc_size(dw);
+        k = MIN(len, size - MIN(pos, size));
+        if (h264_waits(s, true, n, dw[2] + pos, k, true)) {
+            return true;
+        }
+        pos += k;
+        len -= k;
+        if ((pos >= size && (len || !eof)) || (!len && eof)) {
+            if (h264_waits(s, true, n, addr, 8, true)) {
+                return true;
+            }
+            if (!len) {
+                eof = false;
+            }
+            addr = dw[3];
+            hd = false;
+            run = addr != 0;
+        }
+    }
+    return false;
+}
+
 static void chan_reset_link(ESP32P4H264Chan *c)
 {
     c->running = LINK_IDLE;
@@ -821,6 +955,31 @@ static void replace_layout(uint8_t *buf, uint32_t len, int ylines,
     }
 }
 
+/* Whether move_row() waits on a held port. */
+static bool move_row_waits(ESP32P4H264State *s)
+{
+    int seq = move_seq(s), mbw = seq_mb_w(s, seq), mbh = seq_mb_h(s, seq);
+    bool last = s->mv_row == mbh - 1;
+    uint32_t b3 = (last ? H264E_MB_BYTES : H264E_LINE12_BYTES) * mbw;
+    uint32_t b4 = last ? 0 : H264E_LINE4_BYTES * mbw;
+    uint32_t base = s->block_start + s->ring_next * block_row_stride(s);
+
+    if (tx_pull_waits(s, 3, b3) || (b4 && tx_pull_waits(s, 4, b4))) {
+        return true;
+    }
+    for (int x = 0; x < mbw; x++) {
+        uint32_t a = base + x * (block_len12(s) + block_len4(s));
+
+        if (h264_in_range(s, true, a, H264E_MB_BYTES) &&
+            (h264_waits(s, true, 5, a, H264E_LINE12_BYTES, true) ||
+             h264_waits(s, true, 5, a + block_len12(s), H264E_LINE4_BYTES,
+                        true))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Move the next reference row into the window, through TX 3 and 4. */
 static void move_row(ESP32P4H264State *s)
 {
@@ -881,7 +1040,7 @@ static void h264_move_cb(void *opaque)
     ESP32P4H264State *s = opaque;
     int64_t when = esp32p4_clkwait_expire(&s->move_wait);
 
-    if (s->mv_eager <= 0 || !move_possible(s)) {
+    if (s->mv_eager <= 0 || !move_possible(s) || move_row_waits(s)) {
         return;
     }
     move_row(s);
@@ -940,7 +1099,7 @@ static int h264_ref_rows(ESP32P4H264State *s, int r)
                 (s->mv_gen == s->ref_gen && s->mv_row > k)) {
                 return -1;
             }
-            if (s->mv_eager > 0 || !move_possible(s)) {
+            if (s->mv_eager > 0 || !move_possible(s) || move_row_waits(s)) {
                 return 0;
             }
             move_row(s);
@@ -1144,6 +1303,71 @@ static bool h264_read_tmp(ESP32P4H264State *s, int r, bool dry)
     return true;
 }
 
+/*
+ * Whether reading row @r's inputs (h264_read_tmp(), _read_ref() and
+ * _read_source(), their descriptors fetched by their dry runs) waits on a
+ * held port.
+ */
+static bool h264_row_read_waits(ESP32P4H264State *s, int r)
+{
+    ESP32P4H264Chan *c0 = &s->tx[0], *c1 = &s->tx[1];
+    int mbw = s->enc.cfg.mb_w, pb2 = pbyte2(s);
+    uint32_t lb, lines;
+
+    if (r > 0 && tx_pull_waits(s, 2, H264E_LINE4_BYTES * mbw)) {
+        return true;
+    }
+    if (!s->intra) {
+        lb = (uint64_t)DW1_LEN_HI(c1->dw[1]) * 3 / 2;
+        for (int slot = 0; slot < 3 && slot < (int)DW1_SIZE_HI(c1->dw[1]);
+             slot++) {
+            int row = s->ring_row[slot];
+
+            if (row < MAX(r - 1, 0) || row > r + 1 ||
+                s->ring_gen[slot] != s->ref_gen) {
+                continue;
+            }
+            if (h264_waits(s, false, 1, c1->dw[2] + slot * lb,
+                           MIN((uint32_t)mbw, lb / H264E_MB_BYTES) *
+                           H264E_MB_BYTES, false)) {
+                return true;
+            }
+        }
+        if ((chan_ctrl(s, false, 1) & TX_AUTO_WRBACK) &&
+            h264_waits(s, false, 1, c1->desc_addr, 4, true)) {
+            return true;
+        }
+    }
+    if (!pb2 || pb2 == 1) {
+        pb2 = 3;
+    }
+    lb = (uint64_t)DW1_LEN_HI(c0->dw[1]) * pb2 / 2;
+    lines = MIN(16, DW1_SIZE_HI(c0->dw[1]) - c0->pos);
+    return h264_waits(s, false, 0, c0->dw[2] + c0->pos * lb, lines * lb,
+                      false) ||
+           (c0->pos + 16 >= DW1_SIZE_HI(c0->dw[1]) &&
+            (chan_ctrl(s, false, 0) & TX_AUTO_WRBACK) &&
+            h264_waits(s, false, 0, c0->desc_addr, 4, true));
+}
+
+/* Whether writing out row @r's results (h264_row_write()) waits. */
+static bool h264_row_write_waits(ESP32P4H264State *s)
+{
+    H264Enc *e = &s->enc;
+    int r = s->row, mbw = e->cfg.mb_w, mbh = e->cfg.mb_h;
+    bool last = r == mbh - 1;
+    bool mvm = !s->intra && e->cfg.mv_merge_en;
+    uint32_t b0 = (last ? H264E_MB_BYTES : H264E_LINE12_BYTES) * mbw;
+
+    return rx_push_waits(s, 0, b0, last) ||
+           (r > 0 && rx_push_waits(s, 1, H264E_LINE4_BYTES * mbw, last)) ||
+           (!last && s->tmp_written < mbw &&
+            rx_push_waits(s, 2, H264E_LINE4_BYTES * (mbw - s->tmp_written),
+                          r == mbh - 2)) ||
+           (mvm && rx_push_waits(s, 3, 4 * e->mvm_n, last)) ||
+           rx_push_waits(s, 4, h264e_take_len(e), last);
+}
+
 /* The picture */
 
 static void h264_row_read(ESP32P4H264State *s, int64_t now);
@@ -1202,6 +1426,13 @@ static void h264_tmp_cb(void *opaque)
     if (s->state != ST_CODE || s->row != 0 || s->tmp_ready) {
         return;
     }
+    if (!rx_held(s, 2) &&
+        rx_push_waits(s, 2, H264E_LINE4_BYTES * trigger,
+                      trigger == s->enc.cfg.mb_w &&
+                      s->enc.cfg.mb_h == 2)) {
+        s->tmp_pending = true;
+        return;
+    }
     if (h264_write_tmp(s, 0, 0, trigger, false)) {
         s->tmp_written = trigger;
         s->tmp_ready = true;
@@ -1256,6 +1487,9 @@ static void h264_row_write(ESP32P4H264State *s, int64_t now)
             return;
         }
     }
+    if (h264_row_write_waits(s)) {
+        return;
+    }
     d0 = g_malloc(b0);
     for (int x = 0; x < mbw; x++) {
         h264e_mb_get(e, r, x, d0 + x * (b0 / mbw), true, last);
@@ -1302,9 +1536,6 @@ static void h264_row_write(ESP32P4H264State *s, int64_t now)
         }
         rx_push(s, 3, mv, 4 * e->mvm_n, last);
         s->mv_merge = deposit32(s->mv_merge, 5, 13, e->mvm_total);
-    }
-    if (last) {
-        h264e_finish(e);
     }
     nbs = h264e_pending(e) * 3 / 2 + 16;
     bs = g_malloc(nbs);
@@ -1354,7 +1585,8 @@ static void h264_row_read(ESP32P4H264State *s, int64_t now)
         }
     }
     if (!h264_read_source(s, r, true) ||
-        (r > 0 && !h264_read_tmp(s, r, true))) {
+        (r > 0 && !h264_read_tmp(s, r, true)) ||
+        h264_row_read_waits(s, r)) {
         return;
     }
     if ((r > 0 && !h264_read_tmp(s, r, false)) ||
@@ -1363,6 +1595,10 @@ static void h264_row_read(ESP32P4H264State *s, int64_t now)
         return;
     }
     h264e_code_row(e, r);
+    if (r == e->cfg.mb_h - 1) {
+        /* The slice's end, which h264_row_write() takes out with it. */
+        h264e_finish(e);
+    }
     s->state = ST_CODE;
     esp32p4_clkwait_start(&s->row_wait, now, (uint64_t)mbw * CYCLES_PER_MB);
     if (r == 0 && e->cfg.mb_h > 1 && trigger < mbw) {
@@ -2224,6 +2460,7 @@ static void esp32p4_h264_reset_hold(Object *obj, ResetType type)
     esp32p4_clkwait_stop(&s->row_wait);
     esp32p4_clkwait_stop(&s->tmp_wait);
     esp32p4_clkwait_stop(&s->move_wait);
+    esp32p4_mspi_dma_wait_cancel(&s->dma_wait);
     s->frame_mode = false;
     s->gop_conf = 0;
     for (int q = 0; q < 2; q++) {
@@ -2296,6 +2533,12 @@ static void esp32p4_h264_reset_exit(Object *obj, ResetType type)
     h264_update_irq(ESP32P4_H264(obj));
 }
 
+/* A held port takes accesses again: the step waiting on it goes on. */
+static void h264_dma_ready(void *opaque)
+{
+    h264_kick(opaque, h264_now());
+}
+
 static void esp32p4_h264_init(Object *obj)
 {
     ESP32P4H264State *s = ESP32P4_H264(obj);
@@ -2317,6 +2560,7 @@ static void esp32p4_h264_init(Object *obj)
     esp32p4_clkwait_init(&s->row_wait, s->clk, h264_row_cb, s);
     esp32p4_clkwait_init(&s->tmp_wait, s->clk, h264_tmp_cb, s);
     esp32p4_clkwait_init(&s->move_wait, s->clk, h264_move_cb, s);
+    esp32p4_mspi_dma_wait_init(&s->dma_wait, h264_dma_ready, s);
     h264e_init(&s->enc);
 }
 
@@ -2503,10 +2747,20 @@ static const VMStateDescription vmstate_esp32p4_h264_chan = {
     },
 };
 
+/* A step a held port held: it asks again. */
+static int esp32p4_h264_post_load(void *opaque, int version_id)
+{
+    ESP32P4H264State *s = opaque;
+
+    esp32p4_mspi_dma_wait_retry(&s->dma_wait);
+    return 0;
+}
+
 static const VMStateDescription vmstate_esp32p4_h264 = {
     .name = TYPE_ESP32P4_H264,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = esp32p4_h264_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(frame_mode, ESP32P4H264State),
         VMSTATE_UINT32(gop_conf, ESP32P4H264State),
