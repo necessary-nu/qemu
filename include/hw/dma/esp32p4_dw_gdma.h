@@ -156,6 +156,15 @@ struct ESP32P4DwGdmaState {
     bool hs_last[ESP32P4_DW_GDMA_HS];
     /* The arbiters' last grants, reads and writes. */
     uint32_t rr_last[2];
+    /*
+     * The channel whose transaction a memory controller's AXI port holds
+     * (esp32p4_mspi_dma_wait()), for each arbiter, or -1: the arbiter's
+     * bus waits, and makes it once the port takes it, which @bus_wait is
+     * told of. A channel's block end, whose accesses the port holds,
+     * waits likewise.
+     */
+    int32_t stall_grant[2];
+    Notifier bus_wait;
 
     /* The streams feeding VDMA's handshakes (esp32p4_dw_gdma_add_source()) */
     NotifierList sources;

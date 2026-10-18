@@ -80,15 +80,19 @@
  *     L2_CACHE_ACS_FAIL_CTRL 1, SYNC_MAP 0x10; the L2 cache its reset 128
  *     KiB of L2MEM. No line is dirty, so their contents, the ROM's on the
  *     chip, are not presented.
- *   - The flash MSPI controller: reset (HP_RST_EN0), then configured for
- *     the image header's DIO reads at 80 MHz, both ports in DIO mode and
+ *   - The flash MSPI controller: its registers reset (HP_RST_EN0's
+ *     RST_EN_MSPI_APB, bit 24, pulsed with RST_EN_DUAL_MSPI_AXI, bit 23,
+ *     the PSRAM controller's AXI port, which the ROM resets with it), then
+ *     configured for the image header's DIO reads at 80 MHz, both ports in DIO mode and
  *     SPI0 reading with DIO's command 0xBB, 28 address bits (the address
  *     and the mode bits' upper half) and 2 dummy cycles (SPI0 CTRL
  *     0x00AC200C, CTRL2 0x01002C41, CLOCK 0x80000000, USER 0x200000C0,
  *     USER1 0x6C000041, USER2 0x700000BB, MOSI_DLEN and MISO_DLEN 0xFF
  *     (SPI_init()'s 256 bits), CACHE_FCTRL 0x40000005 with the AXI port
  *     open; SPI1 CTRL 0x00AC200C, CTRL1 0x001FF7FC, CLOCK 0x80000000),
- *     SPI1's buffer W0 the flash's JEDEC ID from the ROM's RDID, and both
+ *     SPI1's buffer W0 the flash's JEDEC ID from the ROM's RDID (the
+ *     attached part's own: the board's 32 MiB GD25Q256E's C8 40 19), and
+ *     both
  *     ports' SLV_ST_END and MST_ST_END raised by the ROM's transactions
  *     (INT_RAW 0x18); the flash MMU all invalid (Cache_FLASH_MMU_Init(),
  *     ITEM_INDEX 0x3FF), so nothing maps the flash window. The ROM's
@@ -121,7 +125,11 @@
  *     printf channels (_putc1 ets_write_char_uart, _putc2
  *     ets_write_char_usb, as EFUSE_UART_PRINT_CONTROL, GPIO36,
  *     LP_SYSTEM_LP_STORE4 bit 0 and the USB Serial/JTAG eFuses select),
- *     UartDev, the flash's JEDEC ID, g_offset_of_active_bootloader 0x2000,
+ *     UartDev, the flash's JEDEC ID (esp_rom_spi_flash_update_id(): the
+ *     device_id of the esp_rom_spiflash_chip_t that the ROM's
+ *     rom_spiflash_legacy_data points to, ESP-IDF's g_rom_flashchip,
+ *     where its bootloader and esp_flash read the ID back),
+ *     g_offset_of_active_bootloader 0x2000,
  *     usb_uart_connected 0, km_log 1, and g_saved_pc, the PC each core's
  *     record in the debug assistant kept through the reset. This needs the
  *     ROM image the machine knows (its build string is checked); with
@@ -247,8 +255,12 @@
  * clears: the flash MSPI core clock XTAL_CLK undivided.
  */
 #define FLASH_CORE_CLK_DIV_RESET    (3u << 4)
-#define RST_EN_SPI01                BIT(23)
-#define RST_EN_MSPI_AXI             BIT(24)
+/*
+ * HP_RST_EN0's resets of the PSRAM controller's AXI port and the flash
+ * controller's registers, which the ROM pulses together.
+ */
+#define RST_EN_DUAL_MSPI_AXI        BIT(23)
+#define RST_EN_MSPI_APB             BIT(24)
 #define RST_EN_UART0_APB            BIT(13)
 #define SHA_SYS_CLK_EN              BIT(26)
 #define CRYPTO_SHA_CLK_EN           BIT(20)
@@ -353,31 +365,13 @@ static void rom_cache_sync(uint32_t map, uint32_t op)
 }
 
 /*
- * The JEDEC ID the ROM's RDID reads from the flash: the W25Q part of the
- * board's flash size, or nothing, zeros, from a board without flash.
+ * The JEDEC ID the ROM's RDID reads from the flash: the attached part's
+ * own, or from a board without flash the data line as SelectSpiFunction()
+ * leaves its pad, pulled up (all ones).
  */
 static uint32_t rom_flash_jedec_id(ESP32P4MachineState *s)
 {
-    switch (s->flash_size) {
-    case 0:
-        return 0;
-    case 1 * MiB:
-        return 0xef4014;
-    case 2 * MiB:
-        return 0xef4015;
-    case 4 * MiB:
-        return 0xef4016;
-    case 8 * MiB:
-        return 0xef4017;
-    case 16 * MiB:
-        return 0xef4018;
-    case 32 * MiB:
-        return 0xef4019;
-    case 64 * MiB:
-        return 0xef4020;
-    default:
-        return 0xef4021;
-    }
+    return esp32p4_mspi_flash_jedec_id(&s->flash_mspi);
 }
 
 /*
@@ -474,9 +468,9 @@ static void rom_flash_boot(ESP32P4MachineState *s)
     rom_wr(SPI0_BASE + SPI_MEM_CACHE_FCTRL, 0xc0000000);
     rom_wr(HP_SYS_CLKRST_SOC_CLK_CTRL0, rom_rd(HP_SYS_CLKRST_SOC_CLK_CTRL0));
     rom_clr(HP_SYS_CLKRST_PERI_CLK_CTRL00, FLASH_CORE_CLK_DIV_RESET);
-    rom_set(HP_SYS_CLKRST_HP_RST_EN0, RST_EN_SPI01 | RST_EN_MSPI_AXI);
-    rom_clr(HP_SYS_CLKRST_HP_RST_EN0, RST_EN_MSPI_AXI);
-    rom_clr(HP_SYS_CLKRST_HP_RST_EN0, RST_EN_SPI01);
+    rom_set(HP_SYS_CLKRST_HP_RST_EN0, RST_EN_DUAL_MSPI_AXI | RST_EN_MSPI_APB);
+    rom_clr(HP_SYS_CLKRST_HP_RST_EN0, RST_EN_MSPI_APB);
+    rom_clr(HP_SYS_CLKRST_HP_RST_EN0, RST_EN_DUAL_MSPI_AXI);
 
     rom_wr(SPI1_BASE + SPI1_MEM_SUS_STATUS, 0x7a7a0000);
     rom_wr(SPI0_BASE + SPI_MEM_MISC, 0x72);

@@ -625,10 +625,11 @@ static void dwc2_mode_timer(void *opaque)
  * [spec:nuos:req:emu.esp32p4.usb]
  * Take the core's events due by now, in time order, each at its time:
  * the mode switch, the host's frames and bus steps, the device's
- * suspend and end of frame. Without icount their timers can run well
- * after, while software reads GINTSTS (CurMod after a forced mode, SOF,
- * USBSusp, EOPF), HFNUM, a channel's HCINT or DSTS. A register access
- * first takes them. Only a timer that has come is run.
+ * suspend and end of frame, and those of the host at the device port's
+ * cable (usb-devport.h). Without icount their timers can run well after,
+ * while software reads GINTSTS (CurMod after a forced mode, SOF, USBSusp,
+ * EOPF, a SETUP or OUT the host sent), HFNUM, a channel's HCINT or DSTS.
+ * A register access first takes them. Only a timer that has come is run.
  */
 void dwc2_otg_catch_up(DWC2OTGState *s)
 {
@@ -647,21 +648,27 @@ void dwc2_otg_catch_up(DWC2OTGState *s)
             { s->idle_timer, s->idle_due, dwc2_otg_dev_idle },
             { s->eopf_timer, s->eopf_due, dwc2_otg_dev_eopf },
         };
+        QEMUTimer *timer = NULL;
+        void (*run)(void *opaque) = NULL;
+        void *opaque = s;
         int64_t due = now;
-        int next = -1;
 
         for (int i = 0; i < ARRAY_SIZE(ev); i++) {
             if (timer_pending(ev[i].timer) && ev[i].due <= due &&
-                (next < 0 || ev[i].due < due)) {
-                next = i;
+                (!timer || ev[i].due < due)) {
+                timer = ev[i].timer;
+                run = ev[i].run;
                 due = ev[i].due;
             }
         }
-        if (next < 0) {
+        if (usb_devport_next(&s->devport, &due, &timer, &run)) {
+            opaque = &s->devport;
+        }
+        if (!timer) {
             return;
         }
-        timer_del(ev[next].timer);
-        line_run_at(due, ev[next].run, s);
+        timer_del(timer);
+        line_run_at(due, run, opaque);
     }
 }
 

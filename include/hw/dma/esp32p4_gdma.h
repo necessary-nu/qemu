@@ -13,6 +13,7 @@
 #include "hw/misc/esp32p4_clk_period.h"
 #include "hw/core/clock.h"
 #include "qemu/timer.h"
+#include "qemu/notify.h"
 #include "qom/object.h"
 #include "system/memory.h"
 
@@ -353,6 +354,15 @@ struct ESP32P4GdmaState {
 
     /* The peripherals to tell of data or room, after the engine's run. */
     uint32_t notify;
+
+    /*
+     * The transaction each arbiter granted that a memory controller's AXI
+     * port holds (esp32p4_mspi_dma_wait()), as the arbiter's member, or
+     * -1: the arbiter's bus waits, and makes it once the port takes it,
+     * which @bus_wait is told of.
+     */
+    int32_t stall_grant[2];
+    Notifier bus_wait;
 
     const ESP32P4GdmaPeriphOps *periph_ops[ESP32P4_GDMA_PERIPHS];
     void *periph_opaque[ESP32P4_GDMA_PERIPHS];

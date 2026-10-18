@@ -471,6 +471,9 @@ static void pl022_set_fssin(void *opaque, int n, int level)
  * its moment, each at its own time: without icount their timers run late
  * on a loaded host, and until they do software would read BSY, the FIFOs
  * and the interrupts as of when the host got to them, not of the access.
+ * The moment is the access's time (line_time()), not the present: a DMA
+ * answering a frame's DREQ makes its access at that frame's end, however
+ * late the frame's timer ran, and takes no frame due after it.
  * SSPCLK comes up to time before them (clock_sync()): a start, stop or
  * change of rate that has fallen due, its event's timer late, times the
  * frames from its time.

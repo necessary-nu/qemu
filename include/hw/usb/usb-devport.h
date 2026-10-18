@@ -115,6 +115,8 @@ typedef struct USBDevPort {
 
     uint32_t br_state;
     QEMUTimer *br_timer;
+    /* When br_timer is due: the time of the bridge's next step. */
+    int64_t br_due;
     QEMUTimer *br_frame_timer;
     uint16_t br_frame;
     int64_t br_frame_ns;
@@ -163,6 +165,14 @@ bool usb_devport_host_attached(USBDevPort *p);
 void usb_devport_changed(USBDevPort *p);
 /* The device's software armed a buffer: a NAKed transaction may succeed. */
 void usb_devport_kick(USBDevPort *p);
+/*
+ * The bridge's earliest event pending, if it is due no later than *@due:
+ * set *@due, *@timer and *@run, which takes @p, for the device controller
+ * to run it at its time (line_run_at()) once the timer is deleted, in
+ * order with its own events, before a register access.
+ */
+bool usb_devport_next(USBDevPort *p, int64_t *due, QEMUTimer **timer,
+                      void (**run)(void *opaque));
 
 extern const VMStateDescription vmstate_usb_devport;
 

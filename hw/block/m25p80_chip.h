@@ -129,5 +129,6 @@ void m25chip_set_cs(M25Chip *c, bool high);
 uint8_t m25chip_transfer(M25Chip *c, uint8_t tx);
 int64_t m25chip_busy_until(M25Chip *c);
 uint32_t m25chip_size(const M25ChipInfo *info);
+uint32_t m25chip_jedec_id(const M25ChipInfo *info);
 
 #endif
