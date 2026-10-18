@@ -228,10 +228,10 @@
  * or the caches waits on the bus until the port takes accesses again,
  * and is then made. A DMA master's waits likewise, with its channel or
  * engine, for GDMA-AHB, GDMA-AXI, VDMA, the 2D-DMA, H264_DMA, the OTGs,
- * the GMAC and the SD/MMC host's IDMAC, which ask before each transaction
- * (esp32p4_mspi_dma_wait()) and make it once the port takes it; another
- * master's (qtest's, TRACE's) is refused with an error response and
- * logged.
+ * the GMAC, the SD/MMC host's IDMAC and the trace encoders, which ask
+ * before each transaction (esp32p4_mspi_dma_wait()) and make it once the
+ * port takes it; another master's (qtest's) is refused with an error
+ * response and logged.
  *
  * Not modelled: ECC on the external memory (FMEM/SMEM ECC, the PSRAM's
  * 16-to-18 byte mode and its address conversion), logged as unimplemented

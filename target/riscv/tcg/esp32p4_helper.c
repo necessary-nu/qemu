@@ -342,12 +342,17 @@ void esp32p4_trace_unwound(ESP32P4CPU *cpu, bool unwound)
 /*
  * [spec:nuos:req:emu.esp32p4.debug]
  * An instruction starts: the one unwound starting again is the same
- * instruction, which the trace has, and is not reported twice.
+ * instruction, which the trace has, and is not reported twice. The
+ * encoder's stall request stops the core before it: the core unwinds to
+ * its start, not having executed it, its start reported
+ * (esp32p4_restore_state_to_opc()), and waits until the encoder lets it
+ * go on (esp32p4_cpu_trace_stall()).
  */
 void helper_esp32p4_trace_insn(CPURISCVState *env, target_ulong pc,
                                uint32_t kind)
 {
     ESP32P4CPU *cpu = esp32p4_cpu_from_env(env);
+    CPUState *cs = CPU(cpu);
 
     if (cpu->trace_unwound) {
         cpu->trace_unwound = false;
@@ -358,7 +363,12 @@ void helper_esp32p4_trace_insn(CPURISCVState *env, target_ulong pc,
     cpu->trace_started = cpu->trace_ops && qatomic_read(&cpu->trace_en);
     if (cpu->trace_started) {
         cpu->trace_start_pc = pc;
-        cpu->trace_ops->insn(cpu->trace_opaque, pc, kind, env->priv);
+        if (cpu->trace_ops->insn(cpu->trace_opaque, pc, kind, env->priv)) {
+            cpu_restore_state(cs, GETPC());
+            cs->halted = 1;
+            cs->exception_index = EXCP_HLT;
+            cpu_loop_exit(cs);
+        }
     }
 }
 

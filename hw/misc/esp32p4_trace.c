@@ -65,27 +65,39 @@
  * accesses checked by the DMA APM), which raises MEM_FULL_INTR as the
  * address reaches MEM_END_ADDR and goes back to MEM_START_ADDR in loop
  * mode (TRACE_MEM_LOOP), or drops what follows. The master writes at
- * once while TRACE_SYS_CLK runs, so the FIFO only fills while the clock is
- * stopped: a packet that does not fit is lost, raising
- * FIFO_OVERFLOW_INTR and stopping the encoder (WORK_STATUS 3) until the
- * FIFO empties, when, with TRACE_RESTART_ENA, it starts again with a
- * support packet reporting the loss. As TRM 3.5.7 has it, with
- * TRACE_RESTART_ENA set the encoder restarts once the FIFO is empty
- * however it stopped, TRIGGER_OFF included, which is why ESP-IDF clears
- * it before stopping. TRACE_RESET_ENA stops the trace while the core is
- * held in reset, as for TRIGGER_OFF but waiting (WORK_STATUS 2), and
- * starts it again with the core; the core is never halted, there being no
- * debugger. COREn_TRACE_INTR (sources 97, 98) is the OR of the enabled
- * interrupts.
+ * once while TRACE_SYS_CLK runs and the bus takes its writes. Its write
+ * into a memory controller's window (a trace memory in PSRAM, through
+ * 0x48000000) waits while the controller's AXI port holds accesses (its
+ * clocks stopped, held in reset, AXI_REQ_EN clear), as every DMA master's
+ * transaction does, MEM_CURRENT_ADDR staying at the waiting byte, and is
+ * made once the port takes accesses again; a port a reset release leaves
+ * closed answers it with an error, which loses the bytes (logged): the
+ * TRM says nothing of what the master does then, and it goes on with the
+ * next. So the FIFO fills while the clock is stopped or the write waits:
+ * a packet that does not fit is lost, raising FIFO_OVERFLOW_INTR and
+ * stopping the encoder (WORK_STATUS 3) until the FIFO empties, when, with
+ * TRACE_RESTART_ENA, it starts again with a support packet reporting the
+ * loss (TRM 3.4: "When the memory bandwidth is insufficient, the FIFO may
+ * overflow, and packet loss occurs"). The core is not held back by it:
+ * only with TRACE_STALL_ENA (TRM 3.5.3, 3.8.1) is the stall request
+ * asserted to the core while the FIFO is almost full
+ * (ESP32P4_TRACE_STALL_ROOM), the core stopping before the instruction it
+ * is starting until the FIFO drains, so that no packet is lost (lossless
+ * trace); a stall request no event ends stops the core for good, as on
+ * the chip. As TRM 3.5.7 has it, with TRACE_RESTART_ENA set the encoder
+ * restarts once the FIFO is empty however it stopped, TRIGGER_OFF
+ * included, which is why ESP-IDF clears it before stopping.
+ * TRACE_RESET_ENA stops the trace while the core is held in reset, as for
+ * TRIGGER_OFF but waiting (WORK_STATUS 2), and starts it again with the
+ * core; the core is never halted, there being no debugger. COREn_TRACE_INTR
+ * (sources 97, 98) is the OR of the enabled interrupts.
  *
- * Not modelled: stalling the core while the FIFO is almost full
- * (TRACE_STALL_ENA, logged as unimplemented: packets are lost instead);
- * implicit exception mode (TRACE_IMPLICIT_EXCEPT, logged: exception
- * packets keep their address, as the TRM's support packet says the mode is
- * not implemented); the AHB burst settings, which change no data; and the
- * register clock gate, CLOCK_GATE. Starting the encoder takes effect from
- * the core's next block of instructions, and stopping it from a debug
- * trigger, at the instruction the trigger fires on.
+ * Not modelled: implicit exception mode (TRACE_IMPLICIT_EXCEPT, logged:
+ * exception packets keep their address, as the TRM's support packet says
+ * the mode is not implemented); the AHB burst settings, which change no
+ * data; and the register clock gate, CLOCK_GATE. Starting the encoder
+ * takes effect from the core's next block of instructions, and stopping it
+ * from a debug trigger, at the instruction the trigger fires on.
  */
 
 #include "qemu/osdep.h"
@@ -191,11 +203,17 @@ enum {
 #define ANCHOR_PACKETS          128
 #define ANCHOR_BYTES            14
 
-/* What the FIFO's master writes once the lock is let go. */
+/*
+ * What the FIFO's master writes once the lock is let go: up to a FIFO's
+ * bytes, a restart's support packet and the FIFO's again
+ * (trace_progress()). With `need_bql`, a write into I/O, which is asked
+ * about and made with the BQL held, waits in the FIFO for the BQL.
+ */
 typedef struct {
-    uint8_t data[ESP32P4_TRACE_FIFO];
-    uint32_t addr[ESP32P4_TRACE_FIFO];
+    uint8_t data[2 * ESP32P4_TRACE_FIFO];
+    uint32_t addr[2 * ESP32P4_TRACE_FIFO];
     unsigned n;
+    bool need_bql;
 } ESP32P4TraceDrain;
 
 /* A packet's payload as it is built, least significant bit first. */
@@ -260,9 +278,42 @@ static void trace_fifo_push(ESP32P4TraceState *t, uint8_t byte)
     t->fifo_count++;
 }
 
+static MemTxAttrs trace_attrs(ESP32P4TraceState *t)
+{
+    return esp32p4_dma_attrs(
+        t->core ? ESP32P4_DMA_MASTER_TRACE1 : ESP32P4_DMA_MASTER_TRACE0,
+        t->core ? ESP32P4_ICM_ID_TRACE1 : ESP32P4_ICM_ID_TRACE0);
+}
+
+/*
+ * Whether the master's write at `addr` reaches I/O, not RAM: a memory
+ * controller's window among it, whose AXI port may hold the write.
+ */
+static bool trace_dest_io(ESP32P4TraceState *t, uint32_t addr)
+{
+    hwaddr xlat, l = 1;
+    MemoryRegion *mr;
+
+    RCU_READ_LOCK_GUARD();
+    mr = address_space_translate(esp32p4_pms_bus_as(t->pms), addr, &xlat,
+                                 &l, true, trace_attrs(t));
+    return !memory_region_is_ram(mr);
+}
+
+/* Drop the FIFO's bytes, past the end of the trace memory. */
+static void trace_fifo_drop(ESP32P4TraceState *t)
+{
+    t->fifo_head = (t->fifo_head + t->fifo_count) % ESP32P4_TRACE_FIFO;
+    t->fifo_count = 0;
+}
+
 /*
  * The master takes the FIFO's bytes while TRACE_SYS_CLK runs, each to
- * MEM_CURRENT_ADDR; the write itself is made once the lock is let go.
+ * MEM_CURRENT_ADDR; the write itself is made once the lock is let go. A
+ * write into I/O is asked about first, with the BQL held through to the
+ * write, so that a memory controller's port cannot come to hold it in
+ * between: one the port holds is not made, its bytes staying in the FIFO,
+ * until the port takes accesses again (trace_dma_ready()).
  */
 /* [spec:nuos:req:emu.esp32p4.debug] */
 static void trace_drain(ESP32P4TraceState *t, ESP32P4TraceDrain *d)
@@ -272,24 +323,42 @@ static void trace_drain(ESP32P4TraceState *t, ESP32P4TraceDrain *d)
     if (!clock_is_enabled(t->sys_clk)) {
         return;
     }
-    while (t->fifo_count) {
-        uint8_t byte = t->fifo[t->fifo_head];
+    while (t->fifo_count && !t->held) {
+        uint32_t n;
 
-        t->fifo_head = (t->fifo_head + 1) % ESP32P4_TRACE_FIFO;
-        t->fifo_count--;
         if (t->mem_current >= t->mem_end) {
             if (!loop) {
-                continue;
+                trace_fifo_drop(t);
+                break;
             }
             t->mem_current = t->mem_start;
             if (t->mem_current >= t->mem_end) {
-                continue;
+                trace_fifo_drop(t);
+                break;
             }
         }
-        d->data[d->n] = byte;
-        d->addr[d->n] = t->mem_current;
-        d->n++;
-        t->mem_current++;
+        n = MIN(t->fifo_count, t->mem_end - t->mem_current);
+        if (trace_dest_io(t, t->mem_current)) {
+            if (!bql_locked()) {
+                d->need_bql = true;
+                break;
+            }
+            if (esp32p4_mspi_dma_wait_on(&t->dma_wait,
+                                         esp32p4_pms_bus_as(t->pms),
+                                         t->mem_current, n, trace_attrs(t),
+                                         true)) {
+                t->held = true;
+                break;
+            }
+        }
+        while (n--) {
+            d->data[d->n] = t->fifo[t->fifo_head];
+            d->addr[d->n] = t->mem_current;
+            d->n++;
+            t->fifo_head = (t->fifo_head + 1) % ESP32P4_TRACE_FIFO;
+            t->fifo_count--;
+            t->mem_current++;
+        }
         if (t->mem_current == t->mem_end) {
             t->intr_raw |= INTR_MEM_FULL;
             if (loop) {
@@ -301,9 +370,7 @@ static void trace_drain(ESP32P4TraceState *t, ESP32P4TraceDrain *d)
 
 static void trace_write(ESP32P4TraceState *t, ESP32P4TraceDrain *d)
 {
-    MemTxAttrs attrs = esp32p4_dma_attrs(
-        t->core ? ESP32P4_DMA_MASTER_TRACE1 : ESP32P4_DMA_MASTER_TRACE0,
-        t->core ? ESP32P4_ICM_ID_TRACE1 : ESP32P4_ICM_ID_TRACE0);
+    MemTxAttrs attrs = trace_attrs(t);
     unsigned i = 0;
 
     while (i < d->n) {
@@ -339,6 +406,30 @@ static void trace_update_irq(ESP32P4TraceState *t)
 static void trace_irq_timer(void *opaque)
 {
     trace_update_irq(opaque);
+}
+
+static void trace_unlock(ESP32P4TraceState *t, ESP32P4TraceDrain *d);
+static void trace_progress(ESP32P4TraceState *t, ESP32P4TraceDrain *d);
+
+/*
+ * Let go of the lock after a report of the core's, made without the BQL,
+ * as trace_unlock(); a write into I/O the drain left for the BQL is then
+ * made with it, the BQL taken before the lock.
+ */
+static void trace_finish(ESP32P4TraceState *t, ESP32P4TraceDrain *d)
+{
+    bool retry = d->need_bql;
+
+    trace_unlock(t, d);
+    if (retry) {
+        ESP32P4TraceDrain d2 = { .n = 0 };
+
+        bql_lock();
+        qemu_mutex_lock(&t->lock);
+        trace_progress(t, &d2);
+        trace_unlock(t, &d2);
+        bql_unlock();
+    }
 }
 
 /*
@@ -895,21 +986,72 @@ static void trace_lost(ESP32P4TraceState *t)
     trace_set_working(t, WORK_LOST);
 }
 
+/*
+ * The stall request (TRACE_STALL_ENA) asserted while the FIFO has less
+ * room than ESP32P4_TRACE_STALL_ROOM: from the report of an instruction's
+ * start, which the core then does not execute until the request is
+ * deasserted. Returns whether it stalls the core.
+ */
+/* [spec:nuos:req:emu.esp32p4.debug] */
+static bool trace_stall_check(ESP32P4TraceState *t)
+{
+    if (!(t->config & CONFIG_STALL_ENA) || t->work_status != WORK_WORKING ||
+        trace_fifo_space(t) >= ESP32P4_TRACE_STALL_ROOM) {
+        return false;
+    }
+    t->stall = true;
+    esp32p4_cpu_trace_stall(t->cpu);
+    return true;
+}
+
+/*
+ * The stall request deasserted, the core going on, once the FIFO has the
+ * room or the request no longer applies (TRACE_STALL_ENA cleared, the
+ * encoder stopped).
+ */
+static void trace_stall_update(ESP32P4TraceState *t)
+{
+    if (t->stall && (!(t->config & CONFIG_STALL_ENA) ||
+                     t->work_status != WORK_WORKING ||
+                     trace_fifo_space(t) >= ESP32P4_TRACE_STALL_ROOM)) {
+        t->stall = false;
+        esp32p4_cpu_trace_unstall(t->cpu);
+    }
+}
+
 /* Drain, and restart if that empties the FIFO. */
 static void trace_progress(ESP32P4TraceState *t, ESP32P4TraceDrain *d)
 {
     trace_drain(t, d);
     trace_check_restart(t);
     trace_drain(t, d);
+    trace_stall_update(t);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.debug]
+ * The memory controller's port takes accesses again: the master's write
+ * goes on.
+ */
+static void trace_dma_ready(void *opaque)
+{
+    ESP32P4TraceState *t = opaque;
+    ESP32P4TraceDrain d = { .n = 0 };
+
+    qemu_mutex_lock(&t->lock);
+    t->held = false;
+    trace_progress(t, &d);
+    trace_unlock(t, &d);
 }
 
 /* The core's reports */
 
 /* [spec:nuos:req:emu.esp32p4.debug] */
-static void trace_insn(void *opaque, uint32_t pc, uint32_t kind, int priv)
+static bool trace_insn(void *opaque, uint32_t pc, uint32_t kind, int priv)
 {
     ESP32P4TraceState *t = opaque;
     ESP32P4TraceDrain d = { .n = 0 };
+    bool stall = false;
 
     qemu_mutex_lock(&t->lock);
     if (t->work_status == WORK_WORKING) {
@@ -924,8 +1066,19 @@ static void trace_insn(void *opaque, uint32_t pc, uint32_t kind, int priv)
         t->pend_notify = t->notify_next;
         t->notify_next = false;
         trace_progress(t, &d);
+        if (!d.need_bql) {
+            stall = trace_stall_check(t);
+        }
+    }
+    if (d.need_bql) {
+        trace_finish(t, &d);
+        qemu_mutex_lock(&t->lock);
+        stall = trace_stall_check(t);
+        qemu_mutex_unlock(&t->lock);
+        return stall;
     }
     trace_unlock(t, &d);
+    return stall;
 }
 
 /* [spec:nuos:req:emu.esp32p4.debug] */
@@ -956,7 +1109,7 @@ static void trace_trap(void *opaque, uint32_t epc, uint32_t cause,
         trace_push(t, &r);
         trace_progress(t, &d);
     }
-    trace_unlock(t, &d);
+    trace_finish(t, &d);
 }
 
 /* [spec:nuos:req:emu.esp32p4.debug] */
@@ -988,7 +1141,7 @@ static void trace_trigger(void *opaque, int action, bool before)
         }
         trace_progress(t, &d);
     }
-    trace_unlock(t, &d);
+    trace_finish(t, &d);
 }
 
 static const ESP32P4TraceOps esp32p4_trace_ops = {
@@ -1117,11 +1270,6 @@ static void esp32p4_trace_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     case A_CONFIG:
         esp32p4_trace_set(&t->config, v, bytes, CONFIG_MASK);
-        if (t->config & CONFIG_STALL_ENA) {
-            qemu_log_mask(LOG_UNIMP, "%s%d: stalling the core while the FIFO "
-                          "is almost full is not modelled; packets are lost "
-                          "instead\n", TYPE_ESP32P4_TRACE, t->core);
-        }
         if (t->config & CONFIG_IMPLICIT_EXCEPT) {
             qemu_log_mask(LOG_UNIMP, "%s%d: implicit exception mode is not "
                           "modelled; exception packets keep their address\n",
@@ -1218,7 +1366,13 @@ static void esp32p4_trace_reset_hold(Object *obj, ResetType type)
 {
     ESP32P4TraceState *t = ESP32P4_TRACE(obj);
 
+    esp32p4_mspi_dma_wait_cancel(&t->dma_wait);
     qemu_mutex_lock(&t->lock);
+    t->held = false;
+    if (t->stall) {
+        t->stall = false;
+        esp32p4_cpu_trace_unstall(t->cpu);
+    }
     t->mem_start = 0;
     t->mem_end = UINT32_MAX;
     t->mem_current = 0;
@@ -1267,6 +1421,7 @@ static void esp32p4_trace_realize(DeviceState *dev, Error **errp)
         return;
     }
     t->irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, trace_irq_timer, t);
+    esp32p4_mspi_dma_wait_init(&t->dma_wait, trace_dma_ready, t);
     esp32p4_trace_connect(t->cpu, &esp32p4_trace_ops, t);
 }
 
@@ -1291,13 +1446,20 @@ static void esp32p4_trace_finalize(Object *obj)
     qemu_mutex_destroy(&ESP32P4_TRACE(obj)->lock);
 }
 
-/* The encoder's reporting resumes on its own state after migration. */
+/*
+ * The encoder's reporting resumes on its own state after migration, and a
+ * write a held port held asks again (a wait's place on a controller's list
+ * is not migrated).
+ */
 static int esp32p4_trace_post_load(void *opaque, int version_id)
 {
     ESP32P4TraceState *t = opaque;
 
     if (t->cpu) {
         esp32p4_trace_set_enabled(t->cpu, t->work_status == WORK_WORKING);
+    }
+    if (t->held) {
+        esp32p4_mspi_dma_wait_retry(&t->dma_wait);
     }
     return 0;
 }
@@ -1322,8 +1484,8 @@ static const VMStateDescription vmstate_esp32p4_trace_insn = {
 
 static const VMStateDescription vmstate_esp32p4_trace = {
     .name = TYPE_ESP32P4_TRACE,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = esp32p4_trace_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_CLOCK(sys_clk, ESP32P4TraceState),
@@ -1346,6 +1508,8 @@ static const VMStateDescription vmstate_esp32p4_trace = {
         VMSTATE_UINT32(work_status, ESP32P4TraceState),
         VMSTATE_BOOL(core_reset, ESP32P4TraceState),
         VMSTATE_BOOL(irq_level, ESP32P4TraceState),
+        VMSTATE_BOOL(held, ESP32P4TraceState),
+        VMSTATE_BOOL(stall, ESP32P4TraceState),
         VMSTATE_TIMER_PTR(irq_timer, ESP32P4TraceState),
         VMSTATE_UINT8_ARRAY(fifo, ESP32P4TraceState, ESP32P4_TRACE_FIFO),
         VMSTATE_UINT32(fifo_head, ESP32P4TraceState),
