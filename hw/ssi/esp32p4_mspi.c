@@ -237,14 +237,15 @@
  * port takes it; another master's (qtest's) is refused with an error
  * response and logged.
  *
+ * A DDR read of the die with DQS_LOOP set is captured on the controller's
+ * own clock, through SMEM_DIN_MODE's and SMEM_DIN_NUM's delays, the die's
+ * data following its clock by tDQSCK (psram_loop_init()).
+ *
  * Not modelled: ECC on the external memory (FMEM/SMEM ECC, the PSRAM's
  * 16-to-18 byte mode and its address conversion), logged as unimplemented
- * when enabled; the PSRAM controller's own sampling (SMEM_DIN_MODE,
- * SMEM_DIN_NUM, the HEX ones, and a DDR read with DQS_LOOP set, which
- * captures every beat right), as ESP-IDF captures on the strobe; the
- * flash controller's FMEM_VAR_DUMMY, for flashes with a strobe, which the
- * chip's quad flash has not; SPI0's own user command (USR, which the
- * headers mark reserved).
+ * when enabled; the flash controller's FMEM_VAR_DUMMY, for flashes with a
+ * strobe, which the chip's quad flash has not; SPI0's own user command
+ * (USR, which the headers mark reserved).
  */
 
 #include "qemu/osdep.h"
@@ -700,6 +701,11 @@ static const ESP32P4MSPIReg esp32p4_spi1_psram_regs[ESP32P4_MSPI_NREGS] = {
 #define R0_DIN_MODE             (0x184 / 4)
 #define R0_DIN_NUM              (0x188 / 4)
 #define R0_FSM                  (0x054 / 4)
+#define R0_SMEM_TIMING_CALI     (0x190 / 4)
+#define R0_SMEM_DIN_MODE        (0x194 / 4)
+#define R0_SMEM_DIN_NUM         (0x198 / 4)
+#define R0_SMEM_DIN_HEX_MODE    (0x1a4 / 4)
+#define R0_SMEM_DIN_HEX_NUM     (0x1a8 / 4)
 #define R1_TIMING_CALI          (0x180 / 4)
 
 /* SPI0's FSM: the lock delay of the SPI0/SPI1 arbiter. */
@@ -1789,18 +1795,17 @@ static int64_t mspi_core_ps(ESP32P4MSPIState *s)
 
 /*
  * [spec:nuos:req:emu.esp32p4.memory]
- * How much earlier than its edge flash data line `io` is sampled, ps, at
- * core clock period `core_ps` and SPI clock period `t_ps`.
+ * How much earlier than its edge a data line delayed by DIN mode `mode`
+ * and DIN number `num` is sampled, ps, at core clock period `core_ps` and
+ * SPI clock period `t_ps` (see flash_sample()); `what` names the line, and
+ * bit `bit` of *`logged` says whether its undocumented mode 7 is logged.
  */
-static int64_t flash_din_advance_ps(ESP32P4MSPIState *s, unsigned io,
-                                    int64_t core_ps, int64_t t_ps)
+static int64_t mspi_din_advance_ps(ESP32P4MSPIState *s, unsigned mode,
+                                   int64_t num, int64_t core_ps,
+                                   int64_t t_ps, const char *what,
+                                   unsigned line, uint32_t *logged,
+                                   unsigned bit)
 {
-    unsigned mode = extract32(s->tune_din_mode, 3 * io, 3);
-    int64_t num = extract32(s->tune_din_num, 2 * io, 2);
-
-    if (!(s->tune_cali[0] & TIMING_CLK_ENA)) {
-        return 0;
-    }
     switch (mode) {
     case 0:
         return 0;
@@ -1817,14 +1822,27 @@ static int64_t flash_din_advance_ps(ESP32P4MSPIState *s, unsigned io,
     case 6:
         return num * t_ps + t_ps / 2;
     default:
-        if (!(s->tune_logged & BIT(io))) {
-            s->tune_logged |= BIT(io);
-            qemu_log_mask(LOG_GUEST_ERROR, "%s: DIN%u_MODE %u, which no "
-                          "document describes: line IO%u is sampled as with "
-                          "mode 0\n", mspi_name(s), io, mode, io);
+        if (!(*logged & BIT(bit))) {
+            *logged |= BIT(bit);
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: %s%u_MODE %u, which no "
+                          "document describes: the line is sampled as with "
+                          "mode 0\n", mspi_name(s), what, line, mode);
         }
         return 0;
     }
+}
+
+/* How much earlier than its edge flash data line `io` is sampled. */
+static int64_t flash_din_advance_ps(ESP32P4MSPIState *s, unsigned io,
+                                    int64_t core_ps, int64_t t_ps)
+{
+    if (!(s->tune_cali[0] & TIMING_CLK_ENA)) {
+        return 0;
+    }
+    return mspi_din_advance_ps(s, extract32(s->tune_din_mode, 3 * io, 3),
+                               extract32(s->tune_din_num, 2 * io, 2),
+                               core_ps, t_ps, "DIN", io, &s->tune_logged,
+                               io);
 }
 
 /*
@@ -2453,6 +2471,123 @@ static int64_t psram_beat_unit(ESP32P4MSPIState *s, uint32_t addr, int64_t j,
 
 /*
  * [spec:nuos:req:emu.esp32p4.memory]
+ * The controller's own capture of a DDR read, with its port's DDR
+ * register's DQS_LOOP: "Do not need the input of SPI_DQS signal, SPI0
+ * starts to receive data when spi0_slv_st is in SPI_MEM_S_DIN state. It
+ * is used when there is no SPI_DQS signal or SPI_DQS signal is not
+ * stable" (the headers; SPI1's DDR register has the same bit). The
+ * controller then samples each beat of its data phase on its own SPI
+ * clock, at the edge after the one it expects the die to send it on, as
+ * the flash's reads are sampled half a clock after their launch
+ * (flash_sample()); each line earlier by its SMEM_DINn_MODE and
+ * SMEM_DINn_NUM delay (lines 8 to 15 by SMEM_DIN_HEX_MODE and _NUM),
+ * which mean what the flash's DIN fields do (mspi_din_advance_ps()), with
+ * SMEM_TIMING_CALI's SMEM_TIMING_CLK_ENA. Both ports use SPI0's, as
+ * ESP-IDF's tuning has it on the ESP32-S3 ("SPI0 and SPI1 share the
+ * SPI_MEM_SPI_SMEM_DINx_MODE(0)"), and they take effect as written: no
+ * document says an update bit governs them. SMEM_TIMING_CALI's
+ * SMEM_EXTRA_DUMMY_CYCLELEN, with its SMEM_TIMING_CALI (SPI1: its own
+ * TIMING_CALI), lengthens a read's dummy phase by as many clocks, with
+ * either capture.
+ *
+ * The die's data come late: its strobe, and each beat with it, follows
+ * its clock by tDQSCK, 2 to 6.5 ns, the data valid tDQSQ (0.4 ns) after
+ * the strobe's edge (APS256XXN table 31, figure 8) until the next beat's.
+ * Which tDQSCK a die has the datasheet does not say: the model takes the
+ * middle of the range, 4.25 ns. A sample outside its beat's window takes
+ * the beat before, or, within the change between two beats, the opposite
+ * of the level the line changes to; the loop has no delay of its own. So
+ * with the dummy phase matched to the die's latency a loop read reads
+ * right up to about 107 MHz and, at 250 MHz, two beats early. ESP-IDF
+ * never sets DQS_LOOP on the ESP32-P4. Board checks: the fastest clock a
+ * loop read reads right at, the extra dummy clocks it needs at 250 MHz
+ * (the model: one), and whether SMEM_DIN delays change a read captured on
+ * the strobe (the model: they do not).
+ */
+#define PSRAM_TDQSCK_PS     4250
+#define PSRAM_TDQSQ_PS      400
+
+typedef struct {
+    int64_t beat_ps;
+    int64_t adv_ps[ESP32P4_MSPI_IOMUX_PSRAM_DQ];
+} ESP32P4PsramLoop;
+
+/*
+ * The loop capture's timing for a read on the port with DDR register
+ * `ddr` and SPI clock register `clk`, into *loop: false where the read is
+ * captured on the die's strobe (or not in DDR, when the die answers
+ * nothing).
+ */
+static bool psram_loop_init(ESP32P4MSPIState *s, uint32_t ddr, uint32_t clk,
+                            ESP32P4PsramLoop *loop)
+{
+    uint64_t div = clk & CLOCK_CLK_EQU_SYSCLK ? 1 : CLOCK_CLKCNT_N(clk) + 1;
+    int64_t core_ps = mspi_core_ps(s), t_ps = core_ps * div;
+    uint32_t cali = s->spi0[R0_SMEM_TIMING_CALI];
+
+    if (!(ddr & DDR_FMEM_DDR_EN) || !(ddr & DDR_DQS_LOOP) || !t_ps) {
+        return false;
+    }
+    loop->beat_ps = t_ps / 2;
+    for (unsigned l = 0; l < ESP32P4_MSPI_IOMUX_PSRAM_DQ; l++) {
+        bool hex = l >= 8;
+        uint32_t mode = s->spi0[hex ? R0_SMEM_DIN_HEX_MODE : R0_SMEM_DIN_MODE];
+        uint32_t num = s->spi0[hex ? R0_SMEM_DIN_HEX_NUM : R0_SMEM_DIN_NUM];
+
+        loop->adv_ps[l] = !(cali & TIMING_CLK_ENA) ? 0 :
+            mspi_din_advance_ps(s, extract32(mode, 3 * (l % 8), 3),
+                                extract32(num, 2 * (l % 8), 2), core_ps,
+                                t_ps, "SMEM_DIN", l, &s->tune_logged, 16 + l);
+    }
+    return true;
+}
+
+/*
+ * The die's beat `j` from its first of a read with instruction `inst` from
+ * `addr`, waiting `wait` beats at each row it crosses (psram_beat_unit()):
+ * nothing before its first.
+ */
+static uint16_t psram_loop_die(ESP32P4MSPIState *s, uint8_t inst,
+                               uint32_t addr, int64_t j, unsigned wait,
+                               bool garbled, bool cross)
+{
+    return psram_die_beat(s, inst, addr,
+                          j < 0 ? -1 : psram_beat_unit(s, addr, j, wait),
+                          garbled, cross);
+}
+
+/*
+ * The levels the loop capture samples on DQ0 to DQ`lines - 1` for the
+ * controller's beat that its dummy phase puts at the die's beat `ik`.
+ */
+static uint16_t psram_loop_beat(ESP32P4MSPIState *s,
+                                const ESP32P4PsramLoop *loop, uint8_t inst,
+                                uint32_t addr, int64_t ik, unsigned wait,
+                                bool garbled, bool cross, unsigned lines)
+{
+    int64_t b = loop->beat_ps;
+    uint16_t v = 0;
+
+    for (unsigned l = 0; l < lines && l < ESP32P4_MSPI_IOMUX_PSRAM_DQ; l++) {
+        int64_t u = (ik + 1) * b - loop->adv_ps[l] - PSRAM_TDQSCK_PS -
+                    PSRAM_TDQSQ_PS;
+        int64_t j = u >= 0 ? u / b : -((-u + b - 1) / b);
+        bool bit;
+
+        if (u - j * b <= b - PSRAM_TDQSQ_PS) {
+            bit = (psram_loop_die(s, inst, addr, j, wait, garbled, cross) >>
+                   l) & 1;
+        } else {
+            bit = !((psram_loop_die(s, inst, addr, j + 1, wait, garbled,
+                                    cross) >> l) & 1);
+        }
+        v |= (uint16_t)bit << l;
+    }
+    return v;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.memory]
  * Transaction `x` on the PSRAM die, as the die takes it (APS256XXN
  * datasheet, 7.1 to 7.7): its data phase `data`, `len` bytes, written to
  * it (`write`) or read, on `lines` data lines, at SPI clock `hz`, its
@@ -2503,7 +2638,8 @@ static int64_t psram_beat_unit(ESP32P4MSPIState *s, uint32_t addr, int64_t j,
 static void psram_die_xfer(ESP32P4MSPIState *s, const ESP32P4MSPIXfer *x,
                            bool ddr, bool cmd_ddr, unsigned lines,
                            uint8_t *data, uint32_t len, bool write,
-                           unsigned lead, bool follow, uint64_t hz,
+                           unsigned lead, bool follow,
+                           const ESP32P4PsramLoop *loop, uint64_t hz,
                            int64_t when, const char *what, uint32_t *logged)
 {
     uint32_t addr = x->addr_wire >> 32;
@@ -2610,7 +2746,8 @@ static void psram_die_xfer(ESP32P4MSPIState *s, const ESP32P4MSPIXfer *x,
                       psram_lc[psram_rl_code(s)], latency);
     }
     k = follow ? 0 : (int64_t)x->dummy - 2 * ((int64_t)latency - 1);
-    if (k && inst != PSRAM_INST_REG_READ &&
+    /* A loop capture's dummy phase may outlast the latency, for its lag. */
+    if (k && inst != PSRAM_INST_REG_READ && !loop &&
         psram_log(logged, MSPI_LOGGED_PSRAM_LAT)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: %s's dummy phase of %u edges "
                       "does not match the PSRAM die's latency of %u clocks "
@@ -2644,8 +2781,11 @@ static void psram_die_xfer(ESP32P4MSPIState *s, const ESP32P4MSPIXfer *x,
                             : psram_beat_unit(s, addr, (int64_t)i + k, wait);
 
                 psram_ctrl_take(data, len, lines, i,
-                                psram_die_beat(s, inst, addr, u, garbled,
-                                               cross));
+                                loop ? psram_loop_beat(s, loop, inst, addr,
+                                                       (int64_t)i + k, wait,
+                                                       garbled, cross, lines)
+                                     : psram_die_beat(s, inst, addr, u,
+                                                      garbled, cross));
             }
         }
         return;
@@ -2793,6 +2933,20 @@ static bool mspi_var_dummy(ESP32P4MSPIState *s, uint32_t ddr)
 }
 
 /*
+ * A read's extra dummy phase from a timing calibration register `cali`
+ * (SPI0's SMEM_TIMING_CALI, SPI1's TIMING_CALI): EXTRA_DUMMY_CYCLELEN
+ * clocks with its TIMING_CALI bit, in the dummy phase's clock edges in
+ * DDR (see psram_loop_init()).
+ */
+static unsigned psram_extra_dummy(uint32_t cali, uint32_t ddr)
+{
+    if (!(cali & TIMING_CALI_EN)) {
+        return 0;
+    }
+    return TIMING_EXTRA_DUMMY(cali) * (ddr & DDR_FMEM_DDR_EN ? 2 : 1);
+}
+
+/*
  * [spec:nuos:req:emu.esp32p4.memory]
  * SPI0's access to the PSRAM die of `len` bytes at `addr` (no more than
  * its page holds), as SPI0's registers set it up: the command of
@@ -2819,6 +2973,7 @@ static void spi0_psram_access(ESP32P4MSPIState *s, uint32_t addr,
     unsigned lines;
     uint32_t wire, lead;
     g_autofree uint8_t *buf = NULL;
+    ESP32P4PsramLoop loop;
     ESP32P4MSPIXfer x;
 
     memset(&x, 0, sizeof(x));
@@ -2852,6 +3007,9 @@ static void spi0_psram_access(ESP32P4MSPIState *s, uint32_t addr,
         x.dummy = (write ? SCTRL_WDUMMY_CYCLELEN(sctrl)
                          : SCTRL_RDUMMY_CYCLELEN(sctrl)) + 1;
     }
+    if (!write) {
+        x.dummy += psram_extra_dummy(s->spi0[R0_SMEM_TIMING_CALI], ddr);
+    }
     buf = g_malloc0(len + lead);
     if (write) {
         memcpy(buf + lead, data, len);
@@ -2859,6 +3017,8 @@ static void spi0_psram_access(ESP32P4MSPIState *s, uint32_t addr,
     psram_die_xfer(s, &x, ddr & DDR_FMEM_DDR_EN, !(ddr & DDR_FMEM_DDR_CMD_DIS),
                    lines, buf, len + lead, write, lead,
                    mspi_var_dummy(s, ddr),
+                   !write && psram_loop_init(s, ddr, s->spi0[R0_SRAM_CLK],
+                                             &loop) ? &loop : NULL,
                    mspi_spi_hz(s, s->spi0[R0_SRAM_CLK]), mspi_access_time(),
                    write ? "SPI0's write" : "SPI0's read", &s->spi0_logged);
     if (!write) {
@@ -3650,6 +3810,8 @@ static void spi1_psram_xfer(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x, int cs)
 {
     uint32_t ddr = s->spi1[R1_DDR], scmd = s->spi0[R0_SRAM_CMD];
     bool read = x->miso_bytes;
+    ESP32P4PsramLoop loop;
+    ESP32P4MSPIXfer y;
     unsigned lines;
 
     if (cs != 1) {
@@ -3665,10 +3827,16 @@ static void spi1_psram_xfer(ESP32P4MSPIState *s, ESP32P4MSPIXfer *x, int cs)
     } else {
         lines = scmd & SCMD_SDOUT_HEX ? 16 : x->dout_lines;
     }
-    psram_die_xfer(s, x, ddr & DDR_FMEM_DDR_EN, !(ddr & DDR_FMEM_DDR_CMD_DIS),
+    y = *x;
+    if (read) {
+        y.dummy += psram_extra_dummy(s->spi1[R1_TIMING_CALI], ddr);
+    }
+    psram_die_xfer(s, &y, ddr & DDR_FMEM_DDR_EN, !(ddr & DDR_FMEM_DDR_CMD_DIS),
                    lines, read ? x->miso : x->mosi,
                    read ? x->miso_bytes : x->mosi_bytes, !read, 0,
                    mspi_var_dummy(s, ddr),
+                   read && psram_loop_init(s, ddr, s->spi1[R1_CLOCK], &loop)
+                   ? &loop : NULL,
                    mspi_spi_hz(s, s->spi1[R1_CLOCK]), mspi_access_time(),
                    "SPI1's transaction", NULL);
     if (read) {
