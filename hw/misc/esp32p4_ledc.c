@@ -1006,7 +1006,11 @@ static const Esp32LineWaveOps ledc_wave_ops = {
  * [spec:nuos:req:emu.esp32p4.pwm]
  * Whether channel n's edges are timed one by one: something watches its
  * pad, or a counter takes its wave while it does not describe its edges.
- * A channel that comes to be has its level of the moment at `now`.
+ * A channel that comes to be has its level of the moment at `now`. One
+ * whose SIG_OUT_EN is not in effect holds IDLE_LV and has no edges to
+ * time, whatever its routing: as SIG_OUT_EN takes effect (chan_load())
+ * its generator's level is driven, and its edges are timed from there if
+ * it is seen then.
  */
 static void chan_update_seen(ESP32P4LedcState *s, int n, int64_t now)
 {
