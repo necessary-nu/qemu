@@ -157,6 +157,15 @@ bool esp32_line_pwm_skips(const Esp32LineLag *lag, int64_t due_ns);
  * of itself, at an update the output has waiting (until), which it
  * announces as it comes.
  *
+ * It comes when the output's own catch-up gets to it, which on the host's
+ * clock can be after another source's catch-up has put out a change, at
+ * a later time, of another input of the block taking the output: QEMU
+ * runs each source's timer late, and each catches up to the present. A
+ * block taking an input's change at t, whose outcome depends on the
+ * output's edges before it (a pulse counter's other inputs), first brings
+ * the outputs it takes up to t (esp32_line_wave_catch_up()), so that it
+ * takes their updates due before t first, every change in time order.
+ *
  * An output describes its edges only in stretches it can work out in
  * closed form (a steady PWM, not a fade): otherwise (describes false) it
  * drives every edge on its line, as an output something else watches
@@ -188,6 +197,12 @@ typedef struct Esp32LineWaveOps {
     int64_t (*min_hold)(Esp32LineWave *w);
     /* When the description ends of itself; INT64_MAX if it does not. */
     int64_t (*until)(Esp32LineWave *w);
+    /*
+     * Bring the output's updates up to time t: each due by t announced at
+     * its moment, as its own catch-up would. NULL for an output whose
+     * description never ends of itself.
+     */
+    void (*catch_up)(Esp32LineWave *w, int64_t t);
 } Esp32LineWaveOps;
 
 struct Esp32LineWave {
@@ -213,6 +228,7 @@ void esp32_line_wave_take(Esp32LineWave *w, Notifier *n);
 void esp32_line_wave_drop(Notifier *n);
 void esp32_line_wave_changing(Esp32LineWave *w, int64_t when);
 void esp32_line_wave_changed(Esp32LineWave *w, int64_t when);
+void esp32_line_wave_catch_up(Esp32LineWave *w, int64_t t);
 
 /*
  * The routing of a GPIO matrix, for a block both chips have whose outputs

@@ -125,6 +125,12 @@
  * cycles' edges repeating every sixteen (DUTY[3:0]'s dither); every
  * change to the channel, its timer or LEDC_CLK is announced at its
  * moment to the counters taking it. During a fade it drives its edges.
+ * A register access first brings every line source up to its moment, as
+ * a GPIO matrix access does, so that an update it announces comes after
+ * the edges another block, its timer late without icount, had yet to put
+ * out; and a counter about to take another input's change has the
+ * controller announce its updates due before then (the wave's catch_up),
+ * so that the counter takes both in the order of their times.
  *
  * Not modelled: the light-sleep output (TRM 58.2), which needs the PMU;
  * LEDC_CLK_EN and GAMMA_RAM_CLK_EN, clock gating that software cannot
@@ -967,6 +973,25 @@ static int64_t ledc_wave_until(Esp32LineWave *w)
     return until;
 }
 
+static void ledc_advance(ESP32P4LedcState *s, int64_t now);
+static void ledc_schedule(ESP32P4LedcState *s);
+
+/*
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * Bring the controller up to t, for a counter about to take another
+ * input's change: its updates due by then, each at its moment. Its own
+ * catch-up takes its updates in time order with the edges it drives, so
+ * that an edge of its own reaching the counter finds none due before it
+ * waiting.
+ */
+static void ledc_wave_catch_up(Esp32LineWave *w, int64_t t)
+{
+    ESP32P4LedcState *s = wave_ledc(w);
+
+    ledc_advance(s, t);
+    ledc_schedule(s);
+}
+
 static const Esp32LineWaveOps ledc_wave_ops = {
     .describes = ledc_wave_describes,
     .level = ledc_wave_level,
@@ -974,6 +999,7 @@ static const Esp32LineWaveOps ledc_wave_ops = {
     .edge = ledc_wave_edge,
     .min_hold = ledc_wave_min_hold,
     .until = ledc_wave_until,
+    .catch_up = ledc_wave_catch_up,
 };
 
 /*
@@ -1854,9 +1880,8 @@ static uint64_t chan_cycle(ESP32P4LedcState *s, int n, int64_t now)
 }
 
 /* [spec:nuos:req:emu.esp32p4.pwm] */
-static uint64_t esp32p4_ledc_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t ledc_reg_read(ESP32P4LedcState *s, hwaddr addr)
 {
-    ESP32P4LedcState *s = opaque;
     int64_t now = ledc_now(s);
     uint64_t r = 0;
 
@@ -1935,10 +1960,8 @@ static uint64_t esp32p4_ledc_read(void *opaque, hwaddr addr, unsigned size)
 }
 
 /* [spec:nuos:req:emu.esp32p4.pwm] */
-static void esp32p4_ledc_write(void *opaque, hwaddr addr, uint64_t value,
-                               unsigned size)
+static void ledc_reg_write(ESP32P4LedcState *s, hwaddr addr, uint64_t value)
 {
-    ESP32P4LedcState *s = opaque;
     int64_t now = ledc_now(s);
     uint32_t v = value;
 
@@ -2027,6 +2050,54 @@ static void esp32p4_ledc_write(void *opaque, hwaddr addr, uint64_t value,
     ledc_advance(s, now);
     ledc_waves_changed(s, now);
     ledc_schedule(s);
+}
+
+/* A register access under way, which acts at one moment throughout. */
+typedef struct LedcAccess {
+    ESP32P4LedcState *s;
+    hwaddr addr;
+    uint64_t value;
+} LedcAccess;
+
+static void ledc_access_read(void *opaque)
+{
+    LedcAccess *a = opaque;
+
+    esp32_line_sync();
+    a->value = ledc_reg_read(a->s, a->addr);
+}
+
+static void ledc_access_write(void *opaque)
+{
+    LedcAccess *a = opaque;
+
+    esp32_line_sync();
+    ledc_reg_write(a->s, a->addr, a->value);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32p4.pwm]
+ * A register access acts at the moment it began, every line source
+ * brought up to it first (esp32_line_sync()), as a GPIO matrix access
+ * does: an update it announces to a counter taking a channel's wave
+ * (hw/gpio/esp32_line.h) comes after the changes another source, its
+ * timer running late without icount, had yet to put out on the
+ * counter's other inputs before then.
+ */
+static uint64_t esp32p4_ledc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    LedcAccess a = { .s = opaque, .addr = addr };
+
+    esp32_line_run_at(esp32_line_time(), ledc_access_read, &a);
+    return a.value;
+}
+
+static void esp32p4_ledc_write(void *opaque, hwaddr addr, uint64_t value,
+                               unsigned size)
+{
+    LedcAccess a = { .s = opaque, .addr = addr, .value = value };
+
+    esp32_line_run_at(esp32_line_time(), ledc_access_write, &a);
 }
 
 static const MemoryRegionOps esp32p4_ledc_ops = {

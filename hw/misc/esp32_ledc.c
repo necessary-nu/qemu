@@ -45,7 +45,14 @@
  * each at its exact time, and the counter takes them when it looks; the
  * output takes its level of the moment as the controller is brought up
  * to date. Every change to the channel, its timer or their clocks is
- * announced at its moment to the counters taking it.
+ * announced at its moment to the counters taking it. The controller's
+ * catch-up takes its channels' and timers' updates in time order with
+ * every channel's edges, a register access first brings every line source
+ * up to its moment, as a GPIO matrix access does, and a counter about to
+ * take another input's change has the controller announce its updates due
+ * before then (the wave's catch_up): the counter takes the updates and
+ * the other inputs' changes, from this block or another whose timer runs
+ * late without icount, in the order of their times.
  */
 
 #include "qemu/osdep.h"
@@ -709,6 +716,25 @@ static int64_t ledc_wave_until(Esp32LineWave *w)
     return until;
 }
 
+static void ledc_advance(Esp32LEDCState *s, int64_t now, bool sample);
+static void ledc_schedule(Esp32LEDCState *s);
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * Bring the controller up to t, for a counter about to take another
+ * input's change: its updates due by then, each at its moment. Its own
+ * catch-up takes its updates in time order with the edges it drives
+ * (ledc_advance()), so that an edge of its own reaching the counter finds
+ * none due before it waiting.
+ */
+static void ledc_wave_catch_up(Esp32LineWave *w, int64_t t)
+{
+    Esp32LEDCState *s = wave_ledc(w);
+
+    ledc_advance(s, t, false);
+    ledc_schedule(s);
+}
+
 static const Esp32LineWaveOps ledc_wave_ops = {
     .describes = ledc_wave_describes,
     .level = ledc_wave_level,
@@ -716,6 +742,7 @@ static const Esp32LineWaveOps ledc_wave_ops = {
     .edge = ledc_wave_edge,
     .min_hold = ledc_wave_min_hold,
     .until = ledc_wave_until,
+    .catch_up = ledc_wave_catch_up,
 };
 
 /*
@@ -887,16 +914,22 @@ static void timer_take_conf(Esp32LedcTimer *t)
 
 /*
  * [spec:nuos:req:emu.esp32.gpio]
- * Bring the whole controller up to now: the timers' deferred updates in
- * time order, each with its channels run up to it and carried over it,
- * then every channel, the overflow interrupts, and with sample the
- * outputs' exact levels.
+ * Bring the whole controller up to now: its updates in time order, the
+ * timers' deferred ones and the channels' loads and fade ends, each after
+ * every channel's edges before it, and the channels on a timer carried
+ * over its update; then every channel, the overflow interrupts, and with
+ * sample the outputs' exact levels. A block taking two channels' outputs
+ * (a pulse counter's signal and control inputs) so sees an update and
+ * another channel's edges in the order of their times however late the
+ * controller is brought up. At one moment a timer's update comes first,
+ * and the channels go in turn, each with its update before its own edges,
+ * as when the controller is on time.
  */
 static void ledc_advance(Esp32LEDCState *s, int64_t now, bool sample)
 {
     for (;;) {
-        int best = -1;
-        int64_t tb = INT64_MAX;
+        int best = -1, chan = -1;
+        int64_t tb = INT64_MAX, tc = INT64_MAX;
         Esp32LedcTimer *t;
 
         for (unsigned i = 0; i < ESP32_LEDC_TIMER_CNT; i++) {
@@ -910,13 +943,30 @@ static void ledc_advance(Esp32LEDCState *s, int64_t now, bool sample)
                 }
             }
         }
-        if (best < 0 || tb > now) {
+        for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
+            int64_t te = MIN(chan_load_time(s, n), chan_fade_end_time(s, n));
+
+            if (te < tc) {
+                tc = te;
+                chan = n;
+            }
+        }
+        if (MIN(tb, tc) > now) {
             break;
+        }
+        if (tc < tb) {
+            for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
+                chan_eval(s, n, tc, (int)n < chan);
+            }
+            chan_eval(s, chan, tc, true);
+            continue;
         }
         t = &s->timer[best];
         for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
+            chan_eval(s, n, tb, false);
+        }
+        for (unsigned n = 0; n < ESP32_LEDC_CHANNEL_CNT; n++) {
             if (chan_timer_idx(s, n) == best) {
-                chan_eval(s, n, tb, false);
                 chan_wave_changing(s, n, tb);
             }
         }
@@ -1183,10 +1233,9 @@ static void ledc_conf0_write(Esp32LEDCState *s, unsigned n, uint32_t v,
     chan_drive(s, n, now);
 }
 
-static uint64_t esp32_ledc_read(void *opaque, hwaddr addr, unsigned int size)
+static uint64_t ledc_reg_read(Esp32LEDCState *s, hwaddr addr)
 {
-    Esp32LEDCState *s = ESP32_LEDC(opaque);
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
     uint64_t r = 0;
 
     ledc_advance(s, now, false);
@@ -1255,11 +1304,9 @@ static uint64_t esp32_ledc_read(void *opaque, hwaddr addr, unsigned int size)
 }
 
 /* [spec:nuos:req:emu.esp32.gpio] */
-static void esp32_ledc_write(void *opaque, hwaddr addr,
-                             uint64_t value, unsigned int size)
+static void ledc_reg_write(Esp32LEDCState *s, hwaddr addr, uint64_t value)
 {
-    Esp32LEDCState *s = ESP32_LEDC(opaque);
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = esp32_line_time();
     uint32_t v = value;
 
     ledc_advance(s, now, false);
@@ -1340,6 +1387,54 @@ static void esp32_ledc_write(void *opaque, hwaddr addr,
     ledc_advance(s, now, false);
     ledc_waves_changed(s, now);
     ledc_schedule(s);
+}
+
+/* A register access under way, which acts at one moment throughout. */
+typedef struct LedcAccess {
+    Esp32LEDCState *s;
+    hwaddr addr;
+    uint64_t value;
+} LedcAccess;
+
+static void ledc_access_read(void *opaque)
+{
+    LedcAccess *a = opaque;
+
+    esp32_line_sync();
+    a->value = ledc_reg_read(a->s, a->addr);
+}
+
+static void ledc_access_write(void *opaque)
+{
+    LedcAccess *a = opaque;
+
+    esp32_line_sync();
+    ledc_reg_write(a->s, a->addr, a->value);
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * A register access acts at the moment it began, every line source
+ * brought up to it first (esp32_line_sync()), as a GPIO matrix access
+ * does: an update it announces to a counter taking a channel's wave
+ * (hw/gpio/esp32_line.h) comes after the changes another source, its
+ * timer running late without icount, had yet to put out on the
+ * counter's other inputs before then.
+ */
+static uint64_t esp32_ledc_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    LedcAccess a = { .s = ESP32_LEDC(opaque), .addr = addr };
+
+    esp32_line_run_at(esp32_line_time(), ledc_access_read, &a);
+    return a.value;
+}
+
+static void esp32_ledc_write(void *opaque, hwaddr addr,
+                             uint64_t value, unsigned int size)
+{
+    LedcAccess a = { .s = ESP32_LEDC(opaque), .addr = addr, .value = value };
+
+    esp32_line_run_at(esp32_line_time(), ledc_access_write, &a);
 }
 
 static const MemoryRegionOps esp32_ledc_ops = {
