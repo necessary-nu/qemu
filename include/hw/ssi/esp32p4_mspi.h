@@ -189,6 +189,37 @@ bool esp32p4_mspi_dma_wait(AddressSpace *as, hwaddr addr, hwaddr len,
                            MemTxAttrs attrs, bool write, Notifier *n);
 
 /*
+ * Whether any memory controller's AXI port holds accesses now: while none
+ * does, no DMA master's access can wait, and a master that works out its
+ * next transaction's accesses before making them (to ask
+ * esp32p4_mspi_dma_wait() about each) can skip that.
+ */
+bool esp32p4_mspi_dma_holds(void);
+
+/*
+ * A DMA master's wait on a held AXI port, for a master that goes on from
+ * a callback: esp32p4_mspi_dma_wait_on() asks esp32p4_mspi_dma_wait()
+ * about an access, and once the port takes accesses again `ready` is
+ * called from a QEMU timer at that moment (esp32_line_time()), not from
+ * within the controller's change, so that the master makes its accesses
+ * outside the controller's own MMIO handlers.
+ */
+typedef struct ESP32P4MspiDmaWait {
+    Notifier n;
+    QEMUTimer *timer;
+    void (*ready)(void *opaque);
+    void *opaque;
+} ESP32P4MspiDmaWait;
+
+void esp32p4_mspi_dma_wait_init(ESP32P4MspiDmaWait *w,
+                                void (*ready)(void *opaque), void *opaque);
+bool esp32p4_mspi_dma_wait_on(ESP32P4MspiDmaWait *w, AddressSpace *as,
+                              hwaddr addr, hwaddr len, MemTxAttrs attrs,
+                              bool write);
+/* Forget a wait (the master's reset): `ready` is not called for it. */
+void esp32p4_mspi_dma_wait_cancel(ESP32P4MspiDmaWait *w);
+
+/*
  * The AXI port through which the cache, the direct windows and the DMA
  * masters reach the memory: `len` bytes at `addr`, an offset into the
  * 64 MiB virtual window the MMU maps, which may span MMU pages. Returns

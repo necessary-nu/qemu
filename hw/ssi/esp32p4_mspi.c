@@ -3095,6 +3095,58 @@ bool esp32p4_mspi_dma_wait(AddressSpace *as, hwaddr addr, hwaddr len,
     return false;
 }
 
+/* The controllers, for esp32p4_mspi_dma_holds(). */
+static GSList *mspi_instances;
+
+bool esp32p4_mspi_dma_holds(void)
+{
+    for (GSList *l = mspi_instances; l; l = l->next) {
+        if (mspi_axi_stall(l->data)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void mspi_dma_wait_notify(Notifier *n, void *data)
+{
+    ESP32P4MspiDmaWait *w = container_of(n, ESP32P4MspiDmaWait, n);
+
+    notifier_remove(n);
+    timer_mod(w->timer, esp32_line_time());
+}
+
+static void mspi_dma_wait_timer(void *opaque)
+{
+    ESP32P4MspiDmaWait *w = opaque;
+
+    w->ready(w->opaque);
+}
+
+void esp32p4_mspi_dma_wait_init(ESP32P4MspiDmaWait *w,
+                                void (*ready)(void *opaque), void *opaque)
+{
+    w->n.notify = mspi_dma_wait_notify;
+    w->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mspi_dma_wait_timer, w);
+    w->ready = ready;
+    w->opaque = opaque;
+}
+
+bool esp32p4_mspi_dma_wait_on(ESP32P4MspiDmaWait *w, AddressSpace *as,
+                              hwaddr addr, hwaddr len, MemTxAttrs attrs,
+                              bool write)
+{
+    return len && esp32p4_mspi_dma_wait(as, addr, len, attrs, write, &w->n);
+}
+
+void esp32p4_mspi_dma_wait_cancel(ESP32P4MspiDmaWait *w)
+{
+    if (QLIST_IS_INSERTED(&w->n, node)) {
+        notifier_remove(&w->n);
+    }
+    timer_del(w->timer);
+}
+
 /* Let the cores' held accesses go once the AXI port takes them. */
 static void mspi_axi_wake(ESP32P4MSPIState *s)
 {
@@ -4278,6 +4330,7 @@ static void mspi_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->spi0_iomem);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->spi1_iomem);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->window);
+    mspi_instances = g_slist_prepend(mspi_instances, s);
 }
 
 static void mspi_init(Object *obj)
