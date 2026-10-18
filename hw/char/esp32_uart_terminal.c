@@ -20,6 +20,16 @@
  * with them: a UART whose software stops reading overflows its RX FIFO
  * and loses bytes, as on silicon.
  *
+ * The main loop hands it the chardev's bytes as it finds them, filling
+ * the terminal's FIFO, at moments of the host's. When the FIFO runs out
+ * with a frame's end, and as the machine starts running, the terminal
+ * takes the bytes the chardev has ready itself, then
+ * (qemu_chr_fe_poll_input()): a line fed what was given to the host's
+ * port before it was needed (a file's bytes, /dev/zero's) carries them
+ * back to back from the start, however late the main loop runs, and
+ * under icount at the same virtual times in every run. Only bytes the
+ * host has yet to give come when it gives them.
+ *
  * Without a chardev there is no bridge on the pads: the terminal drives
  * nothing, and the board does not have it watch the pad carrying the
  * chip's TXD either (esp32_uart_terminal_attached()). Nothing would see
@@ -57,6 +67,7 @@
 #include "migration/vmstate.h"
 #include "exec/icount.h"
 #include "system/qtest.h"
+#include "system/runstate.h"
 
 static gboolean term_out_ready(void *do_not_use, GIOCondition cond,
                                void *opaque);
@@ -154,6 +165,20 @@ static unsigned term_tx_next_change(Esp32UartTerminalState *s)
 static void term_tx_advance(Esp32UartTerminalState *s);
 
 /*
+ * With no byte left to send, take those the chardev has ready now (see
+ * the top of the file). They come through term_receive(), which only
+ * queues them while the terminal takes them.
+ */
+static void term_take_input(Esp32UartTerminalState *s)
+{
+    if (fifo8_is_empty(&s->in) && !s->taking) {
+        s->taking = true;
+        qemu_chr_fe_poll_input(&s->chr);
+        s->taking = false;
+    }
+}
+
+/*
  * On the host's clock, whether the UART's RX FIFO lacks room for a frame
  * and one being decoded, so that the host's bytes wait (see the top of
  * the file).
@@ -231,6 +256,7 @@ static void term_tx_advance(Esp32UartTerminalState *s)
         s->tx_busy = false;
         /* The next byte follows the stop bits without a gap */
         s->tx_chained = true;
+        term_take_input(s);
         term_tx_start(s, t);
     }
     if (s->tx_busy) {
@@ -263,15 +289,24 @@ static int term_can_receive(void *opaque)
 static void term_receive(void *opaque, const uint8_t *buf, int size)
 {
     Esp32UartTerminalState *s = ESP32_UART_TERMINAL(opaque);
+    bool taken = s->taking;
 
-    /*
-     * The bytes arrive now: a frame whose stop bits ended before, which a
-     * late timer has not yet seen end, is not followed by them back to
-     * back.
-     */
-    term_tx_advance(s);
+    if (!taken) {
+        /*
+         * The bytes arrive now: a frame whose stop bits ended before,
+         * which a late timer has not yet seen end, is not followed by
+         * them back to back. Nor is it by bytes the chardev has after
+         * these, which the terminal is not to take ahead of them.
+         */
+        s->taking = true;
+        term_tx_advance(s);
+        s->taking = false;
+    }
     for (int i = 0; i < size && !fifo8_is_full(&s->in); i++) {
         fifo8_push(&s->in, buf[i]);
+    }
+    if (taken) {
+        return;
     }
     if (!s->tx_busy) {
         term_tx_start(s, esp32_line_time());
@@ -281,6 +316,20 @@ static void term_receive(void *opaque, const uint8_t *buf, int size)
 
 static void term_event(void *opaque, QEMUChrEvent event)
 {
+}
+
+/* As the machine starts running, the bytes the chardev has ready go out. */
+static void term_vm_state_change(void *opaque, bool running,
+                                 RunState state)
+{
+    Esp32UartTerminalState *s = ESP32_UART_TERMINAL(opaque);
+
+    if (running && !s->tx_busy) {
+        term_take_input(s);
+        if (term_tx_start(s, esp32_line_time())) {
+            term_tx_advance(s);
+        }
+    }
 }
 
 static bool term_get_break(Object *obj, Error **errp)
@@ -355,6 +404,7 @@ static void esp32_uart_terminal_realize(DeviceState *dev, Error **errp)
                              term_event, NULL, s, NULL, true);
     if (qemu_chr_fe_backend_connected(&s->chr)) {
         qemu_set_irq(s->tx_out, !s->brk);
+        qemu_add_vm_change_state_handler(term_vm_state_change, s);
     }
 }
 
