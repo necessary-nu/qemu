@@ -51,6 +51,47 @@ void line_run_at(int64_t when_ns, void (*fn)(void *opaque), void *opaque);
 int64_t line_event_time(void);
 
 /*
+ * Streams on the host's clock.
+ *
+ * A stream (a unit's clock edges, a state machine's cycles, a serial
+ * transmitter's words, a sensor's or a panel's lines, an audio port's
+ * frames) takes each of its events at the event's own time, however late
+ * the QEMU timer that runs it: under icount virtual time waits for the
+ * stream, which never falls behind. On the host's clock QEMU's main loop
+ * runs late, by however long the host holds it up, and a stream catches
+ * up: it takes the events that fell due at their due times, in order,
+ * with what feeds or takes its data (DMA, a peer on the pads) brought up
+ * to each event's time first, so that a frame or transfer in progress
+ * completes as it would have.
+ *
+ * Only a stream more than LINE_MAX_LAG_NS behind the present, as it comes
+ * to take an event (line_lags()), slips: it goes on from the present, as
+ * the stream says (logged). The bound is far beyond the host's pauses: a
+ * scheduler holds a thread up for a quantum of about 10 ms
+ * (LINE_SLACK_NS), a host loaded several times over its cores for tens of
+ * milliseconds at a time. A stream a second behind is one whose events
+ * cost the host more than their own time, which it can never catch up
+ * with; slipping then keeps the catch-up from holding QEMU's main loop,
+ * and the cores waiting for it, ever longer.
+ *
+ * A PWM output, whose edges follow a counter software reads, keeps its
+ * timing: it goes on from the present by skipping to its level at the
+ * moment it is being brought to, the edges in between lost. It does so
+ * as soon as the host is losing ground on it, falling further behind
+ * beyond the slack LINE_LOSING_RUN times running, not only a second
+ * behind: edges that cost the host more than their own time would
+ * otherwise hold the main loop for up to a second at a time before the
+ * bound. How falling behind is measured depends on how the output's
+ * timer catches up: see hw/gpio/esp32_line.h for outputs whose timer
+ * takes them to the present.
+ */
+#define LINE_MAX_LAG_NS     NANOSECONDS_PER_SECOND
+#define LINE_SLACK_NS       (10 * SCALE_MS)
+#define LINE_LOSING_RUN     2
+
+bool line_lags(int64_t due_ns);
+
+/*
  * Sources a receiver brings up to its time.
  *
  * A transmitter times its bits on QEMU timers of its own, which without

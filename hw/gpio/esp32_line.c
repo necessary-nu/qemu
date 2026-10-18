@@ -82,20 +82,6 @@ void esp32_line_sync(void)
 /*
  * [spec:nuos:req:emu.esp32.gpio]
  * [spec:nuos:req:emu.esp32p4.gpio]
- * Whether a stream's event due at @due_ns is more than
- * ESP32_LINE_MAX_LAG_NS behind the present: never under icount, where
- * virtual time waits for every event.
- */
-bool esp32_line_lags(int64_t due_ns)
-{
-    return !icount_enabled() &&
-           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - due_ns >
-           ESP32_LINE_MAX_LAG_NS;
-}
-
-/*
- * [spec:nuos:req:emu.esp32.gpio]
- * [spec:nuos:req:emu.esp32p4.gpio]
  * An output's own QEMU timer begins a catch-up, at the present, from
  * where its last one left it.
  */
@@ -123,8 +109,8 @@ void esp32_line_caught_up(Esp32LineLag *lag, int64_t reached_ns)
         return;
     }
     behind = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - reached_ns;
-    if (behind > ESP32_LINE_SLACK_NS && behind > lag->behind_ns) {
-        lag->losing = MIN(lag->losing + 1, ESP32_LINE_LOSING_RUN);
+    if (behind > LINE_SLACK_NS && behind > lag->behind_ns) {
+        lag->losing = MIN(lag->losing + 1, LINE_LOSING_RUN);
     } else {
         lag->losing = 0;
     }
@@ -136,7 +122,7 @@ void esp32_line_caught_up(Esp32LineLag *lag, int64_t reached_ns)
  * [spec:nuos:req:emu.esp32.gpio]
  * [spec:nuos:req:emu.esp32p4.gpio]
  * Whether a PWM output skips its edge due at @due_ns: the edge lags
- * (esp32_line_lags()), or it is beyond the slack while the host is losing
+ * (line_lags()), or it is beyond the slack while the host is losing
  * ground on the output: its last catch-up ended beyond the slack and
  * further behind than the one before, and either the one before that
  * did too, or the catch-up taking the edge has spent longer than the
@@ -152,13 +138,13 @@ bool esp32_line_pwm_skips(const Esp32LineLag *lag, int64_t due_ns)
     }
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     behind = now - due_ns;
-    if (behind > ESP32_LINE_MAX_LAG_NS) {
+    if (behind > LINE_MAX_LAG_NS) {
         return true;
     }
-    if (behind <= ESP32_LINE_SLACK_NS || !lag->losing) {
+    if (behind <= LINE_SLACK_NS || !lag->losing) {
         return false;
     }
-    return lag->losing >= ESP32_LINE_LOSING_RUN ||
+    return lag->losing >= LINE_LOSING_RUN ||
            (lag->catching_up &&
             now - lag->began_ns > due_ns - lag->reached_ns);
 }

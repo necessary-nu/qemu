@@ -33,10 +33,10 @@
  * RMT receiver) sees the pulses the channel made. Only a host slower than
  * the edges it is to drive, losing ground on the controller as its
  * timers' catch-ups each end further behind than the last, or changes
- * more than ESP32_LINE_MAX_LAG_NS (1 s) behind the present as the channel
- * comes to them (esp32_line_pwm_skips(), include/hw/gpio/esp32_line.h),
- * make the output skip to its level at the moment it is being brought
- * to, the changes in between lost.
+ * more than LINE_MAX_LAG_NS (1 s) behind the present as the channel comes
+ * to them (esp32_line_pwm_skips(), include/hw/gpio/esp32_line.h), make
+ * the output skip to its level at the moment it is being brought to, the
+ * changes in between lost.
  *
  * A channel's output that only a pulse counter takes, in bulk through the
  * channel's wave (hw/gpio/esp32_line.h), has no edges driven: outside a

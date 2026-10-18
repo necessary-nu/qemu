@@ -10,6 +10,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
+#include "exec/icount.h"
 #include "hw/core/line-time.h"
 #include "migration/vmstate.h"
 #include "system/runstate.h"
@@ -60,6 +61,17 @@ void line_run_at(int64_t when_ns, void (*fn)(void *opaque), void *opaque)
     line_stamp = when_ns;
     fn(opaque);
     line_stamp = outer;
+}
+
+/*
+ * Whether a stream's event due at @due_ns is more than LINE_MAX_LAG_NS
+ * behind the present: never under icount, where virtual time waits for
+ * every event.
+ */
+bool line_lags(int64_t due_ns)
+{
+    return !icount_enabled() &&
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - due_ns > LINE_MAX_LAG_NS;
 }
 
 void line_add_source(Notifier *n)
