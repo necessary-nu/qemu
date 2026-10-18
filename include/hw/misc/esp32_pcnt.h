@@ -73,20 +73,26 @@ struct Esp32PcntState {
 
     /* APB_CLK is running: the block is neither gated nor held in reset */
     bool clk_running;
+    /*
+     * An edge of APB_CLK, as the filters see its edges: the moment the
+     * block last saw the clock change, its edges every period after it.
+     */
+    int64_t apb_edge_ns;
 
     /*
      * Per input: the level on the wire, the level past the glitch filter,
      * and when the wire last changed. The two levels differ while the
      * filter is holding a change back; the timer runs to the earliest
-     * time such a change matures. A change held back across a change of
-     * APB_CLK counts on from the moment of that change, which
-     * raw_since_ns then holds, having held for `held` cycles before it,
-     * in units of 2^-32 of a cycle.
+     * time such a change matures. A change held back counts the edges of
+     * APB_CLK after raw_since_ns that see it, having counted `held`
+     * before then: up to a change of the clock, or up to a dip back to
+     * the filter's level (raw_since_ns then the dip's start, the levels
+     * alike), which the count runs on through unless an edge sees it.
      */
     uint8_t raw[ESP32_PCNT_INPUT_COUNT];
     uint8_t filt[ESP32_PCNT_INPUT_COUNT];
     int64_t raw_since_ns[ESP32_PCNT_INPUT_COUNT];
-    uint64_t held[ESP32_PCNT_INPUT_COUNT];
+    uint16_t held[ESP32_PCNT_INPUT_COUNT];
     QEMUTimer filter_timer;
 
     /*
