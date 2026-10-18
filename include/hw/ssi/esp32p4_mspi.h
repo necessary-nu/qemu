@@ -128,6 +128,17 @@ struct ESP32P4MSPIState {
      */
     uint32_t axi_waiting;
 
+    /*
+     * The flash's timing calibration as TIMING_CALI_UPDATE last took it
+     * up: SPI0's and SPI1's TIMING_CALI, SPI0's DIN_MODE and DIN_NUM,
+     * which both ports' reads use; and the DIN modes logged as
+     * unimplemented, a bit per line.
+     */
+    uint32_t tune_cali[2];
+    uint32_t tune_din_mode;
+    uint32_t tune_din_num;
+    uint32_t tune_logged;
+
     /* The manual encryption block: its state and the ciphertext. */
     uint32_t xts_state;
     uint8_t xts_cipher[64];
