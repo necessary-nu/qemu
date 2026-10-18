@@ -614,8 +614,9 @@ static void esp32_gate_update_clocks(Esp32SocState *s, Esp32PeriphGate *g)
  * or still starting up) gives no CPU_CLK, and the CPUs stop until it runs.
  * RC_FAST_CLK runs at the rate its CK8M_DFREQ trim gives it.
  */
-static void esp32_soc_update_clocks(Esp32SocState *s)
+static void esp32_soc_update_clocks_run(void *opaque)
 {
+    Esp32SocState *s = opaque;
     MachineState *ms = MACHINE(qdev_get_machine());
     uint32_t sel = s->dport.cpuperiod_sel;
     uint32_t xtal_hz = s->rtc_cntl.xtal_apb_freq;
@@ -686,6 +687,20 @@ static void esp32_soc_update_clocks(Esp32SocState *s)
             esp32_cpu_stall(s, i, 1);
         }
     }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.clock-gating]
+ * The clocks change at one moment for every block they reach
+ * (esp32_line_time()). Without icount virtual time runs on while the
+ * blocks take the change one after another: one taking it later would
+ * act at a later moment, so that an RMT channel on REF_TICK would run on
+ * at its old rate past the moment a pulse counter had taken APB_CLK's
+ * new one, its pulse longer in the counter's cycles than it is.
+ */
+static void esp32_soc_update_clocks(Esp32SocState *s)
+{
+    esp32_line_run_at(esp32_line_time(), esp32_soc_update_clocks_run, s);
 }
 
 /* eFuse BLK0 word 4: the flash regulator's settings (TRM table 5.2-1) */
