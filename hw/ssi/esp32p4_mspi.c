@@ -2500,6 +2500,15 @@ void esp32p4_mspi_raise_state_ends(ESP32P4MSPIState *s)
     mspi_update_irq(s);
 }
 
+/* [spec:nuos:req:emu.esp32p4.boot] */
+uint32_t esp32p4_mspi_flash_jedec_id(ESP32P4MSPIState *s)
+{
+    if (!flash_present(s)) {
+        return flash_idle_byte(s, 1) * 0x010101u;
+    }
+    return m25p80_jedec_id(ssi_get_cs(s->bus, 0));
+}
+
 /* The window: direct accesses, and the accesses of masters without cache. */
 
 /* [spec:nuos:req:emu.esp32p4.memory] */

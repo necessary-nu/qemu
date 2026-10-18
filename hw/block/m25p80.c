@@ -2125,6 +2125,23 @@ BlockBackend *m25p80_get_blk(DeviceState *dev)
 }
 
 /* [spec:nuos:req:emu.flash-chip] */
+uint32_t m25p80_jedec_id(DeviceState *dev)
+{
+    Flash *s = (Flash *)object_dynamic_cast(OBJECT(dev), TYPE_M25P80);
+
+    if (!s) {
+        return 0;
+    }
+    if (s->pi->chip) {
+        return m25chip_jedec_id(s->pi->chip);
+    }
+    if (s->pi->id_len < 3) {
+        return 0;
+    }
+    return s->pi->id[0] << 16 | s->pi->id[1] << 8 | s->pi->id[2];
+}
+
+/* [spec:nuos:req:emu.flash-chip] */
 bool m25p80_hold_enabled(DeviceState *dev)
 {
     Flash *s = (Flash *)object_dynamic_cast(OBJECT(dev), TYPE_M25P80);

@@ -465,6 +465,53 @@ static void test_kernel(void)
     unlink(efuse);
 }
 
+/*
+ * The flash's JEDEC ID, where the ROM leaves it for -kernel's image to
+ * find: in SPI1's W0 as its RDID read it, first byte lowest, and in the
+ * device_id of the esp_rom_spiflash_chip_t that rom_spiflash_legacy_data
+ * (0x4FFBFFE8, ESP-IDF's esp32p4.rom.ld) points to, ESP-IDF's
+ * g_rom_flashchip, manufacturer ID in bits 23:16. It is the attached
+ * part's own at each size the machine offers: the board's GigaDevice
+ * GD25Q256E at 32 MiB, Winbond parts at the others. With no flash on the
+ * bus the RDID reads the data line as the ROM's SelectSpiFunction() leaves
+ * its pad: pulled up, all ones.
+ */
+/* [spec:nuos:req:emu.esp32p4.boot/test] */
+static void test_kernel_flash_id(void)
+{
+    static const struct {
+        const char *size;
+        uint32_t id;
+    } parts[] = {
+        { "0", 0xffffff },
+        { "1M", 0xef4014 },             /* W25Q80BL */
+        { "2M", 0xef4015 },             /* W25Q16JV */
+        { "4M", 0xef4016 },             /* W25Q32RV */
+        { "8M", 0xef4017 },             /* W25Q64 */
+        { "16M", 0xef4018 },            /* W25Q128 */
+        { "32M", 0xc84019 },            /* GD25Q256E */
+        { "64M", 0xef4020 },            /* W25Q512JV */
+        { "128M", 0xef4021 },           /* W25Q01JVQ */
+    };
+    g_autofree char *elf = write_elf(prog_magic, ARRAY_SIZE(prog_magic));
+
+    for (size_t i = 0; i < ARRAY_SIZE(parts); i++) {
+        QTestState *qts = qtest_initf("-M esp32p4,flash-size=%s,"
+                                      "strap-mode=0x8 -accel tcg "
+                                      "-icount shift=0,sleep=off -kernel %s",
+                                      parts[i].size, elf);
+        uint32_t chip = qtest_readl(qts, 0x4ffbffe8);
+
+        g_test_message("flash-size=%s", parts[i].size);
+        g_assert_cmphex(qtest_readl(qts, 0x5008d058), ==,
+                        bswap32(parts[i].id) >> 8);
+        g_assert_cmphex(chip, ==, 0x4ffbfee8);
+        g_assert_cmphex(qtest_readl(qts, chip), ==, parts[i].id);
+        qtest_quit(qts);
+    }
+    unlink(elf);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -476,6 +523,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32p4/boot/download-disabled", test_download_disabled);
     qtest_add_func("/esp32p4/boot/print-control", test_print_control);
     qtest_add_func("/esp32p4/boot/kernel", test_kernel);
+    qtest_add_func("/esp32p4/boot/kernel-flash-id", test_kernel_flash_id);
     qtest_add_func("/esp32p4/boot/spi-slave-download", test_spi_slave_download);
     return g_test_run();
 }

@@ -178,4 +178,13 @@ MemTxResult esp32p4_mspi_axi_write(ESP32P4MSPIState *s, uint32_t addr,
  */
 void esp32p4_mspi_raise_state_ends(ESP32P4MSPIState *s);
 
+/*
+ * The three bytes a JEDEC ID read (9Fh) on chip select 0 reads from the
+ * flash bus now, the first in bits 23:16: the attached part's ID, or with
+ * no flash the data line's level as its pad's pulls hold it, for each
+ * bit. For the machine's presentation of the boot ROM's hand-off, which
+ * does not repeat the ROM's RDID on the bus.
+ */
+uint32_t esp32p4_mspi_flash_jedec_id(ESP32P4MSPIState *s);
+
 #endif
