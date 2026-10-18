@@ -3462,12 +3462,21 @@ void esp32p4_mspi_dma_wait_retry(ESP32P4MspiDmaWait *w)
     timer_mod(w->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
-/* Let the cores' held accesses go once the AXI port takes them. */
+/*
+ * Let the cores' held accesses go once the AXI port takes them. Held
+ * accesses that auto-suspend now holds ask for the suspend instead.
+ */
 static void mspi_axi_wake(ESP32P4MSPIState *s)
 {
     uint32_t waiting = s->axi_waiting;
+    const char *why = mspi_axi_stall(s);
 
-    if (mspi_axi_stall(s)) {
+    if (why == mspi_asus_why &&
+        (waiting || !notifier_list_empty(&s->dma_waiters))) {
+        mspi_asus_request(s);
+        return;
+    }
+    if (why) {
         return;
     }
     s->dma_wait_logged = false;
@@ -4173,7 +4182,7 @@ static void spi1_end(void *opaque)
 
         s->spi1_waiti = false;
         s->spi1_poll_from = s->spi1_end_at;
-        if (s->asus == MSPI_ASUS_REQUESTED && mspi_asus_holds(s)) {
+        if (s->asus == MSPI_ASUS_REQUESTED && mspi_asus_holds(s) && ready) {
             mspi_asus_start_pes(s, s->spi1_end_at);
             return;
         }
