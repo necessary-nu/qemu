@@ -44,7 +44,13 @@
  * (hw/misc/esp32_pcnt_bulk.h): the counter steps through matches one at a
  * time, and between them takes any number of edges at once; a watch
  * point's interrupt, enabled, has the timer set for its edge. Otherwise
- * the wave's edges are taken one by one, as the line's would be.
+ * the wave's edges are taken one by one, as the line's would be. An output
+ * announces a change of its settings as its own catch-up comes to it,
+ * which without icount can be after another source has put out a later
+ * change: before a unit takes an input's change, or an output's
+ * announcement, the other outputs its inputs take announce theirs due
+ * before then (pcnt_bulk_catch_up()), so that the unit takes every
+ * input's changes in time order.
  */
 
 #include "qemu/osdep.h"
@@ -682,6 +688,27 @@ static void pcnt_filter_cb(void *opaque)
     pcnt_schedule(opaque);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.pcnt]
+ * Before unit u takes a change at t, the outputs whose waves its signal
+ * inputs take, but `but`, announce their updates due before then
+ * (esp32_line_wave_catch_up()): an output announces an update as its own
+ * catch-up comes to it, which without icount can be after another
+ * source's catch-up has put out this later change, and the unit takes its
+ * inputs' changes in time order.
+ */
+static void pcnt_bulk_catch_up(Esp32PcntState *s, unsigned u,
+                               Esp32LineWave *but, int64_t t)
+{
+    for (unsigned ch = 0; ch < 2; ch++) {
+        Esp32PcntBulk *b = &s->bulk[u * UI + IN_SIG(ch)];
+
+        if (b->on && b->wave != but) {
+            esp32_line_wave_catch_up(b->wave, t);
+        }
+    }
+}
+
 /* Input n changes to level at t, as its line or a wave says. */
 static void pcnt_input_change(Esp32PcntState *s, int n, bool level,
                               int64_t t)
@@ -698,7 +725,8 @@ static void pcnt_input_change(Esp32PcntState *s, int n, bool level,
  * An input changes at its stamp's time. A signal input taking a wave
  * ignores its line, which the output drives only at its level of the
  * moment as software samples the pads, keeping its level for when it
- * follows the line again.
+ * follows the line again. The outputs its unit's signal inputs take
+ * announce their updates before it first (pcnt_bulk_catch_up()).
  */
 static void pcnt_set_input(void *opaque, int n, int level)
 {
@@ -707,6 +735,10 @@ static void pcnt_set_input(void *opaque, int n, int level)
 
     level = !!level;
     s->line[n] = level;
+    if (s->bulk[n].on || s->raw[n] == level) {
+        return;
+    }
+    pcnt_bulk_catch_up(s, n / UI, NULL, t);
     if (s->bulk[n].on || s->raw[n] == level) {
         return;
     }
@@ -759,7 +791,7 @@ static void pcnt_bulk_switch(Esp32PcntState *s, unsigned i, int64_t from)
         return;
     }
     from = MAX(from, s->line_ns[i]);
-    pcnt_sync(s, from);
+    pcnt_sync_unit(s, i / UI, from);
     b->on = true;
     s->bulk_ns[i] = from;
     pcnt_bulk_join(s, i, from);
@@ -768,9 +800,11 @@ static void pcnt_bulk_switch(Esp32PcntState *s, unsigned i, int64_t from)
 /*
  * [spec:nuos:req:emu.esp32.pcnt]
  * A signal input's output announcing a change at c->when: before it, the
- * unit takes its edges until then; after, the input goes on from its new
- * description, its level at c->when as the change left it, or follows its
- * line if it describes its edges no more.
+ * other outputs the input's unit takes announce their updates before then
+ * (pcnt_bulk_catch_up()), and the unit, which counts apart from the
+ * others, takes the edges until then; after, the input goes on from its
+ * new description, its level at c->when as the change left it, or
+ * follows its line if it describes its edges no more.
  */
 static void pcnt_wave_changed(Notifier *n, void *data)
 {
@@ -779,8 +813,9 @@ static void pcnt_wave_changed(Notifier *n, void *data)
     Esp32LineWaveChange *c = data;
 
     if (!c->done) {
+        pcnt_bulk_catch_up(s, b->input / UI, b->wave, c->when);
         if (b->on) {
-            pcnt_sync(s, c->when - 1);
+            pcnt_sync_unit(s, b->input / UI, c->when - 1);
         }
         return;
     }

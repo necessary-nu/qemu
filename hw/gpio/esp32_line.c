@@ -213,6 +213,21 @@ void esp32_line_wave_changed(Esp32LineWave *w, int64_t when)
     wave_announce(w, when, true);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32.gpio]
+ * [spec:nuos:req:emu.esp32p4.gpio]
+ * A taker of the output is about to take another input's change at @t:
+ * the output announces its updates due before then first. One due at @t
+ * itself comes after that change, as it does when the output's own timer,
+ * due at the same moment, runs after the other source's.
+ */
+void esp32_line_wave_catch_up(Esp32LineWave *w, int64_t t)
+{
+    if (w->ops->catch_up && w->ops->until(w) < t) {
+        w->ops->catch_up(w, t - 1);
+    }
+}
+
 /* [spec:nuos:req:emu.esp32.gpio] */
 /* [spec:nuos:req:emu.esp32p4.gpio] */
 bool esp32_sig_out_watched(Object *matrix, unsigned sig)
