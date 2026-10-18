@@ -226,11 +226,12 @@
  * AXI_REQ_EN is clear (esp32p4_mspi_axi_ready()): on the chip the access
  * never completes and the bus hangs. A core's access through the window
  * or the caches waits on the bus until the port takes accesses again,
- * and is then made. A DMA master's waits likewise, with its channel, for
- * GDMA-AHB, GDMA-AXI and VDMA, which ask before each transaction
+ * and is then made. A DMA master's waits likewise, with its channel or
+ * engine, for GDMA-AHB, GDMA-AXI, VDMA, the 2D-DMA, H264_DMA, the OTGs,
+ * the GMAC and the SD/MMC host's IDMAC, which ask before each transaction
  * (esp32p4_mspi_dma_wait()) and make it once the port takes it; another
- * master's (qtest's, or a DMA master that does not ask) is refused with
- * an error response and logged.
+ * master's (qtest's, TRACE's) is refused with an error response and
+ * logged.
  *
  * Not modelled: ECC on the external memory (FMEM/SMEM ECC, the PSRAM's
  * 16-to-18 byte mode and its address conversion), logged as unimplemented
