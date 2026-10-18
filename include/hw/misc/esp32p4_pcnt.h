@@ -106,10 +106,12 @@ struct ESP32P4PcntState {
      * Per input: the level on the wire, the level past the glitch filter,
      * and when the wire last changed. The two levels differ while the
      * filter is holding a change back; the timer runs to the earliest
-     * time such a change matures. A change held back across a change of
-     * APB_CLK's edges counts on from the moment of that change, which
-     * raw_since_ns then holds, having held for `held` edges before it.
-     * The clear signals are not filtered.
+     * time such a change matures. A change held back counts the edges of
+     * APB_CLK after raw_since_ns that see it, having counted `held`
+     * before then: up to a change of the clock's edges, or up to a dip
+     * back to the filter's level (raw_since_ns then the dip's start, the
+     * levels alike), which the count runs on through unless an edge sees
+     * it. The clear signals are not filtered.
      */
     uint8_t raw[ESP32P4_PCNT_INPUTS];
     uint8_t filt[ESP32P4_PCNT_INPUTS];

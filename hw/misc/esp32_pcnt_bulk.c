@@ -32,7 +32,8 @@ int64_t esp32_pcnt_feed_next_raw(const Esp32PcntFeed *f)
  * Whether the filter passes every pulse of the wave, each lasting at least
  * as long as any change takes to reach the counter: a change is then due
  * no later than the edge after it, which the counter takes only after
- * what is due by then (a pulse of exactly the filter's length passes).
+ * what is due by then, and every pulse, and every gap between two, is
+ * seen at as many of the filter's samples as it asks for.
  */
 bool esp32_pcnt_feed_passes(const Esp32PcntFeed *f)
 {
@@ -125,14 +126,6 @@ void esp32_pcnt_feed_advance(Esp32PcntFeed *f, int64_t x)
     f->raw = w->ops->level(w, x) ^ f->inv;
     f->filt ^= nf & 1;
     f->pos = x;
-}
-
-/* The wave's next edge, at e: the level changes there, the filter waits. */
-void esp32_pcnt_feed_raw_edge(Esp32PcntFeed *f, int64_t e)
-{
-    f->raw = !f->raw;
-    f->raw_since = e;
-    f->pos = e;
 }
 
 /*

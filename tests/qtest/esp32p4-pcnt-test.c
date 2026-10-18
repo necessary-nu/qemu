@@ -161,14 +161,19 @@ static void drive(int pad, int level)
     qtest_set_irq_in(qts, GPIO_PATH, "pad-in", pad, level);
 }
 
-static void start(void)
+static void start_args(const char *args)
 {
-    qts = qtest_init("-M esp32p4,strap-mode=0");
+    qts = qtest_initf("-M esp32p4,strap-mode=0 %s", args);
     now = 0;
     wr(SOC_CLK_CTRL2, rd(SOC_CLK_CTRL2) | PCNT_APB_CLK_EN);
     for (int pad = 20; pad < 25; pad++) {
         drive(pad, 0);
     }
+}
+
+static void start(void)
+{
+    start_args("");
 }
 
 static void stop(void)
@@ -575,6 +580,141 @@ static void test_filter_span(void)
 }
 
 /*
+ * The filter sees the pad only at APB_CLK's edges, each seeing the level
+ * the pad had up to it, and passes a change at the FILTER_THRES-th edge in
+ * a row that sees it. Unit 0 counts rising edges of pad 20 through a
+ * filter of `thres`; APB_CLK's edges are at every multiple of 100 ns.
+ */
+static void start_sampled(uint32_t thres)
+{
+    start();
+    pad_to(20, SIG_CH0(0));
+    unit_setup(0, POS_MODE(0, INC) | FILTER_EN | FILTER(thres), 0,
+               lims(1000, -1000));
+}
+
+/*
+ * A dip back to the filtered level that no edge sees leaves the count
+ * running on; one that an edge sees restarts it. FILTER_THRES 10.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_filter_dip(void)
+{
+    int64_t t;
+
+    start_sampled(10);
+
+    /*
+     * A dip from t + 410 to t + 450, between the edges at t + 400 and
+     * t + 500, is not seen: the rise at t is seen at the 10 edges to
+     * t + 1000 and passes there. Counted afresh from t + 450 it would be
+     * lost.
+     */
+    t = 10000;
+    clock_to(t);
+    drive(20, 1);
+    clock_to(t + 410);
+    drive(20, 0);
+    clock_to(t + 450);
+    drive(20, 1);
+    expect_edge_at(t + 1000, 0);
+
+    /* A dip the edge at t + 500 sees restarts the count: 10 from t + 600 */
+    t = 30000;
+    clock_to(t);
+    drive(20, 1);
+    clock_to(t + 410);
+    drive(20, 0);
+    clock_to(t + 510);
+    drive(20, 1);
+    expect_edge_at(t + 1500, 1);
+    stop();
+}
+
+/*
+ * A change counts from the first edge after it, so a pulse is judged by
+ * the edges it spans rather than its length. FILTER_THRES 10.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_filter_start(void)
+{
+    int64_t t;
+
+    start_sampled(10);
+
+    /*
+     * A rise just after an edge counts from the next: 999 ns, less than
+     * 10 cycles, are seen at the 10 edges from t + 100 to t + 1000 and
+     * pass.
+     */
+    t = 10000;
+    clock_to(t + 1);
+    drive(20, 1);
+    expect_edge_at(t + 1000, 0);
+
+    /* The same 999 ns from an edge are seen at 9 and lost */
+    t = 30000;
+    clock_to(t);
+    drive(20, 1);
+    clock_to(t + 999);
+    drive(20, 0);
+    step(10000);
+    g_assert_cmpint(count(0), ==, 1);
+    stop();
+}
+
+/*
+ * The clock gated from t + 350 to t + 2350, after 3 edges have seen a
+ * rise at t: a dip while it is stopped is seen at no edge, and the rise
+ * passes at the 7th edge after the restart, t + 3000. FILTER_THRES 10.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_filter_gated_dip(void)
+{
+    int64_t t = 10000;
+
+    start_sampled(10);
+    clock_to(t);
+    drive(20, 1);
+    clock_to(t + 350);
+    wr(SOC_CLK_CTRL2, rd(SOC_CLK_CTRL2) & ~PCNT_APB_CLK_EN);
+    clock_to(t + 1000);
+    drive(20, 0);
+    clock_to(t + 1500);
+    drive(20, 1);
+    clock_to(t + 2350);
+    wr(SOC_CLK_CTRL2, rd(SOC_CLK_CTRL2) | PCNT_APB_CLK_EN);
+    expect_edge_at(t + 3000, 0);
+    stop();
+}
+
+/*
+ * FILTER_THRES 0 passes a change at the first edge that sees it: a pulse
+ * from t + 5 to t + 60 is seen at none, one from t + 60 to t + 120 at
+ * t + 100.
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_filter_thres_zero(void)
+{
+    int64_t t = 10000;
+
+    start_sampled(0);
+    clock_to(t + 5);
+    drive(20, 1);
+    clock_to(t + 60);
+    drive(20, 0);
+    g_assert_cmpint(count(0), ==, 0);
+    drive(20, 1);
+    clock_to(t + 99);
+    g_assert_cmpint(count(0), ==, 0);
+    clock_to(t + 100);
+    g_assert_cmpint(count(0), ==, 1);
+    clock_to(t + 120);
+    drive(20, 0);
+    stop();
+}
+
+/*
  * LEDC timer x from XTAL_CLK, a count every 25 ns, 3 bits: started at t,
  * its 200 ns cycles count from t; a channel set up then takes its settings
  * in at the first overflow, at t + 200, which is returned.
@@ -611,6 +751,73 @@ static void ledc_on(void)
     wr(SOC_CLK_CTRL3, rd(SOC_CLK_CTRL3) | LEDC_APB_CLK_EN);
     /* LEDC_CLK from XTAL_CLK */
     wr(PERI_CLK_CTRL22, (rd(PERI_CLK_CTRL22) & ~3u) | LEDC_CLK_EN);
+}
+
+/*
+ * At t, units 0 and 1 have passed the rise at c at the third edge of
+ * APB_CLK after it, c + 275, and unit 2 has counted every rise.
+ */
+static void wave_dips_at(int64_t c, int64_t t)
+{
+    clock_to(t);
+    g_assert_cmpint(count(0), ==, t >= c + 275);
+    g_assert_cmpint(count(1), ==, t >= c + 275);
+    g_assert_cmpint(count(2), ==, t < c ? 0 : 1 + (t - c) / 200);
+}
+
+/*
+ * A wave whose lows are shorter than APB_CLK's period (100 ns, its edges
+ * at every multiple of 100 ns), from the LEDC, taken by a filter of 3 from
+ * the output in bulk (unit 0, pad 26), which takes such a wave's edges one
+ * by one, and from a pad the board wires the same wave to (unit 1, pad 29
+ * from pad 28), which the output drives edge by edge; unit 2 counts every
+ * rise of pad 26. Channels 0 and 1, on timer 0, start their cycles at c,
+ * 25 ns after an edge, so that no edge sees their lows, from
+ * c + 175 + 200 k to c + 200 (k + 1): units 0 and 1 see their pads high
+ * from the first rise on, and pass it at the third edge after c, alike.
+ * Channel 2, on timer 1, starts its cycles at an edge, the edge at the end
+ * of each low sees it, and each high, seen at one edge, is lost (unit 3,
+ * pad 30).
+ */
+/* [spec:nuos:req:emu.esp32p4.rmt-pcnt/test] */
+static void test_filter_wave_dips(void)
+{
+    int64_t c, c1, t;
+
+    start_args("-global esp32p4-gpio.pad-wires=28:29");
+    ledc_on();
+    for (int u = 0; u < 4; u++) {
+        uint32_t filter = u == 2 ? 0 : FILTER_EN | FILTER(3);
+
+        unit_setup(u, POS_MODE(0, INC) | filter, 0, lims(1000, -1000));
+    }
+    wr(IO_MUX_GPIO(29), MCU_SEL_GPIO | FUN_IE | FUN_DRV2);
+    c = ledc_timer_start(0, 10025);
+    ledc_dip_channel(0, 0, 26);
+    ledc_dip_channel(1, 0, 28);
+    route(26, 0);
+    route(29, 1);
+    route(26, 2);
+    c1 = ledc_timer_start(1, 10100);
+    ledc_dip_channel(2, 1, 30);
+    route(30, 3);
+
+    /* Every 25 ns through the first cycles, and a ns before the pass */
+    for (t = c - 25; t < c + 1000; t += 25) {
+        wave_dips_at(c, t);
+        if (t == c + 250) {
+            wave_dips_at(c, c + 274);
+        }
+    }
+
+    /* 500 cycles on: one rise seen, 501 made; channel 2's all lost */
+    clock_to(c + 100000);
+    g_assert_cmpint(count(0), ==, 1);
+    g_assert_cmpint(count(1), ==, 1);
+    g_assert_cmpint(count(2), ==, 501);
+    clock_to(c1 + 100000);
+    g_assert_cmpint(count(3), ==, 0);
+    stop();
 }
 
 /*
@@ -655,6 +862,11 @@ int main(int argc, char **argv)
     qtest_add_func("esp32p4/pcnt/rmt_pulses", test_rmt_pulses);
     qtest_add_func("esp32p4/pcnt/block_reset", test_block_reset);
     qtest_add_func("esp32p4/pcnt/filter_span", test_filter_span);
+    qtest_add_func("esp32p4/pcnt/filter_dip", test_filter_dip);
+    qtest_add_func("esp32p4/pcnt/filter_start", test_filter_start);
+    qtest_add_func("esp32p4/pcnt/filter_gated_dip", test_filter_gated_dip);
+    qtest_add_func("esp32p4/pcnt/filter_thres_zero", test_filter_thres_zero);
+    qtest_add_func("esp32p4/pcnt/filter_wave_dips", test_filter_wave_dips);
     qtest_add_func("esp32p4/pcnt/wave_join_watch", test_wave_join_watch);
     return g_test_run();
 }

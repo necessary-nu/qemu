@@ -13,6 +13,7 @@
 #define DPORT_PERIP_RST_EN  0x3ff000c4
 #define PERIP_PCNT          (1u << 10)
 #define PERIP_LEDC          (1u << 11)
+#define PERIP_PWM0          (1u << 17)
 #define PERIP_CLK_EN_RESET  0xf9c1e06fu
 #define SYSCON_SYSCLK_CONF  0x3ff66000
 #define PRE_DIV_MASK        0x3ffu
@@ -64,13 +65,18 @@
 #define GPIO                0x3ff44000
 #define GPIO_FUNC_IN(s)     (GPIO + 0x130 + 4 * (s))
 #define GPIO_FUNC_OUT(n)    (GPIO + 0x530 + 4 * (n))
+#define GPIO_PIN(n)         (GPIO + 0x88 + 4 * (n))
+#define PAD_DRIVER          (1u << 2)
 #define IN_SIG_IN_SEL       (1u << 7)
 #define IN_CONST_LOW        0x30
 #define IN_CONST_HIGH       0x38
 #define IO_MUX              0x3ff49000
 #define IO_MUX_GPIO18       (IO_MUX + 0x70)
 #define IO_MUX_GPIO19       (IO_MUX + 0x74)
+#define IO_MUX_GPIO21       (IO_MUX + 0x7c)
 #define IO_MUX_GPIO22       (IO_MUX + 0x80)
+#define IO_MUX_GPIO23       (IO_MUX + 0x8c)
+#define FUN_WPU             (1u << 8)
 #define FUN_IE              (1u << 9)
 #define MCU_SEL_GPIO        (2u << 12)
 
@@ -87,6 +93,25 @@
 
 #define PAD_SIG             18
 #define PAD_CTRL            19
+#define PAD_PWM             21
+
+/* MCPWM0, for a wave the PCNT takes in bulk */
+#define PWM0                0x3ff5e000
+#define PWM_CLK_CFG         (PWM0 + 0x000)
+#define PWM_TIMER0_CFG0     (PWM0 + 0x004)
+#define PWM_TIMER0_CFG1     (PWM0 + 0x008)
+#define PWM_GEN0_TSTMP_A    (PWM0 + 0x040)
+#define PWM_GEN0_TSTMP_B    (PWM0 + 0x044)
+#define PWM_GEN0_A          (PWM0 + 0x050)
+#define PWM_GEN0_B          (PWM0 + 0x054)
+#define PWM_UTEZ_HIGH       (2u << 0)
+#define PWM_UTEA_LOW        (1u << 4)
+#define PWM_UTEB_HIGH       (2u << 6)
+/* Timer 0 started, counting up */
+#define PWM_RUN_UP          (2u | (1u << 3))
+#define SIG_PWM0_OUT0A      32
+#define SIG_PWM0_OUT0B      33
+#define PAD_PWM_OD          23
 
 /* LEDC high-speed channel 0 on high-speed timer 0 */
 #define LEDC                0x3ff59000
@@ -529,6 +554,209 @@ static void clock_to(QTestState *qts, int64_t t)
 }
 
 /*
+ * Unit 1's count, `was`, steps at t as a rising edge comes through its
+ * filter, not a nanosecond sooner; the pad goes low there.
+ */
+static void expect_pass_at(QTestState *qts, int64_t t, int16_t was)
+{
+    clock_to(qts, t - 1);
+    g_assert_cmpint(count(qts, 1), ==, was);
+    clock_to(qts, t);
+    g_assert_cmpint(count(qts, 1), ==, was + 1);
+    drive(qts, PAD_SIG, 0);
+}
+
+/*
+ * The filter sees the pad only at APB_CLK's edges, each seeing the level
+ * the pad had up to it, and passes a change at the FILTER_THRES-th edge in
+ * a row that sees it (TRM 23.2.2: the inputs "are sampled on APB_CLK
+ * edges"). Unit 1 counts rising edges through a filter of `thres`, from
+ * 1000 ns on, when APB_CLK (40 MHz) is restarted by its gate: its edges
+ * are every 25 ns from then, at every multiple of 25 ns.
+ */
+static QTestState *start_sampled(uint32_t thres)
+{
+    QTestState *qts = start();
+
+    clock_to(qts, 1000);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET | PERIP_PCNT);
+    setup_unit(qts, 1, CH_POS(0, INC) | FILTER_EN | FILTER_THRES(thres), 0);
+    return qts;
+}
+
+/*
+ * A dip back to the filtered level that no edge sees leaves the count
+ * running on; one that an edge sees restarts it. FILTER_THRES 10.
+ */
+/* [spec:nuos:req:emu.esp32.pcnt/test] */
+static void test_filter_dip(void)
+{
+    QTestState *qts = start_sampled(10);
+    int64_t t;
+
+    /*
+     * A dip from t + 110 to t + 120, between the edges at t + 100 and
+     * t + 125, is not seen: the rise at t is seen at the 10 edges to
+     * t + 250 and passes there. Counted afresh from t + 120 it would be
+     * lost.
+     */
+    t = 2000;
+    clock_to(qts, t);
+    drive(qts, PAD_SIG, 1);
+    clock_to(qts, t + 110);
+    drive(qts, PAD_SIG, 0);
+    clock_to(qts, t + 120);
+    drive(qts, PAD_SIG, 1);
+    expect_pass_at(qts, t + 250, 0);
+
+    /* A dip the edge at t + 125 sees restarts the count: 10 from t + 150 */
+    t = 4000;
+    clock_to(qts, t);
+    drive(qts, PAD_SIG, 1);
+    clock_to(qts, t + 110);
+    drive(qts, PAD_SIG, 0);
+    clock_to(qts, t + 130);
+    drive(qts, PAD_SIG, 1);
+    expect_pass_at(qts, t + 375, 1);
+    qtest_quit(qts);
+}
+
+/*
+ * A change counts from the first edge after it, so a pulse is judged by
+ * the edges it spans rather than its length. FILTER_THRES 10.
+ */
+/* [spec:nuos:req:emu.esp32.pcnt/test] */
+static void test_filter_start(void)
+{
+    QTestState *qts = start_sampled(10);
+    int64_t t;
+
+    /*
+     * A rise just after an edge counts from the next: 249 ns, less than
+     * 10 cycles, are seen at the 10 edges from t + 25 to t + 250 and pass.
+     */
+    t = 2000;
+    clock_to(qts, t + 1);
+    drive(qts, PAD_SIG, 1);
+    expect_pass_at(qts, t + 250, 0);
+
+    /* The same 249 ns from an edge are seen at 9 and lost */
+    t = 4000;
+    clock_to(qts, t);
+    drive(qts, PAD_SIG, 1);
+    clock_to(qts, t + 249);
+    drive(qts, PAD_SIG, 0);
+    clock_to(qts, t + 1000);
+    g_assert_cmpint(count(qts, 1), ==, 1);
+    qtest_quit(qts);
+}
+
+/*
+ * The clock gated from t + 100 to t + 1100, after 4 edges have seen a
+ * rise at t: a dip while it is stopped is seen at no edge, and the rise
+ * passes at the 6th edge after the restart. FILTER_THRES 10.
+ */
+/* [spec:nuos:req:emu.esp32.pcnt/test] */
+static void test_filter_gated_dip(void)
+{
+    QTestState *qts = start_sampled(10);
+    int64_t t = 2000;
+
+    clock_to(qts, t);
+    drive(qts, PAD_SIG, 1);
+    clock_to(qts, t + 100);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET);
+    clock_to(qts, t + 500);
+    drive(qts, PAD_SIG, 0);
+    clock_to(qts, t + 600);
+    drive(qts, PAD_SIG, 1);
+    clock_to(qts, t + 1100);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET | PERIP_PCNT);
+    expect_pass_at(qts, t + 1250, 0);
+    qtest_quit(qts);
+}
+
+/*
+ * FILTER_THRES 0 passes a change at the first edge that sees it: a pulse
+ * from t + 5 to t + 20 is seen at none, one from t + 20 to t + 30 at
+ * t + 25.
+ */
+/* [spec:nuos:req:emu.esp32.pcnt/test] */
+static void test_filter_thres_zero(void)
+{
+    QTestState *qts = start_sampled(0);
+    int64_t t = 2000;
+
+    clock_to(qts, t + 5);
+    drive(qts, PAD_SIG, 1);
+    clock_to(qts, t + 20);
+    drive(qts, PAD_SIG, 0);
+    g_assert_cmpint(count(qts, 1), ==, 0);
+    drive(qts, PAD_SIG, 1);
+    expect_pass_at(qts, t + 25, 0);
+    qtest_quit(qts);
+}
+
+/*
+ * A wave the filter takes from its output rather than its pad, in closed
+ * form, every pulse outlasting the filter: each rising edge passes at the
+ * FILTER_THRES-th edge of APB_CLK after it, not FILTER_THRES cycles after
+ * it. APB_CLK (40 MHz) restarted by its gate at t0: its edges every 25 ns
+ * from then. MCPWM0's PWM0A, PWM_clk 40 MHz (PLL_F160M_CLK by 4) from its
+ * own gate's restart at t0 + 15, rises at TEZ, every 1 us from t0 + 1015,
+ * 15 ns after an edge, and falls 500 ns later. Unit 0 counts the rising
+ * edges through a filter of 4 (100 ns), passing each at its 4th edge, 85
+ * ns after it; unit 1 counts every one.
+ */
+/* [spec:nuos:req:emu.esp32.pcnt/test] */
+static void test_filter_wave_due(void)
+{
+    QTestState *qts = start();
+    int64_t t0 = 1000, r;
+
+    clock_to(qts, t0);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET | PERIP_PCNT);
+    setup_unit(qts, 0, CH_POS(0, INC) | FILTER_EN | FILTER_THRES(4), 0);
+    setup_unit(qts, 1, CH_POS(0, INC), 0);
+    qtest_writel(qts, IO_MUX_GPIO21, MCU_SEL_GPIO | FUN_IE);
+    qtest_writel(qts, GPIO_FUNC_OUT(PAD_PWM), SIG_PWM0_OUT0A);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_CH0(0)), IN_SIG_IN_SEL | PAD_PWM);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_CH0(1)), IN_SIG_IN_SEL | PAD_PWM);
+
+    clock_to(qts, t0 + 15);
+    qtest_writel(qts, DPORT_PERIP_RST_EN,
+                 qtest_readl(qts, DPORT_PERIP_RST_EN) & ~PERIP_PWM0);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET | PERIP_PCNT |
+                 PERIP_PWM0);
+    qtest_writel(qts, PWM_CLK_CFG, 3);
+    qtest_writel(qts, PWM_GEN0_TSTMP_A, 20);
+    qtest_writel(qts, PWM_GEN0_A, PWM_UTEZ_HIGH | PWM_UTEA_LOW);
+    qtest_writel(qts, PWM_TIMER0_CFG0, 39 << 8);
+    qtest_writel(qts, PWM_TIMER0_CFG1, PWM_RUN_UP);
+
+    r = t0 + 1015;
+    clock_to(qts, r - 1);
+    g_assert_cmpint(count(qts, 1), ==, 0);
+    clock_to(qts, r);
+    g_assert_cmpint(count(qts, 1), ==, 1);
+    clock_to(qts, r + 84);
+    g_assert_cmpint(count(qts, 0), ==, 0);
+    clock_to(qts, r + 85);
+    g_assert_cmpint(count(qts, 0), ==, 1);
+
+    /* A thousand periods on, each rise passing 85 ns after it */
+    r += 1000 * 1000;
+    clock_to(qts, r + 84);
+    g_assert_cmpint(count(qts, 0), ==, 1000);
+    g_assert_cmpint(count(qts, 1), ==, 1001);
+    clock_to(qts, r + 85);
+    g_assert_cmpint(count(qts, 0), ==, 1001);
+    qtest_quit(qts);
+}
+
+/*
  * A wave taken in bulk whose level changes as it is taken up: LEDC
  * high-speed channel 0, high from count 0 for 7 of its timer's 8 counts
  * of 25 ns, goes high as it is set up at t0. Unit 2 counts that rise
@@ -567,6 +795,86 @@ static void test_wave_join_watch(void)
     qtest_quit(qts);
 }
 
+/*
+ * At t, units 0 and 1 have passed the first rise of MCPWM0's dip wave, at
+ * ts + 69, at the third edge of APB_CLK after it, ts + 125, and unit 2 has
+ * counted every rise: that one, and one at the end of each dip, at
+ * ts + 319 + 250 k.
+ */
+static void wave_dips_at(QTestState *qts, int64_t ts, int64_t t)
+{
+    int64_t rises = t < ts + 69 ? 0 : t < ts + 319 ? 1 :
+                    2 + (t - ts - 319) / 250;
+
+    clock_to(qts, t);
+    g_assert_cmpint(count(qts, 0), ==, t >= ts + 125);
+    g_assert_cmpint(count(qts, 1), ==, t >= ts + 125);
+    g_assert_cmpint(count(qts, 2), ==, rises);
+}
+
+/*
+ * A wave whose lows are shorter than APB_CLK's period (25 ns, its edges
+ * at every multiple of 25 ns from its restart at 1000), taken by a filter
+ * of 3 from the output in bulk (unit 0, pad 21), which takes such a
+ * wave's edges one by one, and from an open-drain pad (unit 1, pad 23),
+ * which the output drives edge by edge; unit 2 counts every rise of pad
+ * 21. MCPWM0, PWM_clk 160 MHz from its gate's restart at ts, timer 0
+ * counting 40 cycles of 6.25 ns: PWM0A and PWM0B low at TEA (10) and high
+ * at TEB (11), so that after the first rise, at ts + 69, the wave dips
+ * low from ts + 313 + 250 k to ts + 319 + 250 k, no edge of APB_CLK
+ * seeing it. Units 0 and 1 see their pads high from the first rise on,
+ * and pass it at the third edge after it, alike.
+ */
+/* [spec:nuos:req:emu.esp32.pcnt/test] */
+static void test_filter_wave_dips(void)
+{
+    QTestState *qts = start();
+    int64_t ts = 1100;
+
+    clock_to(qts, 1000);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET | PERIP_PCNT);
+    for (unsigned u = 0; u < 3; u++) {
+        uint32_t filter = u == 2 ? 0 : FILTER_EN | FILTER_THRES(3);
+
+        setup_unit(qts, u, CH_POS(0, INC) | filter, 0);
+    }
+    qtest_writel(qts, IO_MUX_GPIO21, MCU_SEL_GPIO | FUN_IE);
+    qtest_writel(qts, GPIO_FUNC_OUT(PAD_PWM), SIG_PWM0_OUT0A);
+    qtest_writel(qts, IO_MUX_GPIO23, MCU_SEL_GPIO | FUN_IE | FUN_WPU);
+    qtest_writel(qts, GPIO_PIN(PAD_PWM_OD), PAD_DRIVER);
+    qtest_writel(qts, GPIO_FUNC_OUT(PAD_PWM_OD), SIG_PWM0_OUT0B);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_CH0(0)), IN_SIG_IN_SEL | PAD_PWM);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_CH0(1)), IN_SIG_IN_SEL | PAD_PWM_OD);
+    qtest_writel(qts, GPIO_FUNC_IN(SIG_CH0(2)), IN_SIG_IN_SEL | PAD_PWM);
+
+    clock_to(qts, ts);
+    qtest_writel(qts, DPORT_PERIP_RST_EN,
+                 qtest_readl(qts, DPORT_PERIP_RST_EN) & ~PERIP_PWM0);
+    qtest_writel(qts, DPORT_PERIP_CLK_EN, PERIP_CLK_EN_RESET | PERIP_PCNT |
+                 PERIP_PWM0);
+    qtest_writel(qts, PWM_CLK_CFG, 0);
+    qtest_writel(qts, PWM_GEN0_TSTMP_A, 10);
+    qtest_writel(qts, PWM_GEN0_TSTMP_B, 11);
+    qtest_writel(qts, PWM_GEN0_A, PWM_UTEA_LOW | PWM_UTEB_HIGH);
+    qtest_writel(qts, PWM_GEN0_B, PWM_UTEA_LOW | PWM_UTEB_HIGH);
+    qtest_writel(qts, PWM_TIMER0_CFG0, 39 << 8);
+    qtest_writel(qts, PWM_TIMER0_CFG1, PWM_RUN_UP);
+
+    /* Every 25 ns through the first cycles, and a ns before the pass */
+    wave_dips_at(qts, ts, ts + 68);
+    wave_dips_at(qts, ts, ts + 69);
+    for (int64_t t = ts + 75; t < ts + 1000; t += 25) {
+        if (t == ts + 125) {
+            wave_dips_at(qts, ts, t - 1);
+        }
+        wave_dips_at(qts, ts, t);
+    }
+    /* 400 cycles on, the rise still the only one seen */
+    wave_dips_at(qts, ts, ts + 100000);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -578,6 +886,12 @@ int main(int argc, char **argv)
     qtest_add_func("esp32-pcnt/filter", test_filter);
     qtest_add_func("esp32-pcnt/gated", test_gated);
     qtest_add_func("esp32-pcnt/filter-span", test_filter_span);
+    qtest_add_func("esp32-pcnt/filter-dip", test_filter_dip);
+    qtest_add_func("esp32-pcnt/filter-start", test_filter_start);
+    qtest_add_func("esp32-pcnt/filter-gated-dip", test_filter_gated_dip);
+    qtest_add_func("esp32-pcnt/filter-thres-zero", test_filter_thres_zero);
+    qtest_add_func("esp32-pcnt/filter-wave-due", test_filter_wave_due);
+    qtest_add_func("esp32-pcnt/filter-wave-dips", test_filter_wave_dips);
     qtest_add_func("esp32-pcnt/wave-join-watch", test_wave_join_watch);
 
     return g_test_run();
