@@ -11,6 +11,7 @@
 
 #include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
+#include "hw/ssi/esp32p4_mspi.h"
 #include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -26,6 +27,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4TraceState, ESP32P4_TRACE)
 #define ESP32P4_TRACE_FIFO      128
 
 /*
+ * With TRACE_STALL_ENA the stall request is asserted while the FIFO is
+ * "almost full" (TRM 3.5.3, 3.8.1), which the TRM does not quantify: while
+ * it has less room than the most the encoder puts into it for one
+ * instruction, two packets of the longest, 13 bytes (TRM 3.5.5), and an
+ * anchor, 14 zero bytes, so that the instructions the core retires never
+ * overflow it.
+ */
+#define ESP32P4_TRACE_STALL_ROOM (2 * 13 + 14)
+
+/*
  * Named GPIO input ESP32P4_TRACE_CORE_RESET: high while the traced core
  * is held in reset, the encoder's reset sideband signal (TRACE_RESET_ENA).
  *
@@ -33,7 +44,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4TraceState, ESP32P4_TRACE)
  * Clock input "sys-clk": TRACE_SYS_CLK, the clock of its AHB master,
  * which writes the trace memory. Links "cpu" (the traced HP core) and
  * "pms" (the bus, through which it writes); property "core", the core's
- * number.
+ * number. The master's writes into a memory controller's window wait on
+ * its held AXI port as the other DMA masters' do (esp32p4_mspi_dma_wait()).
  */
 #define ESP32P4_TRACE_CORE_RESET "core-reset"
 
@@ -97,6 +109,15 @@ struct ESP32P4TraceState {
     bool core_reset;
     /* The level last driven on the interrupt. */
     bool irq_level;
+    /*
+     * The master's write of the FIFO's oldest bytes waits on a memory
+     * controller's held AXI port (esp32p4_mspi_dma_wait()), until dma_wait
+     * says the port takes accesses again; and the stall request to the
+     * core is asserted (TRACE_STALL_ENA).
+     */
+    ESP32P4MspiDmaWait dma_wait;
+    bool held;
+    bool stall;
 
     /* The FIFO's bytes, oldest at fifo_head. */
     uint8_t fifo[ESP32P4_TRACE_FIFO];
