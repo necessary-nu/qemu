@@ -52,4 +52,12 @@ struct RP2350WatchdogState {
     uint32_t scratch[RP2350_WATCHDOG_SCRATCH];
 };
 
+/*
+ * Bring the watchdog up to the time of the access at hand: a count that
+ * has reached zero by then fires, its reset request going out, as its
+ * timer, which without icount can run well after, would have. For the
+ * blocks the request reaches, POWMAN and the PSM, at their own accesses.
+ */
+void rp2350_watchdog_catch_up(RP2350WatchdogState *s);
+
 #endif

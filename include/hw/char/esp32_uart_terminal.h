@@ -66,6 +66,8 @@ struct Esp32UartTerminalState {
     bool tx_chained;
     /* The host holds its TX line low, a break ("break" property). */
     bool brk;
+    /* While set, bytes from the chardev only join the FIFO (term_receive) */
+    bool taking;
 
     Notifier format_notifier;
     Notifier line_source;

@@ -16,6 +16,7 @@
 #include "hw/misc/esp32p4_keymng.h"
 #include "hw/nvram/esp32p4_efuse.h"
 #include "hw/ssi/ssi.h"
+#include "qemu/notify.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -124,9 +125,24 @@ struct ESP32P4MSPIState {
     uint32_t spi0_logged;
     /*
      * The cores (bit n for CPU index n) whose access the AXI port holds
-     * until it takes accesses again (esp32p4_mspi_axi_ready()).
+     * until it takes accesses again (esp32p4_mspi_axi_ready()), and the
+     * DMA masters, each waiting with a Notifier (esp32p4_mspi_dma_wait()),
+     * which it has logged since it last took accesses.
      */
     uint32_t axi_waiting;
+    NotifierList dma_waiters;
+    bool dma_wait_logged;
+
+    /*
+     * The flash's timing calibration as TIMING_CALI_UPDATE last took it
+     * up: SPI0's and SPI1's TIMING_CALI, SPI0's DIN_MODE and DIN_NUM,
+     * which both ports' reads use; and the DIN modes logged as
+     * unimplemented, a bit per line.
+     */
+    uint32_t tune_cali[2];
+    uint32_t tune_din_mode;
+    uint32_t tune_din_num;
+    uint32_t tune_logged;
 
     /* The manual encryption block: its state and the ciphertext. */
     uint32_t xts_state;
@@ -158,6 +174,21 @@ bool esp32p4_mspi_axi_ready(ESP32P4MSPIState *s, MemTxAttrs attrs,
                             MemTxResult *res);
 
 /*
+ * For a DMA master about to make an access of `len` bytes at `addr` on its
+ * bus `as` (with `attrs`, a write if `write`): whether it reaches a memory
+ * controller's window (flash or PSRAM) whose AXI port cannot take it now,
+ * its bus clock stopped, the controller held in reset, its core clock
+ * stopped or AXI_REQ_EN clear (esp32p4_mspi_axi_ready()). On the chip the
+ * AXI transaction then waits, and the master with it, until the port
+ * takes it: the master does not make the access, and `n` is notified once
+ * the port takes accesses again (it is in the controller's list until
+ * then, and its callback removes it), when the master makes it. A master
+ * that makes an access without asking is answered with an error.
+ */
+bool esp32p4_mspi_dma_wait(AddressSpace *as, hwaddr addr, hwaddr len,
+                           MemTxAttrs attrs, bool write, Notifier *n);
+
+/*
  * The AXI port through which the cache, the direct windows and the DMA
  * masters reach the memory: `len` bytes at `addr`, an offset into the
  * 64 MiB virtual window the MMU maps, which may span MMU pages. Returns
@@ -177,5 +208,14 @@ MemTxResult esp32p4_mspi_axi_write(ESP32P4MSPIState *s, uint32_t addr,
  * transactions.
  */
 void esp32p4_mspi_raise_state_ends(ESP32P4MSPIState *s);
+
+/*
+ * The three bytes a JEDEC ID read (9Fh) on chip select 0 reads from the
+ * flash bus now, the first in bits 23:16: the attached part's ID, or with
+ * no flash the data line's level as its pad's pulls hold it, for each
+ * bit. For the machine's presentation of the boot ROM's hand-off, which
+ * does not repeat the ROM's RDID on the bus.
+ */
+uint32_t esp32p4_mspi_flash_jedec_id(ESP32P4MSPIState *s);
 
 #endif

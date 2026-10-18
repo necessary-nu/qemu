@@ -41,7 +41,25 @@ struct ptimer_state
      */
     bool in_transaction;
     bool need_reload;
+    /*
+     * The transaction's changes take effect at `at` rather than the
+     * present (ptimer_transaction_begin_at()).
+     */
+    bool timed;
+    int64_t at;
 };
+
+/*
+ * The time a reading or change of the counter is made at: the present, or
+ * in a transaction begun at a time of its own, that time.
+ */
+static int64_t ptimer_now(ptimer_state *s)
+{
+    if (s->in_transaction && s->timed) {
+        return s->at;
+    }
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
 
 /*
  * Whether @s counts its clock's edges: asked to, with a period of at least
@@ -255,9 +273,13 @@ static void ptimer_tick(void *opaque)
  */
 void ptimer_run_due(ptimer_state *s)
 {
+    ptimer_run_due_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+void ptimer_run_due_at(ptimer_state *s, int64_t when)
+{
     assert(!s->in_transaction);
-    while (s->enabled &&
-           s->next_event <= qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+    while (s->enabled && s->next_event <= when) {
         timer_del(s->timer);
         ptimer_tick(s);
     }
@@ -268,7 +290,7 @@ uint64_t ptimer_get_count(ptimer_state *s)
     uint64_t counter;
 
     if (s->enabled && s->delta != 0) {
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int64_t now = ptimer_now(s);
         int64_t next = s->next_event;
         int64_t last = s->last_event;
         bool expired = (now - next >= 0);
@@ -513,6 +535,19 @@ void ptimer_transaction_begin(ptimer_state *s)
     assert(!s->in_transaction);
     s->in_transaction = true;
     s->need_reload = false;
+    s->timed = false;
+}
+
+void ptimer_transaction_begin_at(ptimer_state *s, int64_t when)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    ptimer_transaction_begin(s);
+    if (s->enabled) {
+        when = MAX(when, s->last_event);
+    }
+    s->timed = when < now;
+    s->at = when;
 }
 
 void ptimer_transaction_commit(ptimer_state *s)
@@ -527,11 +562,12 @@ void ptimer_transaction_commit(ptimer_state *s)
      */
     while (s->need_reload && s->enabled) {
         s->need_reload = false;
-        s->next_event = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->next_event = ptimer_now(s);
         ptimer_reload(s, 0);
     }
     /* Now we've finished reload we can leave the transaction block. */
     s->in_transaction = false;
+    s->timed = false;
 }
 
 static bool ptimer_edges_needed(void *opaque)

@@ -382,6 +382,11 @@ uint32_t m25chip_size(const M25ChipInfo *info)
     return info->size;
 }
 
+uint32_t m25chip_jedec_id(const M25ChipInfo *info)
+{
+    return info->jedec[0] << 16 | info->jedec[1] << 8 | info->jedec[2];
+}
+
 enum {
     OP_NONE,
     OP_PROGRAM,

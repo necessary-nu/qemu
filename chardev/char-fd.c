@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/sockets.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "chardev/char.h"
 #include "chardev/char-fe.h"
@@ -82,6 +83,39 @@ static int fd_chr_read_poll(void *opaque)
 
     s->max_size = qemu_chr_be_can_write(chr);
     return s->max_size;
+}
+
+/*
+ * The input the file descriptor has ready, read as fd_chr_read() reads it
+ * once the main loop's poll finds the descriptor readable; nothing, and
+ * no wait, if it has none. Reading only while the main loop's watch is
+ * set (chr->gsource) leaves alone input that ended, or that no frontend
+ * reads.
+ */
+static void fd_chr_poll_input(Chardev *chr)
+{
+    FDChardev *s = FD_CHARDEV(chr);
+    QIOChannelFile *fioc;
+    GPollFD pfd = { .events = G_IO_IN | G_IO_HUP | G_IO_ERR };
+
+    if (!chr->gsource || !s->ioc_in) {
+        return;
+    }
+    fioc = (QIOChannelFile *)object_dynamic_cast(OBJECT(s->ioc_in),
+                                                 TYPE_QIO_CHANNEL_FILE);
+    if (!fioc) {
+        return;
+    }
+    pfd.fd = fioc->fd;
+    if (qemu_poll_ns(&pfd, 1, 0) > 0 && fd_chr_read_poll(chr) > 0) {
+        fd_chr_read(s->ioc_in, pfd.revents, chr);
+    }
+    /*
+     * The main loop's read, if its poll has found the descriptor readable
+     * meanwhile, takes no more than the frontend has room for now: the
+     * room fd_chr_read_poll() last gave it may be gone.
+     */
+    fd_chr_read_poll(chr);
 }
 
 typedef struct FDSource {
@@ -249,6 +283,7 @@ static void char_fd_class_init(ObjectClass *oc, const void *data)
     cc->chr_add_watch = fd_chr_add_watch;
     cc->chr_write = fd_chr_write;
     cc->chr_update_read_handler = fd_chr_update_read_handler;
+    cc->chr_poll_input = fd_chr_poll_input;
 }
 
 static const TypeInfo char_fd_type_info = {

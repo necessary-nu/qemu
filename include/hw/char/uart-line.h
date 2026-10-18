@@ -42,6 +42,16 @@
  * bytes come once the main loop reads them. A queue holding less than
  * the line carries over the timer's lateness would leave the line idle
  * until then, which with the timer on time it never is.
+ *
+ * The main loop reads the host's bytes at moments of the host's. A queue
+ * that runs out at a frame's end, and the queue as the machine starts
+ * running, the adapter tops up itself, then, with the bytes the
+ * character device has ready (qemu_chr_fe_poll_input()): a line fed what
+ * was given to the host's port before it was needed (a file's bytes,
+ * /dev/zero's) carries them back to back from the start, however late
+ * the main loop runs, and under icount at the same virtual times in
+ * every run. Only bytes the host has yet to give come when it gives
+ * them.
  */
 #define TYPE_UART_LINE "uart-line"
 OBJECT_DECLARE_SIMPLE_TYPE(UARTLineState, UART_LINE)
@@ -76,6 +86,9 @@ struct UARTLineState {
     int32_t tx_len;
     int32_t tx_bit;
     uint8_t txd;
+    /* While set, the host's bytes only join the queue (uart_line_receive) */
+    bool tx_taking;
+    VMChangeStateEntry *vm_change;
     /* A break from the host, after tx_break_after more bytes */
     bool tx_break;
     uint32_t tx_break_after;

@@ -695,6 +695,13 @@ static void rp2350_accessctrl_realize(DeviceState *dev, Error **errp)
             g->range = r;
             memory_region_init_io(&g->iomem, obj, &gate_ops, g, gname,
                                   r->size);
+            /*
+             * The gates share this device's re-entrancy guard, so a core's
+             * access through one would refuse the DMA's through any other,
+             * to another block. A gate holds nothing across the access it
+             * passes on, and the block behind it keeps its own guard.
+             */
+            g->iomem.disable_reentrancy_guard = true;
             memory_region_set_enabled(&g->iomem, false);
             memory_region_add_subregion_overlap(&s->view[m], r->base,
                                                 &g->iomem, 1);

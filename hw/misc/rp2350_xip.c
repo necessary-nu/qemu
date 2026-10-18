@@ -1032,10 +1032,18 @@ static void rp2350_xip_stream_cb(void *opaque)
  * STREAM_CTR, or pushes DIRECT_TX, whose next frame would otherwise run on
  * from the last with the chip select still held. Only a timer that has
  * come is run.
+ *
+ * First clk_sys comes up to the access (clock_sync()), as for every block
+ * timing from the clock tree: a start or change of it that has fallen
+ * due reaches the stream (rp2350_xip_clk_changed()) from its own time.
  */
+/* [spec:nuos:req:emu.clock-tree] */
 static void rp2350_xip_catch_up(RP2350XIPState *s)
 {
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now;
+
+    clock_sync(s->clk);
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     for (;;) {
         int64_t busy = timer_expire_time_ns(s->busy_timer);

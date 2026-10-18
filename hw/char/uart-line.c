@@ -22,6 +22,7 @@
 #include "hw/core/line-time.h"
 #include "chardev/char-serial.h"
 #include "migration/vmstate.h"
+#include "system/runstate.h"
 
 /* 8N1: start, eight data bits, stop. */
 #define FRAME_BITS 10
@@ -136,6 +137,20 @@ static void uart_line_tx_schedule(UARTLineState *s)
     timer_mod(s->tx_timer, s->tx_next);
 }
 
+/*
+ * With no byte queued, take those the character device has ready now
+ * (see uart-line.h). They come through uart_line_receive(), which only
+ * queues them while the adapter takes them.
+ */
+static void uart_line_take_input(UARTLineState *s)
+{
+    if (fifo8_is_empty(&s->tx_queue) && !s->tx_taking) {
+        s->tx_taking = true;
+        qemu_chr_fe_poll_input(&s->chr);
+        s->tx_taking = false;
+    }
+}
+
 static void uart_line_tx_start(UARTLineState *s, int64_t now)
 {
     if (s->tx_bit >= 0) {
@@ -170,6 +185,7 @@ static void uart_line_tx_tick(void *opaque)
     if (s->tx_bit >= s->tx_len) {
         s->tx_bit = -1;
         uart_line_set_txd(s, 1, now);
+        uart_line_take_input(s);
         uart_line_tx_start(s, now);
         return;
     }
@@ -209,7 +225,9 @@ static void uart_line_receive(void *opaque, const uint8_t *buf, int size)
     for (i = 0; i < size && !fifo8_is_full(&s->tx_queue); i++) {
         fifo8_push(&s->tx_queue, buf[i]);
     }
-    uart_line_tx_start(s, line_time());
+    if (!s->tx_taking) {
+        uart_line_tx_start(s, line_time());
+    }
 }
 
 static void uart_line_event(void *opaque, QEMUChrEvent event)
@@ -219,6 +237,21 @@ static void uart_line_event(void *opaque, QEMUChrEvent event)
     if (event == CHR_EVENT_BREAK && !s->tx_break) {
         s->tx_break = true;
         s->tx_break_after = fifo8_num_used(&s->tx_queue);
+        uart_line_tx_start(s, line_time());
+    }
+}
+
+/*
+ * As the machine starts running, the bytes the character device has
+ * ready go out.
+ */
+static void uart_line_vm_state_change(void *opaque, bool running,
+                                      RunState state)
+{
+    UARTLineState *s = opaque;
+
+    if (running && s->tx_bit < 0) {
+        uart_line_take_input(s);
         uart_line_tx_start(s, line_time());
     }
 }
@@ -280,11 +313,16 @@ static void uart_line_realize(DeviceState *dev, Error **errp)
                              uart_line_receive, uart_line_event, NULL, s,
                              NULL, true);
     line_add_source(&s->line_source);
+    s->vm_change = qemu_add_vm_change_state_handler(uart_line_vm_state_change,
+                                                    s);
 }
 
 static void uart_line_unrealize(DeviceState *dev)
 {
-    line_remove_source(&UART_LINE(dev)->line_source);
+    UARTLineState *s = UART_LINE(dev);
+
+    qemu_del_vm_change_state_handler(s->vm_change);
+    line_remove_source(&s->line_source);
 }
 
 static int uart_line_post_load(void *opaque, int version_id)

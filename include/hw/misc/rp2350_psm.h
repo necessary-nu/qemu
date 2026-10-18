@@ -10,6 +10,7 @@
 #define HW_MISC_RP2350_PSM_H
 
 #include "hw/core/sysbus.h"
+#include "hw/watchdog/rp2350_watchdog.h"
 #include "qom/object.h"
 
 #define TYPE_RP2350_PSM "rp2350-psm"
@@ -54,6 +55,14 @@ typedef void RP2350PSMResetFn(void *opaque, uint32_t reset, uint32_t held,
                               bool watchdog);
 
 /*
+ * A sequence that resets the stages in `reset`, among them a processor's,
+ * is queued, to run once every vCPU has paused: on the chip the processors
+ * it resets stop at once. Called with the BQL held, from whichever thread
+ * asked for the sequence.
+ */
+typedef void RP2350PSMQueuedFn(void *opaque, uint32_t reset);
+
+/*
  * Named GPIO inputs: "watchdog", the watchdog's reset request, which runs
  * the sequence WDSEL selects; and "powman-reset", the power manager's
  * chip-level reset of the PSM, which restores its registers and runs the
@@ -74,10 +83,14 @@ struct RP2350PSMState {
     bool pending_watchdog;
 
     RP2350PSMResetFn *reset_fn;
+    RP2350PSMQueuedFn *queued_fn;
     void *reset_opaque;
+
+    /* The watchdog, whose reset request comes here (property). */
+    RP2350WatchdogState *watchdog;
 };
 
 void rp2350_psm_set_reset_fn(RP2350PSMState *s, RP2350PSMResetFn *fn,
-                             void *opaque);
+                             RP2350PSMQueuedFn *queued, void *opaque);
 
 #endif
