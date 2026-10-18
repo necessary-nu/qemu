@@ -34,7 +34,8 @@
  *
  * Both cores' DMA masters reach memory through the DMA access permission
  * manager as USB 2.0 High-Speed OTG (master 20, ICM ID 7) and Full-Speed
- * OTG (master 23, ICM ID 3). OTG_HS raises USB_OTG_INTR and, for its
+ * OTG (master 23, ICM ID 3); an access a memory controller's AXI port
+ * holds waits (esp32p4_usb_dma_wait_init()). OTG_HS raises USB_OTG_INTR and, for its
  * endpoints, USB_OTG_ENDP_MULTI_PROC_INTR; OTG_FS USB_OTG11_INTR.
  *
  * Both cores count their PHY clocks at the clocks' exact periods
@@ -144,6 +145,30 @@ static int64_t esp32p4_usb_clock_after(DWC2OTGState *s, Clock *clk,
     ESP32P4ClkEdges e = esp32p4_clk_edges_or_at(clk, from);
 
     return esp32p4_clk_edges_after(&e, from, n);
+}
+
+/* [spec:nuos:req:emu.esp32p4.usb] */
+static bool esp32p4_usb_dma_wait(void *opaque, uint32_t addr, uint32_t len,
+                                 bool write)
+{
+    ESP32P4UsbDmaWait *w = opaque;
+
+    return esp32p4_mspi_dma_wait_on(&w->wait, w->core->dma_as, addr, len,
+                                    w->core->dma_attrs, write);
+}
+
+static void esp32p4_usb_dma_ready(void *opaque)
+{
+    ESP32P4UsbDmaWait *w = opaque;
+
+    dwc2_otg_dma_ready(w->core);
+}
+
+void esp32p4_usb_dma_wait_init(ESP32P4UsbDmaWait *w, DWC2OTGState *core)
+{
+    w->core = core;
+    esp32p4_mspi_dma_wait_init(&w->wait, esp32p4_usb_dma_ready, w);
+    dwc2_otg_set_dma_wait(core, esp32p4_usb_dma_wait, w);
 }
 
 static void esp32p4_usb_otg_class_init(ObjectClass *klass, const void *data)

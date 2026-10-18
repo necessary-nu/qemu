@@ -145,6 +145,44 @@ void dwc2_otg_set_dma(DWC2OTGState *s, AddressSpace *as, MemTxAttrs attrs)
     s->dma_attrs = attrs;
 }
 
+void dwc2_otg_set_dma_wait(DWC2OTGState *s,
+                           bool (*fn)(void *opaque, uint32_t addr,
+                                      uint32_t len, bool write),
+                           void *opaque)
+{
+    s->dma_wait = fn;
+    s->dma_wait_opaque = opaque;
+}
+
+/* [spec:nuos:req:emu.esp32p4.usb] */
+bool dwc2_otg_dma_waits(DWC2OTGState *s, uint32_t addr, uint32_t len,
+                        bool write)
+{
+    return len && s->dma_wait && s->dma_wait(s->dma_wait_opaque, addr, len,
+                                             write);
+}
+
+/* What waited on the bus goes on: the host's bus, a device's SETUP. */
+static void dwc2_otg_dma_retry_now(void *opaque)
+{
+    DWC2OTGState *s = opaque;
+
+    dwc2_otg_host_bus(s);
+    dwc2_otg_dev_dma_ready(s);
+}
+
+static void dwc2_otg_dma_retry(void *opaque)
+{
+    line_run_at(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                dwc2_otg_dma_retry_now, opaque);
+}
+
+/* [spec:nuos:req:emu.esp32p4.usb] */
+void dwc2_otg_dma_ready(DWC2OTGState *s)
+{
+    timer_mod(s->dma_retry_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
 /*
  * The PHY clock the core runs from, NULL while it is stopped, and what
  * the core divides it by: the dedicated full-speed PHY's, which a host
@@ -1684,6 +1722,8 @@ static void dwc2_otg_realize(DeviceState *dev, Error **errp)
     s->has_desc_dma = s->has_dma && (s->hwcfg4 & GHWCFG4_DESC_DMA);
     s->multiproc = s->hwcfg2 & GHWCFG2_MULTI_PROC_INT;
     s->mode_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dwc2_mode_timer, s);
+    s->dma_retry_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dwc2_otg_dma_retry,
+                                      s);
     dwc2_otg_host_init(s);
     dwc2_otg_dev_init(s);
     usb_devport_realize(&s->devport, errp);
@@ -1694,6 +1734,20 @@ static int dwc2_otg_pre_save(void *opaque)
     DWC2OTGState *s = opaque;
 
     dwc2_otg_host_pre_save(s);
+    return 0;
+}
+
+/*
+ * What waited on the integration's bus asks again: a migration carries
+ * no wait's place on the bus.
+ */
+static int dwc2_otg_post_load(void *opaque, int version_id)
+{
+    DWC2OTGState *s = opaque;
+
+    if (s->dma_wait) {
+        dwc2_otg_dma_ready(s);
+    }
     return 0;
 }
 
@@ -1729,6 +1783,7 @@ static const VMStateDescription vmstate_dwc2_otg = {
     .version_id = 4,
     .minimum_version_id = 4,
     .pre_save = dwc2_otg_pre_save,
+    .post_load = dwc2_otg_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(gotgctl, DWC2OTGState),
         VMSTATE_UINT32(gotgint, DWC2OTGState),
