@@ -65,12 +65,18 @@
  * is recorded in its own cycle as long as no state machine can yet have
  * seen it through the synchronisers.
  *
- * Without icount, virtual time follows the host clock. Blocks with more
- * to do than they can run in real time (pins toggling every few cycles
- * through the pads, say) stop catching up after RUN_BUDGET_NS of host
- * time and let the cycles they could not run go: they run slow rather
- * than fall ever further behind. Their own timing stays exact. A timer
- * firing more than PIO_MAX_LATE_NS late takes the blocks to the present.
+ * Without icount, virtual time follows the host clock, and the timer runs
+ * late, by however long the host holds QEMU up: a firing still takes the
+ * blocks to its deadline only, and an access first runs them through the
+ * cycles due before its time, each change at its own time. Only blocks
+ * the host cannot keep up with slip (logged): those more than
+ * LINE_MAX_LAG_NS behind the present as they come to run a cycle, or with
+ * more to do than the host can run in real time (pins toggling every few
+ * cycles through the pads, say), the host losing ground on them as they
+ * run, beyond the slack (line_lag_too_slow(), hw/core/line-time.h). They
+ * let the cycles they have yet to run go, their clock restarting from
+ * where they are at the present, rather than fall ever further behind.
+ * Their own timing stays exact.
  *
  * Not modelled: pad input and output delays beyond the synchronisers.
  */
@@ -79,10 +85,12 @@
 #include "qemu/bitops.h"
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
+#include "hw/core/cpu.h"
 #include "hw/core/irq.h"
 #include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/dma/rp2350_dma.h"
 #include "hw/misc/rp2350_atomic.h"
 #include "hw/misc/rp2350_pio.h"
 #include "exec/icount.h"
@@ -225,24 +233,17 @@ enum {
 #define GPIO_MASK               MAKE_64BIT_MASK(0, RP2350_PIO_GPIOS)
 
 /*
- * Host time one catch-up or run ahead may take. Without icount, virtual
- * time follows the host clock; blocks with more to do than they can run
- * in real time would otherwise never catch up with it.
+ * Host time one run ahead may take. Without icount, virtual time follows
+ * the host clock; a run ahead through cycles busy with changes nothing
+ * outside sees could otherwise take the host longer than the cycles it
+ * covers. It stops there, and the timer looks on from there.
  */
 #define RUN_BUDGET_NS           (1 * SCALE_MS)
-
-/*
- * How late a timer firing may be and still take the blocks only to its
- * deadline: far more than icount ever leaves a timer (up to a clk_sys
- * cycle), and as little as keeps what a late host must catch up on, one
- * output change at a time, short.
- */
-#define PIO_MAX_LATE_NS         (10 * SCALE_US)
 
 typedef enum PIORunResult {
     RUN_DONE,       /* reached the target */
     RUN_EVENT,      /* a run ahead stopped at a visible change */
-    RUN_SLOW,       /* out of host time */
+    RUN_SLOW,       /* a run ahead out of host time; the blocks too late */
 } PIORunResult;
 
 /* Pin writes collected from one cycle. */
@@ -1538,14 +1539,16 @@ static uint64_t blk_routed(RP2350PIOState *s, int b)
  * so that they come back through the pads in the right cycle and reach
  * every other receiver at their time. A run ahead (`spec`) drives nothing
  * and stops after the first cycle that changes an output visible outside
- * the blocks. Without icount, a run also stops when it has taken
- * RUN_BUDGET_NS of host time.
+ * the blocks. Without icount, a run ahead also stops when it has taken
+ * RUN_BUDGET_NS of host time, and the live state when the host is too
+ * slow for the cycle it comes to run (line_lag_too_slow()).
  */
 static PIORunResult core_run(RP2350PIOState *s, RP2350PIOCore *core,
                              uint64_t target, bool spec)
 {
-    int64_t deadline = icount_enabled() ? INT64_MAX :
-        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + RUN_BUDGET_NS;
+    bool host = !icount_enabled();
+    int64_t deadline = host && spec ?
+        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + RUN_BUDGET_NS : INT64_MAX;
     unsigned steps = 0;
     uint64_t routed[RP2350_PIO_BLOCKS];
     uint32_t m;
@@ -1566,9 +1569,19 @@ static PIORunResult core_run(RP2350PIOState *s, RP2350PIOCore *core,
             core->cycle = target;
             break;
         }
-        if (!(++steps % 256) &&
-            qemu_clock_get_ns(QEMU_CLOCK_REALTIME) > deadline) {
-            return RUN_SLOW;
+        if (host && !(steps++ % 256)) {
+            if (spec) {
+                if (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) > deadline) {
+                    return RUN_SLOW;
+                }
+            } else {
+                int64_t at = pio_ns_at(s, c);
+
+                line_lag_note(&s->lag, at, steps == 1 && current_cpu != NULL);
+                if (line_lag_too_slow(&s->lag, at)) {
+                    return RUN_SLOW;
+                }
+            }
         }
         memset(cx.irq_set, 0, sizeof(cx.irq_set));
         memset(cx.irq_clr, 0, sizeof(cx.irq_clr));
@@ -1627,8 +1640,8 @@ static PIORunResult core_run(RP2350PIOState *s, RP2350PIOCore *core,
  * Apply the queued pin changes from outside up to cycle `target`, each in
  * the cycle it came in, to the pins it changed: the blocks' own pins,
  * which come back through the pads as the blocks run up to that cycle,
- * keep the levels the blocks gave them. Returns false if the blocks ran
- * out of host time on the way; every change queued then applies at once.
+ * keep the levels the blocks gave them. Returns false if the blocks fell
+ * too far behind on the way; every change queued then applies at once.
  */
 static bool pio_apply_inputs(RP2350PIOState *s, uint64_t target)
 {
@@ -1652,6 +1665,32 @@ static bool pio_apply_inputs(RP2350PIOState *s, uint64_t target)
 }
 
 /*
+ * The host cannot keep up with the blocks (line_lag_too_slow()). Rather
+ * than fall ever further behind, they slip, letting the cycles they have
+ * yet to run go: their clock restarts from where they are, now, and the
+ * pin changes queued meanwhile apply there.
+ */
+static void pio_slip(RP2350PIOState *s)
+{
+    uint32_t k;
+
+    if (!s->lag_logged) {
+        s->lag_logged = true;
+        qemu_log_mask(LOG_UNIMP, "rp2350-pio: the host is too slow for the "
+                      "state machines: they slip to the present, the cycles "
+                      "between not run\n");
+    }
+    for (k = 0; k < s->inq_n; k++) {
+        core_input(&s->core, s->inq_mask[k], s->inq_vec[k],
+                   MIN(s->inq_cycle[k], s->core.cycle));
+    }
+    s->inq_n = 0;
+    s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->base_cycle = s->core.cycle;
+    line_lag_reset(&s->lag);
+}
+
+/*
  * Bring the blocks up to cycle `target`: commit the run ahead if it has
  * come due, or else discard it and run the blocks themselves.
  */
@@ -1667,29 +1706,10 @@ static void pio_sync(RP2350PIOState *s, uint64_t target)
     s->spec_valid = false;
     slow = !pio_apply_inputs(s, target);
     if (slow || core_run(s, &s->core, target, false) == RUN_SLOW) {
-        /*
-         * The blocks cannot keep up with virtual time. Rather than fall
-         * ever further behind, they let the cycles they could not run go:
-         * their clock restarts from where they are, now.
-         */
-        s->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        s->base_cycle = s->core.cycle;
+        pio_slip(s);
     }
     drive_all(s, pio_drive_time(s, s->core.cycle));
     s->busy = false;
-}
-
-/*
- * The cycle a timer due at `due` takes the blocks to: its deadline's,
- * with every change on the way reaching the pads at its own time. A timer
- * fired more than PIO_MAX_LATE_NS late, as when the host falls behind
- * virtual time without icount, takes them to the present.
- */
-static uint64_t pio_timer_target(RP2350PIOState *s, int64_t due)
-{
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-
-    return pio_cycle_at(s, now - due > PIO_MAX_LATE_NS ? now : due);
 }
 
 /* Run ahead to find when the blocks next change an output. */
@@ -1723,16 +1743,22 @@ static void pio_schedule(RP2350PIOState *s)
 
 /*
  * [spec:nuos:req:emu.pio]
- * The blocks change an output: run them to that cycle only, so that the
- * timers of other devices due before the next change, running in deadline
- * order, find them there.
+ * The blocks change an output: run them to that cycle only, however late
+ * the timer fires, with every change on the way reaching the pads at its
+ * own time, so that the timers of other devices due before the next
+ * change, running in deadline order, find them there; unless the host is
+ * too slow for them, when they slip.
  */
 static void pio_timer_cb(void *opaque)
 {
     RP2350PIOState *s = opaque;
 
     s->horizon = MIN(s->horizon * 2, HORIZON_MAX);
-    pio_sync(s, pio_timer_target(s, s->due_ns));
+    line_lag_note(&s->lag, s->due_ns, false);
+    if (line_lag_too_slow(&s->lag, s->due_ns)) {
+        pio_slip(s);
+    }
+    pio_sync(s, pio_cycle_at(s, s->due_ns));
     pio_schedule(s);
 }
 
@@ -1750,9 +1776,9 @@ static void pio_disturb(RP2350PIOState *s)
 /*
  * [spec:nuos:req:emu.pio]
  * Software samples the pads (line_sync()): the blocks run to the cycle of
- * line_time(), clk_sys brought up to it first, each pin change on the way
- * reaching the pads at its own time, which their timer, late without
- * icount, has yet to bring.
+ * line_time(), clk_sys and the DMA's transfers to and from the FIFOs
+ * brought up to it first, each pin change on the way reaching the pads at
+ * its own time, which their timer, late without icount, has yet to bring.
  */
 static void pio_line_sync(Notifier *n, void *data)
 {
@@ -1760,6 +1786,9 @@ static void pio_line_sync(Notifier *n, void *data)
 
     if (s->busy) {
         return;
+    }
+    if (s->dma) {
+        rp2350_dma_sync(s->dma);
     }
     clock_sync(s->clk);
     if (!clock_is_enabled(s->clk)) {
@@ -1861,7 +1890,7 @@ static void pio_in(void *opaque, int n, int level)
 static void pio_in_timer_cb(void *opaque)
 {
     RP2350PIOState *s = opaque;
-    uint64_t target = pio_timer_target(s, s->in_due_ns);
+    uint64_t target = pio_cycle_at(s, s->in_due_ns);
 
     if (s->inq_n) {
         target = MAX(target, s->inq_cycle[s->inq_n - 1]);
@@ -2249,11 +2278,12 @@ static void pio_write_reg(RP2350PIOState *s, int b, hwaddr reg,
 }
 
 /*
- * Bring the blocks to the time of a register access, clk_sys first
- * (clock_sync()). An access made from within the blocks' own run (the DMA
- * answering a DREQ they raised) happens at the cycle the run has reached:
- * the blocks are not run on to the present first. Returns whether the
- * access is such a one.
+ * Bring the blocks to the time of a register access, the DMA's transfers
+ * to and from the FIFOs due by then (rp2350_dma_sync()) and clk_sys
+ * (clock_sync()) first. An access made from within the blocks' own run
+ * (the DMA answering a DREQ they raised) happens at the cycle the run has
+ * reached: the blocks are not run on to the present first. Returns
+ * whether the access is such a one.
  */
 static bool pio_access_begin(RP2350PIOState *s)
 {
@@ -2261,6 +2291,9 @@ static bool pio_access_begin(RP2350PIOState *s)
         core_settle_loops(&s->core);
         s->spec_valid = false;
         return true;
+    }
+    if (s->dma) {
+        rp2350_dma_sync(s->dma);
     }
     clock_sync(s->clk);
     pio_disturb(s);
@@ -2451,6 +2484,8 @@ static void rp2350_pio_init(Object *obj)
         s->win[b].block = b;
         memory_region_init_io(&s->win[b].iomem, obj, &rp2350_pio_ops,
                               &s->win[b], name, RP2350_ATOMIC_REGION_SIZE);
+        /* The DMA's transfers due before an access come in from within it. */
+        s->win[b].iomem.disable_reentrancy_guard = true;
         sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->win[b].iomem);
     }
     for (b = 0; b < RP2350_PIO_IRQS; b++) {
@@ -2481,6 +2516,8 @@ static void rp2350_pio_realize(DeviceState *dev, Error **errp)
 static const Property rp2350_pio_properties[] = {
     DEFINE_PROP_LINK("gpio", RP2350PIOState, gpio, TYPE_RP2350_GPIO,
                      RP2350GPIOState *),
+    DEFINE_PROP_LINK("dma", RP2350PIOState, dma, TYPE_RP2350_DMA,
+                     RP2350DMAState *),
 };
 
 static const VMStateDescription vmstate_rp2350_pio_sm = {

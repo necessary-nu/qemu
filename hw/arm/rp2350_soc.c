@@ -1002,10 +1002,73 @@ static const MemoryRegionOps rp2350_sram_off_ops = {
     .valid.max_access_size = 4,
 };
 
-/* The SRAM domain's window in sram_off order: SRAM0, then SRAM1. */
-static int rp2350_sram_domain(int domain)
+#define TYPE_RP2350_SRAM_GATE "rp2350-sram-gate"
+
+/*
+ * [spec:nuos:req:emu.powman]
+ * The SRAM gate's translation: an access within SRAM goes on to it while
+ * its power domain is up, and to sram_off while it is down, page by page.
+ */
+static IOMMUTLBEntry rp2350_sram_gate_translate(IOMMUMemoryRegion *iommu,
+                                                hwaddr addr,
+                                                IOMMUAccessFlags flags,
+                                                int iommu_idx)
 {
-    return domain == RP2350_POWMAN_SRAM0 ? 0 : 1;
+    RP2350State *s = container_of(iommu, RP2350State, sram_gate);
+    int domain = addr < RP2350_SRAM0_DOMAIN_SIZE ? RP2350_POWMAN_SRAM0
+                                                 : RP2350_POWMAN_SRAM1;
+
+    return (IOMMUTLBEntry) {
+        .target_as = rp2350_powman_domain_on(&s->powman, domain) ?
+                     &s->sram_as : &s->sram_off_as,
+        .iova = addr & ~(s->sram_gate_page - 1),
+        .translated_addr = addr & ~(s->sram_gate_page - 1),
+        .addr_mask = s->sram_gate_page - 1,
+        .perm = IOMMU_RW,
+    };
+}
+
+static int rp2350_sram_gate_attrs_to_index(IOMMUMemoryRegion *iommu,
+                                           MemTxAttrs attrs)
+{
+    return 0;
+}
+
+/*
+ * The SRAM gate's translations have changed with a domain's power state:
+ * the cores' TLBs, holding the old, are flushed.
+ */
+static void rp2350_sram_gate_changed(RP2350State *s)
+{
+    IOMMUTLBEvent event = {
+        .type = IOMMU_NOTIFIER_UNMAP,
+        .entry = {
+            .target_as = &s->sram_as,
+            .iova = 0,
+            .addr_mask = RP2350_SRAM_SIZE - 1,
+            .perm = IOMMU_NONE,
+        },
+    };
+
+    memory_region_notify_iommu(&s->sram_gate, 0, event);
+}
+
+/*
+ * Clear an SRAM domain that powers down, at its offset @base in SRAM: the
+ * datasheet leaves the contents undefined once it powers up again
+ * ("Full memory power down"), and they read zero. One host memset over
+ * the RAM, the region marked written for TCG's translations of code in
+ * it as any write is (address_space_map(), address_space_unmap()).
+ */
+static void rp2350_sram_clear(RP2350State *s, hwaddr base, hwaddr size)
+{
+    hwaddr len = size;
+    void *ram = address_space_map(&s->sram_as, base, &len, true,
+                                  MEMTXATTRS_UNSPECIFIED);
+
+    assert(ram && len == size);
+    memset(ram, 0, len);
+    address_space_unmap(&s->sram_as, ram, len, true, len);
 }
 
 /*
@@ -1158,7 +1221,7 @@ static void rp2350_soc_swcore_stop(void *opaque)
 static void rp2350_soc_domain_power(void *opaque, int domain, bool on)
 {
     RP2350State *s = opaque;
-    int i;
+    bool sram1 = domain == RP2350_POWMAN_SRAM1;
 
     if (domain == RP2350_POWMAN_XIP) {
         if (!on) {
@@ -1167,16 +1230,12 @@ static void rp2350_soc_domain_power(void *opaque, int domain, bool on)
         }
         return;
     }
-    i = rp2350_sram_domain(domain);
     if (!on) {
-        /* The address space's root keeps its address in board memory. */
-        address_space_set(&s->sram_as, RP2350_SRAM_BASE +
-                          (i ? RP2350_SRAM0_DOMAIN_SIZE : 0), 0,
-                          i ? RP2350_SRAM1_DOMAIN_SIZE
-                            : RP2350_SRAM0_DOMAIN_SIZE,
-                          MEMTXATTRS_UNSPECIFIED);
+        rp2350_sram_clear(s, sram1 ? RP2350_SRAM0_DOMAIN_SIZE : 0,
+                          sram1 ? RP2350_SRAM1_DOMAIN_SIZE
+                                : RP2350_SRAM0_DOMAIN_SIZE);
     }
-    memory_region_set_enabled(&s->sram_off[i], !on);
+    rp2350_sram_gate_changed(s);
 }
 
 /* Whether the XOSC or the ROSC is DORMANT, for the AON alarm to wake. */
@@ -1219,10 +1278,7 @@ void rp2350_soc_system_reset(RP2350State *s, ResetType type)
         type = rp2350_powman_next_reset_type(&s->powman);
     }
     qemu_devices_reset(type);
-    memory_region_set_enabled(&s->sram_off[0],
-        !rp2350_powman_domain_on(&s->powman, RP2350_POWMAN_SRAM0));
-    memory_region_set_enabled(&s->sram_off[1],
-        !rp2350_powman_domain_on(&s->powman, RP2350_POWMAN_SRAM1));
+    rp2350_sram_gate_changed(s);
     if (!rp2350_powman_domain_on(&s->powman, RP2350_POWMAN_SWCORE)) {
         for (i = 0; i < RP2350_NUM_CORES; i++) {
             rp2350_soc_core_off(s, i);
@@ -1496,18 +1552,17 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
                                 RP2350_SRAM_SIZE, errp)) {
         return;
     }
-    memory_region_add_subregion(s->board_memory, RP2350_SRAM_BASE, &s->sram);
     address_space_init(&s->sram_as, &s->sram, "rp2350-sram");
-    for (i = 0; i < ARRAY_SIZE(s->sram_off); i++) {
-        memory_region_init_io(&s->sram_off[i], obj, &rp2350_sram_off_ops, s,
-                              i ? "rp2350.sram1-off" : "rp2350.sram0-off",
-                              i ? RP2350_SRAM1_DOMAIN_SIZE
-                                : RP2350_SRAM0_DOMAIN_SIZE);
-        memory_region_set_enabled(&s->sram_off[i], false);
-        memory_region_add_subregion_overlap(s->board_memory,
-            RP2350_SRAM_BASE + (i ? RP2350_SRAM0_DOMAIN_SIZE : 0),
-            &s->sram_off[i], 1);
-    }
+    memory_region_init_io(&s->sram_off, obj, &rp2350_sram_off_ops, s,
+                          "rp2350.sram-off", RP2350_SRAM_SIZE);
+    address_space_init(&s->sram_off_as, &s->sram_off, "rp2350-sram-off");
+    /* [spec:nuos:req:emu.powman] */
+    memory_region_init_iommu(&s->sram_gate, sizeof(s->sram_gate),
+                             TYPE_RP2350_SRAM_GATE, obj, "rp2350.sram-gate",
+                             RP2350_SRAM_SIZE);
+    s->sram_gate_page = memory_region_iommu_get_min_page_size(&s->sram_gate);
+    memory_region_add_subregion(s->board_memory, RP2350_SRAM_BASE,
+                                MEMORY_REGION(&s->sram_gate));
 
     /*
      * The bus filters stand between each core and board memory, so every
@@ -1898,7 +1953,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     /*
      * PWM. Each slice's A and B drive their GPIO function signals, and B
      * returns the OR of the pins selecting it. The DREQ_PWM_WRAP0-11
-     * outputs ("dreq-wrap") are connected with the DMA's other sources.
+     * outputs ("dreq-wrap") are connected with the DMA's other sources;
+     * an access first brings up the DMA ("dma"), which sets CC and TOP.
      */
     /* [spec:nuos:req:emu.pwm] */
     {
@@ -1907,6 +1963,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
         int n;
 
         qdev_connect_clock_in(dev, "clk", CLK(s, SYS));
+        object_property_set_link(OBJECT(dev), "dma", OBJECT(&s->dma),
+                                 &error_abort);
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
@@ -1933,7 +1991,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
      * PIO0-2. Each block drives its GPIO function signals and sees every
      * pin; the IO bank delivers the same pin levels to all three PIO
      * ports, so the blocks take them from PIO0's. The DREQ_PIOx_TXn/RXn
-     * outputs are connected with the DMA's other sources.
+     * outputs are connected with the DMA's other sources; an access first
+     * brings up the DMA ("dma"), which fills and drains the FIFOs.
      */
     /* [spec:nuos:req:emu.pio] */
     {
@@ -1943,6 +2002,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
         qdev_connect_clock_in(dev, "clk", CLK(s, SYS));
         object_property_set_link(OBJECT(dev), "gpio", OBJECT(&s->gpio),
+                                 &error_abort);
+        object_property_set_link(OBJECT(dev), "dma", OBJECT(&s->dma),
                                  &error_abort);
         if (!sysbus_realize(sbd, errp)) {
             return;
@@ -1991,7 +2052,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
     /*
      * HSTX, clocked by clk_hstx. Its eight outputs drive the HSTX
      * function of GPIOs 12-19. DREQ_HSTX is connected with the DMA's other
-     * sources.
+     * sources; an access first brings up the DMA ("dma"), which fills the
+     * FIFO.
      */
     /* [spec:nuos:req:emu.hstx] */
     {
@@ -2001,6 +2063,8 @@ static void rp2350_soc_realize(DeviceState *dev_soc, Error **errp)
 
         /* [spec:nuos:req:emu.clock-tree] */
         qdev_connect_clock_in(dev, "clk", CLK(s, HSTX));
+        object_property_set_link(OBJECT(dev), "dma", OBJECT(&s->dma),
+                                 &error_abort);
         if (!sysbus_realize(sbd, errp)) {
             return;
         }
@@ -2559,8 +2623,23 @@ static const TypeInfo rp2350_soc_info = {
     },
 };
 
+static void rp2350_sram_gate_class_init(ObjectClass *klass, const void *data)
+{
+    IOMMUMemoryRegionClass *imrc = IOMMU_MEMORY_REGION_CLASS(klass);
+
+    imrc->translate = rp2350_sram_gate_translate;
+    imrc->attrs_to_index = rp2350_sram_gate_attrs_to_index;
+}
+
+static const TypeInfo rp2350_sram_gate_info = {
+    .name = TYPE_RP2350_SRAM_GATE,
+    .parent = TYPE_IOMMU_MEMORY_REGION,
+    .class_init = rp2350_sram_gate_class_init,
+};
+
 static void rp2350_soc_types(void)
 {
     type_register_static(&rp2350_soc_info);
+    type_register_static(&rp2350_sram_gate_info);
 }
 type_init(rp2350_soc_types)

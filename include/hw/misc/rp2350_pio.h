@@ -35,6 +35,7 @@
 #ifndef HW_MISC_RP2350_PIO_H
 #define HW_MISC_RP2350_PIO_H
 
+#include "hw/core/line-time.h"
 #include "hw/core/sysbus.h"
 #include "hw/gpio/rp2350_gpio.h"
 #include "qemu/timer.h"
@@ -193,6 +194,8 @@ struct RP2350PIOState {
     RP2350PIOWindow win[RP2350_PIO_BLOCKS];
     Clock *clk;
     RP2350GPIOState *gpio;
+    /* The DMA, which feeds and drains the FIFOs: an access syncs it first. */
+    struct RP2350DMAState *dma;
     QEMUTimer *timer;
     /* The virtual time timer is due at: the run ahead's end. */
     int64_t due_ns;
@@ -212,6 +215,10 @@ struct RP2350PIOState {
     uint64_t horizon;
     /* Set while the engine runs or drives its outputs. */
     bool busy;
+    /* How the host keeps up with the blocks (line_lag_too_slow()). */
+    LineLag lag;
+    /* The blocks have slipped behind a host too slow for them (logged once). */
+    bool lag_logged;
 
     /* clk_sys cycle count at virtual time base_ns. */
     int64_t base_ns;

@@ -2949,9 +2949,9 @@ static void brg_event(void *opaque)
 
 /*
  * [spec:nuos:req:emu.esp32p4.mipi]
- * The host has fallen ESP32_LINE_MAX_LAG_NS behind the generator
- * (include/hw/gpio/esp32_line.h), at esp32_line_time(), the present: its
- * timing restarts there with a new frame, the frames between dropped.
+ * The host has fallen LINE_MAX_LAG_NS behind the generator
+ * (hw/core/line-time.h), at esp32_line_time(), the present: its timing
+ * restarts there with a new frame, the frames between dropped.
  */
 static void brg_slip(void *opaque)
 {
@@ -2979,12 +2979,12 @@ static void brg_slip(void *opaque)
 /*
  * [spec:nuos:req:emu.esp32p4.mipi]
  * The generator's event at @t, its time: on the host's clock, an event
- * ESP32_LINE_MAX_LAG_NS behind the present, which the host cannot follow,
+ * LINE_MAX_LAG_NS behind the present, which the host cannot follow,
  * makes the generator slip to the present instead.
  */
 static void brg_take_event(ESP32P4DsiBridgeState *s, int64_t t)
 {
-    if (esp32_line_lags(t)) {
+    if (line_lags(t)) {
         esp32_line_run_at(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), brg_slip, s);
     } else {
         esp32_line_run_at(t, brg_event, s);
