@@ -30,9 +30,14 @@
  * GPIO outputs at that coarse resolution, and at the cycle in which it
  * stops shifting, to drive their final levels. A coupled-mode PIO output
  * change is taken in the cycle of its time (hw/core/line-time.h), and a
- * timer firing runs the block to its deadline only, so that a PIO change
- * due before the firing but delivered after it still finds the block in
- * time for it. Cycles in which nothing but the
+ * timer firing runs the block to its deadline only, however late it
+ * fires, so that a PIO change due before the firing but delivered after
+ * it still finds the block in time for it.
+ * Without icount, where the host's clock is virtual time and the timer
+ * runs late, only a block more than LINE_MAX_LAG_NS behind as its timer
+ * fires (line_lags()), which the host cannot keep up with, slips
+ * (logged): it lets the cycles it has yet to run go, its clock restarting
+ * from where it is at the present. Cycles in which nothing but the
  * output shift register changes are run in bulk, and an infinite
  * RAW_REPEAT or TMDS_REPEAT command, whose output is eventually periodic,
  * is run forward by whole periods.
@@ -117,13 +122,6 @@ enum {
 #define FF_MAX_PERIOD           4096
 /* The furthest ahead, in cycles, the next FIFO pop is looked for. */
 #define POP_LOOKAHEAD           (1u << 20)
-
-/*
- * How late a timer firing may be and still take the block only to its
- * deadline: far more than icount ever leaves a timer, and as little as
- * keeps a late host's catching up short.
- */
-#define HSTX_MAX_LATE_NS        (10 * SCALE_US)
 
 /* Register fields. */
 
@@ -760,11 +758,18 @@ static uint64_t hstx_stop_cycle(RP2350HSTXState *s)
 /*
  * Wake at the cycle in which a pop makes room in a full FIFO, every
  * pin-refresh-ns while shifting, and at the cycle in which shifting stops,
- * so that the outputs settle on their final levels when they do.
+ * so that the outputs settle on their final levels when they do. Without
+ * icount, a timer running more than pin-refresh-ns late refreshes the
+ * pins next pin-refresh-ns after the present rather than after its
+ * deadline: a host behind the block then runs it through the stretch it
+ * fell behind by at once, an infinite repeat by whole periods, rather
+ * than refresh by refresh, each costing more than its time, its pins
+ * refreshed only as often as the host gets to them.
  */
 static void hstx_schedule(RP2350HSTXState *s)
 {
     int64_t now = line_time();
+    int64_t present = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t due = INT64_MAX;
     uint64_t stop;
 
@@ -784,7 +789,9 @@ static void hstx_schedule(RP2350HSTXState *s)
         }
     }
     if (s->pin_refresh_ns) {
-        due = MIN(due, now + s->pin_refresh_ns);
+        int64_t from = present - now > s->pin_refresh_ns ? present : now;
+
+        due = MIN(due, from + s->pin_refresh_ns);
     }
     stop = hstx_stop_cycle(s);
     if (stop != UINT64_MAX) {
@@ -814,17 +821,30 @@ static void hstx_fire(void *opaque)
 }
 
 /*
- * The timer runs the block to its deadline only. One firing more than
- * HSTX_MAX_LATE_NS late, as when the host falls behind virtual time
- * without icount, takes it to the present.
+ * [spec:nuos:req:emu.hstx]
+ * The timer runs the block to its deadline only, however late it fires.
+ * A block more than LINE_MAX_LAG_NS behind the present there slips: its
+ * clock restarts from where it is, now, and the timer runs it there.
  */
 static void hstx_timer_cb(void *opaque)
 {
     RP2350HSTXState *s = opaque;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now;
 
-    line_run_at(now - s->due_ns > HSTX_MAX_LATE_NS ? now : s->due_ns,
-                hstx_fire, s);
+    if (!line_lags(s->due_ns)) {
+        line_run_at(s->due_ns, hstx_fire, s);
+        return;
+    }
+    if (!s->lag_logged) {
+        s->lag_logged = true;
+        qemu_log_mask(LOG_UNIMP, "rp2350-hstx: the host is too slow for the "
+                      "block: it slips to the present, the cycles between "
+                      "not run\n");
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->base_ns = now;
+    s->base_cycle = s->core.cycle;
+    line_run_at(now, hstx_fire, s);
 }
 
 /* What clearing CSR.EN does, and holds while it is clear. */

@@ -77,12 +77,15 @@ int64_t line_event_time(void);
  * A PWM output, whose edges follow a counter software reads, keeps its
  * timing: it goes on from the present by skipping to its level at the
  * moment it is being brought to, the edges in between lost. It does so
- * as soon as the host is losing ground on it, falling further behind
- * beyond the slack LINE_LOSING_RUN times running, not only a second
- * behind: edges that cost the host more than their own time would
+ * as soon as the host is losing ground on it beyond the slack, not only a
+ * second behind: edges that cost the host more than their own time would
  * otherwise hold the main loop for up to a second at a time before the
- * bound. How falling behind is measured depends on how the output's
- * timer catches up: see hw/gpio/esp32_line.h for outputs whose timer
+ * bound. A block whose every clock cycle costs the host more than the
+ * cycle's time (a state machine toggling pins through the pads every few
+ * cycles) slips as the host loses ground on it too: its catch-ups would
+ * otherwise hold the main loop for as long, as often as it runs. How
+ * falling behind is measured depends on how the output's timer catches
+ * up: see LineLag below, and hw/gpio/esp32_line.h for outputs whose timer
  * takes them to the present.
  */
 #define LINE_MAX_LAG_NS     NANOSECONDS_PER_SECOND
@@ -90,6 +93,50 @@ int64_t line_event_time(void);
 #define LINE_LOSING_RUN     2
 
 bool line_lags(int64_t due_ns);
+
+/*
+ * An output brought to each moment at its own time, its QEMU timer taking
+ * it to the timer's deadline only, its later edges left to their own
+ * firings in deadline order with every other device's (line_run_at()
+ * above). How far behind the present a firing finds it counts how late
+ * every timer runs, which can be steady, as under QEMU_LATE_TIMERS_NS,
+ * and how long the host held QEMU up just before, which on a host shared
+ * with other work comes and goes: neither says the host cannot keep up.
+ * What does is the work of bringing it up: the CPU time spent, on the
+ * output's catch-ups and everything else the main loop runs, against the
+ * time it is brought through. The moments its timer's firings and its
+ * catch-ups bring it to (line_lag_note()) measure it: at each, the CPU
+ * time the thread has spent since the last, less the time the output has
+ * come through meanwhile, adds to how much ground the host has lost on
+ * the output, which never falls below none. The last note is one of the
+ * same thread's: the main loop's, from one firing to the next; a vCPU's,
+ * within one catch-up its access makes (`fresh` marks the first), the
+ * guest's own instructions between two not counted. A host keeping up
+ * loses none, however late every timer runs and however long the host
+ * holds QEMU up, which costs no CPU time; one spending more than the
+ * time it brings the output through, as when the output's edges cost
+ * more than their own time, loses ground as it goes. A moment beyond the
+ * slack is one the host is too slow for (line_lag_too_slow()) once the
+ * host has lost more than the slack, or once it lags (line_lags()).
+ * After the output skips or slips to the present (line_lag_reset()) it
+ * starts afresh. Where the host cannot tell a thread's CPU time, its wall
+ * time stands for it. Host timing, not the chip's: left out of migration,
+ * and as it is across a reset. Nothing under icount, where nothing falls
+ * behind.
+ */
+typedef struct LineLag {
+    /* The last note: its thread (the vCPU, or none), CPU time and moment */
+    bool started;
+    void *thread;
+    int64_t cpu_ns;
+    int64_t at_ns;
+    /* The ground the host has lost on the output */
+    int64_t lost_ns;
+} LineLag;
+
+void line_lag_note(LineLag *lag, int64_t at_ns, bool fresh);
+void line_lag_reset(LineLag *lag);
+bool line_lag_too_slow(const LineLag *lag, int64_t due_ns);
 
 /*
  * Sources a receiver brings up to its time.

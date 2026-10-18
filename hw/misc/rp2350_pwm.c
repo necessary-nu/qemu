@@ -35,21 +35,25 @@
  *
  * An edge carries its own time on the line (hw/core/line-time.h) however
  * late its timer fires, so that a receiver takes it at its cycle: a
- * firing at most PWM_MAX_LATE_NS late takes the slice to its deadline
- * only, drives what changes there with that time, and leaves later edges
- * to their own firings. Later than that, as when the host falls behind
- * virtual time without icount, the slice is taken to the present at once,
- * its outputs showing their level there, the edges in between not
- * driven, and the DREQ line pulsed once per wrap since (at most
- * RP2350_PWM_DREQ_BURST times), so that the work a late firing does is
- * bounded however late it is. A change of the B pin is taken at the time
- * it carries.
+ * firing takes the slice to its deadline only, drives what changes there
+ * with that time, and leaves later edges to their own firings, in
+ * deadline order with every other device's timers; an access or a change
+ * the slice takes first takes the firings due before its time, each at
+ * its own. Without icount, where the host's clock is virtual time and the
+ * timers run late, a slice the host is losing ground on, or one more than
+ * LINE_MAX_LAG_NS behind (line_lag_too_slow()), skips instead: it is taken
+ * to the moment it is being brought to at once, its outputs showing their
+ * level there, the edges in between not driven (logged), and the DREQ
+ * line pulsed once per wrap since (at most RP2350_PWM_DREQ_BURST times),
+ * so that a host slower than the edges does work bounded by the edges'
+ * time. A change of the B pin is taken at the time it carries.
  *
  * clk_sys is the "clk" clock input.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "hw/core/cpu.h"
 #include "hw/core/irq.h"
 #include "hw/core/line-time.h"
 #include "hw/core/qdev-clock.h"
@@ -100,14 +104,6 @@ enum {
 
 /* The most DREQ pulses one late timer firing delivers. */
 #define RP2350_PWM_DREQ_BURST   64
-
-/*
- * How late a timer firing may be and still take the slice through its
- * edges one at a time: far more than icount ever leaves a timer (up to a
- * clk_sys cycle), and as little as keeps the edges a late host must catch
- * up on few.
- */
-#define PWM_MAX_LATE_NS         (10 * SCALE_US)
 
 #define NO_EVENT                UINT64_MAX
 
@@ -396,15 +392,9 @@ static void pwm_sync(RP2350PWMState *s, int i, uint64_t cycle)
     pwm_try_advance(s, i);
 }
 
-/* The cycle of the present, or of the stamped change being propagated. */
-static uint64_t pwm_now_cycle(RP2350PWMState *s)
+static void pwm_sync_all(RP2350PWMState *s, int64_t when)
 {
-    return pwm_cycle_at(s, line_time());
-}
-
-static void pwm_sync_all(RP2350PWMState *s)
-{
-    uint64_t cycle = pwm_now_cycle(s);
+    uint64_t cycle = pwm_cycle_at(s, when);
     int i;
 
     for (i = 0; i < RP2350_PWM_SLICES; i++) {
@@ -560,41 +550,73 @@ static void pwm_fire(void *opaque)
 }
 
 /*
+ * [spec:nuos:req:emu.pwm]
+ * The host is too slow for slice i's edges (line_lag_too_slow()): take it
+ * to `when` at once, its outputs showing their level there, the edges in
+ * between not driven.
+ */
+static void pwm_skip(RP2350PWMState *s, int i, int64_t when)
+{
+    RP2350PWMSlice *sl = &s->slice[i];
+
+    if (!s->lag_logged) {
+        s->lag_logged = true;
+        qemu_log_mask(LOG_UNIMP, "rp2350-pwm: the host is too slow for "
+                      "slice %d's edges: it skips to the present, the edges "
+                      "between lost\n", i);
+    }
+    timer_del(sl->timer);
+    line_lag_reset(&sl->lag);
+    pwm_sync(s, i, pwm_cycle_at(s, when));
+    pwm_update(s, i);
+}
+
+/*
  * Take slice i's timer firings due before `when`, the time of an access or
  * of a change the slice takes, each at its own time, as they would have
- * run at their deadlines: under icount an access can come up to an
- * instruction after a deadline whose timer has yet to fire, and the edges
- * then due must not take the access's time. Firings further behind than
- * PWM_MAX_LATE_NS are left to the slice's run to the present.
+ * run at their deadlines: on the host's clock the timer can run well
+ * after them, and under icount an access can come up to an instruction
+ * after a deadline whose timer has yet to fire; the edges then due must
+ * not take the access's time. A slice the host is too slow for skips to
+ * `when`.
  */
 static void pwm_catch_up(RP2350PWMState *s, int i, int64_t when)
 {
     RP2350PWMSlice *sl = &s->slice[i];
+    bool fresh = current_cpu != NULL;
 
-    while (timer_pending(sl->timer) && sl->due_ns < when &&
-           when - sl->due_ns <= PWM_MAX_LATE_NS) {
+    while (timer_pending(sl->timer) && sl->due_ns < when) {
+        line_lag_note(&sl->lag, sl->due_ns, fresh);
+        fresh = false;
+        if (line_lag_too_slow(&sl->lag, sl->due_ns)) {
+            pwm_skip(s, i, when);
+            return;
+        }
         timer_del(sl->timer);
         line_run_at(sl->due_ns, pwm_fire, sl);
     }
 }
 
-static void pwm_catch_up_all(RP2350PWMState *s)
+/*
+ * Bring every slice up to `when`: each slice's firings due before it,
+ * edges reaching other slices' B pins at their own times, then the slices
+ * themselves.
+ */
+static void pwm_bring_up_all(RP2350PWMState *s, int64_t when)
 {
-    int64_t when = line_time();
     int i;
 
     for (i = 0; i < RP2350_PWM_SLICES; i++) {
         pwm_catch_up(s, i, when);
     }
+    pwm_sync_all(s, when);
 }
 
 /*
  * [spec:nuos:req:emu.pwm]
  * Software samples the pads (line_sync()): every slice brought up to
  * line_time(), clk_sys first, which its timer, late without icount, has
- * yet to bring it to: the edges due up to PWM_MAX_LATE_NS before, each at its own time,
- * and a slice further behind taken to that moment at once, its outputs
- * showing their level there, as its late timer would take it.
+ * yet to bring it to: the edges due before then, each at its own time.
  */
 static void pwm_line_sync(Notifier *n, void *data)
 {
@@ -606,27 +628,24 @@ static void pwm_line_sync(Notifier *n, void *data)
     when = line_time();
 
     for (i = 0; i < RP2350_PWM_SLICES; i++) {
-        RP2350PWMSlice *sl = &s->slice[i];
-
         pwm_catch_up(s, i, when);
-        if (timer_pending(sl->timer) && sl->due_ns < when) {
-            timer_del(sl->timer);
-            pwm_sync(s, i, pwm_cycle_at(s, when));
-            pwm_update(s, i);
-        }
     }
 }
 
-/* [spec:nuos:req:emu.pwm] */
+/*
+ * [spec:nuos:req:emu.pwm]
+ * The slice's timer fires, however late, for its deadline: the slice is
+ * taken there, unless the host is too slow for its edges, when it skips
+ * to the present.
+ */
 static void pwm_timer_cb(void *opaque)
 {
     RP2350PWMSlice *sl = opaque;
     RP2350PWMState *s = sl->pwm;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    if (now - sl->due_ns > PWM_MAX_LATE_NS) {
-        pwm_sync(s, sl->index, pwm_cycle_at(s, now));
-        pwm_update(s, sl->index);
+    line_lag_note(&sl->lag, sl->due_ns, false);
+    if (line_lag_too_slow(&sl->lag, sl->due_ns)) {
+        pwm_skip(s, sl->index, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         return;
     }
     line_run_at(sl->due_ns, pwm_fire, sl);
@@ -663,6 +682,7 @@ static void pwm_b_in(void *opaque, int n, int level)
     RP2350PWMState *s = opaque;
     RP2350PWMSlice *sl = &s->slice[n];
     bool b = level != 0;
+    int64_t when;
     uint64_t cycle;
 
     if (b == sl->b_in) {
@@ -680,8 +700,9 @@ static void pwm_b_in(void *opaque, int n, int level)
      * in its cycle if the slice has not yet run the cycle after it, in
      * which the synchroniser passes it on; otherwise in that cycle.
      */
-    pwm_catch_up(s, n, line_time());
-    cycle = MAX(pwm_now_cycle(s), sl->sync_cycle ? sl->sync_cycle - 1 : 0);
+    when = line_time();
+    pwm_catch_up(s, n, when);
+    cycle = MAX(pwm_cycle_at(s, when), sl->sync_cycle ? sl->sync_cycle - 1 : 0);
     if (sl->b_in != sl->b_seen) {
         cycle = MAX(cycle, sl->b_change);
     }
@@ -701,12 +722,14 @@ static void pwm_dreq_wanted(void *opaque, int n, int level)
 {
     RP2350PWMState *s = opaque;
     RP2350PWMSlice *sl = &s->slice[n];
+    int64_t when;
 
     if (sl->dreq_wanted == (level != 0)) {
         return;
     }
-    pwm_catch_up(s, n, line_time());
-    pwm_sync(s, n, pwm_now_cycle(s));
+    when = line_time();
+    pwm_catch_up(s, n, when);
+    pwm_sync(s, n, pwm_cycle_at(s, when));
     sl->dreq_pending = 0;
     sl->dreq_wanted = level != 0;
     pwm_update(s, n);
@@ -714,7 +737,10 @@ static void pwm_dreq_wanted(void *opaque, int n, int level)
 
 /*
  * An access first brings clk_sys up to its time (clock_sync()), so that
- * the slices count by the clock as it is then.
+ * the slices count by the clock as it is then. It acts at one moment,
+ * line_time() read once as it begins: without icount the virtual clock
+ * moves on while a slice catches up, and a slice taken on to a later
+ * moment than its catch-up's would skip the edges between.
  */
 /* [spec:nuos:req:emu.pwm] */
 static uint64_t rp2350_pwm_read(void *opaque, hwaddr addr, unsigned size)
@@ -722,16 +748,18 @@ static uint64_t rp2350_pwm_read(void *opaque, hwaddr addr, unsigned size)
     RP2350PWMState *s = opaque;
     hwaddr reg = rp2350_atomic_reg(addr);
     uint32_t v = 0;
+    int64_t when;
     int i;
 
     clock_sync(s->clk);
+    when = line_time();
     if (reg < A_EN) {
         RP2350PWMSlice *sl;
 
         i = reg / SLICE_STRIDE;
         sl = &s->slice[i];
-        pwm_catch_up(s, i, line_time());
-        pwm_sync(s, i, pwm_now_cycle(s));
+        pwm_catch_up(s, i, when);
+        pwm_sync(s, i, pwm_cycle_at(s, when));
         switch (reg % SLICE_STRIDE) {
         case A_CSR:
             v = sl->csr;
@@ -753,8 +781,7 @@ static uint64_t rp2350_pwm_read(void *opaque, hwaddr addr, unsigned size)
         return v;
     }
 
-    pwm_catch_up_all(s);
-    pwm_sync_all(s);
+    pwm_bring_up_all(s, when);
     switch (reg) {
     case A_EN:
         for (i = 0; i < RP2350_PWM_SLICES; i++) {
@@ -793,17 +820,19 @@ static void rp2350_pwm_write(void *opaque, hwaddr addr, uint64_t value64,
     RP2350PWMState *s = opaque;
     hwaddr reg = rp2350_atomic_reg(addr);
     uint32_t value = value64;
+    int64_t when;
     int i;
 
     clock_sync(s->clk);
+    when = line_time();
     if (reg < A_EN) {
         RP2350PWMSlice *sl;
         uint32_t v;
 
         i = reg / SLICE_STRIDE;
         sl = &s->slice[i];
-        pwm_catch_up(s, i, line_time());
-        pwm_sync(s, i, pwm_now_cycle(s));
+        pwm_catch_up(s, i, when);
+        pwm_sync(s, i, pwm_cycle_at(s, when));
         switch (reg % SLICE_STRIDE) {
         case A_CSR:
             /*
@@ -843,8 +872,7 @@ static void rp2350_pwm_write(void *opaque, hwaddr addr, uint64_t value64,
         return;
     }
 
-    pwm_catch_up_all(s);
-    pwm_sync_all(s);
+    pwm_bring_up_all(s, when);
     switch (reg) {
     case A_EN: {
         uint32_t en = 0;

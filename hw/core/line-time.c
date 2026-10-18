@@ -11,6 +11,7 @@
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
 #include "exec/icount.h"
+#include "hw/core/cpu.h"
 #include "hw/core/line-time.h"
 #include "migration/vmstate.h"
 #include "system/runstate.h"
@@ -72,6 +73,68 @@ bool line_lags(int64_t due_ns)
 {
     return !icount_enabled() &&
            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - due_ns > LINE_MAX_LAG_NS;
+}
+
+/* The CPU time the calling thread has spent; its wall time if unknown. */
+static int64_t line_thread_cpu_ns(void)
+{
+#ifdef CLOCK_THREAD_CPUTIME_ID
+    struct timespec ts;
+
+    if (!clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts)) {
+        return ts.tv_sec * NANOSECONDS_PER_SECOND + ts.tv_nsec;
+    }
+#endif
+    return get_clock();
+}
+
+/*
+ * The output has been brought to @at_ns, by its timer or a catch-up,
+ * @fresh at the first moment of a catch-up a vCPU's access makes: the CPU
+ * time the thread has spent since its last note, less the time the
+ * output has come through since, adds to the ground lost.
+ */
+void line_lag_note(LineLag *lag, int64_t at_ns, bool fresh)
+{
+    int64_t cpu;
+
+    if (icount_enabled()) {
+        return;
+    }
+    cpu = line_thread_cpu_ns();
+    if (lag->started && !fresh && lag->thread == current_cpu) {
+        int64_t covered = MAX(at_ns - lag->at_ns, 0);
+
+        lag->lost_ns = MAX(lag->lost_ns + (cpu - lag->cpu_ns) - covered, 0);
+    }
+    lag->started = true;
+    lag->thread = current_cpu;
+    lag->cpu_ns = cpu;
+    lag->at_ns = at_ns;
+}
+
+/* The output has skipped or slipped to the present: nothing behind it. */
+void line_lag_reset(LineLag *lag)
+{
+    lag->started = false;
+    lag->lost_ns = 0;
+}
+
+/*
+ * Whether the host is too slow for the output's moment @due_ns: the
+ * moment lags, or it is beyond the slack while the host is losing ground
+ * on the output.
+ */
+bool line_lag_too_slow(const LineLag *lag, int64_t due_ns)
+{
+    int64_t behind;
+
+    if (icount_enabled()) {
+        return false;
+    }
+    behind = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - due_ns;
+    return behind > LINE_MAX_LAG_NS ||
+           (behind > LINE_SLACK_NS && lag->lost_ns > LINE_SLACK_NS);
 }
 
 void line_add_source(Notifier *n)

@@ -56,7 +56,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RP2350HSTXState, RP2350_HSTX)
  * device keeps exact records of what it emitted and drives the "out"
  * lines only at coarse instants: whenever its state is synchronised (a
  * register access, a DREQ edge, a coupled-mode PIO input change), every
- * "pin-refresh-ns" while it is shifting, and in the cycle in which it
+ * "pin-refresh-ns" while it is shifting (without icount, no more often
+ * than the host gets to the device's timer), and in the cycle in which it
  * stops shifting. At each instant a line
  * shows the level of the last half-cycle emitted, or while the shift
  * register is stopped, the crossbar applied to its current contents.
@@ -162,6 +163,8 @@ struct RP2350HSTXState {
      * run it further.
      */
     bool syncing;
+    /* The block has slipped behind a host too slow for it (logged once). */
+    bool lag_logged;
 };
 
 #endif

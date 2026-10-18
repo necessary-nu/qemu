@@ -35,6 +35,7 @@
 #ifndef HW_MISC_RP2350_PIO_H
 #define HW_MISC_RP2350_PIO_H
 
+#include "hw/core/line-time.h"
 #include "hw/core/sysbus.h"
 #include "hw/gpio/rp2350_gpio.h"
 #include "qemu/timer.h"
@@ -212,6 +213,10 @@ struct RP2350PIOState {
     uint64_t horizon;
     /* Set while the engine runs or drives its outputs. */
     bool busy;
+    /* How the host keeps up with the blocks (line_lag_too_slow()). */
+    LineLag lag;
+    /* The blocks have slipped behind a host too slow for them (logged once). */
+    bool lag_logged;
 
     /* clk_sys cycle count at virtual time base_ns. */
     int64_t base_ns;
