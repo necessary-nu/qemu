@@ -84,8 +84,8 @@
  * (esp32p4_gdma_sync()), and GDMA-AXI's own register accesses first let
  * the unit take its edges due by then (ops->sync). On the host's clock a
  * unit held up by the host catches up edge by edge, its frames going on
- * as they would have; once an edge is ESP32_LINE_MAX_LAG_NS behind
- * (include/hw/gpio/esp32_line.h), the clocks slip to the present
+ * as they would have; once an edge is LINE_MAX_LAG_NS behind
+ * (hw/core/line-time.h), the clocks slip to the present
  * (logged), the frames going on from there, rather than hold the system
  * back for ever.
  *
@@ -1367,7 +1367,7 @@ static int parlio_next_event(ESP32P4ParlioState *s, int64_t *due)
 
 /*
  * [spec:nuos:req:emu.esp32p4.parlio]
- * The host has fallen ESP32_LINE_MAX_LAG_NS behind the units' edges at
+ * The host has fallen LINE_MAX_LAG_NS behind the units' edges at
  * @now: the clocks' next edges move to the present, and the receive
  * timeout counts from it. A frame in progress goes on from there.
  */
@@ -1401,7 +1401,7 @@ static void parlio_slip(ESP32P4ParlioState *s, int64_t now)
  * has GDMA-AXI's rounds due by then run. Each edge costs the host far
  * less than a MHz clock's period, the quiet ones least, but a unit that
  * drives watched lines that fast for long may still fall behind: once an
- * edge is ESP32_LINE_MAX_LAG_NS behind the present, the clocks slip to
+ * edge is LINE_MAX_LAG_NS behind the present, the clocks slip to
  * the present rather than hold the system back for ever.
  */
 static void parlio_catch_up(ESP32P4ParlioState *s, int64_t upto)
@@ -1414,7 +1414,7 @@ static void parlio_catch_up(ESP32P4ParlioState *s, int64_t upto)
     }
     s->in_catch_up = true;
     while ((next = parlio_next_event(s, &due)) >= 0 && due <= upto) {
-        if (esp32_line_lags(due)) {
+        if (line_lags(due)) {
             parlio_slip(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
             continue;
         }

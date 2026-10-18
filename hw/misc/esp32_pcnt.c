@@ -14,7 +14,17 @@
  * per edge direction (POS_MODE, NEG_MODE), with the action kept, inverted
  * or inhibited by the level of its control input (HCTRL_MODE,
  * LCTRL_MODE). All four inputs of a unit pass through the unit's glitch
- * filter, clocked by APB_CLK.
+ * filter, clocked by APB_CLK: with FILTER_EN, a level change reaches the
+ * counter once it has held for FILTER_THRES cycles of the clock, and a
+ * shorter pulse is lost. The filter counts the clock's cycles (TRM 23.2.2:
+ * the inputs "are sampled on APB_CLK edges", pulses "shorter than
+ * REG_FILTER_THRES_Un number of APB_CLK clock cycles" filtered out), so
+ * a change it holds back while APB_CLK changes rate counts the old
+ * clock's cycles up to the change and the new clock's after it: nothing
+ * in the block restarts the count as the clock changes. With the clock
+ * stopped it counts none, and counts on once the clock restarts. The
+ * clock's cycles are counted as time over its period, a fraction of one
+ * at either end, as its edges are not modelled.
  *
  * Five comparators watch each counter as it counts: the two thresholds
  * and zero match on equality, the high limit on count >= H_LIM and the
@@ -255,6 +265,30 @@ static int64_t pcnt_filter_delay(Esp32PcntState *s, unsigned i)
 
 /*
  * [spec:nuos:req:emu.esp32.pcnt]
+ * When a change of input i at e reaches the counter past the filter: once
+ * FILTER_THRES cycles of APB_CLK have passed since it, the cycles the
+ * change waiting at raw_since_ns had held for before the clock last
+ * changed (held) among them.
+ */
+static int64_t pcnt_filter_due(Esp32PcntState *s, unsigned i, int64_t e)
+{
+    uint32_t conf0 = s->unit[i / ESP32_PCNT_UNIT_INPUTS].conf0;
+    uint64_t n = (uint64_t)(conf0 & CONF0_FILTER_THRES) << 32;
+    uint64_t lo, hi;
+
+    if (!(conf0 & CONF0_FILTER_EN)) {
+        return e;
+    }
+    if (e == s->raw_since_ns[i] && s->raw[i] != s->filt[i]) {
+        n -= MIN(n, s->held[i]);
+    }
+    /* n / 2^32 cycles of clock_get() / 2^32 ns, rounded down */
+    mulu64(&lo, &hi, n, clock_get(s->apb_clk));
+    return e + hi;
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.pcnt]
  * The glitch filter: with FILTER_EN, a level change on an input reaches
  * the counter once it has held for FILTER_THRES APB_CLK cycles; a pulse
  * shorter than that is lost. Whether a change got through is decided from
@@ -265,17 +299,18 @@ static int64_t pcnt_filter_delay(Esp32PcntState *s, unsigned i)
  */
 static bool pcnt_pending(Esp32PcntState *s, unsigned i, int64_t *due)
 {
-    uint32_t conf0 = s->unit[i / ESP32_PCNT_UNIT_INPUTS].conf0;
-    uint32_t thres = conf0 & CONF0_FILTER_THRES;
-
     if (!s->clk_running || s->raw[i] == s->filt[i]) {
         return false;
     }
-    *due = s->raw_since_ns[i];
-    if (conf0 & CONF0_FILTER_EN) {
-        *due += clock_ticks_to_ns(s->apb_clk, thres);
-    }
+    *due = pcnt_filter_due(s, i, s->raw_since_ns[i]);
     return true;
+}
+
+/* Input i's wire changed at t: the filter counts afresh from there. */
+static void pcnt_raw_since(Esp32PcntState *s, unsigned i, int64_t t)
+{
+    s->raw_since_ns[i] = t;
+    s->held[i] = 0;
 }
 
 /* Inputs taking a wave in bulk */
@@ -291,7 +326,7 @@ static int64_t pcnt_feed_due(void *opaque, int64_t e)
 {
     Esp32PcntBulk *b = opaque;
 
-    return e + pcnt_filter_delay(b->s, b->input);
+    return pcnt_filter_due(b->s, b->input, e);
 }
 
 /* Input i's state, taking its wave, as a feed (esp32_pcnt_bulk.h). */
@@ -320,7 +355,9 @@ static void pcnt_feed_store(Esp32PcntState *s, unsigned i,
     s->bulk_ns[i] = f->pos;
     s->raw[i] = f->raw;
     s->filt[i] = f->filt;
-    s->raw_since_ns[i] = f->raw_since;
+    if (f->raw_since != s->raw_since_ns[i]) {
+        pcnt_raw_since(s, i, f->raw_since);
+    }
 }
 
 /*
@@ -574,6 +611,7 @@ static void pcnt_sync_unit(Esp32PcntState *s, unsigned u, int64_t t)
         rep.input = -1;
         if (tm <= te) {
             s->filt[mat] = s->raw[mat];
+            s->held[mat] = 0;
             pcnt_edge(s, u, mat % UI, s->filt[mat]);
         } else {
             Esp32PcntFeed f = pcnt_feed(s, edge_in);
@@ -596,7 +634,7 @@ static void pcnt_sync_unit(Esp32PcntState *s, unsigned u, int64_t t)
             uint64_t nr = w->ops->edges(w, s->bulk_ns[i], lim);
 
             if (nr) {
-                s->raw_since_ns[i] = w->ops->edge(w, s->bulk_ns[i], nr);
+                pcnt_raw_since(s, i, w->ops->edge(w, s->bulk_ns[i], nr));
             }
             s->raw[i] = w->ops->level(w, lim) ^ s->bulk[i].inv;
         }
@@ -716,7 +754,7 @@ static void pcnt_input_change(Esp32PcntState *s, int n, bool level,
     /* A change already held long enough happened before this one */
     pcnt_sync_unit(s, n / UI, t);
     s->raw[n] = level;
-    s->raw_since_ns[n] = t;
+    pcnt_raw_since(s, n, t);
     pcnt_sync_unit(s, n / UI, t);
 }
 
@@ -1061,37 +1099,62 @@ static void esp32_pcnt_reset_hold(Object *obj, ResetType type)
             s->bulk_ns[i] = now;
         }
         s->filt[i] = s->raw[i];
+        s->held[i] = 0;
     }
     pcnt_update_irq(s);
 }
 
 /*
  * [spec:nuos:req:emu.esp32.pcnt]
+ * APB_CLK is about to change at t, from the period it has: each change
+ * still waiting in a filter has held for the cycles since it up to t, at
+ * the old period, and goes on counting from t at the new one, the count
+ * kept (held). A stopped clock has no cycles: a change waiting while it is
+ * stopped holds its count, and one made while it is stopped counts from
+ * its restart.
+ */
+static void pcnt_hold(Esp32PcntState *s, int64_t t)
+{
+    uint64_t period = clock_get(s->apb_clk);
+
+    for (unsigned i = 0; i < ESP32_PCNT_INPUT_COUNT; i++) {
+        uint64_t lo = 0, hi;
+
+        if (s->raw[i] == s->filt[i] || s->raw_since_ns[i] >= t) {
+            continue;
+        }
+        if (s->clk_running && period) {
+            /* (t - since) ns over period / 2^32 ns, in 2^-32 cycles */
+            hi = t - s->raw_since_ns[i];
+            divu128(&lo, &hi, period);
+            s->held[i] = hi || lo > UINT64_MAX - s->held[i] ?
+                         UINT64_MAX : s->held[i] + lo;
+        }
+        s->raw_since_ns[i] = t;
+    }
+}
+
+/*
+ * [spec:nuos:req:emu.esp32.pcnt]
  * APB_CLK is about to change: the line sources are brought up to now and
  * the filters judge the changes matured by then at its old period
- * (pcnt_catch_up()). As it changes, at the moment that has come to, the
- * sources are brought up to that and the filters count its new period.
- * With the clock stopped the filter's flops hold their state; a change
- * waiting at the wire is filtered afresh once the clock restarts.
+ * (pcnt_catch_up()), the changes still waiting keeping the cycles they
+ * have held for (pcnt_hold()). As it changes, at the moment that has come
+ * to, the sources are brought up to that and the filters count its new
+ * period. With the clock stopped the filter's flops hold their state.
  */
 static void esp32_pcnt_clk_update(void *opaque, ClockEvent event)
 {
     Esp32PcntState *s = opaque;
-    bool running = clock_is_enabled(s->apb_clk);
     int64_t now;
 
     if (event == ClockPreUpdate) {
-        pcnt_catch_up(s);
+        pcnt_hold(s, pcnt_catch_up(s));
         pcnt_schedule(s);
         return;
     }
     now = esp32_line_time();
-    if (running && !s->clk_running) {
-        for (unsigned i = 0; i < ESP32_PCNT_INPUT_COUNT; i++) {
-            s->raw_since_ns[i] = now;
-        }
-    }
-    s->clk_running = running;
+    s->clk_running = clock_is_enabled(s->apb_clk);
     esp32_line_run_at(now, pcnt_sync_sources, NULL);
     pcnt_sync(s, now);
     pcnt_schedule(s);
@@ -1202,8 +1265,8 @@ static const VMStateDescription vmstate_esp32_pcnt_unit = {
 
 static const VMStateDescription vmstate_esp32_pcnt = {
     .name = TYPE_ESP32_PCNT,
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .pre_save = esp32_pcnt_pre_save,
     .post_load = esp32_pcnt_post_load,
     .fields = (const VMStateField[]) {
@@ -1217,6 +1280,7 @@ static const VMStateDescription vmstate_esp32_pcnt = {
         VMSTATE_UINT8_ARRAY(filt, Esp32PcntState, ESP32_PCNT_INPUT_COUNT),
         VMSTATE_INT64_ARRAY(raw_since_ns, Esp32PcntState,
                             ESP32_PCNT_INPUT_COUNT),
+        VMSTATE_UINT64_ARRAY(held, Esp32PcntState, ESP32_PCNT_INPUT_COUNT),
         VMSTATE_TIMER(filter_timer, Esp32PcntState),
         VMSTATE_BOOL(clk_running, Esp32PcntState),
         VMSTATE_CLOCK(apb_clk, Esp32PcntState),

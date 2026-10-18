@@ -992,9 +992,9 @@ static void update_stream(ESP32P4ImageSource *s);
 /*
  * [spec:nuos:req:emu.esp32p4.lcd-cam]
  * [spec:nuos:req:emu.esp32p4.mipi]
- * The host has fallen ESP32_LINE_MAX_LAG_NS behind the stream
- * (include/hw/gpio/esp32_line.h): it restarts at the present, the frames
- * between dropped.
+ * The host has fallen LINE_MAX_LAG_NS behind the stream
+ * (hw/core/line-time.h): it restarts at the present, the frames between
+ * dropped.
  */
 static void image_source_restart(void *opaque)
 {
@@ -1013,7 +1013,7 @@ static void image_source_restart(void *opaque)
 /*
  * Run every event due by @now, each at its own time. On the host's clock
  * a stream the host held up catches up event by event, the frame in
- * progress going on; only a stream ESP32_LINE_MAX_LAG_NS behind, which
+ * progress going on; only a stream LINE_MAX_LAG_NS behind, which
  * the host cannot follow at all, restarts at the present.
  */
 static void run_until(ESP32P4ImageSource *s, int64_t now)
@@ -1028,7 +1028,7 @@ static void run_until(ESP32P4ImageSource *s, int64_t now)
         if (when > now) {
             break;
         }
-        if (esp32_line_lags(when)) {
+        if (line_lags(when)) {
             esp32_line_run_at(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                               image_source_restart, s);
             continue;

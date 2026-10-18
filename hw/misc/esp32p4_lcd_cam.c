@@ -1698,8 +1698,8 @@ static void lcd_tx_arrived(void *opaque)
 
 /*
  * [spec:nuos:req:emu.esp32p4.lcd-cam]
- * The host has fallen ESP32_LINE_MAX_LAG_NS behind the LCD's events
- * (include/hw/gpio/esp32_line.h), at esp32_line_time(), the present. RGB
+ * The host has fallen LINE_MAX_LAG_NS behind the LCD's events
+ * (hw/core/line-time.h), at esp32_line_time(), the present. RGB
  * frames restart at the present, the ones between dropped; an i80
  * transaction goes on from the present, PCLK pausing as when GDMA holds it
  * up, so that a panel takes every word of it.
@@ -1733,7 +1733,7 @@ static void lcd_slip(void *opaque)
  * [spec:nuos:req:emu.esp32p4.lcd-cam]
  * Take the engine's events due by @until, each at its own time, with a
  * GDMA delivery that came during them taken at its time. On the host's
- * clock an event ESP32_LINE_MAX_LAG_NS behind the present, which the host
+ * clock an event LINE_MAX_LAG_NS behind the present, which the host
  * cannot follow, makes the LCD slip to the present first (lcd_slip()).
  */
 static void lcd_run(ESP32P4LcdCamState *s, int64_t until)
@@ -1758,7 +1758,7 @@ static void lcd_run(ESP32P4LcdCamState *s, int64_t until)
         if (!have || t > until) {
             break;
         }
-        if (kind != EV_EDGE && esp32_line_lags(t)) {
+        if (kind != EV_EDGE && line_lags(t)) {
             esp32_line_run_at(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                               lcd_slip, s);
             continue;

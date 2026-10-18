@@ -602,8 +602,9 @@ static void test_wrap_threshold(void)
 
 /*
  * [spec:nuos:req:emu.esp32.rmt/test]
- * Continuous mode repeats the data with one idle tick between passes,
- * raising TX_END on each, until it is turned off.
+ * Continuous mode repeats the data with one idle tick between passes (TRM
+ * 30.2.2: "an idle level lasting one clk_div cycle between N and N+1
+ * transmissions"), raising TX_END on each, until it is turned off.
  */
 static void test_continuous(void)
 {

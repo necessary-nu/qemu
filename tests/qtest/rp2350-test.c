@@ -85,7 +85,10 @@ static void test_memory_map(void)
                           "(prio 0, rom): rp2350.rom");
     assert_mtree_has(qts, "0000000010000000-00000000103fffff "
                           "(prio 0, romd): rp2350.qspi-cs0");
+    /* SRAM behind the gate its power domains turn (rp2350_soc.h). */
     assert_mtree_has(qts, "0000000020000000-0000000020081fff "
+                          "(prio 0, i/o): rp2350.sram-gate");
+    assert_mtree_has(qts, "0000000000000000-0000000000081fff "
                           "(prio 0, ram): rp2350.sram");
     assert_mtree_has(qts, "0000000040000000-0000000040003fff "
                           "(prio 0, i/o): rp2350-sysinfo");
