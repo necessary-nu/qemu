@@ -1564,6 +1564,7 @@ static void panel_class_init(ObjectClass *klass, const void *data)
 /*
  * [spec:nuos:req:emu.esp32p4.dsi-panel]
  * [spec:nuos:req:emu.esp32p4.panel-control]
+ * [spec:nuos:req:emu.esp32p4.touch]
  * Waveshare's 5-DSI-TOUCH-A, plugged into the board's DSI connector:
  * -device waveshare-5-dsi-touch-a. Its panel is a 5" 720 x 1280 HX8394
  * on 2 data lanes (Waveshare's esp_lcd_hx8394 and Linux's
@@ -1571,7 +1572,17 @@ static void panel_class_init(ObjectClass *klass, const void *data)
  * on the connector's I2C wires at 0x45, switching the panel's AVDD,
  * IOVCC, RESX and backlight (lines 0, 4, 1 and 2, and its PWM), as
  * Linux's vc4-kms-dsi-waveshare-panel-v2 overlay and gpio-waveshare-dsi.c
- * wire them.
+ * wire them. Its GT911 (hw/input/esp32p4_gt911.c) is on the same wires,
+ * powered by the chip's VCC (line 8) and reset by its line 9, as the
+ * Raspberry Pi kernel's waveshare-panel-regulator.c powers the touch
+ * controller with them and its overlay resets the Goodix by line 9. Its
+ * INT goes to the control chip, not the connector (the overlay's pull
+ * request: "the mcu is connected to the INT pin"); what level the chip
+ * holds it at through a reset is not documented: the model's is low
+ * (-global gt911.int-level=on for high), selecting 0x5D, the address the
+ * overlay gives the touch controller and the one Waveshare's ESP-IDF
+ * BSPs try first. The touches are the QEMU pointer's on the panel's
+ * console.
  */
 static void ws5a_init(Object *obj)
 {
@@ -1585,6 +1596,7 @@ static void ws5a_init(Object *obj)
     s->power_pins = true;
     s->controller = g_strdup("hx8394");
     object_initialize_child(obj, "mcu", &m->mcu, TYPE_WAVESHARE_PANEL_MCU);
+    object_initialize_child(obj, "touch", &m->touch, TYPE_GT911);
 }
 
 static void ws5a_realize(DeviceState *dev, Error **errp)
@@ -1592,16 +1604,19 @@ static void ws5a_realize(DeviceState *dev, Error **errp)
     ERRP_GUARD();
     Waveshare5DsiTouchAState *m = WAVESHARE_5_DSI_TOUCH_A(dev);
     ESP32P4DsiHostState *host;
-    DeviceState *mcu = DEVICE(&m->mcu);
+    DeviceState *mcu = DEVICE(&m->mcu), *touch = DEVICE(&m->touch);
     BusState *bus = qdev_get_parent_bus(dev);
     static const struct {
         int line;
+        bool touch;
         const char *in;
     } wires[] = {
-        { WAVESHARE_LINE_AVDD, ESP32P4_DSI_PANEL_AVDD },
-        { WAVESHARE_LINE_IOVCC, ESP32P4_DSI_PANEL_IOVCC },
-        { WAVESHARE_LINE_PANEL_RESET, ESP32P4_DSI_PANEL_RESX },
-        { WAVESHARE_LINE_BL_ENABLE, ESP32P4_DSI_PANEL_BL_EN },
+        { WAVESHARE_LINE_AVDD, false, ESP32P4_DSI_PANEL_AVDD },
+        { WAVESHARE_LINE_IOVCC, false, ESP32P4_DSI_PANEL_IOVCC },
+        { WAVESHARE_LINE_PANEL_RESET, false, ESP32P4_DSI_PANEL_RESX },
+        { WAVESHARE_LINE_BL_ENABLE, false, ESP32P4_DSI_PANEL_BL_EN },
+        { WAVESHARE_LINE_VCC, true, GT911_VDD },
+        { WAVESHARE_LINE_TS_RESET, true, GT911_RSTB },
     };
 
     host = bus ? (ESP32P4DsiHostState *)object_dynamic_cast(
@@ -1618,13 +1633,18 @@ static void ws5a_realize(DeviceState *dev, Error **errp)
     for (int i = 0; i < ARRAY_SIZE(wires); i++) {
         qdev_connect_gpio_out_named(mcu, WAVESHARE_PANEL_MCU_LINE,
                                     wires[i].line,
-                                    qdev_get_gpio_in_named(dev, wires[i].in,
-                                                           0));
+                                    qdev_get_gpio_in_named(
+                                        wires[i].touch ? touch : dev,
+                                        wires[i].in, 0));
     }
     qdev_connect_gpio_out_named(mcu, WAVESHARE_PANEL_MCU_PWM, 0,
                                 qdev_get_gpio_in_named(dev,
                                     ESP32P4_DSI_PANEL_BL_PWM, 0));
-    qdev_realize(mcu, BUS(host->connector_i2c), errp);
+    if (!qdev_realize(mcu, BUS(host->connector_i2c), errp) ||
+        !qdev_realize(touch, BUS(host->connector_i2c), errp)) {
+        return;
+    }
+    gt911_bind_console(&m->touch, dev);
 }
 
 static void ws5a_class_init(ObjectClass *klass, const void *data)
@@ -1632,8 +1652,8 @@ static void ws5a_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = ws5a_realize;
-    dc->desc = "Waveshare 5-DSI-TOUCH-A: an HX8394 720x1280 panel and its "
-               "control chip at I2C 0x45";
+    dc->desc = "Waveshare 5-DSI-TOUCH-A: an HX8394 720x1280 panel, its "
+               "control chip at I2C 0x45 and its GT911 touch controller";
 }
 
 /* [spec:nuos:req:emu.esp32p4.mipi] */

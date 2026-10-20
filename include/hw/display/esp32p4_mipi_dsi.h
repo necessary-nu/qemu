@@ -14,6 +14,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
 #include "hw/i2c/i2c.h"
+#include "hw/input/esp32p4_gt911.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "hw/misc/esp32p4_mipi.h"
 #include "qemu/timer.h"
@@ -401,11 +402,15 @@ struct WavesharePanelMcuState {
     uint8_t written;
 };
 
-/* The 5-DSI-TOUCH-A module: its HX8394 panel, with its control chip. */
+/*
+ * The 5-DSI-TOUCH-A module: its HX8394 panel, with its control chip and
+ * its GT911 touch controller.
+ */
 struct Waveshare5DsiTouchAState {
     ESP32P4DsiPanelState parent_obj;
 
     WavesharePanelMcuState mcu;
+    GT911State touch;
 };
 typedef struct Waveshare5DsiTouchAState Waveshare5DsiTouchAState;
 DECLARE_INSTANCE_CHECKER(Waveshare5DsiTouchAState, WAVESHARE_5_DSI_TOUCH_A,

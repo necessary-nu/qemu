@@ -401,8 +401,10 @@
  *
  *       -device esp32p4-dsi-panel,width=1024,height=600
  *
- *     or Waveshare's 5-DSI-TOUCH-A, its HX8394 720 x 1280 panel and its
- *     control chip at 0x45 on the ESP_I2C wires (esp32p4_panel_mcu.c):
+ *     or Waveshare's 5-DSI-TOUCH-A, its HX8394 720 x 1280 panel, its
+ *     control chip at 0x45 on the ESP_I2C wires (esp32p4_panel_mcu.c)
+ *     and its GT911 touch controller at 0x5D there, touched by the QEMU
+ *     pointer on the panel's console (hw/input/esp32p4_gt911.c):
  *
  *       -device waveshare-5-dsi-touch-a
  *
@@ -3492,9 +3494,9 @@ static void esp32p4_init_jpeg(ESP32P4MachineState *s)
  * ISP takes its place (include/hw/misc/esp32p4_mipi_csi.h); the DSI host's
  * byte clock to timer group 0's calibration mux. A display plugged into
  * the board's DSI connector is a -device on the DSI host's bus, "dsi":
- * esp32p4-dsi-panel, or waveshare-5-dsi-touch-a, whose control chip goes
- * on the connector's ESP_I2C wires (esp32p4_init_audio() names their bus
- * to the DSI host). Both hosts' VDD_MIPI_DPHY is VO3
+ * esp32p4-dsi-panel, or waveshare-5-dsi-touch-a, whose control chip and
+ * touch controller go on the connector's ESP_I2C wires
+ * (esp32p4_init_audio() names their bus to the DSI host). Both hosts' VDD_MIPI_DPHY is VO3
  * (esp32p4_dphy_supply()).
  */
 /* [spec:nuos:req:emu.esp32p4.mipi] */
