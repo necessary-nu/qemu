@@ -176,6 +176,8 @@ struct ESP32P4CsiHostState {
     uint8_t t44;
     bool cfg_clk_en;
     bool enableclk;
+    uint32_t vdd_mv;
+    bool vdd_warned;
     uint32_t phy_state;
     int64_t phy_due_ns;
 

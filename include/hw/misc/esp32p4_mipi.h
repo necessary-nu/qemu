@@ -13,6 +13,19 @@
 #include "migration/vmstate.h"
 
 /*
+ * The PHYs' supply
+ * ================
+ *
+ * Both D-PHYs and their pads are on the chip's VDD_MIPI_DPHY pin (pin 41;
+ * datasheet table 2-12), which each host takes as its input
+ * "vdd-mipi-dphy", in mV. They work only within its recommended range
+ * (table 5-2); 2.75 V is also its absolute maximum (table 5-1).
+ */
+#define ESP32P4_VDD_MIPI_DPHY       "vdd-mipi-dphy"
+#define ESP32P4_DPHY_VDD_MIN_MV     2250
+#define ESP32P4_DPHY_VDD_MAX_MV     2750
+
+/*
  * The test code interface
  * =======================
  *

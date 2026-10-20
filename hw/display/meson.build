@@ -148,7 +148,8 @@ system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
 system_ss.add(when: 'CONFIG_ESP_RGB', if_true: files('esp_rgb.c'))
 system_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_ppa.c',
                                                       'esp32p4_mipi_dsi.c',
-                                                      'esp32p4_dsi_panel.c'))
+                                                      'esp32p4_dsi_panel.c',
+                                                      'esp32p4_panel_mcu.c'))
 system_ss.add(when: 'CONFIG_LCD_PANEL', if_true: files('lcd_panel.c',
                                                        'mipi_dbi_panel.c',
                                                        'rgb_panel.c'))

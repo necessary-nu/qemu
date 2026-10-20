@@ -391,11 +391,20 @@
  *     DSI_BRIDGE_INTR (sources 88 and 86); and MIPI CSI (TRM chapter 42):
  *     the CSI-2 host at 0x5009F000 and the CSI bridge at 0x5009F800, which
  *     VDMA empties through its interface 1 at 0x50104000, their
- *     interrupts CSI_INTR and CSI_BRIDGE_INTR (sources 87 and 85). The
- *     board's DSI display is a panel on the DSI host's bus, shown on a
- *     QEMU console (hw/display/esp32p4_dsi_panel.c):
+ *     interrupts CSI_INTR and CSI_BRIDGE_INTR (sources 87 and 85). Both
+ *     D-PHYs are on VDD_MIPI_DPHY, which the board feeds from the PMU's
+ *     VO3: they work only with software holding VO3 at 2.25 to 2.75 V.
+ *     The board's DSI connector carries the DSI lanes and the ESP_I2C
+ *     wires; a display plugged into it is a panel on the DSI host's bus,
+ *     shown on a QEMU console (hw/display/esp32p4_dsi_panel.c), with no
+ *     display unless one is given:
  *
  *       -device esp32p4-dsi-panel,width=1024,height=600
+ *
+ *     or Waveshare's 5-DSI-TOUCH-A, its HX8394 720 x 1280 panel and its
+ *     control chip at 0x45 on the ESP_I2C wires (esp32p4_panel_mcu.c):
+ *
+ *       -device waveshare-5-dsi-touch-a
  *
  *   - The image signal processor (TRM chapter 38) at 0x500A1000, behind
  *     CSI_BRG_SYS_CLK, reset by RST_EN_ISP and RST_EN_CSI_BRG, its
@@ -2279,6 +2288,22 @@ static void esp32p4_sd_pads(void *opaque, int n, int mv)
     esp32p4_sd_supply_update(s);
 }
 
+/*
+ * [spec:nuos:req:emu.esp32p4.dphy-supply]
+ * VDD_MIPI_DPHY, which supplies both D-PHYs, is ESP_LDO_VO3 on the
+ * board's schematic: the PMU's regulator VO3, off until software sets it
+ * (ESP-IDF's MIPI examples take it at 2.5 V, esp_ldo_acquire_channel()).
+ */
+static void esp32p4_dphy_supply(void *opaque, int n, int mv)
+{
+    ESP32P4MachineState *s = opaque;
+
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->dsi_host),
+                                        ESP32P4_VDD_MIPI_DPHY, 0), mv);
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->csi_host),
+                                        ESP32P4_VDD_MIPI_DPHY, 0), mv);
+}
+
 static void esp32p4_init_sd_power(ESP32P4MachineState *s)
 {
     DeviceState *pmu = DEVICE(&s->pmu), *sd = DEVICE(&s->sdmmc);
@@ -2795,6 +2820,9 @@ static void esp32p4_init_low_power(ESP32P4MachineState *s)
     sysbus_connect_irq(SYS_BUS_DEVICE(pmu), 1,
                        esp32p4_intr_source(s, ESP32P4_INTR_PMU_1));
     esp32p4_init_sd_power(s);
+    qdev_connect_gpio_out_named(pmu, ESP32P4_PMU_LDO_MV,
+                                ESP32P4_BOARD_DPHY_LDO - 1,
+                                qemu_allocate_irq(esp32p4_dphy_supply, s, 0));
 
     s->hp_top_power = qemu_allocate_irq(esp32p4_hp_top_power, s, 0);
     s->hp_mem_power = qemu_allocate_irq(esp32p4_hp_mem_power, s, 0);
@@ -3462,8 +3490,12 @@ static void esp32p4_init_jpeg(ESP32P4MachineState *s)
  * output, which is the CSI bridge's); the CSI host on the board's
  * csi-camera, its image interface into the CSI bridge's CSI_CM, where the
  * ISP takes its place (include/hw/misc/esp32p4_mipi_csi.h); the DSI host's
- * byte clock to timer group 0's calibration mux. The board's display is a
- * -device esp32p4-dsi-panel on the DSI host's bus, "dsi".
+ * byte clock to timer group 0's calibration mux. A display plugged into
+ * the board's DSI connector is a -device on the DSI host's bus, "dsi":
+ * esp32p4-dsi-panel, or waveshare-5-dsi-touch-a, whose control chip goes
+ * on the connector's ESP_I2C wires (esp32p4_init_audio() names their bus
+ * to the DSI host). Both hosts' VDD_MIPI_DPHY is VO3
+ * (esp32p4_dphy_supply()).
  */
 /* [spec:nuos:req:emu.esp32p4.mipi] */
 static void esp32p4_init_mipi(ESP32P4MachineState *s)

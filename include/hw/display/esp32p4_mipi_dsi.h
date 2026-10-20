@@ -13,6 +13,7 @@
 #include "hw/core/qdev.h"
 #include "hw/core/sysbus.h"
 #include "hw/dma/esp32p4_dw_gdma.h"
+#include "hw/i2c/i2c.h"
 #include "hw/misc/esp32p4_clk_period.h"
 #include "hw/misc/esp32p4_mipi.h"
 #include "qemu/timer.h"
@@ -23,9 +24,12 @@
 #define TYPE_ESP32P4_DSI_BRIDGE "esp32p4-dsi-bridge"
 #define TYPE_ESP32P4_DSI_BUS    "esp32p4-dsi-bus"
 #define TYPE_ESP32P4_DSI_PANEL  "esp32p4-dsi-panel"
+#define TYPE_WAVESHARE_5_DSI_TOUCH_A "waveshare-5-dsi-touch-a"
+#define TYPE_WAVESHARE_PANEL_MCU "waveshare-panel-mcu"
 OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4DsiHostState, ESP32P4_DSI_HOST)
 OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4DsiBridgeState, ESP32P4_DSI_BRIDGE)
 OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4DsiPanelState, ESP32P4_DSI_PANEL)
+OBJECT_DECLARE_SIMPLE_TYPE(WavesharePanelMcuState, WAVESHARE_PANEL_MCU)
 
 #define ESP32P4_DSI_HOST_BASE   0x500a0000
 #define ESP32P4_DSI_BRIDGE_BASE 0x500a0800
@@ -55,6 +59,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(ESP32P4DsiPanelState, ESP32P4_DSI_PANEL)
  * output "lanebyteclk" is the D-PHY's TX_BYTE_CLK, which the reset and
  * clock control takes as "dsi-dphy-in" (timer group 0's calibration
  * clock source 12).
+ *
+ * The host's input "vdd-mipi-dphy" is the voltage on the chip's
+ * VDD_MIPI_DPHY pin, in mV, which supplies the D-PHY (the CSI host takes
+ * the same pin's voltage, its input of that name): the board feeds it
+ * from the PMU's regulator VO3. The board's DSI connector carries its
+ * ESP_I2C wires besides the lanes: esp32p4_dsi_host_set_connector_i2c()
+ * names their QEMU bus, on which a display module puts the chips it
+ * controls over I2C.
  */
 #define ESP32P4_DSI_HS_REQ          "hs-req"
 #define ESP32P4_DSI_HS_SINGLE       "hs-single"
@@ -118,10 +130,15 @@ struct ESP32P4DsiHostState {
     uint32_t regs[ESP32P4_DSI_HOST_NREGS];
     uint32_t int_st[2];
 
+    /* The board's DSI connector's I2C wires (no reference held) */
+    I2CBus *connector_i2c;
+
     /* The D-PHY: its test interface and registers, its state. */
     ESP32P4DphyTest test;
     uint8_t t10, t11, t12, t17, t18[2], t19, t22[2], t44;
     bool cfg_ref_en;
+    uint32_t vdd_mv;
+    bool vdd_warned;
     uint32_t phy_state;
     int64_t phy_due_ns;
     ESP32P4ClkEdges ref_edges;
@@ -241,9 +258,25 @@ struct ESP32P4DsiBridgeState {
     uint32_t blk_words;
 };
 
-/* The board's panel: a command-level MIPI DSI display module. */
-#define ESP32P4_DSI_PANEL_VREGS     256
-#define ESP32P4_DSI_PANEL_VREG_LEN  16
+/*
+ * The board's panel: a command-level MIPI DSI display module. Its
+ * manufacturer registers: one per command code, then the HX8394's banks
+ * 1 to 3 of the six commands SET_BANK selects among.
+ */
+#define ESP32P4_DSI_PANEL_BANKED    6
+#define ESP32P4_DSI_PANEL_VREGS     (256 + 3 * ESP32P4_DSI_PANEL_BANKED)
+#define ESP32P4_DSI_PANEL_VREG_LEN  128
+
+/*
+ * Inputs of a panel whose module switches its supplies and reset
+ * ("power-pins"): its AVDD and IOVCC supplies and its RESX, each on while
+ * high; its backlight driver's enable and its PWM duty (0 to 255).
+ */
+#define ESP32P4_DSI_PANEL_AVDD      "avdd"
+#define ESP32P4_DSI_PANEL_IOVCC     "iovcc"
+#define ESP32P4_DSI_PANEL_RESX      "resx"
+#define ESP32P4_DSI_PANEL_BL_EN     "bl-en"
+#define ESP32P4_DSI_PANEL_BL_PWM    "bl-pwm"
 
 struct ESP32P4DsiPanelState {
     DeviceState parent_obj;
@@ -256,14 +289,36 @@ struct ESP32P4DsiPanelState {
     uint32_t vc;
     bool display_on_reset;
     uint8_t id[3];
+    char *controller;
+    bool hx8394;
+    bool power_pins;
 
     /* The frame memory, 0x00RRGGBB per pixel, row by row. */
     uint32_t *fb;
     uint32_t fb_words;
     bool dirty;
+    /* What the console shows: lit, and the backlight's duty. */
+    bool shown_lit;
+    uint8_t shown_bl;
+
+    /*
+     * The module's lines; whether the panel is supplied, and supplied and
+     * out of reset.
+     */
+    bool avdd;
+    bool iovcc;
+    bool resx;
+    bool bl_en;
+    uint8_t bl_pwm;
+    bool supplied;
+    bool live;
+    /* Commands before this time come before the panel can take them. */
+    int64_t cmd_ready_ns;
+    uint8_t cmd_ready_why;
 
     bool sleep_in;
     int64_t sleep_out_ns;
+    int64_t sleep_in_ns;
     bool display_on;
     bool inversion;
     bool idle;
@@ -290,12 +345,75 @@ struct ESP32P4DsiPanelState {
     uint8_t vreg[ESP32P4_DSI_PANEL_VREGS][ESP32P4_DSI_PANEL_VREG_LEN];
     uint8_t vreg_len[ESP32P4_DSI_PANEL_VREGS];
 
+    /* The HX8394's own state: its IDs as SETID leaves them, and more. */
+    uint8_t id_now[3];
+    bool extc;
+    uint8_t rx_lanes;
+    uint8_t bank;
+    uint8_t dsdr;
+    bool all_on;
+    bool all_off;
+    uint8_t gamma;
+    uint8_t imcol;
+    uint8_t cabc_min;
+    bool ram_warned;
+
     /* The command a read answers, as the last read request gave it. */
     bool read_pending;
     uint8_t read_dt;
     uint8_t read_cmd;
     uint8_t read_vc;
 };
+
+/*
+ * The control chip of a Waveshare DSI TOUCH panel module, at I2C 0x45:
+ * its sixteen output lines (REG_LCD bits 0 to 7, REG_TP bits 8 to 15, as
+ * Linux's drivers number them) and its backlight PWM duty, outputs
+ * "line" (16) and "pwm".
+ */
+#define WAVESHARE_PANEL_MCU_LINE    "line"
+#define WAVESHARE_PANEL_MCU_PWM     "pwm"
+#define WAVESHARE_PANEL_MCU_LINES   16
+
+/* The lines Linux's gpio-waveshare-dsi.c names. */
+#define WAVESHARE_LINE_AVDD         0
+#define WAVESHARE_LINE_PANEL_RESET  1
+#define WAVESHARE_LINE_BL_ENABLE    2
+#define WAVESHARE_LINE_IOVCC        4
+#define WAVESHARE_LINE_VCC          8
+#define WAVESHARE_LINE_TS_RESET     9
+
+struct WavesharePanelMcuState {
+    I2CSlave parent_obj;
+
+    qemu_irq line[WAVESHARE_PANEL_MCU_LINES];
+    qemu_irq pwm_out;
+    bool powered;
+    uint8_t size;
+    uint8_t hw_id;
+    uint8_t version;
+
+    uint8_t tp;
+    uint8_t lcd;
+    uint8_t pwm;
+    uint8_t ptr;
+    bool ptr_next;
+    uint8_t written;
+};
+
+/* The 5-DSI-TOUCH-A module: its HX8394 panel, with its control chip. */
+struct Waveshare5DsiTouchAState {
+    ESP32P4DsiPanelState parent_obj;
+
+    WavesharePanelMcuState mcu;
+};
+typedef struct Waveshare5DsiTouchAState Waveshare5DsiTouchAState;
+DECLARE_INSTANCE_CHECKER(Waveshare5DsiTouchAState, WAVESHARE_5_DSI_TOUCH_A,
+                         TYPE_WAVESHARE_5_DSI_TOUCH_A)
+
+/* The board's DSI connector's I2C bus, for the display module on it. */
+void esp32p4_dsi_host_set_connector_i2c(ESP32P4DsiHostState *s,
+                                        I2CBus *bus);
 
 /*
  * The panel's side of the link, for the host: a packet, as its last byte

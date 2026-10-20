@@ -235,6 +235,12 @@ void esp32p4_init_audio(ESP32P4MachineState *s)
     qemu_set_irq(qdev_get_gpio_in_named(gpio, ESP32P4_GPIO_BOARD_PULL_UP,
                                         ESP32P4_BOARD_I2C_SDA_PAD),
                  ESP32P4_BOARD_I2C_PULL_UP);
+    /*
+     * [spec:nuos:req:emu.esp32p4.panel-control]
+     * The wires go to the DSI connector too, for the display module
+     * plugged into it (-device waveshare-5-dsi-touch-a).
+     */
+    esp32p4_dsi_host_set_connector_i2c(&s->dsi_host, a->esp_i2c.bus);
 
     /* The codec's MCLK, from whichever I2S drives GPIO13 */
     a->codec_mclk = clock_new(OBJECT(s), "codec-mclk");

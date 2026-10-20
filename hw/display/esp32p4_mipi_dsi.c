@@ -83,7 +83,11 @@
  *   - The PHY. Its test codes (esp32p4_mipi.h) 0x10, 0x11, 0x12, 0x17,
  *     0x18 (two sets), 0x19, 0x22 (two sets) and 0x44 hold what TRM
  *     43.4.3.3 gives them, TESTDOUT showing each as the TRM's loopback
- *     tables do; other codes are reserved (logged). With PHY_SHUTDOWNZ and
+ *     tables do; other codes are reserved (logged). The PHY works only on
+ *     VDD_MIPI_DPHY ("vdd-mipi-dphy") within its recommended 2.25 to
+ *     2.75 V (datasheet table 5-2): off, lower or higher (beyond the
+ *     2.75 V absolute maximum, logged) it is as if shut down, its PLL
+ *     unlocked and no lane driven. With PHY_SHUTDOWNZ and
  *     PHY_RSTZ set and DSI_DPHY_CFG_CLK and DSI_DPHY_PLL_REFCLK running
  *     (and the bridge's DSI_CFG_REF_CLK_EN), the PLL locks 2000 cycles of
  *     the configuration clock later, and the lanes reach LP-11 1000 after
@@ -616,12 +620,20 @@ static void phy_test_data(ESP32P4DsiHostState *s, uint8_t data)
     }
 }
 
+/* [spec:nuos:req:emu.esp32p4.dphy-supply] */
+static bool phy_supplied(ESP32P4DsiHostState *s)
+{
+    return s->vdd_mv >= ESP32P4_DPHY_VDD_MIN_MV &&
+           s->vdd_mv <= ESP32P4_DPHY_VDD_MAX_MV;
+}
+
 static bool phy_wanted(ESP32P4DsiHostState *s)
 {
     uint32_t r = hreg(s, A_PHY_RSTZ);
 
     return (r & PHY_SHUTDOWNZ) && (r & PHY_RSTZ) && s->cfg_ref_en &&
-           clock_is_enabled(s->clk_cfg) && clock_is_enabled(s->clk_ref);
+           phy_supplied(s) && clock_is_enabled(s->clk_cfg) &&
+           clock_is_enabled(s->clk_ref);
 }
 
 static void phy_set_byte_out(ESP32P4DsiHostState *s, ESP32P4ClkEdges e)
@@ -2137,6 +2149,26 @@ static void host_cfg_ref_en(void *opaque, int n, int level)
     phy_update(s);
 }
 
+/* [spec:nuos:req:emu.esp32p4.dphy-supply] VDD_MIPI_DPHY, @level mV. */
+static void host_vdd(void *opaque, int n, int level)
+{
+    ESP32P4DsiHostState *s = opaque;
+
+    s->vdd_mv = MAX(level, 0);
+    if (s->vdd_mv > ESP32P4_DPHY_VDD_MAX_MV && !s->vdd_warned) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: VDD_MIPI_DPHY at %u mV, beyond "
+                      "the 2.75 V the chip allows: the PHY does not work\n",
+                      TYPE_ESP32P4_DSI_HOST, s->vdd_mv);
+        s->vdd_warned = true;
+    }
+    phy_update(s);
+}
+
+void esp32p4_dsi_host_set_connector_i2c(ESP32P4DsiHostState *s, I2CBus *bus)
+{
+    s->connector_i2c = bus;
+}
+
 static bool host_exact_edges(Object *obj, Clock *out, ESP32P4ClkEdges *e)
 {
     ESP32P4DsiHostState *s = ESP32P4_DSI_HOST(obj);
@@ -2208,6 +2240,7 @@ static void host_init(Object *obj)
     s->lanebyteclk = qdev_init_clock_out(dev, "lanebyteclk");
     qdev_init_gpio_in_named(dev, host_cfg_ref_en, ESP32P4_DSI_CFG_REF_CLK_EN,
                             1);
+    qdev_init_gpio_in_named(dev, host_vdd, ESP32P4_VDD_MIPI_DPHY, 1);
     s->phy_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, phy_timer_cb, s);
     s->link_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, link_timer_cb, s);
     s->vpg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vpg_timer_cb, s);
@@ -2227,8 +2260,8 @@ static void host_finalize(Object *obj)
 
 static const VMStateDescription vmstate_host = {
     .name = TYPE_ESP32P4_DSI_HOST,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(phy_timer, ESP32P4DsiHostState),
         VMSTATE_TIMER_PTR(link_timer, ESP32P4DsiHostState),
@@ -2246,6 +2279,8 @@ static const VMStateDescription vmstate_host = {
         VMSTATE_UINT8_ARRAY(t22, ESP32P4DsiHostState, 2),
         VMSTATE_UINT8(t44, ESP32P4DsiHostState),
         VMSTATE_BOOL(cfg_ref_en, ESP32P4DsiHostState),
+        VMSTATE_UINT32(vdd_mv, ESP32P4DsiHostState),
+        VMSTATE_BOOL(vdd_warned, ESP32P4DsiHostState),
         VMSTATE_UINT32(phy_state, ESP32P4DsiHostState),
         VMSTATE_INT64(phy_due_ns, ESP32P4DsiHostState),
         VMSTATE_ESP32P4_CLK_EDGES(ref_edges, ESP32P4DsiHostState),

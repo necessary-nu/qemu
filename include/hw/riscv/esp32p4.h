@@ -167,6 +167,9 @@ enum {
 /* The PMU regulator, VO<n>, that supplies the microSD slot's pads */
 #define ESP32P4_BOARD_SD_PAD_LDO    4
 
+/* The PMU regulator, VO<n>, on VDD_MIPI_DPHY */
+#define ESP32P4_BOARD_DPHY_LDO      3
+
 /* The board pad whose high level switches the microSD socket's supply off */
 #define ESP32P4_BOARD_SD_POWER_PAD  45
 /*

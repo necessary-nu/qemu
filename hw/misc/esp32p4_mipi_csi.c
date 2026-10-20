@@ -19,9 +19,11 @@
  *
  *   - The PHY. Test code 0x44 holds hsfreqrange (TRM 42.5.3.2: TESTDOUT
  *     its loopback with TESTDIN[7] 0); other codes are reserved (logged).
- *     With PHY_SHUTDOWNZ and DPHY_RSTZ set and CSI_DPHY_CFG_CLK running
- *     (and the bridge's CSI_CFG_CLK_EN), the PHY is up 1000 configuration
- *     clocks later (the TRM gives no time). PHY_STOPSTATE shows the lanes
+ *     It works only on VDD_MIPI_DPHY within its recommended range, as
+ *     the DSI host's does (include/hw/misc/esp32p4_mipi.h): outside it the
+ *     PHY is as if shut down. With PHY_SHUTDOWNZ and DPHY_RSTZ set and
+ *     CSI_DPHY_CFG_CLK running (and the bridge's CSI_CFG_CLK_EN), the PHY
+ *     is up 1000 configuration clocks later (the TRM gives no time). PHY_STOPSTATE shows the lanes
  *     in LP-11: the data lanes between the sensor's bursts while it
  *     streams, and while it does not (a sensor in standby holds LP-11);
  *     the clock lane likewise, but while a continuous clock runs. PHY_RX's
@@ -270,10 +272,13 @@ static void host_err(ESP32P4CsiHostState *s, int g, uint32_t bits)
 
 /* ---- The PHY ---- */
 
+/* [spec:nuos:req:emu.esp32p4.dphy-supply] */
 static bool phy_wanted(ESP32P4CsiHostState *s)
 {
     return (hreg(s, A_PHY_SHUTDOWNZ) & 1) && (hreg(s, A_DPHY_RSTZ) & 1) &&
-           s->cfg_clk_en && clock_is_enabled(s->clk_cfg);
+           s->cfg_clk_en && s->vdd_mv >= ESP32P4_DPHY_VDD_MIN_MV &&
+           s->vdd_mv <= ESP32P4_DPHY_VDD_MAX_MV &&
+           clock_is_enabled(s->clk_cfg);
 }
 
 static void phy_update(void *opaque)
@@ -833,6 +838,21 @@ static void host_cfg_clk_en(void *opaque, int n, int level)
     phy_update(s);
 }
 
+/* [spec:nuos:req:emu.esp32p4.dphy-supply] VDD_MIPI_DPHY, @level mV. */
+static void host_vdd(void *opaque, int n, int level)
+{
+    ESP32P4CsiHostState *s = opaque;
+
+    s->vdd_mv = MAX(level, 0);
+    if (s->vdd_mv > ESP32P4_DPHY_VDD_MAX_MV && !s->vdd_warned) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: VDD_MIPI_DPHY at %u mV, beyond "
+                      "the 2.75 V the chip allows: the PHY does not work\n",
+                      TYPE_ESP32P4_CSI_HOST, s->vdd_mv);
+        s->vdd_warned = true;
+    }
+    phy_update(s);
+}
+
 static void host_enableclk(void *opaque, int n, int level)
 {
     ESP32P4CsiHostState *s = opaque;
@@ -878,6 +898,7 @@ static void host_init(Object *obj)
                                     ClockUpdate);
     qdev_init_gpio_in_named(dev, host_cfg_clk_en, ESP32P4_CSI_CFG_CLK_EN, 1);
     qdev_init_gpio_in_named(dev, host_enableclk, ESP32P4_CSI_ENABLECLK, 1);
+    qdev_init_gpio_in_named(dev, host_vdd, ESP32P4_VDD_MIPI_DPHY, 1);
     s->phy_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, phy_timer_cb, s);
     s->cfg_clk_en = true;
     s->enableclk = true;
@@ -911,8 +932,8 @@ static const Property host_properties[] = {
 
 static const VMStateDescription vmstate_host = {
     .name = TYPE_ESP32P4_CSI_HOST,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(phy_timer, ESP32P4CsiHostState),
         VMSTATE_UINT32_ARRAY(regs, ESP32P4CsiHostState,
@@ -923,6 +944,8 @@ static const VMStateDescription vmstate_host = {
         VMSTATE_ESP32P4_DPHY_TEST(test, ESP32P4CsiHostState),
         VMSTATE_UINT8(t44, ESP32P4CsiHostState),
         VMSTATE_BOOL(cfg_clk_en, ESP32P4CsiHostState),
+        VMSTATE_UINT32(vdd_mv, ESP32P4CsiHostState),
+        VMSTATE_BOOL(vdd_warned, ESP32P4CsiHostState),
         VMSTATE_BOOL(enableclk, ESP32P4CsiHostState),
         VMSTATE_UINT32(phy_state, ESP32P4CsiHostState),
         VMSTATE_INT64(phy_due_ns, ESP32P4CsiHostState),
