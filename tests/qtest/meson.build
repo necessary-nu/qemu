@@ -392,7 +392,7 @@ qtests_riscv32 = \
      'esp32p4-systimer-test', 'esp32p4-timg-test', 'esp32p4-lpwdt-test',
      'esp32p4-lp-timer-test', 'esp32p4-gdma-test', 'esp32p4-dwgdma-test',
      'esp32p4-sdmmc-test', 'esp32p4-sd-card-test', 'esp32p4-sd-uhs-test',
-     'esp32p4-sd-pins-test',
+     'esp32p4-sd-pins-test', 'esp32p4-c6-test',
      'esp32p4-emac-test', 'esp32p4-etm-test',
      'esp32p4-twai-test', 'esp32p4-usb-test', 'esp32p4-usb-pads-test',
      'esp32p4-i2c-test',

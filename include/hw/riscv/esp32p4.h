@@ -321,6 +321,8 @@ struct ESP32P4MachineState {
     ESP32P4I3CMstState i3c_mst;
     ESP32P4I3CSlvState i3c_slv;
     ESP32P4SdmmcState sdmmc;
+    /* The ESP32-C6 on SD slot 1, unless a card is given for the slot */
+    struct Esp32c6HostedState *c6;
     /* GPIO45, the microSD socket's supply switch, is driven high. */
     bool sd_power_pad;
     /* GDMA-AHB, GDMA-AXI. */

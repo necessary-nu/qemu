@@ -521,6 +521,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/misc/unimp.h"
+#include "hw/sd/esp32c6_hosted.h"
 #include "hw/riscv/esp32p4.h"
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
@@ -2172,7 +2173,8 @@ static void esp32p4_init_emac(ESP32P4MachineState *s)
     }
     qdev_connect_clock_in(emac, "phy-ref",
                           qdev_get_clock_out(phy, "rmii-ref"));
-    qemu_configure_nic_device(emac, true, NULL);
+    /* The default NIC is the C6's; Ethernet takes one naming its model. */
+    qemu_configure_nic_device(emac, !s->c6, NULL);
     sysbus_realize(sbd, &error_fatal);
     esp32p4_clkrst_map_gated(&s->clkrst, sbd, 0, ESP32P4_EMAC_BASE,
                              ESP32P4_CLK_EMAC_SYS,
@@ -2467,6 +2469,23 @@ static void esp32p4_init_sdmmc(ESP32P4MachineState *s)
                 qdev_prop_set_uint8(card, "uhs", UHS_I);
             }
             qdev_realize_and_unref(card, bus, &error_fatal);
+        }
+        /*
+         * [spec:nuos:req:emu.esp32p4.c6]
+         * Without a card given for it, slot 1 holds the board's ESP32-C6:
+         * its CHIP_PU follows GPIO54's level and its station is the
+         * machine's default NIC, as NuOS networks through it.
+         */
+        if (slot == 1 && !dinfo) {
+            DeviceState *c6 = qdev_new(TYPE_ESP32C6_HOSTED);
+
+            object_property_add_child(OBJECT(s), "esp32c6", OBJECT(c6));
+            qemu_configure_nic_device(c6, true, NULL);
+            qdev_realize_and_unref(c6, NULL, &error_fatal);
+            s->c6 = ESP32C6_HOSTED(c6);
+            esp32c6_hosted_attach(s->c6, SD_BUS(bus));
+            esp32p4_gpio_watch_pad(&s->gpio, ESP32P4_BOARD_C6_CHIP_PU_PAD,
+                qdev_get_gpio_in_named(c6, ESP32C6_HOSTED_CHIP_PU, 0));
         }
         /*
          * [spec:nuos:req:emu.esp32p4.gpio]

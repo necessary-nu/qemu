@@ -79,3 +79,14 @@ pl181_data_engine_idle(void) "data engine idle"
 # aspeed_sdhci.c
 aspeed_sdhci_read(uint64_t addr, uint32_t size, uint64_t data) "@0x%" PRIx64 " size %u: 0x%" PRIx64
 aspeed_sdhci_write(uint64_t addr, uint32_t size, uint64_t data) "@0x%" PRIx64 " size %u: 0x%" PRIx64
+
+# esp32c6_hosted.c
+esp32c6_hosted_cmd(uint8_t cmd, uint32_t arg, int state, uint32_t resp) "CMD%u arg 0x%08x state %d resp 0x%08x"
+esp32c6_hosted_xfer(bool write, unsigned fn, uint32_t addr, uint32_t len, bool block) "write %u fn%u addr 0x%05x len %u block %u"
+esp32c6_hosted_reg_read(uint32_t addr, uint32_t value) "fn1 reg 0x%02x reads 0x%08x"
+esp32c6_hosted_reg_write(uint32_t addr, uint8_t value) "fn1 reg 0x%02x byte 0x%02x"
+esp32c6_hosted_to_host(uint8_t iface, uint32_t len, uint32_t queued) "packet for interface %u, %u bytes; %u queued"
+esp32c6_hosted_from_host(uint8_t iface, uint32_t len) "packet from the host for interface %u, %u bytes"
+esp32c6_hosted_rpc(uint32_t id, uint32_t uid) "RPC request %u uid %u"
+esp32c6_hosted_chip_pu(bool on) "CHIP_PU %u"
+esp32c6_hosted_irq(bool level) "card interrupt %u"

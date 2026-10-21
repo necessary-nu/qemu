@@ -13,5 +13,6 @@ system_ss.add(when: 'CONFIG_CADENCE_SDHCI', if_true: files('cadence_sdhci.c'))
 system_ss.add(when: 'CONFIG_AXIADO_SDHCI', if_true: files('axiado_sdhci.c'))
 system_ss.add(when: 'CONFIG_DWC_SDMMC', if_true: files('dwc_sdmmc.c'))
 system_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32p4_sdmmc.c'))
+system_ss.add(when: 'CONFIG_ESP32P4', if_true: files('esp32c6_hosted.c'))
 system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files('esp32_sdio_slave.c',
                                                          'esp32_sdmmc.c'))

@@ -482,7 +482,7 @@ static void test_tx_rx(void)
     int fd[2];
 
     g_assert_cmpint(socketpair(PF_UNIX, SOCK_STREAM, 0, fd), ==, 0);
-    qts = qtest_initf("-M esp32p4 -nic socket,fd=%d", fd[1]);
+    qts = qtest_initf("-M esp32p4 -nic socket,fd=%d,model=esp32p4-emac", fd[1]);
     emac_setup(qts);
     smi_pins(qts);
     rmii_pins(qts);
@@ -675,7 +675,7 @@ static void test_ptp_frames(void)
     int fd[2];
 
     g_assert_cmpint(socketpair(PF_UNIX, SOCK_STREAM, 0, fd), ==, 0);
-    qts = qtest_initf("-M esp32p4 -nic socket,fd=%d", fd[1]);
+    qts = qtest_initf("-M esp32p4 -nic socket,fd=%d,model=esp32p4-emac", fd[1]);
     emac_setup(qts);
     rmii_pins(qts);
     set_station(qts);
@@ -806,7 +806,7 @@ static void test_vlan_flow_pmt(void)
     int fd[2], pauses;
 
     g_assert_cmpint(socketpair(PF_UNIX, SOCK_STREAM, 0, fd), ==, 0);
-    qts = qtest_initf("-M esp32p4 -nic socket,fd=%d", fd[1]);
+    qts = qtest_initf("-M esp32p4 -nic socket,fd=%d,model=esp32p4-emac", fd[1]);
     emac_setup(qts);
     rmii_pins(qts);
     set_station(qts);
